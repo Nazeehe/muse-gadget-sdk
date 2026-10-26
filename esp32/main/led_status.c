@@ -42,10 +42,14 @@
 #include "esp_lcd_panel_ops.h"
 #include "happy_anim.h"
 #include "pixel_font.h"
-#if CONFIG_HOMEHUB_LED_BACKEND_IDEASPARK_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_C6_ST7789
+#if CONFIG_HOMEHUB_LED_BACKEND_IDEASPARK_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_C6_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_ESP32_2424S012C_GC9A01
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
+#if CONFIG_HOMEHUB_LED_BACKEND_ESP32_2424S012C_GC9A01
+#include "esp_lcd_gc9a01.h"
+#else
 #include "esp_lcd_panel_st7789.h"
+#endif
 #else
 #include "driver/i2c_master.h"
 #include "esp_lcd_panel_rgb.h"
@@ -180,6 +184,27 @@ static const char *TAG = "link.led";
 #define LCD_BAR_ROWS     10
 #define LCD_ANIM_SCALE   2
 #define LCD_DOT_MARGIN   4
+#define LCD_BUF_CAPS     MALLOC_CAP_DMA
+#elif CONFIG_HOMEHUB_LED_BACKEND_ESP32_2424S012C_GC9A01
+// ESP32-2424S012C: 1.28 inch 240x240 GC9A01 round panel on SPI, backlight on
+// GPIO3, no reset line (tied to EN). 56x59-cell animation at scale 4 is
+// 224x236, centred; the round mask clips the bars' corners.
+#define LCD_NAME         "ESP32-2424S012C GC9A01"
+#define LCD_HOST         SPI2_HOST
+#define LCD_PIN_SCLK     6
+#define LCD_PIN_MOSI     7
+#define LCD_PIN_CS       10
+#define LCD_PIN_DC       2
+#define LCD_PIN_RST      -1
+#define LCD_PIN_BL       3
+#define LCD_PCLK_HZ      (40 * 1000 * 1000)
+#define LCD_H_RES        240
+#define LCD_V_RES        240
+#define LCD_X_GAP        0
+#define LCD_BAR_ROWS     10
+#define LCD_ANIM_SCALE   4
+#define LCD_DOT_MARGIN   4
+// Draw buffers are sent by SPI DMA.
 #define LCD_BUF_CAPS     MALLOC_CAP_DMA
 #endif
 
@@ -404,7 +429,7 @@ static bool s_dot_drawn = false;
 static bool s_image_mode = false;
 static const uint8_t s_dot_rows[LCD_DOT_CELLS] = {0x6, 0xf, 0xf, 0x6};
 
-#if CONFIG_HOMEHUB_LED_BACKEND_IDEASPARK_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_C6_ST7789
+#if CONFIG_HOMEHUB_LED_BACKEND_IDEASPARK_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_C6_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_ESP32_2424S012C_GC9A01
 static SemaphoreHandle_t s_draw_done = NULL;
 
 static bool lcd_draw_done(esp_lcd_panel_io_handle_t io,
@@ -617,7 +642,52 @@ static void anim_task(void *arg) {
     }
 }
 
-#if CONFIG_HOMEHUB_LED_BACKEND_IDEASPARK_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_C6_ST7789
+#if CONFIG_HOMEHUB_LED_BACKEND_ESP32_2424S012C_GC9A01
+static esp_err_t lcd_panel_init(void) {
+    s_draw_done = xSemaphoreCreateBinary();
+    if (!s_draw_done) return ESP_ERR_NO_MEM;
+    spi_bus_config_t bus_cfg = {
+        .sclk_io_num = LCD_PIN_SCLK,
+        .mosi_io_num = LCD_PIN_MOSI,
+        .miso_io_num = -1,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = LCD_ANIM_BUF_PIXELS * sizeof(uint16_t),
+    };
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .cs_gpio_num = LCD_PIN_CS,
+        .dc_gpio_num = LCD_PIN_DC,
+        .spi_mode = 0,
+        .pclk_hz = LCD_PCLK_HZ,
+        .trans_queue_depth = 4,
+        .on_color_trans_done = lcd_draw_done,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+    };
+    esp_lcd_panel_dev_config_t panel_cfg = {
+        // No reset line on this board (tied to EN): the driver falls back
+        // to a software reset.
+        .reset_gpio_num = LCD_PIN_RST,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+    };
+    esp_lcd_panel_io_handle_t io = NULL;
+    esp_err_t err = spi_bus_initialize(LCD_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (err == ESP_OK) {
+        err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg, &io);
+    }
+    if (err == ESP_OK) err = esp_lcd_new_panel_gc9a01(io, &panel_cfg, &s_panel);
+    if (err == ESP_OK) err = esp_lcd_panel_reset(s_panel);
+    if (err == ESP_OK) err = esp_lcd_panel_init(s_panel);
+    if (err == ESP_OK) err = esp_lcd_panel_invert_color(s_panel, true);
+    if (err == ESP_OK) err = esp_lcd_panel_set_gap(s_panel, LCD_X_GAP, 0);
+    return err;
+}
+
+static esp_err_t lcd_panel_on(void) {
+    return esp_lcd_panel_disp_on_off(s_panel, true);
+}
+#elif CONFIG_HOMEHUB_LED_BACKEND_IDEASPARK_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_C6_ST7789
 static esp_err_t lcd_panel_init(void) {
     s_draw_done = xSemaphoreCreateBinary();
     if (!s_draw_done) return ESP_ERR_NO_MEM;
@@ -1219,7 +1289,7 @@ static bool lcd_draw_image_rect(int x, int y, int w, int h, const void *pixels) 
         s_image_mode = true;
         lcd_clear_rows(0, LCD_V_RES);
     }
-#if CONFIG_HOMEHUB_LED_BACKEND_IDEASPARK_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_C6_ST7789
+#if CONFIG_HOMEHUB_LED_BACKEND_IDEASPARK_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_C6_ST7789 || CONFIG_HOMEHUB_LED_BACKEND_ESP32_2424S012C_GC9A01
     // Already in the panel's format; copied only to reach DMA memory.
     memcpy(s_anim_buf, pixels, (size_t)w * h * sizeof(uint16_t));
 #else

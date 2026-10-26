@@ -24,7 +24,9 @@
 
 /*
  * Bring up the display and build the UI: the avatar on the first tile,
- * settings one swipe to the left. Also owns screen sleep and brightness.
+ * settings one swipe to the left, and with CONFIG_MUSE_CLOCK a pocket watch
+ * one swipe to the right, where the screen starts. Also owns screen sleep
+ * and brightness.
  */
 esp_err_t muse_ui_start(void);
 
@@ -33,6 +35,10 @@ bool muse_ui_dark(void);
 
 /* From any task: the face tile is the currently visible tile. */
 bool muse_ui_face_active(void);
+/* From any task: the pocket watch is the page showing, asleep or not. */
+bool muse_ui_clock_showing(void);
+/* From any task: slides to Muse's face at the next frame. */
+void muse_ui_request_face(void);
 
 /* The functions below run in the LVGL task (or with the display lock held). */
 
@@ -61,9 +67,14 @@ void muse_ui_camera_hint(bool visible);
 /* Bench testing, from any task: streams the screen over USB serial. */
 void muse_ui_request_snapshot(void);
 #if CONFIG_LV_USE_SNAPSHOT
+typedef enum {
+    MUSE_UI_PAGE_FACE,
+    MUSE_UI_PAGE_SETTINGS,
+    MUSE_UI_PAGE_CLOCK,     /* the face, without CONFIG_MUSE_CLOCK */
+} muse_ui_page_t;
 /* Bench-only, from any task: select the touch tile without pretending a/s
  * are touch-menu navigation. No effect on non-touch boards. */
-void muse_ui_bench_page(bool settings);
+void muse_ui_bench_page(muse_ui_page_t page);
 /* Display-only demo name for privacy-safe screenshots; no provisioning changes. */
 void muse_ui_bench_demo(bool enabled);
 #endif

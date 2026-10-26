@@ -47,6 +47,7 @@ before adding a feature to one.
 |---|---|---|---|
 | ESP32-C5 DevKitC-1 (default) | `esp32c5` | none | `tools/board.sh devkit` |
 | ESP32-C6 devkit without PSRAM | `esp32c6` | `devices/sdkconfig.c6-nopsram` | `tools/board.sh c6-nopsram` |
+| ESP32-2424S012C 1.28" round display | `esp32c3` | `devices/sdkconfig.esp32-2424s012c` | `tools/board.sh esp32-2424s012c` |
 | Espressif ESP32-S3-DevKitC-1 v1.1 (N8R8) | `esp32s3` | `devices/sdkconfig.espressif-s3-devkitc-1` | `tools/board.sh espressif-s3-devkitc-1` |
 | ideaspark ESP32 + 1.9" ST7789 | `esp32` | `devices/sdkconfig.ideaspark` | `tools/board.sh ideaspark` |
 | Waveshare ESP32-C6-LCD-1.47 | `esp32c6` | `devices/sdkconfig.waveshare-c6-lcd-147` | `tools/board.sh waveshare-c6-lcd-147` |
@@ -457,6 +458,13 @@ touch boards' speaker button appear. They're hidden until then, since a press
 can't reach Muse and there are no replies to mute. The StopWatch is an exception:
 its dedicated microphone, speaker/mute and power rim icons stay visible before
 pairing as well, identifying its three physical controls.
+
+With `CONFIG_MUSE_CLOCK` (on for the Waveshare 1.75C), a touch board has a
+pocket watch page left of Muse's face. The screen starts and wakes on it, and
+the talk button there brings Muse's face up instead of recording. It takes the
+time from `pool.ntp.org` once Wi-Fi joins, in `CONFIG_MUSE_CLOCK_TZ`, a POSIX
+TZ string that defaults to UTC: set it in the build's `sdkconfig`. Bench
+builds select the page with `>ui=clock`.
 
 To skip BLE Wi-Fi provisioning while you iterate, set
 `CONFIG_HOMEHUB_WIFI_SSID` and `CONFIG_HOMEHUB_WIFI_PASSWORD` in `menuconfig`.

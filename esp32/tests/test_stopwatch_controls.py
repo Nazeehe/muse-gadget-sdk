@@ -164,7 +164,7 @@ int main(int argc, char **argv) {
 static struct { char text[64]; bool hidden; } hints[3];
 typedef void lv_obj_t;
 static lv_obj_t *s_ptt_hint = &hints[0], *s_spk_hint = &hints[1], *s_pwr_hint = &hints[2];
-static lv_obj_t *s_tv = (void *)1, *s_settings = (void *)2;
+static lv_obj_t *s_tv = (void *)1, *s_settings = (void *)2, *s_face = 0;
 static bool settings, speaker = true;
 static uint32_t mic_color;
 static int lv_calls;

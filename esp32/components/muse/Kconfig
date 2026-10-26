@@ -233,6 +233,28 @@ menu "Muse"
             Without it those characters show as boxes. Hangul isn't
             included.
 
+    config MUSE_CLOCK
+        bool "Pocket watch page left of Muse's face"
+        depends on MUSE_ENABLED
+        default n
+        help
+            Touch boards get an analog pocket watch on a page of its own,
+            one swipe right of Muse's face. It's the page the screen starts
+            and wakes on, and the talk button there brings Muse's face up
+            rather than recording. The time comes from pool.ntp.org once
+            Wi-Fi joins. Laid out for a round screen.
+
+    config MUSE_CLOCK_TZ
+        string "Pocket watch time zone (POSIX TZ string)"
+        depends on MUSE_CLOCK
+        default "UTC0"
+        help
+            The watch's time zone and its daylight saving rule, as a POSIX
+            TZ string: for example "PST8PDT,M3.2.0,M11.1.0" for US Pacific
+            time, "CET-1CEST,M3.5.0,M10.5.0/3" for Central Europe. The last
+            line of /usr/share/zoneinfo/<Area>/<City> on Linux or macOS
+            gives yours.
+
     config MUSE_JC3248W535_MIC_GPIO
         int "JC3248W535: GPIO for an external I2S mic's data (SD) line"
         depends on MUSE_BOARD_GUITION_JC3248W535

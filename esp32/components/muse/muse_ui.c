@@ -34,6 +34,9 @@
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_chat.h"
+#if CONFIG_MUSE_CLOCK
+#include "muse_clock.h"
+#endif
 #include "muse_console.h"
 #include "muse_link.h"
 #include "muse_mem.h"
@@ -69,6 +72,8 @@ static const char *TAG = "muse_ui";
 #define COLOR_METER_OFF 0x1d1733
 #define COLOR_ACCENT 0xa77dff
 #define COLOR_DOT_OFF 0x3a3358
+#define COLOR_DOT_ON_GOLD 0x3a2a0e
+#define COLOR_DOT_OFF_GOLD 0xe6cc85
 #define COLOR_LIT 0xf2efff
 #define SETTINGS_TICK_S 0.25f
 
@@ -93,7 +98,11 @@ static lv_indev_t *s_indev;
 static lv_obj_t *s_tv;
 static lv_obj_t *s_face;
 static lv_obj_t *s_settings;
-static lv_obj_t *s_dots[2];
+static lv_obj_t *s_clock;   /* the pocket watch, left of the face (CONFIG_MUSE_CLOCK) */
+static int s_pages;
+static lv_obj_t *s_dots[3];
+static volatile bool s_on_clock;    /* read by the input task */
+static volatile bool s_want_face;
 static lv_obj_t *s_wifi_icon;
 static lv_obj_t *s_ble_icon;
 static lv_obj_t *s_cover;
@@ -152,6 +161,12 @@ static int s_preview_brightness = -1;
 static int s_shown_page = -1;
 static int s_shown_speaker = -1;
 static muse_mode_t s_last_mode = MUSE_MODE_COUNT;
+
+/* Where the face is in the tileview: one page in when the watch is left of it. */
+static int32_t face_x(void)
+{
+    return s_clock ? s_w : 0;
+}
 
 /*
  * While Muse is thinking or speaking it shrinks to make room for the reply:
@@ -815,12 +830,18 @@ static void build_screen(void)
 
     lv_obj_t *face = scr;
     if (muse_board->touch) {
-        /* Swipe left from Muse for settings. */
+        /* Swipe left from Muse for settings, and right for the pocket watch,
+         * which comes first so that the screen starts on it. */
         s_tv = lv_tileview_create(scr);
         lv_obj_set_style_bg_color(s_tv, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_tv, LV_OPA_COVER, 0);
         lv_obj_set_scrollbar_mode(s_tv, LV_SCROLLBAR_MODE_OFF);
-        s_face = lv_tileview_add_tile(s_tv, 0, 0, LV_DIR_RIGHT);
+        int col = 0;
+#if CONFIG_MUSE_CLOCK
+        s_clock = lv_tileview_add_tile(s_tv, col++, 0, LV_DIR_RIGHT);
+        s_on_clock = true;
+#endif
+        s_face = lv_tileview_add_tile(s_tv, col, 0, s_clock ? LV_DIR_HOR : LV_DIR_RIGHT);
         /* It never scrolls, but LVGL would size its scrollbars from all its
          * children every time it draws any part of it. */
         lv_obj_set_scrollbar_mode(s_face, LV_SCROLLBAR_MODE_OFF);
@@ -828,7 +849,8 @@ static void build_screen(void)
          * shows as a different-coloured square around the character. */
         lv_obj_set_style_bg_color(s_face, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_face, LV_OPA_COVER, 0);
-        s_settings = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT);
+        s_settings = lv_tileview_add_tile(s_tv, col + 1, 0, LV_DIR_LEFT);
+        s_pages = col + 2;
         face = s_face;
     }
 
@@ -1063,8 +1085,8 @@ static lv_obj_t *make_control_icon(lv_obj_t *scr, const muse_button_hint_t *pos,
 static void update_control_hints(muse_mode_t mode)
 {
     if (!s_ptt_hint) return;
-    /* Don't obscure settings rows/keyboards with floating physical icons. */
-    bool settings = s_tv && lv_tileview_get_tile_active(s_tv) == s_settings;
+    /* Don't obscure settings rows/keyboards or the watch with floating physical icons. */
+    bool settings = s_tv && lv_tileview_get_tile_active(s_tv) != s_face;
     lv_obj_set_flag(s_ptt_hint, LV_OBJ_FLAG_HIDDEN, settings);
     lv_obj_set_flag(s_spk_hint, LV_OBJ_FLAG_HIDDEN, settings);
     lv_obj_set_flag(s_pwr_hint, LV_OBJ_FLAG_HIDDEN, settings);
@@ -1086,7 +1108,7 @@ static void build_overlays(void)
     lv_obj_t *scr = lv_screen_active();
 
     /* Page dots. */
-    for (int i = 0; i < 2 && s_tv; i++) {
+    for (int i = 0; i < s_pages; i++) {
         lv_obj_t *d = lv_obj_create(scr);
         lv_obj_remove_style_all(d);
         lv_obj_set_size(d, 8, 8);
@@ -1094,7 +1116,7 @@ static void build_overlays(void)
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(d, lv_color_hex(COLOR_DOT_OFF), 0);
         lv_obj_remove_flag(d, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, i ? 8 : -8, -14);
+        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, (2 * i - (s_pages - 1)) * 8, -14);
         s_dots[i] = d;
     }
 
@@ -1191,6 +1213,11 @@ static bool update_sleep(void)
     bool asleep = muse_state_asleep();
     if (asleep && !s_dark) {
         muse_menu_close();
+        if (s_clock) {
+            /* The watch is where the screen wakes. */
+            lv_tileview_set_tile(s_tv, s_clock, LV_ANIM_OFF);
+            s_on_clock = true;
+        }
         apply_brightness(0);
         if (muse_board->panel_sleep) {
             muse_board->panel_sleep(true);
@@ -1249,21 +1276,26 @@ static void update_chrome(float now)
     s_next_settings_tick = now + SETTINGS_TICK_S;
 
     if (s_tv) {
-        int page = lv_tileview_get_tile_active(s_tv) == s_settings;
+        lv_obj_t *tile = lv_tileview_get_tile_active(s_tv);
+        bool settings = tile == s_settings;
+        int page = settings ? s_pages - 1 : tile == s_face ? s_pages - 2 : 0;
         bool subpage = muse_settings_ui_in_subpage();
-        bool swipe = !page || !subpage;
+        bool swipe = !settings || !subpage;
         if (swipe != lv_obj_has_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE)) {
             lv_obj_set_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE, swipe);
         }
         int shown = page * 2 + subpage;
         if (shown != s_shown_page) {
-            for (int i = 0; i < 2; i++) {
-                lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(i == page ? COLOR_ACCENT : COLOR_DOT_OFF), 0);
-                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, page && subpage);
+            /* On the watch's gold case, dots in its own colours. */
+            bool gold = tile == s_clock;
+            uint32_t on = gold ? COLOR_DOT_ON_GOLD : COLOR_ACCENT, off = gold ? COLOR_DOT_OFF_GOLD : COLOR_DOT_OFF;
+            for (int i = 0; i < s_pages; i++) {
+                lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(i == page ? on : off), 0);
+                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, settings && subpage);
             }
             s_shown_page = shown;
         }
-        muse_settings_ui_tick(lv_obj_get_scroll_x(s_tv) > 0);
+        muse_settings_ui_tick(lv_obj_get_scroll_x(s_tv) > face_x());
     }
 
     /* Joining, the icon blinks: the compact layout has no state label. */
@@ -1508,9 +1540,9 @@ static void update_status(muse_mode_t mode, float now)
 static volatile bool s_snapshot;
 #if LV_USE_SNAPSHOT
 static volatile int s_bench_page = -1;
-void muse_ui_bench_page(bool settings)
+void muse_ui_bench_page(muse_ui_page_t page)
 {
-    s_bench_page = settings ? 1 : 0;   /* applied in the LVGL task */
+    s_bench_page = page;   /* applied in the LVGL task */
 }
 #endif
 
@@ -1556,11 +1588,16 @@ static void frame_tick(lv_timer_t *timer)
 {
 #if LV_USE_SNAPSHOT
     if (s_bench_page >= 0) {
-        bool settings = s_bench_page != 0;
+        lv_obj_t *tile = s_bench_page == MUSE_UI_PAGE_SETTINGS ? s_settings
+                         : s_bench_page == MUSE_UI_PAGE_CLOCK && s_clock ? s_clock : s_face;
         s_bench_page = -1;
-        if (s_tv) lv_tileview_set_tile(s_tv, settings ? s_settings : s_face, LV_ANIM_OFF);
+        if (s_tv) lv_tileview_set_tile(s_tv, tile, LV_ANIM_OFF);
     }
 #endif
+    if (s_want_face) {
+        s_want_face = false;
+        muse_ui_show_face();
+    }
     update_control_hints(muse_state_mode(NULL));
     if (s_snapshot) {
         s_snapshot = false;
@@ -1583,6 +1620,13 @@ static void frame_tick(lv_timer_t *timer)
         return;
     }
     update_chrome(now);
+    int32_t scroll_x = s_tv ? lv_obj_get_scroll_x(s_tv) : 0;
+    if (s_clock) {
+        s_on_clock = lv_tileview_get_tile_active(s_tv) == s_clock;
+    }
+#if CONFIG_MUSE_CLOCK
+    muse_clock_tick(scroll_x < face_x());   /* any of the watch on screen */
+#endif
     if (muse_menu_tick(now)) {
         image_hide_locked();
         return;   /* the menu covers the face */
@@ -1590,9 +1634,9 @@ static void frame_tick(lv_timer_t *timer)
     if (s_image_dsc.data) {
         return;   /* the image covers the face */
     }
-    if (s_tv && lv_obj_get_scroll_x(s_tv) != 0) {
-        /* Off screen, or sliding to or from settings: hold still so the
-         * slide gets the whole frame time. */
+    if (scroll_x != face_x()) {
+        /* Off screen, or sliding to or from settings or the watch: hold
+         * still so the slide gets the whole frame time. */
         return;
     }
 
@@ -1654,6 +1698,13 @@ esp_err_t muse_ui_start(void)
     s_image_mutex = xSemaphoreCreateMutex();
     muse_board->display_lock(-1);
     build_screen();
+#if CONFIG_MUSE_CLOCK
+    if (s_clock) {
+        muse_clock_build(s_clock);
+        /* The tileview has no active tile until one is set. */
+        lv_tileview_set_tile(s_tv, s_clock, LV_ANIM_OFF);
+    }
+#endif
     if (s_settings) {
         muse_settings_ui_build(s_settings);
     } else {
@@ -1675,6 +1726,17 @@ void muse_ui_show_face(void)
     }
     lv_obj_add_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE);
     lv_tileview_set_tile(s_tv, s_face, LV_ANIM_ON);
+}
+
+bool muse_ui_clock_showing(void)
+{
+    return s_on_clock;
+}
+
+void muse_ui_request_face(void)
+{
+    s_on_clock = false;   /* a second press before the slide talks */
+    s_want_face = true;
 }
 
 void muse_ui_set_swipe_enabled(bool enabled)

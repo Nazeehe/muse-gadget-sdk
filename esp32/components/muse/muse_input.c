@@ -205,7 +205,8 @@ static void aux_key(bool pressed, bool edge)
 
 /* Talk button: push-to-talk, or Select while the menu is open. Asleep, the
  * press wakes and is posted as a waking one: muse_voice records only if it's
- * still held once awake. */
+ * still held once awake. On the pocket watch, which the screen also sleeps
+ * on, it only brings Muse's face up. */
 static void talk_button(unsigned ev)
 {
     bool talk_down = s_talk_down;
@@ -240,6 +241,11 @@ static void talk_button(unsigned ev)
         if (muse_link_talk_press()) {
             /* Confirmed a Muse app pairing (Link's setup button). */
             muse_state_poke();
+            swallow = true;
+        } else if (muse_ui_clock_showing()) {
+            set_asleep(false, muse_board->talk_button);
+            muse_state_poke();
+            muse_ui_request_face();
             swallow = true;
         } else if (muse_state_asleep()) {
             set_asleep(false, muse_board->talk_button);
@@ -659,8 +665,10 @@ static bool console_command(char *line, bool whole)
         muse_ui_bench_demo(!strcmp(line, "ui.demo=1"));
         return true;
     }
-    if (!strcmp(line, "ui=settings") || !strcmp(line, "ui=face")) {
-        muse_ui_bench_page(!strcmp(line, "ui=settings"));
+    if (!strcmp(line, "ui=settings") || !strcmp(line, "ui=face") || !strcmp(line, "ui=clock")) {
+        muse_ui_bench_page(!strcmp(line, "ui=settings") ? MUSE_UI_PAGE_SETTINGS
+                           : !strcmp(line, "ui=clock")  ? MUSE_UI_PAGE_CLOCK
+                                                        : MUSE_UI_PAGE_FACE);
         return true;
     }
 #endif

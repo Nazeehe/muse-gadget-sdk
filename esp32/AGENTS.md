@@ -412,6 +412,13 @@ can't reach Muse and there are no replies to mute. The StopWatch is an exception
 its dedicated microphone, speaker/mute and power rim icons stay visible before
 pairing as well, identifying its three physical controls.
 
+With `CONFIG_MUSE_CLOCK` (on for the Waveshare 1.75C), a touch board has a
+pocket watch page left of Muse's face. The screen starts and wakes on it, and
+the talk button there brings Muse's face up instead of recording. It takes the
+time from `pool.ntp.org` once Wi-Fi joins, in `CONFIG_MUSE_CLOCK_TZ`, a POSIX
+TZ string that defaults to UTC: set it in the build's `sdkconfig`. Bench
+builds select the page with `>ui=clock`.
+
 To skip BLE Wi-Fi provisioning while you iterate, set
 `CONFIG_HOMEHUB_WIFI_SSID` and `CONFIG_HOMEHUB_WIFI_PASSWORD` in `menuconfig`.
 The device still needs to be paired once for its token.

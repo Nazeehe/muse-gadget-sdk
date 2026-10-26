@@ -65,3 +65,7 @@ CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 # actually slept, and how long each power lock kept the chip awake.
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
 CONFIG_PM_PROFILING=y
+
+# It looks like a pocket watch, so it starts on one: an analog dial left of
+# Muse's face. Set CONFIG_MUSE_CLOCK_TZ to your time zone (UTC by default).
+CONFIG_MUSE_CLOCK=y

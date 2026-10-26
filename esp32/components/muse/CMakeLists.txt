@@ -52,6 +52,9 @@ if(CONFIG_MUSE_ENABLED)
     if(CONFIG_MUSE_CJK_FONT)
         list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback
     endif()
+    if(CONFIG_MUSE_CLOCK)
+        list(APPEND srcs "muse_clock.c")
+    endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
     # avatar when avatar/muse_pixel.c exists here; this avatar/ is gitignored. The
     # default is in avatar/ at the top of the project.
@@ -114,7 +117,7 @@ set(muse_priv_requires
     esp_timer esp_driver_usb_serial_jtag esp_psram nvs_flash
     bt esp-tls mbedtls esp_app_format esp_http_client
     noise_core minimp3
-    esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
+    esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi esp_netif
     esp_driver_pcnt)
 list(APPEND muse_priv_requires camera)
 

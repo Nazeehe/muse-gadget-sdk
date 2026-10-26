@@ -37,12 +37,14 @@
 #              Waveshare ESP32-C6-LCD-1.47 with a 172x320 status screen
 #   waveshare-s3-epaper-154
 #              Waveshare ESP32-S3-1.54inch-ePaper V2 with a 200x200 e-paper
+#   esp32-2424s012c
+#              ESP32-2424S012C 1.28 inch round GC9A01 display (ESP32-C3)
 #
 # The action defaults to build. Without PORT, flash and monitor use the only
 # matching serial port, if there is exactly one.
 set -euo pipefail
 
-usage() { sed -n '16,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '16,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 [ $# -ge 1 ] || usage 2
 case "$1" in -h|--help) usage ;; esac
@@ -99,6 +101,12 @@ case "$BOARD" in
     TARGET=esp32s3
     DEFAULTS="$DEFAULTS;devices/sdkconfig.$BOARD"
     # The S3's own USB-Serial-JTAG.
+    PORTS="/dev/cu.usbmodem* /dev/ttyACM*"
+    ;;
+  esp32-2424s012c)
+    TARGET=esp32c3
+    DEFAULTS="$DEFAULTS;devices/sdkconfig.$BOARD"
+    # The C3's own USB-Serial-JTAG.
     PORTS="/dev/cu.usbmodem* /dev/ttyACM*"
     ;;
   *) echo "error: unknown board '$BOARD'" >&2; usage 2 ;;

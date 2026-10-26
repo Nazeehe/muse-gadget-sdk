@@ -1,0 +1,112 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ESP32-2424S012C_I ("1.28 inch ESP32-C3 round display", Sunton/DIYmall):
+# ESP32-C3-MINI-1U (RISC-V 160 MHz, 400 KB SRAM), 4 MB flash in DIO mode,
+# no PSRAM, native USB-Serial-JTAG (303a:1001). 240x240 GC9A01 round LCD on
+# SPI (SCLK 6, MOSI 7, CS 10, DC 2, backlight 3, reset tied to EN) plus a
+# CST816S touch controller on I2C (SDA 4, SCL 5, INT 0, RST 1) that the
+# status-screen firmware does not use. BOOT button on GPIO9 (active low).
+# Load last, after sdkconfig.defaults.
+#
+# Pin sources: the board's working Arduino setup (LovyanGFX: SPI2 6/7/10/2,
+# BL 3, no reset; touch I2C 4/5/0/1) and matching community pinouts for the
+# ESP32-2424S012 family.
+CONFIG_IDF_TARGET="esp32c3"
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+
+# GC9A01 status screen: status bars, animation, agent name, display.* commands.
+CONFIG_HOMEHUB_LED_BACKEND_ESP32_2424S012C_GC9A01=y
+# Advertise as <prefix>-Disp-XXXXXX to tell this board apart from real devices.
+CONFIG_HOMEHUB_BLE_NAME_SUFFIX="-Disp"
+# BOOT button, active low: tap confirms pairing, 5 s hold resets setup.
+CONFIG_HOMEHUB_BUTTON_GPIO=9
+# Console over the C3's own USB-Serial-JTAG (shows up as /dev/ttyACM*).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 4 MB flash in DIO mode. Single app slot: the stock dual-OTA layout ends
+# past 4 MB, so this board uses partitions_esp32_2424s012c.csv (one ota slot,
+# no OTA updates).
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_esp32_2424s012c.csv"
+CONFIG_HOMEHUB_OTA_ENABLED=n
+
+# No PSRAM. mbedtls and every PSRAM-preferred buffer fall back to internal RAM.
+CONFIG_SPIRAM=n
+CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=n
+# 16 KB TLS records in both directions would cost 32 KB of internal RAM per
+# connection. Servers may still send 16 KB records, so only shrink outbound.
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+
+# No PSRAM: the home-network tunnel and network discovery do not fit next to
+# the control session. Only the control API to the VM is available.
+CONFIG_HOMEHUB_TUNNEL=n
+
+# C3 SRAM diet, as on the FoloToy AI Passport (also a 400 KB C3, no PSRAM):
+# every function kept in IRAM is heap Wi-Fi, BLE and TLS don't get.
+CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
+CONFIG_ESP_PHY_IRAM_OPT=n
+CONFIG_SPI_MASTER_ISR_IN_IRAM=n
+CONFIG_SPI_SLAVE_ISR_IN_IRAM=n
+CONFIG_GDMA_CTRL_FUNC_IN_IRAM=n
+CONFIG_GDMA_ISR_HANDLER_IN_IRAM=n
+CONFIG_I2C_MASTER_ISR_HANDLER_IN_IRAM=n
+CONFIG_GPTIMER_ISR_HANDLER_IN_IRAM=n
+CONFIG_RMT_ENCODER_FUNC_IN_IRAM=n
+CONFIG_RMT_TX_ISR_HANDLER_IN_IRAM=n
+CONFIG_RMT_RX_ISR_HANDLER_IN_IRAM=n
+CONFIG_RINGBUF_PLACE_ISR_FUNCTIONS_INTO_FLASH=y
+# No LIBC_MISC_IN_IRAM: the symbol is invisible without SPI_FLASH_AUTO_SUSPEND.
+CONFIG_ESP_EVENT_POST_FROM_IRAM_ISR=n
+
+# BLE is only for pairing and phone setup: one advertiser and one connection,
+# no scanning, no BLE 5 extended advertising, no test mode.
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+CONFIG_BT_CTRL_BLE_SCAN=n
+CONFIG_BT_CTRL_BLE_SCAN_DUPL=n
+CONFIG_BT_CTRL_DTM_ENABLE=n
+CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=12
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=15
+# No old-name ACL_BUF_COUNT/HCI_EVT_HI_BUF_COUNT: sdkconfig.rename maps them
+# onto the two lines above, clobbering these values on IDF 6.
+
+# Fewer preallocated Wi-Fi receive buffers; the dynamic ones grow on demand.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=5
+# The block-ack window may be at most twice the static buffers.
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
+# Full-size TCP buffers: validate_config.cmake mandates 16384 outside the
+# Cardputer ADV / AI Passport exception (DMA headroom for tunnel bursts).
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+
+# The C3 has far less IRAM than the C5; keep lwIP and Wi-Fi hot paths in
+# flash so the image links.
+CONFIG_LWIP_IRAM_OPTIMIZATION=n
+CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION=n
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n

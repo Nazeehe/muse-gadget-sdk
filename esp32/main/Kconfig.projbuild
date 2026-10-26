@@ -206,6 +206,10 @@ menu "ESP32 Device SDK"
             bool "Waveshare ESP32-C6-LCD-1.47 inch ST7789 display (status bars)"
             depends on IDF_TARGET_ESP32C6
 
+        config HOMEHUB_LED_BACKEND_ESP32_2424S012C_GC9A01
+            bool "ESP32-2424S012C 1.28 inch GC9A01 round display (status bars)"
+            depends on IDF_TARGET_ESP32C3
+
         config HOMEHUB_LED_BACKEND_SENSECAP_ST7701
             bool "SenseCAP Indicator 4 inch ST7701S RGB display (status bars)"
             depends on IDF_TARGET_ESP32S3 && SPIRAM
@@ -262,6 +266,7 @@ menu "ESP32 Device SDK"
         bool
         default y if HOMEHUB_LED_BACKEND_IDEASPARK_ST7789
         default y if HOMEHUB_LED_BACKEND_WAVESHARE_C6_ST7789
+        default y if HOMEHUB_LED_BACKEND_ESP32_2424S012C_GC9A01
         default y if HOMEHUB_LED_BACKEND_SENSECAP_ST7701
         default y if HOMEHUB_LED_BACKEND_RETERMINAL_UC8179
         default y if HOMEHUB_LED_BACKEND_RETERMINAL_SPECTRA6

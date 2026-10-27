@@ -32,7 +32,11 @@ class MuseBenchTest(unittest.TestCase):
         self.assertIn('"lvgl"', inp)
 
     def test_register_size_is_logged(self):
-        self.assertIn('"link.register %u bytes"', (ROOT / "main/noise_control.cpp").read_text())
+        # The size comes from the log line every session already prints when it sends
+        # the registration: "sent link.register (N bytes)".
+        source = (ROOT / "main/noise_control.cpp").read_text()
+        self.assertIn('"sent %s (%u bytes)"', source)
+        self.assertIn('is_registration ? "link.register"', source)
 
 
 if __name__ == "__main__":

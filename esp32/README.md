@@ -399,6 +399,9 @@ their upstream licenses:
   copyright, with Google's patent grant. See
   [`components/libvpx_vp8/LICENSE`](components/libvpx_vp8/LICENSE) and
   [`PATENTS`](components/libvpx_vp8/PATENTS).
+- [`components/lua/src`](components/lua), the interpreter Muse apps run on, is Lua 5.4.9,
+  unmodified: MIT under Lua.org, PUC-Rio's copyright. See
+  [`components/lua/LICENSE`](components/lua/LICENSE).
 
 ESP-IDF components fetched at build time (into `managed_components/`) are
 under their own licenses.

@@ -163,6 +163,10 @@ jobs:
           - board: muse-waveshare-s3-175c-video
             target: esp32s3
             overlays: ";devices/sdkconfig.muse;devices/sdkconfig.muse-waveshare-s3-175c;devices/sdkconfig.muse-video"
+          # Lua apps (MUSE_APPS=1 tools/muse/board.sh): the interpreter and the option's checks.
+          - board: muse-waveshare-s3-175c-apps
+            target: esp32s3
+            overlays: ";devices/sdkconfig.muse;devices/sdkconfig.muse-waveshare-s3-175c;devices/sdkconfig.muse-apps"
           - board: muse-waveshare-s3-185c
             target: esp32s3
             overlays: ";devices/sdkconfig.muse;devices/sdkconfig.muse-waveshare-s3-185c"

@@ -118,3 +118,15 @@ if(CONFIG_HOMEHUB_PAIRING_EFUSE_AUTH)
             "Manufacturer pairing builds must use production epoch 1. ${GADGET_CONFIG_REGEN_HINT}")
     endif()
 endif()
+
+# Muse apps keep each app's Lua heap and its task's stack in PSRAM. An app's
+# memory_kb (256 by default, at most 1024) is capped at
+# CONFIG_MUSE_APPS_HEAP_MAX_KB, which therefore has to be 256 to 1024.
+if(CONFIG_MUSE_APPS AND NOT CONFIG_SPIRAM)
+    message(FATAL_ERROR
+        "CONFIG_MUSE_APPS needs PSRAM (CONFIG_SPIRAM): each app's Lua heap and its task's stack live there. ${GADGET_CONFIG_REGEN_HINT}")
+endif()
+if(CONFIG_MUSE_APPS AND (CONFIG_MUSE_APPS_HEAP_MAX_KB LESS 256 OR CONFIG_MUSE_APPS_HEAP_MAX_KB GREATER 1024))
+    message(FATAL_ERROR
+        "CONFIG_MUSE_APPS_HEAP_MAX_KB must be from 256 to 1024 (KB of PSRAM for one app's Lua heap). ${GADGET_CONFIG_REGEN_HINT}")
+endif()

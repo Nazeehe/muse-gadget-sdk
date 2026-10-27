@@ -55,6 +55,12 @@ RING_BYTES = 8192
 LINE_MAX = 200
 
 
+# A module nested NEST deep compiles from the main thread (its parser takes a level of the C-call count for each
+# level, 40 in all) and not from a coroutine DEPTH pcalls deep.
+NEST = 25
+DEPTH = 20
+
+
 def nomem(kb):
     return f"out of memory: this app may use {kb} KB (memory_kb in manifest.json)"
 
@@ -410,6 +416,22 @@ class RuntimeTest(AppHostTestCase):
         run = self.run_app("local x <close> = nil\nreturn {}", rc=1)
         self.assertEqual(run.messages("crash"), ["main.lua:1: '<close>' variables are not available in Muse apps"])
 
+    def test_a_compile_error_shows_the_token_as_clean_text(self):
+        # Lua's message for an unfinished string quotes the token, raw bytes and all: it is cleaned like any text
+        # this module hands out. (A module's error is cleaned the same way, and is one line.)
+        run = self.run_app(b"x = '\x01\x1b[2J\xff\n", rc=1)
+        self.assertEqual(run.messages("crash"), ["main.lua:1: unfinished string near ''??[2J?'"])
+        app = self.make_app("scratch", "return {message = function() return require('m') end}",
+                            files={"m.lua": b"x = '\x01\x1b[2J\xff\n"})
+        run = self.host(app, script=["message x"])
+        self.assertEqual(run.messages("error"), ["main.lua:1: require: m.lua:1: unfinished string near ''??[2J?'"])
+        # One line: a token can hold a newline ('\x and the end of the line is "hexadecimal digit expected").
+        app = self.make_app("scratch", "return {message = function() return {pcall(require, 'm')} end}",
+                            files={"m.lua": b"x = '\\x\n"})
+        run = self.host(app, script=["message x"])
+        self.assertEqual(run.of("reply")[0]["data"],
+                         [False, "require: m.lua:1: hexadecimal digit expected near ''\\x?'"])
+
     def test_after_a_crash_nothing_runs(self):
         run = self.run_app(
             "local app = {}\n"
@@ -610,6 +632,10 @@ class RuntimeTest(AppHostTestCase):
         self.assertEqual(run.messages("error"), ["bad?[2J? end\nnext\tline?"])  # a NUL ends the C string
         run = self.run_app("return {start = function() error('\\1\\255\\226\\130', 0) end}", rc=1)
         self.assertRegex(run.messages("crash")[0], r"^\?\?\?\?\nstack traceback:\n\t")
+        # A crash record is cleaned as print's lines are, a C1 control character (U+009B is CSI) included, and
+        # keeps "\n" and tab (R8.4, R8.5 as ratified in Task 8's fix round 1).
+        run = self.run_app("return {start = function() error('a\\194\\155b\\194\\133c\\rd\\te\\nf', 0) end}", rc=1)
+        self.assertRegex(run.messages("crash")[0], r"^a\?b\?c\?d\te\nf\nstack traceback:\n\t")
 
     def test_valid_utf8_in_error_text_stays(self):
         run = self.run_app("return {message = function() error('h\\195\\169llo \\240\\159\\152\\128', 0) end}",
@@ -712,6 +738,54 @@ class RuntimeTest(AppHostTestCase):
         run = self.host(app, script=["message x", "message x"])
         self.assertEqual([e["data"] for e in run.of("reply")], [7, 7])
 
+    def test_a_module_compiles_against_the_c_call_room_of_the_thread_that_requires_it(self):
+        # The parser recurses in C, a level of Lua's C-call count for each level of nesting, so the room it has
+        # is the requiring thread's: a coroutine already deep in C calls has less than the main thread, and a
+        # module that compiles on one doesn't on the other. (Compiled on the main thread whatever called
+        # require, the parse added its levels to a count that left the coroutine's out.) One module a thread,
+        # as a module that compiled is cached.
+        self.assertIn("LUAI_MAXCCALLS=40", apps_host.lua_defines(), "NEST and DEPTH are calibrated to the limit")
+        nest = "return " + "(" * NEST + "1" + ")" * NEST
+        main = ("local function at_depth(n, f, ...)\n"
+                "    if n == 0 then return f(...) end\n"
+                "    return select(2, pcall(at_depth, n - 1, f, ...))\n"
+                "end\n"
+                "local function try(name) local ok, e = pcall(require, name) return ok and 'compiled' or e end\n"
+                "return {message = function(where)\n"
+                "    if where == 'main' then return try('n1') end\n"
+                "    if where == 'coroutine' then return coroutine.wrap(try)('n2') end\n"
+                f"    return coroutine.wrap(function() return at_depth({DEPTH}, try, 'n3') end)()\n"
+                "end}")
+        app = self.make_app("scratch", main, files={"n1.lua": nest, "n2.lua": nest, "n3.lua": nest})
+        run = self.host(app, script=["message main", "message coroutine", "message deep", "state"])
+        self.assertEqual([e["data"] for e in run.of("reply")], ["compiled", "compiled", "require: C stack overflow"])
+        self.assertEqual(run.events[-1], {"event": "state", "state": "running"})
+
+    def test_a_parse_that_overflows_is_one_clean_line(self):
+        # A runtime error in the parser (C stack overflow, for source nested past the C-call room) comes with
+        # the call's traceback and no position, unlike a syntax error: the message is cut before it, as a
+        # handler's error is.
+        nested = "return " + "(" * 60 + "1" + ")" * 60
+        run = self.run_app(nested, rc=1)  # main.lua itself: nothing of it ran
+        self.assertEqual(run.events, [{"event": "crash", "message": "C stack overflow"}])
+        modules = {"deep.lua": nested}
+        # require outside a pcall: an error with the require's position, from a handler ...
+        app = self.make_app("scratch", "return {message = function() return require('deep') end}", files=modules)
+        run = self.host(app, script=["message x", "message x", "state"])
+        self.assertEqual(run.messages("error"), ["main.lua:1: require: C stack overflow"] * 2)  # not cached
+        self.assertEqual(run.events[-1], {"event": "state", "state": "running"})
+        # ... and from main.lua's top level, a crash with the traceback of the require.
+        app = self.make_app("scratch", "require('deep') return {}", files=modules)
+        run = self.host(app, rc=1)
+        record = run.messages("crash")[0]
+        self.assertRegex(record, r"^main\.lua:1: require: C stack overflow\nstack traceback:\n\t")
+        self.assertNotIn("?stack traceback", record)
+        # Under a pcall there is no traceback to cut: the one line.
+        app = self.make_app("scratch", "return {message = function() return select(2, pcall(require, 'deep')) end}",
+                            files=modules)
+        run = self.host(app, script=["message x"])
+        self.assertEqual(run.of("reply")[0]["data"], "require: C stack overflow")
+
     # ---- Launch, stop, free ----
 
     def test_launch_stop_cycles_leak_nothing(self):
@@ -762,15 +836,60 @@ class RuntimeTest(AppHostTestCase):
         self.assertEqual(run.kinds().count("started"), 2)
 
     def test_commands_after_a_load_that_failed(self):
-        # There is no runtime to ask, so the app is a crashed one: the commands answer with its crash record.
-        run = self.host(FIXTURES / "bad_return", script=["state", "message x", "start", "show", "hide", "stop", "log"],
-                        rc=1)
+        # main.lua's top level ran and failed, so the app is a crashed one and its runtime kept the log: the
+        # commands answer with the crash record, and `log` shows what main.lua printed before it failed.
+        run = self.run_app("print('one')\nprint('two')\nreturn 1",
+                           script=["state", "message x", "start", "show", "hide", "stop", "log", "log 1"], rc=1)
+        one, two = ({"event": "log", "app": "scratch", "line": line} for line in ("one", "two"))
         self.assertEqual(run.events, [
+            one, two,  # as they were printed
             {"event": "crash", "message": NOT_A_TABLE},
             {"event": "state", "state": "crashed"},
             {"event": "error", "message": NOT_A_TABLE},
             {"event": "error", "message": NOT_A_TABLE},
+            one, two,  # `log`
+            two,       # `log 1`
         ])
+
+    def test_commands_after_a_main_that_does_not_compile(self):
+        # Nothing of it ran, so there is no runtime and nothing to log: the commands answer with the reason.
+        syntax = "main.lua:2: unexpected symbol near '='"
+        run = self.run_app("print('never')\nx = = 1", script=["state", "message x", "start", "show", "stop", "log"], rc=1)
+        self.assertEqual(run.events, [
+            {"event": "crash", "message": syntax},
+            {"event": "state", "state": "crashed"},
+            {"event": "error", "message": syntax},
+            {"event": "error", "message": syntax},
+        ])
+
+    def test_every_failure_of_main_lua_s_top_level_keeps_its_log(self):
+        # A runtime error, error(), a kill, running out of memory, a main that returns no table, a handler that
+        # isn't a function: the app ran, so the crash event carries the record and `log` the lines.
+        for name, source, mem_kb, record in (
+                ("runtime error", "print('before')\nlocal t\nt.x = 1\nreturn {}", None,
+                 r"^main\.lua:3: attempt to index a nil value \(local 't'\)\nstack traceback:\n\t"),
+                ("error()", "print('before') error('boom', 0)", None, r"^boom\nstack traceback:\n\t"),
+                ("kill", "print('before') while true do end", None, "^" + re.escape(BUDGET_START) + "$"),
+                ("out of memory", "print('before') local t = {} for i = 1, 1e6 do t[i] = i end", 64,
+                 "^" + re.escape(nomem(64)) + "$"),
+                ("no table", "print('before') return 1", None, "^" + re.escape(NOT_A_TABLE) + "$"),
+                ("not a function", "print('before') return {start = 5}", None,
+                 r"^main\.lua returned 'start' as a number; handlers must be functions$")):
+            with self.subTest(name):
+                run = self.run_app(source, script=["state", "log"], mem_kb=mem_kb, rc=1)
+                self.assertEqual(run.kinds(), ["log", "crash", "state", "log"])
+                before = {"event": "log", "app": "scratch", "line": "before"}
+                self.assertEqual([run.events[0], run.events[3]], [before, before])  # printed; and kept in the ring
+                self.assertRegex(run.messages("crash")[0], record)
+                self.assertEqual(run.events[2], {"event": "state", "state": "crashed"})
+
+    def test_a_crash_in_main_has_no_warnings(self):
+        # The table was read up to the key that isn't a function; the warnings so far would depend on the order
+        # the keys came in, so there are none (the runtime never got as far as a table it could report on).
+        app = self.make_app("scratch", "return {1, 2, start = 5}")
+        run = self.host(app, rc=1)
+        self.assertEqual(run.events, [{"event": "crash", "message":
+                                       "main.lua returned 'start' as a number; handlers must be functions"}])
 
     # ---- apphost ----
 
@@ -953,6 +1072,22 @@ class RuntimeTest(AppHostTestCase):
 
     # ---- The build ----
 
+    def test_apphost_asks_for_the_posix_it_uses(self):
+        # getline, realpath and PATH_MAX are hidden on glibc under -std=c11 unless the defaults are asked for
+        # (_DEFAULT_SOURCE: realpath is not under _POSIX_C_SOURCE 200809L alone), and build() passes
+        # -D_GNU_SOURCE to every file, which hides that from this test. A build that doesn't (app.py check
+        # builds apphost with its own command) needs the file to ask. The macro comes before any include, or the
+        # headers have already decided.
+        source = (apps_host.APPHOST / "apphost.c").read_text()
+        directives = [line for line in source.splitlines() if line.startswith("#")]
+        self.assertRegex(directives[0], r"^#define _DEFAULT_SOURCE( 1)?$")
+        # And nothing else it uses is hidden: it compiles with no feature macro from the command line.
+        args = [*apps_host.cc(), "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
+                *(f"-I{d}" for d in (apps_host.LUA_SRC, apps_host.APPS, apps_host.APPHOST)),
+                str(apps_host.APPHOST / "apphost.c")]
+        done = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_sources_txt_lists_only_apps_and_apphost_c_files(self):
         # E14: Lua's files and defines come from components/lua/CMakeLists.txt, not from here.
         listed = [line.strip() for line in (ROOT / "tools/muse/apphost/sources.txt").read_text().splitlines()
@@ -1005,6 +1140,9 @@ class HarnessTest(unittest.TestCase):
     def test_messages_survive_a_heap_that_refuses_at_every_step(self):
         self.run_case("message_refused")
 
+    def test_requires_survive_a_heap_that_refuses_at_every_step(self):
+        self.run_case("require_refused")
+
     def test_err_is_cut_on_a_character_boundary(self):
         self.run_case("err_cut")
 
@@ -1046,6 +1184,9 @@ class HarnessTest(unittest.TestCase):
 
     def test_a_package_without_a_main_file(self):
         self.run_case("no_main")
+
+    def test_a_failure_in_main_luas_top_level_is_a_crashed_runtime_with_its_log(self):
+        self.run_case("boot_crash")
 
     def test_an_app_without_handlers_answers_every_call(self):
         self.run_case("optional_handlers")

@@ -41,25 +41,32 @@
  *   its chunk returns (true when it returns nothing) is what every later require of it gives. name is a
  *   path of manifest.json's "files" with or without the ".lua" ("util", "util.lua", "lib/util"); main.lua
  *   isn't one of them. Nothing else loads: no other path, no package.path. The chunk is called with the
- *   name and its path.
+ *   name and its path. A module that doesn't compile is an error of the require, one line ("require: " and
+ *   Lua's message, with the module's path), and the next require compiles it again. It compiles on the thread
+ *   that called require, so how deeply nested it may be is the C-call room that code has left: a coroutine deep
+ *   in C calls has less than the main thread, and a module nested past the room fails as "require: C stack
+ *   overflow".
  *
  * States. A runtime is STOPPED when it is made (main.lua's top level has run, start() hasn't), RUNNING from
  * a successful start() until stop(), and CRASHED when a handler raises an error, is killed (CPU, wall clock
  * or a kill from another task: apps_vm.h) or runs out of memory. The one exception is message(): its own
- * error() fails that message and nothing else. A crash is final: a CRASHED runtime runs no app code again,
- * whatever it is asked, and its crash record (below) and log stay until apps_rt_free. To run the app again
- * make a new runtime. HUNG is the supervisor's (Task 12) to report: nothing here ever enters it.
+ * error() fails that message and nothing else. main.lua's top level is the app's first run and can crash
+ * it in the same ways: apps_rt_new then returns a CRASHED runtime (below). A crash is final: a CRASHED runtime
+ * runs no app code again, whatever it is asked, and its crash record (below) and log stay until apps_rt_free.
+ * To run the app again make a new runtime. HUNG is the supervisor's (Task 12) to report: nothing here ever
+ * enters it.
  *
  * Crash record. apps_rt_last_error is the message of the error with the traceback of the app's frames, or
  * the kill's reason: "main.lua:12: attempt to index a nil value (local 'arc')\nstack traceback:\n\t…".
  * Like every text this module hands out, it is valid UTF-8 and has no control byte but "\n" and tab (the
- * bytes of an app's own error text are the app's, and they reach the console and Muse inside JSON), cut at
- * APPS_ERROR_MAX bytes. An error that fails a message alone isn't a crash: it is returned to the caller
- * without its traceback and last_error stays empty.
+ * bytes of an app's own error text are the app's, and they reach the console and Muse inside JSON): anything
+ * else becomes '?' as it does in print's lines, a C1 control character included, one '?' for the character.
+ * It is cut at APPS_ERROR_MAX bytes. An error that fails a message alone isn't a crash: it is returned to the
+ * caller without its traceback and last_error stays empty.
  *
- * The log. The last lines the app printed, in a ring of APPS_LOG_RING_BYTES bytes in which a line takes
- * its length plus one: the oldest lines go when a new one needs room. Every line is also given to
- * apps_port_log as it is printed.
+ * The log. The last lines the app printed, main.lua's top level's included, in a ring of APPS_LOG_RING_BYTES
+ * bytes in which a line takes its length plus one: the oldest lines go when a new one needs room. Every line
+ * is also given to apps_port_log as it is printed.
  *
  * Messages. apps_rt_message(rt, event, data) calls message(event, data) and returns what it returned, as
  * JSON, in one apps_vm_call: decoding data, the handler and encoding the reply all run in the protected
@@ -70,7 +77,8 @@
  *   with apps_port_free.
  * - Failure is NULL with the reason in err, and the app keeps running unless it says it crashed:
  *   - the handler's error: its message, without the traceback (the text before the first
- *     "\nstack traceback:"), as the app raised it: "main.lua:7: unknown event";
+ *     "\nstack traceback:"), cleaned as the crash record is (above, so "\n" and tab stay and a stray
+ *     control byte is a '?'): "main.lua:7: unknown event";
  *   - "data: <message>": data isn't JSON, with the decoder's own message ("data: unexpected end of input at
  *     byte 4");
  *   - "message: <message>": the reply can't be encoded, with the encoder's ("message: can't encode a function");
@@ -126,10 +134,19 @@ typedef struct apps_rt apps_rt_t;
  * caller's and must outlive the runtime: the runtime reads the bytes of its .lua files from it, for require.
  * The runtime is STOPPED: start() hasn't run.
  *
- * NULL when that can't be done, and then nothing is held: the reason is in err (cut to err_len on a character
- * boundary; err may be NULL), a message of this header or the text of main.lua's own error (a syntax error
- * "main.lua:3: unexpected symbol near 'x'"; a runtime error with its traceback; a kill's reason). main.lua's
- * log is lost with it, but every line went through apps_port_log.
+ * Once the VM exists, main.lua's top level is the app's first run, and when it fails the app has crashed
+ * before it was made: a runtime error, a kill, running out of memory, a main.lua that returns no table, a
+ * handler that isn't a function. The result is then a runtime in APPS_STATE_CRASHED, with err "": the crash
+ * record is apps_rt_last_error's, the lines main.lua printed before it failed are in the log
+ * (apps_rt_log_tail), and apps_rt_warnings is empty (the table, if main.lua got that far, wasn't read to its
+ * end). Nothing runs in it, as in any crashed runtime, and apps_rt_free frees it.
+ *
+ * NULL when there is no app to make, and then nothing is held: the reason is in err (cut to err_len on a
+ * character boundary; err may be NULL), and no log, as nothing ran. That is: no package; a main file that
+ * isn't in it or isn't a .lua file, or no room for the VM (messages of this header); or a main.lua that
+ * doesn't compile, with Lua's own message ("main.lua:3: unexpected symbol near 'x'"), or the parser's for
+ * source nested past the C-call room ("C stack overflow"), which has no position and no traceback. Every line
+ * main.lua printed went through apps_port_log in either case.
  */
 apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len);
 

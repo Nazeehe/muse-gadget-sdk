@@ -182,6 +182,12 @@ class MuseAppsVmTest(unittest.TestCase):
         done = self.run_case("c_stack", harness=harness)
         print(done.stdout, end="", file=sys.stderr, flush=True)
 
+    def test_load_on_a_thread_is_apps_vm_load_with_that_threads_c_call_room(self):
+        # apps_vm_load_on: one implementation with apps_vm_load (the same rules), and the parser's recursion
+        # counted against the thread it runs on, as every other C recursion is.
+        self.assertIn("LUAI_MAXCCALLS=40", apps_host.lua_defines(), "the harness's nesting is calibrated to the limit")
+        self.run_case("load_on", timeout=30)
+
     def test_traceback_has_app_frames(self):
         self.run_case("traceback")
 

@@ -24,8 +24,12 @@
  * Stack, for the device's 56 KB app task. What this file puts under app code, by -fstack-usage on the S3
  * build (-O2): print 272 bytes, require 384, and 656 more for its not-found message (a luaL_Buffer, at the end
  * of the chain), the unknown-handler warning 352 (once, while main.lua loads). apps_rt_new (720) and
- * apps_rt_message (192) sit at the top, outside any app call. The recursions through print and require, each
- * to Lua's C-call limit, are measured beside the sandbox's own (test_muse_apps_rt.py, c_stack).
+ * apps_rt_message (192) sit at the top, outside any app call. require compiles on the thread it was called on
+ * (apps_vm_load_on), so the parser's recursion, which is C, counts against the C-call room of the code that
+ * asked (a coroutine's included), and Lua's C-call limit bounds it like every other recursion under app code.
+ * What is measured, beside the sandbox's own chains (test_muse_apps_rt.py, c_stack): the recursions through print
+ * and through require, each to that limit, and a chain through a luaL_Buffer that requires a module nested
+ * past the limit at each level, on the main thread and in a coroutine.
  */
 
 #include "apps_rt.h"
@@ -116,6 +120,15 @@ static void clean_text(char *s, bool keep_newline) {
         r += n;
     }
     *w = '\0';
+}
+
+/* text with its traceback dropped: what follows the first "\nstack traceback:" (the message alone, as a
+ * handler's error() text is given). */
+static void cut_traceback(char *text) {
+    char *traceback = strstr(text, "\nstack traceback:");
+    if (traceback != NULL) {
+        *traceback = '\0';
+    }
 }
 
 /* text into out (cap bytes with the NUL), cut on a character boundary. NULL out or no room: nothing. */
@@ -406,15 +419,16 @@ static int rt_require(lua_State *L) {
     lua_pop(L, 1);
 
     /* Not loaded yet. Compiling is C work no count hook sees, so it is charged by the size of the source:
-     * a require that fails over and over can't hold a call for long. apps_vm_load compiles on the VM's main
-     * thread, and the chunk moves to this one when require runs in a coroutine. */
+     * a require that fails over and over can't hold a call for long. It compiles on this thread, so the
+     * parser's recursion counts against the C-call room of the code that asked, in a coroutine too: on the
+     * VM's main thread it would add its levels to a count that leaves out the coroutine's own. */
     apps_vm_charge(L, (unsigned)file->len);
     char message[COMPILE_MESSAGE_MAX];
-    if (!apps_vm_load(rt->vm, file->path, (const char *)file->data, file->len, message, sizeof message)) {
+    if (!apps_vm_load_on(L, file->path, (const char *)file->data, file->len, message, sizeof message)) {
+        cut_traceback(message);  /* the parser's own runtime error ("C stack overflow") arrives with the call's */
         clean_text(message, false);
         return luaL_error(L, "require: %s", message);
     }
-    lua_xmove(apps_vm_lua(rt->vm), L, 1);
     lua_pushvalue(L, 1);
     lua_pushstring(L, file->path);
     lua_call(L, 2, 1);
@@ -441,6 +455,12 @@ static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t b
     lua_pushcfunction(L, fn);
     lua_pushlightuserdata(L, arg);
     return apps_vm_call(rt->vm, 1, 0, budget, rt->err, sizeof rt->err);
+}
+
+/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. */
+static void crash(apps_rt_t *rt) {
+    clean_text(rt->err, true);
+    rt->state = APPS_STATE_CRASHED;
 }
 
 /* ---- Loading main.lua ---- */
@@ -487,12 +507,19 @@ static void warn_unknown(apps_rt_t *rt, lua_State *L, int idx) {
     warn_add(rt, text);
 }
 
+/* How main.lua's load went, when the call itself didn't fail. */
+typedef enum {
+    BOOT_OK,
+    BOOT_NOT_COMPILED,  /* Lua's message is in fail: nothing of main.lua ran */
+    BOOT_BAD_TABLE,     /* main.lua ran, and what it returned can't be handlers: the reason is in fail */
+} boot_outcome_t;
+
 /* What the boot trampoline reads and fills. */
 typedef struct {
     apps_rt_t *rt;
     const apps_blob_t *main;
-    bool failed;
-    char fail[512];  /* why, when main.lua can't be a handler table (failed): not a Lua error */
+    boot_outcome_t outcome;
+    char fail[512];
 } boot_t;
 
 /* The handlers of the table at idx: each known key's function into the registry; every other key a warning. */
@@ -515,7 +542,7 @@ static void take_handlers(boot_t *b, lua_State *L, int idx) {
         } else if (lua_type(L, -1) != LUA_TFUNCTION) {
             snprintf(b->fail, sizeof b->fail, "%s returned '%s' as a %s; handlers must be functions",
                      b->rt->pkg->manifest.main, handler_names[h], luaL_typename(L, -1));
-            b->failed = true;
+            b->outcome = BOOT_BAD_TABLE;
             return;
         } else {
             lua_pushvalue(L, -1);
@@ -541,14 +568,14 @@ static int boot_trampoline(lua_State *L) {
 
     apps_vm_charge(L, (unsigned)b->main->len);  /* compiling, as in require */
     if (!apps_vm_load(rt->vm, b->main->path, (const char *)b->main->data, b->main->len, b->fail, sizeof b->fail)) {
-        b->failed = true;
+        b->outcome = BOOT_NOT_COMPILED;
         return 0;
     }
     lua_call(L, 0, 1);
     if (!lua_istable(L, -1)) {
         snprintf(b->fail, sizeof b->fail,
                  "%s must return a table of handlers: local app = {} \xE2\x80\xA6 return app", rt->pkg->manifest.main);
-        b->failed = true;
+        b->outcome = BOOT_BAD_TABLE;
         return 0;
     }
     take_handlers(b, L, lua_gettop(L));
@@ -607,27 +634,32 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     lua_State *L = apps_vm_lua(rt->vm);
     apps_json_open(L);  /* safe outside a call: if the heap refuses, the call below ends out of memory */
 
-    boot_t boot = {.rt = rt, .main = main};
+    boot_t boot = {.rt = rt, .main = main, .outcome = BOOT_OK};
     apps_call_t result = vm_run(rt, boot_trampoline, &boot, APPS_BUDGET_START);
-    if (result == APPS_CALL_OK && !boot.failed) {
-        return rt;
+    if (result == APPS_CALL_OK && boot.outcome == BOOT_NOT_COMPILED) {
+        /* Nothing of main.lua ran, so there is no app to keep: Lua's message, which may be the parser's own
+         * runtime error and have the call's traceback, as in require. */
+        cut_traceback(boot.fail);
+        clean_text(boot.fail, true);
+        put_text(err, err_len, boot.fail);
+        apps_rt_free(rt);
+        return NULL;
     }
-    if (result == APPS_CALL_OK) {  /* main.lua can't be a handler table, and no Lua error says so */
-        snprintf(rt->err, sizeof rt->err, "%s", boot.fail);
+    if (result == APPS_CALL_OK && boot.outcome == BOOT_BAD_TABLE) {
+        snprintf(rt->err, sizeof rt->err, "%s", boot.fail);  /* no Lua error says so: the record is ours */
     }
-    clean_text(rt->err, true);
-    put_text(err, err_len, rt->err);
-    apps_rt_free(rt);
-    return NULL;
+    if (result != APPS_CALL_OK || boot.outcome != BOOT_OK) {
+        /* main.lua's top level ran and failed (an error, a kill, no memory, no table, a handler that isn't a
+         * function): the app has crashed before it was made. The runtime is kept for the record and the log. A
+         * table that was read part way has given warnings for the keys met so far, which the order of its keys
+         * decides: they are dropped. */
+        crash(rt);
+        rt->warnings[0] = '\0';
+    }
+    return rt;
 }
 
 /* ---- Handlers ---- */
-
-/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. */
-static void crash(apps_rt_t *rt) {
-    clean_text(rt->err, true);
-    rt->state = APPS_STATE_CRASHED;
-}
 
 /* One handler call: which handler, and its argument if it has one (alarm's name, a string of the Lua heap,
  * so it is made inside the call). */
@@ -760,10 +792,7 @@ char *apps_rt_message(apps_rt_t *rt, const char *event, const char *data_json, s
             return NULL;
         case APPS_CALL_ERROR: {  /* the handler's error() or a runtime error: the message alone fails */
             apps_port_free(m.reply);
-            char *traceback = strstr(rt->err, "\nstack traceback:");
-            if (traceback != NULL) {
-                *traceback = '\0';
-            }
+            cut_traceback(rt->err);
             clean_text(rt->err, true);
             put_text(err, err_len, rt->err);
             return NULL;

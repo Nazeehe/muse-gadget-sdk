@@ -463,22 +463,30 @@ static apps_rt_t *make_rt_with_kill(apps_pkg_t **pkg_out, const char *main_src) 
 
 static void external_kill(void) {
     static const char *const handlers[] = {"start", "show", "message"};
-    static const char *const afters[] = {
-        "print('after the kill')",
-        "require('m')",
-        "print(setmetatable({}, {__tostring = function() ran = true return 'x' end}))",  /* print runs app code */
+    static const struct {
+        const char *text;
+        bool preloaded;  /* main.lua's top level requires m first, so the require under test is a cached one */
+    } afters[] = {
+        {"print('after the kill')", false},
+        {"require('m')", false},
+        /* print runs app code */
+        {"print(setmetatable({}, {__tostring = function() ran = true return 'x' end}))", false},
+        /* A cached require starts no work and charges nothing, so only its own check can stop what follows it. */
+        {"require('m') ran = true", true},
     };
     for (size_t h = 0; h < ARRAY_LEN(handlers); h++) {
         for (size_t a = 0; a < ARRAY_LEN(afters); a++) {
             char source[384], err[256] = "";
-            snprintf(source, sizeof source, "ran = false\nlocal app = {}\nfunction app.%s() kill_me() %s end\nreturn app\n",
-                     handlers[h], afters[a]);
+            snprintf(source, sizeof source,
+                     "ran = false\n%slocal app = {}\nfunction app.%s() kill_me() %s end\nreturn app\n",
+                     afters[a].preloaded ? "local _ = require('m')\n" : "", handlers[h], afters[a].text);
             apps_pkg_t *pkg;
             apps_rt_t *rt = make_rt_with_kill(&pkg, source);
             if (rt == NULL) {
                 free_pkg(pkg);
                 continue;
             }
+            forget_logged();  /* what main.lua's top level logged: m's own print, for a preloaded m */
             bool started = true;
             if (h == 0) {
                 started = apps_rt_start(rt);
@@ -563,6 +571,106 @@ static void null_arguments(void) {
     finish(rt, pkg);
 }
 
+#define NOT_A_TABLE "main.lua must return a table of handlers: local app = {} \xE2\x80\xA6 return app"
+
+/* A failure in main.lua's top level. The app ran, so there is a runtime to hold what it printed and how it
+ * died: CRASHED from the start, whatever it did wrong. No runtime (NULL, and a reason in err) is for what can't
+ * be made at all: a main.lua that doesn't compile (nothing of it ran), a heap too small for a VM. */
+static void boot_crash(void) {
+    static const struct {
+        const char *name, *src, *record;
+        bool traceback;  /* the record starts with `record` and goes on with the app's frames */
+        unsigned memory_kb;
+    } crashes[] = {
+        {"runtime error", "print('before')\nlocal t\nt.x = 1\nreturn {}",
+         "main.lua:3: attempt to index a nil value (local 't')\nstack traceback:\n\t", true, 256},
+        {"error()", "print('before') error('boom', 0)", "boom\nstack traceback:\n\t", true, 256},
+        {"kill", "print('before') while true do end", BUDGET_START, false, 256},
+        {"out of memory", "print('before') local t = {} for i = 1, 1e6 do t[i] = i end",
+         "out of memory: this app may use 64 KB (memory_kb in manifest.json)", false, 64},
+        {"not a table", "print('before') return 1", NOT_A_TABLE, false, 256},
+        {"nothing returned", "print('before')", NOT_A_TABLE, false, 256},
+        {"handler that isn't a function", "print('before') return {start = 5}",
+         "main.lua returned 'start' as a number; handlers must be functions", false, 256},
+        /* Keys 1 and 2 (the array part comes first) are unknown handlers, and warnings, before start is found to
+         * be a number: a crashed runtime reports none of them. */
+        {"handler that isn't a function, after unknown keys", "print('before') return {1, 2, start = 5}",
+         "main.lua returned 'start' as a number; handlers must be functions", false, 256},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(crashes); i++) {
+        const char *name = crashes[i].name;
+        const file_t files[] = {{"main.lua", crashes[i].src}};
+        forget_logged();
+        apps_pkg_t *pkg = make_pkg_kb(crashes[i].memory_kb, files, 1);
+        char err[APPS_ERROR_MAX] = "";
+        apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+        CHECK(rt != NULL, "%s: no runtime ('%s')", name, err);
+        if (rt == NULL) {
+            free_pkg(pkg);
+            continue;
+        }
+        char record[APPS_ERROR_MAX];
+        snprintf(record, sizeof record, "%s", apps_rt_last_error(rt));
+        CHECK(apps_rt_state(rt) == APPS_STATE_CRASHED, "%s: state %d", name, apps_rt_state(rt));
+        CHECK(crashes[i].traceback ? strncmp(record, crashes[i].record, strlen(crashes[i].record)) == 0
+                                   : strcmp(record, crashes[i].record) == 0,
+              "%s: record '%s'", name, record);
+        CHECK(err[0] == '\0', "%s: err '%s' (the record is last_error's)", name, err);
+        CHECK(apps_rt_warnings(rt)[0] == '\0', "%s: warnings '%s'", name, apps_rt_warnings(rt));
+        /* What it printed before failing went out as it was printed, and is in the ring. */
+        expect_logged("before");
+        char tail[64];
+        apps_rt_log_tail(rt, 10, tail, sizeof tail);
+        CHECK(strcmp(tail, "before") == 0, "%s: the log holds '%s'", name, tail);
+        /* And, as after any crash, nothing runs. */
+        forget_logged();
+        apps_rt_show(rt, true);
+        apps_rt_show(rt, false);
+        apps_rt_stop(rt);
+        CHECK(!apps_rt_start(rt), "%s: start", name);
+        CHECK(!apps_rt_alarm(rt, "a"), "%s: alarm", name);
+        char *reply = send(rt, "x", err, sizeof err);
+        CHECK(reply == NULL && strcmp(err, record) == 0, "%s: message: '%s'", name, err);
+        expect_no_logs();
+        CHECK(apps_rt_state(rt) == APPS_STATE_CRASHED && strcmp(apps_rt_last_error(rt), record) == 0,
+              "%s: state %d, record '%s'", name, apps_rt_state(rt), apps_rt_last_error(rt));
+        finish(rt, pkg);
+    }
+
+    char nested[256];
+    int n = snprintf(nested, sizeof nested, "return ");
+    for (int i = 0; i < 60; i++) {
+        nested[n++] = '(';
+    }
+    nested[n++] = '1';
+    for (int i = 0; i < 60; i++) {
+        nested[n++] = ')';
+    }
+    nested[n] = '\0';
+    static const struct {
+        const char *name, *src, *want;
+        unsigned memory_kb;
+    } refused[] = {
+        {"syntax error", "print('x')\nx = = 1", "main.lua:2: unexpected symbol near '='", 256},
+        {"<close>", "local x <close> = nil", "main.lua:1: '<close>' variables are not available in Muse apps", 256},
+        {"no heap", "return {}", "out of memory: can't make the app's heap of 2 KB", 2},
+        /* A runtime error of the parser, not a syntax error: it has no position, and no traceback once cut. */
+        {"nested past the C-call room", NULL, "C stack overflow", 256},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(refused); i++) {
+        const file_t files[] = {{"main.lua", refused[i].src != NULL ? refused[i].src : nested}};
+        forget_logged();
+        apps_pkg_t *pkg = make_pkg_kb(refused[i].memory_kb, files, 1);
+        char err[APPS_ERROR_MAX] = "";
+        apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+        CHECK(rt == NULL && strcmp(err, refused[i].want) == 0, "%s: %p '%s'", refused[i].name, (void *)rt, err);
+        apps_rt_free(rt);
+        expect_no_logs();  /* nothing of main.lua ran */
+        free_pkg(pkg);
+        CHECK(held == 0, "%s: %zu bytes held", refused[i].name, held);
+    }
+}
+
 static void no_main(void) {
     apps_pkg_t *pkg = make_pkg("return {}");
     pkg->count = 0;  /* the manifest names main.lua, the package has no bytes for it */
@@ -575,8 +683,11 @@ static void no_main(void) {
     free(pkg->files[0].data);
     pkg->files[0].data = (uint8_t *)exact_copy("", 0);
     pkg->files[0].len = 0;
-    CHECK(apps_rt_new(pkg, err, sizeof err) == NULL, "new with an empty main file");
-    CHECK(strstr(err, "must return a table of handlers") != NULL, "'%s'", err);
+    apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt != NULL && apps_rt_state(rt) == APPS_STATE_CRASHED && err[0] == '\0' &&
+              strstr(apps_rt_last_error(rt), "must return a table of handlers") != NULL,
+          "an empty main file: %p '%s'", (void *)rt, err);  /* it ran, and returned nothing: a crashed runtime */
+    apps_rt_free(rt);
 
     /* main names a file that isn't Lua: there is nothing to run. */
     snprintf(pkg->manifest.main, sizeof pkg->manifest.main, "%s", "data.json");
@@ -761,11 +872,12 @@ static void err_cut(void) {
     check_every_cut("message on a crashed app", record, ask_message, &ask);
     finish(rt, pkg);
 
-    /* The reason apps_rt_new gives, from main.lua's own top level. */
-    pkg = make_pkg("error('" WIDE_END "', 0)");
+    /* The reason apps_rt_new gives for a main.lua that doesn't compile (a failure of its top level is a crashed
+     * runtime now, and its record is last_error's): Lua's message, which shows the text of the token. */
+    pkg = make_pkg("x = '" WIDE_END "\n");
     char full[APPS_ERROR_MAX] = "";
     CHECK(apps_rt_new(pkg, full, sizeof full) == NULL &&
-              strncmp(full, WIDE_END "\nstack traceback:", strlen(WIDE_END "\nstack traceback:")) == 0,
+              strcmp(full, "main.lua:1: unfinished string near ''" WIDE_END "'") == 0,
           "'%s'", full);
     ask_t ask_load = {NULL, pkg};
     check_every_cut("new", full, ask_new, &ask_load);
@@ -978,8 +1090,23 @@ static void port_log(void) {
  * reached, and checks that nothing aborts, nothing leaks and the answer is the right one: a failure the
  * runtime reports when something was refused, success when nothing was. */
 
+/* The growth requests apps_rt_new makes before main.lua runs: its own block, then apps_vm_new's, counted by
+ * making a VM with the config the runtime gives it. */
+static long growths_before_main(size_t mem_limit) {
+    apps_vm_config_t cfg = {.mem_limit = mem_limit,
+                            .realloc_fn = apps_port_realloc,
+                            .free_fn = apps_port_free,
+                            .now_ms = apps_port_mono_ms};
+    growths = 0;
+    apps_vm_t *vm = apps_vm_new(&cfg);
+    CHECK(vm != NULL, "a VM of %zu bytes", mem_limit);
+    apps_vm_free(vm);
+    return 1 + growths;
+}
+
 static void new_refused(void) {
     apps_pkg_t *pkg = make_pkg("local app = {}\nfunction app.start() end\nreturn app\n");
+    const long before_main = growths_before_main(256 * 1024);
     long total = 0;
     for (long k = 1; k < 100000; k++) {
         growths = 0;
@@ -989,9 +1116,18 @@ static void new_refused(void) {
         bool refused = growths >= k;
         refuse_from = -1;
         if (refused) {
-            CHECK(rt == NULL && err[0] != '\0', "k=%ld: refused, but new returned %p '%s'", k, (void *)rt, err);
+            /* No runtime while there is no VM (the reason is err); once there is one, the heap that ran out
+             * is main.lua's top level running out of memory: a crashed runtime with its record, and no err.
+             * Never a running one, never silence. */
+            bool none = rt == NULL && err[0] != '\0';
+            bool crashed = rt != NULL && err[0] == '\0' && apps_rt_state(rt) == APPS_STATE_CRASHED &&
+                           strstr(apps_rt_last_error(rt), "out of memory") != NULL;
+            CHECK(k <= before_main ? none : crashed,
+                  "k=%ld (the runtime and VM took %ld requests): refused, but new returned %p '%s' (state %d)", k,
+                  before_main, (void *)rt, err, rt != NULL ? apps_rt_state(rt) : -1);
         } else {
-            CHECK(rt != NULL, "k=%ld: nothing refused, but new failed: %s", k, err);
+            CHECK(rt != NULL && apps_rt_state(rt) == APPS_STATE_STOPPED, "k=%ld: nothing refused, but new gave %p: %s",
+                  k, (void *)rt, err);
             total = k;
         }
         apps_rt_free(rt);
@@ -1121,6 +1257,61 @@ static void message_refused(void) {
     CHECK(saw_soft_failure, "the reply's block was never the one refused");
 }
 
+/* require compiles on the thread that calls it, a coroutine's too, and allocates there (the parser, the chunk, its
+ * strings): a heap that refuses at any step of it is the app running out of memory, as anywhere else, and never
+ * an abort or a leak. */
+static void require_refused(void) {
+    static const char *const mains[] = {
+        "return {message = function() return require('m').v end}",
+        "return {message = function() return coroutine.wrap(function() return require('m').v end)() end}",
+    };
+    for (size_t scenario = 0; scenario < ARRAY_LEN(mains); scenario++) {
+        const file_t files[] = {
+            {"main.lua", mains[scenario]},
+            {"m.lua", "local t = {} for i = 1, 20 do t[i] = tostring(i) .. 'x' end return {v = #t}"},
+        };
+        bool saw_crash = false;
+        long reached = 0;
+        for (long k = 1; k < 100000; k++) {
+            apps_pkg_t *pkg = make_pkg_kb(256, files, 2);
+            char err[256] = "";
+            apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+            CHECK(rt != NULL && apps_rt_start(rt), "scenario %zu: %s", scenario, err);
+            if (rt == NULL) {
+                free_pkg(pkg);
+                return;
+            }
+            long before = growths;
+            refuse_from = growths + k;
+            char *reply = send(rt, "go", err, sizeof err);
+            bool refused = growths >= refuse_from;
+            refuse_from = -1;
+            if (refused) {
+                CHECK(reply == NULL, "scenario %zu, k=%ld: refused, but a reply came: '%s'", scenario, k, reply);
+                if (apps_rt_state(rt) == APPS_STATE_CRASHED) {
+                    saw_crash = true;
+                    CHECK(strcmp(err, apps_rt_last_error(rt)) == 0 && strstr(err, "out of memory") != NULL,
+                          "scenario %zu, k=%ld: '%s'", scenario, k, err);
+                } else {  /* only the reply's own block can be refused without the app running out of memory */
+                    CHECK(strcmp(err, "message: out of memory") == 0 && apps_rt_state(rt) == APPS_STATE_RUNNING,
+                          "scenario %zu, k=%ld: '%s', state %d", scenario, k, err, apps_rt_state(rt));
+                }
+            } else {
+                CHECK(reply != NULL && strcmp(reply, "20") == 0 && err[0] == '\0', "scenario %zu, k=%ld: '%s' '%s'",
+                      scenario, k, reply != NULL ? reply : "(none)", err);
+                reached = growths - before;
+            }
+            apps_port_free(reply);
+            finish(rt, pkg);
+            if (!refused) {
+                break;
+            }
+        }
+        CHECK(reached > 10, "scenario %zu: only %ld growth requests in the message", scenario, reached);
+        CHECK(saw_crash, "scenario %zu: no refusal ever crashed the app", scenario);
+    }
+}
+
 /* ---- The C stack under this module's bindings ----
  *
  * The recursions that go deepest in C through print and require, each to Lua's C-call limit, on a thread whose
@@ -1186,6 +1377,58 @@ static void stack_print_chain(void) {
     stack_chain("print_chain", files, 1);
 }
 
+/* The reviewer's probe (Task 8's review): string.format('%s', o), which holds a luaL_Buffer, calls o's __tostring,
+ * which does the same one level down, to the C-call limit. The message runs it on the main thread or in a
+ * coroutine, and each level may first pcall(require, 'deep'). deep.lua is nested 60 deep, past any thread's
+ * C-call room, so a require parses as deep as the count of the thread that compiles it allows, then fails
+ * ("C stack overflow"), and the module is never cached: every level parses again. Before the fix a coroutine's
+ * require compiled on the main thread, whose count leaves out the coroutine's C levels, so the parse went about
+ * 38 levels deeper than the coroutine's count allowed, on top of the chain. */
+static bool format_in_coroutine, format_requires;
+static lua_Integer format_parsed;
+
+static void stack_format_chain(void) {
+    char deep[256];
+    int n = snprintf(deep, sizeof deep, "return ");
+    memset(deep + n, '(', 60);
+    n += 60;
+    deep[n++] = '1';
+    memset(deep + n, ')', 60);
+    n += 60;
+    deep[n] = '\0';
+    char main_lua[1024];
+    snprintf(main_lua, sizeof main_lua,
+             "depth = 0 parsed = 0\n"
+             "local o\n"
+             "o = setmetatable({}, {__tostring = function(self)\n"
+             "  depth = depth + 1\n"
+             "%s"
+             "  local s = string.format('%%s', self) depth = depth - 1 return s end})\n"
+             "local function run() local ok, e = pcall(string.format, '%%s', o) return tostring(e):sub(1, 120) end\n"
+             "return {message = function() return %s end}\n",
+             format_requires ? "  if not pcall(require, 'deep') then parsed = parsed + 1 end\n" : "",
+             format_in_coroutine ? "coroutine.wrap(run)()" : "run()");
+    const file_t files[] = {{"main.lua", main_lua}, {"deep.lua", deep}};
+    apps_pkg_t *pkg = make_pkg_kb(256, files, 2);
+    char err[256] = "";
+    apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt != NULL && apps_rt_start(rt), "format chain: %s", err);
+    if (rt != NULL) {
+        char *reply = send(rt, "go", err, sizeof err);
+        CHECK(reply != NULL && strstr(reply, "stack overflow") != NULL, "format chain: reply '%s', err '%s'",
+              reply != NULL ? reply : "(none)", err);
+        apps_port_free(reply);
+        CHECK(apps_rt_state(rt) == APPS_STATE_RUNNING, "format chain: state %d", apps_rt_state(rt));
+        lua_State *L = apps_vm_lua(apps_rt_vm(rt));
+        lua_getglobal(L, "depth");
+        stack_depth = lua_tointeger(L, -1);
+        lua_getglobal(L, "parsed");
+        format_parsed = lua_tointeger(L, -1);
+        lua_pop(L, 2);
+    }
+    finish(rt, pkg);
+}
+
 typedef struct {
     const char *name;
     void (*run)(void);
@@ -1231,17 +1474,50 @@ static size_t on_exact_stack(stack_case_t *c) {
     return rc == 0 ? size - untouched : 0;
 }
 
+/* The room a require adds to a chain on the same kind of thread: the parse of what it compiles, which the
+ * C-call limit bounds like every other recursion, so a few levels of it at most (each of a parser's levels is far
+ * smaller than the chain's own). Before the fix the coroutine's chain took 8.6 KB or more over the same chain
+ * without the require. */
+#define REQUIRE_SLACK ((size_t)4096)
+
 static void c_stack(void) {
     static stack_case_t cases[] = {{"require_chain", stack_require_chain}, {"print_chain", stack_print_chain}};
     for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
         stack_depth = 0;
         size_t used = on_exact_stack(&cases[i]);
-        printf("c_stack: %-14s %6zu of %zu bytes (depth %lld)\n", cases[i].name, used, TASK_STACK_HOST,
+        printf("c_stack: %-22s %6zu of %zu bytes (depth %lld)\n", cases[i].name, used, TASK_STACK_HOST,
                (long long)stack_depth);
         fflush(stdout);
         CHECK(used > 0, "%s: the case didn't run", cases[i].name);
         CHECK(stack_depth > 30, "%s: reached depth %lld, short of the C-call limit", cases[i].name,
               (long long)stack_depth);
+    }
+
+    /* The format chain, with and without a require at each level, on the main thread and in a coroutine. */
+    static stack_case_t format = {"format_chain", stack_format_chain};
+    size_t used[2][2];  /* [in a coroutine][with require] */
+    for (int co = 0; co < 2; co++) {
+        for (int req = 0; req < 2; req++) {
+            format_in_coroutine = co != 0;
+            format_requires = req != 0;
+            stack_depth = format_parsed = 0;
+            used[co][req] = on_exact_stack(&format);
+            printf("c_stack: %s%s %6zu of %zu bytes (depth %lld, %lld modules failed to compile)\n",
+                   co ? "co_format_chain" : "format_chain", req ? "_require" : "", used[co][req], TASK_STACK_HOST,
+                   (long long)stack_depth, (long long)format_parsed);
+            fflush(stdout);
+            CHECK(used[co][req] > 0, "format chain %d/%d: the case didn't run", co, req);
+            CHECK(stack_depth > 30, "format chain %d/%d: depth %lld, short of the C-call limit", co, req,
+                  (long long)stack_depth);
+            /* With require, every level's compile fails (60 levels don't fit) and is reported as the require's
+             * error, which the chain catches: the app goes on, and the stack comes back. */
+            CHECK(req ? format_parsed >= stack_depth - 2 : format_parsed == 0,
+                  "format chain %d/%d: %lld failed compiles, depth %lld", co, req, (long long)format_parsed,
+                  (long long)stack_depth);
+        }
+        CHECK(used[co][1] <= used[co][0] + REQUIRE_SLACK,
+              "%s: a require at each level takes %zu bytes, %zu more than the chain without it (slack %zu)",
+              co ? "in a coroutine" : "on the main thread", used[co][1], used[co][1] - used[co][0], REQUIRE_SLACK);
     }
 }
 
@@ -1257,6 +1533,7 @@ int main(int argc, char **argv) {
         {"external_kill", external_kill},
         {"null_arguments", null_arguments},
         {"no_main", no_main},
+        {"boot_crash", boot_crash},
         {"optional_handlers", optional_handlers},
         {"state_names", state_names},
         {"stack_balanced", stack_balanced},
@@ -1267,6 +1544,7 @@ int main(int argc, char **argv) {
         {"new_refused", new_refused},
         {"handlers_refused", handlers_refused},
         {"message_refused", message_refused},
+        {"require_refused", require_refused},
         {"c_stack", c_stack},
     };
     if (argc != 2) {

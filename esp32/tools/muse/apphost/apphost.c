@@ -52,7 +52,8 @@
  *   log [N]                the last N lines of the app's log ring, oldest first (all of them by default), as
  *                          log events. An empty log, and a log of one empty line, print nothing.
  * An app whose load failed (a crash event at launch) is a crashed app: `state` says crashed, `message` and
- * `start` answer with its crash record, and the rest do nothing.
+ * `start` answer with its crash record, `log` shows what main.lua printed before it failed, and the rest do
+ * nothing. A main.lua that doesn't compile never ran: the crash event is Lua's message, and there is no log.
  *
  * --cycles N makes, starts, stops and frees the app N times, and prints the heap's balance. Nothing else is
  * printed but the first failure, as a crash event: the app's log and warnings are dropped.
@@ -63,6 +64,12 @@
  *
  * Time stands still here (apphost_port.c), so only the instruction budgets stop a runaway app.
  */
+
+/* getline, realpath and PATH_MAX come with POSIX 2008 and a C library's default definitions. One that hides
+ * what a standard doesn't name (glibc under -std=c11) declares them only when asked, and this has to come before
+ * the first include, which is where the headers decide. _DEFAULT_SOURCE asks for the defaults back; glibc has
+ * realpath under it or _XOPEN_SOURCE 500, not under _POSIX_C_SOURCE 200809L alone. */
+#define _DEFAULT_SOURCE 1
 
 #include <errno.h>
 #include <limits.h>
@@ -499,8 +506,10 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name)
     apphost_set_log(emit_log);
     emit_warnings(pkg->manifest.warnings);
     app.rt = apps_rt_new(pkg, app.crash_text, sizeof app.crash_text);
-    if (app.rt == NULL) {
+    if (app.rt == NULL) {  /* nothing could be made (main.lua doesn't compile, ...): the reason */
         emit_text("crash", app.crash_text);
+    } else if (apps_rt_state(app.rt) == APPS_STATE_CRASHED) {  /* main.lua ran and failed: its record */
+        emit_text("crash", apps_rt_last_error(app.rt));
     } else {
         emit_warnings(apps_rt_warnings(app.rt));
         cmd_start(&app);

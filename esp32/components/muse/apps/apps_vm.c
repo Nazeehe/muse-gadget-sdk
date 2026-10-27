@@ -1244,7 +1244,7 @@ static bool proto_has_tbc(const Proto *p, int *line) {
     return found;
 }
 
-bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t len, char *err, size_t err_len) {
+bool apps_vm_load_on(lua_State *L, const char *chunkname, const char *src, size_t len, char *err, size_t err_len) {
     if (len >= 3 && memcmp(src, "\xEF\xBB\xBF", 3) == 0) {
         src += 3;
         len -= 3;
@@ -1266,7 +1266,6 @@ bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t 
     }
     name[1 + name_len] = '\0';
 
-    lua_State *L = vm->L;
     if (!lua_checkstack(L, 1)) {
         copy_message(err, err_len, "not enough memory");
         return false;
@@ -1289,6 +1288,10 @@ bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t 
         return false;
     }
     return true;
+}
+
+bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t len, char *err, size_t err_len) {
+    return apps_vm_load_on(vm->L, chunkname, src, len, err, err_len);
 }
 
 size_t apps_vm_mem_used(const apps_vm_t *vm) {

@@ -1570,6 +1570,112 @@ static void tbc_refused(void) {
     apps_vm_free(vm);
 }
 
+#define LOAD_ON_NEST 24
+#define LOAD_ON_DEPTH 20
+
+/* ---- load_on: apps_vm_load_on, the parser on the running thread ----
+ *
+ * apps_vm_load compiles on the VM's main thread. A binding that compiles for app code (the runtime's require)
+ * has to compile on the thread it was called on: the parser's recursion is counted against that thread's
+ * C-call room (lua_State.nCcalls), and a coroutine's count starts at its resumer's and grows with every C
+ * level it adds, which the main thread's count leaves out. One implementation, two entry points: the same
+ * rules (the '=' name, the BOM, bytecode, <close>), and the result lands on the given thread's stack. */
+
+/* load_on(src): the compiled function (pushed on the calling thread by apps_vm_load_on), or nil and the message. */
+static int c_load_on(lua_State *L) {
+    size_t len;
+    const char *src = luaL_checklstring(L, 1, &len);
+    char err[256];
+    lua_settop(L, 1);
+    if (apps_vm_load_on(L, "lib/t.lua", src, len, err, sizeof err)) {
+        return 1;
+    }
+    lua_pushnil(L);
+    lua_pushstring(L, err);
+    return 2;
+}
+
+static void load_on(void) {
+    apps_vm_t *vm = new_vm(1 * MB);
+    lua_State *L = apps_vm_lua(vm);
+    char a_err[256], b_err[256];
+
+    /* The same answer, message and stack effect as apps_vm_load on the main thread, for what it accepts and for
+     * each way it refuses. */
+    static const char bytecode_header[] = "\x1bLua\x54\x00\x19\x93\r\n\x1a\nrest";
+    static const char *const inputs[] = {
+        "return 1", "", "\xEF\xBB\xBFreturn 2", "\xEF\xBB\xBF\x1b" "Lua", bytecode_header,
+        "local x <close> = nil", "x = = 1", "return (",
+    };
+    for (size_t i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+        size_t len = strcmp(inputs[i], bytecode_header) == 0 ? sizeof bytecode_header - 1 : strlen(inputs[i]);
+        int top = lua_gettop(L);
+        bool a = apps_vm_load(vm, "main.lua", inputs[i], len, a_err, sizeof a_err);
+        int a_pushed = lua_gettop(L) - top;
+        lua_settop(L, top);
+        bool b = apps_vm_load_on(L, "main.lua", inputs[i], len, b_err, sizeof b_err);
+        int b_pushed = lua_gettop(L) - top;
+        lua_settop(L, top);
+        CHECK(a == b && a_pushed == b_pushed && (a || strcmp(a_err, b_err) == 0),
+              "input %zu: apps_vm_load %d '%s' pushed %d, apps_vm_load_on %d '%s' pushed %d", i, a, a_err, a_pushed, b,
+              b_err, b_pushed);
+    }
+    char long_name[80], want[128];
+    memcpy(long_name, "lib/", 4);
+    for (int i = 4; i < 74; i++) {
+        long_name[i] = (char)('a' + i % 26);
+    }
+    long_name[74] = '\0';
+    snprintf(want, sizeof want, "%.*s:1: x", LUA_IDSIZE - 1, long_name);
+    CHECK(apps_vm_load_on(L, long_name, "error('x')", 10, a_err, sizeof a_err), "%s", a_err);
+    CHECK(lua_pcall(L, 0, 0, 0) == LUA_ERRRUN && strcmp(top_text(L), want) == 0, "long name: got '%s', want '%s'",
+          top_text(L), want);
+    lua_settop(L, 0);
+
+    /* On a thread of its own: the function lands on that thread's stack and nowhere else, in the one sandbox. */
+    lua_State *co = lua_newthread(L);
+    int main_top = lua_gettop(L);
+    CHECK(apps_vm_load_on(co, "lib/t.lua", "shared = 42 return shared", 25, a_err, sizeof a_err), "%s", a_err);
+    CHECK(lua_gettop(co) == 1 && lua_gettop(L) == main_top, "stacks: thread %d (want 1), main %d (want %d)",
+          lua_gettop(co), lua_gettop(L), main_top);
+    CHECK(lua_pcall(co, 0, 1, 0) == LUA_OK && lua_isinteger(co, -1) && lua_tointeger(co, -1) == 42, "ran: '%s'",
+          top_text(co));
+    CHECK(raw_global(L, "shared") == LUA_TNUMBER && lua_tointeger(L, -1) == 42, "the thread's chunk didn't write the sandbox");
+    lua_pop(L, 1);
+    lua_settop(co, 0);
+    CHECK(!apps_vm_load_on(co, "lib/t.lua", "local x <close> = nil", 21, a_err, sizeof a_err) &&
+              strcmp(a_err, "lib/t.lua:1: '<close>' variables are not available in Muse apps") == 0 && lua_gettop(co) == 0,
+          "<close> on a thread: '%s', thread stack %d", a_err, lua_gettop(co));
+    lua_settop(L, 0);
+
+    /* The parser's room is the calling thread's. A chunk nested NEST levels deep loads on the main thread and in a
+     * fresh coroutine, but not in a coroutine that is already DEPTH pcall levels down: its count carries them, so
+     * the same bound as every other C recursion applies. */
+    lua_pushcfunction(L, c_load_on);
+    lua_setglobal(L, "load_on");
+    char src[1024];
+    snprintf(src, sizeof src,
+             "local nested = 'return ' .. ('('):rep(%d) .. '1' .. (')'):rep(%d)\n"
+             "local function at_depth(n, f)\n"
+             "    if n == 0 then return f() end\n"
+             "    return select(2, pcall(at_depth, n - 1, f))\n"
+             "end\n"
+             "local function try() local fn, msg = load_on(nested) return fn ~= nil, msg end\n"
+             "local main_ok = try()\n"
+             "local fresh_ok = coroutine.wrap(try)()\n"
+             "local deep_ok, deep_msg = coroutine.wrap(function() return at_depth(%d, try) end)()\n"
+             "return main_ok, fresh_ok, deep_ok, deep_msg",
+             LOAD_ON_NEST, LOAD_ON_NEST, LOAD_ON_DEPTH);
+    char err[512] = "";
+    int rc = call(vm, src, 4, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_OK && lua_toboolean(L, -4) && lua_toboolean(L, -3) && !lua_toboolean(L, -2) &&
+              strcmp(lua_tostring(L, -1) != NULL ? lua_tostring(L, -1) : "", "C stack overflow") == 0,
+          "got %s '%s': main %d, fresh coroutine %d, deep coroutine %d '%s'", call_name(rc), err,
+          lua_toboolean(L, -4), lua_toboolean(L, -3), lua_toboolean(L, -2), top_text(L));
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+}
+
 /* ---- short_coroutines ---- */
 
 /* src, in a fresh VM under apps_vm_call with budget, ends KILLED with reason. Returns the
@@ -2707,6 +2813,7 @@ int main(int argc, char **argv) {
         {"infinite_loop", infinite_loop},
         {"wall_clock", wall_clock},
         {"tbc_refused", tbc_refused},
+        {"load_on", load_on},
         {"short_coroutines", short_coroutines},
         {"kill_not_swallowed", kill_not_swallowed},
         {"memory_kill", memory_kill},

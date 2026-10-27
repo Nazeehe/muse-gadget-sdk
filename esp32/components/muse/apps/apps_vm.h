@@ -102,6 +102,21 @@ lua_State *apps_vm_lua(apps_vm_t *vm);
  */
 bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t len, char *err, size_t err_len);
 
+/*
+ * apps_vm_load on the thread L, one of the VM's (its main thread, or a coroutine): the same rules, and the
+ * function is pushed on L. apps_vm_load is this on the main thread.
+ * Where the chunk compiles matters. The parser recurses in C, a level of Lua's C-call count (LUAI_MAXCCALLS)
+ * for each level of nesting, and the count it adds to is the compiling thread's: a coroutine starts at its
+ * resumer's count and adds a level for each C call under it, which the main thread's count leaves out. A
+ * binding that loads for the code it was called from compiles on that thread, so the parse is bounded by the
+ * C-call room that code has left, like every other recursion under app code.
+ * An error the parser raises as a runtime error rather than a syntax error ("C stack overflow", for a source
+ * nested past the room) has no position, and has the call's traceback appended when it arrives with
+ * apps_vm_call's message handler (on the main thread, outside any pcall of app code): a caller that shows the
+ * message cuts it at the first "\nstack traceback:".
+ */
+bool apps_vm_load_on(lua_State *L, const char *chunkname, const char *src, size_t len, char *err, size_t err_len);
+
 /* The Lua heap against mem_limit: bytes held now, the most ever held, and how many
  * requests were refused (past the cap, or realloc_fn failing). A refusal returns NULL
  * to Lua, which collects garbage and retries at once; one that retry doesn't answer is

@@ -61,6 +61,10 @@ if(CONFIG_MUSE_ENABLED)
     if(CONFIG_MUSE_CLOCK)
         list(APPEND srcs "muse_clock.c")
     endif()
+    if(CONFIG_MUSE_APPS)
+        # Lua mini-apps (apps/): the sandboxed Lua state and its did-you-mean helper.
+        list(APPEND srcs "apps/apps_vm.c" "apps/apps_suggest.c")
+    endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
     # avatar when avatar/muse_pixel.c exists here; this avatar/ is gitignored. The
     # default is in avatar/ at the top of the project.

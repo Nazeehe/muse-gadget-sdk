@@ -1,0 +1,663 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * One Muse app's Lua state (apps_vm.h). Every function the sandbox gives app code
+ * checks its arguments, since an app can call any of them with anything, and keeps
+ * what it allocates in the Lua heap (userdata), so an error raised halfway leaks
+ * nothing and every byte counts against the app's cap.
+ */
+
+#include "apps_vm.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "apps_suggest.h"
+#include "lauxlib.h"
+#include "lualib.h"
+
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+struct apps_vm {
+    apps_vm_config_t cfg;
+    lua_State *L;
+    size_t mem_used;      /* bytes the Lua heap holds; never more than cfg.mem_limit */
+    size_t mem_peak;      /* the most it has held */
+    size_t mem_refusals;  /* requests answered with NULL */
+};
+
+/* ---- Text helpers ---- */
+
+/* How much of s, which is longer than n bytes, to keep so as to cut at most n bytes
+ * without splitting a UTF-8 sequence: steps back past up to 3 continuation bytes
+ * (0x80-0xBF), the most a valid sequence has. */
+static size_t utf8_cut(const char *s, size_t n) {
+    for (int i = 0; i < 3 && n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80; i++) {
+        n--;
+    }
+    return n;
+}
+
+/* Copies msg into out (cap bytes with the NUL), cut on a character boundary. */
+static void copy_message(char *out, size_t cap, const char *msg) {
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    size_t n = strlen(msg);
+    if (n >= cap) {
+        n = utf8_cut(msg, cap - 1);
+    }
+    memcpy(out, msg, n);
+    out[n] = '\0';
+}
+
+/* ---- The capped heap ---- */
+
+/* Lua's allocator. When ptr is NULL, osize is the new object's type, not a size. */
+static void *vm_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    apps_vm_t *vm = ud;
+    size_t old = ptr != NULL ? osize : 0;
+    if (nsize == 0) {
+        if (ptr != NULL) {
+            vm->cfg.free_fn(ptr);
+            vm->mem_used -= old;
+        }
+        return NULL;
+    }
+    /* Past the cap, only NULL: Lua collects garbage and asks again, then raises
+     * LUA_ERRMEM. An allocator must never raise, and must not end the app on the first
+     * refusal, which a collection may still satisfy. */
+    if (nsize > old && nsize - old > vm->cfg.mem_limit - vm->mem_used) {
+        vm->mem_refusals++;
+        return NULL;
+    }
+    void *block = vm->cfg.realloc_fn(ptr, nsize);
+    if (block == NULL) {
+        vm->mem_refusals++;
+        return NULL;
+    }
+    vm->mem_used = vm->mem_used - old + nsize;
+    if (vm->mem_used > vm->mem_peak) {
+        vm->mem_peak = vm->mem_used;
+    }
+    return block;
+}
+
+/* An error outside every protected call: a bug in the C code driving the state. Lua
+ * aborts when this returns; say what the error was first. */
+static int vm_panic(lua_State *L) {
+    const char *msg = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "error object is not a string";
+    lua_writestringerror("apps_vm: unprotected Lua error (%s)\n", msg);
+    return 0;
+}
+
+/* ---- Strict globals ---- */
+
+/* Names apps reach for that the sandbox leaves out on purpose. Each message is a
+ * format for the name (ruling A17: every loader names itself). */
+#define FROM_OWN_FILES "'%s' is not available in Muse apps: code comes only from the app's own files"
+static const struct {
+    const char *name, *why;
+} absent[] = {
+    {"io", "'io' is not available in Muse apps; use store / sys.log"},
+    {"debug", "'debug' is not available in Muse apps"},
+    {"load", FROM_OWN_FILES},
+    {"loadstring", FROM_OWN_FILES},
+    {"dofile", FROM_OWN_FILES},
+    {"loadfile", FROM_OWN_FILES},
+    {"collectgarbage", "'collectgarbage' is not available in Muse apps; use sys.mem()"},
+};
+
+typedef struct {
+    const char **names;  /* NULL while counting */
+    int cap, n;
+} candidates_t;
+
+static void add_candidate(candidates_t *c, const char *name) {
+    if (name[0] == '(' || name[0] == '\0') {
+        return;  /* Lua's "(temporary)" slots, a C upvalue */
+    }
+    if (c->names != NULL && c->n < c->cap) {
+        c->names[c->n] = name;
+    }
+    c->n++;
+}
+
+/* The names a misspelt global may have meant, nearest scope first: the reading
+ * function's locals, its upvalues, then the sandbox's keys (the table at index 1). The
+ * strings stay alive while the function runs and the table holds its keys. */
+static void collect_candidates(lua_State *L, lua_Debug *reader, candidates_t *c) {
+    const char *name;
+    if (reader != NULL) {
+        for (int i = 1; (name = lua_getlocal(L, reader, i)) != NULL; i++) {
+            lua_pop(L, 1);
+            add_candidate(c, name);
+        }
+        lua_getinfo(L, "f", reader);
+        for (int i = 1; (name = lua_getupvalue(L, -1, i)) != NULL; i++) {
+            lua_pop(L, 1);
+            add_candidate(c, name);
+        }
+        lua_pop(L, 1);
+    }
+    lua_pushnil(L);
+    while (lua_next(L, 1) != 0) {
+        if (lua_type(L, -2) == LUA_TSTRING) {
+            add_candidate(c, lua_tostring(L, -2));
+        }
+        lua_pop(L, 1);
+    }
+}
+
+/* The sandbox's __index, so only for names it doesn't have. Only string keys are
+ * globals: _G[1] reads nil, as in any table. */
+static int sandbox_index(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    if (lua_type(L, 2) != LUA_TSTRING) {
+        return 0;
+    }
+    size_t len;
+    const char *name = lua_tolstring(L, 2, &len);
+    for (size_t i = 0; i < ARRAY_LEN(absent); i++) {
+        if (strlen(absent[i].name) == len && memcmp(name, absent[i].name, len) == 0) {
+            return luaL_error(L, absent[i].why, absent[i].name);
+        }
+    }
+    /* Level 1 is the function that read the name. Count the candidates, then gather
+     * them into a userdata, which the error leaves to the collector. */
+    lua_Debug ar;
+    lua_Debug *reader = lua_getstack(L, 1, &ar) ? &ar : NULL;
+    candidates_t c = {NULL, 0, 0};
+    collect_candidates(L, reader, &c);
+    const char *hint = NULL;
+    if (c.n > 0) {
+        c.cap = c.n;
+        c.n = 0;
+        c.names = lua_newuserdatauv(L, (size_t)c.cap * sizeof *c.names, 0);
+        collect_candidates(L, reader, &c);
+        hint = apps_suggest(name, c.names, c.n < c.cap ? c.n : c.cap);
+    }
+    if (hint != NULL) {
+        return luaL_error(L, "unknown global '%s' (did you mean '%s'?)", name, hint);
+    }
+    return luaL_error(L, "unknown global '%s'", name);
+}
+
+/* ---- setmetatable ---- */
+
+/* Base's setmetatable, refusing a metatable that has __gc: Lua runs finalizers with
+ * hooks off, beyond any instruction budget. Lua marks an object for finalization only
+ * when its metatable is set, and looks __gc up raw, so a raw check here is enough: a
+ * __gc added to the metatable later never runs. */
+static int sandbox_setmetatable(lua_State *L) {
+    int t = lua_type(L, 2);
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_argexpected(L, t == LUA_TNIL || t == LUA_TTABLE, 2, "nil or table");
+    if (t == LUA_TTABLE) {
+        lua_pushliteral(L, "__gc");
+        bool finalizer = lua_rawget(L, 2) != LUA_TNIL;
+        lua_pop(L, 1);
+        if (finalizer) {
+            return luaL_error(L, "setmetatable: __gc finalizers are not available in Muse apps");
+        }
+    }
+    if (luaL_getmetafield(L, 1, "__metatable") != LUA_TNIL) {
+        return luaL_error(L, "cannot change a protected metatable");
+    }
+    lua_settop(L, 2);
+    lua_setmetatable(L, 1);
+    return 1;
+}
+
+/* ---- string ---- */
+
+/* string.match, gmatch and gsub, named by the closure's upvalue. They raise before
+ * looking at their arguments: nothing reaches lstrlib's matcher, whose backtracking
+ * no hook can interrupt. */
+static int sandbox_no_patterns(lua_State *L) {
+    return luaL_error(L, "string.%s is not available in Muse apps (api 1): use string.find(s, text, 1, true), string.split or json.decode",
+                      lua_tostring(L, lua_upvalueindex(1)));
+}
+
+/* lstrlib's SPECIALS: a pattern with none of these matches only itself. */
+static bool has_specials(const char *p, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] != '\0' && strchr("^$*+?.([%-", p[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* string.find's init as a 0-based offset, as lstrlib's posrelatI gives it, except that
+ * a start past the end stays past it with a 32-bit size_t. More than len: nothing can
+ * be found. */
+static size_t start_offset(lua_Integer init, size_t len) {
+    if (init > 0) {
+        return (lua_Unsigned)init - 1 > (lua_Unsigned)len ? len + 1 : (size_t)(init - 1);
+    }
+    if (init == 0 || init < -(lua_Integer)len) {
+        return 0;
+    }
+    return len + (size_t)init;
+}
+
+/* Plain text to search for: memchr for one byte, Knuth-Morris-Pratt for more, so a
+ * search takes time linear in what it scans, whatever the input. */
+typedef struct {
+    const char *p;
+    size_t len;
+    const uint32_t *next;  /* KMP's failure table, len entries; NULL when unused */
+} needle_t;
+
+/* The longest needle whose table uint32_t can index and size_t can size. */
+#define NEEDLE_MAX (SIZE_MAX / sizeof(uint32_t) < UINT32_MAX ? SIZE_MAX / sizeof(uint32_t) : (size_t)UINT32_MAX)
+
+/* Readies p for searches of at most hay_len bytes. The KMP table is a userdata in the
+ * capped heap, left on the stack. arg is p's argument, for the error. */
+static void needle_init(lua_State *L, needle_t *nd, const char *p, size_t len, size_t hay_len, int arg) {
+    nd->p = p;
+    nd->len = len;
+    nd->next = NULL;
+    if (len < 2 || len > hay_len) {
+        return;  /* memchr, or no search at all */
+    }
+    luaL_argcheck(L, len <= NEEDLE_MAX, arg, "too long");
+    uint32_t *next = lua_newuserdatauv(L, len * sizeof *next, 0);
+    /* next[i]: the longest proper prefix of p[0..i] that is also its suffix. */
+    uint32_t k = 0;
+    next[0] = 0;
+    for (size_t i = 1; i < len; i++) {
+        while (k > 0 && p[i] != p[k]) {
+            k = next[k - 1];
+        }
+        if (p[i] == p[k]) {
+            k++;
+        }
+        next[i] = k;
+    }
+    nd->next = next;
+}
+
+/* The first occurrence of the needle in s[0, n), n at most needle_init's hay_len, or NULL. */
+static const char *needle_find(const needle_t *nd, const char *s, size_t n) {
+    if (nd->len == 0) {
+        return s;
+    }
+    if (nd->len > n) {
+        return NULL;
+    }
+    if (nd->len == 1) {
+        return memchr(s, (unsigned char)nd->p[0], n);
+    }
+    uint32_t k = 0;  /* bytes of the needle matched */
+    for (size_t i = 0; i < n; i++) {
+        while (k > 0 && s[i] != nd->p[k]) {
+            k = nd->next[k - 1];
+        }
+        if (s[i] == nd->p[k]) {
+            k++;
+        }
+        if (k == nd->len) {
+            return s + i + 1 - nd->len;
+        }
+    }
+    return NULL;
+}
+
+/* string.find(s, text [, init [, plain]]): Lua's find, minus patterns. A pattern
+ * without special characters is plain text, as in Lua; any other raises. */
+static int sandbox_find(lua_State *L) {
+    size_t ls, lp;
+    const char *s = luaL_checklstring(L, 1, &ls);
+    const char *p = luaL_checklstring(L, 2, &lp);
+    lua_Integer init = luaL_optinteger(L, 3, 1);
+    if (!lua_toboolean(L, 4) && has_specials(p, lp)) {
+        return luaL_error(L, "string.find: patterns are not available in Muse apps (api 1); for a plain search pass true as the 4th argument");
+    }
+    size_t start = start_offset(init, ls);
+    if (start <= ls) {
+        needle_t nd;
+        needle_init(L, &nd, p, lp, ls - start, 2);
+        const char *at = needle_find(&nd, s + start, ls - start);
+        if (at != NULL) {
+            lua_pushinteger(L, (lua_Integer)(at - s) + 1);
+            lua_pushinteger(L, (lua_Integer)(at - s) + (lua_Integer)lp);
+            return 2;
+        }
+    }
+    luaL_pushfail(L);
+    return 1;
+}
+
+/* string.split(s, sep): the pieces of s between occurrences of sep, plain text, empty
+ * pieces kept. ("a,,b"):split(",") is {"a", "", "b"}; (""):split(",") is {""}. */
+static int sandbox_split(lua_State *L) {
+    size_t ls, lsep;
+    const char *s = luaL_checklstring(L, 1, &ls);
+    const char *sep = luaL_checklstring(L, 2, &lsep);
+    luaL_argcheck(L, lsep > 0, 2, "empty separator");
+    lua_settop(L, 2);
+    needle_t nd;
+    needle_init(L, &nd, sep, lsep, ls, 2);
+    lua_newtable(L);
+    int pieces = lua_gettop(L);
+    const char *at = s, *end = s + ls;
+    for (lua_Integer i = 1;; i++) {
+        const char *hit = needle_find(&nd, at, (size_t)(end - at));
+        const char *stop = hit != NULL ? hit : end;
+        lua_pushlstring(L, at, (size_t)(stop - at));
+        lua_rawseti(L, pieces, i);
+        if (hit == NULL) {
+            return 1;  /* the table, on top */
+        }
+        at = hit + lsep;
+    }
+}
+
+static bool is_space(char c) {
+    return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
+/* string.trim(s): s without leading and trailing ASCII whitespace (space \t \n \v \f \r). */
+static int sandbox_trim(lua_State *L) {
+    size_t len;
+    const char *s = luaL_checklstring(L, 1, &len);
+    size_t first = 0, end = len;
+    while (first < end && is_space(s[first])) {
+        first++;
+    }
+    while (end > first && is_space(s[end - 1])) {
+        end--;
+    }
+    if (first == 0 && end == len) {
+        lua_settop(L, 1);  /* nothing to trim: s itself */
+        return 1;
+    }
+    lua_pushlstring(L, s + first, end - first);
+    return 1;
+}
+
+/* What api 1 adds to string. */
+static const luaL_Reg apps_string_funcs[] = {
+    {"split", sandbox_split},
+    {"trim", sandbox_trim},
+    {NULL, NULL},
+};
+
+/* ---- The sandbox ---- */
+
+/* Opens the sandbox in L's globals table. Runs under lua_pcall: it allocates, and an
+ * error outside a protected call would abort. */
+static int open_sandbox(lua_State *L) {
+    static const struct {
+        const char *name;
+        lua_CFunction open;
+    } libs[] = {
+        {LUA_GNAME, luaopen_base},       {LUA_COLIBNAME, luaopen_coroutine}, {LUA_TABLIBNAME, luaopen_table},
+        {LUA_STRLIBNAME, luaopen_string}, {LUA_MATHLIBNAME, luaopen_math},    {LUA_UTF8LIBNAME, luaopen_utf8},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(libs); i++) {
+        luaL_requiref(L, libs[i].name, libs[i].open, 1);
+        lua_pop(L, 1);
+    }
+
+    lua_pushglobaltable(L);
+    /* Code from anywhere but the app's own files, the collector and warnings stay out;
+     * print and require belong to the app runtime, which installs its own. */
+    static const char *const removed[] = {"dofile", "loadfile", "load", "collectgarbage", "warn", "require", "print"};
+    for (size_t i = 0; i < ARRAY_LEN(removed); i++) {
+        lua_pushnil(L);
+        lua_setfield(L, -2, removed[i]);
+    }
+    lua_pushcfunction(L, sandbox_setmetatable);
+    lua_setfield(L, -2, "setmetatable");
+
+    /* The string library, also the __index of every string's metatable, so the changes
+     * reach s:find() as well as string.find(). */
+    lua_pushliteral(L, LUA_STRLIBNAME);
+    lua_rawget(L, -2);
+    lua_pushnil(L);
+    lua_setfield(L, -2, "dump");
+    lua_pushcfunction(L, sandbox_find);
+    lua_setfield(L, -2, "find");
+    static const char *const matchers[] = {"match", "gmatch", "gsub"};
+    for (size_t i = 0; i < ARRAY_LEN(matchers); i++) {
+        lua_pushstring(L, matchers[i]);
+        lua_pushcclosure(L, sandbox_no_patterns, 1);
+        lua_setfield(L, -2, matchers[i]);
+    }
+    luaL_setfuncs(L, apps_string_funcs, 0);
+    lua_pop(L, 1);
+
+    /* Strict globals: __index raises. No __newindex, so assigning defines. */
+    lua_createtable(L, 0, 1);
+    lua_pushcfunction(L, sandbox_index);
+    lua_setfield(L, -2, "__index");
+    lua_setmetatable(L, -2);
+    lua_pop(L, 1);
+    return 0;
+}
+
+/* ---- The API ---- */
+
+apps_vm_t *apps_vm_new(const apps_vm_config_t *cfg) {
+    if (cfg == NULL || cfg->realloc_fn == NULL || cfg->free_fn == NULL || cfg->now_ms == NULL) {
+        return NULL;
+    }
+    apps_vm_t *vm = cfg->realloc_fn(NULL, sizeof *vm);
+    if (vm == NULL) {
+        return NULL;
+    }
+    *vm = (apps_vm_t){.cfg = *cfg};
+    vm->L = lua_newstate(vm_alloc, vm);
+    if (vm->L == NULL) {
+        cfg->free_fn(vm);
+        return NULL;
+    }
+    lua_atpanic(vm->L, vm_panic);
+    lua_pushcfunction(vm->L, open_sandbox);
+    if (lua_pcall(vm->L, 0, 0, 0) != LUA_OK) {
+        lua_close(vm->L);
+        cfg->free_fn(vm);
+        return NULL;
+    }
+    return vm;
+}
+
+void apps_vm_free(apps_vm_t *vm) {
+    if (vm != NULL) {
+        lua_close(vm->L);
+        vm->cfg.free_fn(vm);
+    }
+}
+
+lua_State *apps_vm_lua(apps_vm_t *vm) {
+    return vm->L;
+}
+
+bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t len, char *err, size_t err_len) {
+    if (len >= 3 && memcmp(src, "\xEF\xBB\xBF", 3) == 0) {
+        src += 3;
+        len -= 3;
+    }
+    /* Lua takes any chunk that starts with ESC for bytecode, which it doesn't verify. */
+    if (len > 0 && src[0] == LUA_SIGNATURE[0]) {
+        copy_message(err, err_len, "binary chunks are not allowed: install Lua source text");
+        return false;
+    }
+    /* '=' and the name as given (X10). Lua shows at most LUA_IDSIZE - 1 bytes of it, so a
+     * longer name reads the same cut here. */
+    char name[LUA_IDSIZE + 1] = "=";
+    size_t name_len = chunkname != NULL ? strlen(chunkname) : 0;
+    if (name_len > sizeof name - 2) {
+        name_len = sizeof name - 2;
+    }
+    if (name_len > 0) {
+        memcpy(name + 1, chunkname, name_len);
+    }
+    name[1 + name_len] = '\0';
+
+    lua_State *L = vm->L;
+    if (!lua_checkstack(L, 1)) {
+        copy_message(err, err_len, "not enough memory");
+        return false;
+    }
+    if (luaL_loadbufferx(L, src, len, name, "t") != LUA_OK) {
+        const char *msg = lua_tostring(L, -1);
+        copy_message(err, err_len, msg != NULL ? msg : "error loading the chunk");
+        lua_pop(L, 1);
+        return false;
+    }
+    return true;
+}
+
+size_t apps_vm_mem_used(const apps_vm_t *vm) {
+    return vm->mem_used;
+}
+
+size_t apps_vm_mem_peak(const apps_vm_t *vm) {
+    return vm->mem_peak;
+}
+
+size_t apps_vm_mem_refusals(const apps_vm_t *vm) {
+    return vm->mem_refusals;
+}
+
+/* ---- Excerpt ---- */
+
+/* Text written into a fixed buffer, always terminated. Once something has to be cut,
+ * nothing more is written. */
+typedef struct {
+    char *buf;
+    size_t cap, len;
+    bool full;
+} text_t;
+
+static void text_put(text_t *t, const char *s, size_t n) {
+    if (t->full) {
+        return;
+    }
+    size_t room = t->cap - 1 - t->len;
+    if (n > room) {
+        n = utf8_cut(s, room);
+        t->full = true;
+    }
+    if (n > 0) {
+        memcpy(t->buf + t->len, s, n);
+        t->len += n;
+    }
+    t->buf[t->len] = '\0';
+}
+
+/* The line in the first ":<digits>:" of msg, or 0. */
+static int message_line(const char *msg) {
+    for (const char *colon = strchr(msg, ':'); colon != NULL; colon = strchr(colon + 1, ':')) {
+        const char *d = colon + 1;
+        long line = 0;
+        while (*d >= '0' && *d <= '9' && line < 100000000) {
+            line = line * 10 + (*d++ - '0');
+        }
+        if (d > colon + 1 && *d == ':' && line > 0) {
+            return (int)line;
+        }
+    }
+    return 0;
+}
+
+static int decimal_digits(int v) {
+    int digits = 1;
+    for (; v >= 10; v /= 10) {
+        digits++;
+    }
+    return digits;
+}
+
+#define EXCERPT_LINE_MAX 80
+
+size_t apps_vm_excerpt(const char *msg, const char *src, size_t len, char *out, size_t cap) {
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    text_t t = {out, cap, 0, false};
+    out[0] = '\0';
+    if (msg == NULL) {
+        msg = "";
+    }
+    text_put(&t, msg, strlen(msg));
+    int line = message_line(msg);
+    if (line == 0 || src == NULL) {
+        return t.len;
+    }
+    if (len >= 3 && memcmp(src, "\xEF\xBB\xBF", 3) == 0) {
+        src += 3;
+        len -= 3;
+    }
+
+    /* Lines line - 1, line and line + 1, ended where Lua's lexer ends them. */
+    struct {
+        const char *text;
+        size_t len;
+        bool shown;
+    } rows[3] = {{NULL, 0, false}, {NULL, 0, false}, {NULL, 0, false}};
+    const char *p = src, *end = src + len;
+    for (int at = 1; at <= line + 1; at++) {
+        const char *eol = p;
+        while (eol < end && *eol != '\n' && *eol != '\r') {
+            eol++;
+        }
+        bool last = eol == end;
+        /* The empty line after a final newline shows only as the error's own line. */
+        if (at >= line - 1 && !(last && eol == p && at == line + 1)) {
+            rows[at - (line - 1)].text = p;
+            rows[at - (line - 1)].len = (size_t)(eol - p);
+            rows[at - (line - 1)].shown = true;
+        }
+        if (last) {
+            break;
+        }
+        char newline = *eol++;
+        if (eol < end && (*eol == '\n' || *eol == '\r') && *eol != newline) {
+            eol++;  /* \r\n or \n\r: one line break */
+        }
+        p = eol;
+    }
+    if (!rows[1].shown) {
+        return t.len;  /* src has no such line */
+    }
+
+    int width = decimal_digits(rows[2].shown ? line + 1 : line);
+    for (int i = 0; i < 3; i++) {
+        if (!rows[i].shown) {
+            continue;
+        }
+        char number[12];
+        int digits = snprintf(number, sizeof number, "%d", line - 1 + i);
+        text_put(&t, i == 1 ? "\n>" : "\n ", 2);
+        for (int pad = digits; pad < width; pad++) {
+            text_put(&t, " ", 1);
+        }
+        text_put(&t, number, (size_t)digits);
+        text_put(&t, "|", 1);
+        if (rows[i].len > 0) {
+            size_t keep = rows[i].len > EXCERPT_LINE_MAX ? utf8_cut(rows[i].text, EXCERPT_LINE_MAX) : rows[i].len;
+            text_put(&t, " ", 1);
+            text_put(&t, rows[i].text, keep);
+        }
+    }
+    return t.len;
+}

@@ -17,6 +17,8 @@
 Every test_muse_apps_*.py compiles its harness with build() and runs it with
 run(). Lua's files, defines and options come from components/lua/CMakeLists.txt,
 the file the device build reads, so a host binary and the firmware agree.
+build_apphost() builds the host runner (tools/muse/apphost) from its sources.txt
+and those same Lua files.
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LUA = ROOT / "components" / "lua"
 LUA_SRC = LUA / "src"
+APPS = ROOT / "components" / "muse" / "apps"
+APPHOST = ROOT / "tools" / "muse" / "apphost"
 
 # ASan aborts on its first report; -fno-sanitize-recover makes UBSan's fatal too,
 # however the binary is run.
@@ -211,19 +215,50 @@ def build(name: str, sources: Sequence[str | Path], tmp: str | Path, *,
     return exe
 
 
-def run(binary: str | Path, *args: object, input: str | None = None,
-        timeout: float = 60) -> subprocess.CompletedProcess:
+def apphost_sources() -> list[Path]:
+    """The C files of tools/muse/apphost/sources.txt (one path a line, relative to esp32/; blank lines and
+    lines starting with # are skipped), as paths. Only components/muse/apps/*.c and tools/muse/apphost/*.c
+    may be listed: the Lua files come from components/lua/CMakeLists.txt, so there is one list of them
+    and one set of defines.
+    """
+    listed = []
+    for line in (APPHOST / "sources.txt").read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        path = (ROOT / line).resolve()
+        if path.suffix != ".c" or path.parent not in (APPS, APPHOST) or not path.is_file():
+            raise AssertionError(
+                f"tools/muse/apphost/sources.txt: '{line}' must be an existing components/muse/apps/*.c or "
+                "tools/muse/apphost/*.c (Lua's files come from components/lua/CMakeLists.txt)")
+        listed.append(path)
+    if not listed:
+        raise AssertionError("tools/muse/apphost/sources.txt lists no sources")
+    return listed
+
+
+def build_apphost(tmp: str | Path, *, sanitize: bool = True) -> Path:
+    """Builds the host runner from sources.txt and Lua's files, as the firmware's Lua is built (build()),
+    into tmp/apphost, and returns that path. Same flags as build(): -Wall -Wextra -Werror for the runner's
+    own files, ASan and UBSan where the compiler has them.
+    """
+    return build("apphost", [*apphost_sources(), *lua_sources()], tmp,
+                 include_dirs=[LUA_SRC, APPS, APPHOST], sanitize=sanitize)
+
+
+def run(binary: str | Path, *args: object, input: str | bytes | None = None, timeout: float = 60,
+        text: bool = True) -> subprocess.CompletedProcess:
     """Runs a harness built by build() and returns the CompletedProcess.
 
-    Its output is text: bytes that aren't UTF-8 become U+FFFD. A sanitized
-    binary aborts on its first report, and checks for leaks only where
-    LeakSanitizer works.
+    By default its output is text: bytes that aren't UTF-8 become U+FFFD, and input is a str. With
+    text=False both are bytes, for a test that has to see exactly what the binary wrote. A sanitized
+    binary aborts on its first report, and checks for leaks only where LeakSanitizer works.
     """
     sanitized, leaks = _built.get(Path(binary).resolve(), (False, False))
     env = os.environ.copy()
     if sanitized:
         env["ASAN_OPTIONS"] = f"detect_leaks={int(leaks)}:abort_on_error=1"
         env["UBSAN_OPTIONS"] = "print_stacktrace=1"
+    options = {"text": True, "errors": "replace"} if text else {}
     return subprocess.run([str(binary), *map(str, args)], cwd=ROOT, input=input,
-                          capture_output=True, text=True, errors="replace",
-                          timeout=timeout, env=env)
+                          capture_output=True, timeout=timeout, env=env, **options)

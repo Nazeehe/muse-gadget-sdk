@@ -88,6 +88,18 @@ typedef struct lua_State lua_State;
 #define APPS_JSON_MAX_INPUT (32 * 1024)
 
 /*
+ * UTF-8 as the decoder reads it (RFC 3629, above), for the firmware's own checks of text that reaches Muse
+ * inside JSON: the character at p, whose first byte is 0x80 or more, in the text that ends at end (p < end).
+ * Its length in bytes (2 to 4); APPS_UTF8_INVALID when the bytes there aren't one (a stray continuation
+ * byte, an overlong form, a surrogate, past U+10FFFF, or a byte that isn't a continuation byte where one is
+ * due); APPS_UTF8_CUT when the text ends inside it and the bytes so far are valid. One definition of valid
+ * text, so that a string the decoder accepts and one another module calls clean are the same.
+ */
+#define APPS_UTF8_INVALID 0
+#define APPS_UTF8_CUT (-1)
+int apps_json_utf8_len(const unsigned char *p, const unsigned char *end);
+
+/*
  * Installs the global `json`: encode, decode and null. It allocates, but it is safe to call
  * outside a protected call: if the heap refuses, `json` isn't installed and the VM is out of
  * memory (apps_vm.h), so the next apps_vm_call ends NOMEM. The stack is as it was.

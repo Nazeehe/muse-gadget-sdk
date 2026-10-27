@@ -1,0 +1,9 @@
+{
+  "id": "messages",
+  "name": "Messages",
+  "api": 1,
+  "messages": {
+    "status": "Reports the state.",
+    "bad": "Always fails with error()."
+  }
+}

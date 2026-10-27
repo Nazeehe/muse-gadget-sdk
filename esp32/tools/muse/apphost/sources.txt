@@ -1,0 +1,14 @@
+# The C files of the host runner (apphost), one path a line, relative to esp32/. Blank lines and lines that
+# start with # are skipped. tests/apps_host.py (build_apphost) and, from Task 15, tools/muse/app.py build
+# apphost from these and from the Lua files of components/lua/CMakeLists.txt, which they read through the
+# same parser (apps_host.lua_sources, lua_defines), so Lua's list and its defines (LUAI_MAXCCALLS) live
+# in that one file. Only components/muse/apps/*.c and tools/muse/apphost/*.c belong here. Later tasks
+# append their files.
+components/muse/apps/apps_vm.c
+components/muse/apps/apps_suggest.c
+components/muse/apps/apps_json.c
+components/muse/apps/apps_pkg.c
+components/muse/apps/apps_rt.c
+tools/muse/apphost/apphost.c
+tools/muse/apphost/apphost_port.c
+tools/muse/apphost/sha256.c

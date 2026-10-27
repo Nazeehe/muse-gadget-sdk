@@ -125,14 +125,12 @@ static bool expect(apps_jr_t *r, char c) {
 }
 
 /* UTF-8 (RFC 3629) at p, in the text that ends at end, whose first byte is 0x80 or more: the length of the
- * sequence; or UTF8_INVALID when it isn't one: a stray continuation byte, an overlong form, a surrogate
+ * sequence; or APPS_UTF8_INVALID when it isn't one: a stray continuation byte, an overlong form, a surrogate
  * (U+D800-DFFF), a code point past U+10FFFF, or a byte that isn't a continuation byte where one is due; or
- * UTF8_CUT when the text ends inside it and the bytes there are valid so far. Shared by the decoder, which
- * reports a cut sequence as the end of the input like any other cut, and the encoder, which refuses both. */
-#define UTF8_INVALID 0
-#define UTF8_CUT (-1)
-
-static int utf8_len(const unsigned char *p, const unsigned char *end) {
+ * APPS_UTF8_CUT when the text ends inside it and the bytes there are valid so far. Shared by the decoder,
+ * which reports a cut sequence as the end of the input like any other cut, and the encoder, which refuses
+ * both; public (apps_json.h) so that no other module needs a second definition of valid text. */
+int apps_json_utf8_len(const unsigned char *p, const unsigned char *end) {
     unsigned char first = p[0], lo = 0x80, hi = 0xBF;  /* the range of the second byte */
     int n;
     if (first >= 0xC2 && first <= 0xDF) {
@@ -152,15 +150,15 @@ static int utf8_len(const unsigned char *p, const unsigned char *end) {
             hi = 0x8F;  /* nothing past U+10FFFF */
         }
     } else {
-        return UTF8_INVALID;  /* a continuation byte, an overlong 2-byte lead (C0, C1), or past F4 */
+        return APPS_UTF8_INVALID;  /* a continuation byte, an overlong 2-byte lead (C0, C1), or past F4 */
     }
     for (int i = 1; i < n; i++) {
         if (p + i >= end) {
-            return UTF8_CUT;
+            return APPS_UTF8_CUT;
         }
         unsigned char b = p[i];
         if (i == 1 ? (b < lo || b > hi) : (b & 0xC0) != 0x80) {
-            return UTF8_INVALID;
+            return APPS_UTF8_INVALID;
         }
     }
     return n;
@@ -340,11 +338,11 @@ static bool scan_string(apps_jr_t *r, jstr_t *s) {
             }
             run = p;
         } else if (c >= 0x80) {
-            int n = utf8_len((const unsigned char *)p, (const unsigned char *)end);
-            if (n == UTF8_CUT) {
+            int n = apps_json_utf8_len((const unsigned char *)p, (const unsigned char *)end);
+            if (n == APPS_UTF8_CUT) {
                 return fail_unexpected(r, end);
             }
-            if (n == UTF8_INVALID) {
+            if (n == APPS_UTF8_INVALID) {
                 return fail_at(r, "invalid UTF-8", p);
             }
             p += n;
@@ -979,7 +977,7 @@ static bool put_string(enc_t *e, const char *s, size_t n) {
     while (p < end) {
         unsigned char c = *p;
         if (c >= 0x80) {
-            int k = utf8_len(p, end);
+            int k = apps_json_utf8_len(p, end);
             if (k <= 0) {  /* invalid, or cut short by the end of the string */
                 return enc_fail(e, "can't encode a string that isn't valid UTF-8");
             }

@@ -56,6 +56,10 @@ static bool muse_state_asleep(void) { return false; }
 static bool muse_menu_is_open(void) { return false; }
 static void muse_state_poke(void) {}
 static void muse_menu_key(int key) { (void)key; }
+static bool on_clock;
+static int faces;
+static bool muse_ui_clock_showing(void) { return on_clock; }
+static void muse_ui_request_face(void) { faces++; }
 static void set_asleep(bool sleep, const char *why) { (void)sleep; (void)why; }
 static void post(int type, bool wake) { (void)wake; if (type==MUSE_PTT_DOWN) down++; else up++; }
 '''
@@ -93,6 +97,11 @@ int main(void) {
     pending_pair=true;link_state=MUSE_LINK_CONFIRM;on_any_press(&event);
     talk_button(atomic_exchange(&s_touch_talk_events,0));
     assert(confirmed==2 && down==4 && up==4 && !s_talk_down);
+    pending_pair=false; on_clock=true;
+    muse_input_touch_talk(true); muse_input_touch_talk(false);
+    talk_button(atomic_exchange(&s_touch_talk_events,0));
+    assert(faces==1 && down==4 && up==4 && !s_talk_down);
+    on_clock=false;
     board.touch_talk=false;on_any_press(&event);assert(atomic_load(&s_touch_talk_events)==0);
     return 0;
 }

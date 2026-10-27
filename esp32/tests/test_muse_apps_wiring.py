@@ -42,6 +42,17 @@ def kconfig_block(kconfig: str, symbol: str) -> str:
     return kconfig[start:start + end.start()] if end else kconfig[start:]
 
 
+def lv_font_conv_points(args: list) -> set:
+    """The code points an lv_font_conv command line asks for: each -r is a list like `0x20,0x25,0x30-0x3A`."""
+    points = set()
+    for flag, value in zip(args, args[1:]):
+        if flag in ("-r", "--range"):
+            for item in value.split(","):
+                low, _, high = item.partition("-")
+                points.update(range(int(low, 16), int(high or low, 16) + 1))
+    return points
+
+
 class MuseAppsWiringTest(unittest.TestCase):
     def test_lua_component_is_gated_and_trimmed(self):
         cmake = (LUA / "CMakeLists.txt").read_text()
@@ -136,6 +147,46 @@ class MuseAppsWiringTest(unittest.TestCase):
     def test_license_rows(self):
         self.assertIn("esp32/components/lua", (REPO / "README.md").read_text())
         self.assertIn("components/lua", (ROOT / "README.md").read_text())
+        # The digit fonts are Montserrat's, under the SIL OFL 1.1, and both lists say so.
+        row = next((line for line in (REPO / "README.md").read_text().splitlines()
+                    if "esp32/components/muse/apps/fonts" in line), "")
+        self.assertIn("Montserrat Medium", row)
+        self.assertIn("SIL Open Font License 1.1", row)
+        readme = (ROOT / "README.md").read_text()
+        section = readme[readme.index("\n## License"):]
+        bullet = next((item for item in section.split("\n- ") if "components/muse/apps/fonts" in item), "")
+        self.assertIn("Montserrat", bullet)
+        self.assertIn("SIL OFL 1.1", bullet)
+
+    def test_digit_fonts_cover_exactly_the_spec_glyphs(self):
+        # font = "digits48" and "digits96" show "0-9:.-+% " and nothing else. The Opts: line of a generated file
+        # is the command that made it, and its bitmaps are commented with their code points: both must agree.
+        spec = {ord(c) for c in "0123456789:.-+% "}
+        cmake = (MUSE / "CMakeLists.txt").read_text()
+        block = re.search(r"if\(CONFIG_MUSE_APPS\)(.*?)endif\(\)", cmake, re.S).group(1)
+        for size in (48, 96):
+            name = f"apps_digits_{size}"
+            with self.subTest(name):
+                text = (MUSE / "apps/fonts" / f"{name}.c").read_text()
+                header = re.search(r"^ \* Opts: (.*)$", text, re.M)
+                self.assertIsNotNone(header, "no Opts: line, so not lv_font_conv's output")
+                opts = header.group(1).split()
+                self.assertEqual(lv_font_conv_points(opts), spec)
+                drawn = {int(point, 16) for point in re.findall(r"^\s*/\* U\+([0-9A-F]+) ", text, re.M)}
+                self.assertEqual(drawn, spec)
+                self.assertEqual(opts[opts.index("--bpp") + 1], "4")
+                self.assertIn("--no-compress", opts)
+                self.assertEqual(opts[opts.index("--size") + 1], str(size))
+                self.assertEqual(opts[opts.index("--lv-font-name") + 1], name)
+                self.assertIn(f'"apps/fonts/{name}.c"', block)
+                # The generator's sed: the project's include, and no path of the machine that ran it.
+                self.assertIn('#include "lvgl.h"', text)
+                self.assertNotIn("lvgl/lvgl.h", text)
+                self.assertEqual([arg for arg in opts if arg.startswith("/")], [])
+                self.assertNotIn("/", opts[opts.index("-o") + 1])
+        # What regenerates them asks for the same glyphs.
+        script = (ROOT / "tools/muse/gen_app_fonts.sh").read_text()
+        self.assertEqual(lv_font_conv_points([word for word in script.split() if word != "\\"]), spec)
 
     def test_validate_config(self):
         validate = (ROOT / "cmake/validate_config.cmake").read_text()

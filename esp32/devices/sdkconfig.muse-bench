@@ -19,3 +19,7 @@
 # Screenshots ('p' over the serial console, tools/muse/snap.py): under 1 KB of
 # code, plus a buffer the size of the screen (RGB565) while taking one.
 CONFIG_LV_USE_SNAPSHOT=y
+
+# Memory report (">mem" over the serial console): one line with the free
+# internal RAM, DMA and PSRAM and the LVGL task's stack headroom.
+CONFIG_MUSE_BENCH=y

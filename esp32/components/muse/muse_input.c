@@ -825,6 +825,26 @@ static bool console_command(char *line, bool whole)
         s_nap_now = true;
         return true;
     }
+#if CONFIG_MUSE_BENCH
+    /* Memory report for the bench, in bytes: internal RAM free, lowest ever and
+     * largest block, DMA and PSRAM free (PSRAM's lowest ever too), and the LVGL
+     * task's unused stack, -1 when no task is named "lvgl". */
+    if (!strcmp(line, "mem")) {
+        TaskHandle_t lvgl = xTaskGetHandle("lvgl");
+        int lvgl_stack_free =
+            lvgl ? (int)(uxTaskGetStackHighWaterMark(lvgl) * sizeof(StackType_t)) : -1;
+        printf("@mem {\"int_free\":%u,\"int_min\":%u,\"int_largest\":%u,\"dma_free\":%u,"
+               "\"psram_free\":%u,\"psram_min\":%u,\"lvgl_stack_free\":%d}\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), lvgl_stack_free);
+        fflush(stdout);
+        return true;
+    }
+#endif
 #if LV_USE_SNAPSHOT
     if (!strcmp(line, "ui.demo=1") || !strcmp(line, "ui.demo=0")) {
         muse_ui_bench_demo(!strcmp(line, "ui.demo=1"));

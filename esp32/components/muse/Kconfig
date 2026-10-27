@@ -255,6 +255,17 @@ menu "Muse"
             line of /usr/share/zoneinfo/<Area>/<City> on Linux or macOS
             gives yours.
 
+    config MUSE_BENCH
+        bool "Bench extras: screenshots' page selection, injected touch, memory report"
+        depends on MUSE_ENABLED
+        default n
+        help
+            Console commands for bench testing over the USB cable, left out
+            of normal builds; devices/sdkconfig.muse-bench turns them on.
+            ">mem" prints one "@mem" line of JSON, in bytes: free, lowest-ever
+            free and largest free internal RAM, free DMA-capable RAM, free and
+            lowest-ever free PSRAM, and what is left of the LVGL task's stack.
+
     config MUSE_JC3248W535_MIC_GPIO
         int "JC3248W535: GPIO for an external I2S mic's data (SD) line"
         depends on MUSE_BOARD_GUITION_JC3248W535

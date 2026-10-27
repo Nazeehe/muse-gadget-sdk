@@ -2128,6 +2128,8 @@ static session_result_t run_session(stack_monitor_t *stack) {
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
             goto cleanup;
         }
+        // Once per session: the registration's size, against the 8 KB it's printed into.
+        ESP_LOGI(TAG, "link.register %u bytes", (unsigned)strlen(reg_json));
         control_tx = {reg_json, strlen(reg_json), 0, false, session_generation};
         control_tx.is_registration = true;
     }

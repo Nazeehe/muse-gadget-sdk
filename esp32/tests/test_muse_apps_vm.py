@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""apps_vm, the Lua state every Muse app runs in: the capped heap, the sandbox, text-only loading.
+"""apps_vm, the Lua state every Muse app runs in: the capped heap, the sandbox, text-only
+loading, instruction budgets and the kill.
 
 Each test runs one case of tests/muse_apps_vm_harness.c, which prints what it got when the
 case fails. Every case also ends with the harness's counting allocator at 0 bytes.
 """
 
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +29,8 @@ import apps_host
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
+SOURCES = [ROOT / "tests/muse_apps_vm_harness.c", APPS / "apps_vm.c", APPS / "apps_suggest.c"]
+INCLUDES = [ROOT / "components/lua/src", APPS]
 
 
 class MuseAppsVmTest(unittest.TestCase):
@@ -34,22 +38,19 @@ class MuseAppsVmTest(unittest.TestCase):
     def setUpClass(cls):
         tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(tmp.cleanup)
-        cls.harness = apps_host.build(
-            "muse_apps_vm_harness",
-            [ROOT / "tests/muse_apps_vm_harness.c", APPS / "apps_vm.c", APPS / "apps_suggest.c",
-             *apps_host.lua_sources()],
-            tmp.name,
-            include_dirs=[ROOT / "components/lua/src", APPS],
-        )
+        cls.tmp = tmp.name
+        cls.harness = apps_host.build("muse_apps_vm_harness", [*SOURCES, *apps_host.lua_sources()], tmp.name,
+                                      include_dirs=INCLUDES)
 
-    def run_case(self, case: str, timeout: float = 60) -> None:
+    def run_case(self, case: str, timeout: float = 60, harness=None) -> subprocess.CompletedProcess:
         try:
-            done = apps_host.run(self.harness, case, timeout=timeout)
+            done = apps_host.run(harness or self.harness, case, timeout=timeout)
         except subprocess.TimeoutExpired:
             done = None
         if done is None:
             self.fail(f"{case} took more than {timeout} s")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return done
 
     def test_bytecode_is_refused(self):
         self.run_case("bytecode")
@@ -128,6 +129,51 @@ class MuseAppsVmTest(unittest.TestCase):
 
     def test_suggest_rule(self):
         self.run_case("suggest")
+
+    # Budgets and the kill (Task 5). The kill cases' timeouts are short: a kill that doesn't
+    # land leaves a loop running until the budget, seconds later, or for ever.
+    def test_infinite_loop_killed(self):
+        self.run_case("infinite_loop", timeout=10)
+
+    def test_wall_clock_backstop(self):
+        self.run_case("wall_clock", timeout=10)
+
+    def test_kill_not_swallowed(self):
+        self.run_case("kill_not_swallowed", timeout=30)
+
+    def test_memory_exhaustion_is_a_kill(self):
+        self.run_case("memory_kill", timeout=10)
+
+    def test_garbage_churn_near_the_cap_completes(self):
+        # Ruling A2: a refusal is answered by an emergency collection, not a kill.
+        self.run_case("churn", timeout=10)
+
+    def test_external_kill(self):
+        self.run_case("external_kill", timeout=10)
+
+    def test_yield_through_pcall(self):
+        self.run_case("yield_through_pcall")
+
+    def test_deep_recursion_errors_not_crashes(self):
+        self.run_case("deep_recursion")
+
+    def test_c_stack_cases_fit_task_stack(self):
+        # The brief's test_c_stack_cases_fit_32k_thread, renamed for the Task 5 ruling: the app
+        # task's stack is 56 KB on the device, so each case runs to Lua's C-call limit on an
+        # exact 96 KB region (host frames are 1.5-1.7 times Xtensa's), in a build without the
+        # sanitizers, which fatten frames. The high-water marks go to the log.
+        harness = apps_host.build("muse_apps_vm_stack", [*SOURCES, *apps_host.lua_sources()], self.tmp,
+                                  include_dirs=INCLUDES, sanitize=False)
+        done = self.run_case("c_stack", harness=harness)
+        print(done.stdout, end="", file=sys.stderr, flush=True)
+
+    def test_traceback_has_app_frames(self):
+        self.run_case("traceback")
+
+    def test_call_contract(self):
+        # Stack and err on every outcome, in_call and its start, per-call budgets, a call
+        # inside a call, apps_vm_check.
+        self.run_case("call_contract", timeout=10)
 
 
 if __name__ == "__main__":

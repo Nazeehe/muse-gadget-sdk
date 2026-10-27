@@ -23,6 +23,7 @@
 
 #include "apps_vm.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -32,13 +33,45 @@
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
+/* The count hook's period, in VM instructions. */
+#define HOOK_EVERY 1000
+
+/* Room for a kill reason apps_vm formats: the longest, with a 10-digit budget, is 97 bytes. */
+#define KILL_REASON_MAX 128
+
 struct apps_vm {
     apps_vm_config_t cfg;
     lua_State *L;
     size_t mem_used;      /* bytes the Lua heap holds; never more than cfg.mem_limit */
     size_t mem_peak;      /* the most it has held */
     size_t mem_refusals;  /* requests answered with NULL */
+
+    /* Only the task running the VM touches these. */
+    int depth;                   /* apps_vm_call nesting: 0 between calls */
+    uint32_t budget;             /* the outermost call's, in VM instructions */
+    uint64_t call_instructions;  /* run since the outermost call began */
+    uint64_t instructions;       /* run in the VM's lifetime */
+    int64_t started_ms;          /* now_ms() when the outermost call began */
+
+    /* Other tasks read these, and apps_vm_kill writes the reason. Atomic loads and stores
+     * only, which need nothing of the platform: on the device the struct is in PSRAM, where
+     * the S3 has no hardware compare-and-set. */
+    _Atomic(const char *) kill_reason;  /* NULL until the VM is killed, then never NULL again */
+    atomic_bool in_call;
+    _Atomic int64_t call_started_ms;
+
+    /* The reasons apps_vm formats when it kills, each written at most once, before
+     * kill_reason points at it. */
+    char budget_reason[KILL_REASON_MAX];
+    char nomem_reason[KILL_REASON_MAX];
 };
+
+/* The VM a state, or any of its coroutines, belongs to: the allocator's user data. */
+static apps_vm_t *vm_of(lua_State *L) {
+    void *ud;
+    lua_getallocf(L, &ud);
+    return ud;
+}
 
 /* ---- Text helpers ---- */
 
@@ -63,6 +96,41 @@ static void copy_message(char *out, size_t cap, const char *msg) {
     }
     memcpy(out, msg, n);
     out[n] = '\0';
+}
+
+/* Text written into a fixed buffer, always terminated. Once something has to be cut,
+ * nothing more is written. */
+typedef struct {
+    char *buf;
+    size_t cap, len;
+    bool full;
+} text_t;
+
+static void text_put(text_t *t, const char *s, size_t n) {
+    if (t->full) {
+        return;
+    }
+    size_t room = t->cap - 1 - t->len;
+    if (n > room) {
+        n = utf8_cut(s, room);
+        t->full = true;
+    }
+    if (n > 0) {
+        memcpy(t->buf + t->len, s, n);
+        t->len += n;
+    }
+    t->buf[t->len] = '\0';
+}
+
+/* Whether s[0, n) holds what. */
+static bool contains(const char *s, size_t n, const char *what) {
+    size_t m = strlen(what);
+    for (size_t i = 0; m <= n && i <= n - m; i++) {
+        if (memcmp(s + i, what, m) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ---- The capped heap ---- */
@@ -443,9 +511,7 @@ static int sandbox_rep(lua_State *L) {
 /* The most elements this app's heap could hold. A count past it can only be a lying
  * __len or a range with nothing in it, which Lua would still walk element by element. */
 static lua_Unsigned slot_limit(lua_State *L) {
-    void *ud;
-    lua_getallocf(L, &ud);
-    return ((const apps_vm_t *)ud)->cfg.mem_limit / SLOT_BYTES;
+    return vm_of(L)->cfg.mem_limit / SLOT_BYTES;
 }
 
 static int too_many(lua_State *L, const char *fn) {
@@ -577,6 +643,371 @@ static void wrap_lua_own(lua_State *L, const char *name, lua_CFunction wrapper) 
     lua_setfield(L, -2, name);
 }
 
+/* ---- Budgets and the kill ----
+ *
+ * A kill is the VM's kill_reason going from NULL to a reason, for good. It is raised as
+ * the sentinel below, but every check is of kill_reason, never of the error object: a
+ * __close handler can replace the error while it unwinds. */
+
+static char kill_sentinel;
+
+#define WALL_REASON "stopped: one callback ran longer than 1 s"
+
+static const char *kill_reason(const apps_vm_t *vm) {
+    return atomic_load(&vm->kill_reason);
+}
+
+/* Kills the VM unless it is dying already. Any task: a load and a store, so two kills at
+ * the same moment leave one of their reasons, never a torn one. */
+static void set_kill(apps_vm_t *vm, const char *reason) {
+    if (atomic_load(&vm->kill_reason) == NULL) {
+        atomic_store(&vm->kill_reason, reason);
+    }
+}
+
+/* head, n in decimal, then tail, into out (KILL_REASON_MAX bytes). No allocation, and
+ * hardly any stack: the hook can kill at the deepest point of a call. */
+static const char *format_reason(char *out, const char *head, unsigned n, const char *tail) {
+    char digits[10];
+    size_t count = 0;
+    do {
+        digits[count++] = (char)('0' + n % 10);
+        n /= 10;
+    } while (n > 0);
+    text_t t = {out, KILL_REASON_MAX, 0, false};
+    text_put(&t, head, strlen(head));
+    while (count > 0) {
+        text_put(&t, &digits[--count], 1);
+    }
+    text_put(&t, tail, strlen(tail));
+    return out;
+}
+
+static void kill_over_budget(apps_vm_t *vm) {
+    if (kill_reason(vm) == NULL) {
+        set_kill(vm, format_reason(vm->budget_reason, "stopped: ran more than ", (unsigned)vm->budget,
+                                   " VM instructions in one callback (use timer.every for long work)"));
+    }
+}
+
+/* A LUA_ERRMEM reached a protected call: Lua's emergency collection couldn't make room
+ * (ruling A2). */
+static void kill_for_memory(apps_vm_t *vm) {
+    if (kill_reason(vm) == NULL) {
+        set_kill(vm, format_reason(vm->nomem_reason, "out of memory: this app may use ",
+                                   (unsigned)(vm->cfg.mem_limit / 1024), " KB (memory_kb in manifest.json)"));
+    }
+}
+
+static apps_call_t kill_status(const apps_vm_t *vm, const char *reason) {
+    return reason == vm->nomem_reason ? APPS_CALL_NOMEM : APPS_CALL_KILLED;
+}
+
+static void vm_hook(lua_State *L, lua_Debug *ar);
+
+/* Raises the kill on L, the running thread, after setting its hook to run before every
+ * instruction: the __close handlers Lua runs while the kill unwinds then stop before their
+ * first. lua_sethook is safe here, on the task running the VM; it isn't from another task
+ * (ruling A15). Needs one free stack slot. */
+static void raise_kill_here(lua_State *L) {
+    lua_sethook(L, vm_hook, LUA_MASKCOUNT, 1);
+    lua_pushlightuserdata(L, &kill_sentinel);
+    lua_error(L);
+}
+
+/* raise_kill_here from one of the C functions below, dropping its stack first (none marks
+ * a slot to-be-closed) so that the push has room whatever a call left. */
+static int raise_kill(lua_State *L) {
+    lua_settop(L, 0);
+    raise_kill_here(L);
+    return 0;
+}
+
+/* The count hook, every HOOK_EVERY instructions in every coroutine. Inside a call it kills
+ * a call that is over its budget or over APPS_WALL_MS; any time, it raises the kill once
+ * the VM is dying. Lua runs it with hooks off, and a message handler the raise reaches
+ * runs inside it, hooks still off: both message handlers let a kill through untouched. */
+static void vm_hook(lua_State *L, lua_Debug *ar) {
+    (void)ar;
+    apps_vm_t *vm = vm_of(L);
+    if (kill_reason(vm) == NULL) {
+        vm->instructions += HOOK_EVERY;
+        vm->call_instructions += HOOK_EVERY;
+        if (vm->depth > 0) {
+            if (vm->call_instructions > vm->budget) {
+                kill_over_budget(vm);
+            } else if (vm->cfg.now_ms() - vm->started_ms > APPS_WALL_MS) {
+                set_kill(vm, WALL_REASON);
+            }
+        }
+        if (kill_reason(vm) == NULL) {
+            return;
+        }
+    }
+    raise_kill_here(L);  /* a hook gets LUA_MINSTACK free slots */
+}
+
+/* The most of an error message apps_vm_call's traceback copies: the copy is in the Lua heap,
+ * and a huge message near the cap would turn an app's error into running out of memory. */
+#define TRACE_MSG_MAX 1024
+
+/* apps_vm_call's message handler, run where the error was raised: the message, then Lua's
+ * traceback, which put_error trims to the app's frames. A kill goes through untouched and
+ * allocates nothing: when the hook raised it, this runs inside the hook. */
+static int traceback_handler(lua_State *L) {
+    if (kill_reason(vm_of(L)) != NULL) {
+        return 1;
+    }
+    size_t len;
+    const char *msg = lua_tolstring(L, 1, &len);
+    if (msg == NULL) {
+        msg = lua_pushfstring(L, "(error object is a %s value)", luaL_typename(L, 1));
+    } else if (len > TRACE_MSG_MAX) {
+        msg = lua_pushlstring(L, msg, utf8_cut(msg, TRACE_MSG_MAX));
+    }
+    luaL_traceback(L, L, msg, 1);
+    return 1;
+}
+
+/* The error on top of the stack into out (cap bytes, cut on a character boundary): the
+ * message, then the traceback without its "[C]:" and "(...tail calls...)" lines. The
+ * traceback is what follows the last "\nstack traceback:": a message can hold that text,
+ * a frame line can't. */
+static void put_error(lua_State *L, char *out, size_t cap) {
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    if (lua_type(L, -1) != LUA_TSTRING) {
+        snprintf(out, cap, "(error object is a %s value)", luaL_typename(L, -1));
+        return;
+    }
+    static const char header[] = "\nstack traceback:";
+    const size_t header_len = sizeof header - 1;
+    size_t len;
+    const char *s = lua_tolstring(L, -1, &len), *end = s + len, *tb = NULL;
+    for (size_t i = len >= header_len ? len - header_len + 1 : 0; i-- > 0;) {
+        if (memcmp(s + i, header, header_len) == 0) {
+            tb = s + i;
+            break;
+        }
+    }
+    text_t t = {out, cap, 0, false};
+    out[0] = '\0';
+    if (tb == NULL) {
+        text_put(&t, s, len);
+        return;
+    }
+    const char *line = tb + header_len;
+    text_put(&t, s, (size_t)(line - s));
+    while (line < end) {  /* each line starts at its '\n' */
+        const char *next = memchr(line + 1, '\n', (size_t)(end - line - 1));
+        size_t n = (size_t)((next != NULL ? next : end) - line);
+        if (!contains(line, n, "[C]:") && !contains(line, n, "(...tail calls...)")) {
+            text_put(&t, line, n);
+        }
+        line += n;
+    }
+}
+
+/* ---- pcall, xpcall and coroutines that can't keep a kill ----
+ *
+ * Lua's own, except that each raises the kill again once its protected call or its resume
+ * returns, also after a yield, and a memory error that reaches one kills first. */
+
+/* After pcall's or xpcall's protected call: called by them, and by Lua as the continuation
+ * when the call yielded, so both stay yieldable in a coroutine. extra is how many values
+ * lie below the results. */
+static int finish_pcall(lua_State *L, int status, lua_KContext extra) {
+    apps_vm_t *vm = vm_of(L);
+    if (status == LUA_ERRMEM) {
+        kill_for_memory(vm);
+    }
+    if (kill_reason(vm) != NULL) {
+        return raise_kill(L);
+    }
+    if (status != LUA_OK && status != LUA_YIELD) {
+        lua_pushboolean(L, 0);
+        lua_pushvalue(L, -2);  /* the error */
+        return 2;
+    }
+    return lua_gettop(L) - (int)extra;
+}
+
+static int sandbox_pcall(lua_State *L) {
+    apps_vm_check(L);
+    luaL_checkany(L, 1);
+    lua_pushboolean(L, 1);
+    lua_insert(L, 1);
+    int status = lua_pcallk(L, lua_gettop(L) - 2, LUA_MULTRET, 0, 0, finish_pcall);
+    return finish_pcall(L, status, 0);
+}
+
+/* xpcall's message handler, around the app's (upvalue 1). A kill goes through without the
+ * app's handler seeing it: when the hook raised the kill, the handler would run with hooks
+ * off, and it could return something else. */
+static int guarded_handler(lua_State *L) {
+    if (kill_reason(vm_of(L)) != NULL) {
+        return 1;
+    }
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_insert(L, 1);
+    lua_call(L, 1, 1);
+    return 1;
+}
+
+/* xpcall(f, msgh, ...): Lua's, with msgh behind guarded_handler. The stack becomes
+ * <f, handler, true, f, args...>, and the results start after the first two. */
+static int sandbox_xpcall(lua_State *L) {
+    apps_vm_check(L);
+    int n = lua_gettop(L);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_pushvalue(L, 2);
+    lua_pushcclosure(L, guarded_handler, 1);
+    lua_replace(L, 2);
+    lua_pushboolean(L, 1);
+    lua_pushvalue(L, 1);
+    lua_rotate(L, 3, 2);
+    int status = lua_pcallk(L, n - 2, LUA_MULTRET, 2, 2, finish_pcall);
+    return finish_pcall(L, status, 2);
+}
+
+static lua_State *get_co(lua_State *L) {
+    lua_State *co = lua_tothread(L, 1);
+    luaL_argexpected(L, co, 1, "thread");
+    return co;
+}
+
+/* Resumes co with the narg values on top of L: lcorolib's auxresume, plus the kill, raised
+ * in L once co stops. Returns how many results it moved to L, or -1 with the error on top. */
+static int resume_co(lua_State *L, lua_State *co, int narg) {
+    if (!lua_checkstack(co, narg)) {
+        lua_pushliteral(L, "too many arguments to resume");
+        return -1;
+    }
+    lua_xmove(L, co, narg);
+    int nres;
+    int status = lua_resume(co, L, narg, &nres);
+    apps_vm_t *vm = vm_of(L);
+    if (status == LUA_ERRMEM) {
+        kill_for_memory(vm);
+    }
+    if (kill_reason(vm) != NULL) {
+        return raise_kill(L);
+    }
+    if (status == LUA_OK || status == LUA_YIELD) {
+        if (!lua_checkstack(L, nres + 1)) {
+            lua_pop(co, nres);
+            lua_pushliteral(L, "too many results to resume");
+            return -1;
+        }
+        lua_xmove(co, L, nres);
+        return nres;
+    }
+    lua_xmove(co, L, 1);
+    return -1;
+}
+
+static int sandbox_resume(lua_State *L) {
+    apps_vm_check(L);
+    lua_State *co = get_co(L);
+    int r = resume_co(L, co, lua_gettop(L) - 1);
+    if (r < 0) {
+        lua_pushboolean(L, 0);
+        lua_insert(L, -2);
+        return 2;  /* false, the error */
+    }
+    lua_pushboolean(L, 1);
+    lua_insert(L, -(r + 1));
+    return r + 1;  /* true, the results */
+}
+
+/* The function coroutine.wrap returns (the coroutine is upvalue 1): lcorolib's auxwrap.
+ * A coroutine that died of a kill is never closed, which would run its __close handlers:
+ * resume_co raises first. That matters, since a coroutine the hook killed keeps hooks off. */
+static int wrap_call(lua_State *L) {
+    apps_vm_check(L);
+    lua_State *co = lua_tothread(L, lua_upvalueindex(1));
+    int r = resume_co(L, co, lua_gettop(L));
+    if (r >= 0) {
+        return r;
+    }
+    int status = lua_status(co);
+    if (status != LUA_OK && status != LUA_YIELD) {  /* an error in the coroutine */
+        status = lua_closethread(co, L);            /* runs its __close handlers */
+        if (status == LUA_ERRMEM) {
+            kill_for_memory(vm_of(L));
+        }
+        if (kill_reason(vm_of(L)) != NULL) {
+            return raise_kill(L);
+        }
+        lua_xmove(co, L, 1);
+    }
+    if (lua_type(L, -1) == LUA_TSTRING) {  /* never a memory error: that killed */
+        luaL_where(L, 1);
+        lua_insert(L, -2);
+        lua_concat(L, 2);
+    }
+    return lua_error(L);
+}
+
+static int sandbox_wrap(lua_State *L) {
+    apps_vm_check(L);
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    lua_State *co = lua_newthread(L);  /* with the hook, as every coroutine */
+    lua_pushvalue(L, 1);
+    lua_xmove(L, co, 1);
+    lua_pushcclosure(L, wrap_call, 1);
+    return 1;
+}
+
+enum { CO_RUNNING, CO_DEAD, CO_SUSPENDED, CO_NORMAL };
+static const char *const co_status_names[] = {"running", "dead", "suspended", "normal"};
+
+/* lcorolib's auxstatus: co as L sees it. */
+static int co_status(lua_State *L, lua_State *co) {
+    if (L == co) {
+        return CO_RUNNING;
+    }
+    switch (lua_status(co)) {
+        case LUA_YIELD:
+            return CO_SUSPENDED;
+        case LUA_OK: {
+            lua_Debug ar;
+            if (lua_getstack(co, 0, &ar)) {
+                return CO_NORMAL;  /* it has frames: it resumed another */
+            }
+            return lua_gettop(co) == 0 ? CO_DEAD : CO_SUSPENDED;
+        }
+        default:
+            return CO_DEAD;  /* an error ended it */
+    }
+}
+
+/* coroutine.close(co): closes a suspended or dead coroutine, running its __close
+ * handlers. A dying VM refuses before any of them runs (apps_vm_check). */
+static int sandbox_close(lua_State *L) {
+    apps_vm_check(L);
+    lua_State *co = get_co(L);
+    int status = co_status(L, co);
+    if (status != CO_DEAD && status != CO_SUSPENDED) {
+        return luaL_error(L, "cannot close a %s coroutine", co_status_names[status]);
+    }
+    status = lua_closethread(co, L);
+    if (status == LUA_ERRMEM) {
+        kill_for_memory(vm_of(L));
+    }
+    if (kill_reason(vm_of(L)) != NULL) {
+        return raise_kill(L);
+    }
+    if (status == LUA_OK) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    lua_pushboolean(L, 0);
+    lua_xmove(co, L, 1);  /* the error */
+    return 2;
+}
+
 /* ---- The sandbox ---- */
 
 /* Opens the sandbox in L's globals table. Runs under lua_pcall: it allocates, and an
@@ -604,6 +1035,20 @@ static int open_sandbox(lua_State *L) {
     }
     lua_pushcfunction(L, sandbox_setmetatable);
     lua_setfield(L, -2, "setmetatable");
+    /* pcall, xpcall and coroutine's resume, wrap and close that can't keep a kill. */
+    lua_pushcfunction(L, sandbox_pcall);
+    lua_setfield(L, -2, "pcall");
+    lua_pushcfunction(L, sandbox_xpcall);
+    lua_setfield(L, -2, "xpcall");
+    lua_pushliteral(L, LUA_COLIBNAME);
+    lua_rawget(L, -2);
+    lua_pushcfunction(L, sandbox_resume);
+    lua_setfield(L, -2, "resume");
+    lua_pushcfunction(L, sandbox_wrap);
+    lua_setfield(L, -2, "wrap");
+    lua_pushcfunction(L, sandbox_close);
+    lua_setfield(L, -2, "close");
+    lua_pop(L, 1);
 
     /* The string library, also the __index of every string's metatable, so the changes
      * reach s:find() as well as string.find(). */
@@ -653,6 +1098,9 @@ apps_vm_t *apps_vm_new(const apps_vm_config_t *cfg) {
         return NULL;
     }
     *vm = (apps_vm_t){.cfg = *cfg};
+    atomic_init(&vm->kill_reason, NULL);
+    atomic_init(&vm->in_call, false);
+    atomic_init(&vm->call_started_ms, 0);
     vm->L = lua_newstate(vm_alloc, vm);
     if (vm->L == NULL) {
         cfg->free_fn(vm);
@@ -665,6 +1113,9 @@ apps_vm_t *apps_vm_new(const apps_vm_config_t *cfg) {
         cfg->free_fn(vm);
         return NULL;
     }
+    /* Set once, on the main thread, before any coroutine exists: lua_newthread copies it.
+     * Never set again: lua_sethook isn't safe from another task (ruling A15). */
+    lua_sethook(vm->L, vm_hook, LUA_MASKCOUNT, HOOK_EVERY);
     return vm;
 }
 
@@ -727,31 +1178,90 @@ size_t apps_vm_mem_refusals(const apps_vm_t *vm) {
     return vm->mem_refusals;
 }
 
-/* ---- Excerpt ---- */
+apps_call_t apps_vm_call(apps_vm_t *vm, int nargs, int nresults, uint32_t budget, char *err, size_t err_len) {
+    lua_State *L = vm->L;
+    int fn = lua_gettop(L) - nargs;  /* the function's index */
+    if (nargs < 0 || fn < 1) {
+        copy_message(err, err_len, "apps_vm_call: no function to call");
+        return APPS_CALL_ERROR;
+    }
+    if (kill_reason(vm) == NULL && !lua_checkstack(L, 1)) {
+        kill_for_memory(vm);  /* no room for the message handler */
+    }
+    const char *reason = kill_reason(vm);
+    if (reason != NULL) {
+        lua_settop(L, fn - 1);
+        copy_message(err, err_len, reason);
+        return kill_status(vm, reason);
+    }
 
-/* Text written into a fixed buffer, always terminated. Once something has to be cut,
- * nothing more is written. */
-typedef struct {
-    char *buf;
-    size_t cap, len;
-    bool full;
-} text_t;
+    lua_pushcfunction(L, traceback_handler);
+    lua_insert(L, fn);
+    bool outer = vm->depth == 0;
+    if (outer) {
+        vm->budget = budget;
+        vm->call_instructions = 0;
+        vm->started_ms = vm->cfg.now_ms();
+        atomic_store(&vm->call_started_ms, vm->started_ms);
+        atomic_store(&vm->in_call, true);
+    }
+    vm->depth++;
+    int status = lua_pcall(L, nargs, nresults, fn);
+    vm->depth--;
+    if (outer) {
+        atomic_store(&vm->in_call, false);
+    }
+    if (status == LUA_ERRMEM) {
+        kill_for_memory(vm);
+    }
 
-static void text_put(text_t *t, const char *s, size_t n) {
-    if (t->full) {
-        return;
+    /* A kill wins, even over a call that returned before the hook saw it. */
+    reason = kill_reason(vm);
+    if (status == LUA_OK && reason == NULL) {
+        lua_remove(L, fn);
+        copy_message(err, err_len, "");
+        return APPS_CALL_OK;
     }
-    size_t room = t->cap - 1 - t->len;
-    if (n > room) {
-        n = utf8_cut(s, room);
-        t->full = true;
+    apps_call_t result = APPS_CALL_ERROR;
+    if (reason != NULL) {
+        copy_message(err, err_len, reason);
+        result = kill_status(vm, reason);
+    } else {
+        put_error(L, err, err_len);
     }
-    if (n > 0) {
-        memcpy(t->buf + t->len, s, n);
-        t->len += n;
-    }
-    t->buf[t->len] = '\0';
+    lua_settop(L, fn - 1);
+    return result;
 }
+
+void apps_vm_kill(apps_vm_t *vm, const char *reason) {
+    if (vm != NULL) {
+        set_kill(vm, reason != NULL ? reason : "stopped");
+    }
+}
+
+bool apps_vm_dying(const apps_vm_t *vm) {
+    return kill_reason(vm) != NULL;
+}
+
+void apps_vm_check(lua_State *L) {
+    if (kill_reason(vm_of(L)) != NULL) {
+        raise_kill_here(L);
+    }
+}
+
+bool apps_vm_in_call(const apps_vm_t *vm) {
+    return atomic_load(&vm->in_call);
+}
+
+int64_t apps_vm_call_started_ms(const apps_vm_t *vm) {
+    return atomic_load(&vm->call_started_ms);
+}
+
+uint64_t apps_vm_instructions(const apps_vm_t *vm) {
+    return vm->instructions;
+}
+
+/* ---- Excerpt ---- */
 
 /* The line in the first ":<digits>:" of msg, or 0. */
 static int message_line(const char *msg) {

@@ -36,6 +36,23 @@
  * "did you mean" when a name is near, or advice for a library left out (io, debug,
  * load...); assigning one defines it. Strictness lives in the table's __index, so C
  * code reads globals with lua_rawget: lua_getglobal of a missing name raises.
+ *
+ * CPU and memory: app code can't hang or crash the gadget.
+ * - A count hook runs every 1000 VM instructions, in every coroutine (lua_newthread
+ *   copies it). Inside apps_vm_call it stops a call that has run more than its budget of
+ *   instructions, or for longer than APPS_WALL_MS.
+ * - A stop is a kill, and a kill is for good: the VM is dying from then on, and no app
+ *   code runs in it again. The kill is raised as an error app code can't keep: the
+ *   sandbox's pcall, xpcall and coroutine resume, wrap and close raise it again once
+ *   their call returns, and xpcall's handler is never called with it.
+ * - Out of memory: the allocator only refuses, and Lua collects garbage and retries
+ *   before it raises LUA_ERRMEM (ruling A2). A LUA_ERRMEM that reaches pcall, xpcall,
+ *   the coroutine functions or apps_vm_call kills the VM.
+ * - A kill lands within 1000 VM instructions; a C function runs to its end first, which
+ *   the bounds above keep short. Spec §8.2 re-arms the hook with a count of 1 at once:
+ *   lua_sethook from another task isn't safe (ruling A15). Once the kill is raised, each
+ *   thread it passes through re-arms its own hook with a count of 1, so the __close
+ *   handlers Lua runs while it unwinds stop before their first instruction.
  */
 
 #include <stdbool.h>
@@ -78,6 +95,51 @@ bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t 
 size_t apps_vm_mem_used(const apps_vm_t *vm);
 size_t apps_vm_mem_peak(const apps_vm_t *vm);
 size_t apps_vm_mem_refusals(const apps_vm_t *vm);
+
+/* ---- Budgets and the kill ----
+ *
+ * Every function here runs on the task that runs the VM, except apps_vm_kill,
+ * apps_vm_dying, apps_vm_in_call and apps_vm_call_started_ms, which any task may call.
+ */
+
+typedef enum { APPS_CALL_OK = 0, APPS_CALL_ERROR, APPS_CALL_KILLED, APPS_CALL_NOMEM } apps_call_t;
+#define APPS_BUDGET_CALL  2000000u   /* VM instructions per callback; Task 27 tunes */
+#define APPS_BUDGET_START 5000000u   /* load + start() */
+#define APPS_WALL_MS      1000
+
+/*
+ * Calls the function on top of the stack, below its nargs arguments, with at most
+ * budget VM instructions and APPS_WALL_MS of time.
+ * - APPS_CALL_OK: its nresults results (all of them for LUA_MULTRET) replace the function
+ *   and the arguments; err is "".
+ * - Otherwise the function and the arguments are popped and err says why, cut to err_len
+ *   on a character boundary:
+ *   - APPS_CALL_ERROR: "message\nstack traceback:\n\t…", the app's frames only (no "[C]:"
+ *     or "(...tail calls...)" line), the message cut at 1 KB;
+ *   - APPS_CALL_KILLED, APPS_CALL_NOMEM: the kill's reason, with no traceback. A dying VM
+ *     returns one of them at once and runs nothing.
+ * For the C code that drives the VM: it runs on the VM's main thread. A C function Lua
+ * calls runs Lua with lua_call, under the call in progress. A call nested anyway (from such
+ * a function, on the main thread) runs under the outer call's budget and time.
+ */
+apps_call_t apps_vm_call(apps_vm_t *vm, int nargs, int nresults, uint32_t budget, char *err, size_t err_len);
+
+/* Kills the VM: from now on it is dying, with reason (a static string) as apps_vm_call's
+ * err. A running call stops within 1000 VM instructions. Any task: it only stores the
+ * reason; the first kill's reason stays. */
+void apps_vm_kill(apps_vm_t *vm, const char *reason);
+/* Whether the VM has been killed. Any task. */
+bool apps_vm_dying(const apps_vm_t *vm);
+/* Every C function the sandbox gives apps calls this first: when the VM is dying it
+ * raises the kill, so a binding starts no work for a dying app. It pushes one value
+ * before raising, which the slots Lua guarantees a C function hold. */
+void apps_vm_check(lua_State *L);
+/* Whether apps_vm_call is running, and since when (now_ms() when the outermost call
+ * began). Any task: the supervisor reads them to spot a hung app. */
+bool apps_vm_in_call(const apps_vm_t *vm);
+int64_t apps_vm_call_started_ms(const apps_vm_t *vm);
+/* VM instructions run in the VM's lifetime, counted 1000 at a time by the hook. */
+uint64_t apps_vm_instructions(const apps_vm_t *vm);
 
 /*
  * "msg\n 41| …\n>42| …\n 43| …" for a "name:42: …" message about src (the first

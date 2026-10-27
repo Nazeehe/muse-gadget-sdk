@@ -22,12 +22,16 @@
  * end at 0 bytes: that is the leak check, since LeakSanitizer doesn't run on macOS.
  */
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "apps_suggest.h"
 #include "apps_vm.h"
@@ -99,8 +103,14 @@ static void count_free(void *ptr) {
     }
 }
 
+/* The VM's clock: each read returns fake_ms, then moves it on by fake_step (0 but in the
+ * wall-clock case). */
+static int64_t fake_ms, fake_step;
+
 static int64_t fake_now_ms(void) {
-    return 0;
+    int64_t now = fake_ms;
+    fake_ms += fake_step;
+    return now;
 }
 
 static apps_vm_t *new_vm(size_t mem_limit) {
@@ -422,7 +432,7 @@ static void sandbox_contents(void) {
     CHECK(rc == LUA_OK, "rc=%d %s", rc, rc == -1 ? err : top_text(L));
     if (rc == LUA_OK) {
         /* Base without dofile loadfile load collectgarbage warn require print, setmetatable
-         * wrapped, pcall and xpcall as Lua has them until Task 5; the five libraries. */
+         * wrapped, pcall and xpcall replaced (kill-safe); the five libraries. */
         static const char globals[] =
             "_G _VERSION assert coroutine error getmetatable ipairs math next pairs pcall rawequal rawget "
             "rawlen rawset select setmetatable string table tonumber tostring type utf8 xpcall";
@@ -780,11 +790,12 @@ static void split_linear(void) {
     "getmetatable('').__index = string.lower\n" \
     "local t = setmetatable({}, {__index = ''})\n"
 
-/* What src raises in a stock state (base, string, table, math), named main.lua: the
- * wrappers must keep Lua's own argument errors. */
+/* What src raises in a stock state (base, coroutine, string, table, math), named
+ * main.lua: the wrappers must keep Lua's own argument errors. */
 static void stock_error(const char *src, char *out, size_t cap) {
     lua_State *S = luaL_newstate();
     luaL_requiref(S, LUA_GNAME, luaopen_base, 1);
+    luaL_requiref(S, LUA_COLIBNAME, luaopen_coroutine, 1);
     luaL_requiref(S, LUA_STRLIBNAME, luaopen_string, 1);
     luaL_requiref(S, LUA_TABLIBNAME, luaopen_table, 1);
     luaL_requiref(S, LUA_MATHLIBNAME, luaopen_math, 1);
@@ -1373,6 +1384,865 @@ static void suggest(void) {
     CHECK(apps_suggest("strat", handlers, 6) == handlers[0], "strat");
 }
 
+/* ==== Budgets and the kill (Task 5) ==== */
+
+/* The exact reasons (the brief's), for a budget of n instructions and a cap of kb KB. */
+#define BUDGET_MSG(n) "stopped: ran more than " n " VM instructions in one callback (use timer.every for long work)"
+#define WALL_MSG "stopped: one callback ran longer than 1 s"
+#define NOMEM_MSG(kb) "out of memory: this app may use " kb " KB (memory_kb in manifest.json)"
+
+static const char *call_name(int status) {
+    switch (status) {
+        case -1: return "(load refused)";
+        case APPS_CALL_OK: return "OK";
+        case APPS_CALL_ERROR: return "ERROR";
+        case APPS_CALL_KILLED: return "KILLED";
+        case APPS_CALL_NOMEM: return "NOMEM";
+        default: return "?";
+    }
+}
+
+/* Loads src as main.lua and runs it through apps_vm_call. Returns the apps_call_t, or -1
+ * when apps_vm_load refused src; err gets the message either way. Results stay on the
+ * stack. */
+static int call(apps_vm_t *vm, const char *src, int nresults, uint32_t budget, char *err, size_t err_len) {
+    if (!apps_vm_load(vm, "main.lua", src, strlen(src), err, err_len)) {
+        return -1;
+    }
+    return (int)apps_vm_call(vm, 0, nresults, budget, err, err_len);
+}
+
+/* In a fresh VM of cap bytes, src under APPS_BUDGET_CALL ends with want and err exactly
+ * reason, leaving an empty stack, a dying VM and a heap within its cap. A chunk sets
+ * survived where the value of what should have stopped it would come from: apps_vm_call
+ * reports a kill that landed while a call ran even when something swallowed it, so the
+ * status alone can't show a kill that was swallowed for a few instructions. */
+static void expect_end_at(int line, size_t cap, const char *src, apps_call_t want, const char *reason) {
+    apps_vm_t *vm = new_vm(cap);
+    lua_State *L = apps_vm_lua(vm);
+    char err[512] = "";
+    int rc = call(vm, src, LUA_MULTRET, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK_AT(line, rc == (int)want && strcmp(err, reason) == 0, "%s\n  want %s '%s'\n  got  %s '%s'", src,
+             call_name((int)want), reason, call_name(rc), err);
+    CHECK_AT(line, lua_gettop(L) == 0, "%s\n  left %d values on the stack", src, lua_gettop(L));
+    CHECK_AT(line, raw_global(L, "survived") == LUA_TNIL, "%s\n  ran on after it should have stopped", src);
+    lua_settop(L, 0);
+    CHECK_AT(line, apps_vm_dying(vm) && !apps_vm_in_call(vm), "%s\n  dying %d, in a call %d", src, apps_vm_dying(vm),
+             apps_vm_in_call(vm));
+    CHECK_AT(line, apps_vm_mem_peak(vm) <= cap, "%s\n  peak %zu over the %zu cap", src, apps_vm_mem_peak(vm), cap);
+    apps_vm_free(vm);
+}
+#define expect_killed(src) expect_end_at(__LINE__, 256 * KB, src, APPS_CALL_KILLED, BUDGET_MSG("2000000"))
+#define expect_nomem(src) expect_end_at(__LINE__, 256 * KB, src, APPS_CALL_NOMEM, NOMEM_MSG("256"))
+
+/* src under apps_vm_call returns exactly the values describe() shows as want. */
+static void expect_returns_at(int line, apps_vm_t *vm, const char *src, const char *want) {
+    lua_State *L = apps_vm_lua(vm);
+    char err[512] = "", got[512];
+    int rc = call(vm, src, LUA_MULTRET, APPS_BUDGET_CALL, err, sizeof err);
+    describe(L, got, sizeof got);
+    CHECK_AT(line, rc == APPS_CALL_OK && strcmp(got, want) == 0, "%s\n  want %s\n  got  %s '%s' %s", src, want,
+             call_name(rc), err, got);
+    lua_settop(L, 0);
+}
+#define expect_returns(vm, src, want) expect_returns_at(__LINE__, vm, src, want)
+
+/* src under apps_vm_call fails with exactly want as err. */
+static void expect_error_text_at(int line, apps_vm_t *vm, const char *src, const char *want) {
+    lua_State *L = apps_vm_lua(vm);
+    char err[2048] = "";
+    int rc = call(vm, src, 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK_AT(line, rc == APPS_CALL_ERROR && strcmp(err, want) == 0, "%s\n  want ERROR '%s'\n  got  %s '%s'", src, want,
+             call_name(rc), err);
+    CHECK_AT(line, lua_gettop(L) == 0, "%s\n  left %d values on the stack", src, lua_gettop(L));
+    lua_settop(L, 0);
+}
+#define expect_error_text(vm, src, want) expect_error_text_at(__LINE__, vm, src, want)
+
+/* ---- infinite_loop ---- */
+
+static void infinite_loop(void) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    lua_State *L = apps_vm_lua(vm);
+    char err[512] = "";
+    uint64_t before = apps_vm_instructions(vm);
+    int rc = call(vm, "while true do end", 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, BUDGET_MSG("2000000")) == 0, "got %s '%s'", call_name(rc), err);
+    /* Stopped at the hook's first count past the budget. */
+    uint64_t ran = apps_vm_instructions(vm) - before;
+    CHECK(ran == 2001000, "ran %llu instructions", (unsigned long long)ran);
+    CHECK(lua_gettop(L) == 0 && apps_vm_dying(vm) && !apps_vm_in_call(vm), "stack %d, dying %d, in a call %d",
+          lua_gettop(L), apps_vm_dying(vm), apps_vm_in_call(vm));
+
+    /* For good: the next call runs nothing and says why. */
+    rc = call(vm, "ran = true", 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, BUDGET_MSG("2000000")) == 0, "after the kill: %s '%s'", call_name(rc), err);
+    CHECK(lua_gettop(L) == 0 && raw_global(L, "ran") == LUA_TNIL, "a dying VM ran a chunk");
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+
+    /* The reason gives the call's own budget. */
+    vm = new_vm(256 * KB);
+    rc = call(vm, "local n = 0 while true do n = n + 1 end", 0, 12345, err, sizeof err);
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, BUDGET_MSG("12345")) == 0, "budget 12345: %s '%s'", call_name(rc), err);
+    apps_vm_free(vm);
+}
+
+/* ---- wall_clock ---- */
+
+static void wall_clock(void) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    char err[512] = "";
+    uint64_t before = apps_vm_instructions(vm);
+    fake_step = 600;  /* each read of the clock is 600 ms after the one before */
+    int rc = call(vm, "for i = 1, 1e12 do end", 0, UINT32_MAX, err, sizeof err);
+    fake_step = 0;
+    uint64_t ran = apps_vm_instructions(vm) - before;
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, WALL_MSG) == 0, "got %s '%s'", call_name(rc), err);
+    CHECK(ran <= 10000, "ran %llu instructions: the clock didn't stop it", (unsigned long long)ran);
+    apps_vm_free(vm);
+}
+
+/* ---- kill_not_swallowed ---- */
+
+static void kill_not_swallowed(void) {
+    /* The brief's five, then each with survived where its value would go. */
+    expect_killed("pcall(function() while true do end end) return 'survived'");
+    expect_killed("xpcall(function() while true do end end, function(e) return e end) return 'x'");
+    expect_killed("pcall(coroutine.wrap(function() while true do end end)) return 'x'");
+    expect_killed("local co = coroutine.create(function() while true do end end) return coroutine.resume(co)");
+    expect_killed("local co = coroutine.create(function() coroutine.yield() while true do end end)\n"
+                  "coroutine.resume(co) pcall(coroutine.resume, co) return 1");
+    expect_killed("pcall(function() while true do end end) survived = true");
+    expect_killed("xpcall(function() while true do end end, function(e) return e end) survived = true");
+    expect_killed("pcall(coroutine.wrap(function() while true do end end)) survived = true");
+    expect_killed("local co = coroutine.create(function() while true do end end) coroutine.resume(co) survived = true");
+    expect_killed("local co = coroutine.create(function() coroutine.yield() while true do end end)\n"
+                  "coroutine.resume(co) pcall(coroutine.resume, co) survived = true");
+
+    /* pcall in pcall. */
+    expect_killed("pcall(pcall, function() while true do end end) survived = true");
+    /* xpcall's handler: never run for the kill, which the hook raised with hooks off (this
+     * handler would spin unstopped: the test's timeout), and killed when it spins itself. */
+    expect_killed("xpcall(function() while true do end end, function() while true do end end) survived = true");
+    expect_killed("xpcall(function() while true do end end, function(e) return pcall(error, e) end) survived = true");
+    expect_killed("xpcall(function() error('e') end, function() while true do end end) survived = true");
+    /* In a coroutine, pcall and xpcall recover through their continuation. */
+    expect_killed("local co = coroutine.create(function()\n"
+                  "  pcall(function() while true do end end) survived = true\n"
+                  "end)\n"
+                  "coroutine.resume(co) survived = true");
+    expect_killed("local co = coroutine.wrap(function()\n"
+                  "  xpcall(function() error('e') end, function() while true do end end) survived = true\n"
+                  "end)\n"
+                  "pcall(co) survived = true");
+    /* A yield across pcall, then the loop. */
+    expect_killed("local co = coroutine.wrap(function()\n"
+                  "  pcall(function() coroutine.yield() while true do end end) survived = true\n"
+                  "end)\n"
+                  "co() co() survived = true");
+    /* close of a coroutine whose __close handler is killed, alone and inside pcall. */
+    expect_killed("local co = coroutine.create(function()\n"
+                  "  local x <close> = setmetatable({}, {__close = function() while true do end end})\n"
+                  "  coroutine.yield()\n"
+                  "end)\n"
+                  "coroutine.resume(co) coroutine.close(co) survived = true");
+    expect_killed("local co = coroutine.create(function()\n"
+                  "  local x <close> = setmetatable({}, {__close = function() while true do end end})\n"
+                  "  coroutine.yield()\n"
+                  "end)\n"
+                  "coroutine.resume(co) pcall(coroutine.close, co) survived = true");
+    /* The hook killed this coroutine, which leaves its hooks off: wrap mustn't close it,
+     * or the __close handler would spin unstopped (the test's timeout). */
+    expect_killed("local f = coroutine.wrap(function()\n"
+                  "  local x <close> = setmetatable({}, {__close = function() while true do end end})\n"
+                  "  while true do end\n"
+                  "end)\n"
+                  "pcall(f) survived = true");
+    /* A __close handler replaces the error while the kill unwinds, at the top and inside
+     * pcall, or yields out of the unwinding in a coroutine. */
+    expect_killed("do\n"
+                  "  local x <close> = setmetatable({}, {__close = function() error('replaced') end})\n"
+                  "  while true do end\n"
+                  "end\n"
+                  "survived = true");
+    expect_killed("pcall(function()\n"
+                  "  local x <close> = setmetatable({}, {__close = function() error('replaced') end})\n"
+                  "  while true do end\n"
+                  "end)\n"
+                  "survived = true");
+    expect_killed("local co = coroutine.wrap(function()\n"
+                  "  pcall(function()\n"
+                  "    local x <close> = setmetatable({}, {__close = function() coroutine.yield('escaped') end})\n"
+                  "    while true do end\n"
+                  "  end)\n"
+                  "  survived = true\n"
+                  "end)\n"
+                  "co() survived = true");
+    /* App code that C calls: a metamethod, a comparator. */
+    expect_killed("pcall(string.format, '%s', setmetatable({}, {__tostring = function() while true do end end}))\n"
+                  "survived = true");
+    expect_killed("pcall(table.sort, {3, 2, 1}, function() while true do end end) survived = true");
+    /* The __close handlers Lua runs while a kill unwinds stop before their first
+     * instruction, at the top, inside pcall, and on a coroutine that passes the kill up. */
+    expect_killed("do\n"
+                  "  local x <close> = setmetatable({}, {__close = function() survived = true end})\n"
+                  "  while true do end\n"
+                  "end");
+    expect_killed("pcall(function()\n"
+                  "  local x <close> = setmetatable({}, {__close = function() survived = true end})\n"
+                  "  while true do end\n"
+                  "end)");
+    expect_killed("local co = coroutine.wrap(function()\n"
+                  "  local x <close> = setmetatable({}, {__close = function() survived = true end})\n"
+                  "  pcall(function() while true do end end)\n"
+                  "end)\n"
+                  "local y <close> = setmetatable({}, {__close = function() survived = true end})\n"
+                  "co()");
+}
+
+/* ---- memory_kill ---- */
+
+static void memory_kill(void) {
+    /* The brief's two. */
+    expect_nomem("pcall(string.rep, 'x', 1 << 24) return 'survived'");
+    expect_nomem("local t = {} for i = 1, 1e7 do t[i] = i end");
+    /* xpcall's handler isn't called for it (Lua calls none for a memory error). */
+    expect_nomem("xpcall(string.rep, function() return 'handled' end, 'x', 1 << 24) return 'x'");
+    /* In coroutines: resume, wrap, pcall inside, and a __close handler that close runs. */
+    expect_nomem("local co = coroutine.create(function() return string.rep('x', 1 << 24) end)\n"
+                 "return coroutine.resume(co)");
+    expect_nomem("return pcall(coroutine.wrap(function() local t = {} for i = 1, 1e7 do t[i] = i end end))");
+    expect_nomem("local co = coroutine.wrap(function() return pcall(string.rep, 'x', 1 << 24) end) return co()");
+    expect_nomem("local co = coroutine.create(function()\n"
+                 "  local x <close> = setmetatable({}, {__close = function() return string.rep('x', 1 << 24) end})\n"
+                 "  coroutine.yield()\n"
+                 "end)\n"
+                 "coroutine.resume(co) return pcall(coroutine.close, co)");
+    /* wrap closes a coroutine an error ended, and its __close handler runs out: without the
+     * kill, Lua's "not enough memory" would go on as a plain error, position in front. */
+    expect_nomem("local f = coroutine.wrap(function()\n"
+                 "  local x <close> = setmetatable({}, {__close = function() return string.rep('x', 1 << 24) end})\n"
+                 "  error('e')\n"
+                 "end)\n"
+                 "pcall(function() f() end) survived = true");
+    /* The cap in the reason is the VM's. */
+    expect_end_at(__LINE__, 100 * KB, "return string.rep('x', 1 << 20)", APPS_CALL_NOMEM, NOMEM_MSG("100"));
+}
+
+/* ---- churn (ruling A2) ---- */
+
+/* full_gc(): collects garbage and returns the bytes the heap holds then. */
+static int full_gc(lua_State *L) {
+    void *vm;
+    lua_getallocf(L, &vm);
+    lua_gc(L, LUA_GCCOLLECT);
+    lua_pushinteger(L, (lua_Integer)apps_vm_mem_used(vm));
+    return 1;
+}
+
+static void churn(void) {
+    const size_t cap = 256 * KB;
+    apps_vm_t *vm = new_vm(cap);
+    lua_State *L = apps_vm_lua(vm);
+    char err[512] = "";
+    lua_pushcfunction(L, full_gc);
+    lua_setglobal(L, "full_gc");
+    /* About 150 KB live, then about 6 MB of garbage made a kilobyte at a time. Lua starts
+     * its next collection at twice the live size, past the cap, so the heap keeps reaching
+     * the cap, and each refusal is met by an emergency collection, not a kill. */
+    static const char src[] =
+        "local live = {}\n"
+        "for i = 1, 150 do live[i] = string.rep(string.char(65 + i % 26), 1000) .. i end\n"
+        "local live_bytes = full_gc()\n"
+        "local n = 0\n"
+        "for round = 1, 4000 do\n"
+        "  local junk = {string.rep('j', 500) .. round, {round}}\n"
+        "  n = n + #junk[1]\n"
+        "end\n"
+        "return #live, live_bytes, n";
+    int rc = call(vm, src, 3, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_OK, "got %s '%s'", call_name(rc), err);
+    if (rc == APPS_CALL_OK) {
+        lua_Integer live = lua_tointeger(L, 2);
+        CHECK(lua_tointeger(L, 1) == 150 && lua_tointeger(L, 3) == 2014893, "the loops didn't finish: %lld %lld",
+              (long long)lua_tointeger(L, 1), (long long)lua_tointeger(L, 3));
+        CHECK(live >= 150 * (lua_Integer)KB && live <= 190 * (lua_Integer)KB, "live %lld bytes", (long long)live);
+    }
+    CHECK(apps_vm_mem_refusals(vm) > 0, "no refusal: the churn never reached the cap");
+    CHECK(apps_vm_mem_peak(vm) <= cap && !apps_vm_dying(vm), "peak %zu, dying %d", apps_vm_mem_peak(vm), apps_vm_dying(vm));
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+}
+
+/* ---- external_kill ---- */
+
+static void *kill_after_50_ms(void *vm) {
+    struct timespec pause = {0, 50 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+    apps_vm_kill(vm, "stopped by test");
+    return NULL;
+}
+
+/* kill_now(): kills its VM, as another task would while C code runs, and returns. */
+static int kill_now(lua_State *L) {
+    void *vm;
+    lua_getallocf(L, &vm);
+    apps_vm_kill(vm, "stopped by test");
+    return 0;
+}
+
+/* A kill that lands while C code runs, before anything raised it: src gets KILLED and runs
+ * nothing after the call that should stop it. */
+static void expect_killed_from_c_at(int line, const char *src) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    lua_State *L = apps_vm_lua(vm);
+    char err[512] = "";
+    lua_pushcfunction(L, kill_now);
+    lua_setglobal(L, "kill_now");
+    int rc = call(vm, src, 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK_AT(line, rc == APPS_CALL_KILLED && strcmp(err, "stopped by test") == 0, "%s\n  got %s '%s'", src, call_name(rc),
+             err);
+    CHECK_AT(line, lua_gettop(L) == 0 && raw_global(L, "survived") == LUA_TNIL, "%s\n  ran on after the kill", src);
+    apps_vm_free(vm);
+}
+#define expect_killed_from_c(src) expect_killed_from_c_at(__LINE__, src)
+
+static void external_kill(void) {
+    /* While the main thread runs, in a coroutine, and inside pcall. The budget would let each
+     * run for many seconds. */
+    static const char *const loops[] = {
+        "while true do end",
+        "coroutine.wrap(function() while true do end end)() survived = true",
+        "pcall(function() while true do end end) survived = true",
+        "local x <close> = setmetatable({}, {__close = function() survived = true end}) while true do end",
+    };
+    for (size_t i = 0; i < sizeof loops / sizeof loops[0]; i++) {
+        apps_vm_t *vm = new_vm(256 * KB);
+        char err[512] = "";
+        pthread_t killer;
+        if (pthread_create(&killer, NULL, kill_after_50_ms, vm) != 0) {
+            CHECK(false, "no thread to kill from");
+            apps_vm_free(vm);
+            return;
+        }
+        int rc = call(vm, loops[i], 0, UINT32_MAX, err, sizeof err);
+        pthread_join(killer, NULL);
+        CHECK(rc == APPS_CALL_KILLED && strcmp(err, "stopped by test") == 0, "%s\n  got %s '%s'", loops[i], call_name(rc), err);
+        CHECK(lua_gettop(apps_vm_lua(vm)) == 0 && apps_vm_dying(vm), "%s: stack %d, dying %d", loops[i],
+              lua_gettop(apps_vm_lua(vm)), apps_vm_dying(vm));
+        CHECK(raw_global(apps_vm_lua(vm), "survived") == LUA_TNIL, "%s: ran on after the kill", loops[i]);
+        apps_vm_free(vm);
+    }
+
+    /* A kill while C code runs: each replacement's own check stops what comes next, and
+     * apps_vm_call reports a kill even when the chunk returned. */
+    expect_killed_from_c("kill_now()");
+    expect_killed_from_c("pcall(kill_now) survived = true");
+    expect_killed_from_c("xpcall(kill_now, function() end) survived = true");
+    expect_killed_from_c("coroutine.resume(coroutine.create(kill_now)) survived = true");
+    expect_killed_from_c("coroutine.wrap(kill_now)() survived = true");
+    expect_killed_from_c("local co = coroutine.create(function()\n"
+                         "  local x <close> = setmetatable({}, {__close = kill_now})\n"
+                         "  coroutine.yield()\n"
+                         "end)\n"
+                         "coroutine.resume(co) coroutine.close(co) survived = true");
+
+    /* A kill between calls: the next call runs nothing. The first kill's reason stays. */
+    apps_vm_t *vm = new_vm(256 * KB);
+    lua_State *L = apps_vm_lua(vm);
+    char err[512] = "";
+    CHECK(!apps_vm_dying(vm), "dying from the start");
+    apps_vm_kill(vm, "stopped by test");
+    apps_vm_kill(vm, "stopped again");
+    CHECK(apps_vm_dying(vm), "apps_vm_kill didn't kill");
+    int rc = call(vm, "ran = true", 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, "stopped by test") == 0, "got %s '%s'", call_name(rc), err);
+    CHECK(lua_gettop(L) == 0 && raw_global(L, "ran") == LUA_TNIL, "a dying VM ran a chunk");
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+}
+
+/* ---- yield_through_pcall ---- */
+
+static void yield_through_pcall(void) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    /* The brief's. */
+    expect_returns(vm, "local co = coroutine.wrap(function() pcall(coroutine.yield, 1) return 2 end) return co(), co()",
+                   "number:1, number:2");
+    /* xpcall too, and pcall's results once resumed. */
+    expect_returns(vm,
+                   "local co = coroutine.wrap(function() xpcall(coroutine.yield, function(e) return e end, 1) return 2 end)\n"
+                   "return co(), co()",
+                   "number:1, number:2");
+    expect_returns(vm,
+                   "local co = coroutine.wrap(function() return pcall(coroutine.yield, 1) end)\n"
+                   "local a = co() return a, co('back')",
+                   "number:1, boolean:true, string:back");
+    /* An error after the resume reaches pcall's continuation, and xpcall's handler. */
+    expect_returns(vm,
+                   "local co = coroutine.wrap(function()\n"
+                   "  return pcall(function() coroutine.yield(1) error('after', 0) end)\n"
+                   "end)\n"
+                   "local a = co() return a, co()",
+                   "number:1, boolean:false, string:after");
+    expect_returns(vm,
+                   "local co = coroutine.wrap(function()\n"
+                   "  return xpcall(function() coroutine.yield(1) error('after', 0) end, function(e) return 'handled ' .. e end)\n"
+                   "end)\n"
+                   "local a = co() return a, co()",
+                   "number:1, boolean:false, string:handled after");
+
+    /* The rest of Lua's coroutine behaviour, through the replacements. */
+    expect_returns(vm,
+                   "local co = coroutine.create(function(a) local b = coroutine.yield(a + 1) return b * 2 end)\n"
+                   "local ok1, v1 = coroutine.resume(co, 1)\n"
+                   "local ok2, v2 = coroutine.resume(co, 10)\n"
+                   "local ok3, e3 = coroutine.resume(co)\n"
+                   "return ok1, v1, ok2, v2, ok3, e3, coroutine.status(co)",
+                   "boolean:true, number:2, boolean:true, number:20, boolean:false, string:cannot resume dead coroutine, "
+                   "string:dead");
+    expect_returns(vm,
+                   "local f = coroutine.wrap(function() error('inside') end)\n"
+                   "local ok, e = pcall(function() f() end) return ok, e",
+                   "boolean:false, string:main.lua:2: main.lua:1: inside");
+    expect_returns(vm,
+                   "local co = coroutine.create(function()\n"
+                   "  local x <close> = setmetatable({}, {__close = function() closed = true end})\n"
+                   "  coroutine.yield()\n"
+                   "end)\n"
+                   "coroutine.resume(co)\n"
+                   "return coroutine.close(co), closed, coroutine.status(co)",
+                   "boolean:true, boolean:true, string:dead");
+    expect_returns(vm,
+                   "local co = coroutine.create(function()\n"
+                   "  local x <close> = setmetatable({}, {__close = function() error('in close', 0) end})\n"
+                   "  coroutine.yield()\n"
+                   "end)\n"
+                   "coroutine.resume(co)\n"
+                   "return coroutine.close(co)",
+                   "boolean:false, string:in close");
+    /* Lua's own errors, word for word. */
+    expect_stock_error(vm, "pcall()");
+    expect_stock_error(vm, "xpcall(type)");
+    expect_stock_error(vm, "xpcall(type, 1)");
+    expect_stock_error(vm, "coroutine.resume(1)");
+    expect_stock_error(vm, "coroutine.wrap(1)");
+    expect_stock_error(vm, "coroutine.close(1)");
+    expect_stock_error(vm, "coroutine.close(coroutine.running())");
+    expect_stock_error(vm, "local f = coroutine.wrap(function() error('inside') end)\nf()");
+    expect_stock_error(vm, "local f = coroutine.wrap(function() return 1 end)\nf() f()");
+    expect_stock_error(vm, "local co = coroutine.wrap(function() coroutine.close(coroutine.running()) end)\nco()");
+    CHECK(!apps_vm_dying(vm), "errors made the VM dying");
+    apps_vm_free(vm);
+}
+
+/* ---- deep_recursion ---- */
+
+/* return ((...(1)...)), n parentheses deep. */
+static void nested_parens(char *out, size_t cap, int n) {
+    size_t len = 0;
+    len += (size_t)snprintf(out + len, cap - len, "return ");
+    for (int i = 0; i < n && len + 1 < cap; i++) {
+        out[len++] = '(';
+    }
+    if (len + 1 < cap) {
+        out[len++] = '1';
+    }
+    for (int i = 0; i < n && len + 1 < cap; i++) {
+        out[len++] = ')';
+    }
+    out[len] = '\0';
+}
+
+static void deep_recursion(void) {
+    static const char lua_recursion[] = "local function f(n) return 1 + f(n + 1) end return f(1)";
+    char err[1024] = "";
+
+    /* Lua-to-Lua recursion runs out of memory at 256 KB... */
+    apps_vm_t *vm = new_vm(256 * KB);
+    lua_State *L = apps_vm_lua(vm);
+    int rc = call(vm, lua_recursion, 1, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK((rc == APPS_CALL_ERROR && strstr(err, "stack overflow") != NULL) || rc == APPS_CALL_NOMEM, "256 KB: %s '%s'",
+          call_name(rc), err);
+    CHECK(lua_gettop(L) == 0, "left %d values", lua_gettop(L));
+    apps_vm_free(vm);
+
+    /* ... and with room, it reaches Lua's own stack limit: an error, with a traceback. */
+    vm = new_vm(64 * MB);
+    L = apps_vm_lua(vm);
+    rc = call(vm, lua_recursion, 1, UINT32_MAX, err, sizeof err);
+    CHECK(rc == APPS_CALL_ERROR && strncmp(err, "main.lua:1: stack overflow\nstack traceback:\n", 44) == 0
+              && strstr(err, "[C]:") == NULL,
+          "64 MB: %s '%s'", call_name(rc), err);
+    CHECK(lua_gettop(L) == 0 && !apps_vm_dying(vm), "stack %d, dying %d", lua_gettop(L), apps_vm_dying(vm));
+    apps_vm_free(vm);
+
+    /* C-level recursion: an __index chain, then the parser. */
+    vm = new_vm(256 * KB);
+    L = apps_vm_lua(vm);
+    rc = call(vm, "local t = setmetatable({}, {__index = function(t, k) return t[k] end}) return t.x", 1, APPS_BUDGET_CALL,
+              err, sizeof err);
+    CHECK(rc == APPS_CALL_ERROR && strstr(err, "C stack overflow") != NULL && strstr(err, "[C]:") == NULL,
+          "__index chain: %s '%s'", call_name(rc), err);
+    char src[512];
+    nested_parens(src, sizeof src, 200);
+    CHECK(!apps_vm_load(vm, "main.lua", src, strlen(src), err, sizeof err)
+              && (strstr(err, "C stack overflow") != NULL || strstr(err, "too many") != NULL),
+          "200 parentheses: '%s'", err);
+    /* Errors, not kills: the VM carries on. */
+    CHECK(lua_gettop(L) == 0 && !apps_vm_dying(vm), "stack %d, dying %d", lua_gettop(L), apps_vm_dying(vm));
+    expect_returns(vm, "return 1 + 1", "number:2");
+    apps_vm_free(vm);
+}
+
+/* ---- traceback ---- */
+
+static void traceback(void) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    /* The brief's: an error in inner, on line 3. */
+    expect_error_text(vm,
+                      "local x = 1\n"
+                      "local y = 2\n"
+                      "local function inner() error('boom') end\n"
+                      "local function outer() inner() return x + y end\n"
+                      "outer()\n",
+                      "main.lua:3: boom\nstack traceback:\n"
+                      "\tmain.lua:3: in upvalue 'inner'\n"
+                      "\tmain.lua:4: in local 'outer'\n"
+                      "\tmain.lua:5: in main chunk");
+    /* A tail call and a C function in between: their lines go, the app's frames around them stay. */
+    expect_error_text(vm,
+                      "local function inner() error('boom') end\n"
+                      "local function tail() return inner() end\n"
+                      "local function cmp(a, b) tail() return a < b end\n"
+                      "table.sort({2, 1}, cmp)\n",
+                      "main.lua:1: boom\nstack traceback:\n"
+                      "\tmain.lua:1: in function <main.lua:1>\n"
+                      "\tmain.lua:3: in function <main.lua:3>\n"
+                      "\tmain.lua:4: in main chunk");
+    /* Only traceback lines are filtered: the message stays whole. */
+    expect_error_text(vm, "error('a [C]: b (...tail calls...)')",
+                      "main.lua:1: a [C]: b (...tail calls...)\nstack traceback:\n\tmain.lua:1: in main chunk");
+    /* A runtime error, an error with no position, and error objects that aren't strings. */
+    expect_error_text(vm, "local t = nil\nreturn t.x",
+                      "main.lua:2: attempt to index a nil value (local 't')\nstack traceback:\n\tmain.lua:2: in main chunk");
+    expect_error_text(vm, "error('plain', 0)", "plain\nstack traceback:\n\tmain.lua:1: in main chunk");
+    expect_error_text(vm, "error(42)", "42\nstack traceback:\n\tmain.lua:1: in main chunk");
+    expect_error_text(vm, "error({})", "(error object is a table value)\nstack traceback:\n\tmain.lua:1: in main chunk");
+    expect_error_text(vm, "error()", "(error object is a nil value)\nstack traceback:\n\tmain.lua:1: in main chunk");
+
+    /* A message over 1 KB is cut at 1 KB on a character boundary, and the traceback
+     * follows: 'x' and 600 two-byte characters keep 'x' and 511 of them. */
+    char want[2048] = "x";
+    for (int i = 0; i < 511; i++) {
+        strcat(want, "\xC3\xA9");
+    }
+    strcat(want, "\nstack traceback:\n\tmain.lua:1: in main chunk");
+    expect_error_text(vm, "error('x' .. string.rep('\\195\\169', 600), 0)", want);
+
+    /* A small err is cut on a character boundary, and always terminated: 4 bytes would end
+     * inside the é. */
+    lua_State *L = apps_vm_lua(vm);
+    char small[16];
+    memset(small, '#', sizeof small);
+    int rc = call(vm, "error('caf\\195\\169 au lait', 0)", 0, APPS_BUDGET_CALL, small, 5);
+    CHECK(rc == APPS_CALL_ERROR && strcmp(small, "caf") == 0, "cap 5: %s '%s'", call_name(rc), small);
+    CHECK(lua_gettop(L) == 0, "left %d values", lua_gettop(L));
+    rc = call(vm, "error('x')", 0, APPS_BUDGET_CALL, NULL, 0);
+    CHECK(rc == APPS_CALL_ERROR && lua_gettop(L) == 0, "no err: %s, %d values", call_name(rc), lua_gettop(L));
+    apps_vm_free(vm);
+}
+
+/* ---- call_contract ---- */
+
+static apps_vm_t *probe_vm;
+static int probe_calls;
+static bool probe_in_call;
+static int64_t probe_started;
+
+/* probe(): a C function for apps, as the bindings are written. Counts the calls that get
+ * past apps_vm_check, and notes what a call looks like from inside. */
+static int probe(lua_State *L) {
+    apps_vm_check(L);
+    probe_calls++;
+    probe_in_call = apps_vm_in_call(probe_vm);
+    probe_started = apps_vm_call_started_ms(probe_vm);
+    return 0;
+}
+
+static int nested_status = -1;
+static bool nested_in_call;
+
+/* nested(f): runs f through apps_vm_call from inside a call, noting its status and whether
+ * the outer call still shows as running, then returns as if nothing happened. */
+static int nested(lua_State *L) {
+    char err[256];
+    lua_pushvalue(L, 1);
+    nested_status = (int)apps_vm_call(probe_vm, 0, 0, UINT32_MAX, err, sizeof err);
+    nested_in_call = apps_vm_in_call(probe_vm);
+    return 0;
+}
+
+static void call_contract(void) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    lua_State *L = apps_vm_lua(vm);
+    char err[512], got[512];
+    probe_vm = vm;
+    lua_pushcfunction(L, probe);
+    lua_setglobal(L, "probe");
+    lua_pushcfunction(L, nested);
+    lua_setglobal(L, "nested");
+
+    /* The results replace the function and its arguments, above what was below them; err
+     * is "". nresults is kept to. */
+    lua_pushliteral(L, "below");
+    CHECK(apps_vm_load(vm, "main.lua", "return ...", 10, err, sizeof err), "%s", err);
+    lua_pushinteger(L, 4);
+    lua_pushinteger(L, 5);
+    strcpy(err, "untouched");
+    int rc = apps_vm_call(vm, 2, LUA_MULTRET, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_OK && err[0] == '\0' && strcmp(describe(L, got, sizeof got), "string:below, number:4, number:5") == 0,
+          "MULTRET: %s '%s' %s", call_name(rc), err, got);
+    lua_settop(L, 1);
+    CHECK(apps_vm_load(vm, "main.lua", "return 1, 2, 3", 14, err, sizeof err), "%s", err);
+    rc = apps_vm_call(vm, 0, 1, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_OK && strcmp(describe(L, got, sizeof got), "string:below, number:1") == 0, "1 result: %s %s",
+          call_name(rc), got);
+    /* An error pops the function and its arguments and leaves what was below. */
+    lua_settop(L, 1);
+    CHECK(apps_vm_load(vm, "main.lua", "error('boom')", 13, err, sizeof err), "%s", err);
+    lua_pushinteger(L, 4);
+    lua_pushinteger(L, 5);
+    rc = apps_vm_call(vm, 2, 1, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_ERROR && strncmp(err, "main.lua:1: boom\nstack traceback:\n", 34) == 0
+              && strcmp(describe(L, got, sizeof got), "string:below") == 0,
+          "error: %s '%s' %s", call_name(rc), err, got);
+    lua_settop(L, 0);
+    /* No function at all: an error, and the stack as it was. */
+    lua_pushinteger(L, 1);
+    rc = apps_vm_call(vm, 1, 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_ERROR && lua_gettop(L) == 1, "no function: %s, %d values", call_name(rc), lua_gettop(L));
+    lua_settop(L, 0);
+
+    /* In a call: in_call, and when it began. Between calls: not in one. */
+    fake_ms = 123456;
+    CHECK(!apps_vm_in_call(vm), "in a call between calls");
+    rc = call(vm, "probe() return true", 1, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_OK && probe_calls == 1 && probe_in_call && probe_started == 123456,
+          "inside: %s '%s', %d calls, in a call %d, started %lld", call_name(rc), err, probe_calls, probe_in_call,
+          (long long)probe_started);
+    CHECK(!apps_vm_in_call(vm), "still in a call after it");
+    lua_settop(L, 0);
+
+    /* The budget is per call: a loop's measured count, run twice under a budget just above
+     * it. The count goes in steps of 1000, from wherever the hook's countdown stood. */
+    static const char loop[] = "local s = 0 for i = 1, 200000 do s = s + i end return s";
+    uint64_t before = apps_vm_instructions(vm);
+    rc = call(vm, loop, 1, APPS_BUDGET_CALL, err, sizeof err);
+    uint64_t used = apps_vm_instructions(vm) - before;
+    CHECK(rc == APPS_CALL_OK && lua_tointeger(L, -1) == 20000100000 && used >= 200000 && used % 1000 == 0,
+          "loop: %s '%s', %llu instructions", call_name(rc), err, (unsigned long long)used);
+    lua_settop(L, 0);
+    for (int i = 0; i < 2; i++) {
+        rc = call(vm, loop, 1, (uint32_t)used + 2000, err, sizeof err);
+        CHECK(rc == APPS_CALL_OK, "run %d under %llu: %s '%s'", i, (unsigned long long)used + 2000, call_name(rc), err);
+        lua_settop(L, 0);
+    }
+
+    /* A call inside a call runs under the outer call's budget, and the outer call still
+     * shows. The C function ignores the kill, and the chunk still runs nothing after it:
+     * the thread that raised the kill raises it again before its next instruction. */
+    rc = call(vm, "nested(function() while true do end end) survived = true", 0, 100000, err, sizeof err);
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, BUDGET_MSG("100000")) == 0 && lua_gettop(L) == 0, "nested: %s '%s'",
+          call_name(rc), err);
+    CHECK(nested_status == APPS_CALL_KILLED && nested_in_call, "inside: %s, in a call %d", call_name(nested_status),
+          nested_in_call);
+    CHECK(raw_global(L, "survived") == LUA_TNIL, "ran on after the nested kill");
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+
+    /* apps_vm_check raises the kill before a binding does any work: here from a chunk run
+     * outside apps_vm_call, after a kill. */
+    vm = new_vm(256 * KB);
+    L = apps_vm_lua(vm);
+    probe_vm = vm;
+    probe_calls = 0;
+    lua_pushcfunction(L, probe);
+    lua_setglobal(L, "probe");
+    apps_vm_kill(vm, "stopped by test");
+    CHECK(apps_vm_load(vm, "main.lua", "probe()", 7, err, sizeof err), "%s", err);
+    rc = lua_pcall(L, 0, 0, 0);
+    CHECK(rc == LUA_ERRRUN && lua_type(L, -1) == LUA_TLIGHTUSERDATA && probe_calls == 0, "rc %d, %s, %d calls", rc,
+          luaL_typename(L, -1), probe_calls);
+    lua_settop(L, 0);
+    /* Outside apps_vm_call too, the hook stops a dying VM's code (the test's timeout). */
+    CHECK(apps_vm_load(vm, "main.lua", "while true do end", 17, err, sizeof err), "%s", err);
+    rc = lua_pcall(L, 0, 0, 0);
+    CHECK(rc == LUA_ERRRUN && lua_type(L, -1) == LUA_TLIGHTUSERDATA, "loop: rc %d, %s", rc, luaL_typename(L, -1));
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+    fake_ms = 0;
+}
+
+/* ---- c_stack (the Task 5 rulings) ----
+ *
+ * The recursion that goes deepest in C, each case to Lua's C-call limit, on a thread
+ * whose stack is exactly TASK_STACK_HOST bytes above a guard page: overflowing it is a
+ * crash, not a silent pass. 96 KB stands in for the device's 56 KB (host frames are about
+ * 1.5-1.7 times Xtensa's), and the build has no sanitizers, which fatten frames. Prints
+ * each case's high-water mark. The device is the authority (Task 15). */
+
+#if defined(__SANITIZE_ADDRESS__)
+#define UNDER_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define UNDER_ASAN 1
+#endif
+#endif
+
+#ifdef UNDER_ASAN
+
+static void c_stack(void) {
+    CHECK(false, "c_stack measures stacks: build it with apps_host.build(..., sanitize=False)");
+}
+
+#else
+
+#define TASK_STACK_HOST (96 * KB)
+
+static char stack_err[512];
+static lua_Integer stack_depth;
+
+/* Runs src through apps_vm_call in a fresh VM: want, with err containing part (or the chunk's
+ * one integer result, the depth it reached, in stack_depth). */
+static void stack_chain(const char *name, const char *src, apps_call_t want, const char *part) {
+    apps_vm_t *vm = new_vm(1 * MB);
+    lua_State *L = apps_vm_lua(vm);
+    int rc = call(vm, src, 1, APPS_BUDGET_CALL, stack_err, sizeof stack_err);
+    CHECK(rc == (int)want && (part == NULL || strstr(stack_err, part) != NULL), "%s: got %s '%s'", name, call_name(rc), stack_err);
+    if (rc == APPS_CALL_OK) {
+        stack_depth = lua_tointeger(L, -1);
+    }
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+}
+
+static void stack_index_chain(void) {
+    stack_chain("index_chain", "local t = setmetatable({}, {__index = function(t, k) return t[k] end}) return t.x",
+                APPS_CALL_ERROR, "C stack overflow");
+}
+
+static void stack_parser(void) {
+    static char src[512];
+    nested_parens(src, sizeof src, 200);
+    apps_vm_t *vm = new_vm(1 * MB);
+    CHECK(!apps_vm_load(vm, "main.lua", src, strlen(src), stack_err, sizeof stack_err)
+              && (strstr(stack_err, "C stack overflow") != NULL || strstr(stack_err, "too many") != NULL),
+          "parser: '%s'", stack_err);
+    apps_vm_free(vm);
+}
+
+static void stack_pcall_chain(void) {
+    stack_chain("pcall_chain",
+                "local depth = 0\n"
+                "local function f(n) depth = n return pcall(f, n + 1) end\n"
+                "f(1)\n"
+                "return depth",
+                APPS_CALL_OK, NULL);
+}
+
+static void stack_resume_chain(void) {
+    stack_chain("resume_chain",
+                "local depth = 0\n"
+                "local function f(n) depth = n return coroutine.resume(coroutine.create(f), n + 1) end\n"
+                "f(1)\n"
+                "return depth",
+                APPS_CALL_OK, NULL);
+}
+
+static void stack_concat_chain(void) {
+    stack_chain("concat_chain",
+                "local t = setmetatable({}, {__index = function(t, k) return table.concat(t, '', 1, 1) end})\n"
+                "return t[1]",
+                APPS_CALL_ERROR, "C stack overflow");
+}
+
+static void stack_tostring_chain(void) {
+    stack_chain("tostring_chain",
+                "local o = setmetatable({}, {__tostring = function(self) return string.format('%s', self) end})\n"
+                "return tostring(o)",
+                APPS_CALL_ERROR, "C stack overflow");
+}
+
+typedef struct {
+    const char *name;
+    void (*run)(void);
+} stack_case_t;
+
+static void *run_stack_case(void *c) {
+    ((stack_case_t *)c)->run();
+    return NULL;
+}
+
+/* Runs c on a thread whose stack is exactly TASK_STACK_HOST bytes: an mmap'd region above a
+ * PROT_NONE page, painted first, so the deepest byte the case changed shows. Returns how
+ * far down that is from the top (the high-water mark), or 0 if the thread didn't run. */
+static size_t on_exact_stack(stack_case_t *c) {
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE), size = TASK_STACK_HOST;
+    unsigned char *map = mmap(NULL, page + size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (map == MAP_FAILED) {
+        CHECK(false, "%s: mmap failed", c->name);
+        return 0;
+    }
+    unsigned char *stack = map + page;
+    int rc = mprotect(map, page, PROT_NONE);
+    memset(stack, 0xA5, size);
+    pthread_attr_t attr;
+    pthread_t thread;
+    pthread_attr_init(&attr);
+    if (rc == 0) {
+        rc = pthread_attr_setstack(&attr, stack, size);
+    }
+    if (rc == 0) {
+        rc = pthread_create(&thread, &attr, run_stack_case, c);
+    }
+    if (rc == 0) {
+        pthread_join(thread, NULL);
+    }
+    pthread_attr_destroy(&attr);
+    size_t untouched = 0;
+    while (untouched < size && stack[untouched] == 0xA5) {
+        untouched++;
+    }
+    munmap(map, page + size);
+    CHECK(rc == 0, "%s: no thread on the exact stack (%d)", c->name, rc);
+    return rc == 0 ? size - untouched : 0;
+}
+
+static void c_stack(void) {
+    static stack_case_t cases[] = {
+        {"index_chain", stack_index_chain},   {"parser", stack_parser},
+        {"pcall_chain", stack_pcall_chain},   {"resume_chain", stack_resume_chain},
+        {"concat_chain", stack_concat_chain}, {"tostring_chain", stack_tostring_chain},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        stack_depth = 0;
+        size_t used = on_exact_stack(&cases[i]);
+        printf("c_stack: %-14s %6zu of %zu bytes", cases[i].name, used, (size_t)TASK_STACK_HOST);
+        if (stack_depth > 0) {
+            printf(" (depth %lld)", (long long)stack_depth);
+        }
+        printf("\n");
+        fflush(stdout);
+        CHECK(used > 0, "%s: the case didn't run", cases[i].name);
+        /* The chains that count their depth went to the limit: past 30 of the 40 levels. */
+        CHECK(stack_depth == 0 || stack_depth > 30, "%s: reached depth %lld", cases[i].name, (long long)stack_depth);
+    }
+}
+
+#endif /* UNDER_ASAN */
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -1402,6 +2272,17 @@ int main(int argc, char **argv) {
         {"new_without_memory", new_without_memory},
         {"excerpt", excerpt},
         {"suggest", suggest},
+        {"infinite_loop", infinite_loop},
+        {"wall_clock", wall_clock},
+        {"kill_not_swallowed", kill_not_swallowed},
+        {"memory_kill", memory_kill},
+        {"churn", churn},
+        {"external_kill", external_kill},
+        {"yield_through_pcall", yield_through_pcall},
+        {"deep_recursion", deep_recursion},
+        {"traceback", traceback},
+        {"call_contract", call_contract},
+        {"c_stack", c_stack},
     };
     if (argc != 2) {
         fputs("usage: muse_apps_vm_harness <case>\n", stderr);

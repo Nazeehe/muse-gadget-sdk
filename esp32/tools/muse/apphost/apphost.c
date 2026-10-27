@@ -39,6 +39,8 @@
  *   {"event":"crash","message":"…"}        the app crashed, as it happens (once: a crash is final): the crash
  *                                          record, the error with its traceback or the kill's reason
  *   {"event":"state","state":"running"}    the `state` command: stopped, running or crashed
+ *   {"event":"dump","widgets":[...]}       the `dump` command: one object an alive widget (apps_ui.h), with
+ *                                          "dropped":N after them when N didn't fit the size asked for
  *   {"event":"leak_check","bytes":0}       --cycles: what the apps' heap still holds
  * stderr is for the command line only (and an unreadable script), never for the app.
  *
@@ -51,6 +53,16 @@
  *   state                  -> state
  *   log [N]                the last N lines of the app's log ring, oldest first (all of them by default), as
  *                          log events. An empty log, and a log of one empty line, print nothing.
+ *   tap #SLOT[@GEN]        a tap on the widget in that slot, with the gen it has now or the one given: its tap
+ *                          handler runs with the app's budget (a crash prints a crash event). A gen the widget
+ *                          has moved on from, a widget with no tap handler and an app that isn't running print
+ *                          nothing: the touch is dropped, as on the gadget. A slot with no widget is an error.
+ *   tap "TEXT"             a tap on the first button or label (in slot order) whose text is TEXT, a JSON string
+ *   dump [N]               the widgets as the gadget reports them (apps_ui_dump), in at most N bytes (all of
+ *                          them by default)
+ * The LVGL task's apply step has no counterpart here but a stand-in that runs after each command: it takes every
+ * request as applied, so a deleted widget's slot is free for the next command, as it is on the gadget after
+ * a frame. Nothing is laid out, so a dump shows the declared geometry.
  * An app whose load failed (a crash event at launch) is a crashed app: `state` says crashed, `message` and
  * `start` answer with its crash record, `log` shows what main.lua printed before it failed, and the rest do
  * nothing. A main.lua that doesn't compile never ran: the crash event is Lua's message, and there is no log.
@@ -84,11 +96,15 @@
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_rt.h"
+#include "apps_ui.h"
 
 /* The device's CONFIG_MUSE_APPS_HEAP_MAX_KB is set by its build; here the manifest's own ceiling holds. */
 #define HEAP_MAX_KB 1024
 #define MEM_KB_MAX 65535
 #define CYCLES_MAX 1000000
+/* A widget's entry in a dump is under 2 KB (apps_ui.h): room for all of them by default. */
+#define DUMP_DEFAULT_BYTES (APPS_UI_SLOTS * 2048 + 16)
+#define DUMP_MAX_BYTES 4000000
 
 #define USAGE                                                                           \
     "usage: apphost [--mem-kb N] [--script FILE|-] APP_DIR\n"                           \
@@ -381,6 +397,133 @@ static void cmd_log(const app_t *app, int lines) {
     }
 }
 
+/* What the LVGL task's apply step does between two callbacks, as far as a host can: every request is taken as
+ * applied, and what was waiting to be deleted is gone, so its slot is free. */
+static void apply_screen(const app_t *app) {
+    apps_ui_t *ui = app->rt != NULL ? apps_rt_ui(app->rt) : NULL;
+    if (ui == NULL) {
+        return;
+    }
+    apps_port_ui_lock();
+    (void)apps_ui_take_clear(ui);
+    (void)apps_ui_take_bg(ui, NULL);
+    for (int i = 0; i < APPS_UI_SLOTS; i++) {
+        apps_ui_slot(ui, i)->dirty = 0;
+    }
+    apps_port_ui_unlock();
+}
+
+/* s as the digits of a number, up to max, at *s, which moves past them. False when there is no digit. */
+static bool take_number(const char **s, long max, long *out) {
+    if (**s < '0' || **s > '9') {
+        return false;
+    }
+    long v = 0;
+    for (; **s >= '0' && **s <= '9'; (*s)++) {
+        v = v * 10 + (**s - '0');
+        if (v > max) {
+            v = max + 1;  /* too big, and it can't overflow */
+        }
+    }
+    *out = v;
+    return true;
+}
+
+/* The slot of the first button or label whose text is `text`, or -1. */
+static int find_by_text(apps_ui_t *ui, const char *text) {
+    int found = -1;
+    apps_port_ui_lock();
+    for (int i = 0; i < APPS_UI_SLOTS && found < 0; i++) {
+        const apps_widget_t *w = apps_ui_slot(ui, i);
+        if (w->alive && (w->kind == APPS_W_BUTTON || w->kind == APPS_W_LABEL) &&
+            strcmp(w->text != NULL ? w->text : "", text) == 0) {
+            found = i;
+        }
+    }
+    apps_port_ui_unlock();
+    return found;
+}
+
+/* tap #SLOT[@GEN] or tap "TEXT": see the commands, above. */
+static void cmd_tap(app_t *app, const char *args) {
+    if (app->rt == NULL) {
+        return;
+    }
+    apps_ui_t *ui = apps_rt_ui(app->rt);
+    long slot = -1, gen = -1;
+    if (args[0] == '#') {
+        const char *p = args + 1;
+        bool ok = take_number(&p, APPS_UI_SLOTS, &slot);
+        if (ok && *p == '@') {
+            p++;
+            ok = take_number(&p, 65535, &gen) && gen <= 65535;
+        }
+        if (!ok || *p != '\0' || slot >= APPS_UI_SLOTS) {
+            emit_text("error", "tap needs a slot of 0 to 127 and, after an @, a gen of 0 to 65535: tap #3 or tap #3@1");
+            return;
+        }
+        if (gen < 0) {  /* the gen the slot has now: a tap on what is there */
+            apps_port_ui_lock();
+            const apps_widget_t *w = apps_ui_slot(ui, (int)slot);
+            bool alive = w->alive;
+            gen = w->gen;
+            apps_port_ui_unlock();
+            if (!alive) {
+                char text[64];
+                snprintf(text, sizeof text, "no widget in slot %ld", slot);
+                emit_text("error", text);
+                return;
+            }
+        }
+    } else if (args[0] == '"') {
+        apps_jr_t reader;
+        char text[APPS_UI_TEXT_MAX + 1];
+        apps_jr_init(&reader, args, strlen(args));
+        if (!apps_jr_string(&reader, text, sizeof text) || !apps_jr_end(&reader)) {
+            char message[160];
+            snprintf(message, sizeof message, "tap needs the text as a JSON string: %s", reader.err);
+            emit_text("error", message);
+            return;
+        }
+        slot = find_by_text(ui, text);
+        if (slot < 0) {
+            char message[APPS_UI_TEXT_MAX + 48];
+            snprintf(message, sizeof message, "no button or label has the text \"%s\"", text);
+            emit_text("error", message);
+            return;
+        }
+        apps_port_ui_lock();
+        gen = apps_ui_slot(ui, (int)slot)->gen;
+        apps_port_ui_unlock();
+    } else {
+        emit_text("error", "tap needs #<slot>[@<gen>] or a text in quotes: tap #3 or tap \"Go\"");
+        return;
+    }
+    bool was_crashed = crashed(app);
+    apps_rt_touch(app->rt, (uint16_t)slot, (uint16_t)gen, APPS_UI_TAP);
+    report_crash(app, was_crashed);
+}
+
+/* dump [N]: the widgets, as apps_ui_dump writes them, in at most `cap` bytes. */
+static void cmd_dump(const app_t *app, size_t cap) {
+    char *out = malloc(cap);
+    if (out == NULL) {
+        emit_text("error", "dump: out of memory");
+        return;
+    }
+    apps_ui_t *ui = app->rt != NULL ? apps_rt_ui(app->rt) : NULL;
+    int dropped = 0;
+    size_t len = ui != NULL ? apps_ui_dump(ui, out, cap, &dropped) : 0;
+    begin("dump");
+    fputs(",\"widgets\":", stdout);
+    fputs(len > 0 ? out : "[]", stdout);  /* JSON text the dump wrote */
+    if (dropped > 0) {
+        printf(",\"dropped\":%d", dropped);
+    }
+    end_event();
+    free(out);
+}
+
 /* stop, show or hide: nothing is printed unless the handler crashed the app. */
 static void cmd_handler(app_t *app, const char *name) {
     if (app->rt == NULL) {
@@ -467,6 +610,15 @@ static void run_line(app_t *app, char *line) {
         } else {
             cmd_log(app, (int)lines);
         }
+    } else if (strcmp(cmd, "tap") == 0) {
+        cmd_tap(app, args);
+    } else if (strcmp(cmd, "dump") == 0) {
+        long cap = DUMP_DEFAULT_BYTES;
+        if (*args != '\0' && (!parse_count(args, DUMP_MAX_BYTES, &cap) || cap < 1)) {
+            emit_text("error", "dump needs a number of bytes: dump [n]");
+        } else {
+            cmd_dump(app, (size_t)cap);
+        }
     } else if (strcmp(cmd, "start") == 0 || strcmp(cmd, "stop") == 0 || strcmp(cmd, "show") == 0 ||
                strcmp(cmd, "hide") == 0 || strcmp(cmd, "state") == 0) {
         if (*args != '\0') {
@@ -481,9 +633,19 @@ static void run_line(app_t *app, char *line) {
         }
     } else {
         snprintf(text, sizeof text,
-                 "unknown command '%.60s' (commands: message, stop, start, show, hide, state, log)", cmd);
+                 "unknown command '%.60s' (commands: message, stop, start, show, hide, state, log, tap, dump)", cmd);
         emit_text("error", text);
     }
+}
+
+/* After a command, the way a frame follows a callback: the screen is applied, and the UI lock, which no command
+ * leaves held, is checked. */
+static void end_of_command(const app_t *app) {
+    if (apphost_ui_locked()) {
+        fputs("apphost: a command left the UI lock held\n", stderr);
+        abort();
+    }
+    apply_screen(app);
 }
 
 /* Runs the lines of in; false if reading failed. */
@@ -492,6 +654,7 @@ static bool run_script(app_t *app, FILE *in) {
     size_t cap = 0;
     while (getline(&line, &cap, in) != -1) {
         run_line(app, line);
+        end_of_command(app);
     }
     free(line);
     return !ferror(in);
@@ -514,6 +677,7 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name)
         emit_warnings(apps_rt_warnings(app.rt));
         cmd_start(&app);
     }
+    end_of_command(&app);
     int status = 0;
     if (script != NULL && !run_script(&app, script)) {
         fprintf(stderr, "apphost: can't read script '%s': %s\n", script_name, strerror(errno));

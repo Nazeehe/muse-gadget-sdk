@@ -40,6 +40,7 @@
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_rt.h"
+#include "apps_ui.h"
 #include "apps_vm.h"
 #include "lauxlib.h"
 #include "lua.h"
@@ -1090,17 +1091,19 @@ static void port_log(void) {
  * reached, and checks that nothing aborts, nothing leaks and the answer is the right one: a failure the
  * runtime reports when something was refused, success when nothing was. */
 
-/* The growth requests apps_rt_new makes before main.lua runs: its own block, then apps_vm_new's, counted by
- * making a VM with the config the runtime gives it. */
+/* The growth requests apps_rt_new makes before main.lua runs: its own block, the widget table's, then
+ * apps_vm_new's, counted by making a table and a VM with the config the runtime gives it. */
 static long growths_before_main(size_t mem_limit) {
     apps_vm_config_t cfg = {.mem_limit = mem_limit,
                             .realloc_fn = apps_port_realloc,
                             .free_fn = apps_port_free,
                             .now_ms = apps_port_mono_ms};
     growths = 0;
+    apps_ui_t *ui = apps_ui_new();
     apps_vm_t *vm = apps_vm_new(&cfg);
-    CHECK(vm != NULL, "a VM of %zu bytes", mem_limit);
+    CHECK(ui != NULL && vm != NULL, "a widget table and a VM of %zu bytes", mem_limit);
     apps_vm_free(vm);
+    apps_ui_free(ui);
     return 1 + growths;
 }
 

@@ -27,7 +27,8 @@
  * handler call is one apps_vm_call, with APPS_BUDGET_START for main.lua's own top level and for start(),
  * and APPS_BUDGET_CALL for the rest.
  *
- * What the app's code is given besides the sandbox's libraries (apps_vm.h) and `json` (apps_json.h):
+ * What the app's code is given besides the sandbox's libraries (apps_vm.h), `json` (apps_json.h) and `ui`
+ * (apps_ui.h; main.lua's top level can already draw, so ui.image finds the package's images from the start):
  * - print(...): the tostring of each argument, joined with tabs, as the lines of the app's log. The text
  *   is split at each "\n". In each line, a byte under 0x20 but tab, 0x7F, a C1 control character
  *   (U+0080 to U+009F) and anything that isn't valid UTF-8 (RFC 3629) become '?', one for each byte, or
@@ -101,8 +102,9 @@
  * apps_manifest_t's are). A loop over the table's keys is charged to main.lua's budget by the size of the
  * table.
  *
- * Memory: a runtime is one block from apps_port_realloc (itself, with its log and crash record) and the VM's
- * heap, capped at the manifest's memory_kb. apps_rt_free gives all of it back, and runs no app code.
+ * Memory: a runtime is one block from apps_port_realloc (itself, with its log and crash record), the VM's
+ * heap, capped at the manifest's memory_kb, and the widget table (apps_ui.h) with its text. apps_rt_free gives
+ * all of it back, and runs no app code.
  */
 
 #include <stdbool.h>
@@ -111,8 +113,10 @@
 
 #include "apps_pkg.h"
 
-/* apps_vm.h's, which this header doesn't include: the firmware outside apps/ doesn't see Lua's headers. */
+/* apps_vm.h's and apps_ui.h's, which this header doesn't include: the firmware outside apps/ doesn't see Lua's
+ * headers. */
 typedef struct apps_vm apps_vm_t;
+typedef struct apps_ui apps_ui_t;
 
 typedef enum { APPS_STATE_STOPPED, APPS_STATE_RUNNING, APPS_STATE_CRASHED, APPS_STATE_HUNG } apps_state_t;
 
@@ -143,10 +147,10 @@ typedef struct apps_rt apps_rt_t;
  *
  * NULL when there is no app to make, and then nothing is held: the reason is in err (cut to err_len on a
  * character boundary; err may be NULL), and no log, as nothing ran. That is: no package; a main file that
- * isn't in it or isn't a .lua file, or no room for the VM (messages of this header); or a main.lua that
- * doesn't compile, with Lua's own message ("main.lua:3: unexpected symbol near 'x'"), or the parser's for
- * source nested past the C-call room ("C stack overflow"), which has no position and no traceback. Every line
- * main.lua printed went through apps_port_log in either case.
+ * isn't in it or isn't a .lua file, or no room for the VM or the app's screen (messages of this header); or a
+ * main.lua that doesn't compile, with Lua's own message ("main.lua:3: unexpected symbol near 'x'"), or the
+ * parser's for source nested past the C-call room ("C stack overflow"), which has no position and no
+ * traceback. Every line main.lua printed went through apps_port_log in either case.
  */
 apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len);
 
@@ -191,6 +195,24 @@ const char *apps_rt_warnings(const apps_rt_t *rt);
  * APPS_LOG_RING_BYTES + 1 bytes always hold the whole log.
  */
 size_t apps_rt_log_tail(const apps_rt_t *rt, int lines, char *out, size_t cap);
+
+/*
+ * The app's widgets: the shadow table that ui.* fills and the LVGL task's apply step reads (apps_ui.h). The
+ * runtime owns it, from apps_rt_new (so main.lua's top level can draw) to apps_rt_free, and a crash leaves it as
+ * it was: what becomes of the app's last screen is for the supervisor and the LVGL task to decide, and
+ * apps_rt_free takes the table with the runtime. The package's .bin files (those that pass apps_image_check) are
+ * its images, in the package's order, which is how ui.image{src = "logo.bin"} finds them.
+ */
+apps_ui_t *apps_rt_ui(apps_rt_t *rt);
+
+/*
+ * A touch on a widget, from the LVGL task through the app's queue: the handler the app gave w:on for that event
+ * runs with (w, event) and APPS_BUDGET_CALL, for a RUNNING app. slot and gen are what the event carried when
+ * the apply step posted it, and event one APPS_UI_* bit. A widget that has been deleted since (its gen has moved
+ * on, or the slot is empty), or has no handler for the event, runs nothing, and says nothing. A handler that
+ * fails crashes the app, like any other.
+ */
+void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event);
 
 /* The VM, for what the runtime doesn't wrap: apps_vm_kill, apps_vm_in_call, apps_vm_call_started_ms and the
  * memory counters (apps_vm.h). What is installed into its globals through it is there for the handlers, not for

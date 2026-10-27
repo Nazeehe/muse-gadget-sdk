@@ -26,6 +26,7 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -57,7 +58,19 @@ bool apps_port_epoch_ms(int64_t *out) {
     return true;
 }
 
+static bool ui_locked;
+
+/* A violation of the lock's rules is a bug in the core, and ends the run: apphost's tests (and every run of an
+ * app) have an empty stderr, so none goes unseen. */
+static void lock_violation(const char *what) {
+    fprintf(stderr, "apphost: %s\n", what);
+    abort();
+}
+
 void *apps_port_realloc(void *ptr, size_t n) {
+    if (ui_locked) {  /* the heap is Lua's too: a Lua call under the lock would land here */
+        lock_violation("the apps' heap was used while the UI lock was held");
+    }
     header_t *old = ptr != NULL ? (header_t *)ptr - 1 : NULL;
     if (n == 0 || n > SIZE_MAX - sizeof(header_t)) {  /* never n == 0 (apps_port.h) */
         return NULL;
@@ -76,6 +89,9 @@ void apps_port_free(void *ptr) {
     if (ptr == NULL) {
         return;
     }
+    if (ui_locked) {  /* a block is let go of after the lock is released, so the lock is held for short, bounded work */
+        lock_violation("a block of the apps' heap was freed while the UI lock was held");
+    }
     header_t *block = (header_t *)ptr - 1;
     held -= block->size;
     free(block);
@@ -87,16 +103,30 @@ void apps_port_log(const char *app_id, const char *line) {
     }
 }
 
-/* The UI lock guards the widget table against the LVGL task; there is no other task here. */
+/* The UI lock guards the widget table against the LVGL task; there is no other task here, so it only keeps
+ * count, to check that the core holds it by the rules (apps_ui.h): never twice, never across an allocation. */
 void apps_port_ui_lock(void) {
+    if (ui_locked) {
+        lock_violation("the UI lock was taken while it was held");
+    }
+    ui_locked = true;
 }
 
 bool apps_port_ui_trylock(int ms) {
     (void)ms;
+    apps_port_ui_lock();
     return true;
 }
 
 void apps_port_ui_unlock(void) {
+    if (!ui_locked) {
+        lock_violation("the UI lock was given back and wasn't held");
+    }
+    ui_locked = false;
+}
+
+bool apphost_ui_locked(void) {
+    return ui_locked;
 }
 
 void apphost_set_log(apphost_log_fn fn) {

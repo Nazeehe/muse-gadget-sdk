@@ -40,6 +40,7 @@
 #include "apps_json.h"
 #include "apps_port.h"
 #include "apps_suggest.h"
+#include "apps_ui.h"
 #include "apps_vm.h"
 #include "lauxlib.h"
 #include "lua.h"
@@ -68,6 +69,7 @@ static const char *const handler_names[H_COUNT] = {"start", "stop", "show", "hid
 struct apps_rt {
     const apps_pkg_t *pkg;
     apps_vm_t *vm;
+    apps_ui_t *ui;
     apps_state_t state;
     int handler[H_COUNT];  /* registry references; LUA_NOREF for a handler the app hasn't */
     /* apps_vm_call writes its error here. It is the crash record while the state is CRASHED (and nothing runs
@@ -592,6 +594,20 @@ static const apps_blob_t *find_blob(const apps_pkg_t *pkg, const char *path) {
     return NULL;
 }
 
+/* The package's images as the table ui.image looks in: each .bin that passes the image check, in the package's
+ * order, pointing into the package. */
+static int build_assets(const apps_pkg_t *pkg, apps_asset_t *assets) {
+    int n = 0;
+    for (int i = 0; i < pkg->count && n < APPS_UI_ASSETS_MAX; i++) {
+        const apps_blob_t *file = &pkg->files[i];
+        uint16_t w, h;
+        if (apps_file_kind(file->path) == APPS_FILE_IMAGE && apps_image_check(file->data, file->len, &w, &h, NULL, 0)) {
+            assets[n++] = (apps_asset_t){.path = file->path, .data = file->data, .len = file->len, .w = w, .h = h};
+        }
+    }
+    return n;
+}
+
 apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     put_text(err, err_len, "");
     if (pkg == NULL) {
@@ -617,6 +633,15 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     for (int h = 0; h < H_COUNT; h++) {
         rt->handler[h] = LUA_NOREF;
     }
+    rt->ui = apps_ui_new();
+    if (rt->ui == NULL) {
+        put_text(err, err_len, "out of memory: can't make room for the app's screen");
+        apps_port_free(rt);
+        return NULL;
+    }
+    apps_asset_t assets[APPS_UI_ASSETS_MAX];
+    /* Before main.lua runs, so that a ui.image at its top level finds them. */
+    apps_ui_set_assets(rt->ui, assets, build_assets(pkg, assets));
     apps_vm_config_t cfg = {
         .mem_limit = (size_t)pkg->manifest.memory_kb * 1024u,
         .realloc_fn = apps_port_realloc,
@@ -628,11 +653,13 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
         snprintf(text, sizeof text, "out of memory: can't make the app's heap of %u KB",
                  (unsigned)pkg->manifest.memory_kb);
         put_text(err, err_len, text);
+        apps_ui_free(rt->ui);
         apps_port_free(rt);
         return NULL;
     }
     lua_State *L = apps_vm_lua(rt->vm);
     apps_json_open(L);  /* safe outside a call: if the heap refuses, the call below ends out of memory */
+    apps_ui_open(L, rt->ui);
 
     boot_t boot = {.rt = rt, .main = main, .outcome = BOOT_OK};
     apps_call_t result = vm_run(rt, boot_trampoline, &boot, APPS_BUDGET_START);
@@ -730,6 +757,34 @@ bool apps_rt_alarm(apps_rt_t *rt, const char *name) {
            call_handler(rt, H_ALARM, name != NULL ? name : "", APPS_BUDGET_CALL);
 }
 
+/* ---- Touch ---- */
+
+typedef struct {
+    apps_rt_t *rt;
+    uint16_t slot, gen;
+    uint8_t event;
+} touch_call_t;
+
+/* Runs under apps_vm_call: the handler, the widget and the event's name are pushed in here, since the widget's
+ * handle is made in the app's heap. */
+static int touch_trampoline(lua_State *L) {
+    const touch_call_t *t = lua_touserdata(L, 1);
+    if (apps_ui_push_handler(L, t->rt->ui, t->slot, t->gen, t->event)) {
+        lua_call(L, 2, 0);
+    }
+    return 0;
+}
+
+void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event) {
+    if (rt == NULL || rt->state != APPS_STATE_RUNNING) {
+        return;
+    }
+    touch_call_t t = {rt, slot, gen, event};
+    if (vm_run(rt, touch_trampoline, &t, APPS_BUDGET_CALL) != APPS_CALL_OK) {
+        crash(rt);
+    }
+}
+
 /* ---- Messages ---- */
 
 typedef struct {
@@ -809,7 +864,9 @@ char *apps_rt_message(apps_rt_t *rt, const char *event, const char *data_json, s
 
 void apps_rt_free(apps_rt_t *rt) {
     if (rt != NULL) {
+        /* The VM goes first: no app code runs after it, so no handle to the table is left to use. */
         apps_vm_free(rt->vm);
+        apps_ui_free(rt->ui);
         apps_port_free(rt);
     }
 }
@@ -838,4 +895,8 @@ const char *apps_rt_warnings(const apps_rt_t *rt) {
 
 apps_vm_t *apps_rt_vm(apps_rt_t *rt) {
     return rt != NULL ? rt->vm : NULL;
+}
+
+apps_ui_t *apps_rt_ui(apps_rt_t *rt) {
+    return rt != NULL ? rt->ui : NULL;
 }

@@ -41,7 +41,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
 FIXTURES = ROOT / "tests/muse_apps_fixtures"
 HARNESS_SOURCES = [ROOT / "tests/muse_apps_rt_harness.c", APPS / "apps_rt.c", APPS / "apps_vm.c",
-                   APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c"]
+                   APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_ui.c"]
 INCLUDES = [ROOT / "components/lua/src", APPS]
 
 # The messages, exactly (apps_rt.h lists them, and apps_vm.h the kills').
@@ -921,7 +921,7 @@ class RuntimeTest(AppHostTestCase):
         self.assertEqual(run.events[2]["data"], "ping")
         self.assertEqual(run.messages("error"), [
             "message needs an event name: message <event> [json]",
-            "unknown command 'frobnicate' (commands: message, stop, start, show, hide, state, log)",
+            "unknown command 'frobnicate' (commands: message, stop, start, show, hide, state, log, tap, dump)",
             "log needs a number of lines: log [n]",
             "log needs a number of lines: log [n]",
             "state takes no arguments"])
@@ -1029,7 +1029,7 @@ class RuntimeTest(AppHostTestCase):
                              input=b'\xff\xc3(\ncaf\xc3\xa9\x01\nq"uote\\back\n')
         self.assertEqual(done.returncode, 0)
         self.assertEqual(done.stderr, b"")
-        tail = " (commands: message, stop, start, show, hide, state, log)"
+        tail = " (commands: message, stop, start, show, hide, state, log, tap, dump)"
         self.assertEqual(Run(done).messages("error"), [
             "unknown command '\ufffd\ufffd('" + tail,
             "unknown command 'caf\u00e9\x01'" + tail,

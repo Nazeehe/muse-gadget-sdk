@@ -122,6 +122,10 @@ static const struct {
     {"collectgarbage", "'collectgarbage' is not available in Muse apps; use sys.mem()"},
 };
 
+/* The most names one miss gathers. Past it the miss gets no suggestion: its cost, and
+ * the userdata it fills, stay small however many globals an app makes. */
+#define SUGGEST_CANDIDATES_MAX 512
+
 typedef struct {
     const char **names;  /* NULL while counting */
     int cap, n;
@@ -138,28 +142,32 @@ static void add_candidate(candidates_t *c, const char *name) {
 }
 
 /* The names a misspelt global may have meant, nearest scope first: the reading
- * function's locals, its upvalues, then the sandbox's keys (the table at index 1). The
- * strings stay alive while the function runs and the table holds its keys. */
+ * function's locals, its upvalues, then the sandbox's keys (the table at index 1),
+ * stopping once there are more than SUGGEST_CANDIDATES_MAX. The strings stay alive
+ * while the function runs and the table holds its keys. */
 static void collect_candidates(lua_State *L, lua_Debug *reader, candidates_t *c) {
     const char *name;
     if (reader != NULL) {
-        for (int i = 1; (name = lua_getlocal(L, reader, i)) != NULL; i++) {
+        for (int i = 1; c->n <= SUGGEST_CANDIDATES_MAX && (name = lua_getlocal(L, reader, i)) != NULL; i++) {
             lua_pop(L, 1);
             add_candidate(c, name);
         }
         lua_getinfo(L, "f", reader);
-        for (int i = 1; (name = lua_getupvalue(L, -1, i)) != NULL; i++) {
+        for (int i = 1; c->n <= SUGGEST_CANDIDATES_MAX && (name = lua_getupvalue(L, -1, i)) != NULL; i++) {
             lua_pop(L, 1);
             add_candidate(c, name);
         }
         lua_pop(L, 1);
     }
     lua_pushnil(L);
-    while (lua_next(L, 1) != 0) {
+    while (c->n <= SUGGEST_CANDIDATES_MAX && lua_next(L, 1) != 0) {
         if (lua_type(L, -2) == LUA_TSTRING) {
             add_candidate(c, lua_tostring(L, -2));
         }
-        lua_pop(L, 1);
+        lua_pop(L, 1);  /* the value; lua_next takes the key */
+    }
+    if (c->n > SUGGEST_CANDIDATES_MAX) {
+        lua_pop(L, 1);  /* the key lua_next didn't get to finish with */
     }
 }
 
@@ -184,7 +192,7 @@ static int sandbox_index(lua_State *L) {
     candidates_t c = {NULL, 0, 0};
     collect_candidates(L, reader, &c);
     const char *hint = NULL;
-    if (c.n > 0) {
+    if (c.n > 0 && c.n <= SUGGEST_CANDIDATES_MAX) {
         c.cap = c.n;
         c.n = 0;
         c.names = lua_newuserdatauv(L, (size_t)c.cap * sizeof *c.names, 0);
@@ -399,6 +407,176 @@ static const luaL_Reg apps_string_funcs[] = {
     {NULL, NULL},
 };
 
+/* ---- Lua's C loops, bounded ----
+ *
+ * Count hooks run between VM instructions, so C work between two hook checks has to be
+ * bounded, and the cap bounds only work that allocates. Lua's string.rep and five
+ * table functions can loop without allocating: rep over an empty string, the table
+ * functions over a range or a lying __len with nothing behind it. Reading an element
+ * that isn't there needn't allocate either: an __index chain can end at a C function
+ * that returns "" at once (a string's metatable is the app's to change). Each wrapper
+ * checks the count first, then runs Lua's own function (its upvalue 1) on its own
+ * frame, so arguments, results and Lua's errors are unchanged. */
+
+/* Lua's own function, called as if it had been called instead of the wrapper. */
+static int call_lua_own(lua_State *L) {
+    return lua_tocfunction(L, lua_upvalueindex(1))(L);
+}
+
+/* string.rep(s, n [, sep]): an empty result returns at once; Lua's would copy nothing
+ * n - 1 times. A non-empty one allocates its full size first, which the cap bounds. */
+static int sandbox_rep(lua_State *L) {
+    size_t len, sep_len;
+    luaL_checklstring(L, 1, &len);
+    lua_Integer n = luaL_checkinteger(L, 2);
+    luaL_optlstring(L, 3, "", &sep_len);
+    if (n <= 0 || len + sep_len == 0) {
+        lua_pushliteral(L, "");
+        return 1;
+    }
+    return call_lua_own(L);
+}
+
+/* An array slot is a TValue: 16 bytes with 64-bit integers and doubles. */
+#define SLOT_BYTES 16
+
+/* The most elements this app's heap could hold. A count past it can only be a lying
+ * __len or a range with nothing in it, which Lua would still walk element by element. */
+static lua_Unsigned slot_limit(lua_State *L) {
+    void *ud;
+    lua_getallocf(L, &ud);
+    return ((const apps_vm_t *)ud)->cfg.mem_limit / SLOT_BYTES;
+}
+
+static int too_many(lua_State *L, const char *fn) {
+    return luaL_error(L, "table.%s: more elements than this app's memory can hold", fn);
+}
+
+static bool has_metafield(lua_State *L, const char *name) {
+    if (luaL_getmetafield(L, 1, name) == LUA_TNIL) {
+        return false;
+    }
+    lua_pop(L, 1);
+    return true;
+}
+
+/* Whether ltablib's checktab accepts arg 1 for reading and length, and for writing too
+ * if writes: a table, or a value whose metatable has __index and __len (and
+ * __newindex). Otherwise Lua's own function raises its usual error, before taking any
+ * length. */
+static bool table_like(lua_State *L, bool writes) {
+    return lua_type(L, 1) == LUA_TTABLE ||
+           (has_metafield(L, "__index") && has_metafield(L, "__len") && (!writes || has_metafield(L, "__newindex")));
+}
+
+/* A proxy's __len: the count its wrapper checked (upvalue 1). */
+static int proxy_len(lua_State *L) {
+    lua_pushvalue(L, lua_upvalueindex(1));
+    return 1;
+}
+
+/* #arg 1 as Lua's own function will see it, taking __len only once.
+ * - A table without __len: Lua's own function computes the same length again, since
+ *   nothing runs in between.
+ * - Otherwise arg 1 becomes a proxy whose __len returns this count and whose reads and
+ *   writes go through to the object (whose own metamethods still see the object). A
+ *   __len that answers small here and huge to Lua's own call can't slip past. */
+static lua_Integer len_for_lua_own(lua_State *L) {
+    if (luaL_getmetafield(L, 1, "__len") == LUA_TNIL) {
+        return luaL_len(L, 1);
+    }
+    lua_pop(L, 1);
+    lua_Integer n = luaL_len(L, 1);
+    lua_createtable(L, 0, 0);
+    lua_createtable(L, 0, 3);
+    lua_pushvalue(L, 1);
+    lua_setfield(L, -2, "__index");
+    lua_pushvalue(L, 1);
+    lua_setfield(L, -2, "__newindex");
+    lua_pushinteger(L, n);
+    lua_pushcclosure(L, proxy_len, 1);
+    lua_setfield(L, -2, "__len");
+    lua_setmetatable(L, -2);
+    lua_replace(L, 1);
+    return n;
+}
+
+/* table.move(a1, f, e, t [, a2]) moves e - f + 1 elements. */
+static int sandbox_move(lua_State *L) {
+    lua_Integer f = luaL_checkinteger(L, 2);
+    lua_Integer e = luaL_checkinteger(L, 3);
+    luaL_checkinteger(L, 4);
+    /* e - f + 1 > limit, without overflow: e - f is exact as unsigned when e >= f. */
+    if (e >= f && (lua_Unsigned)e - (lua_Unsigned)f >= slot_limit(L)) {
+        return too_many(L, "move");
+    }
+    return call_lua_own(L);
+}
+
+/* table.insert(t, pos, v) shifts t[pos..#t] up one: #t + 1 - pos elements. Counted
+ * from the shift itself, not #t alone: a negative __len passes Lua's position check
+ * for math.mininteger and would shift 2^63 elements. */
+static int sandbox_insert(lua_State *L) {
+    if (lua_gettop(L) == 3 && table_like(L, true)) {
+        lua_Integer e = luaL_intop(+, len_for_lua_own(L), 1);  /* the first empty slot, as Lua has it */
+        lua_Integer pos = luaL_checkinteger(L, 2);
+        bool lua_accepts = (lua_Unsigned)pos - 1u < (lua_Unsigned)e;
+        if (lua_accepts && e > pos && (lua_Unsigned)e - (lua_Unsigned)pos > slot_limit(L)) {
+            return too_many(L, "insert");
+        }
+    }
+    return call_lua_own(L);
+}
+
+/* table.remove(t [, pos]) shifts t[pos + 1..#t] down one: #t - pos elements, counted as
+ * insert counts them. */
+static int sandbox_remove(lua_State *L) {
+    if (table_like(L, true)) {
+        lua_Integer size = len_for_lua_own(L);
+        lua_Integer pos = luaL_optinteger(L, 2, size);
+        bool lua_accepts = pos == size || (lua_Unsigned)pos - 1u <= (lua_Unsigned)size;
+        if (lua_accepts && pos < size && (lua_Unsigned)size - (lua_Unsigned)pos > slot_limit(L)) {
+            return too_many(L, "remove");
+        }
+    }
+    return call_lua_own(L);
+}
+
+/* table.sort(t [, comp]) sorts #t elements. */
+static int sandbox_sort(lua_State *L) {
+    if (table_like(L, true)) {
+        lua_Integer n = len_for_lua_own(L);
+        if (n > 1 && (lua_Unsigned)n > slot_limit(L)) {
+            return too_many(L, "sort");
+        }
+    }
+    return call_lua_own(L);
+}
+
+/* table.concat(t [, sep [, i [, j]]]) reads t[i..j], j - i + 1 elements, j defaulting to
+ * #t. Arguments are checked in Lua's order; sep isn't converted here, which would
+ * allocate between this length and Lua's own. */
+static int sandbox_concat(lua_State *L) {
+    if (table_like(L, false)) {
+        lua_Integer len = len_for_lua_own(L);
+        luaL_argexpected(L, lua_isnoneornil(L, 2) || lua_isstring(L, 2), 2, "string");
+        lua_Integer i = luaL_optinteger(L, 3, 1);
+        lua_Integer j = luaL_optinteger(L, 4, len);
+        if (j >= i && (lua_Unsigned)j - (lua_Unsigned)i >= slot_limit(L)) {
+            return too_many(L, "concat");
+        }
+    }
+    return call_lua_own(L);
+}
+
+/* Replaces the function name in the table on top with wrapper, which gets Lua's own as
+ * its upvalue 1. */
+static void wrap_lua_own(lua_State *L, const char *name, lua_CFunction wrapper) {
+    lua_getfield(L, -1, name);
+    lua_pushcclosure(L, wrapper, 1);
+    lua_setfield(L, -2, name);
+}
+
 /* ---- The sandbox ---- */
 
 /* Opens the sandbox in L's globals table. Runs under lua_pcall: it allocates, and an
@@ -441,7 +619,18 @@ static int open_sandbox(lua_State *L) {
         lua_pushcclosure(L, sandbox_no_patterns, 1);
         lua_setfield(L, -2, matchers[i]);
     }
+    wrap_lua_own(L, "rep", sandbox_rep);
     luaL_setfuncs(L, apps_string_funcs, 0);
+    lua_pop(L, 1);
+
+    /* The table functions that can walk a range or a __len with nothing behind it. */
+    lua_pushliteral(L, LUA_TABLIBNAME);
+    lua_rawget(L, -2);
+    wrap_lua_own(L, "move", sandbox_move);
+    wrap_lua_own(L, "insert", sandbox_insert);
+    wrap_lua_own(L, "remove", sandbox_remove);
+    wrap_lua_own(L, "sort", sandbox_sort);
+    wrap_lua_own(L, "concat", sandbox_concat);
     lua_pop(L, 1);
 
     /* Strict globals: __index raises. No __newindex, so assigning defines. */

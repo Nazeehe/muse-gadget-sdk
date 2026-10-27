@@ -29,13 +29,18 @@ static size_t bounded_len(const char *s) {
 }
 
 /* The Levenshtein distance between a and b, both at most APPS_SUGGEST_MAX_LEN bytes, or
- * bound + 1 as soon as it has to be more than bound. Two rows on the stack: 130 bytes. */
-static int edit_distance(const char *a, size_t la, const char *b, size_t lb, int bound) {
+ * bound + 1 as soon as it has to be more than bound. Each row takes lb cells from
+ * *cells; -1 when they run out. Two rows on the stack: 130 bytes. */
+static int edit_distance(const char *a, size_t la, const char *b, size_t lb, int bound, size_t *cells) {
     unsigned char prev[APPS_SUGGEST_MAX_LEN + 1], cur[APPS_SUGGEST_MAX_LEN + 1];
     for (size_t j = 0; j <= lb; j++) {
         prev[j] = (unsigned char)j;
     }
     for (size_t i = 1; i <= la; i++) {
+        if (*cells < lb) {
+            return -1;
+        }
+        *cells -= lb;
         cur[0] = (unsigned char)i;
         int row_min = cur[0];
         for (size_t j = 1; j <= lb; j++) {
@@ -69,6 +74,7 @@ const char *apps_suggest(const char *name, const char *const *cands, int n) {
     }
     /* A suggestion must come in under this: at most 2 edits, and fewer than len. */
     int beat = (len - 1 < 2 ? (int)len - 1 : 2) + 1;
+    size_t cells = APPS_SUGGEST_MAX_CELLS;
     const char *best = NULL;
     for (int i = 0; i < n; i++) {
         const char *cand = cands[i];
@@ -80,7 +86,10 @@ const char *apps_suggest(const char *name, const char *const *cands, int n) {
         if (clen > APPS_SUGGEST_MAX_LEN || apart >= (size_t)beat) {
             continue;
         }
-        int d = edit_distance(name, len, cand, clen, beat - 1);
+        int d = edit_distance(name, len, cand, clen, beat - 1, &cells);
+        if (d < 0) {
+            return NULL;  /* past the cap: no suggestion rather than unbounded work */
+        }
         if (d > 0 && d < beat) {  /* d == 0 is the name itself */
             best = cand;
             beat = d;

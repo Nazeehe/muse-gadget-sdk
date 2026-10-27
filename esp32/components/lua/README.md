@@ -75,6 +75,16 @@ hash seed, so a table's keys come in the same order on every run, and links
 default) also compile Lua's own files with ASan and UBSan, which inflate stack
 frames: take stack measurements from `build(..., sanitize=False)`.
 
+### Known build warning
+
+Once the firmware references Lua (`CONFIG_MUSE_APPS`), the link prints
+picolibc's `libc_time_clock.c.o: warning: times is not implemented and will
+always fail`. It comes from `table.sort`: when a partition comes out badly
+unbalanced, `l_randomizePivot()` in `src/ltablib.c` picks the next pivot from
+`clock()` and `time(NULL)`. ESP-IDF doesn't implement `clock()`, which returns
+-1, so the pivot still varies with `time(NULL)`. The warning is harmless and
+expected; leave it.
+
 ## Updating
 
 1. Download the new tarball into an empty directory, check its SHA-256 against

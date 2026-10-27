@@ -24,11 +24,16 @@
 /* Names longer than this are never matched, as name or as candidate. */
 #define APPS_SUGGEST_MAX_LEN 64
 
+/* The most edit-distance table cells one call scores. A call that would need more
+ * suggests nothing, so its cost stays bounded however many and long the candidates. */
+#define APPS_SUGGEST_MAX_CELLS 65536
+
 /*
  * The candidate nearest to name by edit distance (Levenshtein, over bytes, so case
  * counts), when that distance is at most 2 and less than strlen(name): a one-letter
  * name gets no suggestion, a two-letter one only at distance 1. Among equally near
  * candidates the first wins. Candidates equal to name and NULL entries are skipped.
- * Returns one of cands' pointers, or NULL when none qualifies.
+ * Returns one of cands' pointers, or NULL when none qualifies or the scoring would
+ * pass APPS_SUGGEST_MAX_CELLS.
  */
 const char *apps_suggest(const char *name, const char *const *cands, int n);

@@ -86,6 +86,34 @@ class MuseAppsVmTest(unittest.TestCase):
     def test_split_is_linear_on_adversarial_input(self):
         self.run_case("split_linear", timeout=2)
 
+    # Lua's own rep, concat, move, insert, remove and sort can loop in C without
+    # allocating, out of reach of the cap and of any count hook. Each must answer at once
+    # instead.
+    def test_rep_of_nothing_returns_at_once(self):
+        self.run_case("rep_bounded", timeout=2)
+
+    def test_move_bounded_by_the_heap(self):
+        self.run_case("move_bounded", timeout=2)
+
+    def test_insert_bounded_by_the_heap(self):
+        self.run_case("insert_bounded", timeout=2)
+
+    def test_remove_bounded_by_the_heap(self):
+        self.run_case("remove_bounded", timeout=2)
+
+    def test_sort_bounded_by_the_heap(self):
+        self.run_case("sort_bounded", timeout=2)
+
+    def test_concat_bounded_by_the_heap(self):
+        self.run_case("concat_bounded", timeout=2)
+
+    def test_len_taken_once_through_a_proxy(self):
+        # A __len that answers small, then huge, can't slip a small count past the check.
+        self.run_case("len_proxy", timeout=2)
+
+    def test_did_you_mean_work_is_capped(self):
+        self.run_case("suggest_capped", timeout=2)
+
     def test_allocator_caps_and_counts(self):
         self.run_case("allocator")
 

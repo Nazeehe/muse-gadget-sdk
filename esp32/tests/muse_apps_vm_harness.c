@@ -754,6 +754,353 @@ static void split_linear(void) {
     apps_vm_free(vm);
 }
 
+/* ---- Bounded C loops: rep, concat, move, insert, remove, sort (fix round 1) ----
+ *
+ * Lua's own versions of these can loop without allocating, where neither the cap nor a
+ * count hook reaches. Each case runs under a 2 s timeout on the Python side, so a loop
+ * that isn't bounded fails it. */
+
+#define TOO_MANY(fn) "table." fn ": more elements than this app's memory can hold"
+
+/* Two lines: a plain table, no metatable, whose #t is 2^61. Its integer keys sit in the
+ * hash part the string keys made room for, so Lua finds the border by doubling. */
+#define SPARSE                                                                                      \
+    "local t = {} for i = 1, 300 do t['k' .. i] = i end for i = 0, 61 do t[1 << i] = true end\n" \
+    "assert(#t == 1 << 61)\n"
+
+/* Two lines: len, a __len that answers small on its first call and big after, counting
+ * its calls. Lua's own function must get the count the wrapper checked. */
+#define STATEFUL_LEN(small, big) \
+    "local calls = 0\n"          \
+    "local function len() calls = calls + 1 return calls == 1 and " small " or " big " end\n"
+
+/* Two lines: t, whose missing elements read as "" without running Lua code or
+ * allocating. The chain goes through a string, and a string's metatable is the app's. */
+#define EMPTY_READS                             \
+    "getmetatable('').__index = string.lower\n" \
+    "local t = setmetatable({}, {__index = ''})\n"
+
+/* What src raises in a stock state (base, string, table, math), named main.lua: the
+ * wrappers must keep Lua's own argument errors. */
+static void stock_error(const char *src, char *out, size_t cap) {
+    lua_State *S = luaL_newstate();
+    luaL_requiref(S, LUA_GNAME, luaopen_base, 1);
+    luaL_requiref(S, LUA_STRLIBNAME, luaopen_string, 1);
+    luaL_requiref(S, LUA_TABLIBNAME, luaopen_table, 1);
+    luaL_requiref(S, LUA_MATHLIBNAME, luaopen_math, 1);
+    lua_settop(S, 0);
+    int rc = luaL_loadbufferx(S, src, strlen(src), "=main.lua", "t");
+    if (rc == LUA_OK) {
+        rc = lua_pcall(S, 0, 0, 0);
+    }
+    snprintf(out, cap, "%s", rc == LUA_OK ? "(no error)" : top_text(S));
+    lua_close(S);
+}
+
+static void expect_stock_error_at(int line, apps_vm_t *vm, const char *src) {
+    char want[512];
+    stock_error(src, want, sizeof want);
+    expect_error_at(line, vm, src, want);
+}
+#define expect_stock_error(vm, src) expect_stock_error_at(__LINE__, vm, src)
+
+/* A 256 KB VM, with the most array slots it could hold (mem_limit / 16) as LIMIT. */
+static apps_vm_t *bounded_vm(void) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    lua_State *L = apps_vm_lua(vm);
+    lua_pushinteger(L, (lua_Integer)(256 * KB / 16));
+    lua_setglobal(L, "LIMIT");
+    return vm;
+}
+
+static void rep_bounded(void) {
+    apps_vm_t *vm = bounded_vm();
+    /* Nothing to repeat: "" at once, however many times. */
+    expect_true(vm, "return (''):rep(math.maxinteger) == '' and (''):rep(math.maxinteger, '') == ''\n"
+                    "  and string.rep('', math.maxinteger) == ''");
+    expect_true(vm, "return ('x'):rep(0) == '' and ('x'):rep(-5) == '' and ('x'):rep(math.mininteger, ',') == ''");
+    /* Anything else is Lua's own rep, bounded by the cap. */
+    expect_true(vm, "return ('x'):rep(3) == 'xxx' and ('x'):rep(3, ',') == 'x,x,x' and (''):rep(3, ',') == ',,'\n"
+                    "  and string.rep(1, 2) == '11'");
+    expect_true(vm, "return not pcall(string.rep, 'x', math.maxinteger)\n"
+                    "  and not pcall(string.rep, '', math.maxinteger, ',')");
+    expect_stock_error(vm, "return ('x'):rep('a')");
+    expect_stock_error(vm, "return string.rep()");
+    expect_stock_error(vm, "return string.rep('x', 1.5)");
+    apps_vm_free(vm);
+}
+
+static void move_bounded(void) {
+    apps_vm_t *vm = bounded_vm();
+    expect_error(vm, "table.move({}, 1, math.maxinteger, 1)", "main.lua:1: " TOO_MANY("move"));
+    expect_error(vm, "table.move({}, math.mininteger, math.maxinteger, 1)", "main.lua:1: " TOO_MANY("move"));
+    expect_error(vm, "table.move('abc', 1, math.maxinteger, 1, {})", "main.lua:1: " TOO_MANY("move"));
+    expect_error(vm, "local t = setmetatable({}, {__len = function() return math.maxinteger end})\n"
+                     "table.move(t, 1, #t, 1, {})",
+                 "main.lua:2: " TOO_MANY("move"));
+    /* LIMIT elements is Lua's own move; one more is refused. */
+    expect_true(vm, "return next(table.move({}, 1, LIMIT, 1)) == nil");
+    expect_error(vm, "table.move({}, 1, LIMIT + 1, 1)", "main.lua:1: " TOO_MANY("move"));
+    /* Lua's behaviour and errors otherwise. */
+    expect_true(vm, "local t = table.move({1, 2, 3}, 1, 3, 2) local d = table.move({1, 2, 3}, 2, 3, 1, {})\n"
+                    "return table.concat(t, ',') == '1,1,2,3' and table.concat(d, ',') == '2,3'\n"
+                    "  and #table.move({1}, 5, 1, 1) == 1 and table.move({1}, math.maxinteger, math.maxinteger, 1)[1] == nil");
+    expect_stock_error(vm, "table.move({}, 1, 2)");
+    expect_stock_error(vm, "table.move({}, 'a', 2, 1)");
+    expect_stock_error(vm, "table.move(nil, 1, 2, 1)");
+    expect_stock_error(vm, "table.move({}, 1, 2, math.maxinteger)");
+    apps_vm_free(vm);
+}
+
+static void insert_bounded(void) {
+    apps_vm_t *vm = bounded_vm();
+    /* A __len of maxinteger - 1 (maxinteger itself wraps to an empty shift). */
+    expect_error(vm, "local t = setmetatable({}, {__len = function() return math.maxinteger - 1 end})\n"
+                     "table.insert(t, 1, 'v')",
+                 "main.lua:2: " TOO_MANY("insert"));
+    expect_true(vm, "local t = setmetatable({}, {__len = function() return math.maxinteger end})\n"
+                    "table.insert(t, 1, 'v') return rawget(t, 1) == 'v'");
+    /* A negative __len passes Lua's position check for the smallest position, and
+     * would shift 2^63 elements. */
+    expect_error(vm, "local t = setmetatable({}, {__len = function() return -2 end})\n"
+                     "table.insert(t, math.mininteger, 'v')",
+                 "main.lua:2: " TOO_MANY("insert"));
+    /* Shifting LIMIT elements is Lua's own insert; one more is refused. */
+    expect_true(vm, "local n = LIMIT local t = setmetatable({}, {__len = function() return n end})\n"
+                    "table.insert(t, 1, 'v') return rawget(t, 1) == 'v'");
+    expect_error(vm, "local n = LIMIT + 1 local t = setmetatable({}, {__len = function() return n end})\n"
+                     "table.insert(t, 1, 'v')",
+                 "main.lua:2: " TOO_MANY("insert"));
+    /* Appending shifts nothing, whatever __len says. */
+    expect_true(vm, "local t = setmetatable({}, {__len = function() return math.maxinteger - 1 end})\n"
+                    "table.insert(t, 'v') return rawget(t, math.maxinteger) == 'v'");
+    /* A __len that answers 1, then maxinteger - 1, is asked once. */
+    expect_true(vm, STATEFUL_LEN("1", "math.maxinteger - 1")
+                    "local t = setmetatable({}, {__len = len}) table.insert(t, 1, 'v')\n"
+                    "return calls == 1 and rawget(t, 1) == 'v'");
+    expect_error(vm, SPARSE "table.insert(t, 1, 'v')", "main.lua:3: " TOO_MANY("insert"));
+    /* Lua's behaviour and errors otherwise. */
+    expect_true(vm, "local t = {1, 2, 3} table.insert(t, 1, 0) table.insert(t, 'x')\n"
+                    "return table.concat(t, ',') == '0,1,2,3,x'");
+    expect_stock_error(vm, "table.insert({1, 2}, 5, 'x')");
+    expect_stock_error(vm, "table.insert({1, 2})");
+    expect_stock_error(vm, "table.insert(nil, 'x')");
+    expect_stock_error(vm, "table.insert('abc', 1, 'x')");
+    expect_stock_error(vm, "table.insert({}, 'a', 'x')");
+    apps_vm_free(vm);
+}
+
+static void remove_bounded(void) {
+    apps_vm_t *vm = bounded_vm();
+    expect_error(vm, "local t = setmetatable({}, {__len = function() return math.maxinteger end})\n"
+                     "table.remove(t, 1)",
+                 "main.lua:2: " TOO_MANY("remove"));
+    expect_error(vm, "local t = setmetatable({}, {__len = function() return -5 end})\n"
+                     "table.remove(t, math.mininteger)",
+                 "main.lua:2: " TOO_MANY("remove"));
+    /* Removing the last element shifts nothing, whatever __len says. */
+    expect_true(vm, "local t = setmetatable({}, {__len = function() return math.maxinteger end})\n"
+                    "return table.remove(t) == nil");
+    /* Shifting LIMIT elements is Lua's own remove; one more is refused. */
+    expect_true(vm, "local n = LIMIT + 1 local t = setmetatable({'a'}, {__len = function() return n end})\n"
+                    "return table.remove(t, 1) == 'a'");
+    expect_error(vm, "local n = LIMIT + 2 local t = setmetatable({}, {__len = function() return n end})\n"
+                     "table.remove(t, 1)",
+                 "main.lua:2: " TOO_MANY("remove"));
+    expect_true(vm, STATEFUL_LEN("1", "math.maxinteger - 1")
+                    "local t = setmetatable({'a'}, {__len = len})\n"
+                    "return table.remove(t, 1) == 'a' and calls == 1 and rawget(t, 1) == nil");
+    expect_error(vm, SPARSE "table.remove(t, 1)", "main.lua:3: " TOO_MANY("remove"));
+    /* Lua's behaviour and errors otherwise. */
+    expect_true(vm, "local t = {1, 2, 3} local a, b = table.remove(t, 1), table.remove(t)\n"
+                    "return a == 1 and b == 3 and #t == 1 and t[1] == 2 and table.remove({}) == nil");
+    expect_stock_error(vm, "table.remove({1, 2}, 5)");
+    expect_stock_error(vm, "table.remove(nil)");
+    expect_stock_error(vm, "table.remove({}, 'a')");
+    apps_vm_free(vm);
+}
+
+static void sort_bounded(void) {
+    apps_vm_t *vm = bounded_vm();
+    /* The review's case: a __len of 2e7 with nothing behind it, and a C comparator. */
+    expect_error(vm, "local t = setmetatable({}, {__len = function() return 2e7 end})\n"
+                     "table.sort(t, getmetatable)",
+                 "main.lua:2: " TOO_MANY("sort"));
+    expect_error(vm, "local t = setmetatable({}, {__len = function() return math.maxinteger end})\n"
+                     "table.sort(t)",
+                 "main.lua:2: " TOO_MANY("sort"));
+    /* LIMIT elements is Lua's own sort; one more is refused. */
+    expect_true(vm, "local n = LIMIT local t = setmetatable({}, {__len = function() return n end})\n"
+                    "table.sort(t, getmetatable) return true");
+    expect_error(vm, "local n = LIMIT + 1 local t = setmetatable({}, {__len = function() return n end})\n"
+                     "table.sort(t, getmetatable)",
+                 "main.lua:2: " TOO_MANY("sort"));
+    expect_true(vm, STATEFUL_LEN("3", "math.maxinteger - 1")
+                    "local t = setmetatable({3, 1, 2}, {__len = len}) table.sort(t)\n"
+                    "return calls == 1 and t[1] == 1 and t[2] == 2 and t[3] == 3");
+    expect_error(vm, SPARSE "table.sort(t)", "main.lua:3: " TOO_MANY("sort"));
+    /* Lua's behaviour and errors otherwise. */
+    expect_true(vm, "local t, u = {3, 1, 2}, {3, 1, 2} table.sort(t) table.sort(u, function(a, b) return a > b end)\n"
+                    "return table.concat(t, ',') == '1,2,3' and table.concat(u, ',') == '3,2,1'");
+    expect_stock_error(vm, "table.sort({3, 1, 2}, 1)");
+    expect_stock_error(vm, "table.sort(nil)");
+    expect_stock_error(vm, "table.sort({1, 'a'})");
+    apps_vm_free(vm);
+}
+
+static void concat_bounded(void) {
+    apps_vm_t *vm = bounded_vm();
+    expect_error(vm, "local t = setmetatable({}, {__len = function() return math.maxinteger end})\n"
+                     "table.concat(t)",
+                 "main.lua:2: " TOO_MANY("concat"));
+    expect_error(vm, "table.concat({}, '', 1, math.maxinteger)", "main.lua:1: " TOO_MANY("concat"));
+    expect_error(vm, "table.concat({}, '', math.mininteger, math.maxinteger)", "main.lua:1: " TOO_MANY("concat"));
+    expect_error(vm, SPARSE "table.concat(t)", "main.lua:3: " TOO_MANY("concat"));
+    /* Lua's behaviour and errors otherwise, in Lua's order: sep before i and j. */
+    expect_true(vm, "return table.concat({1, 2, 3}, ', ') == '1, 2, 3' and table.concat({}, 'x') == ''\n"
+                    "  and table.concat({1, 2}, 0) == '102' and table.concat({'a', 'b', 'c'}, '', 2, 3) == 'bc'\n"
+                    "  and table.concat({}, 'x', 5, 1) == '' and table.concat({'a'}, nil, 1, 1) == 'a'");
+    expect_stock_error(vm, "table.concat({1, {}, 3})");
+    expect_stock_error(vm, "table.concat({}, {})");
+    expect_stock_error(vm, "table.concat({}, {}, 'a')");
+    expect_stock_error(vm, "table.concat({}, '', 'a')");
+    expect_stock_error(vm, "table.concat({}, '', 1, 'b')");
+    expect_stock_error(vm, "table.concat(nil)");
+    expect_stock_error(vm, "table.concat({}, '', math.maxinteger, math.maxinteger)");
+    apps_vm_free(vm);
+
+    /* Elements that read as "" with no Lua code and no allocation: only the count
+     * bounds the loop. LIMIT of them is Lua's own concat; one more is refused. */
+    vm = bounded_vm();
+    expect_error(vm, EMPTY_READS "table.concat(t, '', 1, math.maxinteger)", "main.lua:3: " TOO_MANY("concat"));
+    expect_true(vm, EMPTY_READS "return table.concat(t, '', 1, LIMIT) == ''");
+    expect_error(vm, EMPTY_READS "table.concat(t, '', 1, LIMIT + 1)", "main.lua:3: " TOO_MANY("concat"));
+    expect_error(vm, EMPTY_READS "setmetatable(t, {__index = '', __len = function() return math.maxinteger end})\n"
+                                 "table.concat(t)",
+                 "main.lua:4: " TOO_MANY("concat"));
+    expect_true(vm, EMPTY_READS STATEFUL_LEN("3", "math.maxinteger")
+                    "setmetatable(t, {__index = '', __len = len}) t[1], t[2], t[3] = 'a', 'b', 'c'\n"
+                    "return table.concat(t) == 'abc' and calls == 1");
+    /* A string is table-like to concat once its metatable has __index and __len. Its
+     * length is its own (Lua never asks a string's __len), but a range needn't be. */
+    expect_error(vm, "local mt = getmetatable('') mt.__index, mt.__len = string.sub, true\n"
+                     "table.concat('abc', '', 1, math.maxinteger)",
+                 "main.lua:2: " TOO_MANY("concat"));
+    expect_true(vm, "local mt = getmetatable('') mt.__index, mt.__len = string.sub, true\n"
+                    "return table.concat('abc') == 'abcbcc' and table.concat('abc', ',', 2, 5) == 'bc,c,,'");
+    apps_vm_free(vm);
+}
+
+/* A module's userdata whose metamethods are all C: Lua's own loops over it would run no
+ * Lua code at all. Its length is maxinteger - 1, reads give "" and writes do nothing. */
+static int c_len(lua_State *L) {
+    lua_pushinteger(L, LUA_MAXINTEGER - 1);
+    return 1;
+}
+static int c_index(lua_State *L) {
+    lua_pushliteral(L, "");
+    return 1;
+}
+static int c_newindex(lua_State *L) {
+    (void)L;
+    return 0;
+}
+static void set_c_object(lua_State *L, const char *name, bool writable) {
+    lua_newuserdatauv(L, 1, 0);
+    lua_createtable(L, 0, 3);
+    lua_pushcfunction(L, c_len);
+    lua_setfield(L, -2, "__len");
+    lua_pushcfunction(L, c_index);
+    lua_setfield(L, -2, "__index");
+    if (writable) {
+        lua_pushcfunction(L, c_newindex);
+        lua_setfield(L, -2, "__newindex");
+    }
+    lua_setmetatable(L, -2);
+    lua_setglobal(L, name);
+}
+
+/* Lua's own insert, remove, sort and concat reach an object with __len through a proxy
+ * (fix round 1). Its __len runs once, and its own metamethods get the object itself. */
+static void len_proxy(void) {
+    apps_vm_t *vm = bounded_vm();
+#define OBJECT                                                                                        \
+    "local store, calls, strangers = {'a', 'b', 'c'}, 0, 0\n"                                         \
+    "local t\n"                                                                                       \
+    "local function check(self) if not rawequal(self, t) then strangers = strangers + 1 end end\n"    \
+    "t = setmetatable({}, {__len = function(self) check(self) calls = calls + 1 return #store end,\n" \
+    "  __index = function(self, k) check(self) return store[k] end,\n"                               \
+    "  __newindex = function(self, k, v) check(self) store[k] = v end})\n"
+#define SEEN_ONCE " and calls == 1 and strangers == 0"
+    expect_true(vm, OBJECT "table.insert(t, 1, 'z') return table.concat(store, ',') == 'z,a,b,c'" SEEN_ONCE);
+    expect_true(vm, OBJECT "return table.remove(t, 1) == 'a' and table.concat(store, ',') == 'b,c'" SEEN_ONCE);
+    expect_true(vm, OBJECT "table.sort(t, function(a, b) return a > b end)\n"
+                           "return table.concat(store, ',') == 'c,b,a'" SEEN_ONCE);
+    expect_true(vm, OBJECT "return table.concat(t, '-') == 'a-b-c'" SEEN_ONCE);
+#undef SEEN_ONCE
+#undef OBJECT
+    /* __len's own errors are Lua's. */
+    expect_stock_error(vm, "table.insert(setmetatable({}, {__len = function() return 1.5 end}), 1, 'v')");
+    expect_stock_error(vm, "table.sort(setmetatable({}, {__len = function() error('no length') end}))");
+    expect_stock_error(vm, "table.remove(setmetatable({}, {__len = 7}))");
+    /* Not a table but table-like: refused the same. Without __newindex it is table-like
+     * to concat alone, and the others raise Lua's own error. */
+    lua_State *L = apps_vm_lua(vm);
+    set_c_object(L, "RW", true);
+    set_c_object(L, "RO", false);
+    expect_true(vm, "local function refused(f, ...)\n"
+                    "  local ok, e = pcall(f, ...) return not ok and string.find(e, 'more elements than', 1, true) ~= nil\n"
+                    "end\n"
+                    "local function not_a_table(f, ...)\n"
+                    "  local ok, e = pcall(f, ...) return not ok and string.find(e, 'table expected, got userdata', 1, true) ~= nil\n"
+                    "end\n"
+                    "return refused(table.insert, RW, 1, 'x') and refused(table.remove, RW, 1) and refused(table.sort, RW)\n"
+                    "  and refused(table.concat, RW) and refused(table.concat, RO) and not_a_table(table.insert, RO, 1, 'x')\n"
+                    "  and not_a_table(table.remove, RO, 1) and not_a_table(table.sort, RO)");
+    apps_vm_free(vm);
+}
+
+/* The did-you-mean's work per miss is capped (fix round 1): past the cap, the plain
+ * message. */
+static void suggest_capped(void) {
+    apps_vm_t *vm = new_vm(1 * MB);
+    char src[1024], want[256];
+    static const char stem_src[] =
+        "local stem, letters = ('n'):rep(58), 'abcdefghijklmnopqrstuvwxyz'\n"
+        "for i = 0, %d - 1 do\n"
+        "  local a, b = i // 26 + 1, i %% 26 + 1\n"
+        "  rawset(_G, stem .. letters:sub(a, a) .. letters:sub(b, b), true)\n"
+        "end\n"
+        "return _G[stem .. '!!']";
+    /* 300 globals of 60 characters, all two edits from the missing name, whose tables
+     * stay open to the last row: about a million cells, past the cap. */
+    char stem[59];
+    memset(stem, 'n', 58);
+    stem[58] = '\0';
+    snprintf(src, sizeof src, stem_src, 300);
+    snprintf(want, sizeof want, "main.lua:6: unknown global '%s!!'", stem);
+    expect_error(vm, src, want);
+    apps_vm_free(vm);
+
+    /* The same with 5 such globals is under the cap and gets its suggestion. */
+    vm = new_vm(1 * MB);
+    lua_State *L = apps_vm_lua(vm);
+    char err[256] = "";
+    snprintf(src, sizeof src, stem_src, 5);
+    int rc = run(vm, src, 0, err, sizeof err);
+    CHECK(rc == LUA_ERRRUN && strstr(top_text(L), "(did you mean 'nnnn") != NULL, "5 near globals: rc=%d %s", rc,
+          rc == -1 ? err : top_text(L));
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+
+    /* More candidates than the did-you-mean gathers: the plain message, though 'w1' is
+     * one edit from 'w1x'. */
+    vm = new_vm(1 * MB);
+    expect_error(vm, "for i = 1, 600 do rawset(_G, 'w' .. i, true) end\nreturn w1x", "main.lua:2: unknown global 'w1x'");
+    expect_error(vm, "return pairz", "main.lua:1: unknown global 'pairz'");
+    apps_vm_free(vm);
+}
+
 /* ---- allocator ---- */
 
 static void allocator(void) {
@@ -1000,6 +1347,23 @@ static void suggest(void) {
     static const char *const lower[] = {"pairs"};
     CHECK(apps_suggest("Pairs", lower, 1) == lower[0], "Pairs");
 
+    /* The cells scored per call are capped (64K, fix round 1). A 64-byte name one edit
+     * from each 64-byte candidate fills every table to its last row: 4096 cells each, so
+     * 10 candidates fit and 40 don't. */
+    static char wide[40][65];
+    const char *wides[40];
+    for (int i = 0; i < 40; i++) {
+        memset(wide[i], 'a', 63);
+        wide[i][63] = (char)('0' + i);  /* '0'..'W': never the name's 'a' */
+        wide[i][64] = '\0';
+        wides[i] = wide[i];
+    }
+    char a64[65];
+    memset(a64, 'a', 64);
+    a64[64] = '\0';
+    CHECK(apps_suggest(a64, wides, 10) == wides[0], "10 wide candidates are under the cap");
+    CHECK(apps_suggest(a64, wides, 40) == NULL, "40 wide candidates are past the cap");
+
     /* The callers in Tasks 7 and 8. */
     static const char *const manifest[] = {"id", "name", "version", "api", "main", "memory_kb", "permissions", "files"};
     CHECK(apps_suggest("permission", manifest, 8) == manifest[6], "permission");
@@ -1025,6 +1389,14 @@ int main(int argc, char **argv) {
         {"split_trim", split_trim},
         {"find_linear", find_linear},
         {"split_linear", split_linear},
+        {"rep_bounded", rep_bounded},
+        {"move_bounded", move_bounded},
+        {"insert_bounded", insert_bounded},
+        {"remove_bounded", remove_bounded},
+        {"sort_bounded", sort_bounded},
+        {"concat_bounded", concat_bounded},
+        {"len_proxy", len_proxy},
+        {"suggest_capped", suggest_capped},
         {"allocator", allocator},
         {"cycles", cycles},
         {"new_without_memory", new_without_memory},

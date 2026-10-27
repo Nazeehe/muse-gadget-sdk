@@ -28,6 +28,10 @@
  * - string has no dump; match, gmatch and gsub raise (Lua's pattern matching
  *   backtracks without bound, out of reach of any hook); find searches plain text
  *   only, in linear time; split and trim are added.
+ * - No library call loops in C without allocating, since count hooks never fire
+ *   there: rep of an empty string returns "" at once, and table's concat, move,
+ *   insert, remove and sort refuse to walk more elements than the heap could hold
+ *   (mem_limit / 16: a range or a __len with nothing behind it).
  * Globals are strict: reading an undefined one raises "unknown global 'x'", with a
  * "did you mean" when a name is near, or advice for a library left out (io, debug,
  * load...); assigning one defines it. Strictness lives in the table's __index, so C

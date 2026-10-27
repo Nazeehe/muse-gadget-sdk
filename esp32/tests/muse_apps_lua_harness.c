@@ -113,17 +113,23 @@ static int load_nested(lua_State *L, size_t depth) {
     return luaL_loadstring(L, src);
 }
 
-/* components/lua/CMakeLists.txt's LUAI_MAXCCALLS=64 has to reach the host build:
- * at Lua's default of 200 the parser nests far deeper than the app task's stack allows. */
+/* components/lua/CMakeLists.txt's LUAI_MAXCCALLS has to reach the host build, or the
+ * host would accept nesting the device refuses. The parser spends one level on the
+ * statement, one on the returned expression and one more inside each pair of
+ * parentheses, and level LUAI_MAXCCALLS is the "C stack overflow" error. At 40,
+ * `return ((...(1)...))` therefore parses with 37 pairs and fails with 38 (at Lua's
+ * default of 200 it would be 197 and 198). Changing the limit changes this number. */
+enum { DEEPEST_PAIRS = 37 };
+
 static void nesting_limit(lua_State *L) {
-    int rc = load_nested(L, 20);
-    CHECK(rc == LUA_OK, "20 nested parentheses must parse, rc=%d: %s", rc, top_text(L));
+    int rc = load_nested(L, DEEPEST_PAIRS);
+    CHECK(rc == LUA_OK, "%d nested parentheses must parse, rc=%d: %s", DEEPEST_PAIRS, rc, top_text(L));
     lua_settop(L, 0);
 
-    rc = load_nested(L, 100);
-    /* The parser's level check raises the runtime error, not a syntax error. */
+    /* The parser's level check raises a runtime error, not a syntax error. */
+    rc = load_nested(L, DEEPEST_PAIRS + 1);
     CHECK(rc != LUA_OK && strstr(top_text(L), "C stack overflow") != NULL,
-          "100 nested parentheses must hit the C stack limit, rc=%d: %s", rc, top_text(L));
+          "%d nested parentheses must hit the C stack limit, rc=%d: %s", DEEPEST_PAIRS + 1, rc, top_text(L));
     lua_settop(L, 0);
 }
 

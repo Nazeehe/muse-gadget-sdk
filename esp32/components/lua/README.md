@@ -48,20 +48,32 @@ header to it. Set build options in `CMakeLists.txt` instead.
 
 ## Build settings
 
-- `LUAI_MAXCCALLS=64` (Lua's default is 200) is the deepest nesting of C calls
-  and parser levels. The Lua task's stack is 32 KB, which 200 levels could
-  overflow.
-- `-O2 -w`: upstream's code, warnings and all. Unoptimized, the deepest
-  nesting needs more than that 32 KB as well.
+- `LUAI_MAXCCALLS=40` (Lua's default is 200) is how deep C calls and parser
+  levels may nest before Lua raises "C stack overflow". It's sized to the Lua
+  task's 32 KB stack:
+  - While Lua handles that error it lets the count go on to 1.1 times the
+    limit, 44 C levels. At roughly 500 bytes a level on the ESP32-S3 (the
+    compiler's stack-usage estimate, not yet a measurement on the device)
+    that's about 22 KB. The task's own frames, a binding's buffers and log
+    formatting add about 6 KB: some 28 KB of the 32.
+  - Only nesting across the C boundary counts (`pcall`, metamethods,
+    `coroutine.resume`, `table.sort` comparators), and the parser's own
+    levels. A Lua function calling a Lua function doesn't use the C stack in
+    Lua 5.4. Nesting past the limit ends in a Lua error, not a crash.
+- `-O2 -w`: upstream's code, warnings and all. Unoptimized, the frames are
+  several times larger (40 nested `pcall`s take about 170 KB with the host's
+  compiler), far more than that 32 KB.
 - `LUA_COMPAT_5_3` isn't defined, though upstream's own Makefile defines it, so
   `math.atan2`, `cosh`, `sinh`, `tanh`, `pow`, `frexp`, `ldexp` and `log10` are
   absent.
 
 `tests/apps_host.py` reads the source list, the definition and the options
 from `CMakeLists.txt`, so the host tests build Lua the way the firmware does.
-It adds only `-D_GNU_SOURCE`, `-pthread` and `luai_makeseed`, a fixed string
-hash seed, so a table's keys come in the same order on every run. The device
-keeps Lua's own seed.
+It adds `-D_GNU_SOURCE`, `-pthread` and `luai_makeseed`, a fixed string
+hash seed, so a table's keys come in the same order on every run, and links
+`-lm`. The device keeps Lua's own seed. Sanitized builds (`sanitize=True`, the
+default) also compile Lua's own files with ASan and UBSan, which inflate stack
+frames: take stack measurements from `build(..., sanitize=False)`.
 
 ## Updating
 

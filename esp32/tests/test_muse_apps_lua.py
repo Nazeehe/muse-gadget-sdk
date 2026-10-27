@@ -43,7 +43,7 @@ class MuseAppsLuaTest(unittest.TestCase):
         self.run_case("numbers")
 
     def test_device_defines_reach_the_host_build(self):
-        self.assertIn("LUAI_MAXCCALLS=64", apps_host.lua_defines())
+        self.assertEqual(apps_host.lua_defines(), ["LUAI_MAXCCALLS=40"])
         self.run_case("nesting_limit")
 
 

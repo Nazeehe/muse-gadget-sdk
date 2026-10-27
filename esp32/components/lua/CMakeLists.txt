@@ -17,8 +17,10 @@
 # utf8. Not io, os, debug or package, and not linit.c (the apps runtime opens
 # the libraries one at a time), nor the lua and luac programs.
 #
-# tests/apps_host.py reads this file for the host builds, so keep every source
-# a quoted "src/<name>.c" and each setting in its own PRIVATE call below.
+# tests/apps_host.py reads this file for the host builds and doesn't evaluate
+# if(): keep every source a quoted "src/<name>.c", all the definitions in the one
+# target_compile_definitions call and all the options in the one
+# target_compile_options call, both PRIVATE.
 if(CONFIG_MUSE_APPS)
     idf_component_register(
         SRCS
@@ -33,9 +35,12 @@ if(CONFIG_MUSE_APPS)
     # Upstream code, warnings and all. -O2, as the host tests build it: unoptimized,
     # deep nesting needs more stack than the app task's 32 KB.
     target_compile_options(${COMPONENT_LIB} PRIVATE -O2 -w)
-    # Lua stops nested C calls and parser levels at 200 by default, which could
-    # overflow the app task's 32 KB stack; 64 is the limit for it.
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE LUAI_MAXCCALLS=64)
+    # How deep C calls and parser levels may nest before Lua raises "C stack
+    # overflow" (200 by default), sized to the app task's 32 KB stack: error
+    # handling may go on to 1.1 times this, 44 levels at an estimated 500 bytes
+    # each on the S3, and the task's own frames take a few KB more. Lua-to-Lua
+    # calls don't count. README.md has the arithmetic.
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE LUAI_MAXCCALLS=40)
 else()
     idf_component_register()
 endif()

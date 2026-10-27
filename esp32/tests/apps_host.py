@@ -59,11 +59,23 @@ def _lua_cmake() -> str:
 
 
 def _lua_private(command: str) -> list[str]:
-    """The arguments of `command(${COMPONENT_LIB} PRIVATE ...)` in the Lua component."""
-    found = re.search(command + r"\(\s*\$\{COMPONENT_LIB\}\s+PRIVATE\s+([^)]*)\)", _lua_cmake())
-    if not found:
-        raise AssertionError(f"components/lua/CMakeLists.txt has no {command}(${{COMPONENT_LIB}} PRIVATE ...)")
-    return found.group(1).split()
+    """What the Lua component's one `command(${COMPONENT_LIB} PRIVATE ...)` call passes.
+
+    The host build doesn't evaluate if(), so it only takes a file it can read whole:
+    exactly one such call, and nothing PUBLIC or INTERFACE, which the muse
+    component would pick up too.
+    """
+    calls = re.findall(rf"\b{command}\s*\(([^)]*)\)", _lua_cmake(), re.IGNORECASE)
+    if len(calls) != 1:
+        raise AssertionError(
+            f"components/lua/CMakeLists.txt needs exactly one {command}() call, found {len(calls)}: "
+            "tests/apps_host.py doesn't evaluate if(), so all of them go in that one call")
+    words = calls[0].split()
+    if words[:2] != ["${COMPONENT_LIB}", "PRIVATE"] or {"PUBLIC", "INTERFACE"} & set(words):
+        raise AssertionError(
+            f"components/lua/CMakeLists.txt: {command}() must be (${{COMPONENT_LIB}} PRIVATE ...) "
+            f"and nothing else, got ({' '.join(words)})")
+    return words[2:]
 
 
 def lua_sources() -> list[Path]:

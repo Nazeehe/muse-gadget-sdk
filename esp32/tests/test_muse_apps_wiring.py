@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import apps_host
 
@@ -57,6 +58,36 @@ class MuseAppsWiringTest(unittest.TestCase):
         # src/ is upstream's minus the programs and its Makefile.
         for name in ("lua.c", "luac.c", "Makefile"):
             self.assertFalse((LUA / "src" / name).exists(), name)
+
+    def test_host_parser_refuses_cmake_it_cannot_follow(self):
+        # tests/apps_host.py doesn't evaluate if(). A second call, or one the muse component
+        # would inherit, would change the device build and not the host's.
+        defs = "target_compile_definitions(${COMPONENT_LIB} PRIVATE LUAI_MAXCCALLS=40)\n"
+        opts = "target_compile_options(${COMPONENT_LIB} PRIVATE -O2 -w)\n"
+        extra = "if(CONFIG_FOO)\n    target_compile_{}(${{COMPONENT_LIB}} PRIVATE FOO)\nendif()\n"
+
+        def parse(cmake):
+            # Whatever apps_host reads as components/lua/CMakeLists.txt.
+            with mock.patch.object(Path, "read_text", return_value=cmake):
+                return apps_host.lua_defines(), apps_host.lua_options()
+
+        self.assertEqual(parse(defs + opts), (["LUAI_MAXCCALLS=40"], ["-O2", "-w"]))
+        # Comments are ignored, and CMake commands are case-insensitive.
+        self.assertEqual(parse("# " + defs + defs.replace("target_compile", "Target_Compile") + opts),
+                         (["LUAI_MAXCCALLS=40"], ["-O2", "-w"]))
+        for why, cmake in (
+            ("no definitions call", opts),
+            ("no options call", defs),
+            ("a second definitions call", defs + extra.format("definitions") + opts),
+            ("a second options call", defs + opts + extra.format("options")),
+            ("PUBLIC definitions", defs.replace("PRIVATE", "PUBLIC") + opts),
+            ("INTERFACE options", defs + opts.replace("PRIVATE", "INTERFACE")),
+            ("PUBLIC after PRIVATE", defs.replace("40)", "40 PUBLIC B)") + opts),
+            ("another target", defs.replace("${COMPONENT_LIB}", "other") + opts),
+            ("BEFORE", defs + opts.replace("PRIVATE", "BEFORE PRIVATE")),
+        ):
+            with self.subTest(why), self.assertRaises(AssertionError):
+                parse(cmake)
 
     def test_muse_requires_lua_unconditionally(self):
         # The empty component costs nothing; a conditional requirement is resolved before Kconfig.

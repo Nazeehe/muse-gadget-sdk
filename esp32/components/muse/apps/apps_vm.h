@@ -51,16 +51,16 @@
  *   garbage and retries the request at once. A refusal that retry doesn't answer is
  *   sticky: the app is out of memory, and the next check kills it, whatever Lua made of
  *   the refusal. The checks are the count hook, pcall, xpcall, coroutine create, resume,
- *   wrap and close, apps_vm_check and apps_vm_call.
- * - A deviation: running out of memory can be seen, though not kept. A __close handler
- *   that Lua runs as the memory error unwinds is closed with it, and can run up to 1000 VM
- *   instructions before the hook stops it; raising another error in its place changes
- *   nothing, and a binding it calls stops at apps_vm_check.
+ *   wrap and close, apps_vm_check and apps_vm_call. No app code runs while the error
+ *   unwinds, so none of it can be swallowed: __gc and to-be-closed variables, the only app
+ *   code Lua runs during an unwind, are both out (apps_vm_load refuses a <close>). A refusal
+ *   a C binding survives (a bounded C loop, say) becomes the kill within 1000 pure-Lua
+ *   instructions, and no binding acts in between, since each calls apps_vm_check first.
  * - A kill lands within 1000 VM instructions; a C function runs to its end first, which
  *   the bounds above keep short. Spec §8.2 re-arms the hook with a count of 1 at once:
- *   lua_sethook from another task isn't safe (ruling A15). Once the kill is raised, each
- *   thread it passes through re-arms its own hook with a count of 1, so the __close
- *   handlers Lua runs while it unwinds stop before their first instruction.
+ *   lua_sethook from another task isn't safe (ruling A15). Once the kill is raised, the
+ *   thread re-arms its own hook with a count of 1, a backstop against any app code reached
+ *   while it unwinds (none, with <close> and __gc gone).
  */
 
 #include <stdbool.h>
@@ -91,8 +91,10 @@ lua_State *apps_vm_lua(apps_vm_t *vm);
  * ("main.lua", "lib/util.lua"), to which this adds Lua's '=' itself, so messages read
  * "main.lua:3: boom". Callers never add '=' or '@'. A leading UTF-8 BOM is skipped;
  * a binary chunk is refused with "binary chunks are not allowed: install Lua source
- * text". On success pushes the function (its _ENV is the sandbox) and returns true.
- * Otherwise pushes nothing, puts the message in err (cut to err_len on a character
+ * text". A chunk that declares a to-be-closed variable is refused with
+ * "<name>:<line>: '<close>' variables are not available in Muse apps" (see the CPU and
+ * memory note above). On success pushes the function (its _ENV is the sandbox) and returns
+ * true. Otherwise pushes nothing, puts the message in err (cut to err_len on a character
  * boundary) and returns false.
  */
 bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t len, char *err, size_t err_len);

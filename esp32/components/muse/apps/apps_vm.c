@@ -31,6 +31,14 @@
 #include "lauxlib.h"
 #include "lualib.h"
 
+/* Lua 5.4.9 internals, to refuse a chunk that declares a to-be-closed variable (apps_vm_load):
+ * the compiled prototype tree and OP_TBC. The vendored Lua is pinned (CONFIG_MUSE_APPS builds
+ * only this copy), so the Proto layout, the opcode and luaG_getfuncline are fixed. */
+#include "ldebug.h"    /* luaG_getfuncline */
+#include "lobject.h"   /* Proto, getproto, s2v */
+#include "lopcodes.h"  /* OP_TBC, GET_OPCODE */
+#include "lstate.h"    /* lua_State::top */
+
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 /* The count hook's period, in VM instructions. */
@@ -1183,6 +1191,32 @@ lua_State *apps_vm_lua(apps_vm_t *vm) {
     return vm->L;
 }
 
+/* Whether any prototype in the tree rooted at p compiles a to-be-closed variable (OP_TBC),
+ * and the source line of the earliest one. A <close> variable runs app code (its __close) when
+ * a block or function unwinds, with hooks off, past any budget; with it and __gc both gone, no
+ * app code runs during an unwind, so a kill or running out of memory can't be swallowed there.
+ * The chunk is small (one app file) and this runs once at load, so walking every opcode is cheap. */
+static bool proto_has_tbc(const Proto *p, int *line) {
+    bool found = false;
+    for (int pc = 0; pc < p->sizecode; pc++) {
+        if (GET_OPCODE(p->code[pc]) == OP_TBC) {
+            int l = luaG_getfuncline(p, pc);
+            if (!found || l < *line) {
+                *line = l;
+            }
+            found = true;
+        }
+    }
+    for (int i = 0; i < p->sizep; i++) {
+        int l;
+        if (proto_has_tbc(p->p[i], &l) && (!found || l < *line)) {
+            *line = l;
+            found = true;
+        }
+    }
+    return found;
+}
+
 bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t len, char *err, size_t err_len) {
     if (len >= 3 && memcmp(src, "\xEF\xBB\xBF", 3) == 0) {
         src += 3;
@@ -1213,6 +1247,17 @@ bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t 
     if (luaL_loadbufferx(L, src, len, name, "t") != LUA_OK) {
         const char *msg = lua_tostring(L, -1);
         copy_message(err, err_len, msg != NULL ? msg : "error loading the chunk");
+        lua_pop(L, 1);
+        return false;
+    }
+    /* A to-be-closed variable isn't allowed (see proto_has_tbc). The loaded chunk is always a
+     * Lua closure; its Proto is the top of the stack. The message reads like Lua's own position
+     * errors ("name:line: ..."), so apps_vm_excerpt shows the line. */
+    int tbc_line = 0;
+    if (proto_has_tbc(getproto(s2v(L->top.p - 1)), &tbc_line)) {
+        char msg[LUA_IDSIZE + 64];
+        snprintf(msg, sizeof msg, "%s:%d: '<close>' variables are not available in Muse apps", name + 1, tbc_line);
+        copy_message(err, err_len, msg);
         lua_pop(L, 1);
         return false;
     }

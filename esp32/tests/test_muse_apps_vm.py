@@ -138,6 +138,11 @@ class MuseAppsVmTest(unittest.TestCase):
     def test_wall_clock_backstop(self):
         self.run_case("wall_clock", timeout=10)
 
+    def test_close_variables_refused(self):
+        # Ruling: <close> runs app code during an unwind, so it is refused at load. That closes
+        # the last path by which a __close handler could swallow a kill or out-of-memory error.
+        self.run_case("tbc_refused", timeout=10)
+
     def test_short_coroutines_are_counted(self):
         # A coroutine that runs fewer than 1000 instructions never reaches the hook, so creating
         # one counts as 1000. Without that, the tree in this case runs for minutes.

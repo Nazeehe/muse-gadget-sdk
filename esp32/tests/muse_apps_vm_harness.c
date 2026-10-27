@@ -1431,8 +1431,7 @@ static int call(apps_vm_t *vm, const char *src, int nresults, uint32_t budget, c
  * survived where the value of what should have stopped it would come from: apps_vm_call
  * reports a kill that landed while a call ran even when something swallowed it, so the
  * status alone can't show a kill that was swallowed for a few instructions. */
-static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src, apps_call_t want, const char *reason,
-                          const char *seen) {
+static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src, apps_call_t want, const char *reason) {
     apps_vm_t *vm = new_vm(cap);
     lua_State *L = apps_vm_lua(vm);
     char err[512] = "";
@@ -1441,10 +1440,6 @@ static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src
              call_name((int)want), reason, call_name(rc), err);
     CHECK_AT(line, lua_gettop(L) == 0, "%s\n  left %d values on the stack", src, lua_gettop(L));
     CHECK_AT(line, raw_global(L, "survived") == LUA_TNIL, "%s\n  ran on after it should have stopped", src);
-    if (seen != NULL) {
-        bool same = raw_global(L, "seen") == LUA_TSTRING && strcmp(lua_tostring(L, -1), seen) == 0;
-        CHECK_AT(line, same, "%s\n  seen is %s, not '%s'", src, top_text(L), seen);
-    }
     lua_settop(L, 0);
     CHECK_AT(line, apps_vm_dying(vm) && !apps_vm_in_call(vm), "%s\n  dying %d, in a call %d", src, apps_vm_dying(vm),
              apps_vm_in_call(vm));
@@ -1452,11 +1447,8 @@ static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src
     apps_vm_free(vm);
 }
 #define expect_killed(src) \
-    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_KILLED, BUDGET_MSG("2000000"), NULL)
-#define expect_nomem(src) expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_NOMEM, NOMEM_MSG("256"), NULL)
-/* Out of memory that a __close handler saw, as the message Lua closes it with, and couldn't keep. */
-#define expect_nomem_seen(src) \
-    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_NOMEM, NOMEM_MSG("256"), "not enough memory")
+    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_KILLED, BUDGET_MSG("2000000"))
+#define expect_nomem(src) expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_NOMEM, NOMEM_MSG("256"))
 
 /* src under apps_vm_call returns exactly the values describe() shows as want. */
 static void expect_returns_at(int line, apps_vm_t *vm, const char *src, const char *want) {
@@ -1526,6 +1518,48 @@ static void wall_clock(void) {
     apps_vm_free(vm);
 }
 
+/* ---- tbc_refused: <close> variables (ruling) ---- */
+
+/* src is refused at load with exactly want, and nothing is left on the stack. */
+static void expect_load_refused_at(int line, const char *src, const char *want) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    lua_State *L = apps_vm_lua(vm);
+    char err[256] = "";
+    bool ok = apps_vm_load(vm, "main.lua", src, strlen(src), err, sizeof err);
+    CHECK_AT(line, !ok && strcmp(err, want) == 0, "%s\n  want refused '%s'\n  got loaded=%d '%s'", src, want, ok, err);
+    CHECK_AT(line, lua_gettop(L) == 0, "%s\n  left %d values on the stack", src, lua_gettop(L));
+    apps_vm_free(vm);
+}
+#define expect_load_refused(src, want) expect_load_refused_at(__LINE__, src, want)
+#define TBC_MSG(line) "main.lua:" line ": '<close>' variables are not available in Muse apps"
+
+static void tbc_refused(void) {
+    /* A to-be-closed variable runs app code (its __close) when a block unwinds, with hooks off,
+     * so no kill or out-of-memory could stop or outlast it. It is refused at load, whatever its
+     * value (nil still compiles OP_TBC), and wherever it is declared. */
+    expect_load_refused("local x <close> = nil", TBC_MSG("1"));
+    expect_load_refused("local x <close> = setmetatable({}, {__close = function() end})", TBC_MSG("1"));
+    /* The whole prototype tree is walked: a nested function, and a coroutine body. */
+    expect_load_refused("local function f()\n  local y <close> = nil\nend\nreturn f", TBC_MSG("2"));
+    expect_load_refused("local co = coroutine.create(function()\n  local z <close> = nil\nend)\nreturn co", TBC_MSG("2"));
+    /* With two, the earliest line is named. */
+    expect_load_refused("do local a <close> = nil end\ndo local b <close> = nil end", TBC_MSG("1"));
+
+    /* The message carries a position, so apps_vm_excerpt shows the offending line. */
+    const char *src = "local ok = 1\nlocal x <close> = nil\n";
+    apps_vm_t *vm = new_vm(256 * KB);
+    char err[256] = "", out[256];
+    CHECK(!apps_vm_load(vm, "main.lua", src, strlen(src), err, sizeof err), "a <close> chunk loaded");
+    apps_vm_excerpt(err, src, strlen(src), out, sizeof out);
+    CHECK(strstr(out, "local x <close> = nil") != NULL, "excerpt didn't show the line: [%s]", out);
+    apps_vm_free(vm);
+
+    /* <const> is unaffected: the chunk loads and runs. */
+    vm = new_vm(256 * KB);
+    expect_returns(vm, "local n <const> = 5 return n + 1", "number:6");
+    apps_vm_free(vm);
+}
+
 /* ---- short_coroutines ---- */
 
 /* src, in a fresh VM under apps_vm_call with budget, ends KILLED with reason. Returns the
@@ -1589,7 +1623,7 @@ static void short_coroutines(void) {
     /* A tree of them: the budget stops it, and so does the clock, which creating one reads. */
     expect_killed(TREE);
     fake_step = 600;
-    expect_end_at(__LINE__, 256 * KB, UINT32_MAX, TREE, APPS_CALL_KILLED, WALL_MSG, NULL);
+    expect_end_at(__LINE__, 256 * KB, UINT32_MAX, TREE, APPS_CALL_KILLED, WALL_MSG);
     fake_step = 0;
 }
 
@@ -1631,71 +1665,17 @@ static void kill_not_swallowed(void) {
                   "  pcall(function() coroutine.yield() while true do end end) survived = true\n"
                   "end)\n"
                   "co() co() survived = true");
-    /* close of a coroutine whose __close handler is killed, alone and inside pcall. */
-    expect_killed("local co = coroutine.create(function()\n"
-                  "  local x <close> = setmetatable({}, {__close = function() while true do end end})\n"
-                  "  coroutine.yield()\n"
-                  "end)\n"
-                  "coroutine.resume(co) coroutine.close(co) survived = true");
-    expect_killed("local co = coroutine.create(function()\n"
-                  "  local x <close> = setmetatable({}, {__close = function() while true do end end})\n"
-                  "  coroutine.yield()\n"
-                  "end)\n"
-                  "coroutine.resume(co) pcall(coroutine.close, co) survived = true");
-    /* The hook killed this coroutine, which leaves its hooks off: wrap mustn't close it,
-     * or the __close handler would spin unstopped (the test's timeout). */
-    expect_killed("local f = coroutine.wrap(function()\n"
-                  "  local x <close> = setmetatable({}, {__close = function() while true do end end})\n"
-                  "  while true do end\n"
-                  "end)\n"
-                  "pcall(f) survived = true");
-    /* A __close handler replaces the error while the kill unwinds, at the top and inside
-     * pcall, or yields out of the unwinding in a coroutine. */
-    expect_killed("do\n"
-                  "  local x <close> = setmetatable({}, {__close = function() error('replaced') end})\n"
-                  "  while true do end\n"
-                  "end\n"
-                  "survived = true");
-    expect_killed("pcall(function()\n"
-                  "  local x <close> = setmetatable({}, {__close = function() error('replaced') end})\n"
-                  "  while true do end\n"
-                  "end)\n"
-                  "survived = true");
-    expect_killed("local co = coroutine.wrap(function()\n"
-                  "  pcall(function()\n"
-                  "    local x <close> = setmetatable({}, {__close = function() coroutine.yield('escaped') end})\n"
-                  "    while true do end\n"
-                  "  end)\n"
-                  "  survived = true\n"
-                  "end)\n"
-                  "co() survived = true");
     /* App code that C calls: a metamethod, a comparator. */
     expect_killed("pcall(string.format, '%s', setmetatable({}, {__tostring = function() while true do end end}))\n"
                   "survived = true");
     expect_killed("pcall(table.sort, {3, 2, 1}, function() while true do end end) survived = true");
-    /* The __close handlers Lua runs while a kill unwinds stop before their first
-     * instruction, at the top, inside pcall, and on a coroutine that passes the kill up. */
-    expect_killed("do\n"
-                  "  local x <close> = setmetatable({}, {__close = function() survived = true end})\n"
-                  "  while true do end\n"
-                  "end");
-    expect_killed("pcall(function()\n"
-                  "  local x <close> = setmetatable({}, {__close = function() survived = true end})\n"
-                  "  while true do end\n"
-                  "end)");
-    expect_killed("local co = coroutine.wrap(function()\n"
-                  "  local x <close> = setmetatable({}, {__close = function() survived = true end})\n"
-                  "  pcall(function() while true do end end)\n"
-                  "end)\n"
-                  "local y <close> = setmetatable({}, {__close = function() survived = true end})\n"
-                  "co()");
+    /* A __close handler would be the one piece of app code Lua runs while a kill unwinds, where
+     * it could try to swallow the kill. <close> is refused at load (tbc_refused) and __gc is
+     * out, so there is no such handler to reach. */
 }
 
 /* ---- memory_kill ---- */
 
-/* A __close handler that notes the error it is closed with, then raises another in its place,
- * as Lua's unwinding lets it (ldo.c luaD_closeprotected, finishpcallk). */
-#define SWALLOWER "setmetatable({}, {__close = function(_, e) seen = e error('swallowed', 0) end})"
 #define HUGE_REP "string.rep('x', 1 << 24)"
 
 /* refuse_next_growth(): the allocator refuses the next request to grow, once. */
@@ -1719,81 +1699,22 @@ static void memory_kill(void) {
     expect_nomem("local t = {} for i = 1, 1e7 do t[i] = i end");
     /* xpcall's handler isn't called for it (Lua calls none for a memory error). */
     expect_nomem("xpcall(string.rep, function() return 'handled' end, 'x', 1 << 24) return 'x'");
-    /* In coroutines: resume, wrap, pcall inside, and a __close handler that close runs. */
+    /* In coroutines: resume, wrap, and pcall inside. */
     expect_nomem("local co = coroutine.create(function() return string.rep('x', 1 << 24) end)\n"
                  "return coroutine.resume(co)");
     expect_nomem("return pcall(coroutine.wrap(function() local t = {} for i = 1, 1e7 do t[i] = i end end))");
     expect_nomem("local co = coroutine.wrap(function() return pcall(string.rep, 'x', 1 << 24) end) return co()");
-    expect_nomem("local co = coroutine.create(function()\n"
-                 "  local x <close> = setmetatable({}, {__close = function() return string.rep('x', 1 << 24) end})\n"
-                 "  coroutine.yield()\n"
-                 "end)\n"
-                 "coroutine.resume(co) return pcall(coroutine.close, co)");
-    /* wrap closes a coroutine an error ended, and its __close handler runs out: without the
-     * kill, Lua's "not enough memory" would go on as a plain error, position in front. */
-    expect_nomem("local f = coroutine.wrap(function()\n"
-                 "  local x <close> = setmetatable({}, {__close = function() return string.rep('x', 1 << 24) end})\n"
-                 "  error('e')\n"
-                 "end)\n"
-                 "pcall(function() f() end) survived = true");
+    expect_nomem("local co = coroutine.create(function() local s = " HUGE_REP " end) coroutine.resume(co) survived = true");
     /* The cap in the reason is the VM's. */
     expect_end_at(__LINE__, 100 * KB, APPS_BUDGET_CALL, "return string.rep('x', 1 << 20)", APPS_CALL_NOMEM,
-                  NOMEM_MSG("100"), NULL);
+                  NOMEM_MSG("100"));
     /* Lua's own message, raised as is, is a memory error too (lapi.c lua_error): the app only
      * stops itself. */
     expect_nomem("pcall(error, 'not enough memory', 0) survived = true");
 
-    /* Out of memory is sticky (ruling A2, amended): a __close handler that runs as the memory
-     * error unwinds can see it, but raising another error in its place doesn't get rid of it.
-     * At a pcall, at the top, in a coroutine's pcall, in the __close handlers that wrap and
-     * close run, round a loop, and with xpcall, whose handler doesn't see it either. */
-    expect_nomem_seen("pcall(function() local g <close> = " SWALLOWER " local s = " HUGE_REP " end) survived = true");
-    expect_nomem_seen("local g <close> = " SWALLOWER " local s = " HUGE_REP);
-    expect_nomem_seen("local co = coroutine.wrap(function()\n"
-                      "  pcall(function() local g <close> = " SWALLOWER " local s = " HUGE_REP " end) survived = true\n"
-                      "end)\n"
-                      "co() survived = true");
-    expect_nomem_seen("local f = coroutine.wrap(function()\n"
-                      "  local g <close> = setmetatable({}, {__close = function()\n"
-                      "    local h <close> = " SWALLOWER " local s = " HUGE_REP "\n"
-                      "  end})\n"
-                      "  error('e')\n"
-                      "end)\n"
-                      "pcall(f) survived = true");
-    expect_nomem_seen("local co = coroutine.create(function()\n"
-                      "  local g <close> = setmetatable({}, {__close = function()\n"
-                      "    local h <close> = " SWALLOWER " local s = " HUGE_REP "\n"
-                      "  end})\n"
-                      "  coroutine.yield()\n"
-                      "end)\n"
-                      "coroutine.resume(co) pcall(coroutine.close, co) survived = true");
-    expect_nomem_seen("local co = coroutine.create(function()\n"
-                      "  local g <close> = setmetatable({}, {__close = function()\n"
-                      "    local h <close> = " SWALLOWER " local s = " HUGE_REP "\n"
-                      "  end})\n"
-                      "  coroutine.yield()\n"
-                      "end)\n"
-                      "coroutine.resume(co) coroutine.close(co) survived = true");
-    expect_nomem("local co = coroutine.create(function() local s = " HUGE_REP " end) coroutine.resume(co) survived = true");
-    expect_nomem_seen("while true do\n"
-                      "  pcall(function() local g <close> = " SWALLOWER " local t = {} for i = 1, 1e7 do t[i] = i end end)\n"
-                      "  survived = true\n"
-                      "end");
-    expect_nomem_seen("xpcall(function() local g <close> = " SWALLOWER " local s = " HUGE_REP " end,\n"
-                      "       function(e) survived = e return e end)\n"
-                      "survived = true");
-    /* A handler that runs on is stopped by the hook, within 1000 instructions; one that calls a
-     * binding is stopped there, by apps_vm_check. */
-    expect_nomem_seen("pcall(function()\n"
-                      "  local g <close> = setmetatable({}, {__close = function(_, e) seen = e while true do end end})\n"
-                      "  local s = " HUGE_REP "\n"
-                      "end)\n"
-                      "survived = true");
-    expect_nomem_seen("pcall(function()\n"
-                      "  local g <close> = setmetatable({}, {__close = function(_, e) seen = e survived = ('a,b'):split(',') end})\n"
-                      "  local s = " HUGE_REP "\n"
-                      "end)\n"
-                      "survived = true");
+    /* Out of memory is sticky (ruling A2, amended), and can't be swallowed: no app code runs
+     * while the error unwinds, since <close> is refused at load (tbc_refused) and __gc is out.
+     * What a C binding survives is still caught, below. */
 
     /* A coroutine's stack that can't grow for resume's arguments: lua_checkstack fails, which
      * would be a catchable "too many arguments to resume". The main thread's stack has grown for
@@ -1828,6 +1749,22 @@ static void memory_kill(void) {
     refuse_next = false;
     CHECK(rc == APPS_CALL_NOMEM && strcmp(err, NOMEM_MSG("256")) == 0 && lua_gettop(L) == 0, "shrugged: %s '%s', %d values",
           call_name(rc), err, lua_gettop(L));
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+
+    /* The same shrugged refusal, but a later allocation succeeds before the check: Lua never
+     * retried the refused stack growth, so it stays sticky, the hook kills within 1000
+     * instructions, and survived never runs. (The successful table is a different request, not
+     * the refused one's retry, so it mustn't clear the refusal.) */
+    vm = new_vm(256 * KB);
+    L = apps_vm_lua(vm);
+    lua_pushcfunction(L, shrug_refusal);
+    lua_setglobal(L, "shrug_refusal");
+    rc = call(vm, "shrug_refusal() local t = {} for i = 1, 5000 do t[i % 8 + 1] = i end survived = true", 0,
+              APPS_BUDGET_CALL, err, sizeof err);
+    refuse_next = false;
+    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, NOMEM_MSG("256")) == 0 && raw_global(L, "survived") == LUA_TNIL,
+          "shrug then alloc: %s '%s', survived %s", call_name(rc), err, lua_typename(L, raw_global(L, "survived")));
     lua_settop(L, 0);
     apps_vm_free(vm);
 }
@@ -1917,7 +1854,7 @@ static void external_kill(void) {
         "while true do end",
         "coroutine.wrap(function() while true do end end)() survived = true",
         "pcall(function() while true do end end) survived = true",
-        "local x <close> = setmetatable({}, {__close = function() survived = true end}) while true do end",
+        "local co = coroutine.wrap(function() while true do coroutine.yield() end end) while true do co() end",
     };
     for (size_t i = 0; i < sizeof loops / sizeof loops[0]; i++) {
         apps_vm_t *vm = new_vm(256 * KB);
@@ -1944,11 +1881,8 @@ static void external_kill(void) {
     expect_killed_from_c("xpcall(kill_now, function() end) survived = true");
     expect_killed_from_c("coroutine.resume(coroutine.create(kill_now)) survived = true");
     expect_killed_from_c("coroutine.wrap(kill_now)() survived = true");
-    expect_killed_from_c("local co = coroutine.create(function()\n"
-                         "  local x <close> = setmetatable({}, {__close = kill_now})\n"
-                         "  coroutine.yield()\n"
-                         "end)\n"
-                         "coroutine.resume(co) coroutine.close(co) survived = true");
+    expect_killed_from_c("local co = coroutine.create(function() coroutine.yield() end)\n"
+                         "coroutine.resume(co) kill_now() coroutine.close(co) survived = true");
     /* Every binding checks first (X8): split, trim and coroutine.create too. */
     expect_killed_from_c("kill_now() survived = ('a,b'):split(',')");
     expect_killed_from_c("kill_now() survived = ('  a '):trim()");
@@ -2012,22 +1946,14 @@ static void yield_through_pcall(void) {
                    "local f = coroutine.wrap(function() error('inside') end)\n"
                    "local ok, e = pcall(function() f() end) return ok, e",
                    "boolean:false, string:main.lua:2: main.lua:1: inside");
+    /* coroutine.close of a plain suspended coroutine: it goes dead, and a dead one is a no-op.
+     * (A <close> handler run by close is out: <close> is refused at load.) */
     expect_returns(vm,
-                   "local co = coroutine.create(function()\n"
-                   "  local x <close> = setmetatable({}, {__close = function() closed = true end})\n"
-                   "  coroutine.yield()\n"
-                   "end)\n"
+                   "local co = coroutine.create(function() coroutine.yield() end)\n"
                    "coroutine.resume(co)\n"
-                   "return coroutine.close(co), closed, coroutine.status(co)",
-                   "boolean:true, boolean:true, string:dead");
-    expect_returns(vm,
-                   "local co = coroutine.create(function()\n"
-                   "  local x <close> = setmetatable({}, {__close = function() error('in close', 0) end})\n"
-                   "  coroutine.yield()\n"
-                   "end)\n"
-                   "coroutine.resume(co)\n"
-                   "return coroutine.close(co)",
-                   "boolean:false, string:in close");
+                   "local a, b = coroutine.close(co), coroutine.status(co)\n"
+                   "return a, b, coroutine.close(co)",
+                   "boolean:true, string:dead, boolean:true");
     /* Lua's own errors, word for word. */
     expect_stock_error(vm, "pcall()");
     expect_stock_error(vm, "xpcall(type)");
@@ -2481,6 +2407,7 @@ int main(int argc, char **argv) {
         {"suggest", suggest},
         {"infinite_loop", infinite_loop},
         {"wall_clock", wall_clock},
+        {"tbc_refused", tbc_refused},
         {"short_coroutines", short_coroutines},
         {"kill_not_swallowed", kill_not_swallowed},
         {"memory_kill", memory_kill},

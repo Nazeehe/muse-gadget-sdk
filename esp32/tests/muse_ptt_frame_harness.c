@@ -29,6 +29,11 @@ static float source_level;
 static muse_pose_t rendered;
 static struct { void *data; } s_image_dsc;
 static void *s_tv;
+/* The pocket watch's state in muse_ui.c: this harness never builds the page. */
+static lv_obj_t *s_clock;
+static volatile bool s_on_clock, s_want_face;
+static int32_t face_x(void) { return 0; }
+static lv_obj_t *lv_tileview_get_tile_active(lv_obj_t *obj) { (void)obj; return NULL; }
 static void send_snapshot(void) {}
 static void image_sync(void) {}
 static void image_hide_locked(void) {}

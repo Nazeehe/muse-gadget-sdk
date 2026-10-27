@@ -19,6 +19,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -30,6 +31,17 @@ FAKE_HEADERS = [
     'freertos/FreeRTOS.h', 'freertos/task.h', 'freertos/queue.h',
     'freertos/idf_additions.h', 'freertos/semphr.h',
 ]
+# Apple's toolchain has no -no-pie (its arm64 executables are always position
+# independent, and clang rejects the flag under -Werror) and its linker drops
+# unreferenced code with -dead_strip, not --gc-sections. The harnesses rely on
+# that to leave out production functions they have no fakes for. Other
+# platforms keep the GNU flags.
+if sys.platform == 'darwin':
+    NO_PIE = []
+    DROP_UNUSED_SECTIONS = '-Wl,-dead_strip'
+else:
+    NO_PIE = ['-no-pie']
+    DROP_UNUSED_SECTIONS = '-Wl,--gc-sections'
 
 
 class StopWatchPTT(unittest.TestCase):
@@ -77,9 +89,9 @@ class StopWatchPTT(unittest.TestCase):
                 command = [*shlex.split(os.environ.get('CC', 'cc')), '-std=gnu11',
                            '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
                            '-Wno-unused-variable', '-Wno-unused-function',
-                           '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections',
+                           '-ffunction-sections', '-fdata-sections', DROP_UNUSED_SECTIONS,
                            '-g', '-O1', '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
-                           '-no-pie', '-include', str(ROOT / 'tests/host_compat.h'),
+                           *NO_PIE, '-include', str(ROOT / 'tests/host_compat.h'),
                            '-I', str(stage), str(source)]
                 if kind == 'voice' and realtime:
                     command.append(str(MUSE / 'muse_voice_call_core.c'))

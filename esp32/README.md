@@ -393,7 +393,8 @@ their upstream licenses:
   Font Awesome 5 Free (SIL OFL 1.1); see its README.
 - [`components/muse/apps/fonts/`](components/muse/apps/fonts/), the big digit
   fonts of Muse apps, are digit subsets of Montserrat Medium (SIL OFL 1.1)
-  drawn at 48 and 96 px; see its README.
+  drawn at 48 and 96 px. See [`OFL.txt`](components/muse/apps/fonts/OFL.txt)
+  there, and its README.
 - [`components/tinyh264/src`](components/tinyh264), the H.264 decoder, is the
   Android Open Source Project's (via udevbe/tinyh264), Apache-2.0 under its
   copyright. See [`components/tinyh264/LICENSE`](components/tinyh264/LICENSE).

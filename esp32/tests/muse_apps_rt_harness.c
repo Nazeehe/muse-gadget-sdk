@@ -1128,6 +1128,20 @@ static void new_refused(void) {
             CHECK(k <= before_main ? none : crashed,
                   "k=%ld (the runtime and VM took %ld requests): refused, but new returned %p '%s' (state %d)", k,
                   before_main, (void *)rt, err, rt != NULL ? apps_rt_state(rt) : -1);
+            if (k <= before_main) {
+                /* The message says which block there was no room for: the runtime's (the first request), the
+                 * widget table's (the second) or the VM's heap (the rest, up to its own). */
+                char want[128];
+                if (k == 1) {
+                    snprintf(want, sizeof want, "out of memory: can't make room for the app");
+                } else if (k == 2) {
+                    snprintf(want, sizeof want, "out of memory: can't make room for the app's screen");
+                } else {
+                    snprintf(want, sizeof want, "out of memory: can't make the app's heap of %u KB",
+                             (unsigned)pkg->manifest.memory_kb);
+                }
+                CHECK(strcmp(err, want) == 0, "k=%ld: the message is '%s', want '%s'", k, err, want);
+            }
         } else {
             CHECK(rt != NULL && apps_rt_state(rt) == APPS_STATE_STOPPED, "k=%ld: nothing refused, but new gave %p: %s",
                   k, (void *)rt, err);

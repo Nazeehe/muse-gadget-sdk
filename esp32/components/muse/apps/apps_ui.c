@@ -171,6 +171,7 @@ struct apps_ui {
     bool bg_changed, clear_pending;
     apps_asset_t assets[APPS_UI_ASSETS_MAX];
     int n_assets;
+    char handle_key;  /* its address is the registry's key of the table that remembers the app's handles */
 };
 
 /* What a handle holds. A slot that is gone, or whose gen has moved on, is a deleted widget. */
@@ -376,13 +377,42 @@ static handle_t *push_handle(lua_State *L, int slot, uint16_t gen, int kind) {
     return h;
 }
 
-/* The widget h names, or NULL when it is gone. */
+/*
+ * Handles are remembered, so that a widget is one object while the app holds its handle (a table can be keyed by
+ * it, and rawequal holds): a registry table with a place for each slot, and weak values, so a handle the app has
+ * let go of is not kept. A place holds the handle of that slot's current life, which is looked at before it is
+ * used (slot, gen and kind). The table is made with all its places, so storing a handle in it can't allocate:
+ * create stores its handle after the widget exists, where nothing may raise.
+ */
+static void push_widget(lua_State *L, apps_ui_t *ui, int slot, uint16_t gen, int kind) {
+    if (lua_rawgetp(L, LUA_REGISTRYINDEX, &ui->handle_key) != LUA_TTABLE) {  /* never: ui is installed after it */
+        lua_pop(L, 1);
+        push_handle(L, slot, gen, kind);
+        return;
+    }
+    if (lua_rawgeti(L, -1, slot + 1) == LUA_TUSERDATA) {
+        const handle_t *known = luaL_testudata(L, -1, WIDGET_MT);
+        if (known != NULL && known->slot == slot && known->gen == gen && known->kind == kind) {
+            lua_remove(L, -2);
+            return;
+        }
+    }
+    lua_pop(L, 1);
+    push_handle(L, slot, gen, kind);  /* may raise: nothing is held */
+    lua_pushvalue(L, -1);
+    lua_rawseti(L, -3, slot + 1);
+    lua_remove(L, -2);
+}
+
+/* The widget h names, or NULL when it is gone. A gen has 16 bits and comes round again after 65536 deletes of one
+ * slot, so a handle an app kept can match a later widget of that slot: the kind has to match as well (it never
+ * changes from create to delete), or the handle would write one kind's state into another's. */
 static apps_widget_t *widget_of(apps_ui_t *ui, const handle_t *h) {
     if (h->slot >= APPS_UI_SLOTS) {
         return NULL;
     }
     apps_widget_t *w = &ui->w[h->slot];
-    return w->alive && w->gen == h->gen ? w : NULL;
+    return w->alive && w->gen == h->gen && w->kind == h->kind ? w : NULL;
 }
 
 static apps_widget_t *live_widget(lua_State *L, apps_ui_t *ui, const handle_t *h) {
@@ -490,23 +520,25 @@ static void read_bool(const ctx_t *x, prop_t p, int idx, change_t *c) {
 
 static void read_enum(const ctx_t *x, prop_t p, int idx, change_t *c) {
     lua_State *L = x->L;
-    int type = lua_type(L, idx);
-    if (type != LUA_TSTRING && type != LUA_TNUMBER) {
-        wrong_type(x, p, "a string", idx);
-    }
-    size_t len;
-    const char *s = lua_tolstring(L, idx, &len);  /* a number becomes its text: it is not one of the names either */
     const prop_info_t *info = &prop_info[p];
-    for (int i = 0; i < info->n_names; i++) {
-        if (strlen(info->names[i]) == len && memcmp(info->names[i], s, len) == 0) {
-            c->v[p] = i;
-            return;
+    int type = lua_type(L, idx);
+    shown_t shown;
+    if (type == LUA_TSTRING || type == LUA_TNUMBER) {
+        size_t len;
+        const char *s = lua_tolstring(L, idx, &len);  /* a number becomes its text: it is not one of the names either */
+        for (int i = 0; i < info->n_names; i++) {
+            if (strlen(info->names[i]) == len && memcmp(info->names[i], s, len) == 0) {
+                c->v[p] = i;
+                return;
+            }
         }
+        show(&shown, s, len);
+    } else {  /* a boolean, a table ...: shown by its type, as unknown_property shows a key that isn't text */
+        snprintf(shown.s, sizeof shown.s, "<%s>", luaL_typename(L, idx));
     }
     char list[128];
     join_names(list, sizeof list, info->names, info->n_names);
-    shown_t shown;
-    fail_kind(L, x->kind, "%s '%s' is not one of %s", prop_names[p], show(&shown, s, len), list);
+    fail_kind(L, x->kind, "%s '%s' is not one of %s", prop_names[p], shown.s, list);
 }
 
 static int hex_digit(char ch) {
@@ -934,8 +966,8 @@ static void release(lua_State *L, const apps_ui_t *ui, const leaving_t *gone) {
 
 static NORETURN void quota_error(lua_State *L, const apps_ui_t *ui) {
     if (ui->count < APPS_UI_SLOTS) {  /* the free slots are those of widgets deleted since the last screen update */
-        fail(L, "ui: no more than %d widgets per app (a deleted widget's slot is free again once this callback "
-                "returns)", APPS_UI_SLOTS);
+        fail(L, "ui: no more than %d widgets per app (a deleted widget keeps its slot until the screen next updates)",
+             APPS_UI_SLOTS);
     }
     fail(L, "ui: no more than %d widgets per app", APPS_UI_SLOTS);
 }
@@ -949,6 +981,9 @@ static int create(lua_State *L, int kind) {
     }
     lua_settop(L, 1);
     handle_t *h = push_handle(L, NO_SLOT, 0, kind);  /* before anything is held outside the Lua heap */
+    if (lua_rawgetp(L, LUA_REGISTRYINDEX, &ui->handle_key) != LUA_TTABLE) {  /* the same: nothing may raise later */
+        fail(L, "ui: the handle table is gone");
+    }
     change_t c = {0};
     ctx_t x = {.L = L, .ui = ui, .kind = kind, .creating = true, .cur = NULL};
     read_props(&x, 1, &c);
@@ -961,6 +996,9 @@ static int create(lua_State *L, int kind) {
     }
     h->slot = (uint16_t)slot;
     h->gen = gen;
+    lua_pushvalue(L, 2);
+    lua_rawseti(L, 3, slot + 1);  /* the table has a place for every slot: no allocation, no raise */
+    lua_settop(L, 2);
     return 1;
 }
 
@@ -1159,7 +1197,7 @@ static int w_get(lua_State *L) {
             if (v < 0) {
                 lua_pushnil(L);
             } else {
-                push_handle(L, (int)v, ui->w[(int)v].gen, APPS_W_BOX);
+                push_widget(L, ui, (int)v, ui->w[(int)v].gen, APPS_W_BOX);
             }
             break;
         case T_SRC:
@@ -1289,11 +1327,12 @@ static int widget_tostring(lua_State *L) {
     return 1;
 }
 
-/* Two handles are equal when they name the same widget of the same life. */
+/* Two handles are equal when they name the same widget of the same life. (While the app holds a handle it is the
+ * one object push_widget gives, so this only matters for handles of widgets that are gone.) */
 static int widget_eq(lua_State *L) {
     apps_vm_check(L);
     const handle_t *a = luaL_testudata(L, 1, WIDGET_MT), *b = luaL_testudata(L, 2, WIDGET_MT);
-    lua_pushboolean(L, a != NULL && b != NULL && a->slot == b->slot && a->gen == b->gen);
+    lua_pushboolean(L, a != NULL && b != NULL && a->slot == b->slot && a->gen == b->gen && a->kind == b->kind);
     return 1;
 }
 
@@ -1311,7 +1350,20 @@ static int open_ui(lua_State *L) {
     lua_createtable(L, 0, 0);  /* the handlers, keyed by slot and event */
     lua_rawsetp(L, LUA_REGISTRYINDEX, ui);
 
+    lua_createtable(L, APPS_UI_SLOTS, 0);  /* the handles the app may hold, a place for each slot: see push_widget */
+    lua_createtable(L, 0, 1);
+    lua_pushliteral(L, "v");
+    lua_setfield(L, -2, "__mode");
+    lua_setmetatable(L, -2);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &ui->handle_key);
+
+    /* Protected: getmetatable gives the name, never the table. push_handle's luaL_setmetatable registers a
+     * finalizer whenever the metatable holds __gc and skips the sandbox's setmetatable, which refuses one, so an
+     * app that could write __gc into it would give every later handle a finalizer, and Lua runs those with the
+     * hooks off, beyond the budget and the kill. */
     luaL_newmetatable(L, WIDGET_MT);
+    lua_pushliteral(L, WIDGET_MT);
+    lua_setfield(L, -2, "__metatable");
     lua_createtable(L, 0, 4);  /* the methods */
     lua_pushlightuserdata(L, ui);
     luaL_setfuncs(L, apps_ui_methods, 1);
@@ -1331,9 +1383,11 @@ static int open_ui(lua_State *L) {
         lua_pushinteger(L, apps_ui_consts[i].value);
         lua_setfield(L, -2, apps_ui_consts[i].name);
     }
-    lua_createtable(L, 0, 1);
+    lua_createtable(L, 0, 2);
     lua_pushcfunction(L, ui_missing);
     lua_setfield(L, -2, "__index");
+    lua_pushliteral(L, "muse.ui");  /* protected, like the handles' */
+    lua_setfield(L, -2, "__metatable");
     lua_setmetatable(L, -2);
     lua_setglobal(L, "ui");
     return 0;
@@ -1397,6 +1451,12 @@ const apps_asset_t *apps_ui_asset(const apps_ui_t *ui, int index) {
 }
 
 uint32_t apps_ui_take_bg(apps_ui_t *ui, bool *changed) {
+    if (ui == NULL) {
+        if (changed != NULL) {
+            *changed = false;
+        }
+        return 0;
+    }
     if (changed != NULL) {
         *changed = ui->bg_changed;
     }
@@ -1405,6 +1465,9 @@ uint32_t apps_ui_take_bg(apps_ui_t *ui, bool *changed) {
 }
 
 bool apps_ui_take_clear(apps_ui_t *ui) {
+    if (ui == NULL) {
+        return false;
+    }
     bool pending = ui->clear_pending;
     ui->clear_pending = false;
     return pending;
@@ -1438,7 +1501,7 @@ bool apps_ui_push_handler(lua_State *L, apps_ui_t *ui, uint16_t slot, uint16_t g
         lua_pop(L, 1);
         return false;
     }
-    push_handle(L, slot, gen, w->kind);
+    push_widget(L, ui, slot, gen, w->kind);
     lua_pushstring(L, apps_ui_events[index]);
     return true;
 }

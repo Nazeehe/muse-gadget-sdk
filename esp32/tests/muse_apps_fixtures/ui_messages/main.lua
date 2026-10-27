@@ -48,6 +48,8 @@ case("align", function() ui.label{align = "middle"} end)
 case("text_align", function() ui.label{text_align = "justify"} end)
 case("font_not_a_string", function() ui.label{font = true} end)
 case("font_a_number", function() ui.label{font = 20} end)
+case("align_a_table", function() ui.label{align = {}} end)
+case("text_align_a_boolean", function() ui.label{text_align = true} end)
 
 case("get_unknown_property", function() w.label:get("bg") end)
 case("parent_set_later", function() w.label:set{parent = w.box} end)

@@ -27,7 +27,9 @@
  * - ui.label{...} ui.button{...} ui.box{...} ui.arc{...} ui.bar{...} ui.image{...} make a widget and return its
  *   handle. w:set{...} changes properties, w:get(name) reads one, w:on(event, fn) subscribes (fn nil removes it),
  *   w:delete() removes the widget and everything inside it. set and on return w, so calls chain. tostring(w) is
- *   "label#3": the kind and the slot. Two handles of one widget are equal (==).
+ *   "label#3": the kind and the slot. A widget is one object for as long as the app holds its handle, so a handle
+ *   can be a table key and rawequal holds (a handle of a widget that is gone stays equal to itself, ==). The
+ *   handles' metatable is not the app's to see: getmetatable(w) and getmetatable(ui) give a name.
  * - ui.bg(color) is the screen's background (black at first); ui.clear() removes every widget; ui.polar(deg, r)
  *   returns the x and y offsets of a point r pixels from the centre at deg clock degrees, as integers: ui.polar(90,
  *   100) is 100, 0, and ui.polar(0, 100) is 0, -100. They go straight into the x and y of a widget whose align is
@@ -66,7 +68,8 @@
  *   ui.<kind>: '<p>' must be a number, got <type>          also "got NaN"; must be a boolean, got <type>
  *   ui.<kind>: 'text' must be a string, got <type>
  *   ui.<kind>: unknown property '<name>' (valid: align, x, y, w, h, hidden, opacity, parent, text, ...)
- *   ui.<kind>: font 'sans24' is not one of sans14, sans16, ...      (align and text_align the same way)
+ *   ui.<kind>: font 'sans24' is not one of sans14, sans16, ...      (align and text_align the same way, and for
+ *                                                    a value that isn't text too: font '<boolean>')
  *   ui.<kind>: bg '#12' is not a colour (use "#rgb", "#rrggbb" or 0xRRGGBB)
  *   ui.<kind>: radius '<s>' is not a number or "circle"
  *   ui.<kind>: text is longer than 256 bytes | text is not valid UTF-8 | text can't contain a NUL byte
@@ -78,8 +81,9 @@
  *   ui.<kind>: unknown method '<name>' (valid: set, get, on, delete)
  *   ui.<kind>: unknown event '<s>' (valid: tap, long_press, press, release)
  *   ui.<kind>: handler for '<event>' must be a function (or nil to remove it), got <type>
- *   ui: no more than 128 widgets per app            (a widget deleted in this callback keeps its slot until
- *                                                    the next screen update: the message then adds that)
+ *   ui: no more than 128 widgets per app            (with fewer alive, because deleted widgets still hold their
+ *                                                    slots, it ends " (a deleted widget keeps its slot until
+ *                                                    the screen next updates)")
  *   widget was deleted                                        any use of a handle of a deleted widget
  *   ui.<name> doesn't exist (ui has: label, button, box, arc, bar, image, bg, clear, polar, W, H, R, SAFE)
  *   ui.bg: '<s>' is not a colour (...)
@@ -88,8 +92,11 @@
  * The table. APPS_UI_SLOTS widgets in a block from apps_port_realloc; the slot count is also LVGL's object quota
  * for the app. A handle is userdata {slot, gen, kind}, and a slot's gen is bumped when its widget is deleted, so
  * a handle (and a touch event, which carries the gen it saw) of a widget that is gone finds the slot dead or on
- * another gen, and is dropped. Deleting a box deletes everything inside it. The invariants, which hold whenever
- * the lock is free:
+ * another gen, and is dropped. A gen has 16 bits and comes round again after 65536 deletes of one slot, so a
+ * handle matches its widget by kind as well, and a widget's kind never changes from create to delete. Deleting a
+ * box deletes everything inside it. The handles the app holds are remembered in a weak registry table, a place for
+ * each slot (push_widget), which is what makes a widget one object. The invariants, which hold whenever the lock
+ * is free:
  * - an alive widget's parent is alive and a box, and has at most APPS_UI_BOX_DEPTH_MAX box ancestors, so the
  *   parent chain ends and the apply step may walk it;
  * - an arc or bar has min < max and min <= value <= max, and all of them are within +-APPS_UI_VALUE_MAX;
@@ -221,9 +228,10 @@ void apps_ui_open(lua_State *L, apps_ui_t *ui);
 apps_widget_t *apps_ui_slot(apps_ui_t *ui, int slot);
 /* The image at index, or NULL. */
 const apps_asset_t *apps_ui_asset(const apps_ui_t *ui, int index);
-/* The background colour, and in *changed (may be NULL) whether it changed since the last take. */
+/* The background colour, and in *changed (may be NULL) whether it changed since the last take. A NULL table (no app
+ * is running) has nothing pending: 0, and *changed false. */
 uint32_t apps_ui_take_bg(apps_ui_t *ui, bool *changed);
-/* Whether ui.clear() ran since the last take: true once. */
+/* Whether ui.clear() ran since the last take: true once. False for a NULL table. */
 bool apps_ui_take_clear(apps_ui_t *ui);
 
 /* ---- The app task ---- */
@@ -231,9 +239,10 @@ bool apps_ui_take_clear(apps_ui_t *ui);
 /*
  * For apps_vm_call, inside a C function the call runs, with 4 free stack slots: when the widget at slot is
  * alive on that gen and subscribed to event (one APPS_UI_* bit) with a handler, pushes the handler, the widget
- * (a handle) and the event's name, returns true, and the caller calls it with nargs 2. Otherwise (a slot that is
- * gone, a gen that isn't its, an event nobody asked for, or no room) returns false and pushes nothing. It
- * allocates (the handle, the name), so it raises when the app's heap refuses: only inside a protected call.
+ * (the handle the app already holds, if it does) and the event's name, returns true, and the caller calls it with
+ * nargs 2. Otherwise (a slot that is gone, a gen that isn't its, an event nobody asked for, or no room) returns
+ * false and pushes nothing. It allocates (the handle, the name), so it raises when the app's heap refuses: only
+ * inside a protected call.
  */
 bool apps_ui_push_handler(lua_State *L, apps_ui_t *ui, uint16_t slot, uint16_t gen, uint8_t event);
 

@@ -176,8 +176,10 @@ char *apps_rt_message(apps_rt_t *rt, const char *event, const char *data_json, s
  * Nothing runs for an app that isn't RUNNING. A STOPPED runtime can be started again: apps_rt_start. */
 void apps_rt_stop(apps_rt_t *rt);
 
-/* Frees the runtime and its VM, and runs no app code (a crashed or abandoned app can be freed too). NULL is
- * ignored. */
+/* Frees the runtime, its VM and its widget table, and runs no app code (a crashed or abandoned app can be freed
+ * too). NULL is ignored. The LVGL task reads the table under the UI lock and this frees it without one
+ * (apps_ui_free): the apply step must have let go of apps_rt_ui(rt) before this is called (Task 12 clears its
+ * pointer to it under the lock first), or it reads freed memory. */
 void apps_rt_free(apps_rt_t *rt);
 
 apps_state_t apps_rt_state(const apps_rt_t *rt);

@@ -73,6 +73,7 @@ static long growths;           /* growth requests so far */
 static long refuse_from = -1;  /* refuse every growth request from this one on (counted in growths); -1: none */
 
 static bool lock_held;
+static long lock_takes;  /* times the lock was taken: a change that never takes it is a race on the device */
 static int lock_errors;  /* a lock taken while held, a lock given back that wasn't held, the heap used or freed under it */
 static char lock_note[96];
 
@@ -133,6 +134,7 @@ void apps_port_ui_lock(void) {
         lock_error("the lock was taken while it was held");
     }
     lock_held = true;
+    lock_takes++;
 }
 
 bool apps_port_ui_trylock(int ms) {
@@ -673,8 +675,8 @@ static void slot_reuse(void) {
     RUN(&e, "t[6]:delete()");
     CHECK(apps_ui_count(e.ui) == 127, "count %d", apps_ui_count(e.ui));
     RUN_FAILS_EXACTLY(&e, "ui.label{}",
-                      "t.lua:1: ui: no more than 128 widgets per app (a deleted widget's slot is free again once this "
-                      "callback returns)");
+                      "t.lua:1: ui: no more than 128 widgets per app (a deleted widget keeps its slot until the "
+                      "screen next updates)");
     apply(&e, NULL);
     RUN(&e, "n = ui.label{text = 'new'}");
     CHECK(W(&e, 5)->alive && W(&e, 5)->gen == 1 && strcmp(W(&e, 5)->text, "new") == 0, "slot 5 on gen 1");
@@ -1149,7 +1151,9 @@ static void touch_refused(void) {
     for (long k = 1; k < 1000; k++) {
         env_t e;
         CHECK(env_open(&e, NULL, 0), "env_open");
-        RUN(&e, "b = ui.button{} b:on('tap', function() end)");
+        /* No handle is held (the app let go of it, and a collection took it): the touch has to make one. */
+        RUN(&e, "ui.button{}:on('tap', function() end)");
+        lua_gc(apps_vm_lua(e.vm), LUA_GCCOLLECT);
         long before = growths;
         refuse_from = growths + k;
         char err[256] = "";
@@ -1170,6 +1174,206 @@ static void touch_refused(void) {
     CHECK(reached >= 1, "the touch made no allocation to refuse (%ld)", reached);
 }
 
+/* ---- A box deleted over a lower slot ---- */
+
+/* Slots are reused, so a widget can sit in a lower slot than the box it is in. Deleting the box must still take it:
+ * nothing may stay alive under a dead box (the apply step walks parent chains, and LVGL deletes a box's children
+ * with it). Once with objects the apply step has made, which it has to delete, and once with none. */
+static void cascade_lower_slot(void) {
+    for (int applied = 0; applied < 2; applied++) {
+        OPEN(e);
+        RUN(&e, "x = ui.label{} p = ui.box{} x:delete() c = ui.label{parent = p, text = 'in'}");
+        CHECK(W(&e, 0)->alive && W(&e, 0)->gen == 1 && W(&e, 0)->parent == 1 && W(&e, 1)->kind == APPS_W_BOX,
+              "the child is in slot 0, the box in slot 1: alive %d gen %d parent %d", W(&e, 0)->alive, W(&e, 0)->gen,
+              W(&e, 0)->parent);
+        if (applied) {
+            apply(&e, NULL);
+        }
+        RUN(&e, "p:delete()");
+        const uint32_t want = applied ? APPS_DIRTY_DELETE : 0;
+        for (int slot = 0; slot < 2; slot++) {
+            const apps_widget_t *w = W(&e, slot);
+            CHECK(!w->alive && w->dirty == want && w->text == NULL && w->events == 0,
+                  "applied %d, slot %d: alive %d dirty %u, want %u", applied, slot, w->alive, w->dirty, want);
+        }
+        CHECK(W(&e, 0)->gen == 2 && W(&e, 1)->gen == 1, "applied %d: gens %d and %d", applied, W(&e, 0)->gen,
+              W(&e, 1)->gen);
+        CHECK(apps_ui_count(e.ui) == 0, "applied %d: %d alive", applied, apps_ui_count(e.ui));
+        RUN_FAILS(&e, "c:get('x')", "widget was deleted");
+        RUN_FAILS(&e, "p:get('x')", "widget was deleted");
+        finish(&e);
+    }
+}
+
+/* ---- Every change takes the lock ---- */
+
+static void takes_lock_at(int line, env_t *e, const char *src) {
+    long before = lock_takes;
+    run_ok_at(line, e, src);
+    CHECK_AT(line, lock_takes > before, "'%s' changed the table and never took the lock", src);
+}
+#define TAKES_LOCK(e, src) takes_lock_at(__LINE__, (e), (src))
+
+/* The port checks that the lock is kept and given back in order; this is the other half of the rule, that each
+ * change takes it at all (the apply step reads, clears and writes the same fields on the LVGL task). */
+static void lock_taken(void) {
+    env_t e;
+    CHECK(env_open(&e, TWO_IMAGES, 2), "env_open");
+    TAKES_LOCK(&e, "a = ui.label{text = 'a'}");
+    TAKES_LOCK(&e, "b = ui.button{}");
+    TAKES_LOCK(&e, "c = ui.box{}");
+    TAKES_LOCK(&e, "d = ui.arc{}");
+    TAKES_LOCK(&e, "f = ui.bar{}");
+    TAKES_LOCK(&e, "g = ui.image{src = 'a.bin'}");
+    TAKES_LOCK(&e, "a:set{x = 5}");
+    TAKES_LOCK(&e, "a:set{text = 'changed'}");
+    TAKES_LOCK(&e, "a:set{x = 5, text = 'changed'}");  /* nothing differs */
+    TAKES_LOCK(&e, "a:on('tap', function() end)");
+    TAKES_LOCK(&e, "a:on('tap', nil)");
+    TAKES_LOCK(&e, "ui.bg('#123456')");
+    TAKES_LOCK(&e, "ui.bg('#123456')");
+    TAKES_LOCK(&e, "child = ui.label{parent = c}");
+    TAKES_LOCK(&e, "child:delete()");
+    TAKES_LOCK(&e, "c:delete()");
+    TAKES_LOCK(&e, "ui.clear()");
+    long before = lock_takes;
+    char out[64];
+    apps_ui_dump(e.ui, out, sizeof out, NULL);
+    CHECK(lock_takes > before, "the dump took no lock");
+    finish(&e);
+}
+
+/* ---- The metatables apps can reach ---- */
+
+/* F1: a finalizer runs with the hooks off, beyond the budget and the kill. The handle's metatable is shared and C
+ * puts it on every new handle, so an app that could add __gc to it would give every later handle one. It can't:
+ * getmetatable gives a string, and nothing it does reaches the real table. A full collection runs every finalizer
+ * that was ever set. */
+static void metatables(void) {
+    OPEN(e);
+    RUN(&e,
+        "ran = 0\n"
+        "w = ui.label{}\n"
+        "assert(type(getmetatable(w)) ~= 'table' and type(getmetatable(ui)) ~= 'table')\n"
+        "assert(not pcall(function() getmetatable(w).__gc = function() ran = ran + 1 end end))\n"
+        "assert(not pcall(function() getmetatable(ui).__gc = function() ran = ran + 1 end end))\n"
+        "assert(not pcall(setmetatable, ui, {__gc = function() ran = ran + 1 end}))\n"
+        "assert(not pcall(setmetatable, ui, {}))\n"
+        "for i = 1, 300 do ui.label{}:delete() ui.box{}:delete() end\n"
+        "ui.clear()\n"
+        "for i = 1, 100 do ui.label{} end\n");
+    lua_State *L = apps_vm_lua(e.vm);
+    lua_gc(L, LUA_GCCOLLECT);
+    lua_gc(L, LUA_GCCOLLECT);
+    RUN(&e, "assert(ran == 0, ran)");
+    finish(&e);
+}
+
+/* ---- One handle for one widget ---- */
+
+/* F5: the app holds a handle for as long as it likes, and finds the same object again: as a table key, with
+ * rawequal. The table that remembers them is weak, so it does not keep a handle the app has let go of. */
+static void identity(void) {
+    OPEN(e);
+    RUN(&e,
+        "box = ui.box{} a = ui.label{parent = box} b = ui.label{parent = box}\n"
+        "assert(rawequal(a:get('parent'), box) and rawequal(a:get('parent'), b:get('parent')))\n"
+        "keyed = {} keyed[box] = 'box' keyed[a] = 'a'\n"
+        "assert(keyed[a:get('parent')] == 'box' and keyed[b:get('parent')] == 'box')\n"
+        "weak = setmetatable({}, {__mode = 'v'})\n"
+        "weak[1] = ui.label{text = 'nothing but the app holds this handle'}\n");
+    lua_State *L = apps_vm_lua(e.vm);
+    lua_gc(L, LUA_GCCOLLECT);
+    RUN(&e, "assert(weak[1] == nil, 'the cache kept a handle alive')");
+    CHECK(apps_ui_count(e.ui) == 4, "the widget outlives its handle: %d alive", apps_ui_count(e.ui));
+    /* A handle let go of is made again, as the same widget, and then it is the one every call gives. */
+    RUN(&e, "box = nil keyed = nil");
+    lua_gc(L, LUA_GCCOLLECT);
+    RUN(&e,
+        "p, q = a:get('parent'), b:get('parent')\n"
+        "assert(rawequal(p, q) and tostring(p) == 'box#0' and p:get('radius') == 0)\n"
+        "assert(select('#', p:set{radius = 3}) == 1 and rawequal(a:get('parent'), p))");
+    finish(&e);
+}
+
+/* The table that remembers handles holds one for each slot and looks at it (its gen and its kind) before it gives
+ * it out. No Lua call leaves the table disagreeing with a widget, because every create stores the handle of what
+ * it made, so the widget table is rewritten here as only the apply side's own code could (a slot on its next
+ * life, a slot of another kind) to show that the look is made: the handle the app holds is not handed out for a
+ * widget it doesn't name. */
+static void identity_checks_the_life(void) {
+    OPEN(e);
+    RUN(&e, "a = ui.button{} a:on('tap', function(w) seen = w end)");
+    probe_t p = PROBE(&e, 0, 0, APPS_UI_TAP);
+    CHECK(p.result, "the tap");
+    RUN(&e, "assert(rawequal(seen, a))");  /* the handle the app holds, while it names that widget */
+    W(&e, 0)->gen = 1;
+    p = PROBE(&e, 0, 1, APPS_UI_TAP);
+    CHECK(p.result, "the tap on the next life");
+    RUN(&e, "assert(not rawequal(seen, a) and tostring(seen) == 'button#0' and tostring(a) == 'button#0 (deleted)')");
+    finish(&e);
+
+    OPEN(f);
+    RUN(&f, "a = ui.button{} a:on('tap', function(w) seen = w end)");
+    W(&f, 0)->kind = APPS_W_LABEL;
+    p = PROBE(&f, 0, 0, APPS_UI_TAP);
+    CHECK(p.result, "the tap on a slot of another kind");
+    RUN(&f, "assert(not rawequal(seen, a) and tostring(seen) == 'label#0' and tostring(a) == 'button#0 (deleted)')");
+    finish(&f);
+}
+
+/* ---- No table ---- */
+
+/* F7: the apply side may be asked about an app that isn't there: nothing is pending, nothing is changed. */
+static void null_table(void) {
+    bool changed = true;
+    CHECK(apps_ui_take_bg(NULL, &changed) == 0 && !changed, "take_bg(NULL): changed %d", changed);
+    CHECK(apps_ui_take_bg(NULL, NULL) == 0, "take_bg(NULL, NULL)");
+    CHECK(!apps_ui_take_clear(NULL), "take_clear(NULL)");
+    CHECK(apps_ui_slot(NULL, 0) == NULL && apps_ui_asset(NULL, 0) == NULL && apps_ui_count(NULL) == 0, "NULL table");
+    char out[8] = "xxxxxxx";
+    int dropped = 99;
+    CHECK(apps_ui_dump(NULL, out, sizeof out, &dropped) == 0 && out[0] == '\0' && dropped == 0, "dump(NULL)");
+    apps_ui_free(NULL);
+    apps_ui_set_assets(NULL, NULL, 0);
+}
+
+/* ---- A create that raises ---- */
+
+/* An app that is told a create failed has no handle to a widget made anyway, and the slot would be lost to it for
+ * good. So nothing may be able to raise once the widget is in the table: every growth request of each kind of
+ * create is refused in turn, and wherever one was refused the call has failed and no widget is left. (The table
+ * that remembers handles is made with a place for each slot, so that storing a handle can't ask for memory.) */
+static void create_all_or_nothing(void) {
+    static const char *const makes[] = {
+        "x = ui.label{text = 'hello', x = 3}", "x = ui.button{text = 'go'}", "x = ui.box{}",
+        "x = ui.arc{value = 5}",               "x = ui.bar{}",               "x = ui.image{src = 'a.bin'}",
+    };
+    for (size_t i = 0; i < ARRAY_LEN(makes); i++) {
+        long refusals = 0;
+        for (long k = 1; k < 1000; k++) {
+            env_t e;
+            CHECK(env_open(&e, TWO_IMAGES, 2), "env_open");
+            refuse_from = growths + k;
+            char err[256] = "";
+            bool ran = run(&e, makes[i], err, sizeof err);
+            bool refused = growths >= refuse_from;
+            refuse_from = -1;
+            CHECK(refused ? !ran && apps_ui_count(e.ui) == 0 : ran && apps_ui_count(e.ui) == 1,
+                  "'%s', request %ld: refused %d, ran %d, %d widgets alive (%s)", makes[i], k, refused, ran,
+                  apps_ui_count(e.ui), err);
+            CHECK(!lock_held && lock_errors == 0, "'%s', request %ld: the lock", makes[i], k);
+            check_invariants(__LINE__, &e);
+            finish(&e);
+            if (!refused) {
+                break;
+            }
+            refusals++;
+        }
+        CHECK(refusals >= 2, "'%s': only %ld requests to refuse", makes[i], refusals);
+    }
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -1180,6 +1384,12 @@ int main(int argc, char **argv) {
         {"vm_check", vm_check},
         {"slot_reuse", slot_reuse},
         {"cascade", cascade},
+        {"cascade_lower_slot", cascade_lower_slot},
+        {"lock_taken", lock_taken},
+        {"metatables", metatables},
+        {"identity", identity},
+        {"identity_checks_the_life", identity_checks_the_life},
+        {"null_table", null_table},
         {"clear", clear},
         {"bg", bg},
         {"push_handler", push_handler},
@@ -1190,6 +1400,7 @@ int main(int argc, char **argv) {
         {"lock_discipline", lock_discipline},
         {"refused", refused},
         {"touch_refused", touch_refused},
+        {"create_all_or_nothing", create_all_or_nothing},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

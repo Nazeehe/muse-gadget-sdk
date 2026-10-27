@@ -37,3 +37,7 @@ size_t apphost_heap_held(void);
  * validate and allocate first, then lock, and let go of what was replaced after): a violation shows in every
  * run, and apphost checks the lock is free after each command. */
 bool apphost_ui_locked(void);
+
+/* How many times the UI lock has been taken. apphost compares it across a command: a command that left the screen
+ * changed without taking the lock even once is a binding that writes the table where the LVGL task reads it. */
+unsigned long apphost_ui_lock_takes(void);

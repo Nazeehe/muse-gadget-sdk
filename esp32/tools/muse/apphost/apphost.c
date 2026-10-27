@@ -63,6 +63,8 @@
  * The LVGL task's apply step has no counterpart here but a stand-in that runs after each command: it takes every
  * request as applied, so a deleted widget's slot is free for the next command, as it is on the gadget after
  * a frame. Nothing is laid out, so a dump shows the declared geometry.
+ * The UI lock is policed as the gadget needs it kept (apphost_port.h): taken while held, given back without being
+ * held, or left held by a command ends the run, and so does a command that changes the screen without taking it.
  * An app whose load failed (a crash event at launch) is a crashed app: `state` says crashed, `message` and
  * `start` answer with its crash record, `log` shows what main.lua printed before it failed, and the rest do
  * nothing. A main.lua that doesn't compile never ran: the crash event is Lua's message, and there is no log.
@@ -638,11 +640,33 @@ static void run_line(app_t *app, char *line) {
     }
 }
 
-/* After a command, the way a frame follows a callback: the screen is applied, and the UI lock, which no command
- * leaves held, is checked. */
+/* What the UI lock's count was when the command began. */
+static unsigned long takes_before_command;
+
+static void begin_command(void) {
+    takes_before_command = apphost_ui_lock_takes();
+}
+
+/* Whether any widget has a change waiting for the apply step. */
+static bool screen_changed(const app_t *app) {
+    apps_ui_t *ui = app->rt != NULL ? apps_rt_ui(app->rt) : NULL;
+    for (int i = 0; ui != NULL && i < APPS_UI_SLOTS; i++) {
+        if (apps_ui_slot(ui, i)->dirty != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* After a command, the way a frame follows a callback: the screen is applied, and the UI lock is checked: no
+ * command leaves it held, and none changes the screen without taking it (every change is made under it). */
 static void end_of_command(const app_t *app) {
     if (apphost_ui_locked()) {
         fputs("apphost: a command left the UI lock held\n", stderr);
+        abort();
+    }
+    if (screen_changed(app) && apphost_ui_lock_takes() == takes_before_command) {
+        fputs("apphost: a command changed the screen without taking the UI lock\n", stderr);
         abort();
     }
     apply_screen(app);
@@ -653,6 +677,7 @@ static bool run_script(app_t *app, FILE *in) {
     char *line = NULL;
     size_t cap = 0;
     while (getline(&line, &cap, in) != -1) {
+        begin_command();
         run_line(app, line);
         end_of_command(app);
     }
@@ -668,6 +693,7 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name)
     app_t app = {.pkg = pkg};
     apphost_set_log(emit_log);
     emit_warnings(pkg->manifest.warnings);
+    begin_command();
     app.rt = apps_rt_new(pkg, app.crash_text, sizeof app.crash_text);
     if (app.rt == NULL) {  /* nothing could be made (main.lua doesn't compile, ...): the reason */
         emit_text("crash", app.crash_text);

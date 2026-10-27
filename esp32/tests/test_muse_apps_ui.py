@@ -57,7 +57,7 @@ EVENTS = "tap, long_press, press, release"
 UI_HAS = "label, button, box, arc, bar, image, bg, clear, polar, W, H, R, SAFE"
 COLOUR_HINT = '(use "#rgb", "#rrggbb" or 0xRRGGBB)'
 QUOTA = "ui: no more than 128 widgets per app"
-QUOTA_PENDING = QUOTA + " (a deleted widget's slot is free again once this callback returns)"
+QUOTA_PENDING = QUOTA + " (a deleted widget keeps its slot until the screen next updates)"
 DELETED = "widget was deleted"
 
 
@@ -133,8 +133,11 @@ class UiTest(UiTestCase):
             ("text_a_boolean", "ui.label: 'text' must be a string, got boolean"),
             ("align", f"ui.label: align 'middle' is not one of {ALIGNS}"),
             ("text_align", "ui.label: text_align 'justify' is not one of left, center, right"),
-            ("font_not_a_string", "ui.label: 'font' must be a string, got boolean"),
+            # F3: the font style for a value that is not text, shown by its type
+            ("font_not_a_string", f"ui.label: font '<boolean>' is not one of {FONTS}"),
             ("font_a_number", f"ui.label: font '20' is not one of {FONTS}"),
+            ("align_a_table", f"ui.label: align '<table>' is not one of {ALIGNS}"),
+            ("text_align_a_boolean", "ui.label: text_align '<boolean>' is not one of left, center, right"),
             # R9.3 to R9.6: get, parent, nesting, methods.
             ("get_unknown_property", unknown_property("label", "bg")),
             ("parent_set_later", "ui.label: parent can only be set when the widget is created"),
@@ -276,7 +279,6 @@ class UiTest(UiTestCase):
         lines = self.lua_lines("""
             local a = ui.label{text = "a"}
             local b = ui.button{text = "b"}
-            b:on("tap", function() print("never") end)
             ui.clear()
             print(pcall(a.get, a, "text"))
             print(pcall(b.set, b, {text = "x"}))
@@ -292,6 +294,113 @@ class UiTest(UiTestCase):
             "label#0\tc\tfalse\t" + DELETED,
             "false\ttrue",
         ])
+
+    def test_a_touch_from_before_ui_clear_runs_nothing(self):  # F11
+        # The most common stale event: a tap queued while a handler clears the screen. The gen it carries is the
+        # one of the widget that was there, which the clear ended.
+        main = """
+            local app = {}
+            function app.start()
+                ui.label{text = "a"}
+                ui.button{text = "b"}:on("tap", function() print("old b") end)
+            end
+            function app.message(event)
+                if event == "clear" then ui.clear() end
+                if event == "again" then
+                    ui.label{text = "c"}
+                    ui.button{text = "d"}:on("tap", function() print("new d") end)
+                end
+            end
+            return app
+        """
+        run = self.host(self.make_app("scratch", main), script=[
+            "tap #1@0",          # before the clear: it runs
+            "message clear",
+            "tap #1@0",          # the gen of a widget that is gone: nothing runs, nothing is said
+            "tap #1",            # the slot is empty now
+            "message again",     # a new button takes the slot, on the next gen
+            "tap #1@0",          # still the old one's
+            "tap #1@1",
+            "state"])
+        self.assertEqual(run.logs(), ["old b", "new d"])
+        self.assertEqual(run.messages("error"), ["no widget in slot 1"])
+        self.assertEqual(run.events[-1], {"event": "state", "state": "running"})
+        self.assertEqual(run.of("crash"), [])
+
+    def test_the_metatables_apps_can_reach_are_protected(self):  # F1, X17
+        lines = self.lua_lines("""
+            local w = ui.label{}
+            print(type(getmetatable(w)), type(getmetatable(ui)))
+            print(pcall(function() getmetatable(w).__gc = function() end end))
+            print(pcall(function() getmetatable(w).__index = nil end))
+            print(pcall(function() getmetatable(ui).__index = nil end))
+            print(pcall(setmetatable, ui, {}))
+            print(pcall(setmetatable, w, {}))
+            print(w:get("x"), ui.W, pcall(function() return ui.nothing end))
+        """)
+        self.assertEqual(lines[0], "string\tstring")
+        for line in lines[1:4]:
+            self.assertRegex(line, r"^false\tmain\.lua:\d+: attempt to index a string value")
+        self.assertEqual(lines[4], "false\tcannot change a protected metatable")
+        self.assertRegex(lines[5], r"^false\t.*table expected, got muse\.widget")
+        self.assertRegex(lines[6], r"^0\t466\tfalse\tmain\.lua:\d+: ui\.nothing doesn't exist \(ui has: ")
+
+    def test_a_finalizer_cannot_be_given_to_handles(self):  # F1
+        # The review's probe: __gc put on the handles' metatable, then thousands of handles made and dropped in one
+        # callback. Lua runs finalizers with the hooks off, beyond the budget and the kill.
+        lines = self.lua_lines("""
+            ran = 0
+            local w = ui.label{}
+            print((pcall(function() getmetatable(w).__gc = function() ran = ran + 1 end end)))
+            for i = 1, 3000 do ui.label{}:delete() end
+            for i = 1, 3000 do local garbage = {i, i} end
+            print(ran)
+        """)
+        self.assertEqual(lines, ["false", "0"])
+
+    def test_every_metatable_c_code_makes_is_protected(self):  # X17
+        # luaL_setmetatable and lua_setmetatable from C register a finalizer whenever the metatable holds __gc, and
+        # skip the sandbox's setmetatable, which refuses one: an app that could add __gc to a metatable C puts on
+        # new objects would get finalizers. Each metatable made with luaL_newmetatable is given __metatable, within a
+        # few lines of the call (a later metatable's __metatable must not stand in for it).
+        made = 0
+        for path in sorted(APPS.glob("*.c")):
+            lines = path.read_text().splitlines()
+            for n, line in enumerate(lines):
+                if re.search(r"\bluaL_newmetatable\s*\(", line):
+                    made += 1
+                    self.assertRegex("\n".join(lines[n:n + 8]), r'lua_setfield\([^;]*"__metatable"\)',
+                                     f"{path.name}:{n + 1}: the metatable made here is not given __metatable")
+        self.assertGreater(made, 0, "no luaL_newmetatable to check: has this test lost its target?")
+
+    def test_a_handle_does_not_alias_a_widget_of_another_kind_after_the_gen_wraps(self):  # F4
+        # A slot's gen has 16 bits: after 65536 deletes it is the same again, and a handle kept from before matches
+        # the slot and the gen of whatever lives there. It has to match the kind too, or it writes a box's state
+        # into a label, or makes a label the parent of a widget.
+        lines = self.lua_lines("""
+            local old = ui.box{}
+            old:delete()
+            for i = 1, 65535 do ui.label{}:delete() end
+            local label = ui.label{text = "now"}
+            print(tostring(old), tostring(label), old == label, rawequal(old, label))
+            print(pcall(old.get, old, "radius"))
+            print(pcall(old.set, old, {radius = 5}))
+            print(pcall(ui.label, {parent = old}))
+            print(pcall(old.delete, old))
+            print(label:get("text"))
+        """)
+        self.assertEqual(lines, [
+            "box#0 (deleted)\tlabel#0\tfalse\tfalse",
+            "false\t" + DELETED,
+            "false\t" + DELETED,
+            "false\tui.label: parent was deleted",
+            "false\t" + DELETED,
+            "now",
+        ])
+
+    def test_a_handle_is_one_object_while_the_app_holds_it(self):  # F5
+        run = self.host(FIXTURES / "ui_identity", script=['tap "Go"', 'tap "Go"'])
+        self.assertEqual(run.logs(), ["true\ttrue", "go\ttrue\ttrue\ttap", "go\ttrue\ttrue\ttap"])
 
     def test_tap_dispatch_and_click_alias(self):
         run = self.host(FIXTURES / "ui_tap", script=['tap "Go"', 'tap "Alias"', 'tap "Plain"', 'tap #0', 'tap #1'])
@@ -551,7 +660,11 @@ class UiTest(UiTestCase):
             put = function(name, v) arc:set{[name] = v} print(name, v, arc:get(name)) end
             put("thickness", 0.2) put("thickness", 64.5) put("start_angle", -1) put("end_angle", 360.4)
             put("end_angle", 361) put("start_angle", 359.5)
-        """)
+            local img = ui.image{src = "a.bin"}  -- F10: scale has a range of its own, 10 to 400
+            put = function(name, v) img:set{[name] = v} print(name, v, img:get(name)) end
+            put("scale", 9.4) put("scale", 0) put("scale", 9.5) put("scale", 10) put("scale", 399.5) put("scale", 400)
+            put("scale", 400.5) put("scale", 1 / 0) put("scale", -1 / 0) put("scale", -5)
+        """, files={"a.bin": lvgl_image()})
         def row(name, v, got):
             return f"{name}\t{v}\t{got}"
         want = [row("x", "10.4", 10), row("x", "10.5", 11), row("x", "-10.5", -11), row("x", "-10.4", -10),
@@ -567,7 +680,10 @@ class UiTest(UiTestCase):
                 row("border", "20.5", 20), row("border", "-1", 0), row("radius", "233.4", 233),
                 row("radius", "233.5", 233), row("radius", "-5", 0),
                 row("thickness", "0.2", 1), row("thickness", "64.5", 64), row("start_angle", "-1", 0),
-                row("end_angle", "360.4", 360), row("end_angle", "361", 360), row("start_angle", "359.5", 360)]
+                row("end_angle", "360.4", 360), row("end_angle", "361", 360), row("start_angle", "359.5", 360),
+                row("scale", "9.4", 10), row("scale", "0", 10), row("scale", "9.5", 10), row("scale", "10", 10),
+                row("scale", "399.5", 400), row("scale", "400", 400), row("scale", "400.5", 400),
+                row("scale", "inf", 400), row("scale", "-inf", 10), row("scale", "-5", 10)]
         self.assertEqual(lines, want)
 
     def test_types_other_than_numbers(self):  # R9.2
@@ -654,7 +770,7 @@ class UiTest(UiTestCase):
         self.assertEqual(lines, [
             "circle\t#aabbcc\t0\tnil",
             "bottom_right\tdigits96\tright\t100\tnil\tfalse",
-            "box#0\ttrue\tfalse\t#aabbcc",
+            "box#0\ttrue\ttrue\t#aabbcc",
             "12\tinteger",
             "center top bottom left right top_left top_right bottom_left bottom_right ",
             "sans14 sans16 sans20 sans28 mono8 mono16 digits48 digits96 ",
@@ -787,7 +903,7 @@ class UiTest(UiTestCase):
                     local w = ui[kind]{y = #hits * 20}
                     hits[#hits + 1] = w
                     for _, event in ipairs({"tap", "click", "long_press", "press", "release"}) do
-                        print(kind, event, w:on(event, function(self, name) print("ran", kind, name) end) == w)
+                        print(kind, event, w:on(event, function(self, name) print("ran", kind, event, name) end) == w)
                     end
                 end
                 local img = ui.image{src = "a.bin"}
@@ -800,9 +916,10 @@ class UiTest(UiTestCase):
         logs = run.logs()
         self.assertEqual(len(logs), 25 + 6)
         self.assertEqual(logs[:5], [f"label\t{e}\ttrue" for e in ("tap", "click", "long_press", "press", "release")])
-        # A second handler for "tap" (the "click" one) replaced the first, on every kind.
-        self.assertEqual(logs[25:], ["ran\tlabel\ttap", "ran\tbutton\ttap", "ran\tbox\ttap", "ran\tarc\ttap",
-                                     "ran\tbar\ttap", "image tapped"])
+        # The handler of "click" replaced the one of "tap", on every kind (it names the event it was given for), and
+        # a tap still reaches it as "tap".
+        self.assertEqual(logs[25:], ["ran\tlabel\tclick\ttap", "ran\tbutton\tclick\ttap", "ran\tbox\tclick\ttap",
+                                     "ran\tarc\tclick\ttap", "ran\tbar\tclick\ttap", "image tapped"])
 
     def test_on_replaces_and_nil_removes(self):  # R9.7
         main = """
@@ -963,7 +1080,8 @@ class UiTest(UiTestCase):
                               include_dirs=[apps_host.LUA_SRC, apps_host.APPS, apps_host.APPHOST],
                               lua_extra_defines=["LUA_USE_APICHECK"])
         for fixture, script in (("ui_basic", "dump\n"), ("ui_messages", "dump\n"),
-                                ("ui_tap", 'tap "Go"\ntap "Alias"\ndump\n'), ("ui_dump", "dump\n")):
+                                ("ui_tap", 'tap "Go"\ntap "Alias"\ndump\n'), ("ui_dump", "dump\n"),
+                                ("ui_identity", 'tap "Go"\ndump\n')):
             with self.subTest(fixture):
                 done = apps_host.run(exe, "--script", "-", FIXTURES / fixture, input=script.encode(), text=False)
                 self.assertEqual(done.returncode, 0, done.stderr)
@@ -1003,6 +1121,24 @@ class HarnessTest(unittest.TestCase):
     def test_deleting_a_box_flags_everything_inside(self):
         self.run_case("cascade")
 
+    def test_a_box_deleted_over_a_lower_slot_leaves_nothing_alive(self):  # F8
+        self.run_case("cascade_lower_slot")
+
+    def test_every_change_takes_the_lock(self):  # F9
+        self.run_case("lock_taken")
+
+    def test_the_metatables_of_handles_and_ui_cannot_be_given_a_finalizer(self):  # F1
+        self.run_case("metatables")
+
+    def test_a_handle_is_one_object_and_the_cache_of_them_is_weak(self):  # F5
+        self.run_case("identity")
+
+    def test_a_remembered_handle_is_given_out_only_for_the_widget_it_names(self):  # F5
+        self.run_case("identity_checks_the_life")
+
+    def test_the_apply_side_calls_accept_no_table(self):  # F7
+        self.run_case("null_table")
+
     def test_clear_frees_every_slot_at_once(self):
         self.run_case("clear")
 
@@ -1023,6 +1159,9 @@ class HarnessTest(unittest.TestCase):
 
     def test_the_table_survives_a_heap_that_refuses_at_every_step(self):
         self.run_case("refused")
+
+    def test_a_create_that_raises_leaves_no_widget_behind(self):  # F5
+        self.run_case("create_all_or_nothing")
 
     def test_a_touch_survives_a_heap_that_refuses_at_every_step(self):
         self.run_case("touch_refused")

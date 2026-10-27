@@ -59,6 +59,7 @@ bool apps_port_epoch_ms(int64_t *out) {
 }
 
 static bool ui_locked;
+static unsigned long ui_takes;
 
 /* A violation of the lock's rules is a bug in the core, and ends the run: apphost's tests (and every run of an
  * app) have an empty stderr, so none goes unseen. */
@@ -110,6 +111,7 @@ void apps_port_ui_lock(void) {
         lock_violation("the UI lock was taken while it was held");
     }
     ui_locked = true;
+    ui_takes++;
 }
 
 bool apps_port_ui_trylock(int ms) {
@@ -127,6 +129,10 @@ void apps_port_ui_unlock(void) {
 
 bool apphost_ui_locked(void) {
     return ui_locked;
+}
+
+unsigned long apphost_ui_lock_takes(void) {
+    return ui_takes;
 }
 
 void apphost_set_log(apphost_log_fn fn) {

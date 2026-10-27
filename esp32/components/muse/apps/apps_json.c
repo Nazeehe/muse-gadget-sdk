@@ -61,6 +61,10 @@
 #define DECODE_SLOTS 7
 #define ENCODE_SLOTS 3
 
+/* Decoding and encoding call apps_vm_charge(L, 0) after every 256 values they build or write: it reads the
+ * clock, which kills a call past APPS_WALL_MS and raises an external kill, inside one big table. */
+#define CLOCK_EVERY_MASK 0xFFu
+
 /* json.null is this address. */
 static char null_tag;
 
@@ -120,12 +124,17 @@ static bool expect(apps_jr_t *r, char c) {
     return true;
 }
 
-/* The length of the UTF-8 sequence (RFC 3629) at p, whose first byte is 0x80 or more, or 0 if it
- * isn't valid: no stray continuation byte, no overlong form, no surrogate (U+D800-DFFF), nothing
- * past U+10FFFF, no missing continuation byte. Shared by the decoder and the encoder. */
-static size_t utf8_len(const unsigned char *p, const unsigned char *end) {
+/* UTF-8 (RFC 3629) at p, in the text that ends at end, whose first byte is 0x80 or more: the length of the
+ * sequence; or UTF8_INVALID when it isn't one: a stray continuation byte, an overlong form, a surrogate
+ * (U+D800-DFFF), a code point past U+10FFFF, or a byte that isn't a continuation byte where one is due; or
+ * UTF8_CUT when the text ends inside it and the bytes there are valid so far. Shared by the decoder, which
+ * reports a cut sequence as the end of the input like any other cut, and the encoder, which refuses both. */
+#define UTF8_INVALID 0
+#define UTF8_CUT (-1)
+
+static int utf8_len(const unsigned char *p, const unsigned char *end) {
     unsigned char first = p[0], lo = 0x80, hi = 0xBF;  /* the range of the second byte */
-    size_t n;
+    int n;
     if (first >= 0xC2 && first <= 0xDF) {
         n = 2;
     } else if (first >= 0xE0 && first <= 0xEF) {
@@ -143,14 +152,15 @@ static size_t utf8_len(const unsigned char *p, const unsigned char *end) {
             hi = 0x8F;  /* nothing past U+10FFFF */
         }
     } else {
-        return 0;  /* a continuation byte, an overlong 2-byte lead (C0, C1), or past F4 */
+        return UTF8_INVALID;  /* a continuation byte, an overlong 2-byte lead (C0, C1), or past F4 */
     }
-    if ((size_t)(end - p) < n || p[1] < lo || p[1] > hi) {
-        return 0;
-    }
-    for (size_t i = 2; i < n; i++) {
-        if ((p[i] & 0xC0) != 0x80) {
-            return 0;
+    for (int i = 1; i < n; i++) {
+        if (p + i >= end) {
+            return UTF8_CUT;
+        }
+        unsigned char b = p[i];
+        if (i == 1 ? (b < lo || b > hi) : (b & 0xC0) != 0x80) {
+            return UTF8_INVALID;
         }
     }
     return n;
@@ -330,8 +340,11 @@ static bool scan_string(apps_jr_t *r, jstr_t *s) {
             }
             run = p;
         } else if (c >= 0x80) {
-            size_t n = utf8_len((const unsigned char *)p, (const unsigned char *)end);
-            if (n == 0) {
+            int n = utf8_len((const unsigned char *)p, (const unsigned char *)end);
+            if (n == UTF8_CUT) {
+                return fail_unexpected(r, end);
+            }
+            if (n == UTF8_INVALID) {
                 return fail_at(r, "invalid UTF-8", p);
             }
             p += n;
@@ -590,6 +603,9 @@ static bool array(apps_jr_t *r, lua_State *L) {
 
 /* One value at r->p, pushed when L isn't NULL. */
 static bool value(apps_jr_t *r, lua_State *L) {
+    if (L != NULL && (++r->values & CLOCK_EVERY_MASK) == 0) {
+        apps_vm_charge(L, 0);
+    }
     skip_ws(r);
     if (r->p >= r->end) {
         return fail_unexpected(r, r->p);
@@ -900,6 +916,7 @@ typedef struct {
     int box;          /* the stack index of the userdata holding the output */
     char *buf;        /* that userdata's memory */
     size_t len, cap;  /* bytes written, bytes it holds */
+    unsigned values;  /* values visited, for the clock check */
     char err[96];     /* "" until the first error */
 } enc_t;
 
@@ -962,8 +979,8 @@ static bool put_string(enc_t *e, const char *s, size_t n) {
     while (p < end) {
         unsigned char c = *p;
         if (c >= 0x80) {
-            size_t k = utf8_len(p, end);
-            if (k == 0) {
+            int k = utf8_len(p, end);
+            if (k <= 0) {  /* invalid, or cut short by the end of the string */
                 return enc_fail(e, "can't encode a string that isn't valid UTF-8");
             }
             p += k;
@@ -1043,6 +1060,10 @@ static bool encode_table(enc_t *e, int idx, int level) {
         return enc_fail(e, "nested deeper than 16");
     }
     luaL_checkstack(L, ENCODE_SLOTS, "json");
+    /* lua_next walks every slot the table was ever grown to, empty or not, once to decide array or object and
+     * again to write it, and no count hook fires in C: charge the walk to the call's budget (a table emptied
+     * after it grew costs its size, not what it holds), so a table shared many times is killed, not a spin. */
+    apps_vm_charge(L, apps_vm_table_slots(L, idx) + 1);
     lua_Integer count = 0, largest = 0;
     bool sequence = true;
     lua_pushnil(L);
@@ -1108,6 +1129,9 @@ static bool encode_table(enc_t *e, int idx, int level) {
 /* The value at idx, depth containers deep. */
 static bool encode_at(enc_t *e, int idx, int depth) {
     lua_State *L = e->L;
+    if ((++e->values & CLOCK_EVERY_MASK) == 0) {
+        apps_vm_charge(L, 0);  /* a %.17g costs tens of microseconds on the S3: the clock, inside one big table */
+    }
     switch (lua_type(L, idx)) {
         case LUA_TNIL:
             out_put(e, "null", 4);
@@ -1149,6 +1173,7 @@ static bool encode_into_box(enc_t *e, lua_State *L, int idx) {
     e->L = L;
     e->len = 0;
     e->cap = ENC_FIRST_CAP;
+    e->values = 0;
     e->err[0] = '\0';
     e->buf = lua_newuserdatauv(L, e->cap, 0);
     e->box = lua_gettop(L);

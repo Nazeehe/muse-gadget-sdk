@@ -45,7 +45,11 @@
  * UTF-8 (value or key), which json.decode would refuse after a reboot; a key that is neither a
  * string nor an integer; and nesting deeper than APPS_JSON_MAX_DEPTH. Every value it visits
  * writes at least one byte, so a table that holds the same subtable many times runs into the
- * app's memory cap, not into a long spin.
+ * app's memory cap, not into a long spin. That alone doesn't bound the walk: lua_next visits
+ * every slot a table was ever grown to, empty or not, and a table emptied after it grew writes
+ * little for what it costs. So each table visit is charged its slots plus one to the call's
+ * instruction budget (apps_vm_charge, apps_vm_table_slots), and a table shared many times ends
+ * in the budget's kill. Decoding and encoding both also check the clock every 256 values.
  *
  * Messages. The C functions write the bare message into err, ASCII only (it reaches Muse inside a
  * JSON string), and their callers add their own context ("manifest: ", "store.set: ", a file's
@@ -53,7 +57,8 @@
  * position is a 1-based byte offset:
  *   unexpected '%c' at byte %u              a printable ASCII byte (0x21-0x7E) that can't be there
  *   unexpected byte 0x%02X at byte %u       any other byte, a raw control character in a string too
- *   unexpected end of input at byte %u      the text stops early: one past its last byte
+ *   unexpected end of input at byte %u      the text stops early: one past its last byte, inside a
+ *                                           string or a UTF-8 sequence that is valid so far included
  *   invalid UTF-8 at byte %u                at the sequence's first byte
  *   invalid \u escape at byte %u            at the backslash: bad digits, a lone or unpaired surrogate
  *   number longer than 200 characters at byte %u
@@ -100,9 +105,11 @@ bool apps_json_validate(const char *s, size_t len, char *err, size_t err_len);
 /*
  * Decodes s[0, len) and pushes the one value. On a syntax error it returns false with the bare
  * message in err (cut to err_len) and leaves the stack as it was. ONLY INSIDE A PROTECTED CALL
- * (apps_vm_call or lua_pcall): it allocates on the app's capped heap, and when the heap refuses it
- * raises, which a caller outside one turns into a panic. A syntax error never raises. It reserves
- * the Lua stack slots it uses (luaL_checkstack), so the caller needs none to spare.
+ * (apps_vm_call or lua_pcall): it raises when the app's capped heap refuses memory, and when the
+ * call is killed (over its budget or APPS_WALL_MS, which it checks every 256 values, or by an
+ * external kill), which a caller outside a protected call turns into a panic. A syntax error never
+ * raises. It reserves the Lua stack slots it uses (luaL_checkstack), so the caller needs none to
+ * spare.
  */
 bool apps_json_push(lua_State *L, const char *s, size_t len, char *err, size_t err_len);
 
@@ -119,8 +126,11 @@ bool apps_json_push(lua_State *L, const char *s, size_t len, char *err, size_t e
  *
  * ONLY INSIDE A PROTECTED CALL, as apps_json_push: the output is built in the app's capped heap, in a
  * userdata that grows by copying (never in a luaL_Buffer, whose box must be at the top of the stack
- * when it grows, where lua_next's key is), and when that heap refuses it raises. It reserves the Lua
- * stack slots it uses, as apps_json_push does.
+ * when it grows, where lua_next's key is), and when that heap refuses it raises. It raises as well
+ * when the call is killed: it charges each table's slots to the call's budget and checks the clock
+ * every 256 values (see Encoding above), so a hostile table costs the app its call, not the
+ * gadget its time. Nothing it holds is outside the Lua heap before it returns, so a raise leaks
+ * nothing. It reserves the Lua stack slots it uses, as apps_json_push does.
  */
 char *apps_json_encode_value(lua_State *L, int idx, void *(*realloc_fn)(void *, size_t), size_t *len, char *err,
                              size_t err_len);
@@ -149,6 +159,7 @@ typedef struct {
     /* Private. */
     const char *start;  /* the first byte: positions count from it */
     uint16_t started;   /* bit d-1: the container at depth d has begun its elements (comma rules) */
+    uint32_t values;    /* values the decoder has built, for its clock check */
 } apps_jr_t;
 
 /* Reads s[0, len). Input over APPS_JSON_MAX_INPUT is an error from the first call. */

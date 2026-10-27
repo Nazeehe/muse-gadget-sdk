@@ -62,6 +62,108 @@ static int failures;
 /* A string literal and its length without the NUL, as two arguments. */
 #define LIT(s) (s), (sizeof(s) - 1)
 
+/* ---- Exact-size texts ----
+ *
+ * The scanner must never read past len. A C literal or a Lua string has a NUL after its last byte, and
+ * a stack buffer has room beyond it, so a read past len goes unseen and seldom changes a verdict. So
+ * every text handed to a scanner entry point in this file goes through a copy in a heap block of
+ * exactly len bytes with nothing after it: a read past len is a heap-buffer-overflow, which
+ * AddressSanitizer reports. An empty text is the end of a page with an inaccessible one after it.
+ * (json.decode from Lua can't show any of this: a Lua string carries a NUL. The C entry points
+ * share its scanner.)
+ *
+ * The copies live until exact_release(), which every case ends with and a loop of many texts calls
+ * itself. The macros below shadow the entry points for the rest of the file; the wrappers reach the
+ * real ones with the name in parentheses, which a function-like macro doesn't expand.
+ */
+
+typedef struct {
+    void *block;
+    bool mapped;  /* an mmap'd page pair, not a malloc block */
+} exact_t;
+
+static exact_t *exact_blocks;
+static size_t exact_count, exact_room;
+
+static void exact_track(void *block, bool mapped) {
+    if (exact_count == exact_room) {
+        exact_room = exact_room != 0 ? 2 * exact_room : 64;
+        exact_blocks = realloc(exact_blocks, exact_room * sizeof *exact_blocks);
+        if (exact_blocks == NULL) {
+            fputs("out of memory in the harness\n", stderr);
+            exit(2);
+        }
+    }
+    exact_blocks[exact_count++] = (exact_t){block, mapped};
+}
+
+/* An address with no byte to read at it: the end of a mapped page, with an inaccessible one after.
+ * malloc(0) won't do for an empty text: ASan hands out a readable byte for it. */
+static char *exact_nothing(void) {
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    char *map = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (map == MAP_FAILED || mprotect(map + page, page, PROT_NONE) != 0) {
+        fputs("no pages for an empty text\n", stderr);
+        exit(2);
+    }
+    exact_track(map, true);
+    return map + page;
+}
+
+/* s[0, len) in a block of exactly len bytes, so a read at s[len] is a heap-buffer-overflow. NULL stays
+ * NULL: the entry points take it for no text. */
+static char *exact_copy(const char *s, size_t len) {
+    if (s == NULL) {
+        return NULL;
+    }
+    if (len == 0) {
+        return exact_nothing();
+    }
+    char *p = malloc(len);
+    if (p == NULL) {
+        fputs("out of memory in the harness\n", stderr);
+        exit(2);
+    }
+    memcpy(p, s, len);
+    exact_track(p, false);
+    return p;
+}
+
+/* Frees the copies. Nothing may read one afterwards: call it where no reader or text is live. */
+static void exact_release(void) {
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    for (size_t i = 0; i < exact_count; i++) {
+        if (exact_blocks[i].mapped) {
+            munmap(exact_blocks[i].block, 2 * page);
+        } else {
+            free(exact_blocks[i].block);
+        }
+    }
+    exact_count = 0;
+}
+
+static bool exact_validate(const char *s, size_t len, char *err, size_t err_len) {
+    return (apps_json_validate)(exact_copy(s, len), len, err, err_len);
+}
+
+static bool exact_push(lua_State *L, const char *s, size_t len, char *err, size_t err_len) {
+    return (apps_json_push)(L, exact_copy(s, len), len, err, err_len);
+}
+
+static void exact_jr_init(apps_jr_t *r, const char *s, size_t len) {
+    (apps_jr_init)(r, exact_copy(s, len), len);
+}
+
+static size_t exact_compact(const char *s, size_t len, char *out, size_t cap) {
+    return (apps_json_compact)(exact_copy(s, len), len, out, cap);
+}
+
+/* Variadic, so that an argument like LIT("...") that expands to two still counts as two. */
+#define apps_json_validate(...) exact_validate(__VA_ARGS__)
+#define apps_json_push(...) exact_push(__VA_ARGS__)
+#define apps_jr_init(...) exact_jr_init(__VA_ARGS__)
+#define apps_json_compact(...) exact_compact(__VA_ARGS__)
+
 /* ---- The allocator apps_vm gets: realloc and free, counting what they hold ---- */
 
 typedef union {
@@ -105,8 +207,13 @@ static void *refusing_realloc(void *ptr, size_t n) {
     return NULL;
 }
 
+/* The VM's clock: each read returns fake_ms, then moves it on by fake_step (0 but in the clock cases). */
+static int64_t fake_ms, fake_step;
+
 static int64_t fake_now_ms(void) {
-    return 0;
+    int64_t now = fake_ms;
+    fake_ms += fake_step;
+    return now;
 }
 
 static apps_vm_t *new_vm(size_t mem_limit) {
@@ -666,6 +773,13 @@ static const error_row_t error_rows[] = {
     EROW("1 2", "unexpected '2' at byte 3"),
     EROW("]", "unexpected ']' at byte 1"),
     EROW(":", "unexpected ':' at byte 1"),
+    EROW("{", "unexpected end of input at byte 2"),
+    EROW("[", "unexpected end of input at byte 2"),
+    EROW("[1,", "unexpected end of input at byte 4"),
+    EROW("{\"a\"", "unexpected end of input at byte 5"),
+    EROW("{\"a\":", "unexpected end of input at byte 6"),
+    EROW("{\"a\":1,", "unexpected end of input at byte 8"),
+    EROW("{\"a\":1, ", "unexpected end of input at byte 9"),
     /* Literals. */
     EROW("tru", "unexpected end of input at byte 4"),
     EROW("trux", "unexpected 'x' at byte 4"),
@@ -731,6 +845,29 @@ static const error_row_t error_rows[] = {
     EROW("\"\377\"", "invalid UTF-8 at byte 2"),
     EROW("\"\360\237\230\"", "invalid UTF-8 at byte 2"),
     EROW("\"a\342\202\"", "invalid UTF-8 at byte 3"),
+    /* A text that ends inside a sequence that is valid so far is cut short, as every other cut is
+     * (a string, a number, a literal, an escape): the end of the input, one past its last byte. */
+    EROW("\"\303", "unexpected end of input at byte 3"),
+    EROW("\"a\342", "unexpected end of input at byte 4"),
+    EROW("\"\342\202", "unexpected end of input at byte 4"),
+    EROW("\"\360", "unexpected end of input at byte 3"),
+    EROW("\"\360\237", "unexpected end of input at byte 4"),
+    EROW("\"\360\237\230", "unexpected end of input at byte 5"),
+    EROW("\"\364\217\277", "unexpected end of input at byte 5"),
+    EROW("\"\340\240", "unexpected end of input at byte 4"),
+    EROW("\"\355\237", "unexpected end of input at byte 4"),
+    EROW("{\"\303", "unexpected end of input at byte 4"),
+    EROW("[\"\360\237\230", "unexpected end of input at byte 6"),
+    EROW("\"\303\251", "unexpected end of input at byte 4"),
+    /* Cut short, but with a byte that no valid sequence has there: invalid, at the first byte. */
+    EROW("\"\340\200", "invalid UTF-8 at byte 2"),
+    EROW("\"\355\240", "invalid UTF-8 at byte 2"),
+    EROW("\"\360\217", "invalid UTF-8 at byte 2"),
+    EROW("\"\364\220", "invalid UTF-8 at byte 2"),
+    EROW("\"\360\237\300", "invalid UTF-8 at byte 2"),
+    EROW("\"\300", "invalid UTF-8 at byte 2"),
+    EROW("\"\377", "invalid UTF-8 at byte 2"),
+    EROW("\"\200", "invalid UTF-8 at byte 2"),
     /* Bytes that start no value, as hex since a raw one could break the JSON that carries the message. */
     EROW("\303\251", "unexpected byte 0xC3 at byte 1"),
     EROW("[\177]", "unexpected byte 0x7F at byte 2"),
@@ -778,6 +915,7 @@ static void decode_errors(void) {
            "eq(err_of(json.decode, '\"\\\\udc00\"'), 'json.decode: invalid \\\\u escape at byte 2')\n"
            "eq(err_of(json.decode, '\\xc3\\xa9'), 'json.decode: unexpected byte 0xC3 at byte 1')\n"
            "eq(err_of(json.decode, '\"\\xc3\"'), 'json.decode: invalid UTF-8 at byte 2')\n"
+           "eq(err_of(json.decode, '\"\\xc3'), 'json.decode: unexpected end of input at byte 3')\n"
            "eq(err_of(json.decode, string.rep('[', 17) .. string.rep(']', 17)), 'json.decode: nested deeper than 16')\n"
            "eq(err_of(json.decode, string.rep(' ', 32769)), 'json.decode: input larger than 32 KB')\n");
 
@@ -785,6 +923,106 @@ static void decode_errors(void) {
     run_ok(vm,
            "local function boom() local v = json.decode('[') return v end\n"
            "eq(err_of(boom), 'main.lua:1: json.decode: unexpected end of input at byte 2')\n");
+    apps_vm_free(vm);
+}
+
+/* ---- decode_prefixes: a text is its first len bytes, whatever follows ---- */
+
+typedef struct {
+    const char *json;   /* the literal goes on after len, with its NUL */
+    size_t len;
+    const char *error;  /* the message the first len bytes give, or NULL when they are a valid text: */
+    const char *value;  /* what they decode to, as show_value says */
+} prefix_row_t;
+
+static const prefix_row_t prefix_rows[] = {
+    {"12", 1, NULL, "i:1"},
+    {"123456", 3, NULL, "i:123"},
+    {"-12", 2, NULL, "i:-1"},
+    {"0123", 1, NULL, "i:0"},
+    {"1.5e3", 3, NULL, "f:1.5"},
+    {"1 2", 2, NULL, "i:1"},
+    {"truefalse", 4, NULL, "true"},
+    {"falsey", 5, NULL, "false"},
+    {"nullx", 4, NULL, "null"},
+    {"\"ab\"c", 4, NULL, "s:ab"},
+    {"[1,2]]", 5, NULL, "table"},
+    {"{\"a\":1}}", 7, NULL, "table"},
+    /* The byte after len would finish what len cuts short. */
+    {"1.5e3", 4, "unexpected end of input at byte 5", NULL},
+    {"1.5e3", 2, "unexpected end of input at byte 3", NULL},
+    {"-1", 1, "unexpected end of input at byte 2", NULL},
+    {"true", 3, "unexpected end of input at byte 4", NULL},
+    {"nulll", 3, "unexpected end of input at byte 4", NULL},
+    {"\"abc\"", 4, "unexpected end of input at byte 5", NULL},
+    {"\"\\u00e9\"", 6, "unexpected end of input at byte 7", NULL},
+    {"\"\\ud83d\\ude00\"", 7, "unexpected end of input at byte 8", NULL},
+    {"\"\\ud83d\\ude00\"", 8, "unexpected end of input at byte 9", NULL},
+    {"\"\\ud83d\\ude00\"", 10, "unexpected end of input at byte 11", NULL},
+    {"\"\303\251\"", 2, "unexpected end of input at byte 3", NULL},
+    {"\"\342\202\254\"", 3, "unexpected end of input at byte 4", NULL},
+    {"\"\360\237\230\200\"", 4, "unexpected end of input at byte 5", NULL},
+    {"[1,2]", 4, "unexpected end of input at byte 5", NULL},
+    {"{\"a\":1,\"b\":2}", 7, "unexpected end of input at byte 8", NULL},
+    {"{\"a\":1}", 4, "unexpected end of input at byte 5", NULL},
+    {" 1", 0, "unexpected end of input at byte 1", NULL},
+    {"x", 0, "unexpected end of input at byte 1", NULL},
+};
+
+static void show_value(lua_State *L, int idx, char *out, size_t cap) {
+    switch (lua_type(L, idx)) {
+        case LUA_TNUMBER:
+            if (lua_isinteger(L, idx)) {
+                snprintf(out, cap, "i:%lld", (long long)lua_tointeger(L, idx));
+            } else {
+                snprintf(out, cap, "f:%g", (double)lua_tonumber(L, idx));
+            }
+            break;
+        case LUA_TBOOLEAN: snprintf(out, cap, "%s", lua_toboolean(L, idx) ? "true" : "false"); break;
+        case LUA_TLIGHTUSERDATA: snprintf(out, cap, "null"); break;
+        case LUA_TSTRING: snprintf(out, cap, "s:%s", lua_tostring(L, idx)); break;
+        case LUA_TTABLE: snprintf(out, cap, "table"); break;
+        default: snprintf(out, cap, "?"); break;
+    }
+}
+
+static int t_decode_prefixes(lua_State *L) {
+    for (size_t i = 0; i < sizeof prefix_rows / sizeof prefix_rows[0]; i++) {
+        const prefix_row_t *row = &prefix_rows[i];
+        const bool valid = row->error == NULL;
+        for (int exact = 0; exact < 2; exact++) {
+            char verr[96] = "", perr[96] = "", got[64] = "";
+            int top = lua_gettop(L);
+            apps_jr_t r;
+            bool v, p;
+            if (exact) {
+                v = apps_json_validate(row->json, row->len, verr, sizeof verr);
+                p = apps_json_push(L, row->json, row->len, perr, sizeof perr);
+                apps_jr_init(&r, row->json, row->len);
+            } else {  /* the entry points themselves, on a text that goes on past len */
+                v = (apps_json_validate)(row->json, row->len, verr, sizeof verr);
+                p = (apps_json_push)(L, row->json, row->len, perr, sizeof perr);
+                (apps_jr_init)(&r, row->json, row->len);
+            }
+            if (p) {
+                show_value(L, -1, got, sizeof got);
+            }
+            lua_settop(L, top);
+            bool s = apps_jr_skip(&r) && apps_jr_end(&r);
+            const char *want_err = valid ? "" : row->error;
+            CHECK(v == valid && p == valid && s == valid && strcmp(verr, want_err) == 0 && strcmp(perr, want_err) == 0 &&
+                      strcmp(r.err, want_err) == 0 && (!valid || strcmp(got, row->value) == 0),
+                  "row %zu (%s, first %zu bytes of '%s'): validate %d '%s', push %d '%s' (%s), reader %d '%s'\n  want '%s' %s", i,
+                  exact ? "exact copy" : "in place", row->len, row->json, v, verr, p, perr, got, s, r.err, want_err,
+                  valid ? row->value : "");
+        }
+    }
+    return 0;
+}
+
+static void decode_prefixes(void) {
+    apps_vm_t *vm = new_json_vm(1 * MB);
+    run_c(vm, t_decode_prefixes);
     apps_vm_free(vm);
 }
 
@@ -1145,6 +1383,144 @@ static void encode_shared_subtables(void) {
     apps_vm_free(vm);
 }
 
+/* ---- encode_scan_work (ruling R6.8, amended): the walk over a table's slots is charged ---- */
+
+/* The exact reasons apps_vm kills with. */
+#define BUDGET_MSG(n) "stopped: ran more than " n " VM instructions in one callback (use timer.every for long work)"
+#define WALL_MSG "stopped: one callback ran longer than 1 s"
+
+/* In a fresh VM of cap bytes, setup runs to its end and then work ends KILLED with exactly reason,
+ * running nothing after it (work sets survived at its end), and leaving a dying VM. */
+static void expect_killed_at(int line, size_t cap, const char *setup, const char *work, const char *reason) {
+    apps_vm_t *vm = new_json_vm(cap);
+    lua_State *L = apps_vm_lua(vm);
+    char err[512] = "";
+    int rc = call(vm, setup, 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK_AT(line, rc == APPS_CALL_OK, "setup: %s '%s'\n%s", call_name(rc), err, setup);
+    lua_settop(L, 0);
+    rc = call(vm, work, 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK_AT(line, rc == APPS_CALL_KILLED && strcmp(err, reason) == 0, "%s\n  want KILLED '%s'\n  got  %s '%s'", work, reason,
+             call_name(rc), err);
+    CHECK_AT(line, raw_global(L, "survived") == LUA_TNIL, "%s\n  ran on after the kill", work);
+    lua_settop(L, 0);
+    CHECK_AT(line, apps_vm_dying(vm) && !apps_vm_in_call(vm), "%s\n  dying %d, in a call %d", work, apps_vm_dying(vm),
+             apps_vm_in_call(vm));
+    apps_vm_free(vm);
+}
+#define expect_killed(cap, setup, work, reason) expect_killed_at(__LINE__, cap, setup, work, reason)
+
+/* What src charged the VM, over and above the hook's counts: those come 1000 at a time, from wherever the
+ * countdown stood, so the charge is the difference modulo 1000 (every charge here is under 1000 or
+ * checked beside one that isn't). */
+static void expect_charged_at(int line, apps_vm_t *vm, const char *src, uint64_t want) {
+    char err[512] = "";
+    uint64_t before = apps_vm_instructions(vm);
+    int rc = call(vm, src, 0, APPS_BUDGET_CALL, err, sizeof err);
+    uint64_t got = apps_vm_instructions(vm) - before;
+    CHECK_AT(line, rc == APPS_CALL_OK, "%s: %s '%s'", src, call_name(rc), err);
+    CHECK_AT(line, got >= want && (got - want) % 1000 == 0, "%s\n  charged %llu, want %llu (and any whole counts of the hook)", src,
+             (unsigned long long)got, (unsigned long long)want);
+    lua_settop(apps_vm_lua(vm), 0);
+}
+#define expect_charged(vm, src, want) expect_charged_at(__LINE__, vm, src, want)
+
+static void encode_scan_work(void) {
+    /* A table grown and then emptied keeps its slots, and lua_next walks every one of them, twice in a
+     * visit, for the one value it finds. These shapes cost far more to walk than they write. */
+    static const char emptied[] =
+        "local t = {} for i = 1, 8192 do t[i] = true end for i = 1, 8191 do t[i] = nil end\n";  /* 8192 slots, one live */
+
+    /* The reviewer's shape: the same table many times in an array. */
+    expect_killed(1 * MB, "local t = {} for i = 1, 8192 do t[i] = true end for i = 1, 8191 do t[i] = nil end\n"
+                          "arr = {} for i = 1, 1500 do arr[i] = t end",
+                  "json.encode(arr) survived = true", BUDGET_MSG("2000000"));
+    /* Shared through nesting: 15 levels of four. */
+    expect_killed(1 * MB, "local t = {} for i = 1, 8192 do t[i] = true end for i = 1, 8191 do t[i] = nil end\n"
+                          "for d = 1, 15 do t = {t, t, t, t} end top = t",
+                  "json.encode(top) survived = true", BUDGET_MSG("2000000"));
+    /* The same through the C entry point, which raises the kill as the binding does. */
+    expect_killed(1 * MB, "local t = {} for i = 1, 8192 do t[i] = true end for i = 1, 8191 do t[i] = nil end\n"
+                          "arr = {} for i = 1, 1500 do arr[i] = t end",
+                  "c_encode(arr) survived = true", BUDGET_MSG("2000000"));
+    /* A hash part is walked the same: 128 slots, none live. */
+    expect_killed(4 * MB, "local t = {} for i = 1, 100 do t['k' .. i] = i end for k in pairs(t) do t[k] = nil end\n"
+                          "arr = {} for i = 1, 40000 do arr[i] = t end",
+                  "json.encode(arr) survived = true", BUDGET_MSG("2000000"));
+
+    /* The charge is the table's slots and one, for each visit, and nothing for a value that isn't a table. */
+    apps_vm_t *vm = new_json_vm(4 * MB);
+    expect_charged(vm, "json.encode(7) json.encode('s') json.encode(nil)", 0);
+    expect_charged(vm, "json.encode({})", 1);
+    expect_charged(vm, "json.encode({1, 2, 3})", 4);
+    expect_charged(vm, "json.encode({a = 1, b = 2, c = 3})", 5);
+    expect_charged(vm, "json.encode({1, 2, 3, a = 1})", 5);
+    expect_charged(vm, "json.encode({{1, 2, 3}, {1, 2, 3}})", 3 + 4 + 4);
+    expect_charged(vm, "local s = {1, 2, 3} json.encode({s, s})", 3 + 4 + 4);
+    expect_charged(vm, "c_encode({1, 2, 3})", 3 * 4);  /* it encodes three times */
+    char setup[256];
+    snprintf(setup, sizeof setup, "%s keep = t", emptied);
+    run_ok(vm, setup);
+    expect_charged(vm, "json.encode(keep)", 8192 + 1);
+    expect_charged(vm, "json.encode({keep, keep})", 3 + 2 * (8192 + 1));
+    /* The check every 256 values charges nothing: 600 values are a table of 1024 slots, and decoding builds
+     * without a charge of its own. */
+    run_ok(vm, "list = {} for i = 1, 600 do list[i] = i end text = '[' .. string.rep('1,', 599) .. '1]'");
+    expect_charged(vm, "json.encode(list)", 1024 + 1);
+    expect_charged(vm, "json.decode(text)", 0);
+
+    /* Work that is legitimate still passes: a table of 20000 small ones, text of 250 KB, and the sparse
+     * table a hundred times, well under the budget. */
+    run_ok(vm,
+           "local big = {} for i = 1, 20000 do big[i] = {i, i + 1} end\n"
+           "local s = json.encode(big)\n"
+           "eq(s:sub(1, 12), '[[1,2],[2,3]'); eq(s:sub(-15), ',[20000,20001]]')\n"
+           "local sparse = keep local arr = {} for i = 1, 100 do arr[i] = sparse end\n"
+           "local out = json.encode(arr)\n"
+           "eq(#out, 2 + 99 + 100 * #json.encode(sparse))\n");
+    apps_vm_free(vm);
+}
+
+/* ---- clock_checks: decode and encode read the clock inside one big table ---- */
+
+/* A call whose clock runs 600 ms a read: the first read is the call's start, so a check that reads the
+ * clock is past a second at its second read after that (1200 ms). Each case is a single json call
+ * that runs no VM instruction the hook would count, so only the loops inside json can read the clock.
+ * Encoding charges its one table first (a read), so the first check of the loop is the kill: a list of
+ * 300 values is killed by a check every 256 and not by one every 512. Decoding has no such read, so the
+ * second check is the kill: 600 values are killed by a check every 256 (at 512) and not every 512. */
+static void clock_checks(void) {
+    static const struct {
+        const char *what;
+        const char *setup;
+        const char *work;
+    } cases[] = {
+        {"encode", "list = {} for i = 1, 300 do list[i] = i end", "json.encode(list) survived = true"},
+        {"decode", "text = '[' .. string.rep('1,', 599) .. '1]'", "json.decode(text) survived = true"},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        for (int slow = 1; slow >= 0; slow--) {
+            apps_vm_t *vm = new_json_vm(4 * MB);
+            lua_State *L = apps_vm_lua(vm);
+            char err[512] = "";
+            int rc = call(vm, cases[i].setup, 0, APPS_BUDGET_CALL, err, sizeof err);
+            CHECK(rc == APPS_CALL_OK, "%s setup: %s '%s'", cases[i].what, call_name(rc), err);
+            lua_settop(L, 0);
+            fake_step = slow ? 600 : 0;
+            rc = call(vm, cases[i].work, 0, APPS_BUDGET_CALL, err, sizeof err);
+            fake_step = 0;
+            if (slow) {
+                CHECK(rc == APPS_CALL_KILLED && strcmp(err, WALL_MSG) == 0 && raw_global(L, "survived") == LUA_TNIL,
+                      "%s on a slow clock: %s '%s'", cases[i].what, call_name(rc), err);
+            } else {
+                CHECK(rc == APPS_CALL_OK && raw_global(L, "survived") == LUA_TBOOLEAN, "%s on a still clock: %s '%s'",
+                      cases[i].what, call_name(rc), err);
+            }
+            lua_settop(L, 0);
+            apps_vm_free(vm);
+        }
+    }
+}
+
 /* ---- encode_raw (ruling R6.7) ---- */
 
 static void encode_raw(void) {
@@ -1421,7 +1797,7 @@ static void module(void) {
      * chunk is three instructions, and only the check can stop it. */
     static const char *const chunks[] = {
         "local v = json.decode('[1]') probe() return v",
-        "local v = json.encode({1}) probe() return v",
+        "local v = json.encode(1) probe() return v",  /* a scalar: a table's charge would stop a dying VM too */
     };
     for (size_t i = 0; i < sizeof chunks / sizeof chunks[0]; i++) {
         vm = new_json_vm(1 * MB);
@@ -1669,6 +2045,9 @@ static void reader_strings(void) {
     expect_string_error("\"a\001b\"", 64, "unexpected byte 0x01 at byte 3");
     expect_string_error("\"a\nb\"", 64, "unexpected byte 0x0A at byte 3");
     expect_string_error("\"\303\"", 64, "invalid UTF-8 at byte 2");
+    expect_string_error("\"\303", 64, "unexpected end of input at byte 3");
+    expect_string_error("\"\360\237\230", 64, "unexpected end of input at byte 5");
+    expect_string_error("\"\340\200", 64, "invalid UTF-8 at byte 2");
     expect_string_error("\"\355\240\200\"", 64, "invalid UTF-8 at byte 2");
     expect_string_error("\"\\ud800\"", 64, "invalid \\u escape at byte 2");
     expect_string_error("\"\\x\"", 64, "unexpected 'x' at byte 3");
@@ -1693,6 +2072,9 @@ static void reader_strings(void) {
           "missing colon: %s", r.err);
     jr_init_text(&r, "{\"\\u0000\":1}");
     CHECK(apps_jr_object(&r) && apps_jr_key(&r, key, sizeof key) == -1, "a key with \\u0000");
+    jr_init_text(&r, "{\"\303");
+    CHECK(apps_jr_object(&r) && apps_jr_key(&r, key, sizeof key) == -1 && strcmp(r.err, "unexpected end of input at byte 4") == 0,
+          "a key cut inside a sequence: %s", r.err);
 }
 
 static void expect_integer(const char *json, int64_t want, const char *want_err, int line) {
@@ -1781,6 +2163,18 @@ static void reader_commas_and_structure(void) {
     CHECK(apps_jr_array(&r) && apps_jr_next(&r) == 1 && apps_jr_integer(&r, &v) && apps_jr_next(&r) == 1 && apps_jr_integer(&r, &v) &&
               apps_jr_next(&r) == -1 && strcmp(r.err, "unexpected end of input at byte 5") == 0,
           "%s", r.err);
+    /* Called with nothing left to read. */
+    for (int blank = 0; blank < 2; blank++) {
+        const char *at = blank ? "unexpected end of input at byte 3" : "unexpected end of input at byte 1";
+        jr_init_text(&r, blank ? "  " : "");
+        CHECK(!apps_jr_object(&r) && strcmp(r.err, at) == 0, "object on %s: %s", blank ? "blanks" : "nothing", r.err);
+        jr_init_text(&r, blank ? "  " : "");
+        CHECK(!apps_jr_array(&r) && strcmp(r.err, at) == 0, "array on %s: %s", blank ? "blanks" : "nothing", r.err);
+    }
+    jr_init_text(&r, "{\"a\":1,");
+    CHECK(apps_jr_object(&r) && apps_jr_key(&r, key, sizeof key) == 1 && apps_jr_skip(&r), "%s", r.err);
+    CHECK(apps_jr_key(&r, key, sizeof key) == -1 && strcmp(r.err, "unexpected end of input at byte 8") == 0, "key after a last comma: %s",
+          r.err);
     /* The wrong opening bracket. */
     jr_init_text(&r, "[1]");
     CHECK(!apps_jr_object(&r) && strcmp(r.err, "unexpected '[' at byte 1") == 0, "%s", r.err);
@@ -1937,6 +2331,8 @@ static void compact(void) {
     expect_compact("\"  a  b  \"", "\"  a  b  \"", __LINE__);
     expect_compact(" [ \"\\\\\" , \"\\\\\\\"\" ] ", "[\"\\\\\",\"\\\\\\\"\"]", __LINE__);
     expect_compact("[]", "[]", __LINE__);
+    /* A backslash that ends the text (not JSON the reader accepts) is copied, and nothing after it is read. */
+    expect_compact("\"a\\", "\"a\\", __LINE__);
     /* No room at all. */
     char out[4] = "abc";
     CHECK(apps_json_compact("[]", 2, out, 0) == 0 && strcmp(out, "abc") == 0, "cap 0 wrote '%s'", out);
@@ -2056,6 +2452,7 @@ static int t_fuzz_agreement(lua_State *L) {
     char text[4096], verr[96], perr[96], eerr[96];
     int accepted = 0, rejected = 0, unencodable = 0;
     for (int iteration = 0; iteration < 30000; iteration++) {
+        exact_release();  /* the last iteration's copies: its reader is out of scope */
         const char *base = corpus[fuzz_next() % (sizeof corpus / sizeof corpus[0])];
         size_t len = iteration % 4 == 0 ? strlen(base) : mutate(base, strlen(base), text, sizeof text);
         if (iteration % 4 == 0) {
@@ -2158,10 +2555,11 @@ static void validate16(void *arg) {
     (void)arg;
     char text[16 * (APPS_JSON_MAX_DEPTH + 2)], err[96];
     size_t n = nested_text(text, APPS_JSON_MAX_DEPTH, 2);
-    CHECK(apps_json_validate(text, n, err, sizeof err), "%s", err);
+    /* The entry points themselves, not the exact-size wrappers: this measures the library's frames. */
+    CHECK((apps_json_validate)(text, n, err, sizeof err), "%s", err);
     /* And with an error at the deepest point, which formats its message there. */
     text[n - APPS_JSON_MAX_DEPTH - 1] = 'x';
-    CHECK(!apps_json_validate(text, n, err, sizeof err), "a bad text passed");
+    CHECK(!(apps_json_validate)(text, n, err, sizeof err), "a bad text passed");
 }
 
 static void reader15(void *arg) {
@@ -2169,7 +2567,7 @@ static void reader15(void *arg) {
     char text[16 * (APPS_JSON_MAX_DEPTH + 2)];
     size_t n = nested_text(text, APPS_JSON_MAX_DEPTH - 1, 0);
     apps_jr_t r;
-    apps_jr_init(&r, text, n);
+    (apps_jr_init)(&r, text, n);
     CHECK(apps_jr_array(&r) && apps_jr_next(&r) == 1 && apps_jr_skip(&r) && apps_jr_next(&r) == 0 && apps_jr_end(&r), "%s", r.err);
 }
 
@@ -2227,7 +2625,19 @@ static void *stack_thread(void *unused) {
 
 /* Runs every case on a thread whose stack is exactly STACK_HOST bytes: an mmap'd region above a PROT_NONE
  * page, so overflowing it is a crash, not a silent pass. */
+/* A lazily bound libc function (glibc's PLT) is resolved by its first call, on whatever stack that
+ * call has: at depth 16, strtod, snprintf and strpbrk would add the dynamic linker's frames to
+ * a mark. One call each, here, before any is measured. */
+static NOINLINE_FOR_STACK void warm_up_libc(void) {
+    char buf[32];
+    volatile double sink = strtod("1.5e3", NULL);
+    snprintf(buf, sizeof buf, "%.17g", sink);
+    sink = (double)(strpbrk(buf, ".eE") != NULL) + (double)strlen(buf);
+    (void)sink;
+}
+
 static void stack(void) {
+    warm_up_libc();
     const size_t page = (size_t)sysconf(_SC_PAGESIZE), size = STACK_HOST;
     unsigned char *map = mmap(NULL, page + size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (map == MAP_FAILED) {
@@ -2282,6 +2692,7 @@ int main(int argc, char **argv) {
         {"decode_strings", decode_strings},
         {"decode_valid", decode_valid},
         {"decode_errors", decode_errors},
+        {"decode_prefixes", decode_prefixes},
         {"decode_limits", decode_limits},
         {"encode_roundtrip", encode_roundtrip},
         {"encode_values", encode_values},
@@ -2290,6 +2701,8 @@ int main(int argc, char **argv) {
         {"encode_limits", encode_limits},
         {"encode_large_nested", encode_large_nested},
         {"encode_shared_subtables", encode_shared_subtables},
+        {"encode_scan_work", encode_scan_work},
+        {"clock_checks", clock_checks},
         {"encode_raw", encode_raw},
         {"c_contracts", c_contracts},
         {"validate", validate},
@@ -2317,6 +2730,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (strcmp(argv[1], cases[i].name) == 0) {
             cases[i].run();
+            exact_release();
             CHECK(held == 0, "%s: %zu bytes still held at the end", argv[1], held);
             return failures != 0;
         }

@@ -2364,6 +2364,159 @@ static void call_contract(void) {
     fake_ms = 0;
 }
 
+/* ---- table_slots and charge: for C that loops where no count hook fires ---- */
+
+/* slots(v): apps_vm_table_slots of the first argument, by a positive index, by a negative one with
+ * it on top, and of an index with nothing there. */
+static int slots(lua_State *L) {
+    lua_settop(L, 1);
+    lua_pushinteger(L, (lua_Integer)apps_vm_table_slots(L, 1));
+    lua_pushinteger(L, (lua_Integer)apps_vm_table_slots(L, -2));
+    lua_pushinteger(L, (lua_Integer)apps_vm_table_slots(L, 4));
+    return 3;
+}
+
+/* charge(n): apps_vm_charge(L, n), as a binding that loops in C would call it. */
+static int charge(lua_State *L) {
+    apps_vm_charge(L, (unsigned)luaL_checkinteger(L, 1));
+    return 0;
+}
+
+/* oom_survived(): a request far past the cap, in a protected call of its own that catches the error: the
+ * binding survives, returns, and the VM is out of memory without anything having raised the kill yet.
+ * Returns the status of that call. */
+static int huge_request(lua_State *L) {
+    lua_newuserdatauv(L, 64 * MB, 0);
+    return 0;
+}
+
+static int oom_survived(lua_State *L) {
+    lua_pushcfunction(L, huge_request);
+    lua_pushinteger(L, lua_pcall(L, 0, 0, 0));
+    return 1;
+}
+
+static apps_vm_t *probe_vm_with(size_t cap) {
+    apps_vm_t *vm = new_vm(cap);
+    lua_State *L = apps_vm_lua(vm);
+    lua_pushcfunction(L, slots);
+    lua_setglobal(L, "slots");
+    lua_pushcfunction(L, charge);
+    lua_setglobal(L, "charge");
+    lua_pushcfunction(L, kill_now);
+    lua_setglobal(L, "kill_now");
+    lua_pushcfunction(L, oom_survived);
+    lua_setglobal(L, "oom_survived");
+    return vm;
+}
+
+static void table_slots(void) {
+    apps_vm_t *vm = probe_vm_with(4 * MB);
+    /* What lua_next walks: the array part's allocated size and the hash part's, by any index. */
+    expect_returns(vm, "return slots({})", "number:0, number:0, number:0");
+    expect_returns(vm, "return slots({1, 2, 3})", "number:3, number:3, number:0");
+    expect_returns(vm, "return slots({a = 1, b = 2, c = 3})", "number:4, number:4, number:0");
+    expect_returns(vm, "return slots({1, 2, 3, a = 1})", "number:4, number:4, number:0");
+    /* #t on a table whose last slots are empty moves its alimit (a hint) below its real size, 4097 of 8192: lua_next
+     * walks the real size, and so do the slots. */
+    expect_returns(vm,
+                   "local t = {} for i = 1, 8192 do t[i] = true end for i = 4098, 8192 do t[i] = nil end\n"
+                   "local n = #t return n, slots(t)",
+                   "number:4097, number:8192, number:8192, number:0");
+    /* Grown, then emptied: the slots stay, so a walk costs what the table held. */
+    expect_returns(vm, "local t = {} for i = 1, 8192 do t[i] = true end return slots(t)", "number:8192, number:8192, number:0");
+    expect_returns(vm,
+                   "local t = {} for i = 1, 8192 do t[i] = true end for i = 1, 8191 do t[i] = nil end\n"
+                   "return slots(t)",
+                   "number:8192, number:8192, number:0");
+    expect_returns(vm, "local t = {} for i = 1, 100 do t['k' .. i] = i end return slots(t)", "number:128, number:128, number:0");
+    expect_returns(vm,
+                   "local t = {} for i = 1, 100 do t['k' .. i] = i end for k in pairs(t) do t[k] = nil end\n"
+                   "return (slots(t)), next(t)",
+                   "number:128, nil:nil");
+    /* Anything that isn't a table, including the other collectable values lua_topointer gives an address. */
+    expect_returns(vm, "return slots(nil)", "number:0, number:0, number:0");
+    expect_returns(vm, "return slots(1)", "number:0, number:0, number:0");
+    expect_returns(vm, "return slots(true)", "number:0, number:0, number:0");
+    expect_returns(vm, "return slots('a string that is not short enough to be an interned one, for sure, no way')",
+                   "number:0, number:0, number:0");
+    expect_returns(vm, "return slots(slots)", "number:0, number:0, number:0");
+    expect_returns(vm, "return slots(function() end)", "number:0, number:0, number:0");
+    expect_returns(vm, "return slots(coroutine.create(function() end))", "number:0, number:0, number:0");
+    apps_vm_free(vm);
+}
+
+static void charge_case(void) {
+    char err[512];
+    lua_State *L;
+    int rc;
+
+    /* The lifetime counter takes what is charged, on top of what the hook counts. */
+    apps_vm_t *vm = probe_vm_with(256 * KB);
+    L = apps_vm_lua(vm);
+    uint64_t before = apps_vm_instructions(vm);
+    rc = call(vm, "charge(1500) charge(0) return true", 1, APPS_BUDGET_CALL, err, sizeof err);
+    uint64_t added = apps_vm_instructions(vm) - before;
+    CHECK(rc == APPS_CALL_OK && added >= 1500 && (added - 1500) % 1000 == 0 && lua_toboolean(L, -1),
+          "charge(1500): %s '%s', %llu instructions", call_name(rc), err, (unsigned long long)added);
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+
+    /* Over the call's budget it kills with the budget reason, and what follows doesn't run. */
+    vm = probe_vm_with(256 * KB);
+    L = apps_vm_lua(vm);
+    rc = call(vm, "charge(60000) first = true charge(60000) second = true", 0, 100000, err, sizeof err);
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, BUDGET_MSG("100000")) == 0, "over the budget: %s '%s'", call_name(rc), err);
+    CHECK(raw_global(L, "first") == LUA_TBOOLEAN && raw_global(L, "second") == LUA_TNIL,
+          "a charge within the budget stopped, or the one over it didn't");
+    lua_settop(L, 0);
+    CHECK(apps_vm_dying(vm) && !apps_vm_in_call(vm), "dying %d, in a call %d", apps_vm_dying(vm), apps_vm_in_call(vm));
+    apps_vm_free(vm);
+
+    /* Past APPS_WALL_MS it kills with the wall reason: a charge of 0 is the clock check. */
+    vm = probe_vm_with(256 * KB);
+    L = apps_vm_lua(vm);
+    fake_step = 600;  /* each read of the clock is 600 ms after the one before: the call's start, then each check */
+    rc = call(vm, "charge(0) first = true charge(0) second = true", 0, UINT32_MAX, err, sizeof err);
+    fake_step = 0;
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, WALL_MSG) == 0, "past the clock: %s '%s'", call_name(rc), err);
+    CHECK(raw_global(L, "first") == LUA_TBOOLEAN && raw_global(L, "second") == LUA_TNIL,
+          "the check at 600 ms stopped, or the one at 1200 ms didn't");
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+
+    /* A dying VM raises its kill, with a charge of 0 too: here the kill lands while C code runs. */
+    vm = probe_vm_with(256 * KB);
+    L = apps_vm_lua(vm);
+    rc = call(vm, "kill_now() charge(0) survived = true", 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, "stopped by test") == 0 && raw_global(L, "survived") == LUA_TNIL,
+          "dying: %s '%s'", call_name(rc), err);
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+
+    /* Out of memory, with the kill not raised yet, is a dying VM too: a charge of 0 raises the NOMEM kill. */
+    vm = probe_vm_with(256 * KB);
+    L = apps_vm_lua(vm);
+    rc = call(vm, "local status = oom_survived() charge(0) survived = true", 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, NOMEM_MSG("256")) == 0 && raw_global(L, "survived") == LUA_TNIL,
+          "out of memory: %s '%s'", call_name(rc), err);
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+
+    /* Outside apps_vm_call no budget is in force: the charge counts, and nothing is killed. */
+    vm = probe_vm_with(256 * KB);
+    L = apps_vm_lua(vm);
+    before = apps_vm_instructions(vm);
+    lua_pushcfunction(L, charge);
+    lua_pushinteger(L, 3000000);
+    rc = lua_pcall(L, 1, 0, 0);
+    CHECK(rc == LUA_OK && !apps_vm_dying(vm) && apps_vm_instructions(vm) - before == 3000000,
+          "outside a call: status %d, dying %d, %llu instructions", rc, apps_vm_dying(vm),
+          (unsigned long long)(apps_vm_instructions(vm) - before));
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+}
+
 /* ---- c_stack (the Task 5 rulings) ----
  *
  * The recursion that goes deepest in C, each case to Lua's C-call limit, on a thread
@@ -2564,6 +2717,8 @@ int main(int argc, char **argv) {
         {"deep_recursion", deep_recursion},
         {"traceback", traceback},
         {"call_contract", call_contract},
+        {"table_slots", table_slots},
+        {"charge", charge_case},
         {"c_stack", c_stack},
     };
     if (argc != 2) {

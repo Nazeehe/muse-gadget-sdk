@@ -76,6 +76,11 @@ class MuseAppsJsonTest(unittest.TestCase):
         # the Lua binding: positions, end of input, ASCII-only text, UTF-8 by RFC 3629.
         self.run_case("decode_errors")
 
+    def test_decode_reads_no_further_than_len(self):
+        # A text is its first len bytes, whatever follows in memory: validate, push and the reader's skip
+        # agree on prefixes the next byte would change ("12" with len 1 is 1), in place and from an exact copy.
+        self.run_case("decode_prefixes")
+
     def test_decode_limits_both_ways(self):
         # Depth 16 passes and 17 fails, 32768 bytes pass the size check and 32769 fail, for json.decode,
         # apps_json_validate, apps_json_push and the reader.
@@ -105,6 +110,16 @@ class MuseAppsJsonTest(unittest.TestCase):
     def test_encode_shared_subtables_bounded(self):
         # Ruling R6.8: about 4^15 visits of one subtable end in the memory cap, not in a spin.
         self.run_case("encode_shared_subtables", timeout=10)
+
+    def test_encode_scan_work_is_charged_to_the_budget(self):
+        # Ruling R6.8, amended: lua_next walks every slot a table was ever grown to, empty or not, twice per
+        # visit, so each visit is charged slots + 1 instructions. An emptied table shared through nesting is
+        # killed by the budget, fast; honest work isn't.
+        self.run_case("encode_scan_work", timeout=20)
+
+    def test_decode_and_encode_check_the_clock_in_one_big_table(self):
+        # A value costs microseconds on the S3, so every 256 of them in a loop call apps_vm_charge(L, 0).
+        self.run_case("clock_checks", timeout=20)
 
     def test_encode_reads_tables_raw(self):
         # Ruling R6.7: no __index, __len, __pairs or __tostring runs inside json.encode.

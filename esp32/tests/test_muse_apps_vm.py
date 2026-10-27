@@ -185,6 +185,15 @@ class MuseAppsVmTest(unittest.TestCase):
     def test_traceback_has_app_frames(self):
         self.run_case("traceback")
 
+    def test_table_slots_are_what_lua_next_walks(self):
+        # apps_vm_table_slots: the array and hash slots of a table, which stay after it is emptied.
+        self.run_case("table_slots", timeout=10)
+
+    def test_charge_counts_and_kills(self):
+        # apps_vm_charge, for a C function that loops where no count hook fires: it counts, kills a call
+        # over its budget or APPS_WALL_MS, raises for a dying VM, and does nothing outside a call.
+        self.run_case("charge", timeout=10)
+
     def test_call_contract(self):
         # Stack and err on every outcome, in_call and its start, per-call budgets, a call
         # inside a call, apps_vm_check.

@@ -31,7 +31,9 @@
  * - No library call loops in C without allocating, since count hooks never fire
  *   there: rep of an empty string returns "" at once, and table's concat, move,
  *   insert, remove and sort refuse to walk more elements than the heap could hold
- *   (mem_limit / 16: a range or a __len with nothing behind it).
+ *   (mem_limit / 16: a range or a __len with nothing behind it). A C function that
+ *   walks without allocating anyway charges the walk to the call's budget with
+ *   apps_vm_charge (json.encode: the slots lua_next visits, empty ones too).
  * Globals are strict: reading an undefined one raises "unknown global 'x'", with a
  * "did you mean" when a name is near, or advice for a library left out (io, debug,
  * load...); assigning one defines it. Strictness lives in the table's __index, so C
@@ -152,6 +154,23 @@ bool apps_vm_dying(const apps_vm_t *vm);
  * of memory, it raises the kill, so a binding starts no work for a dying app. It pushes one
  * value before raising, which the slots Lua guarantees a C function hold. */
 void apps_vm_check(lua_State *L);
+/*
+ * Charges n VM instructions to the call and to the VM's lifetime, as the count hook does for the
+ * instructions it counts, and then checks as the hook does: inside apps_vm_call, a call that is
+ * over its budget or over APPS_WALL_MS is killed; at any time, a dying VM (out of memory
+ * included) raises its kill. For a C function that loops where no count hook fires: it charges
+ * the work it is about to do, in the VM's own unit (json.encode charges the slots of each table
+ * it walks, empty or not), and calls with 0 now and then in a long loop, so the clock is read
+ * there too. It raises the kill as apps_vm_check does, so it needs one free stack slot, and
+ * otherwise returns.
+ */
+void apps_vm_charge(lua_State *L, unsigned n);
+/*
+ * The slots lua_next walks in the table at idx: the allocated size of its array part plus that of
+ * its hash part. They stay when the table is emptied, so a walk costs what the table once held,
+ * not what it holds now. 0 for a value that isn't a table. It reads the pinned Lua 5.4.9's Table.
+ */
+unsigned apps_vm_table_slots(lua_State *L, int idx);
 /* Whether apps_vm_call is running, and since when (now_ms() when the outermost call
  * began). Any task: the supervisor reads them to spot a hung app. Read in_call first,
  * then the start: apps_vm_call stores the start before it sets in_call, so a reader that

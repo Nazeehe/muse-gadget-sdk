@@ -32,15 +32,17 @@
 #include "lualib.h"
 
 /* Lua 5.4.9 internals, pinned (CONFIG_MUSE_APPS builds only this copy): the compiled prototype
- * tree and OP_TBC, to refuse a to-be-closed variable at load (apps_vm_load); and the collector
- * flags gcstopem and gcemergency, to tell a refusal Lua will retry from one it won't (vm_alloc). */
+ * tree and OP_TBC, to refuse a to-be-closed variable at load (apps_vm_load); the collector
+ * flags gcstopem and gcemergency, to tell a refusal Lua will retry from one it won't (vm_alloc);
+ * and a table's array and hash sizes, for the slots lua_next walks (apps_vm_table_slots). */
 #include "ldebug.h"    /* luaG_getfuncline */
-#include "lobject.h"   /* Proto, getproto, s2v */
+#include "lobject.h"   /* Proto, Table, getproto, s2v */
 #include "lopcodes.h"  /* OP_TBC, GET_OPCODE */
 #include "lstate.h"    /* lua_State::top, G(), global_State::gcstopem/gcemergency */
+#include "ltable.h"    /* luaH_realasize, allocsizenode */
 
 #if LUA_VERSION_RELEASE_NUM != 50409
-#error "apps_vm.c reads Lua 5.4.9 internals (Proto, OP_TBC, gcstopem, gcemergency); re-check them before upgrading"
+#error "apps_vm.c reads Lua 5.4.9 internals (Proto, OP_TBC, gcstopem, gcemergency, Table sizes); re-check them before upgrading"
 #endif
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
@@ -1371,6 +1373,18 @@ void apps_vm_check(lua_State *L) {
     if (dying(vm_of(L))) {
         raise_kill_here(L);
     }
+}
+
+void apps_vm_charge(lua_State *L, unsigned n) {
+    charge(L, n);
+}
+
+unsigned apps_vm_table_slots(lua_State *L, int idx) {
+    if (lua_type(L, idx) != LUA_TTABLE) {  /* lua_topointer gives an address for any collectable value */
+        return 0;
+    }
+    const Table *t = lua_topointer(L, idx);
+    return luaH_realasize(t) + (unsigned)allocsizenode(t);
 }
 
 bool apps_vm_in_call(const apps_vm_t *vm) {

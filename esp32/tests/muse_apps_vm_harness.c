@@ -1431,7 +1431,8 @@ static int call(apps_vm_t *vm, const char *src, int nresults, uint32_t budget, c
  * survived where the value of what should have stopped it would come from: apps_vm_call
  * reports a kill that landed while a call ran even when something swallowed it, so the
  * status alone can't show a kill that was swallowed for a few instructions. */
-static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src, apps_call_t want, const char *reason) {
+static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src, apps_call_t want, const char *reason,
+                          const char *seen) {
     apps_vm_t *vm = new_vm(cap);
     lua_State *L = apps_vm_lua(vm);
     char err[512] = "";
@@ -1440,6 +1441,12 @@ static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src
              call_name((int)want), reason, call_name(rc), err);
     CHECK_AT(line, lua_gettop(L) == 0, "%s\n  left %d values on the stack", src, lua_gettop(L));
     CHECK_AT(line, raw_global(L, "survived") == LUA_TNIL, "%s\n  ran on after it should have stopped", src);
+    if (seen != NULL) {
+        /* A generic for's closing value ran during the unwind and saw the error, but couldn't
+         * keep it: seen is the error Lua closed the value with. */
+        bool same = raw_global(L, "seen") == LUA_TSTRING && strcmp(lua_tostring(L, -1), seen) == 0;
+        CHECK_AT(line, same, "%s\n  seen is %s, not '%s'", src, top_text(L), seen);
+    }
     lua_settop(L, 0);
     CHECK_AT(line, apps_vm_dying(vm) && !apps_vm_in_call(vm), "%s\n  dying %d, in a call %d", src, apps_vm_dying(vm),
              apps_vm_in_call(vm));
@@ -1447,8 +1454,11 @@ static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src
     apps_vm_free(vm);
 }
 #define expect_killed(src) \
-    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_KILLED, BUDGET_MSG("2000000"))
-#define expect_nomem(src) expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_NOMEM, NOMEM_MSG("256"))
+    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_KILLED, BUDGET_MSG("2000000"), NULL)
+#define expect_nomem(src) expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_NOMEM, NOMEM_MSG("256"), NULL)
+/* A generic for's closing value saw the out-of-memory error during the unwind and couldn't keep it. */
+#define expect_nomem_seen(src) \
+    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_NOMEM, NOMEM_MSG("256"), "not enough memory")
 
 /* src under apps_vm_call returns exactly the values describe() shows as want. */
 static void expect_returns_at(int line, apps_vm_t *vm, const char *src, const char *want) {
@@ -1623,11 +1633,18 @@ static void short_coroutines(void) {
     /* A tree of them: the budget stops it, and so does the clock, which creating one reads. */
     expect_killed(TREE);
     fake_step = 600;
-    expect_end_at(__LINE__, 256 * KB, UINT32_MAX, TREE, APPS_CALL_KILLED, WALL_MSG);
+    expect_end_at(__LINE__, 256 * KB, UINT32_MAX, TREE, APPS_CALL_KILLED, WALL_MSG, NULL);
     fake_step = 0;
 }
 
 /* ---- kill_not_swallowed ---- */
+
+/* A generic for's fourth value is its closing value: a to-be-closed slot made at run time by
+ * OP_TFORPREP, with no OP_TBC, so the chunk loads. Its __close is the one piece of app code Lua
+ * still runs during an unwind. FOR_IT is an iterator that yields one value; FOR_CLOSE(fn) opens a
+ * loop whose closing value runs fn when the block unwinds, with the hook on. */
+#define FOR_IT "local function it() return 1 end\n"
+#define FOR_CLOSE(fn) "for _ in it, nil, nil, setmetatable({}, {__close = " fn "}) do"
 
 static void kill_not_swallowed(void) {
     /* The brief's five, then each with survived where its value would go. */
@@ -1669,14 +1686,54 @@ static void kill_not_swallowed(void) {
     expect_killed("pcall(string.format, '%s', setmetatable({}, {__tostring = function() while true do end end}))\n"
                   "survived = true");
     expect_killed("pcall(table.sort, {3, 2, 1}, function() while true do end end) survived = true");
-    /* A __close handler would be the one piece of app code Lua runs while a kill unwinds, where
-     * it could try to swallow the kill. <close> is refused at load (tbc_refused) and __gc is
-     * out, so there is no such handler to reach. */
+
+    /* A generic for's closing value is the one piece of app code Lua still runs while a kill
+     * unwinds (<close> is refused at load, __gc is out). It can't keep the kill either.
+     * A closing value killed by its own loop, closed alone and inside pcall: */
+    expect_killed(FOR_IT
+                  "local co = coroutine.create(function()\n"
+                  "  " FOR_CLOSE("function() while true do end end") " coroutine.yield() end\n"
+                  "end)\n"
+                  "coroutine.resume(co) coroutine.close(co) survived = true");
+    expect_killed(FOR_IT
+                  "local co = coroutine.create(function()\n"
+                  "  " FOR_CLOSE("function() while true do end end") " coroutine.yield() end\n"
+                  "end)\n"
+                  "coroutine.resume(co) pcall(coroutine.close, co) survived = true");
+    /* The hook killed this coroutine, so its hooks are off: wrap must not close it, or the
+     * closing value would spin unstopped (the test's timeout). */
+    expect_killed(FOR_IT
+                  "local f = coroutine.wrap(function()\n"
+                  "  " FOR_CLOSE("function() while true do end end") " while true do end end\n"
+                  "end)\n"
+                  "pcall(f) survived = true");
+    /* A closing value replaces the kill with its own error, at the top and inside pcall, or yields
+     * out of the unwind in a coroutine. */
+    expect_killed(FOR_IT "do " FOR_CLOSE("function() error('replaced') end") " while true do end end end\nsurvived = true");
+    expect_killed(FOR_IT "pcall(function()\n"
+                         "  " FOR_CLOSE("function() error('replaced') end") " while true do end end\n"
+                         "end)\nsurvived = true");
+    expect_killed(FOR_IT "local co = coroutine.wrap(function()\n"
+                         "  pcall(function() " FOR_CLOSE("function() coroutine.yield('escaped') end") " while true do end end end)\n"
+                         "  survived = true\n"
+                         "end)\nco() survived = true");
+    /* Closing values Lua runs while a kill unwinds stop before their first instruction, at the
+     * top, inside pcall, on a coroutine that passes the kill up, and through xpcall's handler. */
+    expect_killed(FOR_IT "do " FOR_CLOSE("function() survived = true end") " while true do end end end");
+    expect_killed(FOR_IT "pcall(function() " FOR_CLOSE("function() survived = true end") " while true do end end end)");
+    expect_killed(FOR_IT "local co = coroutine.wrap(function()\n"
+                         "  " FOR_CLOSE("function() survived = true end") " pcall(function() while true do end end) end\n"
+                         "end)\n"
+                         "" FOR_CLOSE("function() survived = true end") " co() end");
+    expect_killed(FOR_IT "xpcall(function() " FOR_CLOSE("function() error('replaced') end") " while true do end end end,\n"
+                         "       function(e) survived = true return e end)\nsurvived = true");
 }
 
 /* ---- memory_kill ---- */
 
 #define HUGE_REP "string.rep('x', 1 << 24)"
+/* A closing value that notes the error it is closed with, then raises another in its place. */
+#define FOR_SWALLOW "function(_, e) seen = e error('swallowed', 0) end"
 
 /* refuse_next_growth(): the allocator refuses the next request to grow, once. */
 static int refuse_next_growth(lua_State *L) {
@@ -1707,14 +1764,45 @@ static void memory_kill(void) {
     expect_nomem("local co = coroutine.create(function() local s = " HUGE_REP " end) coroutine.resume(co) survived = true");
     /* The cap in the reason is the VM's. */
     expect_end_at(__LINE__, 100 * KB, APPS_BUDGET_CALL, "return string.rep('x', 1 << 20)", APPS_CALL_NOMEM,
-                  NOMEM_MSG("100"));
+                  NOMEM_MSG("100"), NULL);
     /* Lua's own message, raised as is, is a memory error too (lapi.c lua_error): the app only
      * stops itself. */
     expect_nomem("pcall(error, 'not enough memory', 0) survived = true");
 
-    /* Out of memory is sticky (ruling A2, amended), and can't be swallowed: no app code runs
-     * while the error unwinds, since <close> is refused at load (tbc_refused) and __gc is out.
-     * What a C binding survives is still caught, below. */
+    /* Out of memory is sticky (ruling A2, amended) and can't be swallowed, even by the one piece
+     * of app code Lua still runs during an unwind: a generic for's closing value. It sees the
+     * error (seen) but can't keep it. At the top, in pcall, in a coroutine, round a loop, and
+     * through xpcall (whose handler isn't called for a memory error). */
+    expect_nomem_seen(FOR_IT "pcall(function() " FOR_CLOSE(FOR_SWALLOW) " local s = " HUGE_REP " end end) survived = true");
+    expect_nomem_seen(FOR_IT FOR_CLOSE(FOR_SWALLOW) " local s = " HUGE_REP " end");
+    expect_nomem_seen(FOR_IT "local co = coroutine.wrap(function()\n"
+                             "  pcall(function() " FOR_CLOSE(FOR_SWALLOW) " local s = " HUGE_REP " end end) survived = true\n"
+                             "end)\n"
+                             "co() survived = true");
+    expect_nomem_seen(FOR_IT "while true do\n"
+                             "  pcall(function() " FOR_CLOSE(FOR_SWALLOW) " local t = {} for i = 1, 1e7 do t[i] = i end end end)\n"
+                             "  survived = true\n"
+                             "end");
+    expect_nomem_seen(FOR_IT "xpcall(function() " FOR_CLOSE(FOR_SWALLOW) " local s = " HUGE_REP " end end,\n"
+                             "       function(e) survived = e return e end)\n"
+                             "survived = true");
+    /* A closing value that runs on is stopped by the hook within 1000 instructions; one that
+     * calls a binding is stopped there, by apps_vm_check. */
+    expect_nomem_seen(FOR_IT "pcall(function()\n"
+                             "  " FOR_CLOSE("function(_, e) seen = e while true do end end") " local s = " HUGE_REP " end\n"
+                             "end)\n"
+                             "survived = true");
+    expect_nomem_seen(FOR_IT "pcall(function()\n"
+                             "  " FOR_CLOSE("function(_, e) seen = e survived = ('a,b'):split(',') end") " local s = " HUGE_REP " end\n"
+                             "end)\n"
+                             "survived = true");
+    /* The resizebox path (luaL_Buffer calls the allocator directly and never retries): string.rep
+     * at the cap, with a closing value that repeats the identical string.rep. Even if that
+     * identical request would now fit, no emergency collection ran, so the refusal stays sticky. */
+    expect_nomem_seen(FOR_IT "pcall(function()\n"
+                             "  " FOR_CLOSE("function(_, e) seen = e local s = " HUGE_REP " end") " local s = " HUGE_REP " end\n"
+                             "end)\n"
+                             "survived = true");
 
     /* A coroutine's stack that can't grow for resume's arguments: lua_checkstack fails, which
      * would be a catchable "too many arguments to resume". The main thread's stack has grown for
@@ -1814,6 +1902,54 @@ static void churn(void) {
     apps_vm_free(vm);
 }
 
+/* ---- stack_growth_oom: the re-reviewer's generic-for stack-growth swallow ---- */
+
+/* A deep recursion where each level enters a generic for whose shared closing value swallows:
+ * a stack growth is refused deep in, the memory error unwinds through every closer, and each
+ * tries to keep it (and succeeds, before the fix, when its own identical stack growth is granted
+ * by the GC that the close triggered). vm_alloc now models Lua's retry exactly, so a refusal Lua
+ * never retries (stack growth runs under gcstopem) is final at once. The cap at which the growth
+ * is refused shifts with the harness's heap baseline, so sweep a window: wherever a refusal
+ * happens, the call must end NOMEM with survived unset. */
+static void stack_growth_oom(void) {
+    static const char src[] =
+        "local sw = setmetatable({}, {__close = function(_, e) error('sw', 0) end})\n"
+        "local live = {}\n"
+        "local D = 156\n"
+        "local function it() return 1 end\n"
+        "local function work(n)\n"
+        "  for _ in it, nil, nil, sw do\n"
+        "    local p0\n"
+        "    if n < D then return work(n + 1) + 1 end\n"
+        "    for i = 1, 264 do live[#live + 1] = i end\n"
+        "    local z = 0 for i = 1, 2500 do z = z + i end\n"
+        "    return 0\n"
+        "  end\n"
+        "end\n"
+        "pcall(work, 1)\n"
+        "survived = true\n";
+    int oom_caps = 0;
+    for (size_t kb = 40; kb <= 90; kb++) {
+        apps_vm_t *vm = new_vm(kb * KB);
+        if (vm == NULL) {
+            continue;
+        }
+        lua_State *L = apps_vm_lua(vm);
+        char err[512] = "";
+        int rc = call(vm, src, 0, UINT32_MAX, err, sizeof err);
+        bool refused = apps_vm_mem_refusals(vm) > 0;
+        bool survived = raw_global(L, "survived") != LUA_TNIL;
+        lua_settop(L, 0);
+        if (refused) {
+            oom_caps++;
+            CHECK(rc == APPS_CALL_NOMEM && !survived, "cap %zu KB: a stack-growth refusal was swallowed: %s survived=%d",
+                  kb, call_name(rc), survived);
+        }
+        apps_vm_free(vm);
+    }
+    CHECK(oom_caps > 0, "no cap in 40-90 KB hit a refusal: the regression didn't exercise out of memory");
+}
+
 /* ---- external_kill ---- */
 
 static void *kill_after_50_ms(void *vm) {
@@ -1883,6 +2019,15 @@ static void external_kill(void) {
     expect_killed_from_c("coroutine.wrap(kill_now)() survived = true");
     expect_killed_from_c("local co = coroutine.create(function() coroutine.yield() end)\n"
                          "coroutine.resume(co) kill_now() coroutine.close(co) survived = true");
+    /* A generic for's closing value in a suspended coroutine, closed after a kill: sandbox_close
+     * raises at apps_vm_check before lua_closethread, so the closing value never runs. Without that
+     * check, close would run it (it sets survived) before the hook could stop it: this is where
+     * banning <close> alone isn't enough, since a for-closer has no OP_TBC. */
+    expect_killed_from_c(FOR_IT
+                         "local co = coroutine.create(function()\n"
+                         "  " FOR_CLOSE("function() survived = true end") " coroutine.yield() end\n"
+                         "end)\n"
+                         "coroutine.resume(co) kill_now() coroutine.close(co)");
     /* Every binding checks first (X8): split, trim and coroutine.create too. */
     expect_killed_from_c("kill_now() survived = ('a,b'):split(',')");
     expect_killed_from_c("kill_now() survived = ('  a '):trim()");
@@ -1946,8 +2091,9 @@ static void yield_through_pcall(void) {
                    "local f = coroutine.wrap(function() error('inside') end)\n"
                    "local ok, e = pcall(function() f() end) return ok, e",
                    "boolean:false, string:main.lua:2: main.lua:1: inside");
-    /* coroutine.close of a plain suspended coroutine: it goes dead, and a dead one is a no-op.
-     * (A <close> handler run by close is out: <close> is refused at load.) */
+    /* coroutine.close of a plain suspended coroutine (no closing value pending): it goes dead,
+     * and a dead one is a no-op. (A closing value would run during the close; see stack_growth_oom
+     * and the close-after-kill case in external_kill.) */
     expect_returns(vm,
                    "local co = coroutine.create(function() coroutine.yield() end)\n"
                    "coroutine.resume(co)\n"
@@ -2411,6 +2557,7 @@ int main(int argc, char **argv) {
         {"short_coroutines", short_coroutines},
         {"kill_not_swallowed", kill_not_swallowed},
         {"memory_kill", memory_kill},
+        {"stack_growth_oom", stack_growth_oom},
         {"churn", churn},
         {"external_kill", external_kill},
         {"yield_through_pcall", yield_through_pcall},

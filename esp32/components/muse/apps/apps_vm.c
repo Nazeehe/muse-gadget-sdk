@@ -31,13 +31,17 @@
 #include "lauxlib.h"
 #include "lualib.h"
 
-/* Lua 5.4.9 internals, to refuse a chunk that declares a to-be-closed variable (apps_vm_load):
- * the compiled prototype tree and OP_TBC. The vendored Lua is pinned (CONFIG_MUSE_APPS builds
- * only this copy), so the Proto layout, the opcode and luaG_getfuncline are fixed. */
+/* Lua 5.4.9 internals, pinned (CONFIG_MUSE_APPS builds only this copy): the compiled prototype
+ * tree and OP_TBC, to refuse a to-be-closed variable at load (apps_vm_load); and the collector
+ * flags gcstopem and gcemergency, to tell a refusal Lua will retry from one it won't (vm_alloc). */
 #include "ldebug.h"    /* luaG_getfuncline */
 #include "lobject.h"   /* Proto, getproto, s2v */
 #include "lopcodes.h"  /* OP_TBC, GET_OPCODE */
-#include "lstate.h"    /* lua_State::top */
+#include "lstate.h"    /* lua_State::top, G(), global_State::gcstopem/gcemergency */
+
+#if LUA_VERSION_RELEASE_NUM != 50409
+#error "apps_vm.c reads Lua 5.4.9 internals (Proto, OP_TBC, gcstopem, gcemergency); re-check them before upgrading"
+#endif
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -55,9 +59,10 @@ struct apps_vm {
     size_t mem_refusals;  /* requests answered with NULL */
 
     /* Out of memory (vm_alloc). Only the task running the VM touches these. */
-    bool oom;                     /* a refusal no retry answered */
-    bool oom_retry;               /* the last request was refused; the next may be Lua's retry */
-    void *oom_ptr;                /* that request */
+    bool oom;                     /* a refusal Lua will not, or did not, retry: final */
+    bool oom_retry;               /* a refusal is pending, waiting for Lua's identical retry */
+    bool oom_gc_ran;              /* an emergency collection ran since, so a retry may now pass */
+    void *oom_ptr;                /* the pending refusal's request */
     size_t oom_osize, oom_nsize;
 
     /* Only the task running the VM touches these. */
@@ -151,37 +156,55 @@ static bool contains(const char *s, size_t n, const char *what) {
 
 /* Lua's allocator. When ptr is NULL, osize is the new object's type, not a size.
  *
- * Past the cap, only NULL: an allocator must never raise. Lua retries a refused request at
- * once, after an emergency collection that only frees (lmem.c tryagain), so the next request,
- * when it is the same, is that retry. A refusal no retry answers is the app running out of
- * memory, whatever Lua makes of it: a LUA_ERRMEM that a __close handler may replace with an
- * error of its own, or nothing (a string table that can't grow, a lua_checkstack that fails).
- * It stays pending for good, and each check turns it into the kill (ruling A2, amended). */
+ * Past the cap, only NULL: an allocator must never raise. The app is out of memory when a
+ * refusal is one Lua won't turn into a working allocation, and then each check makes it the kill
+ * (ruling A2, amended). Lua's one retry is modelled exactly (lmem.c), so no later allocation can
+ * clear a refusal Lua would never have retried, which is how a generic for's closing value or a
+ * luaL_Buffer could otherwise run during the unwind and swallow the error:
+ * - A refusal under gcstopem is final at once. Lua's cantryagain needs !gcstopem, and a stack
+ *   reallocation (ldo.c) and a lua_checkstack set gcstopem, so Lua never retries those.
+ * - Any other refusal is pending. Lua retries it only through tryagain, which first runs an
+ *   emergency collection (luaC_fullgc(L, 1), frees seen with gcemergency set) and then repeats
+ *   the identical request. So a pending refusal clears only when an emergency collection has run
+ *   since and the next request is identical; any other next request leaves it unanswered, final.
+ *   A luaL_Buffer resizebox or any direct allocator call never retries, so a coincidentally
+ *   identical later request can't clear it without that collection.
+ * G(vm->L) is read only once vm->L exists; lua_newstate allocates through here before it does. */
 static void *vm_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
     apps_vm_t *vm = ud;
     size_t old = ptr != NULL ? osize : 0;
+    bool emergency = vm->L != NULL && G(vm->L)->gcemergency;
     if (nsize == 0) {
+        if (emergency) {
+            vm->oom_gc_ran = true;  /* the collection before Lua's retry (lmem.c tryagain) */
+        }
         if (ptr != NULL) {
             vm->cfg.free_fn(ptr);
             vm->mem_used -= old;
         }
         return NULL;
     }
-    bool retry = vm->oom_retry && ptr == vm->oom_ptr && osize == vm->oom_osize && nsize == vm->oom_nsize;
-    if (vm->oom_retry && !retry) {
-        vm->oom = true;  /* the refusal before wasn't retried */
+    bool retry = vm->oom_retry && vm->oom_gc_ran && ptr == vm->oom_ptr && osize == vm->oom_osize &&
+                 nsize == vm->oom_nsize;
+    if (vm->oom_retry && !retry && !emergency) {
+        vm->oom = true;  /* the pending refusal was never Lua's identical post-collection retry */
     }
-    vm->oom_retry = false;
+    if (!emergency) {
+        vm->oom_retry = false;
+        vm->oom_gc_ran = false;
+    }
     void *block = NULL;
     if (nsize <= old || nsize - old <= vm->cfg.mem_limit - vm->mem_used) {
         block = vm->cfg.realloc_fn(ptr, nsize);
     }
     if (block == NULL) {
         vm->mem_refusals++;
-        if (retry) {
-            vm->oom = true;  /* refused again */
-        } else {
+        bool final = retry || (vm->L != NULL && G(vm->L)->gcstopem);
+        if (final) {
+            vm->oom = true;  /* a retry that failed again, or a refusal Lua won't retry */
+        } else if (!emergency) {
             vm->oom_retry = true;
+            vm->oom_gc_ran = false;
             vm->oom_ptr = ptr;
             vm->oom_osize = osize;
             vm->oom_nsize = nsize;
@@ -1191,11 +1214,13 @@ lua_State *apps_vm_lua(apps_vm_t *vm) {
     return vm->L;
 }
 
-/* Whether any prototype in the tree rooted at p compiles a to-be-closed variable (OP_TBC),
- * and the source line of the earliest one. A <close> variable runs app code (its __close) when
- * a block or function unwinds, with hooks off, past any budget; with it and __gc both gone, no
- * app code runs during an unwind, so a kill or running out of memory can't be swallowed there.
- * The chunk is small (one app file) and this runs once at load, so walking every opcode is cheap. */
+/* Whether any prototype in the tree rooted at p compiles a to-be-closed variable (OP_TBC), and
+ * the source line of the earliest one. A <close> variable's __close runs app code when a block or
+ * function unwinds, so it is refused at load. This doesn't catch a generic for's closing value,
+ * which becomes a to-be-closed slot at run time (OP_TFORPREP) with no OP_TBC and so still runs
+ * during an unwind; out of memory is final before it does, though, and the hook bounds it (see
+ * vm_alloc and apps_vm.h). The chunk is small (one app file) and this runs once at load, so
+ * walking every opcode is cheap. */
 static bool proto_has_tbc(const Proto *p, int *line) {
     bool found = false;
     for (int pc = 0; pc < p->sizecode; pc++) {

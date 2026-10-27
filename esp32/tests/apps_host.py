@@ -149,11 +149,12 @@ def _define(define: str) -> str:
 
 def build(name: str, sources: Sequence[str | Path], tmp: str | Path, *,
           include_dirs: Sequence[str | Path] = (), defines: Sequence[str] = (),
-          sanitize: bool = True) -> Path:
+          lua_extra_defines: Sequence[str] = (), sanitize: bool = True) -> Path:
     """Compiles and links `sources` into tmp/name, and returns that path.
 
-    Lua's own files (components/lua/src) get the device's options and defines
-    and no warnings: a harness lists them from lua_sources(). The others get
+    Lua's own files (components/lua/src) get the device's options and defines,
+    lua_extra_defines (NAME or NAME=VALUE, for example LUA_USE_APICHECK) and no
+    warnings: a harness lists them from lua_sources(). The others get
     include_dirs, defines (NAME or NAME=VALUE) and -Wall -Wextra -Werror
     -std=c11 -O1 -g. Every file gets -D_GNU_SOURCE and -pthread, as the other
     host tests do, and a fixed string-hash seed, so tables iterate the same on
@@ -164,7 +165,7 @@ def build(name: str, sources: Sequence[str | Path], tmp: str | Path, *,
     cmd, tmp = cc(), Path(tmp)
     san, leaks = _probe(tmp) if sanitize else ([], False)
     common = [*cmd, "-D_GNU_SOURCE", "-pthread", "-Dluai_makeseed(L)=0x5eedu", *san]
-    lua_flags = [*common, *lua_options(), *(_define(d) for d in lua_defines())]
+    lua_flags = [*common, *lua_options(), *(_define(d) for d in [*lua_defines(), *lua_extra_defines])]
     c_flags = [*common, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1", "-g",
                *(f"-I{d}" for d in include_dirs), *(_define(d) for d in defines)]
 

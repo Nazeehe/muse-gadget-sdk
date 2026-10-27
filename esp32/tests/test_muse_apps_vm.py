@@ -138,6 +138,11 @@ class MuseAppsVmTest(unittest.TestCase):
     def test_wall_clock_backstop(self):
         self.run_case("wall_clock", timeout=10)
 
+    def test_short_coroutines_are_counted(self):
+        # A coroutine that runs fewer than 1000 instructions never reaches the hook, so creating
+        # one counts as 1000. Without that, the tree in this case runs for minutes.
+        self.run_case("short_coroutines", timeout=10)
+
     def test_kill_not_swallowed(self):
         self.run_case("kill_not_swallowed", timeout=30)
 

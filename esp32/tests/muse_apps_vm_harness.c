@@ -76,10 +76,15 @@ typedef union {
 
 static size_t held;            /* bytes allocated and not freed */
 static long grants_left = -1;  /* growth requests to grant before refusing all; -1: no limit */
+static bool refuse_next;       /* refuse the next growth request, once */
 
 static void *count_realloc(void *ptr, size_t n) {
     block_t *b = ptr != NULL ? (block_t *)ptr - 1 : NULL;
     size_t old = b != NULL ? b->size : 0;
+    if (n > old && refuse_next) {
+        refuse_next = false;
+        return NULL;
+    }
     if (n > old && grants_left >= 0) {
         if (grants_left == 0) {
             return NULL;
@@ -1136,12 +1141,21 @@ static void allocator(void) {
           apps_vm_mem_used(vm), own);
     lua_settop(L, 0);
 
-    /* The state carries on after a refusal. */
-    expect_ints(vm, "local t = {} for i = 1, 1000 do t[i] = i end return #t", 1000);
+    /* No retry answered that refusal, so the app is out of memory for good (ruling A2,
+     * amended): the next call runs nothing. Lua's state itself carries on: it collects, and
+     * the accounting stays exact. */
+    CHECK(apps_vm_load(vm, "main.lua", "survived = true", 15, err, sizeof err), "%s", err);
+    apps_call_t status = apps_vm_call(vm, 0, 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(status == APPS_CALL_NOMEM && raw_global(L, "survived") == LUA_TNIL, "after the refusal: status %d '%s'",
+          (int)status, err);
+    lua_settop(L, 0);
     lua_gc(L, LUA_GCCOLLECT);
     CHECK(held - apps_vm_mem_used(vm) == own, "accounting drifted after a collection");
+    apps_vm_free(vm);
 
     /* A table bomb ends in LUA_ERRMEM too, inside the cap. */
+    vm = new_vm(cap);
+    L = apps_vm_lua(vm);
     rc = run(vm, "local t = {} for i = 1, 1e7 do t[i] = i end", 0, err, sizeof err);
     CHECK(rc == LUA_ERRMEM, "table bomb: rc=%d %s", rc, rc == -1 ? err : top_text(L));
     CHECK(apps_vm_mem_peak(vm) <= cap, "peak %zu over the %zu cap", apps_vm_mem_peak(vm), cap);
@@ -1417,23 +1431,32 @@ static int call(apps_vm_t *vm, const char *src, int nresults, uint32_t budget, c
  * survived where the value of what should have stopped it would come from: apps_vm_call
  * reports a kill that landed while a call ran even when something swallowed it, so the
  * status alone can't show a kill that was swallowed for a few instructions. */
-static void expect_end_at(int line, size_t cap, const char *src, apps_call_t want, const char *reason) {
+static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src, apps_call_t want, const char *reason,
+                          const char *seen) {
     apps_vm_t *vm = new_vm(cap);
     lua_State *L = apps_vm_lua(vm);
     char err[512] = "";
-    int rc = call(vm, src, LUA_MULTRET, APPS_BUDGET_CALL, err, sizeof err);
+    int rc = call(vm, src, LUA_MULTRET, budget, err, sizeof err);
     CHECK_AT(line, rc == (int)want && strcmp(err, reason) == 0, "%s\n  want %s '%s'\n  got  %s '%s'", src,
              call_name((int)want), reason, call_name(rc), err);
     CHECK_AT(line, lua_gettop(L) == 0, "%s\n  left %d values on the stack", src, lua_gettop(L));
     CHECK_AT(line, raw_global(L, "survived") == LUA_TNIL, "%s\n  ran on after it should have stopped", src);
+    if (seen != NULL) {
+        bool same = raw_global(L, "seen") == LUA_TSTRING && strcmp(lua_tostring(L, -1), seen) == 0;
+        CHECK_AT(line, same, "%s\n  seen is %s, not '%s'", src, top_text(L), seen);
+    }
     lua_settop(L, 0);
     CHECK_AT(line, apps_vm_dying(vm) && !apps_vm_in_call(vm), "%s\n  dying %d, in a call %d", src, apps_vm_dying(vm),
              apps_vm_in_call(vm));
     CHECK_AT(line, apps_vm_mem_peak(vm) <= cap, "%s\n  peak %zu over the %zu cap", src, apps_vm_mem_peak(vm), cap);
     apps_vm_free(vm);
 }
-#define expect_killed(src) expect_end_at(__LINE__, 256 * KB, src, APPS_CALL_KILLED, BUDGET_MSG("2000000"))
-#define expect_nomem(src) expect_end_at(__LINE__, 256 * KB, src, APPS_CALL_NOMEM, NOMEM_MSG("256"))
+#define expect_killed(src) \
+    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_KILLED, BUDGET_MSG("2000000"), NULL)
+#define expect_nomem(src) expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_NOMEM, NOMEM_MSG("256"), NULL)
+/* Out of memory that a __close handler saw, as the message Lua closes it with, and couldn't keep. */
+#define expect_nomem_seen(src) \
+    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_NOMEM, NOMEM_MSG("256"), "not enough memory")
 
 /* src under apps_vm_call returns exactly the values describe() shows as want. */
 static void expect_returns_at(int line, apps_vm_t *vm, const char *src, const char *want) {
@@ -1501,6 +1524,73 @@ static void wall_clock(void) {
     CHECK(rc == APPS_CALL_KILLED && strcmp(err, WALL_MSG) == 0, "got %s '%s'", call_name(rc), err);
     CHECK(ran <= 10000, "ran %llu instructions: the clock didn't stop it", (unsigned long long)ran);
     apps_vm_free(vm);
+}
+
+/* ---- short_coroutines ---- */
+
+/* src, in a fresh VM under apps_vm_call with budget, ends KILLED with reason. Returns the
+ * global n it had counted to, or -1 without one. */
+static lua_Integer killed_at_n_at(int line, const char *src, uint32_t budget, const char *reason) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    lua_State *L = apps_vm_lua(vm);
+    char err[512] = "";
+    int rc = call(vm, src, 0, budget, err, sizeof err);
+    CHECK_AT(line, rc == APPS_CALL_KILLED && strcmp(err, reason) == 0, "%s\n  got %s '%s'", src, call_name(rc), err);
+    lua_Integer n = raw_global(L, "n") == LUA_TNUMBER ? lua_tointeger(L, -1) : -1;
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+    return n;
+}
+#define killed_at_n(src, budget, reason) killed_at_n_at(__LINE__, src, budget, reason)
+
+/* main -> A -> B -> C, 10,101 coroutines for each A, none of which runs 1000 instructions,
+ * while the main thread runs about 6 for each A: without a count for each coroutine, nothing
+ * reaches the hook for some 165 A's, 1.5e9 instructions. */
+#define TREE                                                   \
+    "local wrap = coroutine.wrap\n"                            \
+    "local function C() for i = 1, 900 do end end\n"           \
+    "local function B() for i = 1, 100 do wrap(C)() end end\n" \
+    "local function A() for i = 1, 100 do wrap(B)() end end\n" \
+    "while true do wrap(A)() survived = true end"
+
+static void short_coroutines(void) {
+    /* A coroutine starts its own countdown, so one that runs fewer than 1000 instructions never
+     * reaches the hook: creating one counts as 1000. The same work on the main thread, then in
+     * a new coroutine each round, made by wrap and by create. */
+    lua_Integer n = killed_at_n("n = 0 while true do for i = 1, 990 do end n = n + 1 end", 100000, BUDGET_MSG("100000"));
+    CHECK(n >= 98 && n <= 104, "main thread: n = %lld", (long long)n);
+    n = killed_at_n("local wrap = coroutine.wrap local function work() for i = 1, 990 do end end\n"
+                    "n = 0 while true do wrap(work)() n = n + 1 end",
+                    100000, BUDGET_MSG("100000"));
+    CHECK(n >= 95 && n <= 110, "wrap: n = %lld", (long long)n);
+    n = killed_at_n("local create, resume = coroutine.create, coroutine.resume\n"
+                    "local function work() for i = 1, 990 do end end\n"
+                    "n = 0 while true do resume(create(work)) n = n + 1 end",
+                    100000, BUDGET_MSG("100000"));
+    CHECK(n >= 95 && n <= 110, "create: n = %lld", (long long)n);
+
+    /* One A of the tree is 10,101 coroutines, and that is all that counts: no thread reaches
+     * the hook. */
+    apps_vm_t *vm = new_vm(256 * KB);
+    char err[512] = "";
+    uint64_t before = apps_vm_instructions(vm);
+    int rc = call(vm,
+                  "local wrap = coroutine.wrap\n"
+                  "local function C() for i = 1, 900 do end end\n"
+                  "local function B() for i = 1, 100 do wrap(C)() end end\n"
+                  "local function A() for i = 1, 100 do wrap(B)() end end\n"
+                  "wrap(A)()",
+                  0, UINT32_MAX, err, sizeof err);
+    uint64_t counted = apps_vm_instructions(vm) - before;
+    CHECK(rc == APPS_CALL_OK && counted == 10101000, "one A: %s '%s', %llu counted", call_name(rc), err,
+          (unsigned long long)counted);
+    apps_vm_free(vm);
+
+    /* A tree of them: the budget stops it, and so does the clock, which creating one reads. */
+    expect_killed(TREE);
+    fake_step = 600;
+    expect_end_at(__LINE__, 256 * KB, UINT32_MAX, TREE, APPS_CALL_KILLED, WALL_MSG, NULL);
+    fake_step = 0;
 }
 
 /* ---- kill_not_swallowed ---- */
@@ -1603,6 +1693,26 @@ static void kill_not_swallowed(void) {
 
 /* ---- memory_kill ---- */
 
+/* A __close handler that notes the error it is closed with, then raises another in its place,
+ * as Lua's unwinding lets it (ldo.c luaD_closeprotected, finishpcallk). */
+#define SWALLOWER "setmetatable({}, {__close = function(_, e) seen = e error('swallowed', 0) end})"
+#define HUGE_REP "string.rep('x', 1 << 24)"
+
+/* refuse_next_growth(): the allocator refuses the next request to grow, once. */
+static int refuse_next_growth(lua_State *L) {
+    (void)L;
+    refuse_next = true;
+    return 0;
+}
+
+/* shrug_refusal(): what a refusal Lua shrugs off looks like. The stack can't grow, and
+ * lua_checkstack only says so: returns its answer, false. */
+static int shrug_refusal(lua_State *L) {
+    refuse_next = true;
+    lua_pushboolean(L, lua_checkstack(L, 10000));
+    return 1;
+}
+
 static void memory_kill(void) {
     /* The brief's two. */
     expect_nomem("pcall(string.rep, 'x', 1 << 24) return 'survived'");
@@ -1627,7 +1737,99 @@ static void memory_kill(void) {
                  "end)\n"
                  "pcall(function() f() end) survived = true");
     /* The cap in the reason is the VM's. */
-    expect_end_at(__LINE__, 100 * KB, "return string.rep('x', 1 << 20)", APPS_CALL_NOMEM, NOMEM_MSG("100"));
+    expect_end_at(__LINE__, 100 * KB, APPS_BUDGET_CALL, "return string.rep('x', 1 << 20)", APPS_CALL_NOMEM,
+                  NOMEM_MSG("100"), NULL);
+    /* Lua's own message, raised as is, is a memory error too (lapi.c lua_error): the app only
+     * stops itself. */
+    expect_nomem("pcall(error, 'not enough memory', 0) survived = true");
+
+    /* Out of memory is sticky (ruling A2, amended): a __close handler that runs as the memory
+     * error unwinds can see it, but raising another error in its place doesn't get rid of it.
+     * At a pcall, at the top, in a coroutine's pcall, in the __close handlers that wrap and
+     * close run, round a loop, and with xpcall, whose handler doesn't see it either. */
+    expect_nomem_seen("pcall(function() local g <close> = " SWALLOWER " local s = " HUGE_REP " end) survived = true");
+    expect_nomem_seen("local g <close> = " SWALLOWER " local s = " HUGE_REP);
+    expect_nomem_seen("local co = coroutine.wrap(function()\n"
+                      "  pcall(function() local g <close> = " SWALLOWER " local s = " HUGE_REP " end) survived = true\n"
+                      "end)\n"
+                      "co() survived = true");
+    expect_nomem_seen("local f = coroutine.wrap(function()\n"
+                      "  local g <close> = setmetatable({}, {__close = function()\n"
+                      "    local h <close> = " SWALLOWER " local s = " HUGE_REP "\n"
+                      "  end})\n"
+                      "  error('e')\n"
+                      "end)\n"
+                      "pcall(f) survived = true");
+    expect_nomem_seen("local co = coroutine.create(function()\n"
+                      "  local g <close> = setmetatable({}, {__close = function()\n"
+                      "    local h <close> = " SWALLOWER " local s = " HUGE_REP "\n"
+                      "  end})\n"
+                      "  coroutine.yield()\n"
+                      "end)\n"
+                      "coroutine.resume(co) pcall(coroutine.close, co) survived = true");
+    expect_nomem_seen("local co = coroutine.create(function()\n"
+                      "  local g <close> = setmetatable({}, {__close = function()\n"
+                      "    local h <close> = " SWALLOWER " local s = " HUGE_REP "\n"
+                      "  end})\n"
+                      "  coroutine.yield()\n"
+                      "end)\n"
+                      "coroutine.resume(co) coroutine.close(co) survived = true");
+    expect_nomem("local co = coroutine.create(function() local s = " HUGE_REP " end) coroutine.resume(co) survived = true");
+    expect_nomem_seen("while true do\n"
+                      "  pcall(function() local g <close> = " SWALLOWER " local t = {} for i = 1, 1e7 do t[i] = i end end)\n"
+                      "  survived = true\n"
+                      "end");
+    expect_nomem_seen("xpcall(function() local g <close> = " SWALLOWER " local s = " HUGE_REP " end,\n"
+                      "       function(e) survived = e return e end)\n"
+                      "survived = true");
+    /* A handler that runs on is stopped by the hook, within 1000 instructions; one that calls a
+     * binding is stopped there, by apps_vm_check. */
+    expect_nomem_seen("pcall(function()\n"
+                      "  local g <close> = setmetatable({}, {__close = function(_, e) seen = e while true do end end})\n"
+                      "  local s = " HUGE_REP "\n"
+                      "end)\n"
+                      "survived = true");
+    expect_nomem_seen("pcall(function()\n"
+                      "  local g <close> = setmetatable({}, {__close = function(_, e) seen = e survived = ('a,b'):split(',') end})\n"
+                      "  local s = " HUGE_REP "\n"
+                      "end)\n"
+                      "survived = true");
+
+    /* A coroutine's stack that can't grow for resume's arguments: lua_checkstack fails, which
+     * would be a catchable "too many arguments to resume". The main thread's stack has grown for
+     * them first, so the request refused is the coroutine's. */
+    apps_vm_t *vm = new_vm(256 * KB);
+    lua_State *L = apps_vm_lua(vm);
+    char err[512] = "";
+    lua_pushcfunction(L, refuse_next_growth);
+    lua_setglobal(L, "refuse_next_growth");
+    int rc = call(vm,
+                  "local args = {} for i = 1, 60 do args[i] = i end\n"
+                  "local co = coroutine.create(function(...) return select('#', ...) end)\n"
+                  "local function count(...) return select('#', ...) end\n"
+                  "count(table.unpack(args))\n"
+                  "refuse_next_growth()\n"
+                  "coroutine.resume(co, table.unpack(args)) survived = true",
+                  0, APPS_BUDGET_CALL, err, sizeof err);
+    refuse_next = false;
+    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, NOMEM_MSG("256")) == 0, "resume: %s '%s'", call_name(rc), err);
+    CHECK(apps_vm_mem_refusals(vm) == 1, "resume: %zu refusals", apps_vm_mem_refusals(vm));
+    CHECK(raw_global(L, "survived") == LUA_TNIL, "resume: ran on after the refusal");
+    lua_settop(L, 0);
+    apps_vm_free(vm);
+
+    /* A refusal that Lua's own code shrugs off, as a string table that can't grow does, with no
+     * check after it but apps_vm_call's own: the call still ends out of memory. */
+    vm = new_vm(256 * KB);
+    L = apps_vm_lua(vm);
+    lua_pushcfunction(L, shrug_refusal);
+    lua_setglobal(L, "shrug_refusal");
+    rc = call(vm, "return shrug_refusal()", LUA_MULTRET, APPS_BUDGET_CALL, err, sizeof err);
+    refuse_next = false;
+    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, NOMEM_MSG("256")) == 0 && lua_gettop(L) == 0, "shrugged: %s '%s', %d values",
+          call_name(rc), err, lua_gettop(L));
+    lua_settop(L, 0);
+    apps_vm_free(vm);
 }
 
 /* ---- churn (ruling A2) ---- */
@@ -1747,6 +1949,10 @@ static void external_kill(void) {
                          "  coroutine.yield()\n"
                          "end)\n"
                          "coroutine.resume(co) coroutine.close(co) survived = true");
+    /* Every binding checks first (X8): split, trim and coroutine.create too. */
+    expect_killed_from_c("kill_now() survived = ('a,b'):split(',')");
+    expect_killed_from_c("kill_now() survived = ('  a '):trim()");
+    expect_killed_from_c("kill_now() survived = coroutine.create(type)");
 
     /* A kill between calls: the next call runs nothing. The first kill's reason stays. */
     apps_vm_t *vm = new_vm(256 * KB);
@@ -1827,6 +2033,7 @@ static void yield_through_pcall(void) {
     expect_stock_error(vm, "xpcall(type)");
     expect_stock_error(vm, "xpcall(type, 1)");
     expect_stock_error(vm, "coroutine.resume(1)");
+    expect_stock_error(vm, "coroutine.create(1)");
     expect_stock_error(vm, "coroutine.wrap(1)");
     expect_stock_error(vm, "coroutine.close(1)");
     expect_stock_error(vm, "coroutine.close(coroutine.running())");
@@ -2274,6 +2481,7 @@ int main(int argc, char **argv) {
         {"suggest", suggest},
         {"infinite_loop", infinite_loop},
         {"wall_clock", wall_clock},
+        {"short_coroutines", short_coroutines},
         {"kill_not_swallowed", kill_not_swallowed},
         {"memory_kill", memory_kill},
         {"churn", churn},

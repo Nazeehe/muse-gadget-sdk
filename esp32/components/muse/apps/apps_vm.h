@@ -39,15 +39,23 @@
  *
  * CPU and memory: app code can't hang or crash the gadget.
  * - A count hook runs every 1000 VM instructions, in every coroutine (lua_newthread
- *   copies it). Inside apps_vm_call it stops a call that has run more than its budget of
- *   instructions, or for longer than APPS_WALL_MS.
+ *   copies it). A coroutine starts its own countdown, so creating one counts as 1000
+ *   instructions: one that runs fewer is still paid for. Inside apps_vm_call, a call that
+ *   has run more than its budget of instructions, or for longer than APPS_WALL_MS, stops at
+ *   the next count.
  * - A stop is a kill, and a kill is for good: the VM is dying from then on, and no app
  *   code runs in it again. The kill is raised as an error app code can't keep: the
  *   sandbox's pcall, xpcall and coroutine resume, wrap and close raise it again once
  *   their call returns, and xpcall's handler is never called with it.
- * - Out of memory: the allocator only refuses, and Lua collects garbage and retries
- *   before it raises LUA_ERRMEM (ruling A2). A LUA_ERRMEM that reaches pcall, xpcall,
- *   the coroutine functions or apps_vm_call kills the VM.
+ * - Out of memory (ruling A2, amended): the allocator only refuses, and Lua collects
+ *   garbage and retries the request at once. A refusal that retry doesn't answer is
+ *   sticky: the app is out of memory, and the next check kills it, whatever Lua made of
+ *   the refusal. The checks are the count hook, pcall, xpcall, coroutine create, resume,
+ *   wrap and close, apps_vm_check and apps_vm_call.
+ * - A deviation: running out of memory can be seen, though not kept. A __close handler
+ *   that Lua runs as the memory error unwinds is closed with it, and can run up to 1000 VM
+ *   instructions before the hook stops it; raising another error in its place changes
+ *   nothing, and a binding it calls stops at apps_vm_check.
  * - A kill lands within 1000 VM instructions; a C function runs to its end first, which
  *   the bounds above keep short. Spec §8.2 re-arms the hook with a count of 1 at once:
  *   lua_sethook from another task isn't safe (ruling A15). Once the kill is raised, each
@@ -91,7 +99,8 @@ bool apps_vm_load(apps_vm_t *vm, const char *chunkname, const char *src, size_t 
 
 /* The Lua heap against mem_limit: bytes held now, the most ever held, and how many
  * requests were refused (past the cap, or realloc_fn failing). A refusal returns NULL
- * to Lua, which collects garbage and retries before it raises LUA_ERRMEM. */
+ * to Lua, which collects garbage and retries at once; one that retry doesn't answer is
+ * the app running out of memory (above). */
 size_t apps_vm_mem_used(const apps_vm_t *vm);
 size_t apps_vm_mem_peak(const apps_vm_t *vm);
 size_t apps_vm_mem_refusals(const apps_vm_t *vm);
@@ -99,7 +108,9 @@ size_t apps_vm_mem_refusals(const apps_vm_t *vm);
 /* ---- Budgets and the kill ----
  *
  * Every function here runs on the task that runs the VM, except apps_vm_kill,
- * apps_vm_dying, apps_vm_in_call and apps_vm_call_started_ms, which any task may call.
+ * apps_vm_dying, apps_vm_in_call and apps_vm_call_started_ms, which any task may call,
+ * though never during or after apps_vm_free: the caller keeps the VM alive for as long as
+ * another task may use it.
  */
 
 typedef enum { APPS_CALL_OK = 0, APPS_CALL_ERROR, APPS_CALL_KILLED, APPS_CALL_NOMEM } apps_call_t;
@@ -118,6 +129,8 @@ typedef enum { APPS_CALL_OK = 0, APPS_CALL_ERROR, APPS_CALL_KILLED, APPS_CALL_NO
  *     or "(...tail calls...)" line), the message cut at 1 KB;
  *   - APPS_CALL_KILLED, APPS_CALL_NOMEM: the kill's reason, with no traceback. A dying VM
  *     returns one of them at once and runs nothing.
+ * - No function below the arguments (nargs < 0, or nargs >= lua_gettop): APPS_CALL_ERROR,
+ *   err "apps_vm_call: no function to call", and the stack as it was.
  * For the C code that drives the VM: it runs on the VM's main thread. A C function Lua
  * calls runs Lua with lua_call, under the call in progress. A call nested anyway (from such
  * a function, on the main thread) runs under the outer call's budget and time.
@@ -126,19 +139,24 @@ apps_call_t apps_vm_call(apps_vm_t *vm, int nargs, int nresults, uint32_t budget
 
 /* Kills the VM: from now on it is dying, with reason (a static string) as apps_vm_call's
  * err. A running call stops within 1000 VM instructions. Any task: it only stores the
- * reason; the first kill's reason stays. */
+ * reason. A kill of a dying VM changes nothing, and when kills race, one of their reasons
+ * stays; once set, the reason is never NULL again. */
 void apps_vm_kill(apps_vm_t *vm, const char *reason);
-/* Whether the VM has been killed. Any task. */
+/* Whether the VM has been killed. Any task. Running out of memory becomes the kill at the
+ * next check on the VM's task, so until then this can trail it. */
 bool apps_vm_dying(const apps_vm_t *vm);
-/* Every C function the sandbox gives apps calls this first: when the VM is dying it
- * raises the kill, so a binding starts no work for a dying app. It pushes one value
- * before raising, which the slots Lua guarantees a C function hold. */
+/* Every C function the sandbox gives apps calls this first: when the VM is dying, or out
+ * of memory, it raises the kill, so a binding starts no work for a dying app. It pushes one
+ * value before raising, which the slots Lua guarantees a C function hold. */
 void apps_vm_check(lua_State *L);
 /* Whether apps_vm_call is running, and since when (now_ms() when the outermost call
- * began). Any task: the supervisor reads them to spot a hung app. */
+ * began). Any task: the supervisor reads them to spot a hung app. Read in_call first,
+ * then the start: apps_vm_call stores the start before it sets in_call, so a reader that
+ * saw in_call true gets that call's start, or a later call's. */
 bool apps_vm_in_call(const apps_vm_t *vm);
 int64_t apps_vm_call_started_ms(const apps_vm_t *vm);
-/* VM instructions run in the VM's lifetime, counted 1000 at a time by the hook. */
+/* VM instructions run in the VM's lifetime, counted 1000 at a time by the hook, and 1000
+ * for each coroutine created. */
 uint64_t apps_vm_instructions(const apps_vm_t *vm);
 
 /*

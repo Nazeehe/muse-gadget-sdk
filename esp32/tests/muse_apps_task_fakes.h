@@ -61,9 +61,10 @@ typedef struct fake_mutex *SemaphoreHandle_t;
 typedef struct {
     _Alignas(16) unsigned char opaque[512];
 } StaticSemaphore_t;
-/* A task's TCB, as FreeRTOS sizes it (apps_io.c counts it in the worker's admission); about this on the S3. */
+/* A task's TCB, as FreeRTOS sizes it (apps_io.c counts it in the worker's admission): 100 bytes on the S3, read from the
+ * firmware's ELF (sizeof(StaticTask_t) and sizeof(TCB_t) in gdb), so that the host's sums are the board's. */
 typedef struct {
-    _Alignas(8) unsigned char opaque[352];
+    _Alignas(4) unsigned char opaque[100];
 } StaticTask_t;
 
 #define pdFALSE 0

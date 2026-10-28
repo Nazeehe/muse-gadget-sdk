@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""apps_port_idf.c, the device's port of Muse apps: the console echo's cap and the UI lock's breach log.
+"""apps_port_idf.c, the device's port of Muse apps: the console echo's cap and queue, and the UI lock's breach log.
 
 tests/muse_apps_port_harness.c runs the real apps_port_idf.c on the host over fakes: its ESP-IDF and FreeRTOS headers
 are staged as one line each that includes tests/muse_apps_task_fakes.h (the harness defines what the port calls), and
@@ -83,6 +83,12 @@ class AppPortTest(unittest.TestCase):
 
     def test_the_console_echo_is_capped(self):  # F8
         self.run_case("echo_lines")
+
+    def test_an_echo_only_queues_until_the_drain(self):  # Task 13's F3: never a wait for the console inside a call
+        self.run_case("echo_queues_until_the_drain")
+
+    def test_the_echo_queue_is_bounded(self):  # Task 13's F3
+        self.run_case("echo_queue_is_bounded")
 
     def test_each_kind_of_breach_is_logged_once(self):  # F11
         self.run_case("breach_kinds")

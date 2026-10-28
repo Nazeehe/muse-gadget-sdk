@@ -23,9 +23,10 @@
  * The source is a fake that serves files from a table and records every read (its path, its limit, its deadline); the
  * ops are fakes that record what they were given and answer what the case set (compile returns only Lua's raw message,
  * as C17 has it; run fills the status record from the case's and frees the package, as apps_task_run does). Every
- * result is printed as "@result <json>" for the Python test, which checks each is valid JSON within 6144 bytes. The port
- * is a counting allocator that can refuse, cJSON's allocations are counted too (and can be refused), and each case
- * ends with nothing held.
+ * result is printed as "@result <json>" for the Python test, which checks each is valid JSON (strict UTF-8) within 6144
+ * bytes. The port is a counting allocator that can refuse, and its free PSRAM is a total the case sets less what it
+ * holds; cJSON's allocations are counted too (and can be refused), and each case ends with nothing held. The app task's
+ * two calls the store makes are fakes: the app that runs is the case's, and the launcher's list is recorded.
  */
 
 #include <stdarg.h>
@@ -38,6 +39,7 @@
 #include <unistd.h>
 
 #include "apps_install.h"
+#include "apps_json.h"
 #include "apps_port.h"
 #include "cJSON.h"
 #include "muse_apps_exact_stack.h"
@@ -105,6 +107,13 @@ void apps_port_free(void *ptr) {
     }
 }
 
+/* Free PSRAM: a total the case sets, less what the port holds (so a drop makes room, and a copy takes it). */
+static size_t psram_total = (size_t)1 << 30;
+
+size_t apps_port_psram_free(void) {
+    return port_held < psram_total ? psram_total - port_held : 0;
+}
+
 static int64_t fake_ms = 5000;
 
 int64_t apps_port_mono_ms(void) {
@@ -133,6 +142,54 @@ bool apps_port_ui_trylock(int ms) {
 void apps_port_ui_unlock(void) {}
 
 /* apps_port_sha256 is tools/muse/apphost/sha256.c's. */
+
+/* ---- The app task's calls the store makes ---- */
+
+static char running_app[APPS_ID_MAX + 1]; /* what apps_task_running says: "" for none */
+
+bool apps_task_running(char *id, size_t cap) {
+    snprintf(id, cap, "%s", running_app);
+    return running_app[0] != '\0';
+}
+
+static char listed[1024]; /* the launcher's list as the store last gave it: "id:name id:name ..." */
+static int listings;
+
+void apps_task_set_list(const apps_listed_t *apps, int n) {
+    CHECK(n >= 0 && n <= APPS_TASK_LIST_MAX, "a list of %d", n);
+    size_t at = 0;
+    listed[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        at += (size_t)snprintf(listed + at, sizeof listed - at, "%s%s:%s", i > 0 ? " " : "", apps[i].id, apps[i].name);
+    }
+    listings++;
+}
+
+/* ---- The log: the store's lines, kept ---- */
+
+static char logged[16][200];
+static int n_logged;
+
+void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
+    char text[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof text, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "%c %s: %s\n", level, tag, text);
+    if (n_logged < (int)ARRAY_LEN(logged)) {
+        snprintf(logged[n_logged++], sizeof logged[0], "%c %s: %s", level, tag, text);
+    }
+}
+
+/* How many lines logged since from were exactly line. */
+static int logged_count(int from, const char *line) {
+    int n = 0;
+    for (int i = from; i < n_logged; i++) {
+        n += strcmp(logged[i], line) == 0;
+    }
+    return n;
+}
 
 static size_t cjson_held;
 static long cjson_refuse = -1;
@@ -787,76 +844,134 @@ static void free_pkg(apps_pkg_t *p) {
     apps_port_free(p);
 }
 
+/* What a copy of p needs free (apps_install.h's room): the bytes it allocates (its messages, each file, one byte for an
+ * empty one, and, for a commit's, the package itself: a load copies into the caller's), the app's heap and
+ * APPS_RAM_RESERVE. */
+static size_t need_of(const apps_pkg_t *p, bool commit) {
+    size_t n = (commit ? sizeof *p : 0) + (p->manifest.messages_json != NULL ? strlen(p->manifest.messages_json) + 1 : 0);
+    for (int i = 0; i < p->count; i++) {
+        n += p->files[i].len > 0 ? p->files[i].len : 1;
+    }
+    return n + (size_t)p->manifest.memory_kb * 1024 + APPS_RAM_RESERVE;
+}
+
+/* A package whose main.lua is `bytes` bytes, named as its id in capitals. */
+static apps_pkg_t *make_big(const char *id, size_t bytes) {
+    char name[25];
+    snprintf(name, sizeof name, "%s", id);
+    for (char *c = name; *c != '\0'; c++) {
+        *c = (char)(*c - 'a' + 'A');
+    }
+    apps_pkg_t *p = make_pkg(id, name, "return {}\n");
+    uint8_t *data = apps_port_realloc(p->files[0].data, bytes);
+    CHECK(data != NULL, "no memory");
+    memset(data, '-', bytes);
+    p->files[0].data = data;
+    p->files[0].len = bytes;
+    return p;
+}
+
+/* The store keeps a copy of p (apps_ram_commit), and p stays the caller's: freed here. */
+static void commit_pkg(apps_pkg_t *p) {
+    char err[300];
+    bool unchanged = true;
+    CHECK(apps_ram_commit(p, &unchanged, err, sizeof err) && !unchanged && err[0] == '\0', "commit %s: %s",
+          p->manifest.id, err);
+    free_pkg(p);
+}
+
 static void ram_store(void) {
+    char err[200];
     CHECK(!apps_ram_has("one") && !apps_ram_remove("one"), "an empty store");
-    CHECK(apps_ram_put(make_pkg("one", "One", "return 1\n")), "put one");
-    CHECK(apps_ram_put(make_pkg("two", "Two", "return 2\n")), "put two");
-    CHECK(apps_ram_put(make_pkg("one", "Uno", "return 'uno'\n")), "one again replaces it");
+    /* Most recent first: a commit makes its app the most recent, and the launcher is given the list after each change. */
+    int before = listings;
+    commit_pkg(make_pkg("one", "One", "return 1\n"));
+    commit_pkg(make_pkg("two", "Two", "return 2\n"));
+    CHECK(listings == before + 2 && strcmp(listed, "two:Two one:One") == 0, "the launcher's list: %s, given %d times",
+          listed, listings - before);
+    commit_pkg(make_pkg("one", "Uno", "return 'uno'\n"));
     apps_ram_entry_t e[APPS_RAM_APPS];
     int n = apps_ram_list(e, APPS_RAM_APPS);
     CHECK(n == 2 && strcmp(e[0].id, "one") == 0 && strcmp(e[0].name, "Uno") == 0 && strcmp(e[1].id, "two") == 0 &&
               strcmp(e[1].version, "0.3") == 0,
-          "the list: %d %s %s", n, n > 0 ? e[0].name : "", n > 1 ? e[1].id : "");
+          "one again replaces it, the most recent: %d %s %s", n, n > 0 ? e[0].name : "", n > 1 ? e[1].id : "");
+    CHECK(strcmp(listed, "one:Uno two:Two") == 0, "the launcher's list: %s", listed);
     CHECK(apps_ram_list(e, 1) == 1, "max is kept");
-    /* A load is a deep copy: freeing it, or changing it, leaves the store's. */
+    /* A load for a run makes its app the most recent. */
     apps_pkg_t *copy = apps_port_realloc(NULL, sizeof *copy);
-    CHECK(copy != NULL && apps_ram_load("one", copy), "load one");
+    CHECK(copy != NULL && apps_ram_load("two", copy, err, sizeof err), "load two: %s", err);
+    CHECK(strcmp(listed, "two:Two one:Uno") == 0, "a load makes two the most recent: %s", listed);
+    free_pkg(copy);
+    /* A load is a deep copy: freeing it, or changing it, leaves the store's. */
+    copy = apps_port_realloc(NULL, sizeof *copy);
+    CHECK(copy != NULL && apps_ram_load("one", copy, err, sizeof err), "load one: %s", err);
     CHECK(copy->count == 1 && copy->files[0].len == 13 && memcmp(copy->files[0].data, "return 'uno'\n", 13) == 0 &&
               strcmp(copy->manifest.messages_json, "{\"go\":\"goes\"}") == 0 && strcmp(copy->manifest.name, "Uno") == 0,
           "the copy");
     copy->files[0].data[0] = 'X';
     free_pkg(copy);
     copy = apps_port_realloc(NULL, sizeof *copy);
-    CHECK(copy != NULL && apps_ram_load("one", copy) && copy->files[0].data[0] == 'r', "the store's own is untouched");
+    CHECK(copy != NULL && apps_ram_load("one", copy, err, sizeof err) && copy->files[0].data[0] == 'r',
+          "the store's own is untouched");
     free_pkg(copy);
     copy = apps_port_realloc(NULL, sizeof *copy);
-    CHECK(copy != NULL && !apps_ram_load("three", copy) && copy->count == 0, "no three");
+    CHECK(copy != NULL && !apps_ram_load("three", copy, err, sizeof err) && copy->count == 0 &&
+              strcmp(err, "no such app on the gadget") == 0,
+          "no three: %s", err);
     apps_port_free(copy);
     /* Out of memory, a load fails whole: its two blocks are messages_json and main.lua. */
     for (long k = 0; k < 4; k++) {
-        size_t before = port_held;
+        size_t held_before = port_held;
         copy = apps_port_realloc(NULL, sizeof *copy);
         CHECK(copy != NULL, "no memory");
         port_refuse = k;
-        bool loaded = apps_ram_load("one", copy);
+        bool loaded = apps_ram_load("one", copy, err, sizeof err);
         port_refuse = -1;
         CHECK(loaded == (k >= 2), "refusal %ld: loaded %d", k, loaded);
+        CHECK(loaded || strcmp(err, "out of memory: no room to load the app") == 0, "refusal %ld: %s", k, err);
         if (loaded) {
             apps_pkg_free(copy, apps_port_free);
         }
         apps_port_free(copy);
-        CHECK(port_held == before, "refusal %ld: %zu bytes left", k, port_held - before);
+        CHECK(port_held == held_before, "refusal %ld: %zu bytes left", k, port_held - held_before);
     }
-    /* Full: eight ids, then a ninth is refused (and freed), while one of the eight is replaced. */
+    /* Eight ids fill it (one is now the oldest, then two, app3 ... app8). */
     char id[8];
     for (int i = 3; i <= 8; i++) {
         snprintf(id, sizeof id, "app%d", i);
-        CHECK(apps_ram_put(make_pkg(id, "App", "return {}\n")), "put %s", id);
+        commit_pkg(make_pkg(id, "App", "return {}\n"));
     }
-    CHECK(!apps_ram_put(make_pkg("nine", "Nine", "return {}\n")), "a ninth id");
-    CHECK(!apps_ram_has("nine"), "not kept");
-    CHECK(apps_ram_put(make_pkg("two", "Two again", "return {}\n")), "a kept id when full");
-    char err[200];
-    bool unchanged = true;
+    commit_pkg(make_pkg("two", "Two again", "return {}\n"));  /* a kept id when full: replaced, the most recent */
+    CHECK(apps_ram_list(e, APPS_RAM_APPS) == APPS_RAM_APPS && strcmp(e[APPS_RAM_APPS - 1].id, "one") == 0,
+          "eight, one the oldest");
+    /* A ninth id drops the oldest instead of being refused, with one log line, and never the app that runs: one runs,
+     * so app3 goes. */
+    snprintf(running_app, sizeof running_app, "one");
+    int from = n_logged;
     apps_pkg_t *p = make_pkg("nine", "Nine", "return {}\n");
-    CHECK(!apps_ram_commit(p, &unchanged, err, sizeof err) && !unchanged &&
-              strcmp(err, "the gadget keeps at most 8 apps in RAM; restart it to make room") == 0,
-          "commit when full: %s", err);
-    CHECK(apps_ram_remove("app8") && apps_ram_commit(p, &unchanged, err, sizeof err) && !unchanged && err[0] == '\0',
-          "commit after a remove: %s", err);
+    bool unchanged = true;
+    CHECK(apps_ram_commit(p, &unchanged, err, sizeof err) && !unchanged && err[0] == '\0', "commit when full: %s", err);
+    CHECK(logged_count(from, "W muse_apps: ram: dropped app3 to make room") == 1 && n_logged == from + 1,
+          "one drop, app3's: %d lines", n_logged - from);
+    CHECK(apps_ram_has("one") && !apps_ram_has("app3") && apps_ram_has("nine"), "one stays, app3 went, nine is kept");
+    CHECK(strcmp(listed, "nine:Nine two:Two again app8:App app7:App app6:App app5:App app4:App one:Uno") == 0,
+          "the launcher's list: %s", listed);
+    running_app[0] = '\0';
     /* The commit kept a copy: the caller's package is still the caller's. */
     p->files[0].data[0] = 'Z';
     copy = apps_port_realloc(NULL, sizeof *copy);
-    CHECK(copy != NULL && apps_ram_load("nine", copy) && copy->files[0].data[0] == 'r', "the store has its own copy");
+    CHECK(copy != NULL && apps_ram_load("nine", copy, err, sizeof err) && copy->files[0].data[0] == 'r',
+          "the store has its own copy");
     free_pkg(copy);
     port_refuse = 0;
     CHECK(!apps_ram_commit(p, &unchanged, err, sizeof err) && strcmp(err, "out of memory: no room to keep the app in RAM") == 0,
           "commit without memory: %s", err);
     port_refuse = -1;
+    CHECK(apps_ram_has("nine"), "a commit that failed leaves the store's copy");
     free_pkg(p);
     /* A launch of a stored copy has the shape of an install's run, without "installed but". */
     copy = apps_port_realloc(NULL, sizeof *copy);
-    CHECK(copy != NULL && apps_ram_load("one", copy), "load one");
+    CHECK(copy != NULL && apps_ram_load("one", copy, err, sizeof err), "load one: %s", err);
     const char *got = show(apps_install_launch(copy, &OPS));
     static const char launched[] = "{\"ok\":true,\"payload\":{\"id\":\"one\",\"version\":\"0.3\",\"storage\":\"ram\","
                                    "\"files\":[{\"path\":\"main.lua\",\"bytes\":13,\"sha256\":\"";
@@ -866,13 +981,154 @@ static void ram_store(void) {
     run_err = "crashed in start(): main.lua:1: no";
     crash_record("main.lua:1: no", 1);
     copy = apps_port_realloc(NULL, sizeof *copy);
-    CHECK(copy != NULL && apps_ram_load("one", copy), "load one");
+    CHECK(copy != NULL && apps_ram_load("one", copy, err, sizeof err), "load one: %s", err);
     EXPECT_FAILURE(show(apps_install_launch(copy, &OPS)), APPS_ERR_CRASHED, "crashed in start(): main.lua:1: no\nlog:\nl01");
     run_err = "the app task is busy; try again";
     run_record.state = APPS_STATE_RUNNING;
     copy = apps_port_realloc(NULL, sizeof *copy);
-    CHECK(copy != NULL && apps_ram_load("one", copy), "load one");
+    CHECK(copy != NULL && apps_ram_load("one", copy, err, sizeof err), "load one: %s", err);
     EXPECT_FAILURE(show(apps_install_launch(copy, &OPS)), APPS_ERR_NOT_RUNNING, "the app task is busy; try again");
+}
+
+/* F2: free PSRAM after a copy keeps the app's heap and APPS_RAM_RESERVE. Short of that, the store drops its oldest apps,
+ * one at a time and looking again after each, never the app that runs nor the one being committed or loaded, with one
+ * log line each; short still, it refuses. The fake's free PSRAM is a total less what the port holds, so a drop makes
+ * room as it would on the gadget. */
+static void ram_budget(void) {
+    char err[300], want[300];
+    bool unchanged;
+    const char *const first[] = {"a", "b", "c", "d"};
+    for (size_t i = 0; i < ARRAY_LEN(first); i++) {
+        commit_pkg(make_big(first[i], 200 * KB));
+    }
+    CHECK(strcmp(listed, "d:D c:C b:B a:A") == 0, "the list: %s", listed);
+    /* e needs a byte more than is free: the oldest, a, goes, and e is kept. */
+    apps_pkg_t *p = make_big("e", 200 * KB);
+    psram_total = port_held + need_of(p, true) - 1;
+    int from = n_logged;
+    CHECK(apps_ram_commit(p, &unchanged, err, sizeof err), "e: %s", err);
+    CHECK(logged_count(from, "W muse_apps: ram: dropped a to make room") == 1 && n_logged == from + 1,
+          "one drop, a's: %d lines", n_logged - from);
+    CHECK(strcmp(listed, "e:E d:D c:C b:B") == 0, "the list: %s", listed);
+    free_pkg(p);
+    /* The app that runs is never dropped: b, the oldest, runs, so c goes. */
+    snprintf(running_app, sizeof running_app, "b");
+    p = make_big("f", 200 * KB);
+    psram_total = port_held + need_of(p, true) - 1;
+    from = n_logged;
+    CHECK(apps_ram_commit(p, &unchanged, err, sizeof err), "f: %s", err);
+    CHECK(logged_count(from, "W muse_apps: ram: dropped c to make room") == 1 && n_logged == from + 1,
+          "one drop, c's: %d lines", n_logged - from);
+    CHECK(strcmp(listed, "f:F e:E d:D b:B") == 0, "the list: %s", listed);
+    free_pkg(p);
+    /* Short whatever goes: every app but the one that runs goes, oldest first, then the commit is refused. */
+    p = make_big("g", 200 * KB);
+    psram_total = port_held;
+    from = n_logged;
+    CHECK(!apps_ram_commit(p, &unchanged, err, sizeof err), "g was kept");
+    snprintf(want, sizeof want,
+             "the gadget is short of memory for g: %zu KB free, %zu KB needed; restart it or install a smaller app",
+             apps_port_psram_free() / 1024, (need_of(p, true) + 1023) / 1024);
+    CHECK(strcmp(err, want) == 0, "the refusal: %s\ninstead of %s", err, want);
+    CHECK(n_logged == from + 3 && strcmp(logged[from], "W muse_apps: ram: dropped d to make room") == 0 &&
+              strcmp(logged[from + 1], "W muse_apps: ram: dropped e to make room") == 0 &&
+              strcmp(logged[from + 2], "W muse_apps: ram: dropped f to make room") == 0,
+          "d, e and f went, oldest first: %d lines", n_logged - from);
+    CHECK(strcmp(listed, "b:B") == 0 && !apps_ram_has("g"), "only b is left: %s", listed);
+    free_pkg(p);
+    running_app[0] = '\0';
+    /* A load makes room the same way, never dropping the app it loads: h goes for b. */
+    psram_total = (size_t)1 << 30;
+    commit_pkg(make_big("h", 200 * KB));
+    p = make_big("b", 200 * KB);  /* b's sizes, for what a load of b needs */
+    size_t need_b = need_of(p, false);
+    free_pkg(p);
+    apps_pkg_t *copy = apps_port_realloc(NULL, sizeof *copy);
+    CHECK(copy != NULL, "no memory");
+    psram_total = port_held + need_b - 1;
+    from = n_logged;
+    CHECK(apps_ram_load("b", copy, err, sizeof err), "load b: %s", err);
+    CHECK(logged_count(from, "W muse_apps: ram: dropped h to make room") == 1 && n_logged == from + 1,
+          "one drop, h's: %d lines", n_logged - from);
+    CHECK(strcmp(listed, "b:B") == 0, "the list: %s", listed);
+    free_pkg(copy);
+    /* Short with nothing left to drop: the load is refused. */
+    copy = apps_port_realloc(NULL, sizeof *copy);
+    CHECK(copy != NULL, "no memory");
+    psram_total = port_held;
+    CHECK(!apps_ram_load("b", copy, err, sizeof err) && copy->count == 0, "b was loaded");
+    snprintf(want, sizeof want,
+             "the gadget is short of memory for b: %zu KB free, %zu KB needed; restart it or install a smaller app",
+             apps_port_psram_free() / 1024, (need_b + 1023) / 1024);
+    CHECK(strcmp(err, want) == 0, "the refusal: %s\ninstead of %s", err, want);
+    CHECK(apps_ram_has("b"), "b is still kept");
+    apps_port_free(copy);
+    psram_total = (size_t)1 << 30;
+}
+
+/* Whether s is valid UTF-8, and (printed JSON, which escapes them) with no raw control byte unless controls. */
+static bool utf8_ok(const char *s, bool controls) {
+    const unsigned char *p = (const unsigned char *)s, *end = p + strlen(s);
+    while (p < end) {
+        if (*p < 0x20 && !controls) {
+            return false;
+        }
+        int n = *p < 0x80 ? 1 : apps_json_utf8_len(p, end);
+        if (n <= 0) {
+            return false;
+        }
+        p += n;
+    }
+    return true;
+}
+
+/* T2: a result is text whatever bytes the app's own text has. A compile error quoting a source line with bytes that
+ * aren't UTF-8 (0xE9 alone, a 0xC3 cut short) shows each as '?'. A crash's long message of control bytes and four-byte
+ * characters, with a 0xFF in its error, is cut at the 6,144 bound between characters, whatever the alignment: ten
+ * lengths of the error move the cut across each byte of the characters. The Python test decodes every result strictly. */
+static void results_are_utf8(void) {
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1}");
+    serve_text("main.lua", "local app = {}\nlocal caf\xe9 = = 1 -- \xc3\nreturn app\n");
+    compile_raw = "main.lua:2: unexpected symbol near '='";
+    char *m = message_of(install("hello", true));
+    CHECK(strstr(m, "local caf? = = 1 -- ?") != NULL && utf8_ok(m, true) && utf8_ok(last, false), "%s", m);
+    free(m);
+    compile_raw = NULL;
+    unserve();
+    serve_hello();
+    run_ok = false;
+    run_err = "crashed in start(): main.lua:1: x";
+    static const char unit[] = "\x01\xf0\x9f\x98\x80";  /* escaped, 6 bytes and then 4 of one character */
+    for (int shift = 0; shift < 10; shift++) {
+        run_record.state = APPS_STATE_CRASHED;
+        size_t at = 0;
+        for (int i = 0; i < shift; i++) {
+            run_record.last_error[at++] = 'a';
+        }
+        run_record.last_error[at++] = '\xff';
+        while (at + sizeof unit < sizeof run_record.last_error) {
+            memcpy(run_record.last_error + at, unit, sizeof unit - 1);
+            at += sizeof unit - 1;
+        }
+        run_record.last_error[at] = '\0';
+        at = 0;
+        for (int line = 0; line < 10; line++) {
+            for (int i = 0; i < 60; i++) {
+                memcpy(run_record.log_tail + at, unit, sizeof unit - 1);
+                at += sizeof unit - 1;
+            }
+            run_record.log_tail[at++] = '\n';
+        }
+        run_record.log_tail[at - 1] = '\0';
+        const char *got = install("hello", true);
+        size_t len = strlen(got);
+        CHECK(len <= APPS_RESULT_MAX && len > APPS_RESULT_MAX - 8, "shift %d: cut at the bound: %zu bytes", shift, len);
+        CHECK(utf8_ok(got, false), "shift %d: not valid UTF-8 at the cut: %s", shift, got + (len > 40 ? len - 40 : 0));
+        CHECK(strstr(got, "crashed in start(): ") != NULL && strstr(got, "?\\u0001\xf0\x9f\x98\x80") != NULL,
+              "shift %d: 0xFF as '?', the rest as it was: %.120s", shift, got);
+        CHECK(strstr(got, "\"}}") == got + len - 3, "shift %d: the message is cut at its end: %s", shift,
+              got + (len > 40 ? len - 40 : 0));
+    }
 }
 
 static void status_json(void) {
@@ -1033,6 +1289,8 @@ int main(int argc, char **argv) {
         {"read_and_commit_failures", read_and_commit_failures},
         {"deadline_is_one_absolute_time", deadline_is_one_absolute_time},
         {"ram_store", ram_store},
+        {"ram_budget", ram_budget},
+        {"results_are_utf8", results_are_utf8},
         {"status_json", status_json},
         {"out_of_memory", out_of_memory},
         {"install_stack", install_stack},

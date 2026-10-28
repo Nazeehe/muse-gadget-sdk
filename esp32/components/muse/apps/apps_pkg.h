@@ -58,7 +58,10 @@
  *   manifest: manifest.json is larger than 8 KB
  *   manifest: id '%s' must match ^[a-z][a-z0-9_]{1,23}$ and the folder name '%s'     (a missing id is '')
  *   manifest: name must be 1 to 24 characters                              (also when missing or not text)
+ *   manifest: name has a control character                                 (C0, DEL or C1: U+0000 to U+001F,
+ *                                                                          U+007F, U+0080 to U+009F)
  *   manifest: version must be text of at most 23 characters, like "1.0.0"
+ *   manifest: version has a control character
  *   manifest: this gadget supports api 1 (manifest says api %s)           (the number, or the JSON text)
  *   manifest: api is missing (this gadget supports api 1)
  *   manifest: main '%s' is not an allowed path (a-z 0-9 _ . / -, no '..', at most 64 characters)
@@ -77,8 +80,9 @@
  * main, files, permissions, memory_kb, messages is the one reported, and a required key that is missing
  * only after every key that is there has passed.
  * A warning, for a key that isn't one of those: "unknown key '%s' ignored", with " (did you mean '%s'?)" when
- * a manifest key is near (apps_suggest). They are joined with "; " in apps_manifest_t's warnings, one a key;
- * one that doesn't fit whole in what is left is dropped, never cut.
+ * a manifest key is near (apps_suggest), the key shown as apps_text_shown shows text from outside (a control
+ * character as '?') and never cut. They are joined with "; " in apps_manifest_t's warnings, one a key; one that
+ * doesn't fit whole in what is left is dropped, never cut.
  * An image's: "image: not an LVGL v9 image file (use LVGLImage.py --ofmt BIN)", "image: compressed images
  * aren't supported", "image: flags 0x%04x aren't supported (only premultiplied alpha)", "image: %ux%u has no
  * pixels", "image: %ux%u is larger than the 466x466 screen", "image: colour format 0x%02x isn't RGB565,
@@ -105,6 +109,10 @@
 #define APPS_IMAGE_MAX (512 * 1024)
 #define APPS_IMAGES_TOTAL_MAX (1536 * 1024)
 #define APPS_APP_MAX (2 * 1024 * 1024)
+
+/* What a message says of an id that isn't one, with the id as shown (apps_text_shown): the USB console's and the
+ * install pipeline's. */
+#define APPS_MSG_BAD_ID "app id '%s' must match ^[a-z][a-z0-9_]{1,23}$"
 
 enum { APPS_PERM_SOUND = 1, APPS_PERM_ALARM = 2, APPS_PERM_STORE = 4, APPS_PERM_KEEP_AWAKE = 8 };
 
@@ -144,6 +152,19 @@ bool apps_path_valid(const char *path);
 /* How a file is read, by the end of its path: .lua, .json or .bin (case matters); APPS_FILE_BAD for anything
  * else. It doesn't check that the path is valid. */
 apps_file_kind_t apps_file_kind(const char *path);
+
+/* The most bytes a file of that kind may have: APPS_LUA_MAX, APPS_JSON_FILE_MAX or APPS_IMAGE_MAX, and 0 for
+ * APPS_FILE_BAD (manifest.json's own is APPS_MANIFEST_MAX). The one table of them: the USB console's stage and the
+ * install pipeline both read it. */
+size_t apps_file_max(apps_file_kind_t kind);
+
+/*
+ * s[0, n), text from outside (what someone typed, a manifest's key), as a message shows it: valid UTF-8 as it is, each
+ * byte of a control character (under 0x20, 0x7F) or of broken UTF-8 as '?', and a C1 control character (U+0080 to
+ * U+009F, which a terminal reads as the start of an escape) as one '?'; cut at max bytes on a character boundary, with
+ * "..." after the cut. out has room for max + 4 bytes; it returns out. s may be NULL when n is 0.
+ */
+char *apps_text_shown(const char *s, size_t n, size_t max, char *out);
 
 /*
  * Reads json[0, len), a manifest.json (json may be NULL when len is 0), into m (never NULL), which this

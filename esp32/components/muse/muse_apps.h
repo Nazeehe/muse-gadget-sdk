@@ -49,16 +49,17 @@ esp_err_t muse_apps_start(void);
  *   app.launch <id>                      runs an installed app in front
  *   app.stop                             stops the app that runs
  *   app.status                           the app task's record
- *   app.list                             the installed apps
+ *   app.list                             the installed apps, most recent first (as the launcher lists them)
  *   app.send <id> <event> [json]         message(event, data) to the app that runs, and its reply
  */
 bool muse_apps_console(const char *line);
 
 /*
  * Launches the installed app id, from any task, the LVGL task included: it queues app.launch's job on the I/O worker
- * (apps_io.h) and returns at once. The job loads the store's copy and runs it through apps_task_run, in front or behind,
- * with no settle and nothing printed: a failure is one log line ("launch <id>: <why>"). False, with nothing queued,
- * when the job can't be queued: one log line says why. apps_task_launch calls it for an app that isn't running.
+ * (apps_io.h) and returns at once. The job loads the store's copy and runs it through apps_task_run_by_id, in front or
+ * behind, with no settle and nothing printed: an app of that id that runs by then is fronted (or left where it is), not
+ * started again, and a failure is one log line ("launch <id>: <why>"). False, with nothing queued, when the job can't
+ * be queued: one log line says why. apps_task_launch calls it for an app that isn't running.
  */
 bool muse_apps_launch(const char *id, bool front);
 

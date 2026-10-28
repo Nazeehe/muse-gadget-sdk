@@ -21,8 +21,10 @@
  * Three threads, as on the gadget: the app task (the fake FreeRTOS of tests/muse_apps_task_fakes.h, made of pthreads
  * here), an LVGL task that runs a frame every few ms (muse_apps_ui_supervise, then muse_apps_ui_tick unless the screen
  * "sleeps"; a paused one runs nothing, as LVGL paused on battery), and the case's own thread, the caller. The I/O
- * worker (apps_io.c, made on demand) is a fourth in the cases that submit jobs; the console's launch job and the RAM
- * store it loads from (apps_console.c, apps_install.c, with the real cJSON) are real too. Under the app
+ * worker (apps_io.c, made on demand) is a fourth in the cases that submit jobs. Built with HARNESS_CONSOLE, the
+ * console's launch job and the RAM store it loads from (apps_console.c, apps_install.c, with the real cJSON) are real
+ * too, for the cases that need them; without it (Task 12's cases, which need no cJSON) muse_apps_launch and
+ * muse_apps_console are stubs, and no app is in a store. Under the app
  * task is the real runtime (apps_rt, apps_ui, apps_vm, Lua); apps_lv is a fake that writes what is done to the screen
  * into one log of events, in the order it happens, and that keeps the image objects a pass makes and draws each from
  * the package's bytes at every frame, before the supervisor (LVGL's refresh may come first in a round of its timers),
@@ -32,7 +34,9 @@
  *
  * The port is the harness's: a counting allocator that logs the free of the packages and tables it watches, a UI lock
  * that checks its contract (no double take, no heap use while held), a console whose print of a given line blocks
- * until the case lets it go (a callback stuck in C), and a clock the case can stop and move.
+ * until the case lets it go (a callback stuck in C), and a clock the case can stop and move. A print otherwise only
+ * queues its line, as the device's port does (F3), and the drain echoes the queue holding the console, which a case can
+ * hold as another task's long reply does.
  */
 
 #include <errno.h>
@@ -47,7 +51,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef HARNESS_CONSOLE
 #include "apps_install.h"
+#endif
 #include "apps_io.h"
 #include "apps_lv.h"
 #include "apps_pkg.h"
@@ -531,11 +537,18 @@ void apps_port_sha256(const void *data, size_t len, uint8_t out[32]) {
     memset(out, 0, 32);
 }
 
-/* The console. A print of block_line doesn't return until the case lets it go: a call stuck in C. */
+/* The console. A print of block_line doesn't return until the case lets it go: a call stuck in C. Any other print only
+ * queues its line ("print <id> <line>"), as the device's port does (F3); apps_port_log_drain, on the app task, echoes
+ * the queue ("echo <id> <line>") holding console_mu, which a case holds as another task's long reply holds the
+ * console. */
 static pthread_mutex_t print_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t print_cv = PTHREAD_COND_INITIALIZER;
 static const char *block_line;
 static bool print_blocked;
+static pthread_mutex_t console_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t echo_mu = PTHREAD_MUTEX_INITIALIZER;
+static char *echo_queue[64];
+static int echo_queued;
 
 void apps_port_log(const char *app_id, const char *line) {
     event("print %s %s", app_id, line);
@@ -547,6 +560,35 @@ void apps_port_log(const char *app_id, const char *line) {
     }
     print_blocked = false;
     pthread_mutex_unlock(&print_mu);
+    char text[300];
+    snprintf(text, sizeof text, "%s %s", app_id, line);
+    pthread_mutex_lock(&echo_mu);
+    if (echo_queued < (int)ARRAY_LEN(echo_queue)) {
+        echo_queue[echo_queued++] = strdup(text);
+    }
+    pthread_mutex_unlock(&echo_mu);
+}
+
+void apps_port_log_drain(void) {
+    if (app_task_of_thread() == NULL) {
+        error("apps_port_log_drain off the app task");
+    }
+    char *lines[ARRAY_LEN(echo_queue)];
+    pthread_mutex_lock(&echo_mu);
+    int n = echo_queued;
+    memcpy(lines, echo_queue, (size_t)n * sizeof lines[0]);
+    echo_queued = 0;
+    pthread_mutex_unlock(&echo_mu);
+    if (n == 0) {
+        return;
+    }
+    event("drain %d", n);  /* then it waits for the console */
+    pthread_mutex_lock(&console_mu);
+    for (int i = 0; i < n; i++) {
+        event("echo %s", lines[i]);
+        free(lines[i]);
+    }
+    pthread_mutex_unlock(&console_mu);
 }
 
 static void block_print(const char *line) {
@@ -575,6 +617,9 @@ static void wait_print_blocked_at(int line) {
 }
 #define WAIT_PRINT_BLOCKED() wait_print_blocked_at(__LINE__)
 
+/* When the I/O worker said it goes, and when its last job ended: both on the worker's own thread (T7). */
+static _Atomic int64_t io_idle_ms, io_job_end_ms;
+
 void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
     char msg[400];
     va_list ap;
@@ -584,13 +629,36 @@ void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
     if (strcmp(tag, "muse_apps") != 0) {
         error("a log line with the tag '%s'", tag);
     }
+    if (strncmp(msg, "io: idle", 8) == 0) {
+        atomic_store(&io_idle_ms, real_ms());
+    }
     event("log %c %s", level, msg);
 }
 
 /* muse_input's console hooks, which muse_apps_start adds the apps' to (tests/test_muse_apps_console.py has the chain
- * and the console itself; the real apps_console.c is linked here for its launch job). */
+ * and the console itself; built with HARNESS_CONSOLE, the real apps_console.c is linked here for its launch job). */
 void muse_input_add_console_hook(bool (*hook)(const char *line)) {
     event("console hook %s", hook == muse_apps_console ? "muse_apps_console" : "?");
+}
+
+#ifndef HARNESS_CONSOLE
+/* Without the console: no line is the apps', and no app is in a store, so a launch by id finds nothing to run (the
+ * worker's job would say so in one line). */
+bool muse_apps_console(const char *line) {
+    (void)line;
+    return false;
+}
+
+bool muse_apps_launch(const char *id, bool front) {
+    event("launch by id %s %d", id, front ? 1 : 0);
+    fake_esp_log('W', "muse_apps", "launch %s: no such app on the gadget", id);
+    return true;
+}
+#endif
+
+/* Free PSRAM, for the RAM store's room (the store class): plenty. */
+size_t apps_port_psram_free(void) {
+    return (size_t)64 << 20;
 }
 
 /* The end of a console reply (apps_port_idf.c's on the gadget). */
@@ -833,7 +901,7 @@ struct fake_mutex {
 };
 _Static_assert(sizeof(struct fake_mutex) <= sizeof(StaticSemaphore_t), "a fake mutex fits in its buffer");
 
-enum { MUTEX_RECORD = 1, MUTEX_REQUESTS = 2, MUTEX_NAMES = 3 };
+enum { MUTEX_RECORD = 1, MUTEX_REQUESTS = 2, MUTEX_NAMES = 3, MUTEX_IO = 4 };
 static atomic_int n_mutexes;
 
 SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer) {
@@ -845,8 +913,8 @@ SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer) {
     return m;
 }
 
-/* A gate on one mutex: the next take of it by the app task (or by a thread of the case that marked itself), after a
- * given event, stops before taking it until the case opens the gate. It puts another task's step in between two of
+/* A gate on one mutex: the next take of it by a task (the app task, the I/O worker: by name) or by a thread of the case
+ * that marked itself (NULL), after a given event, stops before taking it until the case opens the gate. It puts another task's step in between two of
  * the app task's, or between a caller's read and its lock, where only a race could otherwise put it. gate_open counts
  * releases, and a held thread waits for the count to pass the one it saw, so arming the gate again right after opening
  * it can't hold that thread a second time. */
@@ -854,7 +922,7 @@ static struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int number;
-    bool by_app_task;
+    char task[24];  /* "" for a thread of the case that marked itself */
     char after[80];
     int from;
     bool armed;
@@ -862,10 +930,10 @@ static struct {
 } gate = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 static _Thread_local bool gated_thread;
 
-static void gate_arm(int number, bool by_app_task, int from, const char *after) {
+static void gate_arm(int number, const char *task, int from, const char *after) {
     pthread_mutex_lock(&gate.mu);
     gate.number = number;
-    gate.by_app_task = by_app_task;
+    snprintf(gate.task, sizeof gate.task, "%s", task != NULL ? task : "");
     gate.from = from;
     snprintf(gate.after, sizeof gate.after, "%s", after != NULL ? after : "");
     gate.armed = true;
@@ -883,7 +951,7 @@ static void gate_open(void) {
 static void gate_check(const struct fake_mutex *m) {
     pthread_mutex_lock(&gate.mu);
     bool mine = gate.armed && m->number == gate.number &&
-                (gate.by_app_task ? app_task_of_thread() != NULL : gated_thread) &&
+                (gate.task[0] != '\0' ? current_task != NULL && strcmp(current_task->name, gate.task) == 0 : gated_thread) &&
                 (gate.after[0] == '\0' || at_from(gate.from, gate.after) >= 0);
     if (!mine) {
         pthread_mutex_unlock(&gate.mu);
@@ -2099,7 +2167,9 @@ static void a_right_swipe_only_backgrounds(void) {
     WAIT(opened, "print busy show");
 }
 
-static void the_launcher_lists_the_resident_app(void) {
+/* The app that runs is listed while it runs, here where no store lists it (F1: on the first row when the store's rows
+ * don't have it); a pick fronts it. */
+static void the_launcher_lists_the_running_app(void) {
     int from = mark();
     muse_apps_open_launcher();  /* from this task: the LVGL task shows it */
     WAIT(from, "launcher 0");
@@ -2119,6 +2189,11 @@ static void the_launcher_lists_the_resident_app(void) {
     ABSENT(during, "launcher");
     TURN(false);
     WAIT(during, "launcher 1 busy:Busy");
+    /* Stopped, and in no store: not listed. */
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    int stopped = mark();
+    muse_apps_open_launcher();
+    WAIT(stopped, "launcher 0");
 }
 
 /* A caller that gives up: its buffers are the case's, kept alive after it returns, so a late write by the app task
@@ -2329,7 +2404,7 @@ static void a_back_request_in_the_turns_last_frame(void) {
     int from = mark();
     TURN(true);
     WAIT(from, "print first hide");
-    gate_arm(MUTEX_NAMES, true, from, "set_ui table#2");
+    gate_arm(MUTEX_NAMES, "muse_apps", from, "set_ui table#2");
     late.pkg = make_pkg("second", "Second", HELLO, 1);
     late.front = false;
     late.settle_ms = 0;
@@ -2484,7 +2559,7 @@ static void dropped_is_read_with_its_base(void) {
     WAIT_PRINT_BLOCKED();
     int from = mark();
     gated_st = new_status();
-    gate_arm(MUTEX_RECORD, false, from, NULL);
+    gate_arm(MUTEX_RECORD, NULL, from, NULL);
     pthread_t reader;
     CHECK(pthread_create(&reader, NULL, gated_status, NULL) == 0, "no reader thread");
     WAIT(from, "gate 1");
@@ -2665,7 +2740,7 @@ static void a_turn_during_a_new_apps_load_fronts_nothing(void) {
     CHECK(apps_task_run(make_pkg("first", "First", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
     WAIT(0, "print first show");
     int from = mark();
-    gate_arm(MUTEX_RECORD, true, from, "print second start");
+    gate_arm(MUTEX_RECORD, "muse_apps", from, "print second start");
     late.pkg = make_pkg("second", "Second", HELLO, 1);
     late.front = false;
     late.settle_ms = 0;
@@ -2683,7 +2758,7 @@ static void a_turn_during_a_new_apps_load_fronts_nothing(void) {
     apps_port_ui_lock();   /* the publication waits for the case */
     gate_open();
     WAIT(from, "ui_lock wait app");
-    gate_arm(MUTEX_NAMES, true, from, "set_ui table#2");
+    gate_arm(MUTEX_NAMES, "muse_apps", from, "set_ui table#2");
     apps_port_ui_unlock();
     WAIT(from, "gate 3");  /* published; the back request not sent yet */
     WAIT_FRAMES(3);
@@ -2806,6 +2881,36 @@ static void a_message_after_its_caller_gave_up(void) {
     heap_caps_free(st);
 }
 
+/* F3: the app task never waits on the console inside a call. A tap's print only queues its line; the drain after the
+ * call echoes it, so a console another task holds delays the echo, never the call: the callback returns at once, and
+ * the line comes once the console is free. The clock stands still through the call, then jumps past the supervisor's
+ * bound while the drain waits for the console: a wait inside the call would be a hang there (and past any call's wall
+ * clock); outside it, nothing happens. */
+static void an_echo_waits_outside_the_call(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "echo busy show");  /* show()'s print, echoed after the call */
+    pthread_mutex_lock(&console_mu);  /* another task's long reply holds the console */
+    int from = mark();
+    const int64_t t0 = apps_port_mono_ms();
+    clock_stop_at(t0);
+    TAP(0);
+    WAIT(from, "print busy busy");
+    WAIT(from, "drain 1");  /* the drain waits for the console */
+    clock_stop_at(t0 + APPS_TASK_HUNG_MS + 1);
+    WAIT_FRAMES(10);  /* the supervisor looks, and finds no call running */
+    ABSENT(from, "crash ");
+    ABSENT(from, "echo busy busy");
+    pthread_mutex_unlock(&console_mu);
+    clock_go();
+    WAIT(from, "echo busy busy");
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_RUNNING, "the app runs on: %s", apps_state_name(st->state));
+    ABSENT(from, "crash ");
+    heap_caps_free(st);
+}
+
 /* The I/O worker's jobs: "hold" waits while io_hold is set, "chain" submits "chained". */
 static atomic_bool io_hold, io_held;
 
@@ -2822,6 +2927,7 @@ static void io_job(void *arg) {
     if (strcmp(label, "chain") == 0) {
         CHECK(apps_io_submit(io_job, "chained"), "a job submits another");
     }
+    atomic_store(&io_job_end_ms, real_ms());
 }
 
 /* apps_io: one worker, made when a job comes, runs the jobs in order and goes after 2 s without one. */
@@ -2833,16 +2939,38 @@ static void io_runs_jobs_in_order(void) {
     ORDERED(from, "job chain on", "job three on");
     ORDERED(from, "job three on", "job chained on");
     CHECK(count_from(from, "task muse_apps_io") == 1 &&
-              at_from(from, "task muse_apps_io stack 6144 priority 3 core any internal") >= 0,
-          "one worker: 6 KB of internal RAM, priority 3, either core");
-    int64_t started = real_ms();
+              at_from(from, "task muse_apps_io stack 6144 priority 3 core 0 internal") >= 0,
+          "one worker: 6 KB of internal RAM, priority 3, on core 0 (F4: never in front of the app task or LVGL)");
     WAIT(from, "log I io: idle, stack 3000 of 6144 free");
-    CHECK(real_ms() - started >= APPS_IO_IDLE_MS - 100, "it went only once idle for %d ms", APPS_IO_IDLE_MS);
+    /* Measured on the worker's own thread: from its last job's end to its going (T7). */
+    int64_t idle = atomic_load(&io_idle_ms) - atomic_load(&io_job_end_ms);
+    CHECK(idle >= APPS_IO_IDLE_MS - 100, "it went after %lld ms without a job, not once idle for %d ms", (long long)idle,
+          APPS_IO_IDLE_MS);
     WAIT(from, "task muse_apps_io deleted");
     int again = mark();
     CHECK(apps_io_submit(io_job, "four"), "submit four");
     WAIT(again, "job four on muse_apps_io");
     CHECK(count_from(again, "task muse_apps_io stack") == 1, "a new worker for it");
+}
+
+/* T3: a job submitted after the worker's 2 s wait ran out, but before it decided to go, is run by that worker: it looks
+ * at the queue again under the lock the submit took. The gate holds the worker just before it takes the lock (its wait
+ * has run out), the case submits, then lets it go. */
+static void io_takes_a_job_that_came_as_it_timed_out(void) {
+    int from = mark();
+    CHECK(apps_io_submit(io_job, "one"), "submit one");
+    WAIT(from, "job one on muse_apps_io");
+    gate_arm(MUTEX_IO, "muse_apps_io", from, "job one on");
+    WAIT(from, "gate 4");  /* its wait ran out: it is about to decide */
+    CHECK(apps_io_submit(io_job, "late"), "submit late");
+    gate_open();
+    WAIT(from, "job late on muse_apps_io");
+    CHECK(count_from(from, "task muse_apps_io stack") == 1, "the same worker ran it: %d made",
+          count_from(from, "task muse_apps_io stack"));
+    WAIT(from, "log I io: idle");
+    ORDERED(from, "job late on", "log I io: idle");
+    WAIT(from, "task muse_apps_io deleted");
+    CHECK(count_from(from, "task muse_apps_io deleted") == 1, "one worker went");
 }
 
 /* Admission: internal RAM short of the worker's stack and 16 KB, or APPS_IO_JOBS jobs waiting, refuse a job, which
@@ -2882,6 +3010,7 @@ static void io_refuses_when_short(void) {
  * already needs no new block, so a job for it is taken. */
 static void io_refuses_when_fragmented(void) {
     const size_t need = APPS_IO_STACK + sizeof(StaticTask_t) + APPS_IO_BLOCK_MARGIN;
+    CHECK(need == 7268, "the board's sum, with the S3's 100-byte TCB: %zu", need);
     char want[160];
     int from = mark();
     atomic_store(&internal_largest, need - 1);
@@ -2907,7 +3036,10 @@ static void io_refuses_when_fragmented(void) {
     atomic_store(&internal_largest, 200u * 1024);
 }
 
-/* The RAM store is the worker's alone: a case puts a package in it, or takes one out, with a job it waits for. */
+#ifdef HARNESS_CONSOLE
+/* ---- The cases that need the console's launch job and the RAM store (HARNESS_CONSOLE) ---- */
+
+/* The RAM store is the worker's alone: a case puts a package in it, or empties it, with a job it waits for. */
 static atomic_bool store_done;
 
 static void store_job(void *arg) {
@@ -2920,8 +3052,13 @@ static void store_job(void *arg) {
     atomic_store(&store_done, true);
 }
 
-static void unstore_job(void *arg) {
-    CHECK(apps_ram_remove((const char *)arg), "%s wasn't in the store", (const char *)arg);
+static void empty_store_job(void *arg) {
+    (void)arg;
+    apps_ram_entry_t e[APPS_RAM_APPS];
+    int n = apps_ram_list(e, APPS_RAM_APPS);
+    for (int i = 0; i < n; i++) {
+        CHECK(apps_ram_remove(e[i].id), "%s wasn't in the store", e[i].id);
+    }
     atomic_store(&store_done, true);
 }
 
@@ -2934,24 +3071,41 @@ static void on_worker(void (*job)(void *), void *arg) {
     }
 }
 
-/* busy installed and run, then stopped: the resident app, in the store and not running. */
-static void stopped_resident(void) {
+/* An install without run: the store keeps a copy (its job publishes the launcher's list). */
+static void store(apps_pkg_t *pkg) {
+    on_worker(store_job, pkg);
+}
+
+/* The launcher, opened now, shows exactly want ("launcher <n> <id>:<name> ..."). */
+static void expect_launcher_at(int line, const char *want) {
+    int from = mark();
+    muse_apps_open_launcher();
+    int i = wait_event_at(line, from, "launcher ", 5000);
+    pthread_mutex_lock(&events_mu);
+    bool same = strcmp(events[i], want) == 0;
+    pthread_mutex_unlock(&events_mu);
+    if (!same) {
+        fail_at(line, "'%s' instead of '%s'", events[i], want);
+    }
+}
+#define EXPECT_LAUNCHER(want) expect_launcher_at(__LINE__, (want))
+
+/* busy installed and run, then stopped: in the store and not running. */
+static void stopped_in_store(void) {
     char err[200];
-    on_worker(store_job, make_pkg("busy", "Busy", BUSY, 1));
+    store(make_pkg("busy", "Busy", BUSY, 1));
     CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
     WAIT(0, "print busy show");
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
     WAIT(0, "log I stop busy: stopped");
 }
 
-/* P2: the launcher lists the resident app after it stopped, and the pick runs it again in front. apps_task_launch
- * hands an app that isn't running to the I/O worker (muse_apps_launch), whose job loads the store's copy and runs it
- * through apps_task_run: the launch's post (no wait) comes before that run's (a caller's, in 10 ms tries). */
-static void a_pick_runs_the_stopped_resident_app(void) {
-    stopped_resident();
-    int from = mark();
-    muse_apps_open_launcher();
-    WAIT(from, "launcher 1 busy:Busy");
+/* P2: the launcher lists the stored app after it stopped, and the pick runs it again in front. apps_task_launch hands
+ * an app that isn't running to the I/O worker (muse_apps_launch), whose job loads the store's copy and runs it through
+ * apps_task_run_by_id: the launch's post (no wait) comes before that run's (a caller's, in 10 ms tries). */
+static void a_pick_runs_a_stored_app_that_stopped(void) {
+    stopped_in_store();
+    EXPECT_LAUNCHER("launcher 1 busy:Busy");
     int picked = mark();
     ON_LVGL(pick_job, "busy");
     WAIT(picked, "log I launch busy (256 KB)");
@@ -2960,12 +3114,12 @@ static void a_pick_runs_the_stopped_resident_app(void) {
     ORDERED(picked, "queue RUN wait 0", "queue RUN wait 10");
     char err[200];
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
-    on_worker(unstore_job, "busy");
+    on_worker(empty_store_job, NULL);
 }
 
 /* P2: a launch the I/O worker can't take is dropped with one log line (apps_io_submit's), and nothing runs. */
 static void a_refused_launch_logs_once(void) {
-    stopped_resident();
+    stopped_in_store();
     int from = mark();
     atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
     launch("busy", true);
@@ -2974,8 +3128,112 @@ static void a_refused_launch_logs_once(void) {
     CHECK(count_from(from, "log W") == 1, "one log line for the refused launch, not %d", count_from(from, "log W"));
     ABSENT(from, "log I launch busy");
     atomic_store(&internal_free, 200u * 1024);
-    on_worker(unstore_job, "busy");
+    on_worker(empty_store_job, NULL);
 }
+
+/* F1: the launcher lists the store's apps, most recent first (an install, with or without run, or a run makes an app
+ * the most recent), up to its four rows; the app that runs comes first when the rows don't have it. A pick of the app
+ * that runs fronts it; a pick of any other launches it through the worker. */
+static void the_launcher_lists_the_store(void) {
+    char err[200];
+    EXPECT_LAUNCHER("launcher 0");
+    store(make_pkg("hello", "Hello", HELLO, 1));
+    EXPECT_LAUNCHER("launcher 1 hello:Hello");
+    store(make_pkg("busy", "Busy", BUSY, 1));
+    EXPECT_LAUNCHER("launcher 2 busy:Busy hello:Hello");
+    /* A pick of an app that doesn't run: the worker loads it (the most recent now) and runs it in front. */
+    int picked = mark();
+    ON_LVGL(pick_job, "hello");
+    WAIT(picked, "log I launch hello (256 KB)");
+    WAIT(picked, "front 1");
+    EXPECT_LAUNCHER("launcher 2 hello:Hello busy:Busy");
+    /* A pick of the app that runs fronts it: nothing is launched. */
+    int swiped = mark();
+    ON_LVGL(swipe_job, NULL);
+    WAIT(swiped, "front 0");
+    int again = mark();
+    ON_LVGL(pick_job, "hello");
+    WAIT(again, "front 1");
+    WAIT(again, "print hello show");
+    ABSENT(again, "log I launch");
+    /* Four installs push hello out of the four rows: while it runs, it comes first. */
+    static const char *const more[][2] = {{"q1", "Q1"}, {"q2", "Q2"}, {"q3", "Q3"}, {"q4", "Q4"}};
+    for (size_t i = 0; i < ARRAY_LEN(more); i++) {
+        store(make_pkg(more[i][0], more[i][1], QUIET, 1));
+    }
+    EXPECT_LAUNCHER("launcher 4 hello:Hello q4:Q4 q3:Q3 q2:Q2");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    EXPECT_LAUNCHER("launcher 4 q4:Q4 q3:Q3 q2:Q2 q1:Q1");
+    on_worker(empty_store_job, NULL);
+    EXPECT_LAUNCHER("launcher 0");
+}
+
+/* T4: an app stays listed for as long as the store has it, however it ended: an install without run, a crash in start(),
+ * a main.lua that gives no app (no_app), and a hang once its stuck call has come back. */
+static void the_launcher_keeps_apps_that_ended(void) {
+    char err[300];
+    store(make_pkg("quiet", "Quiet", QUIET, 1));
+    EXPECT_LAUNCHER("launcher 1 quiet:Quiet");
+    const file_t crash[] = {LUA("main.lua", APP_START_CRASH)};
+    store(make_pkg("crashy", "Crashy", crash, 1));
+    CHECK(!apps_task_run(make_pkg("crashy", "Crashy", crash, 1), true, 0, NULL, err, sizeof err), "a crash isn't a run");
+    WAIT(0, "crash Crashy | main.lua:4: boom");
+    EXPECT_LAUNCHER("launcher 2 crashy:Crashy quiet:Quiet");
+    static const char bad[] = "local x = = 1\n";
+    const file_t syntax[] = {LUA("main.lua", bad)};
+    store(make_pkg("syntax", "Syntax", syntax, 1));
+    CHECK(!apps_task_run(make_pkg("syntax", "Syntax", syntax, 1), true, 0, NULL, err, sizeof err), "no app to run");
+    WAIT(0, "log W launch syntax: no app: ");
+    EXPECT_LAUNCHER("launcher 3 syntax:Syntax crashy:Crashy quiet:Quiet");
+    const file_t hang[] = {LUA("main.lua", APP_HANG)};
+    store(make_pkg("hangy", "Hangy", hang, 1));
+    int from = mark();
+    CHECK(apps_task_run(make_pkg("hangy", "Hangy", hang, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "front 1");
+    const int64_t t0 = apps_port_mono_ms();
+    clock_stop_at(t0);
+    block_print("hang");
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 3001);
+    WAIT(from, "crash Hangy | (stopped responding)");
+    clock_go();
+    release_print();
+    WAIT(from, "priority muse_apps 2");
+    WAIT(from, "log I stop hangy: hung, peak ");
+    EXPECT_LAUNCHER("launcher 4 hangy:Hangy syntax:Syntax crashy:Crashy quiet:Quiet");
+    on_worker(empty_store_job, NULL);
+}
+
+/* F10: a launch by id fronts the app if that id runs by the time the run happens, decided on the app task. Two launches
+ * of busy reach the app task while the worker is busy, so both become jobs; the first runs busy (behind), the second
+ * finds it running and fronts it: one launch, no restart. */
+static void two_launches_of_one_id_run_it_once(void) {
+    store(make_pkg("busy", "Busy", BUSY, 1));
+    atomic_store(&io_held, false);
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    int from = mark();
+    launch("busy", false);
+    launch("busy", true);
+    FIFO_SYNC();  /* both launches were handled: busy ran in neither, so each became a job */
+    atomic_store(&io_hold, false);
+    WAIT(from, "log I launch busy (256 KB)");
+    WAIT(from, "front 1");
+    WAIT(from, "print busy show");
+    WAIT_FRAMES(10);
+    CHECK(count_from(from, "log I launch busy") == 1, "busy was launched %d times", count_from(from, "log I launch busy"));
+    ABSENT(from, "log I stop busy: replaced");
+    ABSENT(from, "print busy stop");
+    char err[200];
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    on_worker(empty_store_job, NULL);
+}
+#endif
 
 int main(int argc, char **argv) {
     static const struct {
@@ -2999,7 +3257,7 @@ int main(int argc, char **argv) {
         {"compile_checks_every_file", compile_checks_every_file},
         {"a_voice_turn_hides_the_app", a_voice_turn_hides_the_app},
         {"a_right_swipe_only_backgrounds", a_right_swipe_only_backgrounds},
-        {"the_launcher_lists_the_resident_app", the_launcher_lists_the_resident_app},
+        {"the_launcher_lists_the_running_app", the_launcher_lists_the_running_app},
         {"a_late_answer_writes_nothing", a_late_answer_writes_nothing},
         {"touches_past_a_full_queue_are_counted", touches_past_a_full_queue_are_counted},
         {"parking_is_bounded", parking_is_bounded},
@@ -3022,8 +3280,15 @@ int main(int argc, char **argv) {
         {"io_runs_jobs_in_order", io_runs_jobs_in_order},
         {"io_refuses_when_short", io_refuses_when_short},
         {"io_refuses_when_fragmented", io_refuses_when_fragmented},
-        {"a_pick_runs_the_stopped_resident_app", a_pick_runs_the_stopped_resident_app},
+        {"io_takes_a_job_that_came_as_it_timed_out", io_takes_a_job_that_came_as_it_timed_out},
+        {"an_echo_waits_outside_the_call", an_echo_waits_outside_the_call},
+#ifdef HARNESS_CONSOLE
+        {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},
+        {"the_launcher_lists_the_store", the_launcher_lists_the_store},
+        {"the_launcher_keeps_apps_that_ended", the_launcher_keeps_apps_that_ended},
+        {"two_launches_of_one_id_run_it_once", two_launches_of_one_id_run_it_once},
+#endif
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

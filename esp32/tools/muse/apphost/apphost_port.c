@@ -98,11 +98,18 @@ void apps_port_free(void *ptr) {
     free(block);
 }
 
+size_t apps_port_psram_free(void) {
+    return SIZE_MAX;  /* the host's heap: no store here to make room in */
+}
+
 void apps_port_log(const char *app_id, const char *line) {
     if (log_fn != NULL) {
         log_fn(app_id, line);
     }
 }
+
+/* apps_port_log prints at once: nothing waits for a drain. */
+void apps_port_log_drain(void) {}
 
 /* The UI lock guards the widget table against the LVGL task; there is no other task here, so it only keeps
  * count, to check that the core holds it by the rules (apps_ui.h): never twice, never across an allocation. */

@@ -95,7 +95,7 @@ bool apps_io_submit(void (*fn)(void *arg), void *arg) {
         why = FRAGMENTED;  /* a worker that runs needs no new block */
     } else if (s_worker == NULL &&
                xTaskCreatePinnedToCore(worker, "muse_apps_io", APPS_IO_STACK, NULL, APPS_IO_PRIORITY, &s_worker,
-                                       tskNO_AFFINITY) != pdPASS) {
+                                       APPS_IO_CORE) != pdPASS) {
         s_worker = NULL;
         why = NO_TASK;
     } else if (xQueueSend(s_jobs, &job, 0) != pdTRUE) {

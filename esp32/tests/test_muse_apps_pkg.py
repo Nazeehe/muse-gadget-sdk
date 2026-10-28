@@ -50,6 +50,8 @@ PATH_RULE = "(a-z 0-9 _ . / -, no '..', at most 64 characters)"
 PERMS_VALID = "(valid: sound, alarm, store, keep_awake)"
 NAME_MSG = "manifest: name must be 1 to 24 characters"
 VERSION_MSG = 'manifest: version must be text of at most 23 characters, like "1.0.0"'
+NAME_CONTROL_MSG = "manifest: name has a control character"
+VERSION_CONTROL_MSG = "manifest: version has a control character"
 API_MISSING_MSG = "manifest: api is missing (this gadget supports api 1)"
 MAIN_NOT_LUA_MSG = "manifest: main must name a .lua file"
 FILES_NOT_LIST_MSG = 'manifest: files must be a list of paths, like ["util.lua"]'
@@ -322,6 +324,29 @@ class MuseAppsPkgTest(unittest.TestCase):
         self.assertEqual(self.ok(doc(version='""'))["version"], "")
         self.refused(doc(version=j("v" * 24)), VERSION_MSG)
         self.refused(doc(version=j("é" * 12)), VERSION_MSG)  # 24 bytes, 12 characters
+
+    def test_names_and_versions_refuse_control_characters(self):  # Task 13's F7
+        # C0 (a decoded \n or \t, ESC), DEL and C1 (U+0080 to U+009F: U+009B is CSI to a terminal) would reach the
+        # console's replies and the hung app's log line as they are: refused where the manifest is read.
+        for text in ("A\u009b2J", "a\nb", "tab\there", "\x1b[31m", "del\x7f", "nel\u0085", "\u0080"):
+            with self.subTest(text=text):
+                self.refused(doc(name=j(text)), NAME_CONTROL_MSG)
+                self.refused(doc(version=j(text)), VERSION_CONTROL_MSG)
+        self.refused(doc(name='"a\\nb"'), NAME_CONTROL_MSG)  # the JSON escape \n, decoded to a newline
+        # The reviewer's manifest: its name is refused first.
+        self.refused('{"id":"timer","name":"A\\u009b2J","version":"\\u009b31m","api":1,"\\u009bk":0}', NAME_CONTROL_MSG)
+        # Text past C1 is text: a no-break space (U+00A0), accents, other scripts.
+        for text in ("\u00a0Caf\u00e9", "\u4e2d\u6587", "x\u00a0y"):
+            with self.subTest(text=text):
+                self.assertEqual(self.ok(doc(name=j(text)))["name"], text)
+                self.assertEqual(self.ok(doc(version=j(text)))["version"], text)
+        # The length rule still comes first for a name too long to read.
+        self.refused(doc(name=j("\n" * 30)), NAME_MSG)
+
+    def test_an_unknown_keys_controls_are_shown_as_question_marks(self):  # Task 13's F7: apps_install_shown's mapping
+        result = self.ok('{"id":"timer","name":"Timer","api":1,"\\u009bk":0,"q\\nz":1,"x\x7fy":2,"\\u00e9t\\u00e9":3}')
+        self.assertEqual(result["warnings"], "unknown key '?k' ignored; unknown key 'q?z' ignored; "
+                                             "unknown key 'x?y' ignored; unknown key '\u00e9t\u00e9' ignored")
 
     # ---- The id ----
 

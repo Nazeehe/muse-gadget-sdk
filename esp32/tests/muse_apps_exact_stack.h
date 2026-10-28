@@ -25,6 +25,12 @@
  * nothing, so that the function's caller has its frame exactly `size` bytes above the guard page. The region is painted
  * first, and the deepest byte the function changed gives its high-water mark.
  *
+ * The guard is one page (4 KB on x86-64 Linux, 16 KB on Apple silicon). A frame larger than that which writes nothing
+ * at its near end can jump it, where the compiler doesn't probe big frames (clang without -fstack-clash-protection),
+ * and then its writes land below the region unseen and the high-water mark reads low. The code these tests run keeps
+ * its frames small (no array over 128 bytes on the serial task's stack: tests/test_muse_apps_console.py checks it), so
+ * no frame comes near a page; a caller that can't say that should map a guard as large as its biggest frame.
+ *
  * Build such a harness without the sanitizers (apps_host.build(..., sanitize=False)), which fatten frames. Host frames
  * are bigger than the S3's (Task 5 measured 1.5 to 1.7 times on Xtensa's), so a pass here is a pass with room to spare
  * there, and the device's own high-water mark (uxTaskGetStackHighWaterMark) is the authority.

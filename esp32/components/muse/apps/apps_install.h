@@ -143,33 +143,39 @@ cJSON *apps_install_launch(apps_pkg_t *pkg, const apps_install_ops_t *ops);
  */
 cJSON *apps_install_status(const apps_status_t *st);
 
-/*
- * s[0, n), which someone typed, as a message shows it: valid UTF-8 as it is, each byte of a control character (under
- * 0x20, 0x7F) or of broken UTF-8 as '?', and a C1 control character (U+0080 to U+009F) as one '?'; cut at
- * APPS_SHOWN_MAX bytes on a character boundary, with "..." after the cut. out has room for APPS_SHOWN_MAX + 4 bytes.
- */
+/* What a message shows of text someone typed (an id, a path, a command): apps_text_shown (apps_pkg.h) with this max,
+ * into room for APPS_SHOWN_MAX + 4 bytes. */
 #define APPS_SHOWN_MAX 64
-void apps_install_shown(const char *s, size_t n, char *out);
 
 /*
- * The RAM store (C4): until Task 20's flash store, a committed package stays in PSRAM, one for each id and at most
- * APPS_RAM_APPS of them, until the gadget restarts. The store is the I/O worker's: every call below is made from a job
- * (apps_io_submit), never from another task, so it takes no lock. Each run gets a fresh copy (apps_ram_load), which the
- * app task frees when that app ends.
+ * The RAM store (C4): until Task 20's flash store, a committed package stays in PSRAM, one for each id, at most
+ * APPS_RAM_APPS of them, until the gadget restarts or the store drops it. The store is the I/O worker's: every call
+ * below is made from a job (apps_io_submit), never from another task, so it takes no lock. Each run gets a fresh copy
+ * (apps_ram_load), which the app task frees when that app ends: an app that runs is in PSRAM twice (C4, E26).
+ *
+ * Recency. The packages are kept most recent first: a commit (an install, with or without run) and a load (a run) make
+ * theirs the most recent. After every change (a commit, a load, a drop, a remove) the store gives the launcher its list
+ * (apps_task_set_list), so the LVGL task never asks the store (X11).
+ *
+ * Room. Before a copy (a commit's, a load's), free PSRAM (apps_port_psram_free) after it must still hold the app's heap
+ * (its memory_kb) and APPS_RAM_RESERVE. Short of that, the store drops its oldest packages, one at a time and looking
+ * again after each, never the app that runs (apps_task_running) nor the one being copied, each with one W log line,
+ * "ram: dropped <id> to make room"; short still, the copy is refused with "the gadget is short of memory for <id>: <F>
+ * KB free, <N> KB needed; restart it or install a smaller app" (F what is free then, N the copy, the heap and the
+ * reserve, rounded up). A commit of a new id into a full store drops the oldest the same way.
  */
 #define APPS_RAM_APPS 8
+#define APPS_RAM_RESERVE (1024 * 1024)  /* free PSRAM a copy leaves besides the app's heap (memory_kb) */
 
 typedef struct {
     char id[APPS_ID_MAX + 1], name[25], version[24];
 } apps_ram_entry_t;
 
-/* Keeps pkg (a block of apps_port_realloc, as all of its own are) in place of the package with its id. It takes pkg
- * whatever happens: false, with pkg freed, when APPS_RAM_APPS packages of other ids are kept already. */
-bool apps_ram_put(apps_pkg_t *pkg);
-
-/* A deep copy of id's package into out, every block of it from apps_port_realloc, for the caller to free (apps_pkg_free
- * with apps_port_free) or to give to apps_task_run. False, with out zeroed, when there is none or no memory for it. */
-bool apps_ram_load(const char *id, apps_pkg_t *out);
+/* A deep copy of id's package into out (a caller's apps_pkg_t), every block of it from apps_port_realloc, for the caller
+ * to free (apps_pkg_free with apps_port_free) or to give to apps_task_run; id becomes the most recent. False, with out
+ * zeroed and why in err ("no such app on the gadget", the store's refusal for room above, "out of memory: no room to load
+ * the app"), when there is none, no room or no memory for it. */
+bool apps_ram_load(const char *id, apps_pkg_t *out, char *err, size_t err_len);
 
 /* Whether a package of that id is kept. */
 bool apps_ram_has(const char *id);
@@ -177,10 +183,10 @@ bool apps_ram_has(const char *id);
 /* Frees id's package. False when there was none. */
 bool apps_ram_remove(const char *id);
 
-/* Up to max of the kept apps, in the order they were first committed; returns how many. */
+/* Up to max of the kept apps, most recent first; returns how many. */
 int apps_ram_list(apps_ram_entry_t *out, int max);
 
-/* ops->commit for the RAM store: a deep copy of pkg, kept by apps_ram_put. *unchanged is always false. Fails with
- * "out of memory: no room to keep the app in RAM", or with "the gadget keeps at most 8 apps in RAM; restart it to make
- * room" when the store is full of other ids. */
+/* ops->commit for the RAM store: a deep copy of pkg, kept in place of its id's (pkg stays the caller's); its id becomes
+ * the most recent. *unchanged is always false. Fails with the store's refusal for room above, or with "out of memory: no
+ * room to keep the app in RAM"; either way the store's copy of that id, if any, stays. */
 bool apps_ram_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t err_len);

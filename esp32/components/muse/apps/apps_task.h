@@ -147,12 +147,20 @@ bool apps_task_compile(const apps_pkg_t *pkg, char *err, size_t err_len);
 bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len);
 
 /*
+ * apps_task_run for a launch by id (muse_apps_launch's job): the run is decided where it is used, on the app task. When
+ * an app of pkg's id runs by the time the app task gets to the request, it stays as it is: it is fronted (front) or left
+ * where it is, pkg is freed, and the call is true with st the record as it is then (no settle). Otherwise this is
+ * apps_task_run. So two launches of one id in flight run it once, and the second fronts it.
+ */
+bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len);
+
+/*
  * Posts a launch of the app id and returns: it never waits, for the answer or for a frame, so the LVGL task (the
  * launcher's pick) can call it. The app task fronts the app that runs when it is that app (front) and leaves it where
  * it is otherwise. Any other id goes to muse_apps_launch (muse_apps.h): the I/O worker loads the store's copy and runs
- * it through apps_task_run, in front or behind; a refusal, or an id the store doesn't have, is one log line. A full
- * queue drops the launch, with a log line. The launcher lists the resident app, the last one run, whether it runs or
- * not, since the store keeps it; Task 17's alarms and Task 20's flash store build on this.
+ * it through apps_task_run_by_id, in front or behind; a refusal, or an id the store doesn't have, is one log line. A full
+ * queue drops the launch, with a log line. The launcher lists the store's apps whether they run or not
+ * (apps_task_set_list); Task 17's alarms and Task 20's flash store build on this.
  */
 void apps_task_launch(const char *id, bool front);
 
@@ -167,6 +175,29 @@ bool apps_task_stop(char *err, size_t err_len);
 /* A copy of the record (never NULL st). It posts nothing, and waits only for the record's lock, which is held for
  * copies. */
 void apps_task_status(apps_status_t *st);
+
+/* An app the launcher lists: its id and the name it shows (its manifest's name, or its id). */
+typedef struct {
+    char id[APPS_ID_MAX + 1], name[25];
+} apps_listed_t;
+
+#define APPS_TASK_LIST_MAX 8  /* the store's apps the launcher is told of (the RAM store keeps 8) */
+
+/*
+ * The launcher's list (cached data for the LVGL task, X11): the store's apps, most recent first, n of them (at most
+ * APPS_TASK_LIST_MAX; more are left out). The store's owner, the I/O worker, gives it after every change of the store
+ * (apps_install.h). It is copied under the names lock, which the caller waits for (held only for copies; a W log line
+ * says so in the unlikely case it stays busy for a second, and the list waits for the next change). When the launcher
+ * opens, the LVGL task shows the first APPS_LV_LAUNCHER_ROWS of it (taking the lock with its 2 ms try), the app that
+ * runs on the first row when they don't have it, so the launcher can always bring it back. A pick of the app that runs
+ * fronts it; a pick of any other launches it (apps_task_launch).
+ */
+void apps_task_set_list(const apps_listed_t *apps, int n);
+
+/* The app that runs, from when it is up (its start() has returned) until it ends (a stop, a crash, an exit, a hang once
+ * its call has come back), into id (cap bytes): true; false, with id "", when none does. Any task: it waits only for the
+ * names lock (held only for copies). The store never drops it. */
+bool apps_task_running(char *id, size_t cap);
 
 /*
  * Sends message(event, data_json) to the app id, which must be the one running (Task 24 adds starting a stored app

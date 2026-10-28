@@ -21,7 +21,8 @@
  * tests/test_muse_apps_console.py; it exits 0 when the case holds, and otherwise prints why.
  *
  * Fakes: apps_io_submit keeps the jobs and the case runs them (the I/O worker); the app task's calls (compile, run,
- * stop, status, message) record what they were given and answer what the case set. stdout, where the console prints
+ * stop, status, message, and the store's two: the launcher's list and the app that runs) record what they were given
+ * and answer what the case set. stdout, where the console prints
  * its replies with printf, is a file the harness reads back after each line (the fake printf sink); at the end the
  * whole of it goes to the real stdout, where the Python test checks that every reply is one line of valid JSON. The
  * port is a counting allocator that can refuse, and cJSON's allocations are counted too, so each case ends with
@@ -178,12 +179,15 @@ typedef union {
 } block_t;
 
 static size_t port_held;      /* apps_port_realloc's bytes */
+static size_t port_peak;      /* the most port_held has been since a case zeroed it */
+static long port_growths;     /* the requests for a bigger block, since a case zeroed it */
 static long port_refuse = -1; /* refuse the Nth growth request from now (0: the next), -1: never */
 
 void *apps_port_realloc(void *ptr, size_t n) {
     CHECK(n > 0, "apps_port_realloc(%p, 0)", ptr);
     block_t *b = ptr != NULL ? (block_t *)ptr - 1 : NULL;
     size_t old = b != NULL ? b->size : 0;
+    port_growths += n > old;
     if (n > old && port_refuse >= 0 && port_refuse-- == 0) {
         return NULL;
     }
@@ -193,6 +197,7 @@ void *apps_port_realloc(void *ptr, size_t n) {
     }
     nb->size = n;
     port_held = port_held - old + n;
+    port_peak = port_held > port_peak ? port_held : port_peak;
     return nb + 1;
 }
 
@@ -213,6 +218,11 @@ int64_t apps_port_mono_ms(void) {
 bool apps_port_epoch_ms(int64_t *out) {
     (void)out;
     return false;
+}
+
+/* The store's room: plenty (tests/test_muse_apps_install.py has the budget). */
+size_t apps_port_psram_free(void) {
+    return (size_t)64 << 20;
 }
 
 void apps_port_log(const char *app_id, const char *line) {
@@ -352,6 +362,16 @@ static char run_id[APPS_ID_MAX + 1], run_err[300];
 static const char *run_log = "hello from start";
 static const char *run_error_record = "";
 
+/* A launch by id's run (F10): counted, then run as apps_task_run (the app task's choice is tests/test_muse_apps_task.py's). */
+static int runs_by_id;
+
+bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len);
+
+bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
+    runs_by_id++;
+    return apps_task_run(pkg, front, settle_ms, st, err, err_len);
+}
+
 bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
     runs++;
     run_front = front;
@@ -391,6 +411,22 @@ bool apps_task_stop(char *err, size_t err_len) {
 }
 
 static apps_status_t status_record; /* what apps_task_status copies */
+
+/* The store's calls into the app task: the list it gives the launcher, and the app that runs (none here). */
+static char listed[1024];
+
+void apps_task_set_list(const apps_listed_t *apps, int n) {
+    size_t at = 0;
+    listed[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        at += (size_t)snprintf(listed + at, sizeof listed - at, "%s%s:%s", i > 0 ? " " : "", apps[i].id, apps[i].name);
+    }
+}
+
+bool apps_task_running(char *id, size_t cap) {
+    snprintf(id, cap, "%s", "");
+    return false;
+}
 
 void apps_task_status(apps_status_t *st) {
     memcpy(st, &status_record, sizeof *st);
@@ -760,7 +796,6 @@ static void commit_submits_staged_files(void) {
     CHECK(line("app.commit hello run"), "commit not taken");
     EXPECT("");
     CHECK(n_jobs == 1, "one job: %d", n_jobs);
-    size_t staged = port_held;
     run_jobs();
     /* The pipeline read the staged files as they were put (and only the listed ones), compiled, kept and ran them. */
     CHECK(n_compiled == 4, "compile saw %d files", n_compiled);
@@ -779,9 +814,9 @@ static void commit_submits_staged_files(void) {
     EXPECT_LINE("@app {\"op\":\"commit\",\"ok\":true,\"payload\":{\"id\":\"hello\",\"version\":\"2.1.0\",", "\"storage\":\"ram\"",
                 "\"path\":\"logo.bin\"", want_bytes, "\"state\":\"running\"", "\"log\":[\"hello from start\"]",
                 "\"ui\":[{\"id\":\"label#0\"", "\"mem_kb\":18", "\"peak_kb\":21");
-    /* The stage went into the job and the job freed it: what is held is the RAM store's copy. */
-    CHECK(port_held < staged, "the stage was freed: %zu then %zu", staged, port_held);
-    CHECK(apps_ram_has("hello"), "kept in RAM");
+    /* The stage went into the job and the job freed it: what is held is the RAM store's copy, and nothing once it goes. */
+    CHECK(apps_ram_has("hello") && port_held > 0, "kept in RAM");
+    CHECK(apps_ram_remove("hello") && port_held == 0, "the stage was freed: %zu bytes held besides the store's", port_held);
     /* Nothing is staged any more; a put after the commit starts a new stage. */
     CHECK(line("app.commit hello"), "commit");
     EXPECT("@app.err {\"op\":\"commit\",\"id\":\"hello\",\"message\":\"nothing is staged for hello: send its files with "
@@ -871,6 +906,7 @@ static void launch_runs_an_installed_app(void) {
            "main.lua:2: boom\\nstack traceback:\\n\\tmain.lua:2: in function 'start'\\nlog:\\none\\ntwo\"}}\n");
     /* The store still has it: a run takes a copy. */
     CHECK(apps_ram_has("hello"), "still installed");
+    CHECK(runs_by_id == 0, "app.launch runs the store's copy afresh, whatever runs");
     /* Short of memory. */
     submit_refuses = true;
     CHECK(line("app.launch hello"), "launch");
@@ -903,6 +939,8 @@ static void launch_by_id_prints_nothing(void) {
     EXPECT("");
     CHECK(runs == before + 1 && !run_front && run_settle == 0 && strcmp(run_id, "hello") == 0,
           "run behind with no settle: runs %d front %d settle %d id %s", runs - before, run_front, run_settle, run_id);
+    CHECK(runs_by_id == 1, "a launch by id runs by id (F10: the app task fronts the app if it runs by then): %d",
+          runs_by_id);
     CHECK(muse_apps_launch("hello", true), "queued");
     run_jobs();
     EXPECT("");
@@ -928,6 +966,7 @@ static void launch_by_id_prints_nothing(void) {
     CHECK(!muse_apps_launch("Not An Id", true), "not an id");
     CHECK(runs == before + 3 && logs == logged + 1, "a refused submit logs nothing here; a bad id logs once (%d)",
           logs - logged);
+    CHECK(runs_by_id == 3, "every launch by id ran by id: %d", runs_by_id);
     EXPECT("");
 }
 
@@ -1048,8 +1087,10 @@ static void list_shows_installed_apps(void) {
     (void)take_output();
     CHECK(line("app.list"), "list");
     run_jobs();
-    EXPECT("@app {\"op\":\"list\",\"storage\":\"ram\",\"apps\":[{\"id\":\"hello\",\"name\":\"Hello\",\"version\":"
-           "\"1.0.0\"},{\"id\":\"timer\",\"name\":\"Timer\",\"version\":\"0.3\"}]}\n");
+    /* Most recent first, as the launcher lists them (F1). */
+    EXPECT("@app {\"op\":\"list\",\"storage\":\"ram\",\"apps\":[{\"id\":\"timer\",\"name\":\"Timer\",\"version\":"
+           "\"0.3\"},{\"id\":\"hello\",\"name\":\"Hello\",\"version\":\"1.0.0\"}]}\n");
+    CHECK(strcmp(listed, "timer:Timer hello:Hello") == 0, "the launcher's list: %s", listed);
     CHECK(line("app.list all"), "list");
     EXPECT("@app.err {\"op\":\"list\",\"message\":\"usage: app.list\"}\n");
 }
@@ -1135,6 +1176,90 @@ static void stage_out_of_memory(void) {
     EXPECT_LINE("@app {\"op\":\"commit\",\"ok\":true,", NULL);
 }
 
+/* F5: one install at a time comes first. The same commit sent again while its job waits is busy (not "nothing is
+ * staged", though its stage went into the job), and a commit with nothing staged gives the hold back. */
+static void a_repeated_commit_is_busy(void) {
+    stage_hello();
+    CHECK(line("app.commit hello run"), "commit");
+    EXPECT("");
+    CHECK(line("app.commit hello run"), "commit");
+    EXPECT("@app.err {\"op\":\"commit\",\"id\":\"hello\",\"message\":\"busy: another install is running\"}\n");
+    run_jobs();
+    EXPECT_LINE("@app {\"op\":\"commit\",\"ok\":true,\"payload\":{\"id\":\"hello\"", NULL);
+    CHECK(runs == 1, "one install ran: %d", runs);
+    CHECK(line("app.commit hello"), "commit");
+    EXPECT("@app.err {\"op\":\"commit\",\"id\":\"hello\",\"message\":\"nothing is staged for hello: send its files with "
+           "app.put first\"}\n");
+    CHECK(apps_install_try_begin(), "nothing staged gave the hold back");
+    apps_install_end();
+}
+
+/* F6: the stage holds what was put and a small slack beyond it (with its own block, under 64 KB), so at most 2 MB and
+ * 64 KB whatever the files' sizes: checked after every piece. The reviewer's in-limit set, five 257 KB images and five
+ * 129 KB modules (1.88 MB) put in 576-byte pieces, made 3.75 MB of blocks when each grew by doubling up to its kind's
+ * limit. */
+static void the_stage_is_bounded(void) {
+    port_peak = port_held;
+    port_growths = 0;
+    size_t before = port_held, content = 0, worst = 0;
+    for (int i = 0; i < 10; i++) {
+        char path[16];
+        size_t len = i < 5 ? 257 * KB : 129 * KB;
+        snprintf(path, sizeof path, i < 5 ? "img%d.bin" : "mod%d.lua", i);
+        unsigned seq = 0;
+        for (size_t at = 0; at < len; at += 576, seq++) {
+            size_t n = len - at < 576 ? len - at : 576;
+            CHECK(put("big", path, seq, ZEROS, n), "put not taken");
+            char *got = take_output();
+            char want[64];
+            snprintf(want, sizeof want, "@app.ack %s %u\n", path, seq);
+            CHECK(strcmp(got, want) == 0, "%s seq %u: %s", path, seq, got);
+            free(got);
+            content += n;
+            size_t over = port_held - before > content ? port_held - before - content : 0;
+            worst = over > worst ? over : worst;
+        }
+    }
+    fprintf(stderr, "the_stage_is_bounded: %zu bytes put, %zu held at most, %zu more than put at worst, %ld growths\n",
+            content, port_peak - before, worst, port_growths);
+    CHECK(worst < 64 * KB, "the stage held %zu bytes more than was put", worst);
+    CHECK(port_peak - before <= APPS_APP_MAX + 64 * KB, "the stage took %zu bytes at most for %zu put: over 2 MB and 64 KB",
+          port_peak - before, content);
+    /* And a block still grows by a good step, not a piece at a time: 3,431 pieces, a few hundred growths at most. */
+    CHECK(port_growths < 400, "%ld growths for %zu bytes in 576-byte pieces", port_growths, content);
+}
+
+/* T5 and F8: the stage's own reads. A file the manifest lists that was never put, or no manifest.json, fails the read
+ * with "it wasn't sent", the stage freed and the hold let go. An empty file (seq 0 with no base64: its first piece adds
+ * nothing to no block) installs as a file of 0 bytes. */
+static void empty_and_missing_files(void) {
+    static const char manifest[] = "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"lib.lua\"]}";
+    put_text("hello", "manifest.json", manifest);
+    put_text("hello", "main.lua", MAIN_HELLO);
+    CHECK(line("app.commit hello"), "commit");
+    run_jobs();
+    EXPECT("@app {\"op\":\"commit\",\"ok\":false,\"error\":{\"code\":\"read_failed\",\"message\":\"reading lib.lua: it "
+           "wasn't sent (app.put)\"}}\n");
+    CHECK(port_held == 0, "the stage was freed: %zu bytes held", port_held);
+    CHECK(apps_install_try_begin(), "the hold was let go");
+    apps_install_end();
+    put_text("hello", "main.lua", MAIN_HELLO);
+    CHECK(line("app.commit hello"), "commit");
+    run_jobs();
+    EXPECT("@app {\"op\":\"commit\",\"ok\":false,\"error\":{\"code\":\"read_failed\",\"message\":\"reading "
+           "manifest.json: it wasn't sent (app.put)\"}}\n");
+    CHECK(port_held == 0, "the stage was freed: %zu bytes held", port_held);
+    put_text("hello", "manifest.json", manifest);
+    put_text("hello", "main.lua", MAIN_HELLO);
+    CHECK(line("app.put hello lib.lua 0 "), "put");
+    EXPECT("@app.ack lib.lua 0\n");
+    CHECK(line("app.commit hello"), "commit");
+    run_jobs();
+    EXPECT_LINE("@app {\"op\":\"commit\",\"ok\":true,", "{\"path\":\"lib.lua\",\"bytes\":0,\"sha256\":"
+                "\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}");
+    CHECK(n_compiled == 2 && strcmp(compiled[1].path, "lib.lua") == 0 && compiled[1].len == 0, "compile saw lib.lua empty");
+}
+
 /* R13.1: the hook on exactly the console task's 3,584 bytes, through a put, a commit, a status and a send. */
 #define SERIAL_STACK 3584
 
@@ -1210,6 +1335,9 @@ int main(int argc, char **argv) {
         {"send_returns_the_reply", send_returns_the_reply},
         {"foreign_and_unknown_lines", foreign_and_unknown_lines},
         {"stage_out_of_memory", stage_out_of_memory},
+        {"a_repeated_commit_is_busy", a_repeated_commit_is_busy},
+        {"the_stage_is_bounded", the_stage_is_bounded},
+        {"empty_and_missing_files", empty_and_missing_files},
         {"console_stack", console_stack},
     };
     if (argc != 2) {

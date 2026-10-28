@@ -56,7 +56,8 @@
  * - s_rec_lock: the record's status, taken by the app task to write it and by apps_task_status to copy it;
  * - s_req_lock: a request's last fields and the caller's buffers, which the app task writes only while the caller
  *   still waits; a caller that gives up marks the request abandoned under it, and the app task writes nothing more;
- * - s_names_lock: what the LVGL task reads of the app (its name, the resident app, a crash card to show);
+ * - s_names_lock: what the LVGL task reads of the apps (the app that runs, the store's list for the launcher, a crash
+ *   card to show), written by the app task and by the store's owner, the I/O worker;
  * - apps_port_ui_lock: the widget table (apps_ui.h), and the table's pointer in apps_lv (apps_lv_set_ui).
  * The order, where two are held: s_req_lock or s_rec_lock, then the UI lock.
  *
@@ -71,6 +72,10 @@
  * The layer's place. The app task asks (front_req, tagged with the asking app); the LVGL task carries it out in
  * muse_apps_ui_supervise, holds a front back during a voice turn and until the app's table is published, and decides
  * at the turn's end, after it has seen the frame's requests. What it knows of an app goes when another begins.
+ *
+ * The echo. An app's print only queues its line (apps_port_log); the app task prints the queue after every call and in
+ * its housekeeping (apps_port_log_drain), never inside a call, so a console another task holds never counts against an
+ * app's wall clock.
  */
 
 static const char *TAG = "muse_apps";
@@ -130,6 +135,7 @@ typedef struct {
     code_t code[APPS_MAX_FILES];
     const char *event, *data;   /* a message's, in the block: NUL-terminated, data data_len bytes */
     size_t data_len;
+    bool by_id;                 /* a run's: a launch by id, which fronts an app of pkg's id that runs (F10) */
     apps_status_t *st;          /* the caller's buffers */
     char *err;
     size_t err_len;
@@ -160,13 +166,16 @@ typedef struct {
     uint32_t dropped_base;     /* dropped when it was launched */
     /* Under s_names_lock. */
     struct {
-        bool resident;                      /* the launcher lists the app: it runs, or it was the last to run and
-                                             * the store keeps it (false while a new one loads) */
-        char id[APPS_ID_MAX + 1], name[25];
+        bool running;                       /* the app below runs: from when it is up (start() has returned) until
+                                             * it ends */
+        char id[APPS_ID_MAX + 1], name[25]; /* the last app launched, and the name it shows (the hung card's too) */
+        int list_n;                         /* the store's apps, most recent first (apps_task_set_list) */
+        apps_listed_t list[APPS_TASK_LIST_MAX];
         bool card;                          /* a crash card to show, once reset card_after has run */
         uint32_t card_after;
         char card_name[25], card_line[FIRST_LINE_MAX];
     } names;
+    apps_listed_t rows[APPS_LV_LAUNCHER_ROWS];  /* the LVGL task's alone: the launcher's rows, copied out of names */
 } record_t;
 
 static atomic_bool s_up;
@@ -453,9 +462,10 @@ static void complete(req_t *r, bool ok, const char *err) {
     complete_with(r, ok, err, NULL);
 }
 
-static void set_resident(bool resident) {
+/* The app task's word on the app that runs, for the launcher and the store (apps_task_running). */
+static void set_running(bool running) {
     if (names_take(LOCK_MS)) {
-        s_rec->names.resident = resident;
+        s_rec->names.running = running;
         names_give();
     }
 }
@@ -632,6 +642,7 @@ static void call_finish(void) {
     }
     roll_to(now / 1000);
     T.dirty = true;
+    apps_port_log_drain();  /* the call's echo, now that its wall clock has stopped */
 }
 
 /* The hung app is gone: the task goes back to its priority and serves calls again. */
@@ -691,7 +702,7 @@ static void end_app(end_t how) {
     }
     ESP_LOGI(TAG, "stop %s: %s, peak %u KB, stack %u free", s_rec->st.id, END_NAMES[how], (unsigned)s_rec->st.peak_kb,
              (unsigned)s_rec->st.stack_free);
-    set_resident(true);  /* stopped or crashed, it stays in the store: the launcher lists it */
+    set_running(false);  /* the launcher lists it still while the store has it */
     apps_rt_free(T.rt);
     T.rt = NULL;
     uint32_t reset;
@@ -762,7 +773,7 @@ static void begin_app(apps_pkg_t *pkg) {
         rec_give();
     }
     if (names_take(LOCK_MS)) {
-        s_rec->names.resident = false;  /* listed once it is up, or once it has ended */
+        s_rec->names.running = false;  /* running once it is up */
         s_rec->names.card = false;  /* an earlier app's crash card not shown yet would come up over this one */
         put_text(s_rec->names.id, sizeof s_rec->names.id, m->id);
         put_text(s_rec->names.name, sizeof s_rec->names.name, m->name[0] != '\0' ? m->name : m->id);
@@ -783,7 +794,7 @@ static void no_app(const char *err) {
     ESP_LOGW(TAG, "launch %s: no app: %s", T.pkg->manifest.id, err);
     free_pkg(T.pkg);
     T.pkg = NULL;
-    set_resident(true);  /* the store keeps it: another launch may find the room */
+    set_running(false);  /* the store keeps it: another launch may find the room */
     complete(T.pending, false, err);
     T.pending = NULL;
     request_front(false);
@@ -906,7 +917,7 @@ static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms) {
     }
     T.publish = true;
     try_publish();
-    set_resident(true);
+    set_running(true);  /* up: the launcher lists it first if it must, and the store never drops it */
     request_front(front);
     refresh_record();
     T.settle_until = apps_port_mono_ms() + settle_ms;  /* its events run for settle_ms from here (the loop's rounds) */
@@ -941,6 +952,15 @@ static void on_run(req_t *r) {
     if (!wanted(r)) {
         free_pkg(pkg);  /* its caller gave up before it began */
         complete(r, false, NULL);
+        return;
+    }
+    if (r->by_id && app_runs(T.gen) && strcmp(T.pkg->manifest.id, pkg->manifest.id) == 0) {
+        /* A launch by id of the app that runs by now (F10): fronted (or left where it is), not started again. */
+        free_pkg(pkg);
+        if (r->front) {
+            request_front(true);
+        }
+        complete(r, true, NULL);
         return;
     }
     run_locked(pkg, r->front, r, r->settle_ms);
@@ -1054,6 +1074,7 @@ static void housekeeping(void) {
     if (T.rt != NULL && T.dirty && apps_port_mono_ms() >= T.refresh_at) {
         refresh_record();
     }
+    apps_port_log_drain();
 }
 
 static int receive_ms(void) {
@@ -1213,6 +1234,32 @@ static void carry_out_front(void) {
     }
 }
 
+/*
+ * The launcher's rows, into s_rec->rows (the names lock held): the store's apps, most recent first, as many as there
+ * are rows, with the app that runs on the first row when they don't have it (the store never drops it, but a run that
+ * didn't come from the store, as on the host, isn't in it), so the launcher can always bring it back.
+ */
+static int launcher_rows(void) {
+    const int n = s_rec->names.list_n;
+    const apps_listed_t *list = s_rec->names.list;
+    bool listed = !s_rec->names.running;
+    for (int i = 0; i < n && i < APPS_LV_LAUNCHER_ROWS && !listed; i++) {
+        listed = strcmp(list[i].id, s_rec->names.id) == 0;
+    }
+    int rows = 0;
+    if (!listed) {
+        put_text(s_rec->rows[0].id, sizeof s_rec->rows[0].id, s_rec->names.id);
+        put_text(s_rec->rows[0].name, sizeof s_rec->rows[0].name, s_rec->names.name);
+        rows = 1;
+    }
+    for (int i = 0; i < n && rows < APPS_LV_LAUNCHER_ROWS; i++) {
+        if (listed || strcmp(list[i].id, s_rec->names.id) != 0) {
+            s_rec->rows[rows++] = list[i];
+        }
+    }
+    return rows;
+}
+
 /* The cards the app task and other tasks asked for: never during a voice turn. */
 static void show_cards(void) {
     if (L.hung_card) {
@@ -1222,8 +1269,9 @@ static void show_cards(void) {
         }
     }
     bool launcher = atomic_load(&s_launcher_wanted);
-    bool card = false, resident = false;
-    char name[25] = "", line[FIRST_LINE_MAX] = "", id[APPS_ID_MAX + 1] = "", app[25] = "";
+    bool card = false;
+    int rows = 0;
+    char name[25] = "", line[FIRST_LINE_MAX] = "";
     if (!names_take(NAMES_LOCK_MS)) {
         return;  /* next frame */
     }
@@ -1234,9 +1282,7 @@ static void show_cards(void) {
         put_text(line, sizeof line, s_rec->names.card_line);
     }
     if (launcher) {
-        resident = s_rec->names.resident && !atomic_load(&s_rec->hung);
-        put_text(id, sizeof id, s_rec->names.id);
-        put_text(app, sizeof app, s_rec->names.name);
+        rows = launcher_rows();
     }
     names_give();
     if (card) {
@@ -1244,9 +1290,12 @@ static void show_cards(void) {
     }
     if (launcher) {
         atomic_store(&s_launcher_wanted, false);
-        const char *ids[] = {id};
-        const char *names[] = {app};
-        apps_lv_show_launcher(ids, names, resident ? 1 : 0, on_pick);
+        const char *ids[APPS_LV_LAUNCHER_ROWS], *names[APPS_LV_LAUNCHER_ROWS];
+        for (int i = 0; i < rows; i++) {
+            ids[i] = s_rec->rows[i].id;
+            names[i] = s_rec->rows[i].name;
+        }
+        apps_lv_show_launcher(ids, names, rows, on_pick);  /* it copies them */
     }
 }
 
@@ -1378,7 +1427,8 @@ static bool await(req_t *r, int64_t until, int ms, char *err, size_t err_len) {
     }
 }
 
-bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
+static bool run_request(apps_pkg_t *pkg, bool front, bool by_id, int settle_ms, apps_status_t *st, char *err,
+                        size_t err_len) {
     put_text(err, err_len, "");
     if (pkg == NULL) {
         put_text(err, err_len, "no package to run");
@@ -1399,6 +1449,7 @@ bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st
     }
     r->pkg = pkg;
     r->front = front;
+    r->by_id = by_id;
     r->settle_ms = settle_ms < 0 ? 0 : settle_ms > SETTLE_MAX_MS ? SETTLE_MAX_MS : settle_ms;
     r->st = st;
     r->err = err;
@@ -1421,6 +1472,14 @@ bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st
     }
     release(r);
     return ok;
+}
+
+bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
+    return run_request(pkg, front, false, settle_ms, st, err, err_len);
+}
+
+bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
+    return run_request(pkg, front, true, settle_ms, st, err, err_len);
 }
 
 static void add_code(req_t *r, char **at, const apps_blob_t *b) {
@@ -1492,6 +1551,36 @@ bool apps_task_compile(const apps_pkg_t *pkg, char *err, size_t err_len) {
     bool ok = await(r, until, APPS_TASK_WAIT_MS, err, err_len) && r->ok;
     release(r);
     return ok;
+}
+
+void apps_task_set_list(const apps_listed_t *apps, int n) {
+    if (!atomic_load(&s_up)) {
+        return;
+    }
+    n = apps == NULL || n < 0 ? 0 : n > APPS_TASK_LIST_MAX ? APPS_TASK_LIST_MAX : n;
+    if (!names_take(LOCK_MS)) {
+        ESP_LOGW(TAG, "the launcher's list wasn't updated: the names were busy");
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        put_text(s_rec->names.list[i].id, sizeof s_rec->names.list[i].id, apps[i].id);
+        put_text(s_rec->names.list[i].name, sizeof s_rec->names.list[i].name, apps[i].name);
+    }
+    s_rec->names.list_n = n;
+    names_give();
+}
+
+bool apps_task_running(char *id, size_t cap) {
+    bool running = false;
+    put_text(id, cap, "");
+    if (atomic_load(&s_up) && names_take(LOCK_MS)) {
+        running = s_rec->names.running;
+        if (running) {
+            put_text(id, cap, s_rec->names.id);
+        }
+        names_give();
+    }
+    return running;
 }
 
 void apps_task_launch(const char *id, bool front) {

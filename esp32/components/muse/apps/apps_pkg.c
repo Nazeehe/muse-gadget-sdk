@@ -208,6 +208,48 @@ apps_file_kind_t apps_file_kind(const char *path) {
     return APPS_FILE_BAD;
 }
 
+size_t apps_file_max(apps_file_kind_t kind) {
+    switch (kind) {
+    case APPS_FILE_LUA:
+        return APPS_LUA_MAX;
+    case APPS_FILE_JSON:
+        return APPS_JSON_FILE_MAX;
+    case APPS_FILE_IMAGE:
+        return APPS_IMAGE_MAX;
+    default:
+        return 0;
+    }
+}
+
+char *apps_text_shown(const char *s, size_t n, size_t max, char *out) {
+    const unsigned char *p = (const unsigned char *)(s != NULL ? s : ""), *end = p + (s != NULL ? n : 0);
+    size_t used = 0;
+    while (p < end) {
+        size_t take = 1, put = 1;
+        bool keep = *p >= 0x20 && *p != 0x7F;
+        if (*p >= 0x80) {
+            int k = apps_json_utf8_len(p, end);
+            keep = k > 0 && !(k == 2 && p[0] == 0xC2 && p[1] < 0xA0);  /* not broken, not C1 */
+            take = k > 0 ? (size_t)k : 1;
+            put = keep ? take : 1;
+        }
+        if (used + put > max) {
+            memcpy(out + used, "...", 3);
+            used += 3;
+            break;
+        }
+        if (keep) {
+            memcpy(out + used, p, take);
+        } else {
+            out[used] = '?';
+        }
+        used += put;
+        p += take;
+    }
+    out[used] = '\0';
+    return out;
+}
+
 /* ==== The manifest ==== */
 
 /* The keys the manifest reads, in the order apps_pkg.h checks them (and the candidates of "did you mean"). */
@@ -268,14 +310,19 @@ static bool warned(const char *warnings, const char *w) {
     return false;
 }
 
-/* The warning for a key the manifest doesn't read, once, if it fits whole in what is left (R7.7). */
+/* The warning for a key the manifest doesn't read, once, if it fits whole in what is left (R7.7). The key is shown as
+ * apps_text_shown shows text from outside (a control character as '?': the warnings reach the console's replies), never
+ * cut: it has at most TEXT_MAX - 1 bytes, and the mapping never lengthens it. */
 static NOINLINE void warn_unknown(apps_manifest_t *m, const char *key) {
     char w[320];  /* a key of 255 bytes, a suggestion of 11 and the words */
     const char *suggestion = apps_suggest(key, k_names, K_COUNT);
+    size_t at = (size_t)snprintf(w, sizeof w, "unknown key '");
+    apps_text_shown(key, strlen(key), TEXT_MAX - 1, w + at);
+    at += strlen(w + at);
     if (suggestion != NULL) {
-        snprintf(w, sizeof w, "unknown key '%s' ignored (did you mean '%s'?)", key, suggestion);
+        snprintf(w + at, sizeof w - at, "' ignored (did you mean '%s'?)", suggestion);
     } else {
-        snprintf(w, sizeof w, "unknown key '%s' ignored", key);
+        snprintf(w + at, sizeof w - at, "' ignored");
     }
     size_t have = strlen(m->warnings), n = strlen(w), sep = have > 0 ? 2 : 0;
     if (have + sep + n + 1 > sizeof m->warnings || warned(m->warnings, w)) {
@@ -369,21 +416,39 @@ static NOINLINE bool check_id(parse_t *p) {
                 quote(&shown, v, text, read), p->folder != NULL ? echo(&folder, p->folder, strlen(p->folder)) : "");
 }
 
+/* Whether s, valid UTF-8, holds a control character: C0 (under 0x20: a decoded \n too), DEL, or C1 (U+0080 to U+009F,
+ * C2 80 to C2 9F), which a terminal reads as the start of an escape (U+009B is CSI). */
+static bool has_control(const char *s) {
+    for (const unsigned char *c = (const unsigned char *)s; *c != '\0'; c++) {
+        if (*c < 0x20 || *c == 0x7F || (c[0] == 0xC2 && c[1] >= 0x80 && c[1] <= 0x9F)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The name and the version reach the console's replies and log lines as they are: no control character in them. */
 static NOINLINE bool check_name(parse_t *p) {
     char text[TEXT_MAX];
-    if (decode_string(p->val[K_NAME], text, sizeof text) && text[0] != '\0' && strlen(text) < sizeof p->m->name) {
-        copy_text(p->m->name, sizeof p->m->name, text);
-        return true;
+    if (!decode_string(p->val[K_NAME], text, sizeof text) || text[0] == '\0' || strlen(text) >= sizeof p->m->name) {
+        return fail(p, "manifest: name must be 1 to 24 characters");
     }
-    return fail(p, "manifest: name must be 1 to 24 characters");
+    if (has_control(text)) {
+        return fail(p, "manifest: name has a control character");
+    }
+    copy_text(p->m->name, sizeof p->m->name, text);
+    return true;
 }
 
 static NOINLINE bool check_version(parse_t *p) {
     slice_t v = p->val[K_VERSION];
-    if (v.p == NULL || decode_string(v, p->m->version, sizeof p->m->version)) {
-        return true;
+    if (v.p != NULL && !decode_string(v, p->m->version, sizeof p->m->version)) {
+        return fail(p, "manifest: version must be text of at most 23 characters, like \"1.0.0\"");
     }
-    return fail(p, "manifest: version must be text of at most 23 characters, like \"1.0.0\"");
+    if (has_control(p->m->version)) {
+        return fail(p, "manifest: version has a control character");
+    }
+    return true;
 }
 
 static NOINLINE bool check_api(parse_t *p) {

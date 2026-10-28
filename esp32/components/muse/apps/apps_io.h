@@ -22,8 +22,10 @@
  * store's reads and writes from Task 20 (X11: a task with a PSRAM stack never touches flash), the snapshot's upload
  * from Task 25.
  *
- * The task has a stack of APPS_IO_STACK bytes in internal RAM and priority APPS_IO_PRIORITY, on either core. It is made
- * when a job comes and there is none, and it deletes itself once it has had no job for APPS_IO_IDLE_MS, logging the
+ * The task has a stack of APPS_IO_STACK bytes in internal RAM and priority APPS_IO_PRIORITY, on core APPS_IO_CORE: its
+ * long console lines (a 6 KB reply spins about 0.53 s on the driverless UART) and its heavy steps (SHA-256, package
+ * copies, the result's trim) never come in front of the app task or LVGL, on core 1. It is made when a job comes and
+ * there is none, and it deletes itself once it has had no job for APPS_IO_IDLE_MS, logging the
  * least stack it had left: "io: idle, stack %u of %u free". So it costs no internal RAM while nothing is being
  * installed.
  *
@@ -35,6 +37,7 @@
 
 #define APPS_IO_STACK 6144        /* bytes, internal RAM */
 #define APPS_IO_PRIORITY 3        /* over the app task (2), under the console (5) and the screen's tasks */
+#define APPS_IO_CORE 0            /* the app task and LVGL are on core 1 */
 #define APPS_IO_IDLE_MS 2000      /* the worker goes after this long without a job */
 #define APPS_IO_HEADROOM 16384    /* internal RAM a submit leaves free besides the worker's stack */
 #define APPS_IO_BLOCK_MARGIN 1024 /* what the largest free internal block keeps besides a new worker's stack and TCB */

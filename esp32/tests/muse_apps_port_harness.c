@@ -20,11 +20,13 @@
  *
  * Its ESP-IDF, FreeRTOS and PSA are fakes (the declarations of tests/muse_apps_task_fakes.h, defined here): a clock the
  * case sets, a log that keeps what the port logs, mutexes of pthreads, and tasks that are threads. The console is
- * stdout, sent to a file the case reads back.
+ * stdout, sent to a file the case reads back; another thread can hold it (flockfile), as another task's long reply
+ * holds the device's console.
  */
 
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -95,6 +97,16 @@ static void dump_log(void) {
 void *heap_caps_realloc(void *ptr, size_t size, uint32_t caps) {
     (void)caps;
     return realloc(ptr, size);
+}
+
+void *heap_caps_malloc(size_t size, uint32_t caps) {
+    (void)caps;
+    return malloc(size);
+}
+
+size_t heap_caps_get_free_size(uint32_t caps) {
+    (void)caps;
+    return (size_t)3 << 20;
 }
 
 void heap_caps_free(void *ptr) {
@@ -264,6 +276,7 @@ static void echo_bucket(void) {
  * after "@app.log <id> (<N> lines not echoed)", which takes its bytes from the bucket too. */
 static void echo_lines(void) {
     console_start();
+    apps_port_init();
     char x200[201];
     memset(x200, 'x', 200);
     x200[200] = '\0';
@@ -275,18 +288,21 @@ static void echo_lines(void) {
     for (int i = 0; i < 6; i++) {
         apps_port_log("hello", x200);
     }
+    apps_port_log_drain();  /* the app task's, after the call */
     for (int i = 0; i < 4; i++) {
         strcat(expect, line);
     }
     /* 60 ms later, 156 + 61.44 bytes: the line (217) would fit, but not with its note (37 + 217): not echoed either. */
     clock_at_ms(10060);
     apps_port_log("hello", x200);
+    apps_port_log_drain();
     /* 100 ms after the burst, 258.4 bytes: the note and the line (254) fit, and 4.4 bytes are left. */
     clock_at_ms(10100);
     apps_port_log("hello", x200);
     strcat(expect, "@app.log hello (3 lines not echoed)\n");
     strcat(expect, line);
     apps_port_log("hello", "bye");  /* 20 bytes: not echoed */
+    apps_port_log_drain();
     /* A quiet second fills the bucket, and no more: the note and the line (37 + 21), then four long lines (868); the
      * fifth doesn't fit in the 98 bytes left. */
     clock_at_ms(12000);
@@ -295,9 +311,102 @@ static void echo_lines(void) {
     for (int i = 0; i < 5; i++) {
         apps_port_log("hello", x200);
     }
+    apps_port_log_drain();
     for (int i = 0; i < 4; i++) {
         strcat(expect, line);
     }
+    apps_port_log_drain();  /* nothing more */
+    char *got = console_text();
+    CHECK(strcmp(got, expect) == 0, "the console:\n%s\nexpected:\n%s", got, expect);
+    free(got);
+    console_end();
+}
+
+/* Another task's long reply: it holds the console (stdout's lock) until the case lets it go. */
+static pthread_mutex_t hold_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t hold_cv = PTHREAD_COND_INITIALIZER;
+static bool console_held, console_release;
+
+static void *hold_the_console(void *arg) {
+    (void)arg;
+    flockfile(stdout);
+    pthread_mutex_lock(&hold_mu);
+    console_held = true;
+    pthread_cond_broadcast(&hold_cv);
+    while (!console_release) {
+        pthread_cond_wait(&hold_cv, &hold_mu);
+    }
+    pthread_mutex_unlock(&hold_mu);
+    funlockfile(stdout);
+    return NULL;
+}
+
+static int64_t wall_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* F3: apps_port_log never waits for the console: it only queues (the app task is inside a call, its wall clock
+ * running). With the console held by another thread it returns at once (a print that waited would never return, and
+ * the alarm would end the case); the drain, after the call, prints the queue once the console is free. */
+static void echo_queues_until_the_drain(void) {
+    console_start();
+    apps_port_init();
+    clock_at_ms(20000);
+    pthread_t holder;
+    CHECK(pthread_create(&holder, NULL, hold_the_console, NULL) == 0, "no thread");
+    pthread_mutex_lock(&hold_mu);
+    while (!console_held) {
+        pthread_cond_wait(&hold_cv, &hold_mu);
+    }
+    pthread_mutex_unlock(&hold_mu);
+    alarm(5);
+    int64_t t0 = wall_ms();
+    apps_port_log("hello", "one");
+    apps_port_log("hello", "two");
+    int64_t took = wall_ms() - t0;
+    alarm(0);
+    CHECK(took < 100, "two prints took %lld ms with the console held", (long long)took);
+    pthread_mutex_lock(&hold_mu);
+    console_release = true;
+    pthread_cond_broadcast(&hold_cv);
+    pthread_mutex_unlock(&hold_mu);
+    pthread_join(holder, NULL);
+    char *got = console_text();
+    CHECK(strcmp(got, "") == 0, "printed before the drain: %s", got);
+    free(got);
+    apps_port_log_drain();
+    got = console_text();
+    CHECK(strcmp(got, "@app.log hello one\n@app.log hello two\n") == 0, "the drain printed:\n%s", got);
+    free(got);
+    console_end();
+}
+
+/* F3: the queue holds what the bucket lets a call echo, APPS_ECHO_QUEUE bytes as the console sends them (CRLF): a line
+ * past that isn't echoed, counted as one past the bucket is. Three seconds of four long lines (217 bytes each) with no
+ * drain: 1,953 bytes fit, the next three lines don't; after the drain, the next line comes after its note. */
+static void echo_queue_is_bounded(void) {
+    console_start();
+    apps_port_init();
+    CHECK(APPS_ECHO_QUEUE == APPS_ECHO_BURST + APPS_ECHO_RATE, "a burst and a second of the rate: %u", APPS_ECHO_QUEUE);
+    char x200[201], line[300], expect[4096] = "";
+    memset(x200, 'x', 200);
+    x200[200] = '\0';
+    snprintf(line, sizeof line, "@app.log hello %s\n", x200);
+    for (int second = 0; second < 3; second++) {
+        clock_at_ms(30000 + 1000 * second);
+        for (int i = 0; i < 4; i++) {
+            apps_port_log("hello", x200);
+        }
+    }
+    for (int i = 0; i < 9; i++) {
+        strcat(expect, line);
+    }
+    apps_port_log_drain();
+    apps_port_log("hello", "after");
+    apps_port_log_drain();
+    strcat(expect, "@app.log hello (3 lines not echoed)\n@app.log hello after\n");
     char *got = console_text();
     CHECK(strcmp(got, expect) == 0, "the console:\n%s\nexpected:\n%s", got, expect);
     free(got);
@@ -357,6 +466,8 @@ static const struct {
 } CASES[] = {
     {"echo_bucket", echo_bucket},
     {"echo_lines", echo_lines},
+    {"echo_queues_until_the_drain", echo_queues_until_the_drain},
+    {"echo_queue_is_bounded", echo_queue_is_bounded},
     {"breach_kinds", breach_kinds},
 };
 

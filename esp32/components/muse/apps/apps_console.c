@@ -35,10 +35,12 @@
  *
  * Who owns what. The stage (the files put for one id, in PSRAM) is the serial task's, until a commit moves it into its
  * job; the job, on the I/O worker, reads the files out of it (taking each one's bytes), runs the install pipeline and
- * frees what is left. The RAM store is the worker's (apps_install.h), so a launch and the list are jobs too. Stop,
- * status and send wait on the serial task, each bounded by the app task's own waits (APPS_TASK_WAIT_MS). The launch
- * job is also muse_apps_launch's, for any task (the launcher's pick comes through apps_task_launch): that one runs the
- * app where it was asked to, with no settle, and prints nothing.
+ * frees what is left. The stage's blocks hold at most STAGE_SLACK bytes beyond what was put, so it is never much more
+ * than the 2 MB an app may be. The RAM store is the worker's (apps_install.h), so a launch and the list are jobs too.
+ * Stop, status and send wait on the serial task, each bounded by the app task's own waits (APPS_TASK_WAIT_MS). The
+ * launch job is also muse_apps_launch's, for any task (the launcher's pick comes through apps_task_launch): that one
+ * runs the app where it was asked to, with no settle, by id (apps_task_run_by_id: an app of that id that runs by then
+ * is fronted, not started again), and prints nothing. app.launch runs the store's copy afresh, as an install's run.
  *
  * Replies. Every one is one line: "@app.ack <path> <seq>", "@app {...}" or "@app.err {...}", the JSON made by cJSON
  * (texts travel escaped, tracebacks included) and written with one printf, so that no log line splits it, then
@@ -48,9 +50,9 @@
 
 #define STAGE_FILES (APPS_MAX_FILES + 1)  /* manifest.json, in slot 0, and as many files as a package has */
 #define MIN_CAP 1024                      /* a staged file's first block */
+#define STAGE_SLACK (STAGE_FILES * MIN_CAP)  /* what the stage's blocks may hold beyond the bytes put */
 #define ERR_MAX 1024                      /* what apps_task_message says of a failure: a handler's error, a crash */
 
-#define MSG_BAD_ID "app id '%s' must match ^[a-z][a-z0-9_]{1,23}$"
 #define MSG_BAD_PATH "'%s' is not an allowed path (a-z 0-9 _ . / -, no '..', at most 64 characters)"
 
 typedef struct {
@@ -73,6 +75,7 @@ typedef struct {
     bool front;      /* a launch's place */
     bool print;      /* a launch the console asked for: it settles, and its result is printed */
     stage_t *stage;
+    char why[192];   /* a launch's failure, said once (a frame keeps no array over 128 bytes) */
 } job_t;
 
 static const char *TAG = "muse_apps";
@@ -105,7 +108,7 @@ static void print_reply(const char *prefix, const char *op, const cJSON *item) {
 }
 
 /* "@app.err {"op":op,["id":id,]["path":path,]"message":...}", the message made from fmt. op, id and path are shown as
- * they are, so callers pass them clean (apps_install_shown). */
+ * they are, so callers pass them clean (apps_text_shown). */
 static void fail(const char *op, const char *id, const char *path, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
 static void fail(const char *op, const char *id, const char *path, const char *fmt, ...) {
     va_list ap;
@@ -186,8 +189,8 @@ static bool take_id(const char *op, word_t w, const char *path, char *id) {
         return true;
     }
     char shown[APPS_SHOWN_MAX + 4];
-    apps_install_shown(w.p, w.n, shown);
-    fail(op, strcmp(op, "put") == 0 ? NULL : shown, path, MSG_BAD_ID, shown);
+    apps_text_shown(w.p, w.n, APPS_SHOWN_MAX, shown);
+    fail(op, strcmp(op, "put") == 0 ? NULL : shown, path, APPS_MSG_BAD_ID, shown);
     return false;
 }
 
@@ -315,18 +318,36 @@ static void drop_file(stage_t *stage, staged_t *f) {
     memset(f, 0, sizeof *f);
 }
 
-static size_t kind_max(const char *path) {
-    if (is_manifest(path)) {
-        return APPS_MANIFEST_MAX;
+/*
+ * The block f grows to for len bytes, at most max: doubling, so a file is copied a few times and not for each piece,
+ * but the stage's blocks never hold more than STAGE_SLACK bytes beyond what was put, so the stage stays within the
+ * 2 MB an app may be and that slack whatever the files are. The other files' blocks are fitted to their bytes first (a
+ * sender sends one file after another, so they are done), and f gets what the slack leaves beyond len.
+ */
+static size_t grown_cap(stage_t *stage, const staged_t *f, size_t len, size_t max) {
+    size_t spare = 0;
+    for (int i = 0; i < STAGE_FILES; i++) {
+        staged_t *g = &stage->files[i];
+        if (g == f || g->cap <= g->len) {
+            continue;
+        }
+        if (g->len == 0) {
+            apps_port_free(g->data);
+            g->data = NULL;
+            g->cap = 0;
+            continue;
+        }
+        uint8_t *fitted = apps_port_realloc(g->data, g->len);  /* smaller: in place */
+        if (fitted != NULL) {
+            g->data = fitted;
+            g->cap = g->len;
+        }
+        spare += g->cap - g->len;
     }
-    switch (apps_file_kind(path)) {
-    case APPS_FILE_LUA:
-        return APPS_LUA_MAX;
-    case APPS_FILE_JSON:
-        return APPS_JSON_FILE_MAX;
-    default:
-        return APPS_IMAGE_MAX;
-    }
+    size_t room = spare < STAGE_SLACK ? STAGE_SLACK - spare : 0;
+    size_t cap = f->cap * 2 > len ? f->cap * 2 : len;
+    cap = cap < MIN_CAP ? MIN_CAP : cap > max ? max : cap;
+    return cap - len > room ? len + room : cap;
 }
 
 /* The source of a commit's job (apps_install.h): a file's bytes leave the stage for the pipeline, fitted to their
@@ -371,7 +392,7 @@ static void put(const char *args) {
         return;
     }
     char shown[APPS_SHOWN_MAX + 4], id[APPS_ID_MAX + 1], path[APPS_PATH_MAX + 1];
-    apps_install_shown(path_w.p, path_w.n, shown);
+    apps_text_shown(path_w.p, path_w.n, APPS_SHOWN_MAX, shown);
     if (!take_id("put", id_w, shown, id)) {
         return;
     }
@@ -423,7 +444,8 @@ static void put(const char *args) {
         return;
     }
     /* The limits, as the bytes arrive: a file over one is dropped whole. */
-    size_t bytes = b64_len(b64, n), max = kind_max(path), len = f->len + bytes;
+    size_t bytes = b64_len(b64, n), max = is_manifest(path) ? APPS_MANIFEST_MAX : apps_file_max(kind);
+    size_t len = f->len + bytes;
     if (len > max) {
         drop_file(s_stage, f);
         fail("put", NULL, path, "%s is larger than %u KB", path, (unsigned)(max / 1024));
@@ -440,8 +462,7 @@ static void put(const char *args) {
         return;
     }
     if (len > f->cap) {
-        size_t cap = f->cap * 2 > len ? f->cap * 2 : len;  /* doubling: a file is copied a few times, not per piece */
-        cap = cap < MIN_CAP ? MIN_CAP : cap > max ? max : cap;
+        size_t cap = grown_cap(s_stage, f, len, max);
         uint8_t *grown = apps_port_realloc(f->data, cap);
         if (grown == NULL) {
             drop_file(s_stage, f);
@@ -451,7 +472,9 @@ static void put(const char *args) {
         f->data = grown;
         f->cap = cap;
     }
-    b64_decode(b64, n, f->data + f->len);  /* straight into the stage */
+    if (bytes > 0) {
+        b64_decode(b64, n, f->data + f->len);  /* straight into the stage (an empty piece may have no block yet) */
+    }
     f->len = len;
     s_stage->app_bytes += bytes;
     if (kind == APPS_FILE_IMAGE) {
@@ -466,17 +489,12 @@ static bool install_run(apps_pkg_t *p, int settle_ms, apps_status_t *st, char *e
     return apps_task_run(p, true, settle_ms, st, err, n);  /* C2: an install with a run fronts the app */
 }
 
-static bool run_behind(apps_pkg_t *p, int settle_ms, apps_status_t *st, char *err, size_t n) {
-    return apps_task_run(p, false, settle_ms, st, err, n);
-}
-
 static const char *ram_storage(void) {
     return "ram";
 }
 
-/* Until Task 20's store, a package stays in PSRAM (apps_install.h's RAM store). A launch behind runs with BEHIND_OPS. */
+/* Until Task 20's store, a package stays in PSRAM (apps_install.h's RAM store). */
 static const apps_install_ops_t USB_OPS = {apps_task_compile, apps_ram_commit, install_run, ram_storage};
-static const apps_install_ops_t BEHIND_OPS = {apps_task_compile, apps_ram_commit, run_behind, ram_storage};
 
 static void commit_job(void *arg) {
     job_t *job = arg;
@@ -500,6 +518,12 @@ static void commit(const char *args) {
     if (!take_id("commit", id_w, NULL, id)) {
         return;
     }
+    /* One install at a time, first: the same commit sent again while its job runs is busy, though its stage went into
+     * that job. */
+    if (!apps_install_try_begin()) {
+        fail("commit", id, NULL, APPS_INSTALL_BUSY);
+        return;
+    }
     bool staged = false;
     if (s_stage != NULL && strcmp(s_stage->id, id) == 0) {
         for (int i = 0; i < STAGE_FILES; i++) {
@@ -507,11 +531,8 @@ static void commit(const char *args) {
         }
     }
     if (!staged) {
+        apps_install_end();
         fail("commit", id, NULL, "nothing is staged for %s: send its files with app.put first", id);
-        return;
-    }
-    if (!apps_install_try_begin()) {
-        fail("commit", id, NULL, APPS_INSTALL_BUSY);
         return;
     }
     job_t *job = apps_port_realloc(NULL, sizeof *job);
@@ -533,30 +554,27 @@ static void commit(const char *args) {
     }
 }
 
-/* The store's copy of job->id, run through apps_task_run (R13.5). The console's settles and prints its result; anyone
- * else's (muse_apps_launch) runs with no settle and says only a failure, in one log line. */
+/* The store's copy of job->id, run. The console's (R13.5) runs it through apps_task_run in front, settles and prints its
+ * result; anyone else's (muse_apps_launch) runs it by id where it was asked to, with no settle, and says only a failure,
+ * in one log line. */
 static void launch_job(void *arg) {
     job_t *job = arg;
-    const apps_install_ops_t *ops = job->front ? &USB_OPS : &BEHIND_OPS;
     apps_pkg_t *pkg = apps_port_realloc(NULL, sizeof *pkg);
-    if (pkg != NULL && apps_ram_load(job->id, pkg)) {
+    snprintf(job->why, sizeof job->why, "out of memory: no room to load the app");
+    if (pkg != NULL && apps_ram_load(job->id, pkg, job->why, sizeof job->why)) {
         if (job->print) {
-            cJSON *r = apps_install_launch(pkg, ops);  /* it takes the copy: the app task frees it */
+            cJSON *r = apps_install_launch(pkg, &USB_OPS);  /* it takes the copy: the app task frees it */
             print_result("launch", job->id, r);
             cJSON_Delete(r);
-        } else {
-            char err[128];
-            if (!ops->run(pkg, 0, NULL, err, sizeof err)) {  /* it takes the copy too */
-                ESP_LOGW(TAG, "launch %s: %s", job->id, err);
-            }
+        } else if (!apps_task_run_by_id(pkg, job->front, 0, NULL, job->why, sizeof job->why)) {  /* it takes it too */
+            ESP_LOGW(TAG, "launch %s: %s", job->id, job->why);
         }
     } else {
         apps_port_free(pkg);
-        const char *why = apps_ram_has(job->id) ? "out of memory: no room to load the app" : "no such app on the gadget";
         if (job->print) {
-            fail("launch", job->id, NULL, "%s", why);
+            fail("launch", job->id, NULL, "%s", job->why);
         } else {
-            ESP_LOGW(TAG, "launch %s: %s", job->id, why);
+            ESP_LOGW(TAG, "launch %s: %s", job->id, job->why);
         }
     }
     apps_port_free(job);
@@ -707,7 +725,7 @@ static void send(const char *args) {
         fail("send", id, NULL, "the reply is %u bytes: the console shows at most %d", (unsigned)len, APPS_RESULT_MAX);
     } else {
         char shown[APPS_SHOWN_MAX + 4];
-        apps_install_shown(event_w.p, event_w.n, shown);
+        apps_text_shown(event_w.p, event_w.n, APPS_SHOWN_MAX, shown);
         cJSON *r = cJSON_CreateObject();
         bool ok = r != NULL && cJSON_AddStringToObject(r, "id", id) != NULL &&
                   cJSON_AddStringToObject(r, "event", shown) != NULL && cJSON_AddRawToObject(r, "reply", reply) != NULL;
@@ -742,7 +760,7 @@ bool muse_apps_console(const char *line) {
         send(args);
     } else {
         char shown[APPS_SHOWN_MAX + 4];
-        apps_install_shown(cmd.p, cmd.n, shown);
+        apps_text_shown(cmd.p, cmd.n, APPS_SHOWN_MAX, shown);
         fail(shown, NULL, NULL,
              "unknown command app.%s (app.put, app.commit, app.launch, app.stop, app.status, app.list, app.send)",
              shown);

@@ -30,6 +30,7 @@
 
 #define APPS_ECHO_RATE 1024u   /* bytes a second */
 #define APPS_ECHO_BURST 1024u  /* bytes at once, after a quiet second */
+#define APPS_ECHO_QUEUE (APPS_ECHO_BURST + APPS_ECHO_RATE)  /* bytes queued between drains: what a call can echo */
 
 /* Zeroed, it is a full bucket that starts at its first take. */
 typedef struct {

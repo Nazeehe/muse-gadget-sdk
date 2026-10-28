@@ -577,10 +577,42 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertHasText(port, "void apps_port_console_flush(void) {", "apps_port_idf.c")
         flush = function_source(port, "void apps_port_console_flush(void)")
         self.assertRegex(flush, r"fflush\(stdout\);\s*\(void\)fsync\(fileno\(stdout\)\);")
-        # The pre-review fix's P3: an echoed log line ends the same way, right after its printf.
+        # Task 13's F3: an app's print only queues, never touching the console (the app task is inside a call, its wall
+        # clock running); the drain, after the call, prints each queued line and ends it as a reply ends (the pre-review
+        # fix's P3). tests/test_muse_apps_port.py runs both.
         echo = function_source(port, "void apps_port_log(const char *app_id, const char *line)")
-        self.assertRegex(echo, r'printf\("%s@app\.log %s %s\\n", note, app_id, line\);\s*apps_port_console_flush\(\);')
-        self.assertNotIn("fflush(stdout)", echo)
+        for call in ("printf", "puts", "fputs", "fwrite", "putchar", "fflush", "fsync", "apps_port_console_flush"):
+            with self.subTest(call):
+                self.assertNotRegex(echo, rf"(?<![\w.]){call}\(")
+        drain = function_source(port, "void apps_port_log_drain(void)")
+        self.assertRegex(drain, r'printf\("%s", \w+\);\s*apps_port_console_flush\(\);')
+        # The app task drains after every call, once in_call is clear, and in its housekeeping.
+        task = (MUSE / "apps/apps_task.c").read_text()
+        finish = function_source(task, "static void call_finish(void)")
+        self.assertRegex(finish, r"atomic_store\(&s_rec->in_call, 0\);[\s\S]*apps_port_log_drain\(\);[^;]*\}\s*$")
+        self.assertIn("apps_port_log_drain();", function_source(task, "static void housekeeping(void)"))
+        self.assertNotIn("apps_port_log_drain", function_source(task, "static void call_begin(void)"))
+
+    def test_one_table_of_limits_and_one_bad_id_message(self):  # Task 13's F9
+        # The stage and the pipeline agree on limits because both read apps_pkg.c's apps_file_max, and say a bad id the
+        # same way (APPS_MSG_BAD_ID).
+        for name in ("apps_console.c", "apps_install.c"):
+            text = (MUSE / "apps" / name).read_text()
+            with self.subTest(name):
+                self.assertNotIn("kind_max", text)
+                self.assertNotRegex(text, r"#define\s+MSG_BAD_ID\b")
+                self.assertNotRegex(text, r"\bAPPS_(?:LUA|JSON_FILE|IMAGE)_MAX\b")
+                self.assertIn("apps_file_max(", text)
+                self.assertIn("APPS_MSG_BAD_ID", text)
+
+    def test_the_io_worker_is_on_core_0(self):  # Task 13's F4: never in front of the app task or LVGL on core 1
+        io = (MUSE / "apps/apps_io.c").read_text()
+        args = call_arguments(io, "xTaskCreatePinnedToCore")
+        self.assertEqual(len(args), 7, args)
+        self.assertEqual(args[1], '"muse_apps_io"')
+        self.assertEqual(args[6], "APPS_IO_CORE")
+        header = dict(re.findall(r"^#define\s+(\w+)\s+(\S+)", (MUSE / "apps/apps_io.h").read_text(), re.M))
+        self.assertEqual(header.get("APPS_IO_CORE"), "0")
 
 
 if __name__ == "__main__":

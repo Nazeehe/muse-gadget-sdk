@@ -17,9 +17,9 @@
 tests/muse_apps_install_harness.c runs the real pipeline with the real cJSON, package rules (apps_pkg, apps_json) and
 apps_vm_excerpt (apps_vm and Lua), a fake source that serves files from a table and records every read, and fake ops
 (compile, commit, run) that record what they were given. Every result the harness prints is checked here to be valid
-JSON within APPS_RESULT_MAX bytes. The stack case runs apps_install_run on exactly the I/O worker's 6,144 bytes (R13.7),
-in a build without the sanitizers. Needs the cJSON sources: CJSON_SOURCE_DIR (~/.cache/muse-cjson), or an IDF build's
-managed_components.
+JSON within APPS_RESULT_MAX bytes, its bytes decoded strictly as UTF-8 (R13.3: a reply is text). The stack case runs
+apps_install_run on exactly the I/O worker's 6,144 bytes (R13.7), in a build without the sanitizers. Needs the cJSON
+sources: CJSON_SOURCE_DIR (~/.cache/muse-cjson), or an IDF build's managed_components.
 """
 
 import hashlib
@@ -41,6 +41,12 @@ HARNESS = TESTS / "muse_apps_install_harness.c"
 SOURCES = [HARNESS, APPS / "apps_install.c", APPS / "apps_pkg.c", APPS / "apps_json.c", APPS / "apps_vm.c",
            APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_ui.c", ROOT / "tools/muse/apphost/sha256.c"]
 SDKCONFIG = "#pragma once\n#define CONFIG_MUSE_APPS 1\n#define CONFIG_MUSE_APPS_HEAP_MAX_KB 1024\n"
+# The store logs what it drops (ESP_LOGW): the harness keeps each line.
+ESP_LOG = ("#pragma once\n"
+           "void fake_esp_log(char level, const char *tag, const char *fmt, ...) __attribute__((format(printf, 3, 4)));\n"
+           "#define ESP_LOGE(tag, ...) fake_esp_log('E', tag, __VA_ARGS__)\n"
+           "#define ESP_LOGW(tag, ...) fake_esp_log('W', tag, __VA_ARGS__)\n"
+           "#define ESP_LOGI(tag, ...) fake_esp_log('I', tag, __VA_ARGS__)\n")
 RESULT_MAX = 6144
 
 
@@ -54,18 +60,26 @@ class Install(unittest.TestCase):
         staged = Path(tmp.name) / "staged"
         staged.mkdir()
         (staged / "sdkconfig.h").write_text(SDKCONFIG)
+        (staged / "esp_log.h").write_text(ESP_LOG)
         cls.includes = [apps_host.LUA_SRC, APPS, MUSE, staged, TESTS, apps_host.CJSON_DIR]
         cls.harness = apps_host.build("muse_apps_install_harness", [*SOURCES, *apps_host.lua_sources()], tmp.name,
                                       include_dirs=cls.includes, objects=[cjson])
 
     def run_case(self, case, harness=None):
         try:
-            done = apps_host.run(harness or self.harness, case, timeout=300)
+            done = apps_host.run(harness or self.harness, case, timeout=300, text=False)
         except subprocess.TimeoutExpired:
             self.fail(f"{case} took more than 300 s")
-        self.assertEqual(done.returncode, 0, done.stdout[-4000:] + done.stderr[-8000:])
+        stderr = done.stderr.decode("utf-8", errors="replace")
+        self.assertEqual(done.returncode, 0, done.stdout[-4000:].decode("utf-8", errors="replace") + stderr[-8000:])
+        try:
+            stdout = done.stdout.decode("utf-8")  # strictly: a reply that isn't UTF-8 fails here
+        except UnicodeDecodeError as e:
+            self.fail(f"not UTF-8 ({e}): {done.stdout[max(e.start - 100, 0):e.end + 100]!r}")
         results, stacks = [], []
-        for line in done.stdout.splitlines():
+        for line in stdout.split("\n"):
+            if not line:
+                continue
             kind, _, text = line.partition(" ")
             self.assertIn(kind, ("@result", "@stack"), f"not a line of the harness: {line[:200]!r}")
             if kind == "@stack":
@@ -132,8 +146,24 @@ class Install(unittest.TestCase):
     def test_the_deadline_is_one_absolute_time(self):  # E24, D3
         self.run_case("deadline_is_one_absolute_time")
 
-    def test_the_ram_store(self):  # C4, E26
+    def test_the_ram_store(self):  # C4, E26; F1's list, most recent first; the cap drops the oldest
         self.run_case("ram_store")
+
+    def test_the_ram_budget(self):  # F2: memory_kb + 1 MiB free after a copy; the oldest go first, never the running app
+        self.run_case("ram_budget")
+
+    def test_results_are_utf8(self):  # T2: a compile error quoting bytes that aren't UTF-8; a long cut between characters
+        results, _ = self.run_case("results_are_utf8")  # every result decoded strictly (run_case)
+        self.assertIn("local caf? = = 1 -- ?", results[0]["error"]["message"])
+        self.assertEqual(len(results), 11)
+        for shift, result in enumerate(results[1:]):
+            with self.subTest(shift=shift):
+                message = result["error"]["message"]
+                self.assertTrue(message.startswith("installed but crashed in start(): " + "a" * shift + "?\x01\U0001F600"),
+                                message[:80])
+                printed = json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode()
+                self.assertLessEqual(len(printed), RESULT_MAX)
+                self.assertTrue(message.endswith("\U0001F600") or message.endswith("\x01"), message[-20:])
 
     def test_status_json(self):  # E13: instructions
         self.run_case("status_json")

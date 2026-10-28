@@ -291,12 +291,25 @@ static void check_messages_json(const char *json) {
     CHECK(r.err[0] == '\0' && apps_jr_end(&r), "messages_json '%s': %s", json, r.err);
 }
 
+/* Whether s holds a control character: C0 (under 0x20), DEL, or C1 (U+0080 to U+009F, C2 80 to C2 9F in UTF-8). */
+static bool has_control(const char *s) {
+    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; p++) {
+        if (*p < 0x20 || *p == 0x7F || (p[0] == 0xC2 && p[1] >= 0x80 && p[1] <= 0x9F)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* A manifest that parsed, for folder and heap_kb. */
 static void check_manifest(const apps_manifest_t *m, const char *folder, int heap_kb) {
     CHECK(apps_id_valid(m->id) && strcmp(m->id, folder) == 0, "id '%s' for folder '%s'", m->id, folder);
     size_t name_len = strlen(m->name);
     CHECK(name_len >= 1 && name_len <= 24, "name of %zu bytes", name_len);
     CHECK(strlen(m->version) <= 23, "version of %zu bytes", strlen(m->version));
+    /* Task 13's F7: what reaches the console's replies carries no control character. */
+    CHECK(!has_control(m->name) && !has_control(m->version), "a control character in name '%s' or version '%s'", m->name,
+          m->version);
     CHECK(apps_path_valid(m->main) && apps_file_kind(m->main) == APPS_FILE_LUA, "main '%s'", m->main);
     CHECK(m->file_count >= 1 && m->file_count <= APPS_MAX_FILES, "file_count %u", m->file_count);
     CHECK(strcmp(m->files[0], m->main) == 0, "files[0] '%s' isn't main '%s'", m->files[0], m->main);
@@ -322,6 +335,7 @@ static void check_manifest(const apps_manifest_t *m, const char *folder, int hea
     size_t warn_len = strlen(m->warnings);
     CHECK(warn_len < sizeof m->warnings, "warnings aren't terminated");
     CHECK(json_text_ok(m->warnings), "warnings aren't valid text: '%s'", m->warnings);
+    CHECK(!has_control(m->warnings), "a control character in the warnings: '%s'", m->warnings);
     if (warn_len > 0) {
         /* Whole warnings only: each is "unknown key '...' ignored", with " (did you mean '...'?)" at most. */
         static const char start[] = "unknown key '";
@@ -554,6 +568,19 @@ static void contracts(void) {
     apps_manifest_clear(NULL, count_free);
     apps_pkg_free(NULL, count_free);
 
+    /* apps_file_max: the one table of the kinds' limits, the console's stage and the install pipeline both read it
+     * (Task 13's F9). */
+    CHECK(apps_file_max(APPS_FILE_LUA) == APPS_LUA_MAX && apps_file_max(APPS_FILE_JSON) == APPS_JSON_FILE_MAX &&
+              apps_file_max(APPS_FILE_IMAGE) == APPS_IMAGE_MAX && apps_file_max(APPS_FILE_BAD) == 0,
+          "apps_file_max");
+    /* apps_text_shown: text from outside as a message shows it (Task 13's F7 and F9). */
+    char out[80];
+    static const char mixed[] = "a\x01\x7f\xff\xc3\xa9\xc2\x9b\xc2\xa0z";
+    CHECK(strcmp(apps_text_shown(mixed, sizeof mixed - 1, 64, out), "a???\xc3\xa9?\xc2\xa0z") == 0, "mapped: '%s'", out);
+    CHECK(strcmp(apps_text_shown("abcdef", 6, 4, out), "abcd...") == 0, "cut: '%s'", out);
+    CHECK(strcmp(apps_text_shown("ab\xc3\xa9", 4, 3, out), "ab...") == 0, "cut between characters: '%s'", out);
+    CHECK(strcmp(apps_text_shown(NULL, 0, 64, out), "") == 0 && apps_text_shown("x", 1, 64, out) == out, "NULL, and out");
+
     /* Images: NULL data, NULL out parameters, a cut error. */
     uint16_t w = 7, h = 7;
     CHECK(!apps_image_check(NULL, 0, &w, &h, err, sizeof err) && w == 0 && h == 0, "NULL image");
@@ -710,12 +737,15 @@ static const pool_t pool_name[] = {
     {"\"\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\"", true},
     {"\"\"", false}, {"\"0123456789012345678901234\"", false}, {"5", false}, {"null", false}, {"[\"x\"]", false},
     {"\"a\\u0000b\"", false}, {"{}", false},
+    {"\"a\\nb\"", false}, {"\"A\\u009b2J\"", false}, {"\"x\\u007f\"", false}, {"\"\\u0085\"", false},  /* F7 */
+    {"\"\\u00a0Timer\"", true},
     {"\"\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\\u00e9\"", false},
 };
 
 static const pool_t pool_version[] = {
     {"\"1.0.0\"", true}, {"\"\"", true}, {"\"01234567890123456789012\"", true},
     {"\"012345678901234567890123\"", false}, {"1", false}, {"null", false}, {"[]", false}, {"\"\\u0000\"", false},
+    {"\"1\\t0\"", false}, {"\"\\u009b31m\"", false}, {"\"1.0\\u00a0\"", true},  /* F7 */
 };
 
 static const pool_t pool_api[] = {
@@ -891,7 +921,8 @@ static size_t make_manifest(char *out, size_t cap, bool *valid) {
             *valid = false;
         }
     }
-    static const char *const unknown_keys[] = {"x", "colour", "entry", "permission", "file", "Name", "zz", "i\\u0064s"};
+    static const char *const unknown_keys[] = {"x", "colour", "entry", "permission", "file", "Name", "zz", "i\\u0064s",
+                                               "\\u009bk", "q\\nz"};
     static const char *const unknown_values[] = {"1", "\"s\"", "[1,{\"a\":null}]", "{\"k\":[]}", "null", "\"\\u00e9\""};
     for (unsigned i = rnd(EXTRA + 1); i > 0; i--) {
         members[count++] = (member_t){unknown_keys[rnd(sizeof unknown_keys / sizeof unknown_keys[0])],

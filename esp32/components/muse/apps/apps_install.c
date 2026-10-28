@@ -26,6 +26,7 @@
 #include "apps_json.h"
 #include "apps_port.h"
 #include "apps_vm.h"
+#include "esp_log.h"
 #include "sdkconfig.h"
 
 /*
@@ -42,14 +43,20 @@
  * APPS_RESULT_MAX: the log's oldest lines, then the dump's last entries, then the last files, the last warnings and
  * (a status) the end of last_error. Each round drops at least what its excess costs, as cJSON prints it, so it takes a
  * round or two, and at least one item a round, so it ends.
+ *
+ * The RAM store. Its packages are kept most recent first (a commit or a load moves one to the front), and every change
+ * gives the launcher the new list (apps_task_set_list). A copy, at a commit or a load, leaves free PSRAM for the app's
+ * heap and APPS_RAM_RESERVE: short of that, the oldest packages go one at a time, looking again after each, never the
+ * app that runs (apps_task_running) nor the one being copied.
  */
 
 #define MSG_MAX 4096     /* a result's message: a crash's error and traceback with the last lines of its log */
 #define RAW_MAX 768      /* what the source, compile, commit and run say, and a status record's last_error */
 #define CRASH_LINES 10   /* the log lines a crash's message shows */
 
-#define MSG_BAD_ID "app id '%s' must match ^[a-z][a-z0-9_]{1,23}$"
 #define MSG_NO_MEMORY "out of memory: no room for the install"
+
+static const char *TAG = "muse_apps";
 
 /* ---- Small things ---- */
 
@@ -118,34 +125,6 @@ static void clean_utf8(char *s) {
             *p++ = '?';
         }
     }
-}
-
-void apps_install_shown(const char *s, size_t n, char *out) {
-    const unsigned char *p = (const unsigned char *)(s != NULL ? s : ""), *end = p + (s != NULL ? n : 0);
-    size_t used = 0;
-    while (p < end) {
-        size_t take = 1, put = 1;
-        bool keep = *p >= 0x20 && *p != 0x7F;
-        if (*p >= 0x80) {
-            int k = apps_json_utf8_len(p, end);
-            keep = k > 0 && !(k == 2 && p[0] == 0xC2 && p[1] < 0xA0);  /* not broken, not C1 */
-            take = k > 0 ? (size_t)k : 1;
-            put = keep ? take : 1;
-        }
-        if (used + put > APPS_SHOWN_MAX) {
-            memcpy(out + used, "...", 3);
-            used += 3;
-            break;
-        }
-        if (keep) {
-            memcpy(out + used, p, take);
-        } else {
-            out[used] = '?';
-        }
-        used += put;
-        p += take;
-    }
-    out[used] = '\0';
 }
 
 /* text into out (cap bytes with its NUL), cut on a character boundary. */
@@ -626,17 +605,6 @@ typedef struct {
     char msg[MSG_MAX];                 /* the result's message */
 } install_t;
 
-static size_t kind_max(apps_file_kind_t kind) {
-    switch (kind) {
-    case APPS_FILE_LUA:
-        return APPS_LUA_MAX;
-    case APPS_FILE_JSON:
-        return APPS_JSON_FILE_MAX;
-    default:
-        return APPS_IMAGE_MAX;
-    }
-}
-
 /* Where the package's blocks come from: apps_port_realloc's, every one, so that apps_task_run can free them. The
  * manifest's messages_json comes from apps_pkg.c's own allocation, malloc on the host: it moves into one. */
 static bool rehome_messages(apps_manifest_t *m) {
@@ -793,7 +761,7 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
             return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE, "files[%d] is not an allowed path", i);
         }
         apps_file_kind_t kind = apps_file_kind(rel);
-        size_t max = kind_max(kind);
+        size_t max = apps_file_max(kind);  /* the manifest's parse checked the type: never 0 */
         if (!src->read(src->ctx, rel, max, deadline_us, &data, &len, in->raw, sizeof in->raw)) {
             return failure(APPS_ERR_READ_FAILED, in->raw);
         }
@@ -844,9 +812,9 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
 cJSON *apps_install_run(const char *id, bool run, const apps_source_t *src, const apps_install_ops_t *ops) {
     id = id != NULL ? id : "";
     if (!apps_id_valid(id)) {
-        char shown[APPS_SHOWN_MAX + 4], msg[sizeof MSG_BAD_ID + APPS_SHOWN_MAX + 4];
-        apps_install_shown(id, strlen(id), shown);
-        return failuref(msg, sizeof msg, APPS_ERR_INVALID_PARAMS, MSG_BAD_ID, shown);
+        char shown[APPS_SHOWN_MAX + 4], msg[sizeof APPS_MSG_BAD_ID + APPS_SHOWN_MAX + 4];
+        apps_text_shown(id, strlen(id), APPS_SHOWN_MAX, shown);
+        return failuref(msg, sizeof msg, APPS_ERR_INVALID_PARAMS, APPS_MSG_BAD_ID, shown);
     }
     install_t *in = apps_port_realloc(NULL, sizeof *in);
     apps_pkg_t *pkg = in != NULL ? apps_port_realloc(NULL, sizeof *pkg) : NULL;
@@ -887,7 +855,10 @@ void apps_install_end(void) {
 
 /* ---- The RAM store: the I/O worker's alone ---- */
 
-static apps_pkg_t *s_ram[APPS_RAM_APPS];  /* in the order first committed */
+_Static_assert(APPS_RAM_APPS >= 2, "one app may run: a full store always has another to drop");
+_Static_assert(APPS_RAM_APPS <= APPS_TASK_LIST_MAX, "the launcher is told of every app the store keeps");
+
+static apps_pkg_t *s_ram[APPS_RAM_APPS];  /* most recent first */
 static int s_ram_count;
 
 static int ram_find(const char *id) {
@@ -897,6 +868,83 @@ static int ram_find(const char *id) {
         }
     }
     return -1;
+}
+
+/* The launcher's list, as the store is now (apps_task.h): ids and the names they show. */
+static void ram_publish(void) {
+    apps_listed_t list[APPS_RAM_APPS];
+    for (int i = 0; i < s_ram_count; i++) {
+        const apps_manifest_t *m = &s_ram[i]->manifest;
+        put_text(list[i].id, sizeof list[i].id, m->id);
+        put_text(list[i].name, sizeof list[i].name, m->name[0] != '\0' ? m->name : m->id);
+    }
+    apps_task_set_list(list, s_ram_count);
+}
+
+/* s_ram[i] becomes the most recent. */
+static void ram_touch(int i) {
+    apps_pkg_t *pkg = s_ram[i];
+    memmove(&s_ram[1], &s_ram[0], (size_t)i * sizeof s_ram[0]);
+    s_ram[0] = pkg;
+}
+
+static void ram_drop(int i) {
+    free_pkg(s_ram[i]);
+    memmove(&s_ram[i], &s_ram[i + 1], (size_t)(s_ram_count - i - 1) * sizeof s_ram[0]);
+    s_ram[--s_ram_count] = NULL;
+}
+
+/* Drops the oldest package that is neither keep's nor the app's that runs, with one log line: false when there is
+ * none. */
+static bool ram_drop_oldest(const char *keep) {
+    char running[APPS_ID_MAX + 1];
+    if (!apps_task_running(running, sizeof running)) {
+        running[0] = '\0';
+    }
+    for (int i = s_ram_count - 1; i >= 0; i--) {
+        const char *id = s_ram[i]->manifest.id;
+        if (strcmp(id, keep) != 0 && strcmp(id, running) != 0) {
+            ESP_LOGW(TAG, "ram: dropped %s to make room", id);
+            ram_drop(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The bytes a deep copy of pkg allocates (pkg_copy's blocks: one byte for an empty file), and with_struct its
+ * apps_pkg_t too. */
+static size_t copy_bytes(const apps_pkg_t *pkg, bool with_struct) {
+    size_t n = with_struct ? sizeof *pkg : 0;
+    if (pkg->manifest.messages_json != NULL) {
+        n += strlen(pkg->manifest.messages_json) + 1;
+    }
+    for (int i = 0; i < pkg->count && i < APPS_MAX_FILES; i++) {
+        n += pkg->files[i].len > 0 ? pkg->files[i].len : 1;
+    }
+    return n;
+}
+
+/*
+ * Room for a copy of `bytes` for the app id whose heap is memory_kb: free PSRAM after the copy at least memory_kb and
+ * APPS_RAM_RESERVE. Short of that, the oldest packages go, one at a time, looking again after each (never id's or the
+ * app's that runs). False, with the refusal in err, when it is short still. *dropped counts what went.
+ */
+static bool ram_room(const char *id, size_t bytes, unsigned memory_kb, int *dropped, char *err, size_t err_len) {
+    size_t need = bytes + (size_t)memory_kb * 1024 + APPS_RAM_RESERVE;
+    for (;;) {
+        size_t free_now = apps_port_psram_free();
+        if (free_now >= need) {
+            return true;
+        }
+        if (!ram_drop_oldest(id)) {
+            snprintf(err, err_len,
+                     "the gadget is short of memory for %s: %u KB free, %u KB needed; restart it or install a smaller app",
+                     id, (unsigned)(free_now / 1024), (unsigned)((need + 1023) / 1024));
+            return false;
+        }
+        (*dropped)++;
+    }
 }
 
 /* A deep copy of src into out (overwritten), every block from apps_port_realloc; out is zeroed when one is refused. */
@@ -921,34 +969,30 @@ static bool pkg_copy(const apps_pkg_t *src, apps_pkg_t *out) {
     return ok;
 }
 
-bool apps_ram_put(apps_pkg_t *pkg) {
-    if (pkg == NULL) {
-        return false;
-    }
-    int i = ram_find(pkg->manifest.id);
-    if (i >= 0) {
-        free_pkg(s_ram[i]);
-        s_ram[i] = pkg;
-        return true;
-    }
-    if (s_ram_count == APPS_RAM_APPS) {
-        free_pkg(pkg);
-        return false;
-    }
-    s_ram[s_ram_count++] = pkg;
-    return true;
-}
-
-bool apps_ram_load(const char *id, apps_pkg_t *out) {
+bool apps_ram_load(const char *id, apps_pkg_t *out, char *err, size_t err_len) {
     if (out == NULL) {
         return false;
     }
+    memset(out, 0, sizeof *out);
     int i = ram_find(id);
     if (i < 0) {
-        memset(out, 0, sizeof *out);
+        snprintf(err, err_len, "no such app on the gadget");
         return false;
     }
-    return pkg_copy(s_ram[i], out);
+    int dropped = 0;
+    bool room = ram_room(id, copy_bytes(s_ram[i], false), s_ram[i]->manifest.memory_kb, &dropped, err, err_len);
+    i = ram_find(id);  /* it stays, a little nearer the front */
+    bool ok = room && pkg_copy(s_ram[i], out);
+    if (room && !ok) {
+        snprintf(err, err_len, "out of memory: no room to load the app");
+    }
+    if (ok) {
+        ram_touch(i);  /* a run makes it the most recent */
+    }
+    if (ok || dropped > 0) {
+        ram_publish();
+    }
+    return ok;
 }
 
 bool apps_ram_has(const char *id) {
@@ -960,9 +1004,8 @@ bool apps_ram_remove(const char *id) {
     if (i < 0) {
         return false;
     }
-    free_pkg(s_ram[i]);
-    memmove(&s_ram[i], &s_ram[i + 1], (size_t)(s_ram_count - i - 1) * sizeof s_ram[0]);
-    s_ram[--s_ram_count] = NULL;
+    ram_drop(i);
+    ram_publish();
     return true;
 }
 
@@ -979,17 +1022,41 @@ int apps_ram_list(apps_ram_entry_t *out, int max) {
 
 bool apps_ram_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t err_len) {
     *unchanged = false;
-    if (ram_find(pkg->manifest.id) < 0 && s_ram_count == APPS_RAM_APPS) {
-        snprintf(err, err_len, "the gadget keeps at most %d apps in RAM; restart it to make room", APPS_RAM_APPS);
-        return false;
+    const char *id = pkg->manifest.id;
+    int dropped = 0;
+    if (ram_find(id) < 0 && s_ram_count == APPS_RAM_APPS) {
+        /* A new id in a full store: the oldest goes, as when memory is short. */
+        if (!ram_drop_oldest(id)) {
+            snprintf(err, err_len, "out of memory: no room to keep the app in RAM");  /* can't be: see the assertion */
+            return false;
+        }
+        dropped++;
     }
-    apps_pkg_t *copy = apps_port_realloc(NULL, sizeof *copy);
-    if (copy == NULL || !pkg_copy(pkg, copy)) {
-        apps_port_free(copy);
-        snprintf(err, err_len, "out of memory: no room to keep the app in RAM");
-        return false;
+    apps_pkg_t *copy = NULL;
+    bool ok = ram_room(id, copy_bytes(pkg, true), pkg->manifest.memory_kb, &dropped, err, err_len);
+    if (ok) {
+        copy = apps_port_realloc(NULL, sizeof *copy);
+        ok = copy != NULL && pkg_copy(pkg, copy);
+        if (!ok) {
+            apps_port_free(copy);
+            snprintf(err, err_len, "out of memory: no room to keep the app in RAM");
+        }
     }
-    (void)apps_ram_put(copy);  /* there is room: its id's place, or a free one */
-    snprintf(err, err_len, "%s", "");
-    return true;
+    if (ok) {
+        int i = ram_find(id);
+        if (i >= 0) {
+            free_pkg(s_ram[i]);  /* its id's place */
+            s_ram[i] = copy;
+            ram_touch(i);
+        } else {
+            memmove(&s_ram[1], &s_ram[0], (size_t)s_ram_count * sizeof s_ram[0]);  /* there is room: see above */
+            s_ram[0] = copy;
+            s_ram_count++;
+        }
+        snprintf(err, err_len, "%s", "");
+    }
+    if (ok || dropped > 0) {
+        ram_publish();
+    }
+    return ok;
 }

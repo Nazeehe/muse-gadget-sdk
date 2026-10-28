@@ -16,8 +16,8 @@
 
 /*
  * apps_port.h on the gadget. The heap is PSRAM; the clock is esp_timer's; an app's log line goes to the console as
- * "@app.log <id> <line>", at most 1,024 bytes of them a second; the UI lock is a static FreeRTOS mutex that
- * muse_apps_start() makes (apps_port_init).
+ * "@app.log <id> <line>", at most 1,024 bytes of them a second, queued in the call and printed after it; the UI lock is
+ * a static FreeRTOS mutex that muse_apps_start() makes (apps_port_init).
  *
  * The UI lock keeps the host runner's contract (tools/muse/apphost/apphost_port.c): it is never taken twice by one
  * task, given back only by its holder, and nothing uses the heap while it is held. The host aborts on a breach; here a
@@ -71,9 +71,14 @@ static bool held_by_me(void) {
     return s_ui_holder != NULL && s_ui_holder == xTaskGetCurrentTaskHandle();
 }
 
+static char *s_echo_queue;  /* APPS_ECHO_QUEUE bytes of PSRAM, made once: see the echo below */
+
 void apps_port_init(void) {
     if (s_ui_lock == NULL) {
         s_ui_lock = xSemaphoreCreateMutexStatic(&s_ui_lock_buf);
+    }
+    if (s_echo_queue == NULL) {
+        s_echo_queue = heap_caps_malloc(APPS_ECHO_QUEUE, MUSE_BIG_CAPS);  /* none: nothing is echoed, all is counted */
     }
 }
 
@@ -97,6 +102,10 @@ void *apps_port_realloc(void *ptr, size_t n) {
     return heap_caps_realloc(ptr, n, MUSE_BIG_CAPS);
 }
 
+size_t apps_port_psram_free(void) {
+    return heap_caps_get_free_size(MUSE_BIG_CAPS);
+}
+
 void apps_port_free(void *ptr) {
     if (ptr != NULL && held_by_me()) {
         breach(BREACH_HEAP, "a block was freed with the lock held");
@@ -106,24 +115,27 @@ void apps_port_free(void *ptr) {
 
 /*
  * The console echo. On the 1.75C the console is UART0 at 115200 with no driver installed, so printf busy-waits on the
- * UART's FIFO, about 87 us a byte, on the app task and inside the call's wall clock: a whole line (236 bytes) is about
- * 20 ms. So the echo takes at most 1,024 bytes a second (apps_echo.h). A line that doesn't fit isn't echoed and is
- * counted; the next echoed line comes after "@app.log <id> (<N> lines not echoed)", which takes its bytes too, <id>
- * being the app of the last line not echoed. The log ring and the status keep every line. The app task is the only
- * caller, so the bucket and the count are its own. One printf is one write: newlib locks stdout for it, so another
- * task's line can't land inside the note or the line.
+ * UART's FIFO, about 87 us a byte: a whole line (236 bytes) is about 20 ms. So the echo takes at most 1,024 bytes a
+ * second (apps_echo.h). A line that doesn't fit isn't echoed and is counted; the next echoed line comes after
+ * "@app.log <id> (<N> lines not echoed)", which takes its bytes too, <id> being the app of the last line not echoed.
+ * The log ring and the status keep every line.
  *
- * An echoed line ends with apps_port_console_flush, as a reply does, so the host doesn't keep one that lands on a
- * 64-byte USB packet. Its cost stays bounded: the app task now waits for the line to leave the UART, which the FIFO used
- * to hide for its last 128 bytes (about 11 ms), and for the host to take the last USB packet (1-2 ms with a reading
- * host, at most 50 ms once when the host stops reading). The cap allows at most five long lines a second, and its
- * 1,024 bytes take about 89 ms to send in all.
+ * The app task never waits for the console inside a call (Task 13's F3). picolibc holds stdout's lock for a whole
+ * printf, so a print there would wait behind another task's 6 KB reply (about 0.53 s) with the call's 1 s wall clock
+ * running. So apps_port_log only queues the line, with its note, in a block of APPS_ECHO_QUEUE bytes as the console
+ * sends them (CRLF counted): what the bucket lets a call echo, a burst and a second of the rate. A line the queue has no
+ * room for is counted as one past the bucket is. apps_port_log_drain, which the app task calls after every call and in
+ * its housekeeping, prints each queued entry with one printf (so another task's line can't land inside the note or the
+ * line) and ends it with apps_port_console_flush, as a reply ends, so the host doesn't keep one that lands on a 64-byte
+ * USB packet. The app task is the only caller of both, so the bucket, the count and the queue are its own.
  */
 #define ECHO_EOL_BYTES 2  /* the console ends a line with CRLF (CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF) */
 
 static apps_echo_t s_echo;
 static uint32_t s_unechoed;                     /* lines not echoed since the last echoed one */
 static char s_unechoed_id[APPS_ID_MAX + 1];
+static size_t s_echo_used;                      /* bytes of s_echo_queue used: entries, each NUL-terminated */
+static size_t s_echo_bytes;                     /* what they are as the console sends them, at most APPS_ECHO_QUEUE */
 
 void apps_port_log(const char *app_id, const char *line) {
     char note[APPS_ID_MAX + 64] = "";
@@ -133,14 +145,28 @@ void apps_port_log(const char *app_id, const char *line) {
         bytes = n > 0 ? (size_t)n - 1 + ECHO_EOL_BYTES : 0;
     }
     bytes += sizeof "@app.log " - 1 + strlen(app_id) + 1 + strlen(line) + ECHO_EOL_BYTES;
-    if (!apps_echo_take(&s_echo, apps_port_mono_ms(), bytes)) {
+    /* An entry takes at most its console bytes in the block (a newline for each CRLF, and one NUL). */
+    if (s_echo_queue == NULL || s_echo_bytes + bytes > APPS_ECHO_QUEUE ||
+        !apps_echo_take(&s_echo, apps_port_mono_ms(), bytes)) {
         s_unechoed = s_unechoed < UINT32_MAX ? s_unechoed + 1 : s_unechoed;
         snprintf(s_unechoed_id, sizeof s_unechoed_id, "%s", app_id);
         return;
     }
-    printf("%s@app.log %s %s\n", note, app_id, line);
-    apps_port_console_flush();
+    int n = snprintf(s_echo_queue + s_echo_used, APPS_ECHO_QUEUE - s_echo_used, "%s@app.log %s %s\n", note, app_id, line);
+    s_echo_used += (size_t)n + 1;
+    s_echo_bytes += bytes;
     s_unechoed = 0;
+}
+
+void apps_port_log_drain(void) {
+    for (size_t at = 0; at < s_echo_used;) {
+        const char *entry = s_echo_queue + at;
+        printf("%s", entry);
+        apps_port_console_flush();
+        at += strlen(entry) + 1;
+    }
+    s_echo_used = 0;
+    s_echo_bytes = 0;
 }
 
 /*

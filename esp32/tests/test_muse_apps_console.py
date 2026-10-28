@@ -17,7 +17,8 @@
 ConsoleHookChain compiles muse_input.c's hook chain on its own (style b). Console runs
 tests/muse_apps_console_harness.c: the real apps_console.c and install pipeline (apps_install.c, with the real cJSON)
 under muse_apps_console, as the serial task calls it, with a fake I/O worker and fake app task calls. Every line the
-console prints is checked here to be one reply of the protocol, its JSON valid (R13.3). The stack case runs the hook on
+console prints is checked here to be one reply of the protocol, its bytes decoded strictly as UTF-8 and its JSON valid
+(R13.3). The stack case runs the hook on
 exactly the serial task's 3,584 bytes (R13.1), in a build without the sanitizers. What these tests can't show is the
 board's own: the UART's speed, the real stack's high-water mark (Task 15 reads muse_serial's), the RAM it all takes.
 """
@@ -55,6 +56,8 @@ STAGED = {
 }
 
 # The protocol's replies: an acknowledgement, a result or a refusal, each one line.
+MAIN_HELLO = "local app = {}\nfunction app.start() ui.label{text = 'Hi'} end\nreturn app\n"  # the harness's
+
 REPLY = re.compile(r"^(?:@app\.ack (?P<path>[a-z0-9_./-]+) (?P<seq>\d+)|@app (?P<result>\{.*\})|"
                    r"@app\.err (?P<err>\{.*\})|@stack (?P<stack>\{.*\}))$")
 
@@ -88,6 +91,43 @@ def replies(test, stdout):
             test.assertIn("op", value, line)
         parsed.append(("result" if match.group("result") else "err" if match.group("err") else "stack", value))
     return parsed
+
+
+def blanked(source):
+    """source with its comments, strings and character literals blanked (each character but a newline a space), so their
+    braces and brackets don't count."""
+    return re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'',
+                  lambda m: re.sub(r"[^\n]", " ", m.group(0)), source, flags=re.S)
+
+
+def function_bodies(source):
+    """Every function body of a C file, by name: from each '{' at the top level that follows a ')' (however the signature
+    is split across lines) to its matching '}', in the blanked text."""
+    text = blanked(source)
+    bodies, depth, start, name = {}, 0, None, None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                j = i - 1
+                while j >= 0 and text[j].isspace():
+                    j -= 1
+                start = None
+                if j >= 0 and text[j] == ")":
+                    parens, k = 0, j
+                    while k >= 0:
+                        parens += {")": 1, "(": -1}.get(text[k], 0)
+                        if parens == 0:
+                            break
+                        k -= 1
+                    match = re.search(r"(\w+)\s*$", text[:k])
+                    start, name = i + 1, match.group(1) if match else None
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None and name is not None:
+                bodies[name] = text[start:i]
+                start = None
+    return bodies
 
 
 class ConsoleHookChain(unittest.TestCase):
@@ -165,11 +205,16 @@ class Console(unittest.TestCase):
 
     def run_case(self, case, harness=None):
         try:
-            done = apps_host.run(harness or self.harness, case, timeout=120)
+            done = apps_host.run(harness or self.harness, case, timeout=120, text=False)
         except subprocess.TimeoutExpired:
             self.fail(f"{case} took more than 120 s")
-        self.assertEqual(done.returncode, 0, done.stdout[-4000:] + done.stderr[-8000:])
-        return replies(self, done.stdout)
+        stderr = done.stderr.decode("utf-8", errors="replace")
+        self.assertEqual(done.returncode, 0, done.stdout[-4000:].decode("utf-8", errors="replace") + stderr[-8000:])
+        try:
+            stdout = done.stdout.decode("utf-8")  # strictly: a reply that isn't UTF-8 fails here (T2)
+        except UnicodeDecodeError as e:
+            self.fail(f"not UTF-8 ({e}): {done.stdout[max(e.start - 100, 0):e.end + 100]!r}")
+        return replies(self, stdout)
 
     def test_put_sequence_and_ack(self):
         self.run_case("put_sequence_and_ack")
@@ -241,6 +286,19 @@ class Console(unittest.TestCase):
     def test_stage_out_of_memory(self):
         self.run_case("stage_out_of_memory")
 
+    def test_a_repeated_commit_is_busy(self):  # F5: the hold first, then the stage
+        self.run_case("a_repeated_commit_is_busy")
+
+    def test_the_stage_is_bounded(self):  # F6: what was put and a small slack, whatever the files
+        self.run_case("the_stage_is_bounded")
+
+    def test_empty_and_missing_files(self):  # T5, F8: stage_read's branches; an empty first piece
+        parsed = self.run_case("empty_and_missing_files")
+        results = [r[1] for r in parsed if r[0] == "result" and r[1]["op"] == "commit"]
+        self.assertEqual([r["error"]["code"] for r in results[:2]], ["read_failed", "read_failed"])
+        files = results[2]["payload"]["files"]
+        self.assertEqual([(f["path"], f["bytes"]) for f in files], [("main.lua", len(MAIN_HELLO)), ("lib.lua", 0)])
+
     def test_console_stack(self):  # R13.1: the hook on exactly 3,584 bytes
         harness = apps_host.build("muse_apps_console_stack", [*SOURCES, *apps_host.lua_sources()], self.tmp,
                                   include_dirs=self.includes, objects=[apps_host.cjson_object()], sanitize=False)
@@ -263,14 +321,15 @@ class Console(unittest.TestCase):
                 expr = re.sub(r"\b[A-Z][A-Z0-9_]{2,}\b", lambda m: f"({defines.get(m.group(0), m.group(0))})", expr)
             return eval(expr, {})
 
-        bodies = []
-        for match in re.finditer(r"^[a-z][^\n;=]*\)\s*\{\n", source, re.M):
-            depth, at = 1, match.end()
-            while depth:
-                depth += {"{": 1, "}": -1}.get(source[at], 0)
-                at += 1
-            bodies.append(source[match.end():at])
-        self.assertGreater(len(bodies), 10, "the function bodies weren't found")
+        found_bodies = function_bodies(source)
+        # Every function the file defines, signatures over several lines included (T6: stage_read's is), is scanned: the
+        # brace walk and a pattern that reads definitions across lines must agree.
+        defined = set(re.findall(r"^[a-z][^;{}#]*?\b(\w+)\([^;{}]*\)\s*\{", blanked(source), re.M))
+        self.assertEqual(sorted(defined - set(found_bodies)), [])
+        self.assertEqual(sorted(set(found_bodies) - defined), [])
+        self.assertIn("stage_read", found_bodies)
+        self.assertGreater(len(found_bodies), 30, "the function bodies weren't found")
+        bodies = list(found_bodies.values())
         found = 0
         for body in bodies:
             # Each declaration that has an array in it (a type, then a declarator with '['), and each array it declares.

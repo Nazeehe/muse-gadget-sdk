@@ -63,6 +63,10 @@ IMAGE_NOT_LVGL_MSG = "image: not an LVGL v9 image file (use LVGLImage.py --ofmt 
 IMAGE_COMPRESSED_MSG = "image: compressed images aren't supported"
 
 
+def image_flags_msg(flags):
+    return f"image: flags 0x{flags:04x} aren't supported (only premultiplied alpha)"
+
+
 def id_msg(id_text, folder="timer"):
     return f"manifest: id '{id_text}' must match ^[a-z][a-z0-9_]{{1,23}}$ and the folder name '{folder}'"
 
@@ -868,13 +872,31 @@ class MuseAppsPkgTest(unittest.TestCase):
         self.refused_image(lvgl_image()[:12], image_size_msg(12, 44))
 
     def test_image_compressed_flag(self):
+        # Compressed is the flag with its own message, whatever else is set with it.
         self.refused_image(lvgl_image(flags=0x0008), IMAGE_COMPRESSED_MSG)
         self.refused_image(lvgl_image(flags=0x0009), IMAGE_COMPRESSED_MSG)
+        self.refused_image(lvgl_image(flags=0x0018), IMAGE_COMPRESSED_MSG)
         self.refused_image(lvgl_image(flags=0xFFFF), IMAGE_COMPRESSED_MSG)
-        # The other flags (premultiplied, modifiable...) don't matter here.
-        self.assertTrue(self.image(lvgl_image(flags=0x0001))["ok"])
-        self.assertTrue(self.image(lvgl_image(flags=0x0002))["ok"])
-        self.assertTrue(self.image(lvgl_image(flags=0xFFF7))["ok"])
+
+    def test_image_flags_are_none_or_premultiplied(self):
+        # No flag, and premultiplied alpha (0x0001, which LVGLImage.py sets for a premultiplied image), are an image
+        # a descriptor can be made of and drawn in place. Allocated (0x0010) would have LVGL take the descriptor for
+        # a draw buffer, and none of the others means anything to an image that is not.
+        self.assertEqual(self.image(lvgl_image(flags=0x0000)), {"ok": True, "w": 4, "h": 4})
+        self.assertEqual(self.image(lvgl_image(flags=0x0001)), {"ok": True, "w": 4, "h": 4})
+        self.assertEqual(self.image(lvgl_image(w=5, h=3, cf=0x0E, flags=0x0001)), {"ok": True, "w": 5, "h": 3})
+        self.assertEqual(self.image(lvgl_image(w=3, h=7, cf=0x14, flags=0x0001)), {"ok": True, "w": 3, "h": 7})
+        for bit in (0x0002, 0x0004, 0x0010, 0x0020, 0x0040, 0x0080, 0x0100, 0x0200, 0x0400, 0x0800, 0x1000, 0x2000, 0x4000,
+                    0x8000):
+            for flags in (bit, bit | 0x0001):
+                with self.subTest(flags=hex(flags)):
+                    self.refused_image(lvgl_image(flags=flags), image_flags_msg(flags))
+        # What LVGL's own snapshot and draw buffers carry, and everything but compressed.
+        self.refused_image(lvgl_image(flags=0x0030), image_flags_msg(0x0030))
+        self.refused_image(lvgl_image(flags=0xFFF7), image_flags_msg(0xFFF7))
+        # The message is the same for every format.
+        self.refused_image(lvgl_image(cf=0x0E, flags=0x0010), image_flags_msg(0x0010))
+        self.refused_image(lvgl_image(cf=0x14, flags=0x0020), image_flags_msg(0x0020))
 
     def test_image_size_against_the_screen(self):
         # 1 to 466 each way, and 466 passes.
@@ -929,10 +951,11 @@ class MuseAppsPkgTest(unittest.TestCase):
         self.refused_image(lvgl_image(w=4, h=4, stride=65535)[:100], image_size_msg(100, 12 + 65535 * 4))
 
     def test_image_checks_come_in_a_fixed_order(self):
-        # magic, compressed, no pixels, too big, colour format, stride, size.
-        bad_all = struct.pack("<BBHHHHH", 0x18, 0x10, 0x0008, 500, 500, 1, 0) + bytes(3)
+        # magic, compressed, other flags, no pixels, too big, colour format, stride, size.
+        bad_all = struct.pack("<BBHHHHH", 0x18, 0x10, 0x0018, 500, 500, 1, 0) + bytes(3)
         self.refused_image(bad_all, IMAGE_NOT_LVGL_MSG)
-        self.refused_image(struct.pack("<BBHHHHH", 0x19, 0x10, 0x0008, 500, 500, 1, 0) + bytes(3), IMAGE_COMPRESSED_MSG)
+        self.refused_image(struct.pack("<BBHHHHH", 0x19, 0x10, 0x0018, 500, 500, 1, 0) + bytes(3), IMAGE_COMPRESSED_MSG)
+        self.refused_image(struct.pack("<BBHHHHH", 0x19, 0x10, 0x0010, 0, 500, 1, 0) + bytes(3), image_flags_msg(0x0010))
         self.refused_image(struct.pack("<BBHHHHH", 0x19, 0x10, 0x0000, 0, 500, 1, 0) + bytes(3),
                            image_empty_msg(0, 500))
         self.refused_image(struct.pack("<BBHHHHH", 0x19, 0x10, 0x0000, 500, 500, 1, 0) + bytes(3),

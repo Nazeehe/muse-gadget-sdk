@@ -158,6 +158,28 @@ typedef enum {
 
 typedef void (*lv_event_cb_t)(lv_event_t *e);
 
+/* lv_image.h: where an image sits in a box that is not its size (the others transform it, and are not used). */
+typedef enum {
+    LV_IMAGE_ALIGN_DEFAULT = 0,
+    LV_IMAGE_ALIGN_TOP_LEFT,
+    LV_IMAGE_ALIGN_TOP_MID,
+    LV_IMAGE_ALIGN_TOP_RIGHT,
+    LV_IMAGE_ALIGN_BOTTOM_LEFT,
+    LV_IMAGE_ALIGN_BOTTOM_MID,
+    LV_IMAGE_ALIGN_BOTTOM_RIGHT,
+    LV_IMAGE_ALIGN_LEFT_MID,
+    LV_IMAGE_ALIGN_RIGHT_MID,
+    LV_IMAGE_ALIGN_CENTER,
+} lv_image_align_t;
+
+/* lv_color.h and lv_image_dsc.h: what an image's header says (only what apps_lv.c reads). */
+enum {
+    LV_COLOR_FORMAT_A8 = 0x0E,
+};
+enum {
+    LV_IMAGE_FLAGS_PREMULTIPLIED = 0x0001,
+};
+
 /* A variable image (what an .bin file is once its first 12 bytes are the header): lv_image_dsc.h. */
 typedef struct {
     uint32_t magic : 8;
@@ -231,6 +253,8 @@ void lv_obj_set_style_text_color(lv_obj_t *obj, lv_color_t value, lv_style_selec
 void lv_obj_set_style_text_align(lv_obj_t *obj, lv_text_align_t value, lv_style_selector_t selector);
 void lv_obj_set_style_arc_width(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
 void lv_obj_set_style_arc_color(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector);
+void lv_obj_set_style_image_recolor(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector);
+void lv_obj_set_style_image_recolor_opa(lv_obj_t *obj, lv_opa_t value, lv_style_selector_t selector);
 
 void lv_label_set_text(lv_obj_t *obj, const char *text);
 void lv_label_set_long_mode(lv_obj_t *obj, lv_label_long_mode_t long_mode);
@@ -245,6 +269,7 @@ void lv_bar_set_value(lv_obj_t *obj, int32_t value, lv_anim_enable_t anim);
 
 void lv_image_set_src(lv_obj_t *obj, const void *src);
 void lv_image_set_scale(lv_obj_t *obj, uint32_t zoom);
+void lv_image_set_inner_align(lv_obj_t *obj, lv_image_align_t align);
 
 void *lv_event_get_user_data(lv_event_t *e);
 lv_event_code_t lv_event_get_code(lv_event_t *e);

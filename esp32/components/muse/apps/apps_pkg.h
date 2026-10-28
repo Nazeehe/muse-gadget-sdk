@@ -80,9 +80,10 @@
  * a manifest key is near (apps_suggest). They are joined with "; " in apps_manifest_t's warnings, one a key;
  * one that doesn't fit whole in what is left is dropped, never cut.
  * An image's: "image: not an LVGL v9 image file (use LVGLImage.py --ofmt BIN)", "image: compressed images
- * aren't supported", "image: %ux%u has no pixels", "image: %ux%u is larger than the 466x466 screen", "image:
- * colour format 0x%02x isn't RGB565, RGB565A8 or A8", "image: stride %u is too small for a row of %u pixels
- * (%u bytes needed)" and "image: size %u doesn't match its header (%u expected)".
+ * aren't supported", "image: flags 0x%04x aren't supported (only premultiplied alpha)", "image: %ux%u has no
+ * pixels", "image: %ux%u is larger than the 466x466 screen", "image: colour format 0x%02x isn't RGB565,
+ * RGB565A8 or A8", "image: stride %u is too small for a row of %u pixels (%u bytes needed)" and "image: size %u
+ * doesn't match its header (%u expected)".
  *
  * Memory. A parsed manifest owns one block, messages_json: the "messages" object as written, less the
  * whitespace outside its strings. It is in PSRAM on the device (the muse overlay keeps small mallocs in
@@ -172,10 +173,12 @@ void apps_pkg_free(apps_pkg_t *pkg, void (*free_fn)(void *));
 
 /*
  * Whether data[0, len) is an LVGL v9 .bin image the gadget can draw: magic 0x19; colour format RGB565 (0x12),
- * RGB565A8 (0x14) or A8 (0x0E); not compressed (flag 0x0008); 1 to 466 pixels each way; a stride (bytes a
- * row) of at least a row's worth; and a size of exactly 12 + stride * h bytes (RGB565A8: and (stride / 2) *
- * h more, for the alpha plane). On success *w and *h are its size (either may be NULL); otherwise they are 0
- * and err has the message (Messages, above). The header's fields are read from the bytes, so data needs no
- * alignment, and nothing past data[len] is read.
+ * RGB565A8 (0x14) or A8 (0x0E); not compressed (flag 0x0008) and with no flag but premultiplied alpha (0x0001,
+ * which LVGLImage.py sets for a premultiplied image; the others, allocated and modifiable, say what an image's
+ * memory is, and the file is drawn in place); 1 to 466 pixels each way; a stride (bytes a row) of at least a
+ * row's worth; and a size of exactly 12 + stride * h bytes (RGB565A8: and (stride / 2) * h more, for the alpha
+ * plane). On success *w and *h are its size (either may be NULL); otherwise they are 0 and err has the message
+ * (Messages, above). The header's fields are read from the bytes, so data needs no alignment, and nothing past
+ * data[len] is read.
  */
 bool apps_image_check(const uint8_t *data, size_t len, uint16_t *w, uint16_t *h, char *err, size_t err_len);

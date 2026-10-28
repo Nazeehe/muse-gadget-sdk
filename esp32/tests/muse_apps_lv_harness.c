@@ -334,6 +334,12 @@ static void log_empty_at(int line) {
 }
 #define LOG_EMPTY() log_empty_at(__LINE__)
 
+/* The log has this line, whole. */
+static void has_at(int line, const char *text) {
+    CHECK_AT(line, log_has_line(text), "the log lacks \"%s\":\n%s", text, log_peek());
+}
+#define HAS(text) has_at(__LINE__, (text))
+
 /* What apps_lv.c logged: "W muse_apps: apply 2001 us". */
 static const char *esp_peek(void) {
     return tb_peek(&esp_log_text);
@@ -371,6 +377,7 @@ struct lv_obj {
     int32_t min, max, value;
     const lv_image_dsc_t *src;
     uint32_t scale;
+    lv_image_align_t inner_align;  /* where an image sits in its box: CENTER until lv_image_set_inner_align says otherwise */
     lv_area_t area;
     bool forced;           /* the test set the area: the layout leaves it */
     fake_cb_t cbs[8];
@@ -396,11 +403,17 @@ static lv_obj_t screen_obj;
 static lv_indev_t indev_obj;
 static bool indev_present = true;
 static lv_dir_t gesture_dir = LV_DIR_NONE;
+static lv_obj_t *pressed_obj;  /* the object the finger went down on (LVGL's act_obj), NULL when it is up */
+static bool wait_released;     /* lv_indev_wait_release was called during this touch */
+static bool long_sent;         /* LONG_PRESSED was sent during this touch */
 
 static int fake_errors;
 static char fake_note[240];
 
 static long lvgl_calls;          /* every call into the fake LVGL, but the getters of events */
+static int create_fail_in;       /* the Nth lv_*_create from now returns NULL, as LVGL does when it has no memory (0: none) */
+static void (*image_hook)(void *);  /* run once, as the next lv_image_create begins: what changes after the pass has checked */
+static void *image_hook_arg;
 static int64_t clock_us = 1000000;
 static int64_t call_cost_us;     /* every LVGL call takes this long */
 static int64_t extra_us_next;    /* and the next one this much more, once */
@@ -555,6 +568,10 @@ static lv_obj_t *make_object(const char *cls, lv_obj_t *parent, const char *fn) 
     if (apply_active && !lock_held) {
         fake_error("%s was called inside the apply step without the UI lock", fn);
     }
+    if (create_fail_in > 0 && --create_fail_in == 0) {
+        logline("create_failed %s", cls);  /* no memory: NULL, and nothing was made */
+        return NULL;
+    }
     if (parent == NULL || parent->deleted) {
         fake_error("%s under %s", fn, parent == NULL ? "NULL" : "a deleted object");
         return NULL;
@@ -631,7 +648,16 @@ lv_obj_t *lv_bar_create(lv_obj_t *parent) {
 }
 
 lv_obj_t *lv_image_create(lv_obj_t *parent) {
-    return make_object("image", parent, "lv_image_create");
+    if (image_hook != NULL) {
+        void (*hook)(void *) = image_hook;
+        image_hook = NULL;
+        hook(image_hook_arg);
+    }
+    lv_obj_t *o = make_object("image", parent, "lv_image_create");
+    if (o != NULL) {
+        o->inner_align = LV_IMAGE_ALIGN_CENTER;  /* lv_image_constructor: img->align = LV_IMAGE_ALIGN_CENTER */
+    }
+    return o;
 }
 
 static void mark_deleted(lv_obj_t *o) {
@@ -753,8 +779,10 @@ static void content_size(lv_obj_t *o, int32_t *w, int32_t *h) {
             }
         }
     } else if (strcmp(o->cls, "image") == 0 && o->src != NULL) {
-        *w = (int32_t)((uint64_t)o->src->header.w * o->scale / 256);
-        *h = (int32_t)((uint64_t)o->src->header.h * o->scale / 256);
+        /* LVGL 9.5.0's LV_EVENT_GET_SELF_SIZE (lv_image.c) says the image as it is: the scale draws it larger or smaller
+         * about the middle of its box, and does not change what the box lays out as. */
+        *w = (int32_t)o->src->header.w;
+        *h = (int32_t)o->src->header.h;
     }
 }
 
@@ -898,6 +926,18 @@ void lv_obj_set_style_arc_color(lv_obj_t *obj, lv_color_t value, lv_style_select
     }
 }
 
+void lv_obj_set_style_image_recolor(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector) {
+    if (use(obj, "lv_obj_set_style_image_recolor", NULL) != NULL) {
+        style_log(obj, "image_recolor", selector, "#%06x", (unsigned)rgb(value));
+    }
+}
+
+void lv_obj_set_style_image_recolor_opa(lv_obj_t *obj, lv_opa_t value, lv_style_selector_t selector) {
+    if (use(obj, "lv_obj_set_style_image_recolor_opa", NULL) != NULL) {
+        style_log(obj, "image_recolor_opa", selector, "%u", (unsigned)value);
+    }
+}
+
 /* ---- Widgets ---- */
 
 void lv_label_set_text(lv_obj_t *obj, const char *text) {
@@ -989,6 +1029,15 @@ void lv_image_set_src(lv_obj_t *obj, const void *src) {
         fake_error("lv_image_set_src(%d) with something that is not an image descriptor", obj->id);
         return;
     }
+    if ((dsc->header.flags & ~(unsigned)LV_IMAGE_FLAGS_PREMULTIPLIED) != 0) {
+        /* LVGL 9.5.0 reads ALLOCATED as "this descriptor is an lv_draw_buf" and, as its unaligned_data and handlers (the
+         * descriptor's reserved fields, NULL here) are not there, refuses it: the image never shows. The other flags say
+         * what the memory is as well. Only premultiplied alpha means anything to a descriptor drawn in place, so any
+         * other that gets this far is a mistake the fake reports. */
+        fake_error("lv_image_set_src(%d): header flags 0x%04x, but only premultiplied alpha means anything to a descriptor "
+                   "drawn in place", obj->id, (unsigned)dsc->header.flags);
+        return;
+    }
     obj->src = dsc;
     logline("image_src %d %ux%u cf=0x%02x data=%u", obj->id, (unsigned)dsc->header.w, (unsigned)dsc->header.h,
          (unsigned)dsc->header.cf, (unsigned)dsc->data_size);
@@ -1004,6 +1053,18 @@ void lv_image_set_scale(lv_obj_t *obj, uint32_t zoom) {
     }
     obj->scale = zoom;
     logline("image_scale %d %u", obj->id, (unsigned)zoom);
+}
+
+void lv_image_set_inner_align(lv_obj_t *obj, lv_image_align_t align) {
+    if (use(obj, "lv_image_set_inner_align", "image") == NULL) {
+        return;
+    }
+    if (align != LV_IMAGE_ALIGN_DEFAULT && align != LV_IMAGE_ALIGN_CENTER) {
+        fake_error("lv_image_set_inner_align(%d, %d): the fake only knows default and center", obj->id, (int)align);
+        return;
+    }
+    obj->inner_align = align;
+    logline("image_inner_align %d %s", obj->id, align == LV_IMAGE_ALIGN_CENTER ? "center" : "default");
 }
 
 /* ---- Events and the input device ---- */
@@ -1051,6 +1112,7 @@ void lv_indev_wait_release(lv_indev_t *indev) {
         fake_error("lv_indev_wait_release(NULL)");
         return;
     }
+    wait_released = true;
     logline("wait_release");
 }
 
@@ -1132,6 +1194,80 @@ static void fake_fire(int id, lv_event_code_t code) {
     }
 }
 
+/* A touch the way LVGL 9.5.0's indev (lv_indev.c) sends it. The finger goes down on an object: PRESSED. */
+static void fake_press(int id) {
+    pressed_obj = fake_obj(id);
+    wait_released = false;
+    long_sent = false;
+    fake_fire(id, LV_EVENT_PRESSED);
+}
+
+/* It stays down long enough: LONG_PRESSED. */
+static void fake_hold(void) {
+    long_sent = true;
+    fake_fire(pressed_obj->id, LV_EVENT_LONG_PRESSED);
+}
+
+/* It moves far enough: indev_gesture sends the gesture, to the first object up from the pressed one that doesn't pass
+ * gestures on (one with no GESTURE_BUBBLE), and to that one only. */
+static void fake_swipe(lv_dir_t dir) {
+    lv_obj_t *target = pressed_obj;
+    while (target != NULL && (target->flags & LV_OBJ_FLAG_GESTURE_BUBBLE) != 0) {
+        target = target->parent;
+    }
+    gesture_dir = dir;
+    if (target != NULL) {
+        fake_fire(target->id, LV_EVENT_GESTURE);
+    }
+}
+
+/* It lifts. After lv_indev_wait_release the pressed object gets PRESS_LOST and nothing else (no RELEASED, no click).
+ * Otherwise RELEASED, then SHORT_CLICKED (when no long press was sent), then CLICKED. */
+static void fake_lift(void) {
+    lv_obj_t *o = pressed_obj;
+    pressed_obj = NULL;
+    if (o == NULL) {
+        return;
+    }
+    if (wait_released) {
+        wait_released = false;
+        fake_fire(o->id, LV_EVENT_PRESS_LOST);
+        return;
+    }
+    fake_fire(o->id, LV_EVENT_RELEASED);
+    if (!long_sent) {
+        fake_fire(o->id, LV_EVENT_SHORT_CLICKED);
+    }
+    fake_fire(o->id, LV_EVENT_CLICKED);
+}
+
+/* A tap: down and up. */
+static void fake_tap(int id) {
+    fake_press(id);
+    fake_lift();
+}
+
+/* Where LVGL 9.5.0's draw_image puts the picture of an image object: the image at its own size, placed in the box by the
+ * inner align (lv_area_align), then scaled about its middle (the default pivot). To a pixel: the fake does the sums in
+ * whole pixels. */
+static lv_area_t fake_drawn(int id) {
+    const lv_obj_t *o = fake_obj(id);
+    int32_t iw = (int32_t)o->src->header.w, ih = (int32_t)o->src->header.h;
+    int32_t bw = o->area.x2 - o->area.x1 + 1, bh = o->area.y2 - o->area.y1 + 1;
+    int32_t x = o->area.x1, y = o->area.y1;
+    if (o->inner_align == LV_IMAGE_ALIGN_CENTER) {
+        x += bw / 2 - iw / 2;
+        y += bh / 2 - ih / 2;
+    }
+    int32_t sw = iw * (int32_t)o->scale / 256, sh = ih * (int32_t)o->scale / 256;
+    lv_area_t a;
+    a.x1 = (2 * x + iw - sw) / 2;
+    a.y1 = (2 * y + ih - sh) / 2;
+    a.x2 = a.x1 + sw - 1;
+    a.y2 = a.y1 + sh - 1;
+    return a;
+}
+
 static void fake_free_all(void) {
     for (int i = 0; i < n_objs; i++) {
         free(objs[i]->text);
@@ -1145,6 +1281,9 @@ static void fake_free_all(void) {
     screen_obj.area = (lv_area_t){0, 0, 465, 465};
     indev_present = true;
     gesture_dir = LV_DIR_NONE;
+    pressed_obj = NULL;
+    wait_released = false;
+    long_sent = false;
 }
 
 /* A fresh LVGL: nothing made, the log empty, the clock and the PSRAM as they start. Errors are not cleared: a
@@ -1256,21 +1395,31 @@ static bool apply_at(int line, env_t *e, bool in_callback) {
 
 /* A fresh fake LVGL and a layer on its screen, an app's table with two images, and the first pass done (which
  * takes the table's background), so the log is empty and a case's first pass is its own. */
-static void scene_raw(env_t *e) {
+static void scene_raw_with(env_t *e, const apps_asset_t *assets, int n_assets) {
     fake_reset();
     refuse_from = -1;
     trylock_refusals = 0;
-    CHECK(env_open(e, ASSETS, 2), "env_open");
+    create_fail_in = 0;
+    CHECK(env_open(e, assets, n_assets), "env_open");
     apps_lv_build(fake_screen());
     log_clear();
     stats_base = stats_now();
 }
 
-static void scene(env_t *e) {
-    scene_raw(e);
+static void scene_raw(env_t *e) {
+    scene_raw_with(e, ASSETS, 2);
+}
+
+/* The same with a table of images of the case's own. */
+static void scene_with(env_t *e, const apps_asset_t *assets, int n_assets) {
+    scene_raw_with(e, assets, n_assets);
     apply_at(__LINE__, e, false);
     log_clear();
     stats_base = stats_now();
+}
+
+static void scene(env_t *e) {
+    scene_with(e, ASSETS, 2);
 }
 
 /* The end of a case: the layer let go, the table gone, nothing held. */
@@ -1322,9 +1471,12 @@ static void run_ok_at(int line, env_t *e, const char *src) {
 
 /* ---- Events from the layer ---- */
 
+static int closes;  /* times the layer's close callback has run */
+
 typedef struct {
     uint16_t slot, gen;
     uint8_t event;
+    int closes_before;  /* closes that had happened when it arrived */
 } ev_t;
 
 static ev_t evs[256];
@@ -1332,11 +1484,9 @@ static int n_evs;
 
 static void on_event(uint16_t slot, uint16_t gen, uint8_t event) {
     if (n_evs < (int)ARRAY_LEN(evs)) {
-        evs[n_evs++] = (ev_t){slot, gen, event};
+        evs[n_evs++] = (ev_t){slot, gen, event, closes};
     }
 }
-
-static int closes;
 
 static void on_close(void) {
     closes++;
@@ -1575,6 +1725,12 @@ static const bad_t BAD[] = {
                             "b4 = ui.box{parent = b3} w = ui.label{}", 5, parent_five_boxes_up, 5, 1},
     {"a parent chain that loops", "b0 = ui.box{} b1 = ui.box{parent = b0}", 1, parent_loop, 0, 2},
     {"a box that became a label under a child", "b = ui.box{} w = ui.label{parent = b}", 1, parent_kind_changed, 1, 1},
+    /* A box in a higher slot than its pending child is made for the child, so it is checked first: bad, it is not made,
+     * and neither is the child. */
+    {"a pending box above its child that is bad itself", "x = ui.label{} b = ui.box{} x:delete() c = ui.label{parent = b}", 1,
+     opacity_101, 0, 2},
+    {"a pending box two levels above it that is bad itself",
+     "x = ui.label{} b0 = ui.box{} b1 = ui.box{parent = b0} x:delete() c = ui.label{parent = b1}", 1, opacity_101, 0, 3},
 };
 
 static void revalidation_drops_bad_slot(void) {
@@ -1786,6 +1942,67 @@ static void create_pending_has_no_object(void) {
     CHECK(APPLY(&e), "the pass ran");
     CHECK(log_count("delete 2") == 1 && log_count("create label 3 in 1") == 1, "slot 0 deleted, slot 1 made\n%s", log_peek());
     CHECK(fake_alive_of("label") == 1, "one label is alive");
+    FINISH(&e);
+}
+
+/* An lv_*_create that gives NULL (LVGL had no memory) is a refused create: the bits stay, no pointer is kept, and the next
+ * pass makes the widget. A button whose label can't be made is deleted again, whole, and is not recorded. */
+static void a_create_that_fails_is_tried_again(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "a = ui.label{text = 'x'}");
+    uint32_t bits = W(&e, 0)->dirty;
+    create_fail_in = 1;
+    CHECK(APPLY(&e), "the pass ran");
+    LOG_IS("create_failed label\n");  /* and nothing else: not a style on an object that isn't there, not a layout */
+    CHECK(stats_since().refused_creates == 1 && stats_since().rejects == 0 && W(&e, 0)->dirty == bits && fake_alive() == 1,
+          "refused %u, rejects %u, bits %u (wanted %u), %d objects", stats_since().refused_creates, stats_since().rejects,
+          W(&e, 0)->dirty, bits, fake_alive());
+    CHECK(APPLY(&e), "the next pass");
+    CHECK(log_count("create label 2 in 1") == 1 && log_has_line("text 2 \"x\"") && W(&e, 0)->dirty == 0 && stats_since().refused_creates == 1,
+          "made\n%s", log_peek());
+    FINISH(&e);
+
+    /* The label of a button is the second create. The button is deleted, with what is inside it, at once. */
+    scene(&e);
+    RUN(&e, "b = ui.button{text = 'go'}");
+    bits = W(&e, 0)->dirty;
+    create_fail_in = 2;
+    CHECK(APPLY(&e), "the pass ran");
+    LOG_IS(
+        "create button 2 in 1\n"
+        "remove_style_all 2\n"
+        "remove_flag 2 scrollable\n"
+        "remove_flag 2 clickable\n"
+        "create_failed label\n"
+        "delete 2\n");
+    CHECK(fake_alive() == 1 && stats_since().refused_creates == 1 && stats_since().rejects == 0 && W(&e, 0)->dirty == bits,
+          "no half-made button is left: %d objects, refused %u, bits %u (wanted %u)", fake_alive(), stats_since().refused_creates,
+          W(&e, 0)->dirty, bits);
+    /* No record of the button: the next pass finds no object to delete (which the fake would count as a call on a deleted one),
+     * and makes a whole one. */
+    CHECK(APPLY(&e), "the next pass");
+    CHECK(log_count("delete ") == 0 && log_count("create button 3 in 1") == 1 && log_count("create label 4 in 3") == 1 &&
+              log_has_line("text 4 \"go\"") && fake_alive() == 3,
+          "a whole button\n%s", log_peek());
+    FINISH(&e);
+
+    /* A box made for a widget that is in it, and then that widget's create fails: the box stays (it is made, and its own slot
+     * applies it), and the widget is made into it by the next pass. */
+    scene(&e);
+    RUN(&e, "x = ui.label{} b = ui.box{w = 50, h = 50} x:delete() c = ui.label{text = 'in', parent = b}");
+    create_fail_in = 2;
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_find("create obj 2 in 1") == 0 && log_count("create_failed label") == 1 && log_count("create label") == 0,
+          "the box is made, the label is not\n%s", log_peek());
+    HAS("size 2 50 50");
+    CHECK(stats_since().refused_creates == 1 && stats_since().rejects == 0 && W(&e, 1)->dirty == 0 &&
+              (W(&e, 0)->dirty & APPS_DIRTY_CREATE) != 0,
+          "the label is refused and waits: refused %u, its bits %u", stats_since().refused_creates, W(&e, 0)->dirty);
+    log_clear();
+    CHECK(APPLY(&e), "the next pass");
+    CHECK(log_count("create ") == 1 && log_has_line("create label 3 in 2") && W(&e, 0)->dirty == 0,
+          "the label goes into the box that is there\n%s", log_peek());
     FINISH(&e);
 }
 
@@ -2010,6 +2227,30 @@ static void no_table_is_no_pass(void) {
     FINISH(&e);
 }
 
+/* A frame inside a callback is skipped before the lock is asked for and before the table is read, so with no table
+ * published up to three such frames in a row still count as skips (Task 12 passes in_callback = false when no app is
+ * published: no callback can run without one). The 4th goes on to read the pointer and finds nothing: not a skip. */
+static void a_callback_frame_is_skipped_before_the_table_is_read(void) {
+    env_t e;
+    scene_raw(&e);
+    unpublish();
+    long trylocks = trylock_calls;
+    for (int frame = 1; frame <= 3; frame++) {
+        CHECK(!APPLY_CB(&e), "frame %d is skipped", frame);
+    }
+    CHECK(trylock_calls == trylocks && stats_since().skips == 3, "skipped before the lock: %ld trylocks, %u skips",
+          trylock_calls - trylocks, stats_since().skips);
+    CHECK(!APPLY_CB(&e), "the 4th has no table");
+    CHECK(trylock_calls == trylocks + 1 && stats_since().skips == 3 && stats_since().applies == 0,
+          "it read the pointer under the lock and counted nothing: %ld trylocks, %u skips, %u applies", trylock_calls - trylocks,
+          stats_since().skips, stats_since().applies);
+    CHECK(!APPLY_CB(&e) && trylock_calls == trylocks + 2 && stats_since().skips == 3, "and so does every frame after it");
+    /* A frame outside a callback is no skip, and it ends the run: the next three in a callback are skipped again. */
+    CHECK(!APPLY(&e) && stats_since().skips == 3, "outside a callback nothing is counted");
+    CHECK(!APPLY_CB(&e) && stats_since().skips == 4 && trylock_calls == trylocks + 3, "a new run: skipped, before the lock");
+    FINISH(&e);
+}
+
 /* Passes are the published table's, whichever it is; the one that isn't published is left as it was. */
 static void the_published_table_is_the_one_applied(void) {
     env_t first, second;
@@ -2192,11 +2433,6 @@ static void layout_written_back_for_every_widget(void) {
 
 /* ---- Events ---- */
 
-static void has_at(int line, const char *text) {
-    CHECK_AT(line, log_has_line(text), "the log lacks \"%s\":\n%s", text, log_peek());
-}
-#define HAS(text) has_at(__LINE__, (text))
-
 static void event_after_delete_carries_stale_gen(void) {
     env_t e;
     scene(&e);
@@ -2209,7 +2445,7 @@ static void event_after_delete_carries_stale_gen(void) {
     CHECK(APPLY(&e), "made");
     int old_obj = fake_nth("button", 0);
     CHECK(old_obj > 0, "the button's object");
-    CHECK(fake_obj(old_obj)->n_cbs == 4, "four callbacks: %d", fake_obj(old_obj)->n_cbs);
+    CHECK(fake_obj(old_obj)->n_cbs == 5, "five callbacks: %d", fake_obj(old_obj)->n_cbs);
     CHECK(fake_obj(old_obj)->cbs[0].ud == (void *)(uintptr_t)3u, "the user data is slot | gen << 16: %p", fake_obj(old_obj)->cbs[0].ud);
 
     /* A tap on the live widget gets through. */
@@ -2254,31 +2490,33 @@ static void tap_events(void) {
     HAS("add_flag 2 clickable");
     CHECK(log_find("add_event_cb 2 short_clicked") >= 0 && log_find("add_event_cb 2 short_clicked") < log_find("add_event_cb 2 long_pressed") &&
               log_find("add_event_cb 2 long_pressed") < log_find("add_event_cb 2 pressed") &&
-              log_find("add_event_cb 2 pressed") < log_find("add_event_cb 2 released"),
-          "one callback each for the four events, in the order of the table\n%s", log_peek());
-    CHECK(log_count("add_event_cb") == 4, "four registrations\n%s", log_peek());
+              log_find("add_event_cb 2 pressed") < log_find("add_event_cb 2 released") &&
+              log_find("add_event_cb 2 released") < log_find("add_event_cb 2 press_lost"),
+          "one callback each for the five events, in the order of the table\n%s", log_peek());
+    CHECK(log_count("add_event_cb") == 5, "five registrations\n%s", log_peek());
     log_clear();
 
-    /* A long press, then LVGL's CLICKED on the release (it follows a long press too): the app hears long_press only. */
+    /* A long press: LVGL sends PRESSED, LONG_PRESSED, and on the lift RELEASED and then CLICKED (it follows a long press
+     * too, and no SHORT_CLICKED does): the app hears press, long_press, release. */
     n_evs = 0;
-    fake_fire(2, LV_EVENT_PRESSED);
-    fake_fire(2, LV_EVENT_LONG_PRESSED);
-    fake_fire(2, LV_EVENT_CLICKED);
-    fake_fire(2, LV_EVENT_RELEASED);
+    fake_press(2);
+    fake_hold();
+    fake_lift();
     CHECK(n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_LONG_PRESS && evs[2].event == APPS_UI_RELEASE,
           "press, long_press, release: %d events", n_evs);
-    /* A short tap: SHORT_CLICKED is the tap. */
+    /* A short tap: PRESSED, and on the lift RELEASED, SHORT_CLICKED, CLICKED, in that order: press, release, tap. */
     n_evs = 0;
-    fake_fire(2, LV_EVENT_PRESSED);
-    fake_fire(2, LV_EVENT_SHORT_CLICKED);
-    fake_fire(2, LV_EVENT_CLICKED);
-    fake_fire(2, LV_EVENT_RELEASED);
-    CHECK(n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_TAP && evs[2].event == APPS_UI_RELEASE,
-          "press, tap, release: %d events", n_evs);
-    CHECK(evs[1].slot == 0 && evs[1].gen == 0, "slot %d gen %d", evs[1].slot, evs[1].gen);
+    fake_tap(2);
+    CHECK(n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE && evs[2].event == APPS_UI_TAP,
+          "press, release, tap: %d events", n_evs);
+    CHECK(evs[2].slot == 0 && evs[2].gen == 0, "slot %d gen %d", evs[2].slot, evs[2].gen);
+    /* PRESS_LOST is the app's release: it is what LVGL sends instead of RELEASED when the touch was taken away. */
+    n_evs = 0;
+    fake_fire(2, LV_EVENT_PRESS_LOST);
+    CHECK(n_evs == 1 && evs[0].event == APPS_UI_RELEASE && evs[0].slot == 0, "release from PRESS_LOST: %d events", n_evs);
     /* The other events LVGL sends a clickable object are not the app's. */
     n_evs = 0;
-    static const lv_event_code_t others[] = {LV_EVENT_PRESSING, LV_EVENT_PRESS_LOST, LV_EVENT_SINGLE_CLICKED, LV_EVENT_DOUBLE_CLICKED,
+    static const lv_event_code_t others[] = {LV_EVENT_PRESSING, LV_EVENT_SINGLE_CLICKED, LV_EVENT_DOUBLE_CLICKED,
                                              LV_EVENT_TRIPLE_CLICKED, LV_EVENT_LONG_PRESSED_REPEAT, LV_EVENT_CLICKED,
                                              LV_EVENT_GESTURE, LV_EVENT_KEY};
     for (size_t i = 0; i < ARRAY_LEN(others); i++) {
@@ -2307,10 +2545,12 @@ static void clickable_only_when_subscribed(void) {
         int id = fake_nth(objects[i], i == 2 ? 1 : 0);  /* the layer is the first lv_obj */
         CHECK(id > 0 && !fake_flag(id, LV_OBJ_FLAG_CLICKABLE), "%s: clickable with no event", kinds[i]);
         CHECK(!fake_flag(id, LV_OBJ_FLAG_SCROLLABLE), "%s: scrollable", kinds[i]);
+        /* A swipe that starts on it has to reach the layer: LVGL's indev_gesture climbs while the objects pass it up. */
+        CHECK(fake_flag(id, LV_OBJ_FLAG_GESTURE_BUBBLE), "%s: it doesn't pass a swipe up to the layer", kinds[i]);
         CHECK(fake_obj(id)->n_cbs == 0, "%s: callbacks with no event", kinds[i]);
         RUN(&e, "w:on('release', function() end)");
         CHECK(APPLY(&e), "subscribed");
-        int callbacks = i == 3 ? 5 : 4;  /* an arc has a guard against being turned by a finger as well */
+        int callbacks = i == 3 ? 6 : 5;  /* an arc has a guard against being turned by a finger as well */
         CHECK(fake_flag(id, LV_OBJ_FLAG_CLICKABLE) && fake_obj(id)->n_cbs == callbacks, "%s: clickable %d with %d callbacks", kinds[i],
               fake_flag(id, LV_OBJ_FLAG_CLICKABLE), fake_obj(id)->n_cbs);
         RUN(&e, "w:on('release', nil)");
@@ -2336,7 +2576,7 @@ static void subscribed_arc_cannot_be_scrubbed(void) {
     CHECK(APPLY(&e), "made");
     int guarded = fake_nth("arc", 0), bare = fake_nth("arc", 1);
     HAS("add_event_cb 2 pressing preprocess");
-    CHECK(fake_obj(guarded)->n_cbs == 5 && fake_obj(bare)->n_cbs == 0, "callbacks %d and %d", fake_obj(guarded)->n_cbs,
+    CHECK(fake_obj(guarded)->n_cbs == 6 && fake_obj(bare)->n_cbs == 0, "callbacks %d and %d", fake_obj(guarded)->n_cbs,
           fake_obj(bare)->n_cbs);
     for (int i = 0; i < 5; i++) {
         fake_fire(guarded, LV_EVENT_PRESSING);
@@ -2347,10 +2587,8 @@ static void subscribed_arc_cannot_be_scrubbed(void) {
     fake_fire(bare, LV_EVENT_PRESSING);
     CHECK(fake_obj(bare)->value == 41 && arc_drags == 1, "the fake's arc follows a finger: %d", (int)fake_obj(bare)->value);
     /* A touch as the app asked for it. */
-    fake_fire(guarded, LV_EVENT_PRESSED);
-    fake_fire(guarded, LV_EVENT_SHORT_CLICKED);
-    fake_fire(guarded, LV_EVENT_RELEASED);
-    CHECK(n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_TAP && evs[2].event == APPS_UI_RELEASE,
+    fake_tap(guarded);
+    CHECK(n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE && evs[2].event == APPS_UI_TAP,
           "the touches arrive: %d events", n_evs);
     FINISH(&e);
 }
@@ -2371,6 +2609,12 @@ static void many_sets_while_dark_apply_once(void) {
     LOG_IS(
         "text 2 \"u100\"\n"
         "update_layout 1\n");
+    /* A change of style makes no call for the size or the alignment: only an image's box follows its style (its src and scale). */
+    RUN(&e, "a:set{opacity = 50}");
+    CHECK(APPLY(&e), "restyled");
+    HAS("opa 2 127");
+    CHECK(log_count("size ") == 0 && log_count("align ") == 0, "no geometry for a style\n%s", log_peek());
+    log_clear();
     /* And all the other properties too: one call of each. */
     RUN(&e, "for i = 1, 100 do a:set{x = i, y = -i, w = 20 + i, color = i * 1000, font = i % 2 == 0 and 'sans14' or 'sans16'} end");
     CHECK(APPLY(&e), "changed");
@@ -2434,6 +2678,47 @@ static void swipe_right_closes(void) {
     log_clear();
     apps_lv_reset();
     log_clear();
+}
+
+/* A right swipe that starts on a widget the app listens to. LVGL sends PRESSED when the finger goes down (the app hears
+ * press); the swipe climbs to the layer (widgets keep GESTURE_BUBBLE), which closes the app and tells LVGL the rest of the
+ * touch is nobody's (lv_indev_wait_release); and the lift then sends the widget PRESS_LOST, not RELEASED, and no click.
+ * The app has to hear press, then release, with the close between them: no press left open, no tap made of a swipe. */
+static void a_swipe_that_starts_on_a_widget_ends_its_press(void) {
+    env_t e;
+    scene(&e);
+    apps_lv_set_event_cb(on_event);
+    apps_lv_set_close_cb(on_close);
+    closes = 0;
+    n_evs = 0;
+    /* A button in a box, as a watch app has them: the swipe has to climb past two objects. */
+    RUN(&e, "g = ui.box{w = 200, h = 100} b = ui.button{text = 'go', parent = g}\n"
+            "b:on('press', function() end) b:on('release', function() end) b:on('tap', function() end)");
+    CHECK(APPLY(&e), "made");
+    int button = fake_nth("button", 0);
+    fake_press(button);
+    CHECK(n_evs == 1 && evs[0].event == APPS_UI_PRESS && evs[0].slot == 1 && closes == 0, "the press: %d events, %d closes", n_evs, closes);
+    fake_swipe(LV_DIR_RIGHT);
+    CHECK(closes == 1 && n_evs == 1, "the swipe closes the app and says nothing to the widget: %d closes, %d events", closes, n_evs);
+    HAS("wait_release");
+    fake_lift();
+    CHECK(n_evs == 2 && evs[1].event == APPS_UI_RELEASE && evs[1].slot == 1 && evs[1].gen == 0 && evs[1].closes_before == 1,
+          "press, then release after the close: %d events", n_evs);
+    CHECK(closes == 1, "and it is not closed twice: %d", closes);
+
+    /* A swipe that is not to the right closes nothing, and the touch ends as any other: press, release, tap. */
+    n_evs = 0;
+    fake_press(button);
+    fake_swipe(LV_DIR_LEFT);
+    fake_lift();
+    CHECK(closes == 1 && n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE && evs[2].event == APPS_UI_TAP,
+          "a left swipe: %d closes, %d events", closes, n_evs);
+    /* The next touch is an ordinary one: the layer's wish to wait for the release doesn't outlive the touch. */
+    n_evs = 0;
+    fake_tap(button);
+    CHECK(n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE && evs[2].event == APPS_UI_TAP,
+          "the next tap: %d events", n_evs);
+    FINISH(&e);
 }
 
 /* ---- Front and back, build and reset ---- */
@@ -2750,6 +3035,9 @@ static void bad_image_bytes_are_rejected(void) {
     static const uint8_t zero_size[] = {0x19, 0x12, 0, 0, 0, 0, 1, 0, 4, 0, 0, 0, 1, 2, 3, 4};
     static const uint8_t bad_stride[] = {0x19, 0x12, 0, 0, 2, 0, 1, 0, 2, 0, 0, 0, 1, 2, 3, 4};
     static const uint8_t tiny[] = {0x19, 0x12, 0};
+    static const uint8_t allocated[] = {0x19, 0x12, 0x10, 0, 2, 0, 1, 0, 4, 0, 0, 0, 1, 2, 3, 4};
+    static const uint8_t modifiable[] = {0x19, 0x12, 0x21, 0, 2, 0, 1, 0, 4, 0, 0, 0, 1, 2, 3, 4};
+    static const uint8_t all_but_compressed[] = {0x19, 0x12, 0xF7, 0xFF, 2, 0, 1, 0, 4, 0, 0, 0, 1, 2, 3, 4};
     static const struct {
         const char *what;
         const uint8_t *bytes;
@@ -2758,6 +3046,9 @@ static void bad_image_bytes_are_rejected(void) {
         {"the wrong magic", bad_magic, sizeof bad_magic},
         {"fewer bytes than the header says", short_data, sizeof short_data},
         {"a compressed image", compressed, sizeof compressed},
+        {"the allocated flag (LVGL would take the descriptor for a draw buffer)", allocated, sizeof allocated},
+        {"premultiplied with the modifiable flag", modifiable, sizeof modifiable},
+        {"every flag but compressed", all_but_compressed, sizeof all_but_compressed},
         {"no pixels", zero_size, sizeof zero_size},
         {"a stride under a row", bad_stride, sizeof bad_stride},
         {"less than a header", tiny, sizeof tiny},
@@ -2777,6 +3068,195 @@ static void bad_image_bytes_are_rejected(void) {
         CHECK(stats_now().rejects == before.rejects + 1, "%s: %u rejects, not 1", cases[i].what, stats_now().rejects - before.rejects);
         FINISH(&e);
     }
+}
+
+/* ---- What an image shows ---- */
+
+/* Images a case needs, all valid LVGL v9 files (apps_image_check passes them). */
+static const uint8_t IMG_RGB565A8[] = {0x19, 0x14, 0, 0, 3, 0, 1, 0, 6, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9};  /* 3x1: 6 colour bytes, 3 alpha */
+static const apps_asset_t ASSETS_FORMATS[] = {{"a.bin", IMG_A, sizeof IMG_A, 2, 1},
+                                              {"b.bin", IMG_B, sizeof IMG_B, 3, 2},
+                                              {"d.bin", IMG_RGB565A8, sizeof IMG_RGB565A8, 3, 1}};
+
+/* LVGL draws an A8 image as a mask filled with the image recolor, which is black unless it is set: invisible on the layer's
+ * black. So an A8 image gets white, in full. RGB565 and RGB565A8 have their own colours and are left alone. */
+static void a8_images_are_white(void) {
+    env_t e;
+    scene_with(&e, ASSETS_FORMATS, 3);
+    RUN(&e, "a = ui.image{src = 'a.bin'} b = ui.image{src = 'b.bin'} d = ui.image{src = 'd.bin'}");
+    CHECK(APPLY(&e), "made");
+    int rgb565 = fake_nth("image", 0), a8 = fake_nth("image", 1), rgb565a8 = fake_nth("image", 2);
+    CHECK(fake_obj(rgb565)->src->header.cf == 0x12 && fake_obj(a8)->src->header.cf == 0x0E && fake_obj(rgb565a8)->src->header.cf == 0x14,
+          "the three formats");
+    char line[64];
+    snprintf(line, sizeof line, "image_recolor %d #ffffff", a8);
+    HAS(line);
+    snprintf(line, sizeof line, "image_recolor_opa %d 255", a8);
+    HAS(line);
+    CHECK(log_count("image_recolor") == 2, "no other image is recoloured\n%s", log_peek());
+    /* It is the image's style, so a change of style that applies the style again gives the same. */
+    log_clear();
+    RUN(&e, "b:set{opacity = 50}");
+    CHECK(APPLY(&e), "changed");
+    snprintf(line, sizeof line, "image_recolor_opa %d 255", a8);
+    HAS(line);
+
+    /* A src that is not A8 any more is drawn as it is: the recolor that was set goes (opacity 0), and is not set again by a
+     * later change of style. And when it is A8 again it is white again. */
+    log_clear();
+    RUN(&e, "b:set{src = 'a.bin'}");
+    CHECK(APPLY(&e), "an RGB565 image now");
+    snprintf(line, sizeof line, "image_recolor_opa %d 0", a8);
+    HAS(line);
+    CHECK(log_count("image_recolor ") == 0, "only the opacity is put back\n%s", log_peek());
+    log_clear();
+    RUN(&e, "b:set{opacity = 60}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(log_count("image_recolor") == 0, "nothing to recolor\n%s", log_peek());
+    log_clear();
+    RUN(&e, "b:set{src = 'b.bin'}");
+    CHECK(APPLY(&e), "A8 again");
+    snprintf(line, sizeof line, "image_recolor %d #ffffff", a8);
+    HAS(line);
+    snprintf(line, sizeof line, "image_recolor_opa %d 255", a8);
+    HAS(line);
+    FINISH(&e);
+}
+
+/* Images of the sizes a case needs: 40x20, 300x2 (up to the edge of the screen when it is scaled) and 5x1 (down to a pixel). */
+static const uint8_t IMG_C[12 + 40 * 2 * 20] = {0x19, 0x12, 0, 0, 40, 0, 20, 0, 80, 0, 0, 0};
+static const uint8_t IMG_WIDE[12 + 300 * 2 * 2] = {0x19, 0x12, 0, 0, 0x2C, 0x01, 2, 0, 0x58, 0x02, 0, 0};
+static const uint8_t IMG_TINY[12 + 5 * 2] = {0x19, 0x12, 0, 0, 5, 0, 1, 0, 10, 0, 0, 0};
+static const apps_asset_t ASSETS_SIZES[] = {{"c.bin", IMG_C, sizeof IMG_C, 40, 20},
+                                            {"wide.bin", IMG_WIDE, sizeof IMG_WIDE, 300, 2},
+                                            {"tiny.bin", IMG_TINY, sizeof IMG_TINY, 5, 1}};
+
+/* The box the pass wrote back for the widget in slot (its object is id), and where the fake puts the picture in it. */
+static void box_is_at(int line, env_t *e, int slot, int id, int w, int h, const char *what) {
+    const apps_widget_t *s = W(e, slot);
+    CHECK_AT(line, s->rw == w && s->rh == h, "%s: written back %dx%d, wanted %dx%d", what, s->rw, s->rh, w, h);
+    lv_area_t d = fake_drawn(id);
+    CHECK_AT(line,
+             abs(d.x1 - s->rx) <= 1 && abs(d.y1 - s->ry) <= 1 && abs(d.x2 - (s->rx + s->rw - 1)) <= 1 &&
+                 abs(d.y2 - (s->ry + s->rh - 1)) <= 1,
+             "%s: the picture is drawn at %d,%d..%d,%d in a box at %d,%d %dx%d", what, d.x1, d.y1, d.x2, d.y2, s->rx, s->ry, s->rw,
+             s->rh);
+}
+#define BOX_IS(e, slot, id, w, h) box_is_at(__LINE__, (e), (slot), (id), (w), (h), #w "x" #h)
+
+/* In LVGL 9.5.0 an image's own size is the image as it is: a scale draws it larger or smaller about the middle of its box
+ * and never changes the box. So for a side the app left to the content, the box is set to the scaled size, the picture
+ * is centred in it and scaled about its middle: what the app reads back, and the overflow, are what is on the screen. */
+static void scaled_images_have_the_scaled_box(void) {
+    env_t e;
+    scene_with(&e, ASSETS_SIZES, 3);
+    RUN(&e, "i = ui.image{src = 'c.bin', scale = 200}");
+    CHECK(APPLY(&e), "made");
+    HAS("size 2 80 40");
+    HAS("image_inner_align 2 center");
+    HAS("image_scale 2 512");
+    BOX_IS(&e, 0, 2, 80, 40);
+    CHECK(W(&e, 0)->rx == 193 && W(&e, 0)->ry == 213, "centred on the screen: %d,%d", W(&e, 0)->rx, W(&e, 0)->ry);
+
+    /* A change of scale alone sizes it again. */
+    log_clear();
+    RUN(&e, "i:set{scale = 50}");
+    CHECK(APPLY(&e), "changed");
+    HAS("size 2 20 10");
+    BOX_IS(&e, 0, 2, 20, 10);
+    log_clear();
+    RUN(&e, "i:set{scale = 100}");
+    CHECK(APPLY(&e), "back to its own size");
+    HAS("size 2 content content");
+    BOX_IS(&e, 0, 2, 40, 20);
+    /* To the nearest pixel: 13.2 and 6.6. */
+    log_clear();
+    RUN(&e, "i:set{scale = 33}");
+    CHECK(APPLY(&e), "changed");
+    HAS("size 2 13 7");
+    BOX_IS(&e, 0, 2, 13, 7);
+    /* A side the app sized is its own; the other is the scaled one. */
+    log_clear();
+    RUN(&e, "i:set{scale = 200, w = 100}");
+    CHECK(APPLY(&e), "changed");
+    HAS("size 2 100 40");
+    CHECK(W(&e, 0)->rw == 100 && W(&e, 0)->rh == 40, "the app's width, the scaled height: %dx%d", W(&e, 0)->rw, W(&e, 0)->rh);
+    log_clear();
+    RUN(&e, "j = ui.image{src = 'c.bin', scale = 200, h = 30}");  /* the other side: the app's height, the scaled width */
+    CHECK(APPLY(&e), "made");
+    HAS("size 3 80 30");
+    CHECK(W(&e, 1)->rw == 80 && W(&e, 1)->rh == 30, "the scaled width, the app's height: %dx%d", W(&e, 1)->rw, W(&e, 1)->rh);
+    log_clear();
+    RUN(&e, "i:set{h = 30}");
+    CHECK(APPLY(&e), "changed");
+    HAS("size 2 100 30");
+    CHECK(W(&e, 0)->rw == 100 && W(&e, 0)->rh == 30, "both the app's: %dx%d", W(&e, 0)->rw, W(&e, 0)->rh);
+    /* In a box the app sized the picture is centred and scaled about its middle: 80x40 in 100x30, 5 px over at the top and bottom
+     * (which is why the overflow of such a box is the box's). */
+    {
+        const apps_widget_t *s = W(&e, 0);
+        lv_area_t d = fake_drawn(2);
+        CHECK(d.x2 - d.x1 + 1 == 80 && d.y2 - d.y1 + 1 == 40 && d.x1 + d.x2 == 2 * s->rx + s->rw - 1 && d.y1 == s->ry - 5,
+              "drawn %d,%d..%d,%d in a box at %d,%d %dx%d", d.x1, d.y1, d.x2, d.y2, s->rx, s->ry, s->rw, s->rh);
+    }
+    FINISH(&e);
+
+    /* Up to the screen and down to a pixel. */
+    scene_with(&e, ASSETS_SIZES, 3);
+    RUN(&e, "a = ui.image{src = 'wide.bin', scale = 400} b = ui.image{src = 'tiny.bin', scale = 10}");
+    CHECK(APPLY(&e), "made");
+    HAS("size 2 466 8");  /* 1200 wide is clamped to the screen */
+    HAS("size 3 1 1");    /* 0.5 and 0.1 pixels are one */
+    FINISH(&e);
+
+    /* The overflow is that of the box on the screen: 80x40 at (400, 213) pokes 15 px past the round edge, where the unscaled
+     * 40x20 is inside it. */
+    scene_with(&e, ASSETS_SIZES, 3);
+    RUN(&e, "i = ui.image{src = 'c.bin', scale = 200, align = 'top_left', x = 400, y = 213}");
+    CHECK(APPLY(&e), "made");
+    CHECK(W(&e, 0)->rx == 400 && W(&e, 0)->rw == 80 && W(&e, 0)->rh == 40 && W(&e, 0)->overflow == 15,
+          "the scaled box %d, %dx%d, overflow %d", W(&e, 0)->rx, W(&e, 0)->rw, W(&e, 0)->rh, W(&e, 0)->overflow);
+    RUN(&e, "i:set{scale = 100}");
+    CHECK(APPLY(&e), "back to its own size");
+    CHECK(W(&e, 0)->rw == 40 && W(&e, 0)->overflow == 0, "unscaled: %d wide, overflow %d", W(&e, 0)->rw, W(&e, 0)->overflow);
+    FINISH(&e);
+}
+
+/* Of an image's flags only premultiplied alpha belongs in the descriptor: the others (allocated, modifiable...) say what
+ * the memory is, and LVGL takes an allocated descriptor for one of its draw buffers and refuses it. apps_image_check
+ * refuses them; the descriptor is made with the rest masked off as well. The bytes here pass the check and change as the
+ * object is made (what the check saw is not what is copied), so only the mask can keep them out. */
+static uint8_t flagged_bytes[sizeof IMG_A];
+
+static void set_stray_flags(void *arg) {
+    (void)arg;
+    flagged_bytes[2] = 0x31;  /* premultiplied, allocated, modifiable */
+}
+
+static void image_flags_are_masked(void) {
+    memcpy(flagged_bytes, IMG_A, sizeof flagged_bytes);
+    const apps_asset_t assets[] = {{"f.bin", flagged_bytes, sizeof flagged_bytes, 2, 1}};
+    env_t e;
+    scene_with(&e, assets, 1);
+    RUN(&e, "i = ui.image{src = 'f.bin'}");
+    image_hook = set_stray_flags;
+    CHECK(APPLY(&e), "made");
+    const lv_obj_t *img = fake_obj(2);
+    CHECK(img->src != NULL && img->src->header.flags == LV_IMAGE_FLAGS_PREMULTIPLIED, "only premultiplied is kept: 0x%04x",
+          img->src != NULL ? (unsigned)img->src->header.flags : 0xFFFFu);
+    FINISH(&e);
+
+    /* Premultiplied alone is a valid file, and stays. */
+    memcpy(flagged_bytes, IMG_A, sizeof flagged_bytes);
+    flagged_bytes[2] = 0x01;
+    scene_with(&e, assets, 1);
+    RUN(&e, "i = ui.image{src = 'f.bin'}");
+    CHECK(APPLY(&e), "made");
+    img = fake_obj(2);
+    CHECK(stats_since().rejects == 0 && img->src != NULL && img->src->header.flags == LV_IMAGE_FLAGS_PREMULTIPLIED,
+          "premultiplied is a valid file: %u rejects, flags 0x%04x", stats_since().rejects,
+          img->src != NULL ? (unsigned)img->src->header.flags : 0xFFFFu);
+    FINISH(&e);
 }
 
 /* ---- Deletes, and the order of work ---- */
@@ -2857,6 +3337,21 @@ static void deletes_come_before_creates(void) {
     CHECK(log_find("delete 2") == 0 && log_find("create label 3 in 1") > 0, "the delete comes first\n%s", log_peek());
     CHECK(log_find("create obj 4 in 1") > log_find("create label 3 in 1"), "slot order among the creates\n%s", log_peek());
     FINISH(&e);
+
+    /* The delete in a higher slot than the create, where plain slot order would make first: b is made in slot 0, below the
+     * slot of a's pending delete. */
+    scene(&e);
+    RUN(&e, "x = ui.label{} a = ui.label{text = 'a'}");
+    CHECK(APPLY(&e), "made");
+    RUN(&e, "x:delete()");
+    CHECK(APPLY(&e), "slot 0 is free");
+    log_clear();
+    RUN(&e, "a:delete() b = ui.label{text = 'b'}");
+    CHECK(W(&e, 1)->dirty == APPS_DIRTY_DELETE && W(&e, 0)->alive && W(&e, 0)->gen == 1,
+          "b went to slot 0, below the slot of a's delete");
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_find("delete 3") == 0 && log_find("create label 4 in 1") > 0, "the delete of the higher slot comes first\n%s", log_peek());
+    FINISH(&e);
 }
 
 /* A slot is free only once its delete has been applied; one that is applied is free for the next widget. */
@@ -2920,6 +3415,23 @@ static void parent_in_a_higher_slot_is_made_first(void) {
     int box0 = log_find("create obj 2 in 1"), box1 = log_find("create obj 3 in 2"), box2 = log_find("create obj 4 in 3");
     int label = log_find("create label ");
     CHECK(box0 >= 0 && box0 < box1 && box1 < box2 && box2 < label, "the chain is made from the top down\n%s", log_peek());
+    FINISH(&e);
+
+    /* Four deep, the most boxes there may be above a widget: the leaf is in the lowest slot and every box above it in a
+     * higher one, so the boxes are made from inside the leaf's visit, four levels down. */
+    scene(&e);
+    RUN(&e, "p0 = ui.label{} p1 = ui.label{} p2 = ui.label{} p3 = ui.label{}\n"
+            "b0 = ui.box{} b1 = ui.box{parent = b0} b2 = ui.box{parent = b1} b3 = ui.box{parent = b2}\n"
+            "p0:delete() p1:delete() p2:delete() p3:delete()\n"
+            "l = ui.label{text = 'deep', parent = b3}");
+    CHECK(W(&e, 0)->parent == 7 && W(&e, 4)->parent == -1 && W(&e, 5)->parent == 4 && W(&e, 6)->parent == 5 && W(&e, 7)->parent == 6,
+          "the leaf sits in slot 0, below the four boxes (slots 4 to 7)");
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_count("create ") == 5 && stats_since().rejects == 0 && fake_errors == 0, "five objects, no reject\n%s", log_peek());
+    int top = log_find("create obj 2 in 1"), second = log_find("create obj 3 in 2"), third = log_find("create obj 4 in 3");
+    int fourth = log_find("create obj 5 in 4"), leaf = log_find("create label 6 in 5");
+    CHECK(top >= 0 && top < second && second < third && third < fourth && fourth < leaf, "made from the top down\n%s", log_peek());
+    CHECK(W(&e, 0)->dirty == 0 && W(&e, 4)->dirty == 0 && W(&e, 7)->dirty == 0, "all clear");
     FINISH(&e);
 }
 
@@ -3073,13 +3585,16 @@ static void slow_apply_is_logged_and_counted(void) {
     CHECK(APPLY(&e), "made");
     long calls = lvgl_calls - before;
     CHECK(calls >= 10, "a create is %ld calls", calls);
-    char want[80];
-    snprintf(want, sizeof want, "W muse_apps: apply %ld us", calls * 500);
-    CHECK(stats_since().slow == 1 && esp_has_line(want), "slow %u, wanted \"%s\"\n%s", stats_since().slow, want, esp_peek());
+    /* The first slow pass is logged at once, with how many there were since the last line (this one). */
+    char want[96];
+    snprintf(want, sizeof want, "W muse_apps: apply %ld us (1 slow since last)", calls * 500);
+    CHECK(stats_since().slow == 1 && esp_has_line(want) && esp_count("") == 1, "slow %u, wanted \"%s\"\n%s", stats_since().slow, want,
+          esp_peek());
+    int64_t logged_at = clock_us;  /* the pass ended now */
     log_clear();
     esp_clear();
 
-    /* Over 2 ms, not 2 ms: the border. */
+    /* Over 2 ms, not 2 ms: the border. A slow pass inside the second after a line is counted and not logged. */
     call_cost_us = 0;
     RUN(&e, "a:set{text = 'y'}");
     extra_us_next = 2000;
@@ -3088,18 +3603,46 @@ static void slow_apply_is_logged_and_counted(void) {
     RUN(&e, "a:set{text = 'z'}");
     extra_us_next = 2001;
     CHECK(APPLY(&e), "2001 us");
-    CHECK(stats_since().slow == 2 && esp_has_line("W muse_apps: apply 2001 us"), "2001 us is\n%s", esp_peek());
+    CHECK(stats_since().slow == 2 && esp_count("") == 0, "2001 us is slow, counted, and not logged: the last line is under a second old\n%s",
+          esp_peek());
+    RUN(&e, "a:set{text = 'w'}");
+    extra_us_next = 4000;
+    CHECK(APPLY(&e), "4000 us");
+    CHECK(stats_since().slow == 3 && esp_count("") == 0, "counted\n%s", esp_peek());
+    /* A microsecond short of a second after the line: still not. */
+    clock_us = logged_at + 1000000 - 1 - 3000;
+    RUN(&e, "a:set{text = 'v'}");
+    extra_us_next = 3000;
+    CHECK(APPLY(&e), "3000 us, a microsecond early");
+    CHECK(stats_since().slow == 4 && esp_count("") == 0, "not yet\n%s", esp_peek());
+    /* A second after it: the line says the worst time and how many slow passes it stands for. */
+    clock_us = logged_at + 1000000 - 2500;
+    RUN(&e, "a:set{text = 'u'}");
+    extra_us_next = 2500;
+    CHECK(APPLY(&e), "2500 us, a second after the last line");
+    CHECK(stats_since().slow == 5 && esp_count("") == 1 && esp_has_line("W muse_apps: apply 4000 us (4 slow since last)"),
+          "one line, the worst of the four since the last\n%s", esp_peek());
+    esp_clear();
+    /* The count starts again after a line. */
+    clock_us += 2000000;
+    RUN(&e, "a:set{text = 't'}");
+    extra_us_next = 2100;
+    CHECK(APPLY(&e), "2100 us, long after");
+    CHECK(stats_since().slow == 6 && esp_count("") == 1 && esp_has_line("W muse_apps: apply 2100 us (1 slow since last)"),
+          "the count started over\n%s", esp_peek());
     log_clear();
     esp_clear();
+
     /* Waiting for the lock isn't the pass's time, and a pass that was skipped isn't slow. */
-    RUN(&e, "a:set{text = 'w'}");
+    clock_us += 2000000;
+    RUN(&e, "a:set{text = 's'}");
     trylock_refusals = 1;
     extra_us_next = 5000;
     CHECK(!APPLY(&e), "skipped");
-    CHECK(stats_since().slow == 2 && esp_count("") == 0, "not slow");
+    CHECK(stats_since().slow == 6 && esp_count("") == 0, "not slow");
     extra_us_next = 0;
     CHECK(APPLY(&e), "applied");
-    CHECK(stats_since().slow == 2, "and fast");
+    CHECK(stats_since().slow == 6 && esp_count("") == 0, "and fast");
     FINISH(&e);
 }
 
@@ -3265,8 +3808,8 @@ static void check_in_sync(env_t *e, uint32_t seed) {
           fake_alive_of("image"), labels, buttons, boxes, arcs, bars, images);
 }
 
-/* Random calls into the ui module, random passes (skipped, refused for PSRAM, in a callback), touches of objects
- * that may be gone, and, for the odd seeds, a table corrupted for one pass. The fake LVGL counts every call on a
+/* Random calls into the ui module, random passes (skipped, refused for PSRAM or for LVGL's own memory, in a callback),
+ * touches of objects that may be gone, and, for the odd seeds, a table corrupted for one pass. The fake LVGL counts every call on a
  * deleted or NULL object, and ASan every wild read; an even seed also checks the layer ends up as the table says. */
 static void fuzz_seed(uint32_t seed) {
     env_t e;
@@ -3311,6 +3854,7 @@ static void fuzz_seed(uint32_t seed) {
             case 80 ... 92: {  /* a pass */
                 psram_free = rnd(4) == 0 ? (size_t)rnd(600 * 1024) : 4u * 1024 * 1024;
                 trylock_refusals = rnd(8) == 0 ? 1 : 0;
+                create_fail_in = rnd(10) == 0 ? (int)rnd(4) + 1 : 0;  /* LVGL has no memory for one of this pass's creates */
                 int slot = (int)rnd(APPS_UI_SLOTS);
                 apps_widget_t saved;
                 char *saved_text = NULL;
@@ -3322,6 +3866,7 @@ static void fuzz_seed(uint32_t seed) {
                 }
                 bool in_callback = rnd(4) == 0;
                 apply_at(__LINE__, &e, in_callback);
+                create_fail_in = 0;
                 if (damaged) {
                     /* Put the widget back as the app's side has it (the pass may have cleared its bits, and may have
                      * written its geometry back: those are the pass's to say). */
@@ -3341,7 +3886,8 @@ static void fuzz_seed(uint32_t seed) {
             case 93 ... 97:  /* a touch, of an object that may be long gone */
                 if (n_objs > 1) {
                     static const lv_event_code_t codes[] = {LV_EVENT_SHORT_CLICKED, LV_EVENT_LONG_PRESSED, LV_EVENT_PRESSED,
-                                                            LV_EVENT_RELEASED, LV_EVENT_CLICKED, LV_EVENT_GESTURE};
+                                                            LV_EVENT_RELEASED, LV_EVENT_PRESS_LOST, LV_EVENT_CLICKED,
+                                                            LV_EVENT_GESTURE};
                     fake_fire(1 + (int)rnd((uint32_t)n_objs), codes[rnd(ARRAY_LEN(codes))]);
                     n_evs = 0;
                 }
@@ -3404,6 +3950,7 @@ int main(int argc, char **argv) {
         {"empty_text_is_made_and_set", empty_text_is_made_and_set},
         {"psram_floor_refuses_creates", psram_floor_refuses_creates},
         {"create_pending_has_no_object", create_pending_has_no_object},
+        {"a_create_that_fails_is_tried_again", a_create_that_fails_is_tried_again},
         {"skips_mid_callback_at_most_three_frames", skips_mid_callback_at_most_three_frames},
         {"lock_discipline", lock_discipline},
         {"no_layer_no_pass", no_layer_no_pass},
@@ -3412,6 +3959,7 @@ int main(int argc, char **argv) {
         {"the_app_can_end_while_the_records_are_made", the_app_can_end_while_the_records_are_made},
         {"the_lock_may_be_refused_after_the_records_are_made", the_lock_may_be_refused_after_the_records_are_made},
         {"no_table_is_no_pass", no_table_is_no_pass},
+        {"a_callback_frame_is_skipped_before_the_table_is_read", a_callback_frame_is_skipped_before_the_table_is_read},
         {"the_published_table_is_the_one_applied", the_published_table_is_the_one_applied},
         {"overflow_from_coords", overflow_from_coords},
         {"overflow_corner_rule", overflow_corner_rule},
@@ -3424,6 +3972,7 @@ int main(int argc, char **argv) {
         {"subscribed_arc_cannot_be_scrubbed", subscribed_arc_cannot_be_scrubbed},
         {"many_sets_while_dark_apply_once", many_sets_while_dark_apply_once},
         {"swipe_right_closes", swipe_right_closes},
+        {"a_swipe_that_starts_on_a_widget_ends_its_press", a_swipe_that_starts_on_a_widget_ends_its_press},
         {"front_and_back", front_and_back},
         {"reset_deletes_every_object", reset_deletes_every_object},
         {"stale_records_after_a_missed_reset", stale_records_after_a_missed_reset},
@@ -3434,6 +3983,9 @@ int main(int argc, char **argv) {
         {"button_text_is_its_labels", button_text_is_its_labels},
         {"images_use_the_assets_bytes", images_use_the_assets_bytes},
         {"bad_image_bytes_are_rejected", bad_image_bytes_are_rejected},
+        {"a8_images_are_white", a8_images_are_white},
+        {"scaled_images_have_the_scaled_box", scaled_images_have_the_scaled_box},
+        {"image_flags_are_masked", image_flags_are_masked},
         {"deleting_a_box_makes_no_call_for_its_children", deleting_a_box_makes_no_call_for_its_children},
         {"deletes_come_before_creates", deletes_come_before_creates},
         {"slot_reuse_across_passes", slot_reuse_across_passes},
@@ -3456,6 +4008,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[1], cases[i].name) == 0) {
             cases[i].run();
             CHECK(held == 0, "%s ended with %zu bytes held", argv[1], held);
+            CHECK(fake_errors == 0, "%s ended with %d fake LVGL errors, the first: %s", argv[1], fake_errors, fake_note);
+            CHECK(lock_errors == 0 && !lock_held, "%s ended with %d lock errors, the lock held %d, the first: %s", argv[1], lock_errors,
+                  lock_held, lock_note);
             fake_reset();
             free(lvgl_log.data);
             free(lvgl_log.taken);

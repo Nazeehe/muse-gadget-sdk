@@ -74,6 +74,7 @@
  * little-endian, in 12 bytes. */
 #define IMAGE_HEADER 12
 #define IMAGE_MAGIC 0x19
+#define IMAGE_FLAG_PREMULTIPLIED 0x0001
 #define IMAGE_FLAG_COMPRESSED 0x0008
 #define IMAGE_CF_A8 0x0E
 #define IMAGE_CF_RGB565 0x12
@@ -664,6 +665,11 @@ bool apps_image_check(const uint8_t *data, size_t len, uint16_t *w, uint16_t *h,
     unsigned cf = data[1], flags = le16(data + 2), iw = le16(data + 4), ih = le16(data + 6), stride = le16(data + 8);
     if ((flags & IMAGE_FLAG_COMPRESSED) != 0) {
         return failf(err, err_len, "image: compressed images aren't supported");
+    }
+    /* The others (allocated, modifiable...) say what the image's memory is, and apps_lv draws the file in place: LVGL
+     * would take a descriptor flagged allocated for one of its draw buffers, refuse it, and never show the image. */
+    if ((flags & ~(unsigned)IMAGE_FLAG_PREMULTIPLIED) != 0) {
+        return failf(err, err_len, "image: flags 0x%04x aren't supported (only premultiplied alpha)", flags);
     }
     if (iw == 0 || ih == 0) {
         return failf(err, err_len, "image: %ux%u has no pixels", iw, ih);

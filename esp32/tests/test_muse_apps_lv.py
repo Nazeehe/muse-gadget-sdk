@@ -20,9 +20,10 @@ as test_muse_ptt_ui.py does). The fake logs every call as a line, keeps every ob
 a deleted one is caught, and counts an LVGL call made inside the pass without the UI lock; the harness's port is a
 counting allocator (every case ends at 0 bytes held) and a lock that records how it is used.
 
-A fake is only as good as its likeness to the real thing, so three tests compare it with LVGL 9.5.0's headers when
-they are on this machine (the Espressif component cache, or managed_components/ after a device build): the
-prototypes it declares, the constants the log shows, and apps_lv.c itself, compiled against the real headers.
+A fake is only as good as its likeness to the real thing, so four tests compare it with LVGL 9.5.0's tree when
+it is on this machine (the Espressif component cache, or managed_components/ after a device build): the
+prototypes it declares, the constants the log shows, the one default of an image the fake copies (it is centred in
+its box), and apps_lv.c itself, compiled against the real headers.
 """
 
 import os
@@ -162,6 +163,9 @@ class HarnessTest(unittest.TestCase):
     def test_an_image_whose_bytes_are_not_an_image_is_rejected(self):
         self.run_case("bad_image_bytes_are_rejected")
 
+    def test_an_images_flags_are_masked_to_premultiplied(self):  # F5
+        self.run_case("image_flags_are_masked")
+
     # ---- Creates, deletes and the order of work ----
 
     def test_deletes_come_before_creates(self):
@@ -187,6 +191,15 @@ class HarnessTest(unittest.TestCase):
 
     def test_images_are_drawn_from_the_assets_bytes(self):
         self.run_case("images_use_the_assets_bytes")
+
+    def test_an_a8_image_is_drawn_white(self):  # F1
+        self.run_case("a8_images_are_white")
+
+    def test_a_scaled_image_has_the_box_that_is_drawn(self):  # F2
+        self.run_case("scaled_images_have_the_scaled_box")
+
+    def test_a_create_that_fails_is_tried_again(self):  # F9
+        self.run_case("a_create_that_fails_is_tried_again")
 
     def test_many_widgets(self):
         self.run_case("many_widgets")
@@ -236,6 +249,9 @@ class HarnessTest(unittest.TestCase):
     def test_no_table_is_neither_a_skip_nor_a_reject(self):
         self.run_case("no_table_is_no_pass")
 
+    def test_a_callback_frame_is_skipped_before_the_table_is_read(self):  # F14
+        self.run_case("a_callback_frame_is_skipped_before_the_table_is_read")
+
     def test_the_published_table_is_the_one_applied(self):
         self.run_case("the_published_table_is_the_one_applied")
 
@@ -252,6 +268,9 @@ class HarnessTest(unittest.TestCase):
 
     def test_a_subscribed_arc_cannot_be_turned_by_a_finger(self):
         self.run_case("subscribed_arc_cannot_be_scrubbed")
+
+    def test_a_swipe_that_starts_on_a_widget_ends_its_press(self):  # F3
+        self.run_case("a_swipe_that_starts_on_a_widget_ends_its_press")
 
     # ---- The layer, build and reset ----
 
@@ -359,10 +378,18 @@ class FakesTest(unittest.TestCase):
         LV_EVENT_SCROLL_THROW_BEGIN LV_EVENT_SCROLL_END LV_EVENT_SCROLL LV_EVENT_GESTURE LV_EVENT_KEY
         LV_EVENT_PREPROCESS
         LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_COVER LV_ANIM_OFF
+        LV_IMAGE_ALIGN_DEFAULT LV_IMAGE_ALIGN_CENTER LV_COLOR_FORMAT_A8 LV_IMAGE_FLAGS_PREMULTIPLIED
         sizeof(lv_image_header_t) sizeof(lv_image_dsc_t) sizeof(lv_color_t) sizeof(lv_area_t)
         offsetof(lv_image_dsc_t,header) offsetof(lv_image_dsc_t,data_size) offsetof(lv_image_dsc_t,data)
         offsetof(lv_area_t,x1) offsetof(lv_area_t,x2) offsetof(lv_area_t,y1) offsetof(lv_area_t,y2)
     """.split()
+
+    def test_an_lvgl_image_is_centred_in_its_box_until_told_otherwise(self):
+        """The fake makes an image centred (a scaled image fills a box of the scaled size): lv_image_constructor says so."""
+        text = _strip_comments((self.lvgl / "src/widgets/image/lv_image.c").read_text(errors="replace"))
+        constructor = re.search(r"static void lv_image_constructor\([^)]*\)\s*\{.*?\n\}", text, re.S)
+        self.assertIsNotNone(constructor, "lv_image_constructor isn't in LVGL 9.5.0's lv_image.c")
+        self.assertRegex(constructor.group(0), r"img->align\s*=\s*LV_IMAGE_ALIGN_CENTER;")
 
     def test_the_constants_the_fakes_log_are_lvgl_9_5_0s(self):
         printer = "#include <stddef.h>\n#include <stdio.h>\n#include \"lvgl.h\"\nint main(void) {\n" + "".join(

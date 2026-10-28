@@ -44,6 +44,7 @@ static const char *TAG = "muse_apps";
 
 #define LOCK_MS 2
 #define SLOW_US 2000
+#define SLOW_LOG_US 1000000  /* a slow pass is logged at most this often */
 #define MAX_CALLBACK_SKIPS 3
 
 /* The bits that name a group of properties, as opposed to CREATE and DELETE. */
@@ -62,6 +63,7 @@ typedef struct {
     int16_t up;        /* the parent's slot + 1; 0: the layer */
     uint8_t kind;
     bool subscribed;   /* the touch callbacks are on obj */
+    bool recolored;    /* an A8 image has the white recolor on it */
 } node_t;
 
 /* The records of the app on the layer, and the descriptors its images are drawn from: one block, from the apps'
@@ -80,6 +82,9 @@ static void (*s_close_cb)(void);
 static volatile bool s_front;
 static uint8_t s_skip_run;       /* frames skipped in a row for a callback */
 static bool s_reject_logged;     /* the app's first reject is in the log */
+static int64_t s_slow_next_log;  /* the esp_timer time a slow pass may be logged from (0: any) */
+static uint32_t s_slow_unlogged; /* slow passes since the last line, and the longest of them */
+static int64_t s_slow_worst_us;
 
 static volatile uint32_t s_applies, s_skips, s_rejects, s_refused, s_slow;
 
@@ -131,7 +136,18 @@ static int32_t radius_of(int16_t radius) {
     return radius < 0 ? LV_RADIUS_CIRCLE : radius;
 }
 
+static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) {
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
 /* ---- Re-validation ---- */
+
+/* Whether the widget's image is one of the asset table that apps_image_check passes; its size (from the file's header)
+ * goes to *iw and *ih (either may be NULL). */
+static bool image_size(const pass_t *p, const apps_widget_t *w, uint16_t *iw, uint16_t *ih) {
+    const apps_asset_t *asset = apps_ui_asset(p->ui, w->image);
+    return asset != NULL && w->image < APPS_UI_ASSETS_MAX && apps_image_check(asset->data, asset->len, iw, ih, NULL, 0);
+}
 
 /* Why the widget at slot can't be given to LVGL, or NULL when it can. This is the table's invariants (apps_ui.h)
  * checked again, field by field, because LVGL asserts abort() and a loop here would hang the UI. The text is
@@ -225,11 +241,8 @@ static const char *check_widget(const pass_t *p, int slot, const apps_widget_t *
         }
     }
 
-    if (w->kind == APPS_W_IMAGE) {
-        const apps_asset_t *asset = apps_ui_asset(p->ui, w->image);
-        if (asset == NULL || w->image >= APPS_UI_ASSETS_MAX || !apps_image_check(asset->data, asset->len, NULL, NULL, NULL, 0)) {
-            return "image";
-        }
+    if (w->kind == APPS_W_IMAGE && !image_size(p, w, NULL, NULL)) {
+        return "image";
     }
     return NULL;
 }
@@ -278,7 +291,8 @@ static void on_touch(lv_event_t *e) {
         case LV_EVENT_SHORT_CLICKED: bit = APPS_UI_TAP; break;
         case LV_EVENT_LONG_PRESSED: bit = APPS_UI_LONG_PRESS; break;
         case LV_EVENT_PRESSED: bit = APPS_UI_PRESS; break;
-        case LV_EVENT_RELEASED: bit = APPS_UI_RELEASE; break;
+        case LV_EVENT_RELEASED:
+        case LV_EVENT_PRESS_LOST: bit = APPS_UI_RELEASE; break;  /* the lift after lv_indev_wait_release */
         default: return;
     }
     apps_lv_event_cb_t cb = s_event_cb;
@@ -289,7 +303,10 @@ static void on_touch(lv_event_t *e) {
 }
 
 /* An arc turns its value to follow a finger on it. The app's value is the app's: stop the arc's own handling of a
- * press that moves (this runs before it, see LV_EVENT_PREPROCESS). */
+ * press that moves (this runs before it, see LV_EVENT_PREPROCESS). That also keeps lv_arc's drag code from ever
+ * running on an app's arc, and it divides by the radius: an arc with no w and h, or a side of 1 px, has a radius of 0
+ * and is still pressable (its click area reaches past its box), so the second PRESSING of a drag would be a division
+ * by zero, which is a CPU exception on the ESP32-S3. Don't drop this as cosmetic. */
 static void on_arc_press(lv_event_t *e) {
     lv_event_stop_processing(e);
 }
@@ -313,6 +330,12 @@ static lv_obj_t *new_object(uint8_t kind, lv_obj_t *parent, lv_obj_t **label) {
     lv_obj_remove_style_all(obj);
     lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    if (kind == APPS_W_IMAGE) {
+        /* In a box that is not its size an image is centred, and a scale is drawn about its middle: so a box of the
+         * scaled size is exactly filled (apply_geom). That is LVGL's default for an image, said here because the
+         * box depends on it. */
+        lv_image_set_inner_align(obj, LV_IMAGE_ALIGN_CENTER);
+    }
     if (kind == APPS_W_ARC) {
         lv_arc_set_rotation(obj, 270);  /* 0 is 12 o'clock, as for the app */
         lv_obj_remove_style(obj, NULL, LV_PART_KNOB);  /* no knob: there is nothing on it to grab */
@@ -357,6 +380,11 @@ static made_t box_object(pass_t *p, int slot, int depth, lv_obj_t **out) {
         return BAD;
     }
     if ((w->dirty & APPS_DIRTY_CREATE) != 0) {
+        /* Its own slot comes later in the pass (or came, and said no): a box that is bad is not made, and what is in it
+         * is rejected for having no parent. */
+        if (check_widget(p, slot, w) != NULL) {
+            return BAD;
+        }
         made_t made = make_object(p, slot, depth);
         if (made != MADE) {
             return made;
@@ -372,8 +400,7 @@ static made_t box_object(pass_t *p, int slot, int depth, lv_obj_t **out) {
  * Makes the object of the widget at slot, which is alive and has CREATE. REFUSED when it can't be made now (the
  * PSRAM is low, LVGL had none) and the bits are to stay; BAD when it can't be made at all. Only on MADE is CREATE
  * cleared, and the groups the widget has to apply are put in its bits, for its own visit (or the visit that is
- * under way) to apply. The caller has checked the widget; what is checked here is what a box that is made on
- * behalf of a widget inside it needs.
+ * under way) to apply. The caller has checked the widget, and box_object has checked a box made for what is in it.
  */
 static made_t make_object(pass_t *p, int slot, int depth) {
     apps_widget_t *w = apps_ui_slot(p->ui, slot);
@@ -409,6 +436,7 @@ static made_t make_object(pass_t *p, int slot, int depth) {
     n->up = (int16_t)(w->parent + 1);
     n->kind = w->kind;
     n->subscribed = false;
+    n->recolored = false;
     w->dirty = (w->dirty & ~(uint32_t)APPS_DIRTY_CREATE) | groups_of_new(w);
     p->changed = true;
     return MADE;
@@ -416,8 +444,25 @@ static made_t make_object(pass_t *p, int slot, int depth) {
 
 /* ---- Applying a group ---- */
 
-static void apply_geom(const apps_widget_t *w, lv_obj_t *obj) {
-    lv_obj_set_size(obj, w->w < 0 ? LV_SIZE_CONTENT : w->w, w->h < 0 ? LV_SIZE_CONTENT : w->h);
+/* One side of an image drawn at scale percent, to the nearest pixel and within the screen. */
+static int32_t scaled_side(uint16_t side, uint16_t scale) {
+    return clamp_i32((int32_t)(((uint32_t)side * scale + 50) / 100), 1, SCREEN_PX);
+}
+
+/*
+ * LVGL lays an image out at its own size and draws a scale as a transform about the middle of its box, which never
+ * changes the box. So for a side of a scaled image that the app left to the content, the box is made the size that is
+ * drawn (new_object centres the image in it): align, x and y place what is on the screen, and the layout written back,
+ * and the overflow, describe it. A side the app sized is its box, as for any widget.
+ */
+static void apply_geom(const pass_t *p, const apps_widget_t *w, lv_obj_t *obj) {
+    int32_t width = w->w < 0 ? LV_SIZE_CONTENT : w->w, height = w->h < 0 ? LV_SIZE_CONTENT : w->h;
+    uint16_t iw, ih;
+    if (w->kind == APPS_W_IMAGE && w->scale != 100 && image_size(p, w, &iw, &ih)) {
+        width = w->w < 0 ? scaled_side(iw, w->scale) : width;
+        height = w->h < 0 ? scaled_side(ih, w->scale) : height;
+    }
+    lv_obj_set_size(obj, width, height);
     lv_obj_align(obj, align_of(w->align), w->x, w->y);
 }
 
@@ -446,7 +491,7 @@ static void style_bar_part(lv_obj_t *obj, uint32_t rgb, int32_t radius, lv_style
     lv_obj_set_style_radius(obj, radius, part);
 }
 
-static void apply_style(pass_t *p, const apps_widget_t *w, const node_t *n) {
+static void apply_style(pass_t *p, const apps_widget_t *w, node_t *n) {
     lv_obj_t *obj = n->obj;
     if (w->hidden) {
         lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
@@ -486,6 +531,11 @@ static void apply_style(pass_t *p, const apps_widget_t *w, const node_t *n) {
             lv_image_dsc_t *dsc = &p->st->image[w->image];
             if (dsc->data != asset->data + IMAGE_HEADER) {
                 memcpy(&dsc->header, asset->data, sizeof dsc->header);
+                /* Only premultiplied alpha means anything to an image drawn in place; the others say what the memory is
+                 * (ALLOCATED: an lv_draw_buf, which this isn't, so LVGL refuses the image and it never shows).
+                 * apps_image_check refuses them already: this keeps out of LVGL what the header said when it was
+                 * copied, which may not be what the check saw. */
+                dsc->header.flags &= LV_IMAGE_FLAGS_PREMULTIPLIED;
                 dsc->data_size = (uint32_t)(asset->len - IMAGE_HEADER);
                 dsc->data = asset->data + IMAGE_HEADER;
                 dsc->reserved = NULL;
@@ -493,6 +543,17 @@ static void apply_style(pass_t *p, const apps_widget_t *w, const node_t *n) {
             }
             lv_image_set_src(obj, dsc);
             lv_image_set_scale(obj, (uint32_t)w->scale * 256 / 100);
+            /* LVGL draws an A8 image as a mask filled with the image recolor, which is black unless it is set: nothing
+             * on the layer's black. An app has no colour for an image, so white, in full. The other two formats have
+             * colours of their own (and one that was A8 and is not now has the recolor taken off). */
+            if (dsc->header.cf == LV_COLOR_FORMAT_A8) {
+                lv_obj_set_style_image_recolor(obj, colour(0xFFFFFF), LV_PART_MAIN);
+                lv_obj_set_style_image_recolor_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+                n->recolored = true;
+            } else if (n->recolored) {
+                lv_obj_set_style_image_recolor_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+                n->recolored = false;
+            }
             break;
         }
         default:
@@ -526,12 +587,14 @@ static void apply_events(int slot, const apps_widget_t *w, node_t *n) {
     if (!n->subscribed) {
         /* The slot and gen the widget was made for travel with the callback: the app's side drops a touch whose
          * widget is gone, and an object can't send one once it is deleted. SHORT_CLICKED is the tap; CLICKED also
-         * follows a long press. */
+         * follows a long press. PRESS_LOST is what the lift sends instead of RELEASED once a swipe has taken the touch
+         * (lv_indev_wait_release), and it is the app's release: a press is never left open. */
         void *user = (void *)(uintptr_t)((uint32_t)slot | ((uint32_t)w->gen << 16));
         lv_obj_add_event_cb(n->obj, on_touch, LV_EVENT_SHORT_CLICKED, user);
         lv_obj_add_event_cb(n->obj, on_touch, LV_EVENT_LONG_PRESSED, user);
         lv_obj_add_event_cb(n->obj, on_touch, LV_EVENT_PRESSED, user);
         lv_obj_add_event_cb(n->obj, on_touch, LV_EVENT_RELEASED, user);
+        lv_obj_add_event_cb(n->obj, on_touch, LV_EVENT_PRESS_LOST, user);
         if (w->kind == APPS_W_ARC) {
             lv_obj_add_event_cb(n->obj, on_arc_press, (lv_event_code_t)(LV_EVENT_PRESSING | LV_EVENT_PREPROCESS), NULL);
         }
@@ -610,8 +673,11 @@ static void visit_live(pass_t *p, int slot, apps_widget_t *w) {
         }
     }
     uint32_t todo = w->dirty & GROUPS;
+    if (w->kind == APPS_W_IMAGE && (todo & APPS_DIRTY_STYLE) != 0) {
+        todo |= APPS_DIRTY_GEOM;  /* a src or a scale (both are STYLE) changes the size an image's box is made */
+    }
     if ((todo & APPS_DIRTY_GEOM) != 0) {
-        apply_geom(w, n->obj);
+        apply_geom(p, w, n->obj);
     }
     if ((todo & APPS_DIRTY_STYLE) != 0) {
         apply_style(p, w, n);
@@ -659,10 +725,6 @@ static uint32_t isqrt(uint64_t n) {
         bit >>= 2;
     }
     return (uint32_t)root;
-}
-
-static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) {
-    return v < lo ? lo : v > hi ? hi : v;
 }
 
 /*
@@ -810,7 +872,8 @@ bool apps_lv_apply(bool in_callback) {
     pass_t pass = {.ui = ui, .st = s_state, .reject_slot = -1};
     int64_t start = esp_timer_get_time();
     run_pass(&pass);
-    int64_t took = esp_timer_get_time() - start;
+    int64_t end = esp_timer_get_time();
+    int64_t took = end - start;
     apps_port_ui_unlock();
 
     s_skip_run = 0;
@@ -823,7 +886,17 @@ bool apps_lv_apply(bool in_callback) {
     }
     if (took > SLOW_US) {
         s_slow++;
-        ESP_LOGW(TAG, "apply %u us", (unsigned)took);
+        /* Every slow pass is counted, and the log has one line a second: a console at 115200 baud that is written to
+         * at the frame rate blocks the LVGL task, which makes the passes slower. The line says how many there were
+         * since the last and the longest of them. */
+        s_slow_unlogged++;
+        s_slow_worst_us = took > s_slow_worst_us ? took : s_slow_worst_us;
+        if (end >= s_slow_next_log) {
+            ESP_LOGW(TAG, "apply %u us (%u slow since last)", (unsigned)s_slow_worst_us, (unsigned)s_slow_unlogged);
+            s_slow_next_log = end + SLOW_LOG_US;
+            s_slow_unlogged = 0;
+            s_slow_worst_us = 0;
+        }
     }
     return true;
 }

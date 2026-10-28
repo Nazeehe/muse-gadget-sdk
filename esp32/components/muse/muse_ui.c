@@ -1672,13 +1672,14 @@ void muse_ui_bench_page(muse_ui_page_t page)
  * release has gone out. The real touch isn't read while a script plays, and is
  * again, untouched, from the next read. The script goes by LVGL's clock, not by
  * the number of reads, so a busy frame delays a step or the release and no
- * more. LVGL's long press fires after 400 ms of press; a swipe's steps are
- * about 43 px, over the 10 px of scroll and the 3 px of speed a gesture needs.
+ * more. LVGL's long press fires after 400 ms of press. A swipe's point is
+ * where the clock says it is on every read, whatever the read period, so no
+ * read stands still: LVGL forgets a gesture's distance on a read that moves
+ * under 3 px and fires it past 50 px (indev_gesture).
  */
 #define BENCH_TAP_MS 80
 #define BENCH_LONG_MS 900
 #define BENCH_SWIPE_MS 240
-#define BENCH_SWIPE_STEPS 9
 #define BENCH_SWIPE_Y 233
 #define BENCH_SWIPE_FROM 406   /* a left swipe starts here and ends at TO; a right swipe goes the other way */
 #define BENCH_SWIPE_TO 60
@@ -1701,7 +1702,7 @@ static int bench_clamp(int v, int size)
 void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y)
 {
     if (!s_real_read) {
-        ESP_LOGW(TAG, "bench touch: this board has no touch input");
+        ESP_LOGW(TAG, "bench touch: no touch input to script on this board");
         return;
     }
     if ((unsigned)kind > MUSE_UI_TOUCH_SWIPE_RIGHT) {
@@ -1736,8 +1737,7 @@ static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
         bool left = s_touch.kind == MUSE_UI_TOUCH_SWIPE_LEFT;
         int from = left ? BENCH_SWIPE_FROM : BENCH_SWIPE_TO;
         int to = left ? BENCH_SWIPE_TO : BENCH_SWIPE_FROM;
-        int step = t >= hold ? BENCH_SWIPE_STEPS - 1 : (int)(t * BENCH_SWIPE_STEPS / hold);
-        x = from + (to - from) * step / (BENCH_SWIPE_STEPS - 1);
+        x = t >= hold ? to : from + (to - from) * (int)t / (int)hold;
         y = BENCH_SWIPE_Y;
     }
     data->point.x = bench_clamp(x, s_w);
@@ -1751,10 +1751,17 @@ static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
 }
 
 /* Puts the wrapper over the driver's read callback. The LVGL task is already running and reads the callback every
- * tick, so muse_ui_start() calls this with the display lock held. */
+ * tick, so muse_ui_start() calls this with the display lock held. A script only advances on LVGL's reads, which an
+ * input in event mode makes only when its driver says so (on an interrupt), so there is no wrapper there, and a
+ * request says there is nothing to drive. */
 static void bench_touch_install(void)
 {
     s_real_read = s_indev ? lv_indev_get_read_cb(s_indev) : NULL;
+    if (s_real_read && lv_indev_get_mode(s_indev) != LV_INDEV_MODE_TIMER) {
+        ESP_LOGW(TAG, "bench touch: the touch input reads in event mode, not on LVGL's timer, "
+                      "so a script can't advance");
+        s_real_read = NULL;
+    }
     if (s_real_read) {
         lv_indev_set_read_cb(s_indev, bench_read);
     }
@@ -1783,7 +1790,9 @@ static uint32_t snap_crc32(uint32_t crc, const uint8_t *p, size_t n)
 /* Streams the screen over the USB cable as base64 RGB565 (bench testing; needs
  * LV_USE_SNAPSHOT, which devices/sdkconfig.muse-bench turns on). The stream
  * ends with the CRC-32 of the pixel bytes, in the order they were sent, so
- * snap.py can tell a capture a log line broke into from a good one. */
+ * snap.py can tell a capture a log line broke into from a good one. BEGIN and
+ * END each start with a newline, so each is a line of its own whatever the log
+ * wrote just before it: snap.py reads them at column 0 only. */
 static void send_snapshot(void)
 {
 #if LV_USE_SNAPSHOT
@@ -1811,7 +1820,7 @@ static void send_snapshot(void)
         }
     }
     char end[24];
-    n = snprintf(end, sizeof(end), "SNAP END %08x\n", (unsigned)crc);
+    n = snprintf(end, sizeof(end), "\nSNAP END %08x\n", (unsigned)crc);
     muse_console_write(end, n);
     lv_draw_buf_destroy(buf);
 #else

@@ -176,10 +176,11 @@ Screenshots are off in normal builds because each one takes a buffer the size
 of the screen. `>face=` works in any build. A bench build also takes touch from
 the Mac, through LVGL's own input: `>tap X Y`, `>longpress X Y` and
 `>swipe left|right` in KEYS (`snap.py PORT '>swipe left' OUT.png`) press and drag
-as a finger would. `snap.py` sends `w` first, since LVGL doesn't read its input
-while the screen sleeps on battery, and waits for the script to finish before the
-picture. Each screenshot ends with a CRC-32 that `snap.py` checks, retaking a
-capture a log line broke into. Or run `idf.py` directly:
+as a finger would, on a touch screen that LVGL polls. `snap.py` sends `w` first,
+since LVGL doesn't read its input while the screen sleeps on battery, and waits
+for the script to finish before the picture (`snap.capture()` does both for
+every caller). Each screenshot ends with a CRC-32 that `snap.py` checks, retaking
+a capture a log line broke into. Or run `idf.py` directly:
 
 ```sh
 idf.py -B build-muse-aipi -DIDF_TARGET=esp32s3 \

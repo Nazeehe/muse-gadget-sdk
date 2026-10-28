@@ -34,7 +34,8 @@ Each one ends with a CRC-32 of its pixels, and a capture that doesn't match is r
 The PNG is scaled 3x so small screens are readable.
 
 As a module: parse(log) reads a captured stream, capture(ser, keys, settle) does the whole
-exchange on an open port, and write_png(path, w, h, raw) saves what they return.
+exchange on an open port (the wake and the touch waits above included, so a caller gets
+them too), and write_png(path, w, h, raw) saves what they return.
 """
 import argparse
 import base64
@@ -48,6 +49,8 @@ import zlib
 SCALE = 3
 TRIES = 3           # a capture whose CRC doesn't match is taken again, this many times in all
 PACE = 0.35         # seconds after each key, and after a command that isn't a touch
+CRC_MISMATCH = 'crc mismatch'
+CUT_SHORT = 'snapshot cut short'
 AFTER_TOUCH = 0.6   # seconds after a touch script has run, before the picture
 TOUCH_MS = {'tap': 80, 'longpress': 900, 'swipe': 240}   # how long each script runs (muse_ui.c)
 DEFAULT_PER_LINE = 144    # bytes per base64 line; older firmware doesn't say
@@ -56,11 +59,14 @@ MAX_SIDE = 4096
 B64 = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/')
 
 # The stream's own lines start at column 0: an app's @app.log echo carries its text after a prefix, so a line
-# that only contains "SNAP END" somewhere is never the firmware's. The one tolerance is a stale fragment glued in
-# front of the first line read after the port opened (STALE_MAX bytes, no newline).
+# that only contains "SNAP END" somewhere is never the firmware's, and neither is what a read starts with (the
+# end of a line the last read stopped in; the firmware's reply to 'p' starts with a newline for that reason).
+# The one tolerance is a stale fragment glued in front of the first line read after the port opened (STALE_MAX
+# bytes, no newline), for a log that says it is fresh. An END line is whole with its CRC, or with its newline (the
+# firmware without a CRC): "SNAP END" at the end of the text is a stream that stopped.
 BEGIN = re.compile(r'^SNAP BEGIN (\d+) (\d+)(?: (\d+))?[ \t]*\r?$', re.M)
 BEGIN_STALE = re.compile(r'[^\n]{0,%d}?SNAP BEGIN (\d+) (\d+)(?: (\d+))?[ \t]*\r?$' % STALE_MAX, re.M)
-END = re.compile(r'^SNAP END(?: ([0-9a-fA-F]{8}))?[ \t]*\r?$', re.M)
+END = re.compile(r'^SNAP END(?: ([0-9a-fA-F]{8})[ \t]*\r?$|[ \t]*\r?\n)', re.M)
 END_LINE = re.compile(rb'^SNAP END(?: [0-9a-fA-F]{8})?[ \t]*\r?\n', re.M)
 BEGIN_LINE = re.compile(rb'^SNAP BEGIN (\d+) (\d+)', re.M)
 OFF_LINE = re.compile(rb'^SNAP OFF[ \t]*\r?\n', re.M)
@@ -68,6 +74,14 @@ OFF_LINE = re.compile(rb'^SNAP OFF[ \t]*\r?\n', re.M)
 
 class SnapError(Exception):
     """No picture, and why; str() says it."""
+
+
+class _Pace(float):
+    """capture()'s default settle, PACE: equal to it, but not the same object, so capture() can tell it from a settle
+    of PACE seconds given on purpose, which a touch command's longer wait doesn't replace."""
+
+
+DEFAULT_SETTLE = _Pace(PACE)
 
 
 def touch_command(keys):
@@ -80,13 +94,13 @@ def prepare(keys, settle=None):
     """-> (keys, wait): what to send and how long to wait before asking for the picture.
 
     A touch command is read by LVGL, which doesn't run while it is paused (battery sleep), so a 'w' goes in
-    front of it, after any keys before it. The wait is the script's length plus AFTER_TOUCH; anything else takes
-    PACE. `settle`, from --settle, replaces the wait.
+    front of it, after any keys before it (one already there is enough). The wait is the script's length plus
+    AFTER_TOUCH; anything else takes PACE. `settle`, from --settle, replaces the wait.
     """
     touch = touch_command(keys)
     if touch:
         plain, sep, line = keys.partition('>')
-        keys = plain + 'w' + sep + line
+        keys = plain + ('' if plain.endswith('w') else 'w') + sep + line
     wait = TOUCH_MS[touch] / 1000 + AFTER_TOUCH if touch else PACE
     return keys, wait if settle is None else settle
 
@@ -104,20 +118,22 @@ def tail(line):
     return line[start:end]
 
 
-def find_begin(log):
-    """The match of the stream's SNAP BEGIN line in `log`, or None."""
-    return BEGIN.search(log) or BEGIN_STALE.match(log)
+def find_begin(log, fresh=False):
+    """The match of the stream's SNAP BEGIN line in `log`, or None. `fresh`: see parse()."""
+    return BEGIN.search(log) or (BEGIN_STALE.match(log) if fresh else None)
 
 
-def parse(log):
-    """-> (w, h, raw, crc_ok) for the stream in `log`, the text read from the port after the 'p'.
+def parse(log, fresh=False):
+    """-> (w, h, raw, crc_ok) for the stream in `log`, the text read from the port after the 'p'. It starts at a line
+    start (fetch() cuts off what it began in the middle of); `fresh` says it starts where the port was opened, so
+    a stale fragment (STALE_MAX bytes, no newline) can be glued in front of its first line. capture() never says it.
 
     raw is the RGB565 bytes (low byte first, as LVGL keeps them) of w*h pixels, short of w*h*2 when lines were lost.
     crc_ok is False when the CRC on the SNAP END line doesn't match raw, or raw is short of it; firmware that
     doesn't send one has nothing to check, so it is True. ValueError when there is no stream to read: no
     SNAP BEGIN, no SNAP END after it, or sizes that can't be a screen.
     """
-    begin = find_begin(log)
+    begin = find_begin(log, fresh)
     if begin is None:
         raise ValueError('no SNAP BEGIN')
     w, h = int(begin.group(1)), int(begin.group(2))
@@ -144,15 +160,29 @@ def parse(log):
     return w, h, raw, crc_ok
 
 
+def first_whole_line(log):
+    """Where the first line `log` has whole begins, just after its first newline; None while it has no newline.
+    What a read starts with is the end of a line the last read stopped in, never a column 0 of its own."""
+    at = log.find(b'\n')
+    return at + 1 if at >= 0 else None
+
+
+def whole_lines(log):
+    """`log` from its first whole line on."""
+    start = first_whole_line(log)
+    return log[start:] if start is not None else b''
+
+
 def read_until(ser, timeout, found, log=b''):
-    """Reads from `ser` for up to `timeout` seconds, or until the pattern `found` matches a line of what has come
-    in. Returns what was read, after `log`."""
+    """Reads from `ser` for up to `timeout` seconds, or until the pattern `found` matches a whole line of what has
+    come in (not the first, which the read began in the middle of). Returns what was read, after `log`."""
     log = bytearray(log)
     end = time.time() + timeout
     while time.time() < end:
         before = len(log)
         log += ser.read(65536)
-        if len(log) > before and found.search(log, max(0, before - 64)):
+        start = first_whole_line(log)
+        if len(log) > before and start is not None and found.search(log, max(start, before - 64)):
             break
     return bytes(log)
 
@@ -164,8 +194,9 @@ def listen(ser, seconds):
         ser.read(65536)
 
 
-def settle_down(ser, quiet=1.0, limit=40):
-    """Reads and drops until the board has been quiet for `quiet` seconds (at most `limit` in all)."""
+def settle_down(ser, quiet=0.3, limit=3.0):
+    """Reads and drops until the board has been quiet for `quiet` seconds (at most `limit` in all, so a board that
+    logs on a timer can't hold it)."""
     last = time.time()
     end = last + limit
     while time.time() < min(last + quiet, end):
@@ -175,36 +206,43 @@ def settle_down(ser, quiet=1.0, limit=40):
 
 def fetch(ser):
     """Asks for a picture with 'p' and reads it. -> (w, h, raw, crc_ok, why): why is what was wrong, when it isn't
-    ok. SnapError when the board has screenshots off or never answers."""
+    ok. SnapError when the board has screenshots off or never answers.
+
+    Nothing before the first newline of what comes back is looked at: it is the end of a line the drain before the
+    'p' stopped in (an @app.log echo that says SNAP END there is not the firmware). The reply starts with a newline."""
     ser.write(b'p')
     log = read_until(ser, 10, re.compile(END_LINE.pattern + b'|' + OFF_LINE.pattern, re.M))
-    begin = BEGIN_LINE.search(log)
-    if begin and not END_LINE.search(log):
+    body = whole_lines(log)
+    begin = BEGIN_LINE.search(body)
+    if begin and not END_LINE.search(body):
         # Wait as long as the image takes on a UART console at 115200 (base64, a newline a
         # line, 10 bits a byte): ~8 s for 135x240, ~40 s for the Watcher's 412x412.
         size = int(begin.group(1)) * int(begin.group(2)) * 2 * 4 / 3 * 1.01
         log = read_until(ser, 10 + size * 10 / 115200, END_LINE, log)
-    text = log.decode('latin1')
+        body = whole_lines(log)
+    text = body.decode('latin1')
     try:
         w, h, raw, ok = parse(text)
     except ValueError:
         if find_begin(text) is None:
-            if OFF_LINE.search(log):
+            if OFF_LINE.search(body):
                 raise SnapError('screenshots are off in this build: '
                                 'MUSE_BENCH=1 tools/muse/board.sh build|flash <board>')
             raise SnapError('no screenshot: the board never answered')
-        return 0, 0, b'', False, 'snapshot cut short'
-    return w, h, raw, ok, 'crc mismatch'
+        return 0, 0, b'', False, CUT_SHORT
+    return w, h, raw, ok, CRC_MISMATCH
 
 
-def capture(ser, keys='', settle=0.35):
+def capture(ser, keys='', settle=DEFAULT_SETTLE):
     """Sends `keys` to the open port `ser`, waits `settle` seconds after the last key or command, and takes a
     screenshot. -> (w, h, raw): RGB565 bytes, w*h*2 of them. A capture whose CRC doesn't match is taken again
     (only the 'p', not the keys), up to TRIES times in all; SnapError when none is good, or when there is none.
 
     keys is what the command line takes: keys sent 350 ms apart, then perhaps a '>' with a console command that
-    runs to the end of the keys. See prepare() for a touch command's 'w' and its wait.
+    runs to the end of the keys. A touch command gets a 'w' in front and waits for its script (see prepare());
+    a `settle` given on purpose replaces the wait, whatever it is, and the default is 0.35 s.
     """
+    keys, settle = prepare(keys, None if settle is DEFAULT_SETTLE else settle)
     listen(ser, 0.3)
     plain, command, line = keys.partition('>')
     for i, key in enumerate(plain):
@@ -220,7 +258,8 @@ def capture(ser, keys='', settle=0.35):
             break
         if attempt + 1 < TRIES:
             print(f'{why}, retaking', file=sys.stderr)
-            settle_down(ser)
+            if why == CUT_SHORT:
+                settle_down(ser)   # the rest of that stream may still be coming; a CRC mismatch's had ended
     else:
         raise SnapError(f'{why} on all {TRIES} tries: the screenshot would be corrupt, so there is none')
     if len(raw) != w * h * 2:
@@ -292,7 +331,7 @@ def main(argv=None):
         ser.rts = False
         listen(ser, args.reset_wait)
     try:
-        w, h, raw = capture(ser, *prepare(args.keys, args.settle))
+        w, h, raw = capture(ser, args.keys, DEFAULT_SETTLE if args.settle is None else args.settle)
     except SnapError as e:
         sys.exit(str(e))
     write_png(args.out, w, h, raw)

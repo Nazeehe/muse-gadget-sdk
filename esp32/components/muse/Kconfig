@@ -313,7 +313,9 @@ menu "Muse"
             ">ui=settings", ">ui=face" and ">ui=clock" pick the touch page for
             a screenshot. ">tap X Y", ">longpress X Y" and ">swipe left|right"
             inject a touch through LVGL's input, as a finger would arrive; they
-            need a touch screen, and a 'w' first when it sleeps on battery.
+            need a touch screen that LVGL polls (not one that reads only on its
+            interrupt: the log says so), and a 'w' first when it sleeps on
+            battery.
             Screenshots (tools/muse/snap.py) are a separate option,
             CONFIG_LV_USE_SNAPSHOT.
 

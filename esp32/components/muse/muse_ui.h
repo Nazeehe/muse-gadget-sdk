@@ -83,11 +83,12 @@ void muse_ui_bench_demo(bool enabled);
  * Bench-only, from any task: a scripted touch, played through LVGL's input
  * read so the widgets see presses, clicks, scrolls and gestures as from a
  * finger. A tap and a long press hold the point (x, y) for 80 and 900 ms; a
- * swipe ignores x and y and drags along y=233 between x=406 and x=60 in 9
- * steps over about 240 ms, a left swipe from the right. While a script plays
- * the real touch isn't read. A request made while one plays waits for it, and
- * the latest of several waits. LVGL doesn't read its input while the screen
- * sleeps on battery: wake it first. No effect on boards without a touch screen.
+ * swipe ignores x and y and drags along y=233 between x=406 and x=60 over
+ * 240 ms, its point following the clock on every read, a left swipe from the
+ * right. While a script plays the real touch isn't read. A request made while
+ * one plays waits for it, and the latest of several waits. LVGL doesn't read
+ * its input while the screen sleeps on battery: wake it first. No effect on
+ * boards without a touch screen, or whose touch reads only on its interrupt.
  */
 typedef enum {
     MUSE_UI_TOUCH_TAP,

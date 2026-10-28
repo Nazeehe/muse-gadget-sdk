@@ -18,6 +18,7 @@ read callback, the screenshot stream's CRC and tools/muse/snap.py, and the size 
 import base64
 import contextlib
 import importlib
+import inspect
 import io
 import random
 import re
@@ -47,18 +48,32 @@ def load_snap():
         sys.path.remove(str(TOOLS))
 
 
+def build_bench(name, program, tmp):
+    """`program` compiled against the real headers with CONFIG_MUSE_BENCH on (the two ESP-IDF headers muse_ui.h
+    includes are faked); the executable's path."""
+    include = Path(tmp) / "include"
+    include.mkdir()
+    (include / "esp_err.h").write_text("typedef int esp_err_t;\n")
+    (include / "sdkconfig.h").write_text("#define CONFIG_MUSE_BENCH 1\n")
+    path = Path(tmp) / f"{name}.c"
+    path.write_text(program)
+    return apps_host.build(name, [path], tmp, include_dirs=[include, MUSE])
+
+
 def pixels(w, h, seed=1):
     """w*h RGB565 pixels of noise."""
     return random.Random(seed).randbytes(w * h * 2)
 
 
 def stream(w, h, raw, per_line=144, crc=True):
-    """What send_snapshot() streams for raw: a blank line, SNAP BEGIN, base64 lines of per_line bytes, SNAP END."""
+    """What send_snapshot() streams for raw: a blank line, SNAP BEGIN, base64 lines of per_line bytes, a blank line and
+    SNAP END with the CRC (both lines start with a newline of their own). crc=False is older firmware's: its END
+    follows the last row at once and carries nothing."""
     lines = ["", f"SNAP BEGIN {w} {h} {per_line}"]
     for y in range(h):
         row = raw[y * w * 2:(y + 1) * w * 2]
         lines += [base64.b64encode(row[at:at + per_line]).decode() for at in range(0, len(row), per_line)]
-    lines.append(f"SNAP END {zlib.crc32(raw):08x}" if crc else "SNAP END")
+    lines += ["", f"SNAP END {zlib.crc32(raw):08x}"] if crc else ["SNAP END"]
     return "\n".join(lines) + "\n"
 
 
@@ -84,22 +99,34 @@ class FakeClock:
 
 
 class FakeBoard:
-    """A serial port: write() records what is sent, and each 'p' queues the next scripted answer. read() hands out at
-    most `piece` bytes, so a line can arrive in parts, and an empty read costs the port's 0.2 s timeout."""
+    """A serial port: write() records what is sent and when, and each 'p' queues the next scripted answer: a string,
+    or (now, later, delay) with `later` arriving `delay` seconds after the 'p'. read() hands out at most `piece` bytes,
+    so a line can arrive in parts, and an empty read costs the port's 0.2 s timeout. With `chatter` the board never
+    goes quiet: the line comes in place of an empty read, as from an app logging on a timer."""
 
-    def __init__(self, clock, answers, piece=100):
-        self.clock, self.answers, self.piece = clock, list(answers), piece
-        self.writes, self.pending = [], b""
+    def __init__(self, clock, answers, piece=100, chatter=""):
+        self.clock, self.answers, self.piece, self.chatter = clock, list(answers), piece, chatter
+        self.writes, self.write_times, self.pending, self.later = [], [], b"", []
+        self.outstanding_at_write = []   # (bytes pending, parts still to come) as each write goes
 
     def write(self, data):
+        self.outstanding_at_write.append((len(self.pending), len(self.later)))
         self.writes.append(bytes(data))
+        self.write_times.append(self.clock.now)
         if data == b"p" and self.answers:
-            self.pending += self.answers.pop(0).encode("latin1")
+            answer = self.answers.pop(0)
+            now, later, delay = (answer, "", 0) if isinstance(answer, str) else answer
+            self.pending += now.encode("latin1")
+            if later:
+                self.later.append((self.clock.now + delay, later.encode("latin1")))
 
     def read(self, size=1):
+        for due in [item for item in self.later if item[0] <= self.clock.now]:
+            self.later.remove(due)
+            self.pending += due[1]
         if not self.pending:
             self.clock.now += 0.2
-            return b""
+            return self.chatter.encode("latin1")
         chunk, self.pending = self.pending[:min(size, self.piece)], self.pending[min(size, self.piece):]
         return chunk
 
@@ -195,14 +222,7 @@ int main(void)
 }
 """
         with tempfile.TemporaryDirectory() as tmp:
-            include = Path(tmp) / "include"
-            include.mkdir()
-            (include / "esp_err.h").write_text("typedef int esp_err_t;\n")
-            (include / "sdkconfig.h").write_text("#define CONFIG_MUSE_BENCH 1\n")
-            path = Path(tmp) / "eink_stubs.c"
-            path.write_text(program)
-            exe = apps_host.build("eink_stubs", [path], tmp, include_dirs=[include, MUSE])
-            done = apps_host.run(exe)
+            done = apps_host.run(build_bench("eink_stubs", program, tmp))
         self.assertEqual((done.returncode, done.stdout), (0, ""), done.stderr)
 
     def run_bench_block(self, lines):
@@ -250,14 +270,7 @@ int main(void)
 }
 """
         with tempfile.TemporaryDirectory() as tmp:
-            include = Path(tmp) / "include"
-            include.mkdir()
-            (include / "esp_err.h").write_text("typedef int esp_err_t;\n")
-            (include / "sdkconfig.h").write_text("#define CONFIG_MUSE_BENCH 1\n")
-            path = Path(tmp) / "bench_block.c"
-            path.write_text(program)
-            exe = apps_host.build("bench_block", [path], tmp, include_dirs=[include, MUSE])
-            done = apps_host.run(exe, input="\n".join(lines) + "\n")
+            done = apps_host.run(build_bench("bench_block", program, tmp), input="\n".join(lines) + "\n")
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout.splitlines()
 
@@ -316,9 +329,12 @@ typedef enum { LV_INDEV_STATE_RELEASED = 0, LV_INDEV_STATE_PRESSED } lv_indev_st
 typedef struct { lv_indev_state_t state; lv_point_t point; } lv_indev_data_t;
 typedef struct lv_indev lv_indev_t;
 typedef void (*lv_indev_read_cb_t)(lv_indev_t *indev, lv_indev_data_t *data);
+typedef enum { LV_INDEV_MODE_NONE = 0, LV_INDEV_MODE_TIMER, LV_INDEV_MODE_EVENT } lv_indev_mode_t;
 
 static lv_indev_read_cb_t g_cb;
+static lv_indev_mode_t g_mode = LV_INDEV_MODE_TIMER;
 static uint32_t g_tick = 5000;
+__attribute__((unused)) static lv_indev_mode_t lv_indev_get_mode(lv_indev_t *indev) { (void)indev; return g_mode; }
 static lv_indev_read_cb_t lv_indev_get_read_cb(lv_indev_t *indev) { (void)indev; return g_cb; }
 static void lv_indev_set_read_cb(lv_indev_t *indev, lv_indev_read_cb_t cb) { (void)indev; g_cb = cb; }
 static uint32_t lv_tick_get(void) { return g_tick; }
@@ -383,10 +399,21 @@ int main(int argc, char **argv)
     int step = argc > 2 ? atoi(argv[2]) : 15;
     s_indev = (lv_indev_t *)&g_tick;
     g_cb = strcmp(what, "no_driver") ? real_read : NULL;
+    g_mode = strcmp(what, "event_mode") ? LV_INDEV_MODE_TIMER : LV_INDEV_MODE_EVENT;
     bench_touch_install();
     if (!strcmp(what, "no_driver")) {
         printf("installed=%d\n", g_cb != NULL);
         muse_ui_bench_touch(MUSE_UI_TOUCH_TAP, 1, 1);
+        return 0;
+    }
+    if (!strcmp(what, "event_mode")) {
+        printf("installed=%d\n", g_cb != real_read);
+        muse_ui_bench_touch(MUSE_UI_TOUCH_TAP, 1, 1);
+        real_calls = 0;
+        lv_indev_data_t d = read_now();
+        printf("read:");
+        show("", d, g_tick);
+        printf(" real=%d\n", real_calls);
         return 0;
     }
     printf("installed=%d\n", g_cb != real_read);
@@ -428,7 +455,7 @@ int main(int argc, char **argv)
         g_tick += (uint32_t)step;
         muse_ui_bench_touch(MUSE_UI_TOUCH_SWIPE_LEFT, 0, 0);
         muse_ui_bench_touch(MUSE_UI_TOUCH_LONG, 50, 60);   /* the later request replaces the earlier one */
-        for (;;) {
+        for (int i = 0; i < 400; i++) {
             lv_indev_data_t d = read_now();
             show("", d, t0);
             if (d.state == LV_INDEV_STATE_RELEASED) {
@@ -454,13 +481,7 @@ int main(int argc, char **argv)
 }
 """
         with tempfile.TemporaryDirectory() as tmp:
-            include = Path(tmp) / "include"
-            include.mkdir()
-            (include / "esp_err.h").write_text("typedef int esp_err_t;\n")
-            (include / "sdkconfig.h").write_text("#define CONFIG_MUSE_BENCH 1\n")
-            path = Path(tmp) / "bench_touch.c"
-            path.write_text(program)
-            exe = apps_host.build("bench_touch", [path], tmp, include_dirs=[include, MUSE])
+            exe = build_bench("bench_touch", program, tmp)
             cases = {name: apps_host.run(exe, *args) for name, args in scenario.items()}
         for name, done in cases.items():
             self.assertEqual(done.returncode, 0, f"{name}: {done.stderr}")
@@ -492,25 +513,70 @@ int main(int argc, char **argv)
         self.assertEqual((long[0], long[-2], long[-1]),
                          (("P", 233, 233, 0), ("P", 233, 233, 885), ("R", 233, 233, 900)))
         self.assertTrue(all(r[:3] == ("P", 233, 233) for r in long[:-1]))
-        # A left swipe starts at the right and goes left along y=233 in 9 steps over 240 ms, then lets go at the end.
+        # A left swipe starts at the right and goes left along y=233 for 240 ms, then lets go at the end (a right swipe
+        # the other way; test_a_swipe_moves_on_every_read_and_fires_lvgls_gesture has the rest).
         left = self.reads(out["left"][2])
         self.assertEqual((left[0], left[-1]), (("P", 406, 233, 0), ("R", 60, 233, 240)))
         self.assertTrue(all(r[2] == 233 for r in left))
-        xs = [r[1] for r in left]
-        self.assertEqual(xs, sorted(xs, reverse=True))
-        self.assertEqual(len({x for x in xs}), 9)
-        self.assertEqual(left[-2][1], 60)   # the finger has reached the end before it lifts
-        self.assertEqual(left[-2][3], 225)
         slow = self.reads(out["left_slow"][2])   # a read every 100 ms: still ends where it should, at the end
         self.assertEqual((slow[0], slow[-1]), (("P", 406, 233, 0), ("R", 60, 233, 300)))
         right = self.reads(out["right"][2])
         self.assertEqual((right[0], right[-1]), (("P", 60, 233, 0), ("R", 406, 233, 240)))
-        xs = [r[1] for r in right]
-        self.assertEqual(xs, sorted(xs))
-        self.assertEqual(len({x for x in xs}), 9)
         # Out of the screen is clamped to its edge; a kind that doesn't exist is dropped (the real touch goes on).
         self.assertEqual(self.reads(out["clamp"][2])[0], ("P", 465, 0, 0))
         self.assertEqual(out["invalid"][2], "invalid: P7,9@0 real=1")
+
+    @staticmethod
+    def lvgl_gesture(reads):
+        """What LVGL 9.5 makes of a pointer's reads (lv_indev.c: indev_proc_press and indev_gesture): the vector is the
+        move since the read before, the first read of a press has none, a read that moves less than the minimum
+        velocity (3 px) forgets the distance so far, and the gesture fires once the distance passes 50 px. -> the
+        direction and the read's ms, or None. (The points stay on y=233, so only x counts.)"""
+        last, total = None, 0
+        for state, x, _, ms in reads:
+            if state != "P":
+                return None   # a release isn't processed as a press
+            vect = 0 if last is None else x - last
+            last = x
+            if abs(vect) < 3:
+                total = 0
+            total += vect
+            if abs(total) > 50:
+                return ("left" if total < 0 else "right"), ms
+        return None
+
+    def test_a_swipe_moves_on_every_read_and_fires_lvgls_gesture(self):
+        # S6: the swipe's position follows the clock on every read, so no read sees the finger standing still, whatever
+        # LV_DEF_REFR_PERIOD is. LVGL forgets a gesture's distance on a read that moves under 3 px, and a 43 px step
+        # on a 26.7 ms clock left every other read standing still at 15 ms, and every one but the odd one at 10.
+        periods = (5, 10, 15, 20, 33, 100)
+        out = self.run_touch_harness({f"{d}_{p}": (f"swipe_{d}", p) for d in ("left", "right") for p in periods})
+        for p in periods:
+            for d, start, end in (("left", 406, 60), ("right", 60, 406)):
+                with self.subTest(direction=d, period=p):
+                    reads = self.reads(out[f"{d}_{p}"][2])
+                    pressed, release = reads[:-1], reads[-1]
+                    # released at the end, on the first read at or after 240 ms
+                    self.assertEqual(release, ("R", end, 233, -(-240 // p) * p))
+                    self.assertTrue(all(r[2] == 233 for r in reads))
+                    delta = end - start   # x is the clock's share of the way, truncated as C divides
+                    self.assertEqual([r[1] for r in pressed],
+                                     [start + (delta * r[3] // 240 if delta > 0 else -(-delta * r[3] // 240))
+                                      for r in pressed])
+                    xs = [r[1] for r in pressed]
+                    self.assertTrue(all((b - a) * delta > 0 for a, b in zip(xs, xs[1:])), xs)   # every read moves
+                    self.assertEqual(self.lvgl_gesture(reads)[0], d)
+
+    def test_a_touch_input_in_event_mode_gets_no_wrapper_and_says_why(self):
+        # S7: in LV_INDEV_MODE_EVENT LVGL reads the touch only when its driver says so, so a script couldn't advance
+        # (and a stored request would play at the next real touch). No wrapper goes in, the log says why once, and a
+        # request says there is nothing to drive. The real touch is read as always.
+        out = self.run_touch_harness({"event": ("event_mode",)})["event"]
+        self.assertRegex(out[0], r"^W muse_ui: bench touch: .*event mode")
+        self.assertEqual(out[1], "installed=0")
+        self.assertRegex(out[2], r"^W muse_ui: .*no touch")
+        self.assertEqual(out[3], "read: P7,9@0 real=1")
+        self.assertEqual(sum("event mode" in line for line in out), 1)
 
     def test_a_request_in_mid_script_waits_and_the_latest_wins(self):
         out = self.run_touch_harness({"queued": ("queued", 15)})["queued"]
@@ -548,6 +614,9 @@ int main(int argc, char **argv)
             "    for (size_t at = 0; at < n; at += chunk) {",
             "        crc = snap_crc32(crc, data + at, n - at < chunk ? n - at : chunk);",
             "    }",
+            "    if (n == 0) {",
+            "        crc = snap_crc32(crc, data, 0);",
+            "    }",
             '    printf("%08x\\n", (unsigned)crc);',
             "    return 0;", "}",
         ])
@@ -564,7 +633,9 @@ int main(int argc, char **argv)
                         done = apps_host.run(exe, chunk, input=data, text=False)
                         self.assertEqual(done.returncode, 0, done.stderr)
                         self.assertEqual(done.stdout.decode().strip(), f"{zlib.crc32(data):08x}")
-        self.assertEqual(zlib.crc32(b"123456789"), 0xCBF43926)   # the standard check value, as zlib gives it
+            # The standard check value for CRC-32, from the firmware's code and not from zlib.
+            done = apps_host.run(exe, 0, input=b"123456789", text=False)
+            self.assertEqual(done.stdout.decode().strip(), "cbf43926")
 
     def test_send_snapshot_streams_what_snap_parses(self):
         # The firmware's own stream (send_snapshot, its chunks and its SNAP END line) read by the tool's parser.
@@ -644,7 +715,7 @@ int main(int argc, char **argv)
                     self.assertEqual(done.returncode, 0, done.stderr)
                     log = done.stdout.decode("latin1")
                     self.assertTrue(log.startswith(f"\nSNAP BEGIN {w} {h} 144\n"), log[:40])
-                    self.assertRegex(log, r"\nSNAP END [0-9a-f]{8}\n$")
+                    self.assertRegex(log, r"\n\nSNAP END [0-9a-f]{8}\n$")   # END has a newline of its own, as BEGIN has
                     got_w, got_h, raw, ok = snap.parse(log)
                     self.assertEqual((got_w, got_h), (w, h))
                     self.assertEqual(raw, dump.read_bytes())
@@ -653,7 +724,7 @@ int main(int argc, char **argv)
 
     def test_snapshot_streaming_stays_on_lvgl_snapshot(self):
         ui = (MUSE / "muse_ui.c").read_text()
-        for text in ("static uint32_t snap_crc32(", "lv_snapshot_take(", '"SNAP END %08x\\n"'):
+        for text in ("static uint32_t snap_crc32(", "lv_snapshot_take(", '"\\nSNAP END %08x\\n"'):
             with self.subTest(text):
                 self.assertIn("if LV_USE_SNAPSHOT", open_conditions(ui, ui.index(text)))
         self.assertIn('"\\nSNAP OFF\\n"', ui)   # a build without it still says why
@@ -728,19 +799,52 @@ int main(int argc, char **argv)
 
     def test_snap_parse_tolerates_one_stale_fragment_before_the_first_line(self):
         # A USB packet left in the FIFO while no program had the port open (at most 64 bytes, no newline) can be glued
-        # in front of the first line read after opening; nowhere else.
+        # in front of the first line read after opening; nowhere else. fresh=True says the log starts there. What
+        # capture() parses, the reply to a 'p', never does (S1).
         snap = load_snap()
         raw = pixels(5, 4, seed=4)
         begin = "SNAP BEGIN 5 4 144\n"
         body = stream(5, 4, raw)[len("\n" + begin):]
-        self.assertEqual(snap.parse("ws=up ra" + begin + body), (5, 4, raw, True))
-        self.assertEqual(snap.parse("x" * 64 + begin + body), (5, 4, raw, True))
-        with self.assertRaises(ValueError):
-            snap.parse("x" * 65 + begin + body)
-        with self.assertRaises(ValueError):
-            snap.parse("I (1) muse: up\nws=up ra" + begin + body)
-        with self.assertRaises(ValueError):
-            snap.parse("ws=up ra\n" + "x" * 3 + begin + body)
+        self.assertEqual(snap.parse("ws=up ra" + begin + body, fresh=True), (5, 4, raw, True))
+        self.assertEqual(snap.parse("x" * 64 + begin + body, fresh=True), (5, 4, raw, True))
+        for log in ("x" * 65 + begin + body, "I (1) muse: up\nws=up ra" + begin + body,
+                    "ws=up ra\n" + "x" * 3 + begin + body):
+            with self.subTest(log=log[:24]):
+                with self.assertRaises(ValueError):
+                    snap.parse(log, fresh=True)
+        for fragment in ("ws=up ra", "x" * 64, "x"):
+            with self.subTest(fragment=fragment):
+                with self.assertRaises(ValueError):
+                    snap.parse(fragment + begin + body)
+        self.assertFalse(snap.parse.__defaults__[0])   # not fresh unless the caller says so
+
+    def test_snap_parse_a_stream_cut_in_its_end_line_is_cut_short(self):
+        # S3: "SNAP END" at the end of the text, before its CRC or its newline has come in, is a stream that stopped,
+        # not firmware that sends no CRC (which would take a corrupt picture for a good one).
+        snap = load_snap()
+        raw = pixels(5, 4, seed=12)
+        good = stream(5, 4, raw)
+        bad = flip_first_data_char(good)
+        head, bad_head = good[:good.index("SNAP END")], bad[:bad.index("SNAP END")]
+        for name, log in (("good", head), ("corrupt", bad_head)):
+            for cut in ("SNAP END", "SNAP END ", "SNAP END 0123", "SNAP END 0123456"):
+                with self.subTest(stream=name, cut=cut):
+                    with self.assertRaises(ValueError):
+                        snap.parse(log + cut)
+        # A whole CRC is a whole line, newline or not.
+        crc = f"SNAP END {zlib.crc32(raw):08x}"
+        self.assertEqual(snap.parse(head + crc), (5, 4, raw, True))
+        self.assertFalse(snap.parse(bad_head + crc)[3])
+
+    def test_snap_parse_finds_the_end_behind_a_log_fragment_on_the_blank_line(self):
+        # S2: END starts a line of its own, so log text cut in front of it sits on the line before and END keeps
+        # column 0.
+        snap = load_snap()
+        raw = pixels(5, 4, seed=20)
+        log = stream(5, 4, raw)
+        at = log.index("SNAP END") - 1
+        self.assertEqual(log[at - 1:at + 1], "\n\n")
+        self.assertEqual(snap.parse(log[:at] + "ws=up ra" + log[at:]), (5, 4, raw, True))
 
     def test_snap_parse_survives_log_lines_between_the_rows(self):
         snap = load_snap()
@@ -762,13 +866,16 @@ int main(int argc, char **argv)
                 with self.assertRaises(ValueError):
                     snap.parse(log)
 
-    def capture(self, snap, answers, keys="", settle=0.35, piece=100):
+    def capture(self, snap, answers, keys="", settle=None, piece=100, pending=b"", chatter=""):
+        """snap.capture() on a FakeBoard (`settle` only when given, so the default applies): the result or the
+        SnapError, the board, the clock and what went to stderr. `pending` is what was in the port before."""
         clock = FakeClock()
-        board = FakeBoard(clock, answers, piece)
+        board = FakeBoard(clock, answers, piece, chatter)
+        board.pending = pending
         errors = io.StringIO()
         with mock.patch.object(snap, "time", clock), contextlib.redirect_stderr(errors):
             try:
-                result = snap.capture(board, keys, settle)
+                result = snap.capture(board, keys, *([] if settle is None else [settle]))
             except snap.SnapError as e:
                 result = e
         return result, board, clock, errors.getvalue()
@@ -783,7 +890,7 @@ int main(int argc, char **argv)
         # The keys go once; only the 'p' that asks for the picture is sent again.
         self.assertEqual(board.writes, [b"a", b">face=happy\n", b"p", b"p"])
         self.assertEqual(errors, "crc mismatch, retaking\n")
-        self.assertEqual(clock.slept[:2], [0.35, 0.5])   # a key's pace, then the settle after the command
+        self.assertEqual(clock.slept, [0.35, 0.5])   # a key's pace, then the settle after the command; no more
 
     def test_snap_capture_gives_up_after_three_corrupt_captures(self):
         snap = load_snap()
@@ -834,6 +941,187 @@ int main(int argc, char **argv)
         result, board, _, _ = self.capture(snap, ["@app.log x SNAP OFF\n"])
         self.assertIn("never answered", str(result))
 
+    def test_snap_capture_never_takes_the_start_of_a_read_for_a_line_start(self):
+        # S1: a drain can stop in the middle of an @app.log echo, so the first thing read after the 'p' can be the rest
+        # of that line, whatever SNAP line it holds. It isn't column 0: the reply to 'p' starts with a newline of its
+        # own.
+        snap = load_snap()
+        raw = pixels(30, 8, seed=11)
+        good = stream(30, 8, raw)
+        for tail in ("SNAP BEGIN 9 9 144\n", "SNAP BEGIN 9 9 144\r\n", "SNAP END 00000000\n", "SNAP END\n",
+                     "SNAP OFF\n"):
+            for piece in (1, 100, 4096):
+                with self.subTest(tail=tail, piece=piece):
+                    result, board, _, errors = self.capture(snap, [tail + good], piece=piece)
+                    self.assertEqual(result, (30, 8, raw))
+                    self.assertEqual(board.writes, [b"p"])   # no retake, and no giving up
+                    self.assertEqual(errors, "")
+
+    def test_snap_capture_takes_no_stale_fragment_for_a_stream_start(self):
+        # S1: only a log that starts where the port was opened gets parse()'s tolerance for text glued in front of
+        # BEGIN. capture() reads what follows a 'p', whose reply starts with a newline, so a BEGIN behind log text is an
+        # app's line, never the firmware's: a stream that starts that way is not read.
+        snap = load_snap()
+        raw = pixels(30, 8, seed=22)
+        glued = "junk\n@app.log x " + stream(30, 8, raw)[1:]   # the BEGIN line without its own line, behind an echo
+        result, board, _, _ = self.capture(snap, [glued])
+        self.assertIsInstance(result, snap.SnapError)
+        self.assertIn("never answered", str(result))
+        self.assertEqual(board.writes, [b"p"])
+
+    def test_snap_capture_drains_what_was_in_the_port_before_it(self):
+        snap = load_snap()
+        raw = pixels(30, 8, seed=15)
+        for pending in (b"ws=up ra", b"SNAP BEGIN 7 7 144\nSNAP END 00000000\n", b"@app.log x SNAP OFF\nSNAP OFF\n"):
+            with self.subTest(pending=pending):
+                result, board, _, errors = self.capture(snap, [stream(30, 8, raw)], pending=pending)
+                self.assertEqual(result, (30, 8, raw))
+                self.assertEqual(board.writes, [b"p"])
+                self.assertEqual(errors, "")
+
+    def test_a_retake_after_a_crc_mismatch_goes_at_once(self):
+        # S4: the corrupt stream had ended (its END was read), so there is nothing to drain, however chatty the board.
+        snap = load_snap()
+        raw = pixels(30, 8, seed=16)
+        good = stream(30, 8, raw)
+        for chatter in ("", "@app.log x tick\n"):
+            with self.subTest(chatter=chatter):
+                result, board, _, errors = self.capture(snap, [flip_first_data_char(good), good], chatter=chatter)
+                self.assertEqual(result, (30, 8, raw))
+                self.assertEqual(board.write_times[1], board.write_times[0])
+                self.assertEqual(errors, "crc mismatch, retaking\n")
+
+    def test_settle_down_waits_for_a_short_quiet_and_never_long(self):
+        # S4: 0.3 s without a byte, or 3 s in all: an app logging on a timer (every 200 ms here) can't hold it for 40.
+        snap = load_snap()
+        for chatter, low, high in (("", 0.3, 0.7), ("@app.log x tick\n", 3.0, 3.6)):
+            with self.subTest(chatter=chatter):
+                clock = FakeClock()
+                board = FakeBoard(clock, [], chatter=chatter)
+                board.pending = b"the tail of a stream"
+                with mock.patch.object(snap, "time", clock):
+                    snap.settle_down(board)
+                self.assertTrue(low <= clock.now - 1000.0 <= high, clock.now - 1000.0)
+
+    def test_snap_capture_retakes_a_stream_that_was_cut_short(self):
+        snap = load_snap()
+        raw = pixels(30, 8, seed=13)
+        good = stream(30, 8, raw)
+        cut, rest = good[:len(good) // 2], good[len(good) // 2:]
+        # Cut short, then whole: one retake, and the picture is the whole one.
+        result, board, clock, errors = self.capture(snap, [cut, good])
+        self.assertEqual(result, (30, 8, raw))
+        self.assertEqual(board.writes, [b"p", b"p"])
+        self.assertEqual(errors, "snapshot cut short, retaking\n")
+        # The rest of the first arrives after the capture gave up on it (the fetch's two waits end 20.2 s after the
+        # 'p'; this comes at 20.3), while the port is drained: nothing of it may be left for the next 'p' to read as
+        # the end of its own stream.
+        result, board, clock, errors = self.capture(snap, [(cut, rest, 20.3), good])
+        self.assertEqual(result, (30, 8, raw))
+        self.assertEqual(board.writes, [b"p", b"p"])
+        self.assertEqual(errors, "snapshot cut short, retaking\n")
+        self.assertEqual(board.outstanding_at_write[1], (0, 0))
+        # Three that stop short say so, after three tries.
+        result, board, clock, errors = self.capture(snap, [cut, cut, cut, good])
+        self.assertIsInstance(result, snap.SnapError)
+        self.assertIn("snapshot cut short", str(result))
+        self.assertEqual(board.writes.count(b"p"), 3)
+        self.assertEqual(errors, "snapshot cut short, retaking\n" * 2)
+        # On a board that never goes quiet the drain between tries is 3 s, not 40.
+        result, board, clock, errors = self.capture(snap, [cut, good], chatter="@app.log x tick\n")
+        self.assertEqual(result, (30, 8, raw))
+        self.assertLess(board.write_times[1] - board.write_times[0], 20.3 + 3.6)
+
+    def test_snap_capture_paces_plain_keys_and_settles_after_the_last(self):
+        snap = load_snap()
+        raw = pixels(30, 8, seed=17)
+        good = stream(30, 8, raw)
+        for keys in ("asa", "aaa"):   # a repeated key is paced like any other
+            with self.subTest(keys=keys):
+                result, board, clock, _ = self.capture(snap, [good], keys=keys, settle=2.0)
+                self.assertEqual(result, (30, 8, raw))
+                self.assertEqual(board.writes, [k.encode() for k in keys] + [b"p"])
+                self.assertEqual(clock.slept, [0.35, 0.35, 2.0])
+        _, _, clock, _ = self.capture(snap, [good], keys="as")   # no settle given: the default
+        self.assertEqual(clock.slept, [0.35, 0.35])
+        _, board, clock, _ = self.capture(snap, [good])   # no keys: nothing to wait for
+        self.assertEqual((board.writes, clock.slept), ([b"p"], []))
+
+    def test_snap_capture_wakes_first_and_waits_for_a_touch_script(self):
+        # S5: capture() applies prepare() itself, so every caller (Task 15's app.py too) gets C13's 'w' and wait for a
+        # touch command; a settle given on purpose replaces the wait, even 0.35.
+        snap = load_snap()
+        raw = pixels(30, 8, seed=18)
+        good = stream(30, 8, raw)
+        for command, ms in (("tap 1 2", 80), ("longpress 233 233", 900), ("swipe left", 240), ("swipe right", 240)):
+            with self.subTest(command):
+                result, board, clock, _ = self.capture(snap, [good], keys=">" + command)
+                self.assertEqual(result, (30, 8, raw))
+                self.assertEqual(board.writes, [b"w", f">{command}\n".encode(), b"p"])
+                self.assertEqual(clock.slept[0], 0.35)   # the 'w' is paced like any key
+                self.assertAlmostEqual(clock.slept[1], ms / 1000 + 0.6)
+                self.assertEqual(len(clock.slept), 2)
+        _, board, _, _ = self.capture(snap, [good], keys="a>tap 1 2")   # keys in front stay in front of the wake
+        self.assertEqual(board.writes, [b"a", b"w", b">tap 1 2\n", b"p"])
+        _, board, _, _ = self.capture(snap, [good], keys="w>tap 1 2")   # one wake is enough
+        self.assertEqual(board.writes, [b"w", b">tap 1 2\n", b"p"])
+        for settle in (0.2, 0.35):
+            with self.subTest(settle=settle):
+                _, _, clock, _ = self.capture(snap, [good], keys=">tap 1 2", settle=settle)
+                self.assertEqual(clock.slept, [0.35, settle])
+        _, board, clock, _ = self.capture(snap, [good], keys=">ui=clock")   # not a touch command: no wake, the default
+        self.assertEqual((board.writes, clock.slept), ([b">ui=clock\n", b"p"], [0.35]))
+
+    def test_snap_main_runs_the_whole_exchange_on_the_port_it_opens(self):
+        snap = load_snap()
+        raw = pixels(30, 8, seed=19)
+        good = stream(30, 8, raw)
+
+        def run(argv, answers):
+            clock = FakeClock()
+            board = FakeBoard(clock, answers)
+            out = io.StringIO()
+            with mock.patch.object(snap, "time", clock), mock.patch.object(snap, "open_port", return_value=board), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    snap.main(argv)
+                    code = None
+                except SystemExit as e:
+                    code = e.code
+            return board, clock, out.getvalue(), code
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shot = Path(tmp) / "shot.png"
+            board, clock, out, code = run(["/dev/x", ">tap 1 2", str(shot)], [good])
+            self.assertIsNone(code)
+            self.assertEqual(board.writes, [b"w", b">tap 1 2\n", b"p"])
+            self.assertAlmostEqual(clock.slept[-1], 0.68)
+            self.assertEqual(out, f"{shot}: 30x8\n")
+            expected = Path(tmp) / "expected.png"
+            snap.write_png(expected, 30, 8, raw)   # 30 wide and 8 high, not the other way round
+            self.assertEqual(shot.read_bytes(), expected.read_bytes())
+            # --settle replaces the wait; a reset first gives the board that long to boot.
+            board, clock, out, code = run(["--settle", "0.2", "/dev/x", ">tap 1 2", str(shot), "1.5"], [good])
+            self.assertEqual(clock.slept[-1], 0.2)
+            self.assertEqual((board.dtr, board.rts), (False, False))
+            self.assertGreaterEqual(board.write_times[0] - 1000.0, 1.5)
+            # No picture: the reason is the exit message, and no file.
+            gone = Path(tmp) / "gone.png"
+            board, clock, out, code = run(["/dev/x", "", str(gone)], [])
+            self.assertIn("never answered", code)
+            self.assertFalse(gone.exists())
+
+    def test_snap_capture_defaults_are_c15s(self):
+        snap = load_snap()
+        params = inspect.signature(snap.capture).parameters
+        self.assertEqual(list(params), ["ser", "keys", "settle"])
+        self.assertEqual((params["keys"].default, params["settle"].default), ("", 0.35))
+        clock = FakeClock()
+        board = FakeBoard(clock, [stream(30, 8, pixels(30, 8, seed=21))])
+        with mock.patch.object(snap, "time", clock):
+            w, h, raw = snap.capture(board)   # no keys, no settle
+        self.assertEqual((w, h, len(raw), board.writes), (30, 8, 30 * 8 * 2, [b"p"]))
+
     def test_touch_commands_wake_first_and_wait_for_the_script(self):
         # C13 and the controller's "wake first": the read callback doesn't run while LVGL is paused, so a touch
         # command is preceded by 'w', and 'p' waits the script's length (80, 900 or 240 ms) plus 600 ms.
@@ -877,10 +1165,11 @@ int main(int argc, char **argv)
             width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
             self.assertEqual((width, height), (6, 6))   # scaled 3x so small screens are readable
             idat = data[data.index(b"IDAT") + 4:data.index(b"IEND") - 8]
-            pixels_out = zlib.decompress(idat)
-            row = pixels_out[1:1 + 18]
-            self.assertEqual(row[:3], bytes([0xF8, 0x00, 0x00]))      # red, three times across
-            self.assertEqual(row[9:12], bytes([0x00, 0xFC, 0x00]))    # green
+            red, green, blue, white = (bytes([0xF8, 0x00, 0x00]), bytes([0x00, 0xFC, 0x00]), bytes([0x00, 0x00, 0xF8]),
+                                       bytes([0xF8, 0xFC, 0xF8]))
+            # Six scanlines (each pixel three across and three down), each a filter byte 0 and 18 bytes of pixels.
+            self.assertEqual(zlib.decompress(idat),
+                             (b"\0" + red * 3 + green * 3) * 3 + (b"\0" + blue * 3 + white * 3) * 3)
             # A capture that came up short is padded, never refused.
             snap.write_png(path, 2, 2, raw[:4])
             self.assertTrue(path.read_bytes().startswith(b"\x89PNG"))

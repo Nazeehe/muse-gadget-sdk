@@ -17,6 +17,7 @@
 #include "muse_ui.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,7 +137,7 @@ static lv_obj_t *s_pair_hint;
 static lv_obj_t *s_canvas;
 static lv_obj_t *s_mic_icon;
 static lv_obj_t *s_ptt_hint, *s_spk_hint, *s_pwr_hint;
-#if LV_USE_SNAPSHOT
+#if CONFIG_MUSE_BENCH
 static volatile bool s_bench_demo;
 void muse_ui_bench_demo(bool enabled)
 {
@@ -1426,7 +1427,7 @@ static void update_chrome(float now)
     const lv_font_t *name_font = s_small ? &lv_font_unscii_8 : &lv_font_unscii_16;
     int name_cw = lv_font_get_glyph_width(name_font, 'M', ' ');
     const char *shown = paired ? "" : b.name;
-#if LV_USE_SNAPSHOT
+#if CONFIG_MUSE_BENCH
     if (!paired && s_bench_demo) shown = "MuseGadget-DEMO";
 #endif
     if (name_cw > 0 && (int)strlen(shown) * name_cw > (muse_board->rim_controls ? 280 : s_w)) {
@@ -1653,7 +1654,7 @@ static void update_status(muse_mode_t mode, float now)
 }
 
 static volatile bool s_snapshot;
-#if LV_USE_SNAPSHOT
+#if CONFIG_MUSE_BENCH
 static volatile int s_bench_page = -1;
 void muse_ui_bench_page(muse_ui_page_t page)
 {
@@ -1661,8 +1662,128 @@ void muse_ui_bench_page(muse_ui_page_t page)
 }
 #endif
 
+#if CONFIG_MUSE_BENCH
+/*
+ * Bench touch: scripted presses played through LVGL's own input read, so the
+ * widgets get presses, clicks, scrolls and gestures as they do from a finger.
+ * muse_ui_bench_touch() (any task) only leaves a request in s_touch_request.
+ * The wrapper muse_ui_start() puts over the touch driver's read callback takes
+ * it in the LVGL task and answers LVGL's reads from the script until its
+ * release has gone out. The real touch isn't read while a script plays, and is
+ * again, untouched, from the next read. The script goes by LVGL's clock, not by
+ * the number of reads, so a busy frame delays a step or the release and no
+ * more. LVGL's long press fires after 400 ms of press; a swipe's steps are
+ * about 43 px, over the 10 px of scroll and the 3 px of speed a gesture needs.
+ */
+#define BENCH_TAP_MS 80
+#define BENCH_LONG_MS 900
+#define BENCH_SWIPE_MS 240
+#define BENCH_SWIPE_STEPS 9
+#define BENCH_SWIPE_Y 233
+#define BENCH_SWIPE_FROM 406   /* a left swipe starts here and ends at TO; a right swipe goes the other way */
+#define BENCH_SWIPE_TO 60
+#define BENCH_PENDING 0x80000000u   /* a request: this bit, the kind in bits 24-25, x in 12-23, y in 0-11 */
+
+static lv_indev_read_cb_t s_real_read;   /* the touch driver's, found in place by muse_ui_start() */
+static atomic_uint s_touch_request;      /* waiting for the LVGL task: 0, or BENCH_PENDING and the rest */
+static struct {
+    bool running;                        /* the LVGL task's alone, from here on */
+    muse_ui_touch_t kind;
+    int x, y;
+    uint32_t start;                      /* lv_tick_get() at the script's first read */
+} s_touch;
+
+static int bench_clamp(int v, int size)
+{
+    return v < 0 ? 0 : v >= size ? size - 1 : v;
+}
+
+void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y)
+{
+    if (!s_real_read) {
+        ESP_LOGW(TAG, "bench touch: this board has no touch input");
+        return;
+    }
+    if ((unsigned)kind > MUSE_UI_TOUCH_SWIPE_RIGHT) {
+        return;
+    }
+    atomic_store(&s_touch_request, BENCH_PENDING | ((unsigned)kind << 24) | ((unsigned)bench_clamp(x, s_w) << 12) |
+                                       (unsigned)bench_clamp(y, s_h));
+}
+
+static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    if (!s_touch.running) {
+        unsigned request = atomic_exchange(&s_touch_request, 0);
+        if (request & BENCH_PENDING) {
+            s_touch.kind = (muse_ui_touch_t)((request >> 24) & 3);
+            s_touch.x = (int)((request >> 12) & 0xfff);
+            s_touch.y = (int)(request & 0xfff);
+            s_touch.start = lv_tick_get();
+            s_touch.running = true;
+        }
+    }
+    if (!s_touch.running) {
+        s_real_read(indev, data);
+        return;
+    }
+    uint32_t t = lv_tick_elaps(s_touch.start);
+    uint32_t hold = s_touch.kind == MUSE_UI_TOUCH_TAP    ? BENCH_TAP_MS
+                    : s_touch.kind == MUSE_UI_TOUCH_LONG ? BENCH_LONG_MS
+                                                         : BENCH_SWIPE_MS;
+    int x = s_touch.x, y = s_touch.y;
+    if (s_touch.kind >= MUSE_UI_TOUCH_SWIPE_LEFT) {
+        bool left = s_touch.kind == MUSE_UI_TOUCH_SWIPE_LEFT;
+        int from = left ? BENCH_SWIPE_FROM : BENCH_SWIPE_TO;
+        int to = left ? BENCH_SWIPE_TO : BENCH_SWIPE_FROM;
+        int step = t >= hold ? BENCH_SWIPE_STEPS - 1 : (int)(t * BENCH_SWIPE_STEPS / hold);
+        x = from + (to - from) * step / (BENCH_SWIPE_STEPS - 1);
+        y = BENCH_SWIPE_Y;
+    }
+    data->point.x = bench_clamp(x, s_w);
+    data->point.y = bench_clamp(y, s_h);
+    if (t >= hold) {
+        data->state = LV_INDEV_STATE_RELEASED;   /* where the finger was last */
+        s_touch.running = false;
+    } else {
+        data->state = LV_INDEV_STATE_PRESSED;
+    }
+}
+
+/* Puts the wrapper over the driver's read callback. The LVGL task is already running and reads the callback every
+ * tick, so muse_ui_start() calls this with the display lock held. */
+static void bench_touch_install(void)
+{
+    s_real_read = s_indev ? lv_indev_get_read_cb(s_indev) : NULL;
+    if (s_real_read) {
+        lv_indev_set_read_cb(s_indev, bench_read);
+    }
+}
+#endif
+
+#if LV_USE_SNAPSHOT
+/* CRC-32 as zlib's crc32() gives it: snap_crc32(0, ...) over a buffer, or chained over its pieces, equals
+ * crc32(0, whole). Nibble by nibble, so the table is 64 bytes. */
+static uint32_t snap_crc32(uint32_t crc, const uint8_t *p, size_t n)
+{
+    static const uint32_t nibble[16] = {
+        0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac, 0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c,
+        0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c, 0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c,
+    };
+    crc = ~crc;
+    while (n--) {
+        crc ^= *p++;
+        crc = (crc >> 4) ^ nibble[crc & 15];
+        crc = (crc >> 4) ^ nibble[crc & 15];
+    }
+    return ~crc;
+}
+#endif
+
 /* Streams the screen over the USB cable as base64 RGB565 (bench testing; needs
- * LV_USE_SNAPSHOT, which devices/sdkconfig.muse-bench turns on). */
+ * LV_USE_SNAPSHOT, which devices/sdkconfig.muse-bench turns on). The stream
+ * ends with the CRC-32 of the pixel bytes, in the order they were sent, so
+ * snap.py can tell a capture a log line broke into from a good one. */
 static void send_snapshot(void)
 {
 #if LV_USE_SNAPSHOT
@@ -1675,6 +1796,7 @@ static void send_snapshot(void)
     int n = snprintf(hdr, sizeof(hdr), "\nSNAP BEGIN %d %d %d\n", (int)buf->header.w, (int)buf->header.h, RAW);
     muse_console_write(hdr, n);
     static unsigned char b64[4 * RAW / 3 + 4];
+    uint32_t crc = 0;
     for (uint32_t y = 0; y < buf->header.h; y++) {
         const unsigned char *p = buf->data + y * buf->header.stride;
         size_t left = buf->header.w * 2;
@@ -1683,11 +1805,14 @@ static void send_snapshot(void)
             mbedtls_base64_encode(b64, sizeof(b64), &olen, p, chunk);
             b64[olen++] = '\n';
             muse_console_write(b64, olen);
+            crc = snap_crc32(crc, p, chunk);
             p += chunk;
             left -= chunk;
         }
     }
-    muse_console_write("SNAP END\n", 9);
+    char end[24];
+    n = snprintf(end, sizeof(end), "SNAP END %08x\n", (unsigned)crc);
+    muse_console_write(end, n);
     lv_draw_buf_destroy(buf);
 #else
     muse_console_write("\nSNAP OFF\n", 10);   /* so snap.py can say why */
@@ -1701,7 +1826,7 @@ void muse_ui_request_snapshot(void)
 
 static void frame_tick(lv_timer_t *timer)
 {
-#if LV_USE_SNAPSHOT
+#if CONFIG_MUSE_BENCH
     if (s_bench_page >= 0) {
         lv_obj_t *tile = s_bench_page == MUSE_UI_PAGE_SETTINGS ? s_settings
                          : s_bench_page == MUSE_UI_PAGE_CLOCK && s_clock ? s_clock : s_face;
@@ -1838,6 +1963,9 @@ esp_err_t muse_ui_start(void)
 
     s_image_mutex = xSemaphoreCreateMutex();
     muse_board->display_lock(-1);
+#if CONFIG_MUSE_BENCH
+    bench_touch_install();
+#endif
     build_screen();
 #if CONFIG_MUSE_CLOCK
     if (s_clock) {

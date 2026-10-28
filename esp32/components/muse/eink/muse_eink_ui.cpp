@@ -1161,6 +1161,26 @@ extern "C" void muse_ui_request_snapshot(void)
     muse_console_write("\nSNAP OFF\n", 10);   /* so snap.py can say why */
 }
 
+#if CONFIG_MUSE_BENCH
+/* The bench console's page and touch calls drive the LVGL touch UI; this one has neither. */
+extern "C" void muse_ui_bench_page(muse_ui_page_t page)
+{
+    (void)page;
+}
+
+extern "C" void muse_ui_bench_demo(bool enabled)
+{
+    (void)enabled;
+}
+
+extern "C" void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y)
+{
+    (void)kind;
+    (void)x;
+    (void)y;
+}
+#endif
+
 /* The button menu is for boards without touch; FreeInk boards have Settings. */
 extern "C" void muse_menu_key(muse_menu_key_t key)
 {

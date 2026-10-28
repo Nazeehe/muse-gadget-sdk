@@ -310,6 +310,12 @@ menu "Muse"
             ">mem" prints one "@mem" line of JSON, in bytes: free, lowest-ever
             free and largest free internal RAM, free DMA-capable RAM, free and
             lowest-ever free PSRAM, and what is left of the LVGL task's stack.
+            ">ui=settings", ">ui=face" and ">ui=clock" pick the touch page for
+            a screenshot. ">tap X Y", ">longpress X Y" and ">swipe left|right"
+            inject a touch through LVGL's input, as a finger would arrive; they
+            need a touch screen, and a 'w' first when it sleeps on battery.
+            Screenshots (tools/muse/snap.py) are a separate option,
+            CONFIG_LV_USE_SNAPSHOT.
 
     config MUSE_JC3248W535_MIC_GPIO
         int "JC3248W535: GPIO for an external I2S mic's data (SD) line"

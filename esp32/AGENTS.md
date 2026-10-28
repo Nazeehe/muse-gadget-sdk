@@ -173,7 +173,13 @@ turns on screenshots: `tools/muse/snap.py PORT KEYS OUT.png` sends bench keys
 and saves the screen, and `>face=thinking` (or `idle`, `listening`,
 `speaking`, `error`, `boot`, `off`, `happy`) in KEYS picks the avatar mode first.
 Screenshots are off in normal builds because each one takes a buffer the size
-of the screen. `>face=` works in any build. Or run `idf.py` directly:
+of the screen. `>face=` works in any build. A bench build also takes touch from
+the Mac, through LVGL's own input: `>tap X Y`, `>longpress X Y` and
+`>swipe left|right` in KEYS (`snap.py PORT '>swipe left' OUT.png`) press and drag
+as a finger would. `snap.py` sends `w` first, since LVGL doesn't read its input
+while the screen sleeps on battery, and waits for the script to finish before the
+picture. Each screenshot ends with a CRC-32 that `snap.py` checks, retaking a
+capture a log line broke into. Or run `idf.py` directly:
 
 ```sh
 idf.py -B build-muse-aipi -DIDF_TARGET=esp32s3 \

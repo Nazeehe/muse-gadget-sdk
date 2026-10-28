@@ -64,9 +64,10 @@ void muse_ui_image_hide(void);
 /* Watcher camera mode: shows an on-screen shutter hint over the live image. */
 void muse_ui_camera_hint(bool visible);
 
-/* Bench testing, from any task: streams the screen over USB serial. */
+/* Bench testing, from any task: streams the screen over USB serial (SNAP OFF
+ * where the build leaves it out: CONFIG_LV_USE_SNAPSHOT). */
 void muse_ui_request_snapshot(void);
-#if CONFIG_LV_USE_SNAPSHOT
+#if CONFIG_MUSE_BENCH
 typedef enum {
     MUSE_UI_PAGE_FACE,
     MUSE_UI_PAGE_SETTINGS,
@@ -77,4 +78,22 @@ typedef enum {
 void muse_ui_bench_page(muse_ui_page_t page);
 /* Display-only demo name for privacy-safe screenshots; no provisioning changes. */
 void muse_ui_bench_demo(bool enabled);
+
+/*
+ * Bench-only, from any task: a scripted touch, played through LVGL's input
+ * read so the widgets see presses, clicks, scrolls and gestures as from a
+ * finger. A tap and a long press hold the point (x, y) for 80 and 900 ms; a
+ * swipe ignores x and y and drags along y=233 between x=406 and x=60 in 9
+ * steps over about 240 ms, a left swipe from the right. While a script plays
+ * the real touch isn't read. A request made while one plays waits for it, and
+ * the latest of several waits. LVGL doesn't read its input while the screen
+ * sleeps on battery: wake it first. No effect on boards without a touch screen.
+ */
+typedef enum {
+    MUSE_UI_TOUCH_TAP,
+    MUSE_UI_TOUCH_LONG,
+    MUSE_UI_TOUCH_SWIPE_LEFT,
+    MUSE_UI_TOUCH_SWIPE_RIGHT,
+} muse_ui_touch_t;
+void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y);
 #endif

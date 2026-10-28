@@ -20,6 +20,7 @@
 # code, plus a buffer the size of the screen (RGB565) while taking one.
 CONFIG_LV_USE_SNAPSHOT=y
 
-# Memory report (">mem" over the serial console): one line with the free
-# internal RAM, DMA and PSRAM and the LVGL task's stack headroom.
+# The bench's console commands, which don't need screenshots: ">mem" (one line
+# with the free internal RAM, DMA and PSRAM and the LVGL task's stack headroom),
+# ">ui=" (the touch page) and injected touch (">tap", ">longpress", ">swipe").
 CONFIG_MUSE_BENCH=y

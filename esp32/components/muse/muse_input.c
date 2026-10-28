@@ -860,8 +860,7 @@ static bool console_command(char *line, bool whole)
         fflush(stdout);
         return true;
     }
-#endif
-#if LV_USE_SNAPSHOT
+    /* The touch page ("ui=settings", "ui=face", "ui=clock") and a display-only demo name, for screenshots. */
     if (!strcmp(line, "ui.demo=1") || !strcmp(line, "ui.demo=0")) {
         muse_ui_bench_demo(!strcmp(line, "ui.demo=1"));
         return true;
@@ -870,6 +869,33 @@ static bool console_command(char *line, bool whole)
         muse_ui_bench_page(!strcmp(line, "ui=settings") ? MUSE_UI_PAGE_SETTINGS
                            : !strcmp(line, "ui=clock")  ? MUSE_UI_PAGE_CLOCK
                                                         : MUSE_UI_PAGE_FACE);
+        return true;
+    }
+    /* Touch, played through LVGL's input (muse_ui.h): "tap X Y" presses that point for 80 ms, "longpress X Y" for
+     * 900 ms, and "swipe left" / "swipe right" drags across the screen in about 240 ms. Wake the screen first
+     * ('w'). Nothing is printed unless the line is wrong. */
+    bool tap = !strncmp(line, "tap ", 4), hold = !strncmp(line, "longpress ", 10), swipe = !strncmp(line, "swipe ", 6);
+    if (tap || hold || swipe) {
+        muse_ui_touch_t kind = tap ? MUSE_UI_TOUCH_TAP : MUSE_UI_TOUCH_LONG;
+        long x = 0, y = 0;
+        bool ok;
+        if (swipe) {
+            bool left = !strcmp(line + 6, "left");
+            kind = left ? MUSE_UI_TOUCH_SWIPE_LEFT : MUSE_UI_TOUCH_SWIPE_RIGHT;
+            ok = left || !strcmp(line + 6, "right");
+        } else {
+            char *end;
+            x = strtol(line + (tap ? 4 : 10), &end, 10);
+            y = *end == ' ' ? strtol(end, &end, 10) : -1;
+            ok = !*end && x >= 0 && y >= 0 && x < muse_board->width && y < muse_board->height;
+        }
+        if (ok) {
+            muse_ui_bench_touch(kind, (int)x, (int)y);
+        } else {
+            printf("@touch.error usage: tap X Y | longpress X Y (X 0..%d, Y 0..%d) | swipe left|right\n",
+                   muse_board->width - 1, muse_board->height - 1);
+            fflush(stdout);
+        }
         return true;
     }
 #endif
@@ -909,7 +935,9 @@ static bool console_command(char *line, bool whole)
  * "power.reset" starts it over, "nap" sleeps and leaves Wi-Fi at once (as
  * two minutes asleep on battery would; 'w' rejoins), "face=" shows a face
  * (see set_face), and "chat=" sends a typed message to Hatch (see chat_line
- * and tools/muse/chat.py).
+ * and tools/muse/chat.py). A bench build (CONFIG_MUSE_BENCH) adds "mem", "ui="
+ * and the touch commands "tap", "longpress" and "swipe", which tools/muse/snap.py
+ * sends before it takes a screenshot.
  */
 static void serial_task(void *arg)
 {

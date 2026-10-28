@@ -54,6 +54,14 @@ esp_err_t muse_apps_start(void);
  */
 bool muse_apps_console(const char *line);
 
+/*
+ * Launches the installed app id, from any task, the LVGL task included: it queues app.launch's job on the I/O worker
+ * (apps_io.h) and returns at once. The job loads the store's copy and runs it through apps_task_run, in front or behind,
+ * with no settle and nothing printed: a failure is one log line ("launch <id>: <why>"). False, with nothing queued,
+ * when the job can't be queued: one log line says why. apps_task_launch calls it for an app that isn't running.
+ */
+bool muse_apps_launch(const char *id, bool front);
+
 /* Makes the app layer on screen (apps_lv_build) and takes its touches and swipes. In build_overlays(), after the
  * page dots and before the downloaded image, under the display lock and before the frame timer exists. */
 void muse_apps_ui_build(lv_obj_t *screen);

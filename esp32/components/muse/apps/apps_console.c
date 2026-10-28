@@ -24,6 +24,7 @@
 #include "apps_port.h"
 #include "apps_task.h"
 #include "cJSON.h"
+#include "esp_log.h"
 #include "muse_apps.h"
 
 /*
@@ -35,7 +36,9 @@
  * Who owns what. The stage (the files put for one id, in PSRAM) is the serial task's, until a commit moves it into its
  * job; the job, on the I/O worker, reads the files out of it (taking each one's bytes), runs the install pipeline and
  * frees what is left. The RAM store is the worker's (apps_install.h), so a launch and the list are jobs too. Stop,
- * status and send wait on the serial task, each bounded by the app task's own waits (APPS_TASK_WAIT_MS).
+ * status and send wait on the serial task, each bounded by the app task's own waits (APPS_TASK_WAIT_MS). The launch
+ * job is also muse_apps_launch's, for any task (the launcher's pick comes through apps_task_launch): that one runs the
+ * app where it was asked to, with no settle, and prints nothing.
  *
  * Replies. Every one is one line: "@app.ack <path> <seq>", "@app {...}" or "@app.err {...}", the JSON made by cJSON
  * (texts travel escaped, tracebacks included) and written with one printf, so that no log line splits it, then
@@ -66,10 +69,13 @@ typedef struct {
 /* A job for the I/O worker: a commit's (which has the stage) or a launch's. */
 typedef struct {
     char id[APPS_ID_MAX + 1];
-    bool run;
+    bool run;        /* a commit's "run" */
+    bool front;      /* a launch's place */
+    bool print;      /* a launch the console asked for: it settles, and its result is printed */
     stage_t *stage;
 } job_t;
 
+static const char *TAG = "muse_apps";
 static stage_t *s_stage;  /* the serial task's */
 
 /* ---- Replies ---- */
@@ -460,12 +466,17 @@ static bool install_run(apps_pkg_t *p, int settle_ms, apps_status_t *st, char *e
     return apps_task_run(p, true, settle_ms, st, err, n);  /* C2: an install with a run fronts the app */
 }
 
+static bool run_behind(apps_pkg_t *p, int settle_ms, apps_status_t *st, char *err, size_t n) {
+    return apps_task_run(p, false, settle_ms, st, err, n);
+}
+
 static const char *ram_storage(void) {
     return "ram";
 }
 
-/* Until Task 20's store, a package stays in PSRAM (apps_install.h's RAM store). */
+/* Until Task 20's store, a package stays in PSRAM (apps_install.h's RAM store). A launch behind runs with BEHIND_OPS. */
 static const apps_install_ops_t USB_OPS = {apps_task_compile, apps_ram_commit, install_run, ram_storage};
+static const apps_install_ops_t BEHIND_OPS = {apps_task_compile, apps_ram_commit, run_behind, ram_storage};
 
 static void commit_job(void *arg) {
     job_t *job = arg;
@@ -522,19 +533,45 @@ static void commit(const char *args) {
     }
 }
 
+/* The store's copy of job->id, run through apps_task_run (R13.5). The console's settles and prints its result; anyone
+ * else's (muse_apps_launch) runs with no settle and says only a failure, in one log line. */
 static void launch_job(void *arg) {
     job_t *job = arg;
+    const apps_install_ops_t *ops = job->front ? &USB_OPS : &BEHIND_OPS;
     apps_pkg_t *pkg = apps_port_realloc(NULL, sizeof *pkg);
     if (pkg != NULL && apps_ram_load(job->id, pkg)) {
-        cJSON *r = apps_install_launch(pkg, &USB_OPS);  /* it takes the copy: the app task frees it */
-        print_result("launch", job->id, r);
-        cJSON_Delete(r);
+        if (job->print) {
+            cJSON *r = apps_install_launch(pkg, ops);  /* it takes the copy: the app task frees it */
+            print_result("launch", job->id, r);
+            cJSON_Delete(r);
+        } else {
+            char err[128];
+            if (!ops->run(pkg, 0, NULL, err, sizeof err)) {  /* it takes the copy too */
+                ESP_LOGW(TAG, "launch %s: %s", job->id, err);
+            }
+        }
     } else {
         apps_port_free(pkg);
-        fail("launch", job->id, NULL,
-             apps_ram_has(job->id) ? "out of memory: no room to load the app" : "no such app on the gadget");
+        const char *why = apps_ram_has(job->id) ? "out of memory: no room to load the app" : "no such app on the gadget";
+        if (job->print) {
+            fail("launch", job->id, NULL, "%s", why);
+        } else {
+            ESP_LOGW(TAG, "launch %s: %s", job->id, why);
+        }
     }
     apps_port_free(job);
+}
+
+/* A launch job for id, or NULL when there is no memory for it. */
+static job_t *new_launch(const char *id, bool front, bool print) {
+    job_t *job = apps_port_realloc(NULL, sizeof *job);
+    if (job != NULL) {
+        memset(job, 0, sizeof *job);
+        snprintf(job->id, sizeof job->id, "%s", id);
+        job->front = front;
+        job->print = print;
+    }
+    return job;
 }
 
 static void launch(const char *args) {
@@ -548,17 +585,30 @@ static void launch(const char *args) {
     if (!take_id("launch", id_w, NULL, id)) {
         return;
     }
-    job_t *job = apps_port_realloc(NULL, sizeof *job);
+    job_t *job = new_launch(id, true, true);
     if (job == NULL) {
         fail("launch", id, NULL, "out of memory: no room for the launch");
-        return;
-    }
-    memset(job, 0, sizeof *job);
-    snprintf(job->id, sizeof job->id, "%s", id);
-    if (!apps_io_submit(launch_job, job)) {
+    } else if (!apps_io_submit(launch_job, job)) {
         apps_port_free(job);
         fail("launch", id, NULL, APPS_IO_REFUSED);
     }
+}
+
+bool muse_apps_launch(const char *id, bool front) {
+    if (id == NULL || !apps_id_valid(id)) {
+        ESP_LOGW(TAG, "launch: not an app id");
+        return false;
+    }
+    job_t *job = new_launch(id, front, false);
+    if (job == NULL) {
+        ESP_LOGW(TAG, "launch %s: out of memory: no room for the launch", id);
+        return false;
+    }
+    if (!apps_io_submit(launch_job, job)) {  /* it says why, in one log line */
+        apps_port_free(job);
+        return false;
+    }
+    return true;
 }
 
 static bool no_args(const char *op, const char *args) {

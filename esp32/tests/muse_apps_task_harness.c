@@ -21,7 +21,8 @@
  * Three threads, as on the gadget: the app task (the fake FreeRTOS of tests/muse_apps_task_fakes.h, made of pthreads
  * here), an LVGL task that runs a frame every few ms (muse_apps_ui_supervise, then muse_apps_ui_tick unless the screen
  * "sleeps"; a paused one runs nothing, as LVGL paused on battery), and the case's own thread, the caller. The I/O
- * worker (apps_io.c, made on demand) is a fourth in the cases that submit jobs. Under the app
+ * worker (apps_io.c, made on demand) is a fourth in the cases that submit jobs; the console's launch job and the RAM
+ * store it loads from (apps_console.c, apps_install.c, with the real cJSON) are real too. Under the app
  * task is the real runtime (apps_rt, apps_ui, apps_vm, Lua); apps_lv is a fake that writes what is done to the screen
  * into one log of events, in the order it happens, and that keeps the image objects a pass makes and draws each from
  * the package's bytes at every frame, before the supervisor (LVGL's refresh may come first in a round of its timers),
@@ -46,6 +47,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "apps_install.h"
 #include "apps_io.h"
 #include "apps_lv.h"
 #include "apps_pkg.h"
@@ -438,6 +440,13 @@ size_t heap_caps_get_free_size(uint32_t caps) {
     return (caps & MALLOC_CAP_INTERNAL) != 0 ? atomic_load(&internal_free) : 4u * 1024 * 1024;
 }
 
+/* And its largest free block (the admission of a new worker, P1): a case can fragment it. */
+static atomic_size_t internal_largest = 200u * 1024;
+
+size_t heap_caps_get_largest_free_block(uint32_t caps) {
+    return (caps & MALLOC_CAP_INTERNAL) != 0 ? atomic_load(&internal_largest) : 4u * 1024 * 1024;
+}
+
 /* ---- The port: the UI lock, the console, the rest ---- */
 
 static pthread_mutex_t ui_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -579,14 +588,14 @@ void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
 }
 
 /* muse_input's console hooks, which muse_apps_start adds the apps' to (tests/test_muse_apps_console.py has the chain
- * and the console itself). */
+ * and the console itself; the real apps_console.c is linked here for its launch job). */
 void muse_input_add_console_hook(bool (*hook)(const char *line)) {
     event("console hook %s", hook == muse_apps_console ? "muse_apps_console" : "?");
 }
 
-bool muse_apps_console(const char *line) {
-    (void)line;
-    return false;
+/* The end of a console reply (apps_port_idf.c's on the gadget). */
+void apps_port_console_flush(void) {
+    fflush(stdout);
 }
 
 /* ---- The fake FreeRTOS: tasks, queues and mutexes on pthreads ---- */
@@ -2868,6 +2877,106 @@ static void io_refuses_when_short(void) {
     atomic_store(&internal_free, 200u * 1024);
 }
 
+/* P1: a new worker's stack, its TCB and APPS_IO_BLOCK_MARGIN must fit in the largest free internal block. With internal
+ * RAM enough in all but no block that big, a job is refused, never runs, and no worker is made. A worker that runs
+ * already needs no new block, so a job for it is taken. */
+static void io_refuses_when_fragmented(void) {
+    const size_t need = APPS_IO_STACK + sizeof(StaticTask_t) + APPS_IO_BLOCK_MARGIN;
+    char want[160];
+    int from = mark();
+    atomic_store(&internal_largest, need - 1);
+    CHECK(!apps_io_submit(io_job, "fragmented"), "refused without a block for the worker");
+    snprintf(want, sizeof want, "log W io: the largest free internal block is %zu bytes, %zu needed: job refused",
+             need - 1, need);
+    WAIT(from, want);
+    CHECK(count_from(from, "task muse_apps_io") == 0, "no worker was made");
+    atomic_store(&internal_largest, need);
+    CHECK(apps_io_submit(io_job, "fits"), "taken with just the block");
+    WAIT(from, "job fits on muse_apps_io");
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    atomic_store(&internal_largest, 1024);
+    CHECK(apps_io_submit(io_job, "behind"), "a job for the worker that runs is taken");
+    atomic_store(&io_hold, false);
+    WAIT(from, "job behind on muse_apps_io");
+    ABSENT(from, "job fragmented");
+    atomic_store(&internal_largest, 200u * 1024);
+}
+
+/* The RAM store is the worker's alone: a case puts a package in it, or takes one out, with a job it waits for. */
+static atomic_bool store_done;
+
+static void store_job(void *arg) {
+    apps_pkg_t *pkg = arg;
+    bool unchanged = false;
+    char err[200];
+    CHECK(apps_ram_commit(pkg, &unchanged, err, sizeof err), "the store: %s", err);
+    apps_pkg_free(pkg, apps_port_free);
+    apps_port_free(pkg);
+    atomic_store(&store_done, true);
+}
+
+static void unstore_job(void *arg) {
+    CHECK(apps_ram_remove((const char *)arg), "%s wasn't in the store", (const char *)arg);
+    atomic_store(&store_done, true);
+}
+
+static void on_worker(void (*job)(void *), void *arg) {
+    atomic_store(&store_done, false);
+    CHECK(apps_io_submit(job, arg), "the store's job wasn't taken");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&store_done);) {
+        CHECK(real_ms() < until, "the store's job never ran");
+        sleep_ms(1);
+    }
+}
+
+/* busy installed and run, then stopped: the resident app, in the store and not running. */
+static void stopped_resident(void) {
+    char err[200];
+    on_worker(store_job, make_pkg("busy", "Busy", BUSY, 1));
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print busy show");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    WAIT(0, "log I stop busy: stopped");
+}
+
+/* P2: the launcher lists the resident app after it stopped, and the pick runs it again in front. apps_task_launch
+ * hands an app that isn't running to the I/O worker (muse_apps_launch), whose job loads the store's copy and runs it
+ * through apps_task_run: the launch's post (no wait) comes before that run's (a caller's, in 10 ms tries). */
+static void a_pick_runs_the_stopped_resident_app(void) {
+    stopped_resident();
+    int from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 1 busy:Busy");
+    int picked = mark();
+    ON_LVGL(pick_job, "busy");
+    WAIT(picked, "log I launch busy (256 KB)");
+    WAIT(picked, "front 1");
+    WAIT(picked, "print busy show");
+    ORDERED(picked, "queue RUN wait 0", "queue RUN wait 10");
+    char err[200];
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    on_worker(unstore_job, "busy");
+}
+
+/* P2: a launch the I/O worker can't take is dropped with one log line (apps_io_submit's), and nothing runs. */
+static void a_refused_launch_logs_once(void) {
+    stopped_resident();
+    int from = mark();
+    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    launch("busy", true);
+    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
+    WAIT_FRAMES(10);
+    CHECK(count_from(from, "log W") == 1, "one log line for the refused launch, not %d", count_from(from, "log W"));
+    ABSENT(from, "log I launch busy");
+    atomic_store(&internal_free, 200u * 1024);
+    on_worker(unstore_job, "busy");
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -2912,6 +3021,9 @@ int main(int argc, char **argv) {
         {"a_message_after_its_caller_gave_up", a_message_after_its_caller_gave_up},
         {"io_runs_jobs_in_order", io_runs_jobs_in_order},
         {"io_refuses_when_short", io_refuses_when_short},
+        {"io_refuses_when_fragmented", io_refuses_when_fragmented},
+        {"a_pick_runs_the_stopped_resident_app", a_pick_runs_the_stopped_resident_app},
+        {"a_refused_launch_logs_once", a_refused_launch_logs_once},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

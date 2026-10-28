@@ -15,10 +15,12 @@
 """apps_task, the app task of Muse apps: its services, its supervisor and the order in which an app ends.
 
 tests/muse_apps_task_harness.c runs the real apps_task.c over the real runtime (apps_rt, apps_ui, apps_vm and Lua),
-and the real I/O worker (apps_io.c), with the app task, an LVGL task, the worker and the caller as threads: the fake FreeRTOS of tests/muse_apps_task_fakes.h is made of
-pthreads there. Its FreeRTOS and ESP-IDF headers are staged as one line each that includes the fakes, as
-test_muse_apps_lv.py stages apps_lv.c's. apps_lv is a fake that logs what is done to the screen and draws every image
-object from the package's bytes each frame, so a package freed before the layer's reset is an AddressSanitizer report.
+the real I/O worker (apps_io.c), and the console's launch job and the RAM store (apps_console.c, apps_install.c, with
+the real cJSON), with the app task, an LVGL task, the worker and the caller as threads: the fake FreeRTOS of
+tests/muse_apps_task_fakes.h is made of pthreads there. Its FreeRTOS and ESP-IDF headers are staged as one line each
+that includes the fakes, as test_muse_apps_lv.py stages apps_lv.c's. apps_lv is a fake that logs what is done to the
+screen and draws every image object from the package's bytes each frame, so a package freed before the layer's reset is
+an AddressSanitizer report.
 What these tests can't show is the board's own: PSRAM, the real LVGL and its timers, the USB console and the stack the
 app task really uses; the board check covers the boot, the screens and the memory.
 """
@@ -37,7 +39,8 @@ APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_task_harness.c"
 SOURCES = [HARNESS, APPS / "apps_task.c", APPS / "apps_io.c", APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c",
-           APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c"]
+           APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_console.c",
+           APPS / "apps_install.c"]
 
 # What apps_task.c and muse_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one is a line that includes the fakes.
 FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/idf_additions.h", "freertos/queue.h", "freertos/semphr.h",
@@ -61,7 +64,8 @@ class AppTaskTest(unittest.TestCase):
         cls.addClassCleanup(tmp.cleanup)
         stage = stage_fakes(Path(tmp.name) / "fake_headers")
         cls.harness = apps_host.build("muse_apps_task_harness", [*SOURCES, *apps_host.lua_sources()], tmp.name,
-                                      include_dirs=[apps_host.LUA_SRC, APPS, MUSE, stage, TESTS])
+                                      include_dirs=[apps_host.LUA_SRC, APPS, MUSE, stage, TESTS, apps_host.CJSON_DIR],
+                                      objects=[apps_host.cjson_object()])
 
     def run_case(self, case, timeout=120):
         try:
@@ -197,6 +201,17 @@ class AppTaskTest(unittest.TestCase):
 
     def test_the_io_worker_refuses_when_short(self):  # apps_io's admission
         self.run_case("io_refuses_when_short")
+
+    # ---- Task 13's pre-review fix ----
+
+    def test_the_io_worker_refuses_a_fragmented_heap(self):  # P1: the largest free internal block
+        self.run_case("io_refuses_when_fragmented")
+
+    def test_a_pick_runs_the_stopped_resident_app(self):  # P2: the launcher lists it; the worker runs it
+        self.run_case("a_pick_runs_the_stopped_resident_app")
+
+    def test_a_refused_launch_logs_once(self):  # P2
+        self.run_case("a_refused_launch_logs_once")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

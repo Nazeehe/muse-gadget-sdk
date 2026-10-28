@@ -212,6 +212,9 @@ class Console(unittest.TestCase):
         # sends the packet that ends it; every reply calls it after its newline (every case checks this too).
         self.run_case("replies_end_with_a_push")
 
+    def test_a_launch_by_id_prints_nothing(self):  # P2: muse_apps_launch, app.launch's job with a place
+        self.run_case("launch_by_id_prints_nothing")
+
     def test_status_prints_the_record(self):  # E13: instructions; C3's trim; "ui_truncated"
         parsed = self.run_case("status_prints_the_record")
         status = [r[1] for r in parsed if r[0] == "result" and r[1]["op"] == "status"]

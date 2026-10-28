@@ -244,13 +244,18 @@ void apps_port_ui_unlock(void) {}
 
 /* apps_port_sha256 is tools/muse/apphost/sha256.c's. */
 
+/* The console's log lines go to stderr; the last one and their count are kept for the cases. */
+static char last_log[300];
+static int logs;
+
 void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "%c %s: ", level, tag);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    int n = snprintf(last_log, sizeof last_log, "%c %s: ", level, tag);
+    vsnprintf(last_log + n, sizeof last_log - (size_t)n, fmt, ap);
     va_end(ap);
+    fprintf(stderr, "%s\n", last_log);
+    logs++;
 }
 
 /* cJSON's allocations, counted. */
@@ -886,6 +891,46 @@ static void stop_reports_the_task(void) {
     CHECK(stops == 2, "stops: %d", stops);
 }
 
+/* P2: muse_apps_launch, from any task: app.launch's job with its place and nothing printed. The job runs the store's copy
+ * through apps_task_run, in front or behind, with no settle; an id the store doesn't have is one log line. A refused
+ * submit adds no line of its own (apps_io_submit logs why, once). */
+static void launch_by_id_prints_nothing(void) {
+    install_hello();
+    int before = runs;
+    CHECK(muse_apps_launch("hello", false), "queued");
+    EXPECT("");
+    run_jobs();
+    EXPECT("");
+    CHECK(runs == before + 1 && !run_front && run_settle == 0 && strcmp(run_id, "hello") == 0,
+          "run behind with no settle: runs %d front %d settle %d id %s", runs - before, run_front, run_settle, run_id);
+    CHECK(muse_apps_launch("hello", true), "queued");
+    run_jobs();
+    EXPECT("");
+    CHECK(runs == before + 2 && run_front, "run in front: runs %d front %d", runs - before, run_front);
+    int logged = logs;
+    CHECK(muse_apps_launch("nosuch", true), "queued");
+    run_jobs();
+    EXPECT("");
+    CHECK(runs == before + 2, "nothing ran");
+    CHECK(logs == logged + 1 && strcmp(last_log, "W muse_apps: launch nosuch: no such app on the gadget") == 0,
+          "one log line: '%s'", last_log);
+    run_ok = false;
+    snprintf(run_err, sizeof run_err, "crashed in start(): main.lua:2: boom");
+    CHECK(muse_apps_launch("hello", true), "queued");
+    run_jobs();
+    EXPECT("");
+    CHECK(strcmp(last_log, "W muse_apps: launch hello: crashed in start(): main.lua:2: boom") == 0, "'%s'", last_log);
+    run_ok = true;
+    logged = logs;
+    submit_refuses = true;
+    CHECK(!muse_apps_launch("hello", true), "refused");
+    submit_refuses = false;
+    CHECK(!muse_apps_launch("Not An Id", true), "not an id");
+    CHECK(runs == before + 3 && logs == logged + 1, "a refused submit logs nothing here; a bad id logs once (%d)",
+          logs - logged);
+    EXPECT("");
+}
+
 /* Each kind of reply goes out to the host as it ends (apps_port_console_flush after its newline): an acknowledgement,
  * a refusal, a result from the serial task, stop's own line and a result from the I/O worker. take_output checks that
  * nothing was printed after the last flush, after every line of every case. */
@@ -1159,6 +1204,7 @@ int main(int argc, char **argv) {
         {"launch_runs_an_installed_app", launch_runs_an_installed_app},
         {"stop_reports_the_task", stop_reports_the_task},
         {"replies_end_with_a_push", replies_end_with_a_push},
+        {"launch_by_id_prints_nothing", launch_by_id_prints_nothing},
         {"status_prints_the_record", status_prints_the_record},
         {"list_shows_installed_apps", list_shows_installed_apps},
         {"send_returns_the_reply", send_returns_the_reply},

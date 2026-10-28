@@ -35,6 +35,10 @@
 
 static const char *TAG = "muse_apps";
 
+/* What a new worker needs in one free internal block: its stack, its TCB (another block, which this one can hold too)
+ * and the margin, so that making it never takes the last block that big. */
+#define BLOCK_NEEDED (APPS_IO_STACK + sizeof(StaticTask_t) + APPS_IO_BLOCK_MARGIN)
+
 typedef struct {
     void (*fn)(void *arg);
     void *arg;
@@ -79,14 +83,16 @@ bool apps_io_submit(void (*fn)(void *arg), void *arg) {
         ESP_LOGW(TAG, "io: not started: job refused");
         return false;
     }
-    enum { TAKEN, SHORT, FULL, NO_TASK } why = TAKEN;
+    enum { TAKEN, SHORT, FULL, FRAGMENTED, NO_TASK } why = TAKEN;
     job_t job = {fn, arg};
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL), largest = 0;
     if (free_internal < APPS_IO_STACK + APPS_IO_HEADROOM) {
         why = SHORT;
     } else if (uxQueueMessagesWaiting(s_jobs) >= APPS_IO_JOBS) {
         why = FULL;
+    } else if (s_worker == NULL && (largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)) < BLOCK_NEEDED) {
+        why = FRAGMENTED;  /* a worker that runs needs no new block */
     } else if (s_worker == NULL &&
                xTaskCreatePinnedToCore(worker, "muse_apps_io", APPS_IO_STACK, NULL, APPS_IO_PRIORITY, &s_worker,
                                        tskNO_AFFINITY) != pdPASS) {
@@ -105,6 +111,10 @@ bool apps_io_submit(void (*fn)(void *arg), void *arg) {
         return false;
     case FULL:
         ESP_LOGW(TAG, "io: %d jobs wait already: job refused", APPS_IO_JOBS);
+        return false;
+    case FRAGMENTED:
+        ESP_LOGW(TAG, "io: the largest free internal block is %u bytes, %u needed: job refused", (unsigned)largest,
+                 (unsigned)BLOCK_NEEDED);
         return false;
     default:
         ESP_LOGW(TAG, "io: no memory for the worker: job refused");

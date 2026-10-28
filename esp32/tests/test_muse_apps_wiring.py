@@ -577,6 +577,10 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertHasText(port, "void apps_port_console_flush(void) {", "apps_port_idf.c")
         flush = function_source(port, "void apps_port_console_flush(void)")
         self.assertRegex(flush, r"fflush\(stdout\);\s*\(void\)fsync\(fileno\(stdout\)\);")
+        # The pre-review fix's P3: an echoed log line ends the same way, right after its printf.
+        echo = function_source(port, "void apps_port_log(const char *app_id, const char *line)")
+        self.assertRegex(echo, r'printf\("%s@app\.log %s %s\\n", note, app_id, line\);\s*apps_port_console_flush\(\);')
+        self.assertNotIn("fflush(stdout)", echo)
 
 
 if __name__ == "__main__":

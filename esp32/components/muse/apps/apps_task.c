@@ -160,7 +160,8 @@ typedef struct {
     uint32_t dropped_base;     /* dropped when it was launched */
     /* Under s_names_lock. */
     struct {
-        bool resident;                      /* the app runs: the launcher lists it */
+        bool resident;                      /* the launcher lists the app: it runs, or it was the last to run and
+                                             * the store keeps it (false while a new one loads) */
         char id[APPS_ID_MAX + 1], name[25];
         bool card;                          /* a crash card to show, once reset card_after has run */
         uint32_t card_after;
@@ -690,7 +691,7 @@ static void end_app(end_t how) {
     }
     ESP_LOGI(TAG, "stop %s: %s, peak %u KB, stack %u free", s_rec->st.id, END_NAMES[how], (unsigned)s_rec->st.peak_kb,
              (unsigned)s_rec->st.stack_free);
-    set_resident(false);
+    set_resident(true);  /* stopped or crashed, it stays in the store: the launcher lists it */
     apps_rt_free(T.rt);
     T.rt = NULL;
     uint32_t reset;
@@ -761,7 +762,7 @@ static void begin_app(apps_pkg_t *pkg) {
         rec_give();
     }
     if (names_take(LOCK_MS)) {
-        s_rec->names.resident = false;
+        s_rec->names.resident = false;  /* listed once it is up, or once it has ended */
         s_rec->names.card = false;  /* an earlier app's crash card not shown yet would come up over this one */
         put_text(s_rec->names.id, sizeof s_rec->names.id, m->id);
         put_text(s_rec->names.name, sizeof s_rec->names.name, m->name[0] != '\0' ? m->name : m->id);
@@ -782,6 +783,7 @@ static void no_app(const char *err) {
     ESP_LOGW(TAG, "launch %s: no app: %s", T.pkg->manifest.id, err);
     free_pkg(T.pkg);
     T.pkg = NULL;
+    set_resident(true);  /* the store keeps it: another launch may find the room */
     complete(T.pending, false, err);
     T.pending = NULL;
     request_front(false);
@@ -916,15 +918,15 @@ static bool app_runs(uint32_t gen) {
     return T.rt != NULL && !T.abandoned && gen == T.gen && apps_rt_state(T.rt) == APPS_STATE_RUNNING;
 }
 
-/* The launcher's pick: the app that runs is the one there is to launch here (the console's app.launch runs a stored app
- * through the I/O worker, and Task 20's store adds stored apps here). */
+/* The launcher's pick, or any apps_task_launch: the app that runs is fronted here; any other goes to the I/O worker
+ * (muse_apps_launch), whose job runs the store's copy through apps_task_run. A refused launch is logged there, once. */
 static void launch(const req_t *r) {
     if (app_runs(T.gen) && strcmp(T.pkg->manifest.id, r->id) == 0) {
         if (r->front) {
             request_front(true);
         }
     } else {
-        ESP_LOGW(TAG, "launch %s: no such app on the gadget", r->id);
+        (void)muse_apps_launch(r->id, r->front);
     }
 }
 

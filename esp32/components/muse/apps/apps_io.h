@@ -33,11 +33,12 @@
 
 #include <stdbool.h>
 
-#define APPS_IO_STACK 6144     /* bytes, internal RAM */
-#define APPS_IO_PRIORITY 3     /* over the app task (2), under the console (5) and the screen's tasks */
-#define APPS_IO_IDLE_MS 2000   /* the worker goes after this long without a job */
-#define APPS_IO_HEADROOM 16384 /* internal RAM a submit leaves free besides the worker's stack */
-#define APPS_IO_JOBS 8         /* jobs that can wait at once */
+#define APPS_IO_STACK 6144        /* bytes, internal RAM */
+#define APPS_IO_PRIORITY 3        /* over the app task (2), under the console (5) and the screen's tasks */
+#define APPS_IO_IDLE_MS 2000      /* the worker goes after this long without a job */
+#define APPS_IO_HEADROOM 16384    /* internal RAM a submit leaves free besides the worker's stack */
+#define APPS_IO_BLOCK_MARGIN 1024 /* what the largest free internal block keeps besides a new worker's stack and TCB */
+#define APPS_IO_JOBS 8            /* jobs that can wait at once */
 
 /* What a caller says when apps_io_submit refuses: internal RAM dips while Wi-Fi joins, and that passes. */
 #define APPS_IO_REFUSED "the gadget is short of memory right now; try again in a few seconds"
@@ -51,7 +52,8 @@ void apps_io_init(void);
  * never waits for another task's progress. True once the job is queued: fn(arg) then runs exactly once, on the worker.
  * False, with nothing queued (fn never runs, and arg stays the caller's), when internal RAM is short
  * (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < APPS_IO_STACK + APPS_IO_HEADROOM), when APPS_IO_JOBS jobs are
- * waiting already, or when the worker can't be made; each says why in one W log line. Callers try again later: a store
- * flush at its next tick, an install by saying APPS_IO_REFUSED.
+ * waiting already, when there is no worker and the largest free internal block can't hold a new one's stack, its TCB
+ * and APPS_IO_BLOCK_MARGIN (heap_caps_get_largest_free_block), or when the worker can't be made; each says why in one
+ * W log line. Callers try again later: a store flush at its next tick, an install by saying APPS_IO_REFUSED.
  */
 bool apps_io_submit(void (*fn)(void *arg), void *arg);

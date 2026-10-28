@@ -148,10 +148,11 @@ bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st
 
 /*
  * Posts a launch of the app id and returns: it never waits, for the answer or for a frame, so the LVGL task (the
- * launcher's pick) can call it. The app task fronts the resident app when it is that app (front) and leaves it
- * where it is otherwise (an app that isn't loaded logs "launch <id>: no such app on the gadget"; the console's
- * app.launch runs a stored app through the I/O worker instead, and Task 20's store adds stored apps here). A full
- * queue drops it, with a log line.
+ * launcher's pick) can call it. The app task fronts the app that runs when it is that app (front) and leaves it where
+ * it is otherwise. Any other id goes to muse_apps_launch (muse_apps.h): the I/O worker loads the store's copy and runs
+ * it through apps_task_run, in front or behind; a refusal, or an id the store doesn't have, is one log line. A full
+ * queue drops the launch, with a log line. The launcher lists the resident app, the last one run, whether it runs or
+ * not, since the store keeps it; Task 17's alarms and Task 20's flash store build on this.
  */
 void apps_task_launch(const char *id, bool front);
 

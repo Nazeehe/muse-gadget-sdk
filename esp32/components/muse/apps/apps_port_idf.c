@@ -112,6 +112,12 @@ void apps_port_free(void *ptr) {
  * being the app of the last line not echoed. The log ring and the status keep every line. The app task is the only
  * caller, so the bucket and the count are its own. One printf is one write: newlib locks stdout for it, so another
  * task's line can't land inside the note or the line.
+ *
+ * An echoed line ends with apps_port_console_flush, as a reply does, so the host doesn't keep one that lands on a
+ * 64-byte USB packet. Its cost stays bounded: the app task now waits for the line to leave the UART, which the FIFO used
+ * to hide for its last 128 bytes (about 11 ms), and for the host to take the last USB packet (1-2 ms with a reading
+ * host, at most 50 ms once when the host stops reading). The cap allows at most five long lines a second, and its
+ * 1,024 bytes take about 89 ms to send in all.
  */
 #define ECHO_EOL_BYTES 2  /* the console ends a line with CRLF (CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF) */
 
@@ -133,7 +139,7 @@ void apps_port_log(const char *app_id, const char *line) {
         return;
     }
     printf("%s@app.log %s %s\n", note, app_id, line);
-    fflush(stdout);
+    apps_port_console_flush();
     s_unechoed = 0;
 }
 

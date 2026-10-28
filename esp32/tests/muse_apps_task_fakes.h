@@ -46,6 +46,7 @@ void *heap_caps_malloc(size_t size, uint32_t caps);
 void *heap_caps_calloc(size_t n, size_t size, uint32_t caps);
 void *heap_caps_realloc(void *ptr, size_t size, uint32_t caps);  /* apps_port_idf.c's (tests/muse_apps_port_harness.c) */
 void heap_caps_free(void *ptr);
+size_t heap_caps_get_largest_free_block(uint32_t caps);  /* apps_io_submit's admission */
 
 /* ---- FreeRTOS ---- */
 
@@ -60,6 +61,10 @@ typedef struct fake_mutex *SemaphoreHandle_t;
 typedef struct {
     _Alignas(16) unsigned char opaque[512];
 } StaticSemaphore_t;
+/* A task's TCB, as FreeRTOS sizes it (apps_io.c counts it in the worker's admission); about this on the S3. */
+typedef struct {
+    _Alignas(8) unsigned char opaque[352];
+} StaticTask_t;
 
 #define pdFALSE 0
 #define pdTRUE 1

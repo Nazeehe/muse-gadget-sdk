@@ -47,13 +47,15 @@ void apps_port_free(void *ptr);  /* NULL is ignored. Any task. */
  * "@app.log <id> <line>" on the console, at most 1,024 bytes of them a second (apps_echo.h); a line past
  * that isn't printed, and the next printed one comes after "@app.log <id> (<N> lines not echoed)". line
  * is one line of valid UTF-8, at most 200 bytes, with no newline and no control byte but tab,
- * NUL-terminated. It returns promptly: the app task is waiting on it, with its CPU budget running. */
+ * NUL-terminated. It returns promptly: the app task is waiting on it, with its CPU budget running. The device ends
+ * an echoed line with apps_port_console_flush, whose wait the cap bounds. */
 void apps_port_log(const char *app_id, const char *line);
 
-/* Ends a console line printed with printf (a reply of the ">app.*" protocol): flushes stdout, then syncs it. On the
- * USB-Serial-JTAG console the sync sends the zero-length packet that ends a line landing on a 64-byte packet boundary;
- * without it the host keeps such a line until the console prints something else. Only the console (apps_console.c)
- * calls it, from the serial task and the I/O worker, so the host runner has none. */
+/* Ends a console line printed with printf (a reply of the ">app.*" protocol, an echoed log line): flushes stdout, then
+ * syncs it. On the USB-Serial-JTAG console the sync sends the zero-length packet that ends a line landing on a 64-byte
+ * packet boundary; without it the host keeps such a line until the console prints something else. The console
+ * (apps_console.c) calls it from the serial task and the I/O worker, and the device's apps_port_log from the app task;
+ * the host runner has none. */
 void apps_port_console_flush(void);
 
 /* Makes what the port needs before anything here is used: the firmware's UI lock (a static mutex). The app task's

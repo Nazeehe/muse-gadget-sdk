@@ -1787,9 +1787,10 @@ static uint32_t snap_crc32(uint32_t crc, const uint8_t *p, size_t n)
 }
 
 /* The stream holds the console (muse_console.h) from before its first byte until its last has left the chip, so a line
- * another task prints meanwhile waits and follows END. Its own waits are bounded: for each row, which the console takes
- * at once unless the host has stopped reading, and then the stream stops; and for the last bytes to leave. A host that
- * stops reading mid-stream costs the other tasks one wait of SNAP_WRITE_MS, and then the console is theirs again. */
+ * another task prints meanwhile waits and follows END (a UART console holds nothing: its stream is too slow for every
+ * task to wait for it). Its own waits are bounded: for each row, which the console takes at once unless the host has
+ * stopped reading, and then the stream stops; and for the last bytes to leave. A host that stops reading mid-stream
+ * costs the other tasks one wait of SNAP_WRITE_MS, and then the console is theirs again. */
 #define SNAP_WRITE_MS 2000
 #define SNAP_DRAIN_MS 2000
 
@@ -1805,7 +1806,8 @@ static bool snap_write(const void *data, size_t n)
  * snap.py can tell a capture a log line broke into from a good one. BEGIN and
  * END each start with a newline, so each is a line of its own whatever the log
  * wrote just before it: snap.py reads them at column 0 only. The console is
- * held for the stream, so a log line comes out after END, not inside a row. */
+ * held for the stream (a USB one: see muse_console.h), so a log line comes out
+ * after END, not inside a row. */
 static void send_snapshot(void)
 {
 #if LV_USE_SNAPSHOT

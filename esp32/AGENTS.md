@@ -181,9 +181,11 @@ since LVGL doesn't read its input while the screen sleeps on battery, and waits
 for the script to finish before the picture (`snap.capture()` does both for
 every caller). Each screenshot ends with a CRC-32 that `snap.py` checks, retaking
 a capture a log line broke into. The firmware holds the console while it streams
-one, so the log lines an app or the system prints meanwhile come out after END and
-can't land inside it; it stops, and lets the console go, if the host takes nothing
-for 2 s. Or run `idf.py` directly:
+one over USB, so the log lines an app or the system prints meanwhile come out after
+END and can't land inside it; it stops, and lets the console go, if the host takes
+nothing for 2 s. A UART console (the Watcher's) holds nothing, since its stream takes
+about 40 s and no task could log for that long: the log can come between its rows,
+and a capture it broke into is retaken. Or run `idf.py` directly:
 
 ```sh
 idf.py -B build-muse-aipi -DIDF_TARGET=esp32s3 \

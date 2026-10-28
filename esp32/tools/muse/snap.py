@@ -30,9 +30,11 @@ script has run and 0.6 s more have passed. --settle S sets that wait, in seconds
 command (the others take 0.35 s).
 Screenshots are off by default; build and flash with MUSE_BENCH=1 tools/muse/board.sh.
 Each one ends with a CRC-32 of its pixels, and a capture that doesn't match is retaken
-(three tries). The firmware holds the console while it streams one, so what the log prints
-meanwhile comes after the END line, and the CRC catches what still gets in. With
-reset_wait_s the board is reset first and given that long to boot.
+(three tries). The firmware holds the console while it streams one over USB, so what the log
+prints meanwhile comes after the END line, and the CRC catches what still gets in; a UART
+console (the Watcher's) holds nothing, and the retake is what copes with the log there. A
+stream whose END comes without a BEGIN to read it by arrived damaged, and is retaken too.
+With reset_wait_s the board is reset first and given that long to boot.
 The PNG is scaled 3x so small screens are readable.
 
 As a module: parse(log) reads a captured stream, capture(ser, keys, settle) does the whole
@@ -53,6 +55,7 @@ TRIES = 3           # a capture whose CRC doesn't match is taken again, this man
 PACE = 0.35         # seconds after each key, and after a command that isn't a touch
 CRC_MISMATCH = 'crc mismatch'
 CUT_SHORT = 'snapshot cut short'
+DAMAGED = 'the screenshot arrived damaged'   # its END came, and no BEGIN a screen can be read from
 AFTER_TOUCH = 0.6   # seconds after a touch script has run, before the picture
 TOUCH_MS = {'tap': 80, 'longpress': 900, 'swipe': 240}   # how long each script runs (muse_ui.c)
 DEFAULT_PER_LINE = 144    # bytes per base64 line; older firmware doesn't say
@@ -208,7 +211,8 @@ def settle_down(ser, quiet=0.3, limit=3.0):
 
 def fetch(ser):
     """Asks for a picture with 'p' and reads it. -> (w, h, raw, crc_ok, why): why is what was wrong, when it isn't
-    ok. SnapError when the board has screenshots off or never answers.
+    ok (a CRC that doesn't match, a stream cut short, or one whose END came without a BEGIN to read it by).
+    SnapError when the board has screenshots off or never answers.
 
     Nothing before the first newline of what comes back is looked at: it is the end of a line the drain before the
     'p' stopped in (an @app.log echo that says SNAP END there is not the firmware). The reply starts with a newline."""
@@ -226,11 +230,16 @@ def fetch(ser):
     try:
         w, h, raw, ok = parse(text)
     except ValueError:
-        if find_begin(text) is None:
+        head = find_begin(text)
+        if head is None:
             if OFF_LINE.search(body):
                 raise SnapError('screenshots are off in this build: '
                                 'MUSE_BENCH=1 tools/muse/board.sh build|flash <board>')
+            if END.search(text):
+                return 0, 0, b'', False, DAMAGED   # the END came, so the board answered: bytes of the head were lost
             raise SnapError('no screenshot: the board never answered')
+        if END.search(text, head.end()):
+            return 0, 0, b'', False, DAMAGED   # a BEGIN that is no screen's, and the END after it
         return 0, 0, b'', False, CUT_SHORT
     return w, h, raw, ok, CRC_MISMATCH
 

@@ -859,12 +859,12 @@ static void *holder_thread(void *arg)
 }
 
 /* The hold and its release are the host's flockfile and funlockfile, as the board's libc has them, noted. */
-static void harness_lock(FILE *f)
+static UNUSED void harness_lock(FILE *f)
 {
     (flockfile)(f);
     event('L');
 }
-static void harness_unlock(FILE *f)
+static UNUSED void harness_unlock(FILE *f)
 {
     event('U');
     (funlockfile)(f);
@@ -946,11 +946,13 @@ int main(int argc, char **argv)
 }
 """
 
-    def run_snapshot_cable(self, *, inject_at=0, vanish_at=-1, flush_ok=1, holder=0, hold=True, w=200, h=6, pad=8):
+    def run_snapshot_cable(self, *, inject_at=0, vanish_at=-1, flush_ok=1, holder=0, hold=True, console="usb",
+                           w=200, h=6, pad=8):
         """send_snapshot() on the shared cable: (what arrived on the cable, the raw pixels, the harness's report as
-        a dict, the warnings it logged). hold=False takes the muse_console_hold() call out, as a stream without it."""
+        a dict, the warnings it logged). hold=False takes the muse_console_hold() call out, as a stream without it;
+        console says whose muse_console_hold() and muse_console_release() run: muse_console.c's "usb" or "uart" one."""
         ui = (MUSE / "muse_ui.c").read_text()
-        console = (MUSE / "muse_console.c").read_text()
+        console = console_variant((MUSE / "muse_console.c").read_text(), console)
         functions = self.snapshot_functions(ui)
         if not hold:
             # The stream without the lock: no hold taken, so none given back.
@@ -1041,6 +1043,38 @@ int main(int argc, char **argv)
         # The same harness without the hold: the stream doesn't wait, and the line comes after it.
         log, raw, report, _ = self.run_snapshot_cable(holder=1, hold=False)
         self.assertLess(log.index("SNAP END"), log.index("HOLDER LINE"))
+
+    def test_a_uart_console_streams_without_the_hold(self):
+        # The hold applies where the stream goes out over USB-Serial-JTAG. A UART's stream lasts as long as its bytes
+        # take at the baud rate (about 40 s for the Watcher's screen at 115200), and for that long no task could log,
+        # Link and the voice pipeline among them. There the stream goes out as it did before the hold: nothing is taken
+        # or given back, and snap.py retakes a capture the log broke into. Same send_snapshot(), the UART's hold.
+        snap = load_snap()
+        w, h = 200, 6
+        rows = h * -(-w * 2 // 144)
+        log, raw, report, warnings = self.run_snapshot_cable(console="uart")
+        self.assertEqual(report["events"], "W" * (rows + 2) + "F")   # the rows, END and the flush; no L, no U
+        self.assertEqual(snap.parse(log), (w, h, raw, True))
+        self.assertEqual((report["bad_ms"], warnings), ("0", []))
+        # Another task's line isn't kept out: it prints at once, inside the stream.
+        log, raw, report, _ = self.run_snapshot_cable(console="uart", inject_at=4)
+        self.assertEqual(report["blocked"], "0")
+        self.assertLess(log.index("SNAP BEGIN"), log.index("LOG LINE"))
+        self.assertLess(log.index("LOG LINE"), log.index("SNAP END"))
+        # A task that has stdout doesn't delay it either: the stream is over before that task is.
+        log, raw, report, _ = self.run_snapshot_cable(console="uart", holder=1)
+        self.assertLess(log.index("SNAP END"), log.index("HOLDER LINE"))
+        self.assertEqual(report["events"], "W" * (rows + 2) + "F")
+        # And the same run on the USB console's hold does hold: the harness tells the two apart.
+        log, raw, report, _ = self.run_snapshot_cable(console="usb", inject_at=4)
+        self.assertEqual(report["blocked"], "1")
+        # The UART's hold and release are empty, and take no lock.
+        uart = console_variant((MUSE / "muse_console.c").read_text(), "uart")
+        for name in ("void muse_console_hold(", "void muse_console_release("):
+            with self.subTest(name):
+                body = code_only(c_function(uart, name))
+                self.assertNotIn("lockfile", body)
+                self.assertEqual(body.split("{")[1].split("}")[0].strip(), "")
 
     def test_the_limits_of_the_stream_are_finite(self):
         ui = (MUSE / "muse_ui.c").read_text()
@@ -1177,12 +1211,13 @@ int main(void)
             with self.subTest(name):
                 self.assertEqual(open_conditions(header, header.index(name)), [with_snapshots])
                 defined = [m.start() for m in re.finditer(rf"^(?:bool|void) {name}\(", source, re.M)]
-                if name in ("muse_console_hold", "muse_console_release"):
-                    # One for both consoles: the lock is stdout's, whatever the port behind it.
-                    self.assertEqual([open_conditions(source, at) for at in defined], [[with_snapshots]])
-                else:
-                    self.assertEqual([open_conditions(source, at) for at in defined],
-                                     [["if !CONFIG_MUSE_CONSOLE_UART", with_snapshots], ["else", with_snapshots]])
+                self.assertEqual([open_conditions(source, at) for at in defined],
+                                 [["if !CONFIG_MUSE_CONSOLE_UART", with_snapshots], ["else", with_snapshots]])
+        # Which console holds is decided here, where the consoles are told apart, and nowhere else.
+        for path in [*MUSE.rglob("*.[ch]"), *MUSE.rglob("*.cpp"), *(ROOT / "main").rglob("*.[ch]")]:
+            if path.name not in ("muse_console.c", "muse_console.h", "Kconfig"):
+                with self.subTest(path.name):
+                    self.assertNotIn("MUSE_CONSOLE_UART", code_only(path.read_text()))
         # Only the snapshot stream calls them, and only where there is one: no plain build refers to them.
         names = re.compile(r"\bmuse_console_(?:hold|release|write_timeout|flush)\b")
         for path in [*MUSE.rglob("*.[ch]"), *MUSE.rglob("*.cpp"), *(ROOT / "main").rglob("*.[ch]")]:
@@ -1201,9 +1236,9 @@ int main(void)
         # hold polling it holds nothing (the log landed inside the stream on the board) and the global lock is never
         # given back. The host's ftrylockfile is POSIX's and works, so no host run can tell. This keeps it out of the
         # source: flockfile and funlockfile are the real ones.
-        console = (MUSE / "muse_console.c").read_text()
-        self.assertIn("flockfile(stdout)", c_function(console, "void muse_console_hold("))
-        self.assertIn("funlockfile(stdout)", c_function(console, "void muse_console_release("))
+        usb = console_variant((MUSE / "muse_console.c").read_text(), "usb")
+        self.assertIn("flockfile(stdout)", c_function(usb, "void muse_console_hold("))
+        self.assertIn("funlockfile(stdout)", c_function(usb, "void muse_console_release("))
         for path in [*MUSE.rglob("*.[ch]"), *MUSE.rglob("*.cpp"), *(ROOT / "main").rglob("*.[ch]")]:
             with self.subTest(path.name):
                 self.assertNotIn("ftrylockfile", code_only(path.read_text()))
@@ -1511,6 +1546,42 @@ int main(void)
         result, board, _, _ = self.capture(snap, ["@app.log x SNAP OFF\n"])
         self.assertIn("never answered", str(result))
 
+    def test_snap_capture_says_the_screenshot_arrived_damaged_when_end_comes_without_a_usable_begin(self):
+        # A stream whose END arrives without a BEGIN a screen can be read from lost its head: bytes were lost on the
+        # way, which is not a board that never answered. It is retaken like a CRC mismatch, at once, its END having
+        # been read, and three of them say so.
+        snap = load_snap()
+        raw = pixels(30, 8, seed=23)
+        good = stream(30, 8, raw)
+        begin = "SNAP BEGIN 30 8 144"
+        for name, log in (("no BEGIN line", good.replace(begin + "\n", "")),
+                          ("a character lost from it", good.replace(begin, "SNAP BEGI 30 8 144")),
+                          ("log text in front of it", good.replace("\n" + begin, "\nI (5) x: " + begin)),
+                          ("sizes that are no screen", good.replace(begin, "SNAP BEGIN 30000 8 144"))):
+            with self.subTest(name):
+                result, board, _, errors = self.capture(snap, [log, good])
+                self.assertEqual(result, (30, 8, raw))
+                self.assertEqual(board.writes, [b"p", b"p"])
+                self.assertEqual(errors, "the screenshot arrived damaged, retaking\n")
+                self.assertEqual(board.write_times[1], board.write_times[0])
+                result, board, _, errors = self.capture(snap, [log, log, log, good])
+                self.assertIsInstance(result, snap.SnapError)
+                self.assertIn("the screenshot arrived damaged", str(result))
+                self.assertNotIn("never answered", str(result))
+                self.assertEqual(board.writes.count(b"p"), 3)
+                self.assertEqual(errors, "the screenshot arrived damaged, retaking\n" * 2)
+        # No END to say a stream ended is still a board that said nothing, and a BEGIN without its END a stream cut
+        # short, whatever else is wrong with the rest.
+        lines = good.split("\n")
+        rows_only = "\n".join(lines[:1] + lines[2:-3]) + "\n"
+        result, board, _, errors = self.capture(snap, [rows_only])
+        self.assertIn("the board never answered", str(result))
+        self.assertEqual(errors, "")
+        cut = good[:good.index("\nSNAP END")] + "\n"
+        result, board, _, errors = self.capture(snap, [cut, good])
+        self.assertEqual(result, (30, 8, raw))
+        self.assertEqual(errors, "snapshot cut short, retaking\n")
+
     def test_snap_capture_never_takes_the_start_of_a_read_for_a_line_start(self):
         # S1: a drain can stop in the middle of an @app.log echo, so the first thing read after the 'p' can be the rest
         # of that line, whatever SNAP line it holds. It isn't column 0: the reply to 'p' starts with a newline of its
@@ -1534,10 +1605,10 @@ int main(void)
         snap = load_snap()
         raw = pixels(30, 8, seed=22)
         glued = "junk\n@app.log x " + stream(30, 8, raw)[1:]   # the BEGIN line without its own line, behind an echo
-        result, board, _, _ = self.capture(snap, [glued])
+        result, board, _, _ = self.capture(snap, [glued] * 3)   # its END arrives: a damaged stream, retaken twice
         self.assertIsInstance(result, snap.SnapError)
-        self.assertIn("never answered", str(result))
-        self.assertEqual(board.writes, [b"p"])
+        self.assertIn("arrived damaged", str(result))
+        self.assertEqual(board.writes, [b"p"] * 3)
 
     def test_snap_capture_drains_what_was_in_the_port_before_it(self):
         snap = load_snap()

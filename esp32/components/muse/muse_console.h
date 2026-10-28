@@ -40,19 +40,20 @@ bool muse_console_host(void);
 
 #if CONFIG_LV_USE_SNAPSHOT
 /*
- * What a screenshot (muse_ui.c's send_snapshot) needs of the console, which is only built with screenshots. Its rows
- * go out through muse_console_write, while printf and the log reach the cable another way, so a line printed during
- * the stream lands inside a row. muse_console_hold keeps stdout's lock, which every printf and log line takes, until
- * muse_console_release: they wait, and come out after the stream. Whatever else reaches the port through stdio has to
- * take the lock too (fsync takes none: apps_port_console_flush does). The writes and the flush give up after a time
- * they are given; the hold itself waits for whoever has stdout, which is another task's line, reply or queue of echo
- * lines.
+ * What a screenshot (muse_ui.c's send_snapshot) needs of the console, which is only built with screenshots. On the
+ * USB-Serial-JTAG console its rows go out through the driver while printf and the log reach the cable another way, so
+ * a line printed during the stream lands inside a row. muse_console_hold keeps stdout's lock, which every printf and
+ * log line takes, until muse_console_release: they wait, and come out after the stream. Whatever else reaches the port
+ * through stdio has to take the lock too (fsync takes none: apps_port_console_flush does). The writes and the flush
+ * give up after a time they are given; the hold itself waits for whoever has stdout, which is another task's line,
+ * reply or queue of echo lines. A UART console holds nothing: its stream takes as long as its bytes do at the baud
+ * rate, about 40 s for the Watcher's screen, and no task could log for that long (see muse_console.c).
  */
 
 /* Takes stdout's lock, waiting for whoever has it: a line, a reply (0.5 s at most) or the app echo's queue. It can't
- * give up: this libc has no try-lock that works (see muse_console.c). */
+ * give up: this libc has no try-lock that works (see muse_console.c). Nothing on a UART console. */
 void muse_console_hold(void);
-/* Gives the lock back. */
+/* Gives the lock back. Nothing on a UART console. */
 void muse_console_release(void);
 /* muse_console_write, giving up when the console takes nothing for ms (a host that has stopped reading): false, and
  * none of buf went out. A UART takes bytes at its baud rate whether or not anyone reads, so it never gives up. */

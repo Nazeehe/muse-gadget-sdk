@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -29,7 +30,7 @@
 #include "apps_pkg.h"
 #include "apps_port.h"
 
-/* The apply step; apps_lv.h has the contract. Everything here runs on the LVGL task. */
+/* The apply step, the layer and the cards over it; apps_lv.h has the contract. All of it runs on the LVGL task. */
 
 LV_FONT_DECLARE(apps_digits_48)
 LV_FONT_DECLARE(apps_digits_96)
@@ -87,6 +88,13 @@ static uint32_t s_slow_unlogged; /* slow passes since the last line, and the lon
 static int64_t s_slow_worst_us;
 
 static volatile uint32_t s_applies, s_skips, s_rejects, s_refused, s_slow;
+
+/* The cards (made at the first show): their parent, the screen the layer is on, and what is shown on them. */
+static lv_obj_t *s_screen;
+static lv_obj_t *s_launcher, *s_crash, *s_crash_title, *s_crash_body;
+static bool s_launcher_shown, s_crash_shown;
+static void (*s_pick)(const char *id);
+static char s_row_ids[APPS_LV_LAUNCHER_ROWS][APPS_ID_MAX + 1];
 
 /* One pass: what it works on and what it found. */
 typedef struct {
@@ -918,12 +926,15 @@ void apps_lv_build(lv_obj_t *screen) {
     if (screen == NULL) {
         return;
     }
-    /* Records belong to the layer they were made on. */
+    /* Records belong to the layer they were made on, and the cards to the screen. */
     apps_port_free(s_state);
     s_state = NULL;
     s_skip_run = 0;
     s_reject_logged = false;
     s_front = false;
+    s_screen = screen;
+    s_launcher = s_crash = s_crash_title = s_crash_body = NULL;
+    s_launcher_shown = s_crash_shown = false;
 
     lv_obj_t *layer = lv_obj_create(screen);
     if (layer == NULL) {
@@ -987,4 +998,227 @@ void apps_lv_stats(apps_lv_stats_t *out) {
     out->rejects = s_rejects;
     out->refused_creates = s_refused;
     out->slow = s_slow;
+}
+
+/* ---- The launcher and the crash card ---- */
+
+#define COLOR_TEXT 0xf2efff     /* muse_ui's, the menu's and the settings' */
+#define COLOR_CAPTION 0xd8d2ff
+#define COLOR_DIM 0x8b84a8
+#define COLOR_ROW 0x1a1530      /* the settings' cards */
+#define CARD_TEXT_W 330         /* ui.SAFE: text this wide stays inside the circle near the middle */
+#define ROW_W 300
+#define ROW_H 64
+#define ROW_GAP 12
+#define ROWS_BELOW 20           /* the rows sit this much under the middle, clear of the title */
+#define TITLE_MAX 96            /* "<name> stopped responding": a manifest's name is at most 24 bytes */
+
+static lv_obj_t *new_label(lv_obj_t *parent, const lv_font_t *font, uint32_t rgb) {
+    lv_obj_t *label = lv_label_create(parent);
+    if (label == NULL) {
+        return NULL;
+    }
+    lv_obj_set_style_text_font(label, font, LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, colour(rgb), LV_PART_MAIN);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    return label;
+}
+
+/* Full-screen and black, it takes every touch on it (labels on it aren't clickable, so theirs are its own), and a
+ * swipe stops at it: the pages under it see nothing. Hidden until shown. */
+static lv_obj_t *new_card(void) {
+    lv_obj_t *card = lv_obj_create(s_screen);
+    if (card == NULL) {
+        return NULL;
+    }
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(card, colour(0), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_HIDDEN);
+    return card;
+}
+
+static void close_launcher(void) {
+    if (s_launcher != NULL) {
+        lv_obj_add_flag(s_launcher, LV_OBJ_FLAG_HIDDEN);
+    }
+    s_launcher_shown = false;
+}
+
+static void close_crash(void) {
+    if (s_crash != NULL) {
+        lv_obj_add_flag(s_crash, LV_OBJ_FLAG_HIDDEN);
+    }
+    s_crash_shown = false;
+}
+
+/* A tap that lands on no row: on the launcher itself, or on its text, which isn't clickable. */
+static void on_launcher_tap(lv_event_t *e) {
+    (void)e;
+    close_launcher();
+}
+
+static void on_launcher_gesture(lv_event_t *e) {
+    (void)e;
+    lv_indev_t *indev = lv_indev_active();
+    if (indev == NULL || lv_indev_get_gesture_dir(indev) != LV_DIR_RIGHT) {
+        return;
+    }
+    lv_indev_wait_release(indev);  /* the row the swipe began on gets no click */
+    close_launcher();
+}
+
+/* The row's own copy of its id: the launcher closes first (pick may open another card), and pick only posts. Nothing
+ * is deleted here, inside the row's event: the rows go when the launcher is next shown. */
+static void on_row_tap(lv_event_t *e) {
+    intptr_t row = (intptr_t)lv_event_get_user_data(e);
+    if (row < 0 || row >= APPS_LV_LAUNCHER_ROWS || s_row_ids[row][0] == '\0') {
+        return;
+    }
+    char id[APPS_ID_MAX + 1];
+    memcpy(id, s_row_ids[row], sizeof id);
+    void (*pick)(const char *id) = s_pick;
+    close_launcher();
+    if (pick != NULL) {
+        pick(id);
+    }
+}
+
+static void on_crash_tap(lv_event_t *e) {
+    (void)e;
+    close_crash();
+}
+
+/* Both cards, once, just above the layer: over the app, under what muse_ui made after the layer. False when there is
+ * no layer, or LVGL had no memory for them (what was made goes, and the next show tries again). */
+static bool make_cards(void) {
+    if (s_launcher != NULL) {
+        return true;
+    }
+    if (s_layer == NULL || s_screen == NULL) {
+        return false;
+    }
+    lv_obj_t *launcher = new_card();
+    lv_obj_t *crash = launcher != NULL ? new_card() : NULL;
+    lv_obj_t *title = crash != NULL ? new_label(crash, &lv_font_montserrat_20, COLOR_TEXT) : NULL;
+    lv_obj_t *body = title != NULL ? new_label(crash, &lv_font_montserrat_16, COLOR_CAPTION) : NULL;
+    lv_obj_t *hint = body != NULL ? new_label(crash, &lv_font_montserrat_14, COLOR_DIM) : NULL;
+    if (hint == NULL) {
+        if (launcher != NULL) {
+            lv_obj_delete(launcher);
+        }
+        if (crash != NULL) {
+            lv_obj_delete(crash);
+        }
+        return false;
+    }
+    lv_obj_add_event_cb(launcher, on_launcher_tap, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(launcher, on_launcher_gesture, LV_EVENT_GESTURE, NULL);
+    lv_obj_add_event_cb(crash, on_crash_tap, LV_EVENT_CLICKED, NULL);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_size(title, CARD_TEXT_W, LV_SIZE_CONTENT);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -72);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_size(body, CARD_TEXT_W, 80);  /* four lines of the error at most */
+    lv_obj_align(body, LV_ALIGN_CENTER, 0, 12);
+    lv_label_set_text(hint, "Tap to close");
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 112);
+    lv_obj_move_to_index(launcher, lv_obj_get_index(s_layer) + 1);
+    lv_obj_move_to_index(crash, lv_obj_get_index(s_layer) + 2);
+    s_launcher = launcher;
+    s_crash = crash;
+    s_crash_title = title;
+    s_crash_body = body;
+    return true;
+}
+
+void apps_lv_show_launcher(const char *const *ids, const char *const *names, int n, void (*pick)(const char *id)) {
+    if (!make_cards()) {
+        return;
+    }
+    lv_obj_clean(s_launcher);  /* the last showing's rows */
+    memset(s_row_ids, 0, sizeof s_row_ids);
+    s_pick = pick;
+    lv_obj_t *title = new_label(s_launcher, &lv_font_montserrat_20, COLOR_DIM);
+    if (title != NULL) {
+        lv_label_set_text(title, "Apps");
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 56);
+    }
+    int rows = ids == NULL || n <= 0 ? 0 : n < APPS_LV_LAUNCHER_ROWS ? n : APPS_LV_LAUNCHER_ROWS;
+    if (rows == 0) {
+        lv_obj_t *empty = new_label(s_launcher, &lv_font_montserrat_16, COLOR_DIM);
+        if (empty != NULL) {
+            lv_label_set_long_mode(empty, LV_LABEL_LONG_MODE_WRAP);
+            lv_obj_set_size(empty, ROW_W, LV_SIZE_CONTENT);
+            lv_label_set_text(empty, "No apps yet. Ask Muse to make one.");
+            lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
+        }
+    }
+    /* The first row's centre, so the list is centred a little under the middle. */
+    int32_t first = ROWS_BELOW - (rows * ROW_H + (rows - 1) * ROW_GAP) / 2 + ROW_H / 2;
+    for (int i = 0; i < rows; i++) {
+        if (ids[i] == NULL || ids[i][0] == '\0') {
+            continue;
+        }
+        snprintf(s_row_ids[i], sizeof s_row_ids[i], "%s", ids[i]);
+        lv_obj_t *row = lv_obj_create(s_launcher);
+        if (row == NULL) {
+            s_row_ids[i][0] = '\0';
+            break;
+        }
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, ROW_W, ROW_H);
+        lv_obj_set_style_bg_color(row, colour(COLOR_ROW), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(row, ROW_H / 2, LV_PART_MAIN);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(row, LV_ALIGN_CENTER, 0, first + i * (ROW_H + ROW_GAP));
+        lv_obj_add_event_cb(row, on_row_tap, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *label = new_label(row, &lv_font_montserrat_20, COLOR_TEXT);
+        if (label != NULL) {
+            lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+            lv_obj_set_size(label, ROW_W - 40, 24);  /* one line */
+            bool named = names != NULL && names[i] != NULL && names[i][0] != '\0';
+            lv_label_set_text(label, named ? names[i] : s_row_ids[i]);
+            lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+        }
+    }
+    lv_obj_remove_flag(s_launcher, LV_OBJ_FLAG_HIDDEN);
+    s_launcher_shown = true;
+}
+
+void apps_lv_show_crash(const char *name, const char *first_line) {
+    if (!make_cards()) {
+        return;
+    }
+    char title[TITLE_MAX];
+    snprintf(title, sizeof title, "%s %s", name != NULL && name[0] != '\0' ? name : "The app",
+             first_line != NULL ? "stopped" : "stopped responding");
+    lv_label_set_text(s_crash_title, title);
+    if (first_line != NULL) {
+        lv_label_set_text(s_crash_body, first_line);
+        lv_obj_remove_flag(s_crash_body, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_crash_body, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_remove_flag(s_crash, LV_OBJ_FLAG_HIDDEN);
+    s_crash_shown = true;
+}
+
+void apps_lv_hide_cards(void) {
+    if (s_launcher_shown) {
+        close_launcher();
+    }
+    if (s_crash_shown) {
+        close_crash();
+    }
+}
+
+bool apps_lv_cards_shown(void) {
+    return s_launcher_shown || s_crash_shown;
 }

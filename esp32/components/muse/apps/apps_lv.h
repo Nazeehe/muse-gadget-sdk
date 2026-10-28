@@ -175,3 +175,34 @@ typedef struct {
     uint32_t applies, skips, rejects, refused_creates, slow;
 } apps_lv_stats_t;
 void apps_lv_stats(apps_lv_stats_t *out);
+
+/*
+ * The launcher and the crash card: two cards the firmware draws over the layer (Task 12), full-screen and black, made
+ * the first time either is shown, on the screen apps_lv_build was given, just above the layer: over the app, under
+ * what muse_ui puts above the layer (the downloaded image, the top layer). They are not on the layer, so
+ * apps_lv_reset leaves them. Each takes every touch on it (clickable, not scrollable, and a swipe goes no further),
+ * so the pages under them see none. The crash card sits over the launcher. Like apps_lv_reset, these need the LVGL
+ * task, or a holder of the display lock: other tasks ask the app task's glue (muse_apps.h), which calls them at the
+ * next frame. Without a layer they do nothing.
+ */
+
+/* Rows the launcher shows; more apps are left out (Task 20 makes the list longer). */
+#define APPS_LV_LAUNCHER_ROWS 4
+
+/* The launcher: "Apps", and a row for each app, ids[i] named names[i] (NULL: the id), at most APPS_LV_LAUNCHER_ROWS,
+ * or, for n 0, "No apps yet. Ask Muse to make one." Both are copied. A tap on a row closes the launcher and calls pick
+ * with the row's id, on the LVGL task inside the tap (pick posts and returns). A tap anywhere else (the text
+ * included: it isn't clickable, so LVGL gives the tap to the launcher) or a right swipe closes it. Showing it again
+ * makes its rows again. */
+void apps_lv_show_launcher(const char *const *ids, const char *const *names, int n, void (*pick)(const char *id));
+
+/* The crash card: "<name> stopped" over first_line (the crash record's first line), or "<name> stopped responding"
+ * when first_line is NULL (the supervisor's card for a hung app); "Tap to close" under them. NULL or "" name is "The
+ * app". A tap closes it. */
+void apps_lv_show_crash(const char *name, const char *first_line);
+
+/* Closes both cards: an app came to the front, or a voice turn began. */
+void apps_lv_hide_cards(void);
+
+/* Whether a card is showing. */
+bool apps_lv_cards_shown(void);

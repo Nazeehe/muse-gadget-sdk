@@ -95,6 +95,46 @@ def lv_font_glyphs(text: str) -> dict:
     return glyphs
 
 
+def c_function(source: str, signature: str) -> str:
+    """A C function's text, from its signature to its closing brace (braces counted: none in its strings)."""
+    start = source.index(signature)
+    pos, depth = source.index("{", start) + 1, 1
+    while depth:
+        depth += {"{": 1, "}": -1}.get(source[pos], 0)
+        pos += 1
+    return source[start:pos]
+
+
+def open_conditions(source: str, index: int) -> list:
+    """The preprocessor branches open at source[index], outermost first: "if CONFIG_X", or "else" once #else is met."""
+    stack = []
+    for match in re.finditer(r"^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|else|endif)\b[ \t]*(.*)$", source[:index], re.M):
+        kind, rest = match.group(1), match.group(2).strip()
+        if kind in ("if", "ifdef", "ifndef"):
+            stack.append(f"{kind} {rest}")
+        elif kind == "endif":
+            stack.pop()
+        else:
+            stack[-1] = f"{kind} {rest}".strip()
+    return stack
+
+
+def call_arguments(source: str, name: str) -> list:
+    """The arguments of the first call of name(...) in source, split at its top-level commas."""
+    pos = source.index(name + "(") + len(name) + 1
+    args, depth, current = [], 0, ""
+    while depth or source[pos] != ")":
+        ch = source[pos]
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if ch == "," and depth == 0:
+            args.append(current.strip())
+            current = ""
+        else:
+            current += ch
+        pos += 1
+    return [*args, current.strip()]
+
+
 def synthetic_font(glyphs: dict) -> str:
     """The parts of an lv_font_conv file that tabular_digits reads, for {code point: (adv_w, ofs_x)}."""
     codes = sorted(glyphs)
@@ -399,6 +439,118 @@ class MuseAppsWiringTest(unittest.TestCase):
                     else:
                         self.assertNotEqual(done.returncode, 0)
                         self.assertIn("CONFIG_MUSE_APPS", done.stderr)
+
+    # ---- Task 12: the app task, the device port and the UI hooks ----
+
+    def test_ui_hooks_in_order(self):
+        ui = (MUSE / "muse_ui.c").read_text()
+        # build_overlays(): the app layer over the pages and their dots and under the downloaded image, so the z-order
+        # is tileview, dots, app layer, image, lv_layer_top.
+        build = ui.index("muse_apps_ui_build(scr)")
+        self.assertLess(ui.index("s_dots[i] = d;"), build)
+        self.assertLess(build, ui.index("s_image = lv_image_create(scr)"))
+        frame = c_function(ui, "static void frame_tick(lv_timer_t *timer)")
+        # The tick (the apply step, and whether an app covers the screen) straight after the chrome, which keeps the
+        # pairing card and the icons alive over an app (C16), so after the video block and before the menu and face.
+        self.assertRegex(frame, r"update_chrome\(now\);\s*#if CONFIG_MUSE_APPS\s*if \(muse_apps_ui_tick\(\)\)")
+        tick = frame.index("if (muse_apps_ui_tick())")
+        self.assertLess(frame.index("muse_video_tick()"), tick)
+        self.assertLess(tick, frame.index("muse_menu_tick("))
+        # The supervisor and the reset before update_sleep(), which returns before the tick while the screen sleeps
+        # (C8 and the reset's invariants).
+        supervise = frame.index("muse_apps_ui_supervise();")
+        self.assertLess(supervise, frame.index("if (update_sleep())"))
+        # A voice turn, from the mode-change block, which runs before the supervisor in the same frame.
+        block = frame.index("if (mode != s_last_mode)")
+        turn = frame.index("muse_apps_ui_turn(mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_THINKING || "
+                           "mode == MUSE_MODE_SPEAKING)")
+        self.assertLess(block, turn)
+        self.assertLess(turn, frame.index("s_last_mode = mode;"))
+        self.assertLess(turn, supervise)
+        # The launcher: a long press on the pocket watch.
+        press = ui.index("lv_obj_add_event_cb(s_clock, on_clock_long_press, LV_EVENT_LONG_PRESSED, NULL)")
+        self.assertLess(ui.index("s_clock = lv_tileview_add_tile("), press)
+        # With the option off nothing changes (X5): every mention of the apps sits inside #if CONFIG_MUSE_APPS.
+        mentions = [m.start() for m in re.finditer(r"muse_apps|on_clock_long_press", ui)]
+        self.assertGreaterEqual(len(mentions), 8)
+        for index in mentions:
+            line = ui[ui.rindex("\n", 0, index) + 1:ui.index("\n", index)]
+            with self.subTest(line.strip()):
+                self.assertIn("if CONFIG_MUSE_APPS", open_conditions(ui, index))
+
+    def test_clock_showing_yields_to_apps(self):
+        # An app in front covers the watch, whatever tile is under it: muse_input's talk button then talks instead of
+        # turning to the face. With the option off it is s_on_clock, as before.
+        body = c_function((MUSE / "muse_ui.c").read_text(), "bool muse_ui_clock_showing(void)")
+        source = ("#include <stdbool.h>\n#include <stdio.h>\n"
+                  "static bool s_on_clock, front;\n"
+                  "__attribute__((unused)) static bool muse_apps_front(void) { return front; }\n" + body +
+                  "\nint main(void) {\n"
+                  "    for (int on = 0; on < 2; on++) {\n"
+                  "        for (int f = 0; f < 2; f++) {\n"
+                  "            s_on_clock = on;\n"
+                  "            front = f;\n"
+                  "            printf(\"%d%d%d\\n\", on, f, muse_ui_clock_showing());\n"
+                  "        }\n"
+                  "    }\n"
+                  "    return 0;\n}\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clock_showing.c"
+            path.write_text(source)
+            for name, defines, expected in (("apps_on", ["CONFIG_MUSE_APPS=1"], ["000", "010", "101", "110"]),
+                                            ("apps_off", [], ["000", "010", "101", "111"])):
+                with self.subTest(name):
+                    exe = apps_host.build(f"clock_showing_{name}", [path], tmp, defines=defines, sanitize=False)
+                    done = apps_host.run(exe)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertEqual(done.stdout.split(), expected)
+
+    def test_started_before_input(self):
+        # After the UI (the app layer exists, built under the display lock), before input (nothing can ask for an app
+        # before its task is up), and only with the option on (X5).
+        app = (MUSE / "muse_app.c").read_text()
+        start = app.index("muse_apps_start()")
+        self.assertLess(app.index("muse_ui_start()"), start)
+        self.assertLess(start, app.index("muse_input_start(q)"))
+        self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, start))
+        self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, app.index('#include "muse_apps.h"')))
+
+    def test_task_shape(self):
+        task = (MUSE / "apps/apps_task.c").read_text()
+        defines = dict(re.findall(r"^#define\s+(\w+)\s+(\S+)", task, re.M))
+
+        def value(arg):
+            while arg in defines:
+                arg = defines[arg]
+            return arg
+
+        args = call_arguments(task, "xTaskCreatePinnedToCoreWithCaps")
+        self.assertEqual(len(args), 8, args)
+        self.assertEqual(args[1], '"muse_apps"')    # E21: the spec's "muse_app" is muse_app.c's
+        self.assertEqual(args[2], "APPS_TASK_STACK")
+        self.assertEqual(value("APPS_TASK_STACK"), "57344")    # 56 KB of PSRAM (the amended constraint)
+        self.assertEqual(value(args[4]), "2")    # under the draw threads, at 3
+        self.assertEqual(value(args[6]), "1")
+        self.assertIn("MALLOC_CAP_SPIRAM", args[7])
+        queue = call_arguments(task, "xQueueCreateWithCaps")
+        self.assertEqual([value(queue[0]), queue[1], queue[2]], ["16", "sizeof(apps_event_t)", "MALLOC_CAP_SPIRAM"])
+
+    def test_task_header_compiles_on_the_host(self):
+        # C29: apps_task.h stays portable C (the host harness and later tasks' host tests include it): the runtime's and
+        # the package's headers and the standard ones, no FreeRTOS.
+        header = (MUSE / "apps/apps_task.h").read_text()
+        includes = re.findall(r'^#include\s+[<"]([^>"]+)[>"]', header, re.M)
+        self.assertEqual(sorted(name for name in includes if not name.startswith("std")), ["apps_pkg.h", "apps_rt.h"])
+
+    def test_device_port(self):
+        port = (MUSE / "apps/apps_port_idf.c").read_text()
+        # C21: PSA's SHA-256, as IDF v6's mbedTLS has it, not the old mbedtls/sha256.h.
+        self.assertHasText(port, "psa_crypto_init()", "apps_port_idf.c")
+        self.assertHasText(port, "psa_hash_compute(PSA_ALG_SHA_256,", "apps_port_idf.c")
+        self.assertHasText(port, "mbedtls/sha256.h", "apps_port_idf.c", absent=True)
+        # The apps' heap is PSRAM, and a line of an app's log is one console line.
+        self.assertHasText(port, "MUSE_BIG_CAPS", "apps_port_idf.c")
+        self.assertHasText(port, '"@app.log %s %s\\n"', "apps_port_idf.c")
 
 
 if __name__ == "__main__":

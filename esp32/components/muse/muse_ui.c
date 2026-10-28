@@ -38,6 +38,9 @@
 #if CONFIG_MUSE_CLOCK
 #include "muse_clock.h"
 #endif
+#if CONFIG_MUSE_APPS
+#include "muse_apps.h"
+#endif
 #include "muse_console.h"
 #include "muse_link.h"
 #include "muse_mem.h"
@@ -869,6 +872,15 @@ static void on_ring_draw(lv_event_t *e)
     layer->_clip_area = clip;
 }
 
+#if CONFIG_MUSE_APPS
+/* A long press on the pocket watch opens the apps' launcher. */
+static void on_clock_long_press(lv_event_t *e)
+{
+    (void)e;
+    muse_apps_open_launcher();
+}
+#endif
+
 static void build_screen(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -889,6 +901,9 @@ static void build_screen(void)
         s_clock = lv_tileview_add_tile(s_tv, col++, 0, LV_DIR_RIGHT);
         s_on_clock = true;
         s_face_active = false;
+#if CONFIG_MUSE_APPS
+        lv_obj_add_event_cb(s_clock, on_clock_long_press, LV_EVENT_LONG_PRESSED, NULL);
+#endif
 #endif
         s_face = lv_tileview_add_tile(s_tv, col, 0, s_clock ? LV_DIR_HOR : LV_DIR_RIGHT);
         /* It never scrolls, but LVGL would size its scrollbars from all its
@@ -1181,6 +1196,11 @@ static void build_overlays(void)
         lv_obj_align(d, LV_ALIGN_BOTTOM_MID, (2 * i - (s_pages - 1)) * 8, -14);
         s_dots[i] = d;
     }
+
+#if CONFIG_MUSE_APPS
+    /* Muse apps' full-screen layer: over the pages and their dots, under the downloaded image. */
+    muse_apps_ui_build(scr);
+#endif
 
     /* A downloaded image: over everything on the screen (and in snapshots),
      * under the pairing code and sleep cover on the top layer. */
@@ -1710,8 +1730,16 @@ static void frame_tick(lv_timer_t *timer)
             image_hide_locked();
             muse_ui_show_face();
         }
+#if CONFIG_MUSE_APPS
+        /* A voice turn hides an app in front; its end brings it back. */
+        muse_apps_ui_turn(mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_THINKING || mode == MUSE_MODE_SPEAKING);
+#endif
         s_last_mode = mode;
     }
+#if CONFIG_MUSE_APPS
+    /* Before update_sleep(): the hang supervisor and an ended app's reset run while the screen sleeps too. */
+    muse_apps_ui_supervise();
+#endif
     if (update_sleep()) {
         return;
     }
@@ -1722,6 +1750,11 @@ static void frame_tick(lv_timer_t *timer)
     }
 #endif
     update_chrome(now);
+#if CONFIG_MUSE_APPS
+    if (muse_apps_ui_tick()) {
+        return;   /* an app, the launcher or a crash card covers the face */
+    }
+#endif
     int32_t scroll_x = s_tv ? lv_obj_get_scroll_x(s_tv) : 0;
     if (s_clock) {
         s_on_clock = lv_tileview_get_tile_active(s_tv) == s_clock;
@@ -1838,7 +1871,11 @@ void muse_ui_show_face(void)
 
 bool muse_ui_clock_showing(void)
 {
+#if CONFIG_MUSE_APPS
+    return s_on_clock && !muse_apps_front();   /* an app in front covers the watch */
+#else
     return s_on_clock;
+#endif
 }
 
 void muse_ui_request_face(void)

@@ -49,6 +49,11 @@ void apps_port_free(void *ptr);  /* NULL is ignored. Any task. */
  * it, with its CPU budget running. */
 void apps_port_log(const char *app_id, const char *line);
 
+/* Makes what the port needs before anything here is used: the firmware's UI lock (a static mutex). The app task's
+ * glue calls it once, first thing in muse_apps_start(), before the app task and the LVGL task can use the lock. A
+ * port with nothing to make (the host runner) doesn't need it. */
+void apps_port_init(void);
+
 /* The lock that keeps the app's widget table steady while the LVGL task reads it (Task 9). Lock takes it,
  * waiting as long as it takes; trylock waits at most ms and says whether it got it; unlock gives it
  * back. Not recursive. */

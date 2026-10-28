@@ -34,6 +34,9 @@
 #if CONFIG_MUSE_VIDEO_WIFI
 #include "muse_video_wifi.h"
 #endif
+#if CONFIG_MUSE_APPS
+#include "muse_apps.h"
+#endif
 
 static const char *TAG = "muse";
 
@@ -80,6 +83,12 @@ void muse_app_run(const muse_board_t *board)
 #endif
     ESP_ERROR_CHECK(muse_ui_start());
     ESP_LOGI(TAG, "UI built: free internal %u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+#if CONFIG_MUSE_APPS
+    /* The app task: after the UI, whose app layer it draws on, and before input, which can ask for an app. */
+    if (muse_apps_start() != ESP_OK) {
+        ESP_LOGE(TAG, "Muse apps are off: no memory for their task");
+    }
+#endif
 
     QueueHandle_t q = xQueueCreate(16, sizeof(muse_input_event_t));
     ESP_ERROR_CHECK(muse_input_start(q));

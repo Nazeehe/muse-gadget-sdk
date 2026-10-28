@@ -38,6 +38,7 @@
 
 #include "apps_json.h"
 #include "apps_lv.h"
+#include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_ui.h"
 #include "apps_vm.h"
@@ -382,6 +383,7 @@ struct lv_obj {
     bool forced;           /* the test set the area: the layout leaves it */
     fake_cb_t cbs[8];
     int n_cbs;
+    int order;             /* where it is among its parent's children (lv_obj_get_index): made last, unless moved */
 };
 
 struct lv_indev {
@@ -399,6 +401,7 @@ struct lv_event {
 static lv_obj_t *objs[FAKE_OBJS_MAX];
 static int n_objs;
 static int next_id;
+static int next_order;
 static lv_obj_t screen_obj;
 static lv_indev_t indev_obj;
 static bool indev_present = true;
@@ -591,6 +594,7 @@ static lv_obj_t *make_object(const char *cls, lv_obj_t *parent, const char *fn) 
     o->id = ++next_id;
     o->cls = cls;
     o->parent = parent;
+    o->order = ++next_order;
     o->w = o->h = LV_SIZE_CONTENT;
     o->align = LV_ALIGN_DEFAULT;
     o->scale = 256;
@@ -690,6 +694,66 @@ void lv_obj_clean(lv_obj_t *obj) {
         if (objs[i]->parent == obj && !objs[i]->deleted) {
             mark_deleted(objs[i]);
         }
+    }
+}
+
+/* parent's live children in their order (LVGL's child list), into kids; their count. */
+static int fake_children(const lv_obj_t *parent, lv_obj_t **kids) {
+    int n = 0;
+    for (int i = 0; i < n_objs; i++) {
+        if (objs[i]->parent == parent && !objs[i]->deleted) {
+            int at = n++;
+            while (at > 0 && kids[at - 1]->order > objs[i]->order) {
+                kids[at] = kids[at - 1];
+                at--;
+            }
+            kids[at] = objs[i];
+        }
+    }
+    return n;
+}
+
+static lv_obj_t *fake_kids[FAKE_OBJS_MAX];
+
+int32_t lv_obj_get_index(const lv_obj_t *obj) {
+    if (use((lv_obj_t *)obj, "lv_obj_get_index", NULL) == NULL || obj->parent == NULL) {
+        return -1;
+    }
+    int n = fake_children(obj->parent, fake_kids);
+    for (int i = 0; i < n; i++) {
+        if (fake_kids[i] == obj) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* LVGL 9.5.0's lv_obj_move_to_index (lv_obj_tree.c): a negative index counts from the end; one out of range, or the
+ * index it has, leaves it where it is. */
+void lv_obj_move_to_index(lv_obj_t *obj, int32_t index) {
+    if (use(obj, "lv_obj_move_to_index", NULL) == NULL || obj->parent == NULL) {
+        return;
+    }
+    logline("move_to_index %d %d", obj->id, (int)index);
+    int n = fake_children(obj->parent, fake_kids);
+    int old = 0;
+    while (old < n && fake_kids[old] != obj) {
+        old++;
+    }
+    if (index < 0) {
+        index += n;
+    }
+    if (index < 0 || index >= n || index == old) {
+        return;
+    }
+    if (index < old) {
+        memmove(&fake_kids[index + 1], &fake_kids[index], (size_t)(old - index) * sizeof fake_kids[0]);
+    } else {
+        memmove(&fake_kids[old], &fake_kids[old + 1], (size_t)(index - old) * sizeof fake_kids[0]);
+    }
+    fake_kids[index] = obj;
+    for (int i = 0; i < n; i++) {
+        fake_kids[i]->order = ++next_order;
     }
 }
 
@@ -1276,6 +1340,7 @@ static void fake_free_all(void) {
     }
     n_objs = 0;
     next_id = 0;
+    next_order = 0;
     memset(&screen_obj, 0, sizeof screen_obj);
     screen_obj.cls = "screen";
     screen_obj.area = (lv_area_t){0, 0, 465, 465};
@@ -3937,6 +4002,214 @@ static void fuzz(void) {
 
 /* ---- The cases ---- */
 
+/* ---- The launcher and the crash card (Task 12) ---- */
+
+/* The id of the live label whose text is text, or -1. */
+static int fake_label(const char *text) {
+    for (int i = 0; i < n_objs; i++) {
+        if (!objs[i]->deleted && strcmp(objs[i]->cls, "label") == 0 && objs[i]->text != NULL && strcmp(objs[i]->text, text) == 0) {
+            return objs[i]->id;
+        }
+    }
+    return -1;
+}
+
+/* The id of an object's parent: 0 for the screen. */
+static int fake_parent(int id) {
+    const lv_obj_t *parent = fake_obj(id)->parent;
+    return parent == NULL || parent == &screen_obj ? 0 : parent->id;
+}
+
+/* How many live children of class cls the object (0: the screen) has. */
+static int fake_children_of(int id, const char *cls) {
+    const lv_obj_t *parent = id == 0 ? &screen_obj : fake_obj(id);
+    int n = 0;
+    for (int i = 0; i < n_objs; i++) {
+        n += objs[i]->parent == parent && !objs[i]->deleted && strcmp(objs[i]->cls, cls) == 0 ? 1 : 0;
+    }
+    return n;
+}
+
+static int fake_index(int id) {
+    return (int)lv_obj_get_index(fake_obj(id));
+}
+
+static int picks;
+static char picked[APPS_ID_MAX + 1];
+
+static void pick(const char *id) {
+    picks++;
+    snprintf(picked, sizeof picked, "%s", id);
+}
+
+static int cards_image;  /* the stand-in for muse_ui's downloaded image, made after the layer as build_overlays() does */
+
+/* A layer on a fresh screen, and an object made after it, as muse_ui's image is: the cards go between them. */
+static void cards_scene(void) {
+    fake_reset();
+    apps_lv_build(fake_screen());
+    cards_image = lv_image_create(fake_screen())->id;
+    log_clear();
+    picks = 0;
+    picked[0] = '\0';
+}
+
+/* A card is full-screen, black and takes every touch on it: the tileview under it never sees one. */
+static void check_card_at(int line, int card) {
+    const lv_obj_t *o = fake_obj(card);
+    CHECK_AT(line, fake_parent(card) == 0, "a card is a child of the screen: %d", fake_parent(card));
+    CHECK_AT(line, fake_flag(card, LV_OBJ_FLAG_CLICKABLE) && !fake_flag(card, LV_OBJ_FLAG_SCROLLABLE) &&
+                       !fake_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE),
+             "a card's flags: clickable %d scrollable %d gesture_bubble %d", fake_flag(card, LV_OBJ_FLAG_CLICKABLE),
+             fake_flag(card, LV_OBJ_FLAG_SCROLLABLE), fake_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE));
+    CHECK_AT(line, o->w == lv_pct(100) && o->h == lv_pct(100), "a card covers the screen");
+    /* Over the layer, under what muse_ui made after it. */
+    CHECK_AT(line, fake_index(card) > fake_index(1) && fake_index(card) < fake_index(cards_image),
+             "a card sits between the layer (%d) and the image (%d): %d", fake_index(1), fake_index(cards_image), fake_index(card));
+}
+#define CHECK_CARD(card) check_card_at(__LINE__, (card))
+
+static void launcher_lists_apps_and_picks(void) {
+    cards_scene();
+    const char *ids[] = {"hello", "timer"};
+    const char *names[] = {"Hello", "Kitchen timer"};
+    apps_lv_show_launcher(ids, names, 2, pick);
+    int hello = fake_label("Hello"), timer = fake_label("Kitchen timer"), title = fake_label("Apps");
+    CHECK(hello > 0 && timer > 0 && title > 0, "a row for each app, and the title: %d %d %d\n%s", hello, timer, title, log_peek());
+    int row = fake_parent(hello), launcher = fake_parent(row);
+    CHECK_CARD(launcher);
+    CHECK(fake_index(launcher) == fake_index(1) + 1, "the launcher is right over the layer: %d %d", fake_index(launcher), fake_index(1));
+    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && apps_lv_cards_shown(), "shown");
+    CHECK(fake_parent(fake_parent(timer)) == launcher && fake_children_of(launcher, "obj") == 2, "two rows on the launcher");
+    CHECK(fake_flag(row, LV_OBJ_FLAG_CLICKABLE) && !fake_flag(row, LV_OBJ_FLAG_SCROLLABLE), "a row is clickable");
+    CHECK(!fake_flag(hello, LV_OBJ_FLAG_CLICKABLE) && !fake_flag(title, LV_OBJ_FLAG_CLICKABLE),
+          "labels aren't: LVGL gives their touches to what is under them");
+    fake_tap(row);
+    CHECK(picks == 1 && strcmp(picked, "hello") == 0, "tapping a row runs its app: %d '%s'", picks, picked);
+    CHECK(fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "and closes the launcher (C12)");
+}
+
+static void launcher_closes_on_a_tap_elsewhere(void) {
+    cards_scene();
+    const char *ids[] = {"hello"};
+    const char *names[] = {"Hello"};
+    apps_lv_show_launcher(ids, names, 1, pick);
+    int launcher = fake_parent(fake_parent(fake_label("Hello")));
+    fake_tap(launcher);
+    CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(),
+          "a tap on no row closes the launcher and runs nothing (C12): %d", picks);
+    /* It opens again, rows and all. */
+    apps_lv_show_launcher(ids, names, 1, pick);
+    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && fake_children_of(launcher, "obj") == 1, "opens again");
+    fake_tap(fake_parent(fake_label("Hello")));
+    CHECK(picks == 1 && strcmp(picked, "hello") == 0, "and picks");
+}
+
+static void launcher_empty_state(void) {
+    cards_scene();
+    apps_lv_show_launcher(NULL, NULL, 0, pick);
+    int empty = fake_label("No apps yet. Ask Muse to make one.");
+    CHECK(empty > 0, "the empty state\n%s", log_peek());
+    int launcher = fake_parent(empty);
+    CHECK_CARD(launcher);
+    CHECK(fake_children_of(launcher, "obj") == 0, "no rows");
+    /* LVGL gives a tap on the text, which isn't clickable, to the launcher under it: that closes it (C12). */
+    CHECK(!fake_flag(empty, LV_OBJ_FLAG_CLICKABLE), "the text isn't clickable");
+    fake_tap(launcher);
+    CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN), "closed");
+}
+
+static void launcher_closes_on_a_right_swipe(void) {
+    cards_scene();
+    const char *ids[] = {"hello"};
+    const char *names[] = {"Hello"};
+    apps_lv_show_launcher(ids, names, 1, pick);
+    int row = fake_parent(fake_label("Hello")), launcher = fake_parent(row);
+    /* A swipe that starts on a row climbs to the launcher, which keeps it from the screen. */
+    fake_press(row);
+    fake_swipe(LV_DIR_LEFT);
+    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN), "a left swipe leaves it open");
+    log_clear();
+    fake_swipe(LV_DIR_RIGHT);
+    CHECK(fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "a right swipe closes it (C12)");
+    CHECK(log_has_line("wait_release"), "and the rest of the touch is nobody's\n%s", log_peek());
+    fake_lift();
+    CHECK(picks == 0, "the row the swipe began on isn't picked: %d", picks);
+}
+
+static void launcher_rows_are_its_own(void) {
+    cards_scene();
+    char first[] = "alpha";
+    const char *ids[] = {first, "bravo", "charlie", "delta", "echo", "foxtrot"};
+    const char *names[] = {"Alpha", "Bravo", "Charlie", "Delta", "Echo", NULL};
+    apps_lv_show_launcher(ids, names, 6, pick);
+    int launcher = fake_parent(fake_parent(fake_label("Alpha")));
+    CHECK(fake_children_of(launcher, "obj") == APPS_LV_LAUNCHER_ROWS, "at most %d rows: %d", APPS_LV_LAUNCHER_ROWS,
+          fake_children_of(launcher, "obj"));
+    CHECK(fake_label("Echo") < 0, "the fifth isn't shown");
+    memcpy(first, "zulu!", sizeof first);  /* the caller's text changes: the launcher kept a copy */
+    fake_tap(fake_parent(fake_label("Alpha")));
+    CHECK(picks == 1 && strcmp(picked, "alpha") == 0, "the copy is picked: '%s'", picked);
+    /* Shown again, it has the new rows only: the old ones are gone, and no call is made on them. */
+    const char *one_id[] = {"solo"};
+    const char *one_name[] = {NULL};  /* no name: the id stands in */
+    apps_lv_show_launcher(one_id, one_name, 1, pick);
+    CHECK(fake_children_of(launcher, "obj") == 1 && fake_label("solo") > 0 && fake_label("Alpha") < 0, "rebuilt\n%s", log_peek());
+    fake_tap(fake_parent(fake_label("solo")));
+    CHECK(picks == 2 && strcmp(picked, "solo") == 0, "picked: '%s'", picked);
+}
+
+static void crash_card_text_and_tap(void) {
+    cards_scene();
+    apps_lv_show_crash("Timer", "main.lua:3: boom");
+    int title = fake_label("Timer stopped"), body = fake_label("main.lua:3: boom"), hint = fake_label("Tap to close");
+    CHECK(title > 0 && body > 0 && hint > 0, "the card's text: %d %d %d\n%s", title, body, hint, log_peek());
+    int card = fake_parent(title);
+    CHECK_CARD(card);
+    CHECK(fake_parent(body) == card && fake_parent(hint) == card && !fake_flag(body, LV_OBJ_FLAG_HIDDEN), "one card");
+    CHECK(apps_lv_cards_shown() && !fake_flag(card, LV_OBJ_FLAG_HIDDEN), "shown");
+    fake_tap(card);
+    CHECK(fake_flag(card, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "a tap closes it");
+    /* The supervisor's card: a hung app has no error to show. */
+    apps_lv_show_crash("Timer", NULL);
+    CHECK(fake_label("Timer stopped responding") == title && fake_flag(body, LV_OBJ_FLAG_HIDDEN) && !fake_flag(card, LV_OBJ_FLAG_HIDDEN),
+          "stopped responding\n%s", log_peek());
+    apps_lv_show_crash(NULL, "x");
+    CHECK(fake_label("The app stopped") == title && fake_label("x") == body && !fake_flag(body, LV_OBJ_FLAG_HIDDEN), "no name");
+    /* The launcher, made with the card, sits under it. */
+    const char *ids[] = {"hello"};
+    const char *names[] = {"Hello"};
+    apps_lv_show_launcher(ids, names, 1, pick);
+    int launcher = fake_parent(fake_parent(fake_label("Hello")));
+    CHECK(fake_index(launcher) < fake_index(card), "a crash card over the launcher: %d %d", fake_index(launcher), fake_index(card));
+    apps_lv_hide_cards();
+    CHECK(fake_flag(card, LV_OBJ_FLAG_HIDDEN) && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "both closed");
+    CHECK(fake_alive_of("obj") == 3 + 1, "the layer, two cards and a row: %d", fake_alive_of("obj"));
+}
+
+/* The reset takes down the app's objects; the cards aren't on its layer, so a card shown before it stays. */
+static void cards_survive_a_reset(void) {
+    cards_scene();
+    apps_lv_show_crash("Timer", "main.lua:3: boom");
+    int card = fake_parent(fake_label("Timer stopped"));
+    int before = fake_alive();
+    apps_lv_reset();
+    CHECK(fake_alive() == before && !fake_flag(card, LV_OBJ_FLAG_HIDDEN) && apps_lv_cards_shown(), "the card is still up: %d of %d",
+          fake_alive(), before);
+}
+
+/* No layer, no cards: nothing is made, and nothing breaks. */
+static void cards_need_a_layer(void) {
+    fake_reset();
+    long before = lvgl_calls;
+    const char *ids[] = {"hello"};
+    const char *names[] = {"Hello"};
+    apps_lv_show_launcher(ids, names, 1, pick);
+    apps_lv_show_crash("Timer", "boom");
+    apps_lv_hide_cards();
+    CHECK(!apps_lv_cards_shown() && lvgl_calls == before, "no LVGL call: %ld\n%s", lvgl_calls - before, log_peek());
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -3999,6 +4272,14 @@ int main(int argc, char **argv) {
         {"a_pass_with_no_memory_is_a_skip", a_pass_with_no_memory_is_a_skip},
         {"many_widgets", many_widgets},
         {"fuzz", fuzz},
+        {"launcher_lists_apps_and_picks", launcher_lists_apps_and_picks},
+        {"launcher_closes_on_a_tap_elsewhere", launcher_closes_on_a_tap_elsewhere},
+        {"launcher_empty_state", launcher_empty_state},
+        {"launcher_closes_on_a_right_swipe", launcher_closes_on_a_right_swipe},
+        {"launcher_rows_are_its_own", launcher_rows_are_its_own},
+        {"crash_card_text_and_tap", crash_card_text_and_tap},
+        {"cards_survive_a_reset", cards_survive_a_reset},
+        {"cards_need_a_layer", cards_need_a_layer},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

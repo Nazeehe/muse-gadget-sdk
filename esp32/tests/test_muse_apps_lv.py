@@ -286,6 +286,32 @@ class HarnessTest(unittest.TestCase):
     def test_build_makes_the_layer_again(self):
         self.run_case("build_makes_the_layer_again")
 
+    # ---- The launcher and the crash card (Task 12) ----
+
+    def test_the_launcher_lists_apps_and_a_tap_runs_one(self):
+        self.run_case("launcher_lists_apps_and_picks")
+
+    def test_a_tap_on_no_row_closes_the_launcher(self):  # C12
+        self.run_case("launcher_closes_on_a_tap_elsewhere")
+
+    def test_the_launcher_with_no_apps(self):  # C12: the empty-state text closes it too
+        self.run_case("launcher_empty_state")
+
+    def test_a_right_swipe_closes_the_launcher(self):  # C12
+        self.run_case("launcher_closes_on_a_right_swipe")
+
+    def test_the_launcher_keeps_its_own_rows(self):
+        self.run_case("launcher_rows_are_its_own")
+
+    def test_the_crash_card(self):
+        self.run_case("crash_card_text_and_tap")
+
+    def test_a_reset_leaves_the_cards(self):
+        self.run_case("cards_survive_a_reset")
+
+    def test_no_layer_no_cards(self):
+        self.run_case("cards_need_a_layer")
+
     # ---- Random tables ----
 
     def test_random_tables_and_passes_make_no_call_on_a_dead_object(self):

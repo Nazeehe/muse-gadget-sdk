@@ -231,6 +231,8 @@ lv_obj_t *lv_bar_create(lv_obj_t *parent);
 lv_obj_t *lv_image_create(lv_obj_t *parent);
 void lv_obj_delete(lv_obj_t *obj);
 void lv_obj_clean(lv_obj_t *obj);
+int32_t lv_obj_get_index(const lv_obj_t *obj);
+void lv_obj_move_to_index(lv_obj_t *obj, int32_t index);
 
 void lv_obj_remove_style(lv_obj_t *obj, const lv_style_t *style, lv_style_selector_t selector);
 void lv_obj_remove_style_all(lv_obj_t *obj);

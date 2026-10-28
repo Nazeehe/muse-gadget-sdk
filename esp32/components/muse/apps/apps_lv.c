@@ -1062,14 +1062,18 @@ static void on_launcher_tap(lv_event_t *e) {
     close_launcher();
 }
 
+/* Any swipe: the row it began on gets no click (LVGL would click it at the lift, as nothing scrolled). Only a right
+ * swipe closes the launcher (C12); the others do nothing. */
 static void on_launcher_gesture(lv_event_t *e) {
     (void)e;
     lv_indev_t *indev = lv_indev_active();
-    if (indev == NULL || lv_indev_get_gesture_dir(indev) != LV_DIR_RIGHT) {
+    if (indev == NULL) {
         return;
     }
-    lv_indev_wait_release(indev);  /* the row the swipe began on gets no click */
-    close_launcher();
+    lv_indev_wait_release(indev);
+    if (lv_indev_get_gesture_dir(indev) == LV_DIR_RIGHT) {
+        close_launcher();
+    }
 }
 
 /* The row's own copy of its id: the launcher closes first (pick may open another card), and pick only posts. Nothing

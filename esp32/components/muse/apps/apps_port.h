@@ -44,9 +44,10 @@ void *apps_port_realloc(void *ptr, size_t n);
 void apps_port_free(void *ptr);  /* NULL is ignored. Any task. */
 
 /* One line of an app's log (what print wrote), for the development loop: the device prints
- * "@app.log <id> <line>" on the console. line is one line of valid UTF-8, at most 200 bytes, with no
- * newline and no control byte but tab, NUL-terminated. It returns promptly: the app task is waiting on
- * it, with its CPU budget running. */
+ * "@app.log <id> <line>" on the console, at most 1,024 bytes of them a second (apps_echo.h); a line past
+ * that isn't printed, and the next printed one comes after "@app.log <id> (<N> lines not echoed)". line
+ * is one line of valid UTF-8, at most 200 bytes, with no newline and no control byte but tab,
+ * NUL-terminated. It returns promptly: the app task is waiting on it, with its CPU budget running. */
 void apps_port_log(const char *app_id, const char *line);
 
 /* Makes what the port needs before anything here is used: the firmware's UI lock (a static mutex). The app task's

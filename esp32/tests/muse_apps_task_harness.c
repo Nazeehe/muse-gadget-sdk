@@ -134,6 +134,7 @@ int64_t esp_timer_get_time(void) {
 static pthread_mutex_t events_mu = PTHREAD_MUTEX_INITIALIZER;
 static char *events[EVENTS_MAX];
 static int n_events;
+static atomic_bool events_full;  /* an event was dropped: no check of the log can be trusted, and the case fails */
 
 static void event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void event(const char *fmt, ...) {
@@ -145,6 +146,8 @@ static void event(const char *fmt, ...) {
     pthread_mutex_lock(&events_mu);
     if (n_events < EVENTS_MAX) {
         events[n_events++] = strdup(text);
+    } else {
+        atomic_store(&events_full, true);
     }
     pthread_mutex_unlock(&events_mu);
 }
@@ -234,10 +237,18 @@ static void error(const char *fmt, ...) {
     event("ERROR %s", text);
 }
 
+/* A full log drops events, and then neither a wait nor an absence means anything: the case fails. */
+static void log_trusted_at(int line) {
+    if (atomic_load(&events_full)) {
+        fail_at(line, "the event log is full (%d events): its checks can't be trusted", EVENTS_MAX);
+    }
+}
+
 /* Waits up to ms of real time for an event that starts with prefix, at or after from, and returns its index. */
 static int wait_event_at(int line, int from, const char *prefix, int ms) {
     int64_t until = real_ms() + ms;
     for (;;) {
+        log_trusted_at(line);
         int i = at_from(from, prefix);
         if (i >= 0) {
             return i;
@@ -251,6 +262,7 @@ static int wait_event_at(int line, int from, const char *prefix, int ms) {
 #define WAIT(from, prefix) wait_event_at(__LINE__, (from), (prefix), 5000)
 
 static void ordered_at(int line, int from, const char *first, const char *then) {
+    log_trusted_at(line);
     int a = at_from(from, first), b = at_from(from, then);
     if (a < 0 || b < 0 || a > b) {
         fail_at(line, "'%s' (%d) should come before '%s' (%d), both after %d", first, a, then, b, from);
@@ -259,6 +271,7 @@ static void ordered_at(int line, int from, const char *first, const char *then) 
 #define ORDERED(from, first, then) ordered_at(__LINE__, (from), (first), (then))
 
 static void absent_at(int line, int from, const char *prefix) {
+    log_trusted_at(line);
     int i = at_from(from, prefix);
     if (i >= 0) {
         fail_at(line, "'%s' at %d: there should be no '%s' after %d", events[i], i, prefix, from);
@@ -285,18 +298,22 @@ static struct {
 
 static void watch(const void *ptr, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void watch(const void *ptr, const char *fmt, ...) {
+    bool room = false;
     pthread_mutex_lock(&heap_mu);
-    for (size_t i = 0; i < ARRAY_LEN(watched); i++) {
+    for (size_t i = 0; i < ARRAY_LEN(watched) && !room; i++) {
         if (watched[i].ptr == NULL) {
             watched[i].ptr = ptr;
             va_list ap;
             va_start(ap, fmt);
             vsnprintf(watched[i].label, sizeof watched[i].label, fmt, ap);
             va_end(ap);
-            break;
+            room = true;
         }
     }
     pthread_mutex_unlock(&heap_mu);
+    if (!room) {
+        error("more than %zu watched blocks: a free could go unseen", ARRAY_LEN(watched));
+    }
 }
 
 /* The label of a watched block, or "?". */
@@ -313,6 +330,7 @@ static const char *watched_label(const void *ptr, char *out, size_t cap) {
 }
 
 static bool ui_held_by_me(void);
+static void forget_table(const void *ptr);
 
 void *apps_port_realloc(void *ptr, size_t n) {
     if (n == 0) {
@@ -355,6 +373,9 @@ void apps_port_free(void *ptr) {
     if (label[0] != '\0') {
         event("free %s", label);
     }
+    if (strncmp(label, "table#", 6) == 0) {
+        forget_table(ptr);
+    }
     free(b);
 }
 
@@ -365,10 +386,17 @@ static size_t held_now(size_t *counter) {
     return n;
 }
 
-/* heap_caps_*: the app task's own blocks (its record and its requests), which must be PSRAM. */
+/* heap_caps_*: the app task's own blocks (its record and its requests), which must be PSRAM. A case can make the next
+ * ones fail (out of memory). */
+static atomic_int caps_failures;
+
 void *heap_caps_malloc(size_t size, uint32_t caps) {
     if ((caps & MALLOC_CAP_SPIRAM) == 0) {
         error("heap_caps_malloc of %zu bytes not in PSRAM (caps 0x%x)", size, (unsigned)caps);
+    }
+    if (atomic_load(&caps_failures) > 0) {
+        atomic_fetch_sub(&caps_failures, 1);
+        return NULL;
     }
     block_t *b = malloc(sizeof *b + (size ? size : 1));
     if (b == NULL) {
@@ -419,12 +447,21 @@ static bool ui_held_by_me(void) {
     return mine;
 }
 
+static bool on_lvgl_task(void);
+static struct fake_task *app_task_of_thread(void);
+
 void apps_port_ui_lock(void) {
     if (ui_held_by_me()) {
         error("apps_port_ui_lock taken again by its holder");
         return;
     }
     pthread_mutex_lock(&ui_mu);
+    if (ui_held) {
+        /* Someone holds it: a case can wait for this instead of sleeping. */
+        pthread_mutex_unlock(&ui_mu);
+        event("ui_lock wait %s", app_task_of_thread() != NULL ? "app" : on_lvgl_task() ? "lvgl" : "case");
+        pthread_mutex_lock(&ui_mu);
+    }
     while (ui_held) {
         pthread_cond_wait(&ui_cv, &ui_mu);
     }
@@ -557,6 +594,11 @@ static struct fake_task *self_task(void) {
     return current_task != NULL ? current_task : &thread_task;
 }
 
+/* The app task, when this thread is it; NULL on the LVGL task and the case's threads. */
+static struct fake_task *app_task_of_thread(void) {
+    return current_task;
+}
+
 static void *task_main(void *arg) {
     struct fake_task *task = arg;
     current_task = task;
@@ -661,7 +703,35 @@ static bool has_item(const struct fake_queue *q) {
     return q->count > 0;
 }
 
+/* What a post asked of the queue: the LVGL task and apps_task_launch never wait (C5, the rulings), whatever the
+ * queue holds, so what they pass is recorded, not timed. */
+static _Atomic(TickType_t) lvgl_longest_send, launch_longest_send;
+static _Thread_local bool in_launch;  /* this thread is inside apps_task_launch (the case marks it) */
+static const char *const EVENT_NAMES[] = {"?", "TOUCH", "RUN", "STOP", "COMPILE", "MESSAGE", "SHOW", "HIDE", "ALARM", "EXIT",
+                                          "WAKE"};
+
+static void note_send(const void *item, size_t item_size, TickType_t wait) {
+    _Atomic(TickType_t) *longest = on_lvgl_task() ? &lvgl_longest_send : in_launch ? &launch_longest_send : NULL;
+    if (longest != NULL && wait > atomic_load(longest)) {
+        atomic_store(longest, wait);
+    }
+    if (item_size == sizeof(apps_event_t)) {
+        uint8_t type = ((const apps_event_t *)item)->type;
+        if (type != APPS_EV_TOUCH) {  /* touches come by the dozen: their count is checked instead */
+            event("queue %s wait %u", type < ARRAY_LEN(EVENT_NAMES) ? EVENT_NAMES[type] : "?", (unsigned)wait);
+        }
+    }
+}
+
+UBaseType_t uxQueueSpacesAvailable(QueueHandle_t q) {
+    pthread_mutex_lock(&q->mu);
+    UBaseType_t spaces = (UBaseType_t)(q->length - q->count);
+    pthread_mutex_unlock(&q->mu);
+    return spaces;
+}
+
 BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t wait) {
+    note_send(item, q->item_size, wait);
     pthread_mutex_lock(&q->mu);
     if (!queue_wait(q, wait, has_room)) {
         pthread_mutex_unlock(&q->mu);
@@ -696,18 +766,77 @@ struct fake_mutex {
     pthread_cond_t cv;
     bool held;
     pthread_t holder;
+    int number;  /* in the order made: muse_apps_start makes the record's (1), the requests' (2) and the names' (3) */
 };
 _Static_assert(sizeof(struct fake_mutex) <= sizeof(StaticSemaphore_t), "a fake mutex fits in its buffer");
+
+enum { MUTEX_RECORD = 1, MUTEX_REQUESTS = 2, MUTEX_NAMES = 3 };
+static atomic_int n_mutexes;
 
 SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer) {
     struct fake_mutex *m = (struct fake_mutex *)(void *)buffer->opaque;
     pthread_mutex_init(&m->mu, NULL);
     pthread_cond_init(&m->cv, NULL);
     m->held = false;
+    m->number = atomic_fetch_add(&n_mutexes, 1) + 1;
     return m;
 }
 
+/* A gate on one mutex: the next take of it by the app task (or by a thread of the case that marked itself), after a
+ * given event, stops before taking it until the case opens the gate. It puts another task's step in between two of
+ * the app task's, or between a caller's read and its lock, where only a race could otherwise put it. */
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int number;
+    bool by_app_task;
+    char after[80];
+    int from;
+    bool armed, open;
+} gate = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+static _Thread_local bool gated_thread;
+
+static void gate_arm(int number, bool by_app_task, int from, const char *after) {
+    pthread_mutex_lock(&gate.mu);
+    gate.number = number;
+    gate.by_app_task = by_app_task;
+    gate.from = from;
+    snprintf(gate.after, sizeof gate.after, "%s", after != NULL ? after : "");
+    gate.armed = true;
+    gate.open = false;
+    pthread_mutex_unlock(&gate.mu);
+}
+
+static void gate_open(void) {
+    pthread_mutex_lock(&gate.mu);
+    gate.open = true;
+    pthread_cond_broadcast(&gate.cv);
+    pthread_mutex_unlock(&gate.mu);
+}
+
+static void gate_check(const struct fake_mutex *m) {
+    pthread_mutex_lock(&gate.mu);
+    bool mine = gate.armed && m->number == gate.number && (gate.by_app_task ? app_task_of_thread() != NULL : gated_thread);
+    int from = gate.from;
+    char after[80];
+    snprintf(after, sizeof after, "%s", gate.after);
+    pthread_mutex_unlock(&gate.mu);
+    if (!mine || (after[0] != '\0' && at_from(from, after) < 0)) {
+        return;
+    }
+    pthread_mutex_lock(&gate.mu);
+    gate.armed = false;
+    pthread_mutex_unlock(&gate.mu);
+    event("gate %d", m->number);
+    pthread_mutex_lock(&gate.mu);
+    while (!gate.open) {
+        pthread_cond_wait(&gate.cv, &gate.mu);
+    }
+    pthread_mutex_unlock(&gate.mu);
+}
+
 BaseType_t xSemaphoreTake(SemaphoreHandle_t m, TickType_t wait) {
+    gate_check(m);
     struct timespec deadline = deadline_in((int64_t)wait);
     pthread_mutex_lock(&m->mu);
     if (m->held && pthread_equal(m->holder, pthread_self())) {
@@ -787,6 +916,17 @@ static int lv_n_objects;
 static apps_ui_t *lv_objects_table;  /* the table they were made for */
 static volatile unsigned lv_drawn;   /* what the draws read, so they can't be left out */
 
+/* A freed table's number isn't given to a new table at the same address (an allocator with no quarantine reuses it). */
+static void forget_table(const void *ptr) {
+    pthread_mutex_lock(&lv_mu);
+    for (int i = 0; i < lv_n_tables; i++) {
+        if (lv_tables[i] == ptr) {
+            lv_tables[i] = NULL;
+        }
+    }
+    pthread_mutex_unlock(&lv_mu);
+}
+
 static int table_number(apps_ui_t *ui) {
     for (int i = 0; i < lv_n_tables; i++) {
         if (lv_tables[i] == ui) {
@@ -794,6 +934,7 @@ static int table_number(apps_ui_t *ui) {
         }
     }
     if (lv_n_tables == (int)ARRAY_LEN(lv_tables)) {
+        error("more than %zu tables published: they can't be told apart", ARRAY_LEN(lv_tables));
         return 0;
     }
     lv_tables[lv_n_tables++] = ui;
@@ -897,9 +1038,11 @@ bool apps_lv_apply(bool in_callback) {
         w->dirty = 0;
         w->rx = 200;
         w->ry = 220;
-        w->rw = 66;
+        w->rw = w->text != NULL && strcmp(w->text, "zero width") == 0 ? 0 : 66;
         w->rh = 26;
-        w->overflow = (int16_t)(overflow_rule != NULL && !w->hidden ? overflow_rule(w) : 0);
+        /* The rule's value even for a hidden widget (stale, as if left from before it was hidden): the app task must
+         * skip hidden and zero-width widgets itself. */
+        w->overflow = (int16_t)(overflow_rule != NULL ? overflow_rule(w) : 0);
     }
     pthread_mutex_unlock(&lv_mu);
     apps_port_ui_unlock();
@@ -988,7 +1131,8 @@ static void (*job)(void *);
 static void *job_arg;
 static bool job_done;
 static atomic_bool lvgl_paused, lvgl_asleep, lvgl_quit;
-static atomic_uint frames;
+static atomic_uint frames, paused_rounds;
+static atomic_bool last_tick;  /* what muse_apps_ui_tick returned at the last frame: frame_tick returns early on true */
 
 static void *lvgl_main(void *arg) {
     (void)arg;
@@ -1010,13 +1154,26 @@ static void *lvgl_main(void *arg) {
             lv_draw();
             muse_apps_ui_supervise();
             if (!atomic_load(&lvgl_asleep)) {
-                (void)muse_apps_ui_tick();
+                atomic_store(&last_tick, muse_apps_ui_tick());
             }
             atomic_fetch_add(&frames, 1);
+        } else {
+            atomic_fetch_add(&paused_rounds, 1);
         }
         sleep_ms(3);
     }
     return NULL;
+}
+
+/* LVGL pauses (as on battery, asleep and dark): once this returns, no frame is under way and none starts. */
+static void pause_lvgl(void) {
+    atomic_store(&lvgl_paused, true);
+    unsigned seen = atomic_load(&paused_rounds);
+    int64_t until = real_ms() + 5000;
+    while (atomic_load(&paused_rounds) - seen < 2) {  /* a whole paused round after the one the flag may have met */
+        CHECK(real_ms() < until, "the LVGL task never saw the pause");
+        sleep_ms(1);
+    }
 }
 
 /* Runs fn(arg) on the LVGL task, between frames, and waits for it. */
@@ -1152,6 +1309,28 @@ static apps_status_t *new_status(void) {
     return st;
 }
 
+/* The queue is first in, first out: once a compile posted now has its answer, everything posted before it (a launch,
+ * touches) has been handled, and the loop's housekeeping has run since. */
+static void fifo_sync_at(int line) {
+    static const char tiny[] = "return {}\n";
+    const file_t files[] = {{"main.lua", tiny, sizeof tiny - 1}};
+    apps_pkg_t *p = make_pkg("sync", "Sync", files, 1);
+    char err[200];
+    bool ok = apps_task_compile(p, err, sizeof err);
+    free_pkg(p);
+    if (!ok) {
+        fail_at(line, "the sync compile failed: %s", err);
+    }
+}
+#define FIFO_SYNC() fifo_sync_at(__LINE__)
+
+/* apps_task_launch, with what it passes the queue recorded (it must never wait). */
+static void launch(const char *id, bool front) {
+    in_launch = true;
+    apps_task_launch(id, front);
+    in_launch = false;
+}
+
 static const char APP_HELLO[] =
     "local app = {}\n"
     "function app.start() print('start') ui.label{text = 'Hello'} end\n"
@@ -1182,6 +1361,12 @@ static lv_obj_t *const SCREEN = (lv_obj_t *)(uintptr_t)0x5c5e;  /* the fake apps
 
 /* ---- The cases ---- */
 
+/* apps_task_stop: true when the app stopped (or none ran), otherwise false with why in err (F3). */
+static bool stop_app(char *err, size_t err_len) {
+    return apps_task_stop(err, err_len);
+}
+
+
 /* What muse_ui does at boot: the layer under the display lock, the frame timer, then the app task. */
 static size_t caps_after_start;
 
@@ -1191,6 +1376,7 @@ static void boot(void) {
     building = false;
     pthread_t thread;
     CHECK(pthread_create(&thread, NULL, lvgl_main, NULL) == 0, "no LVGL thread");
+    pthread_detach(thread);  /* it runs until the case exits, like the app task */
     while (!atomic_load(&lvgl_up)) {
         sleep_ms(1);
     }
@@ -1207,7 +1393,7 @@ static void finish(void) {
     atomic_store(&lvgl_asleep, false);
     release_print();
     clock_go();
-    apps_task_stop();
+    (void)stop_app(NULL, 0);
     int64_t until = real_ms() + 5000;
     while ((held_now(&port_held) != 0 || held_now(&caps_held) != caps_after_start) && real_ms() < until) {
         sleep_ms(5);
@@ -1216,8 +1402,13 @@ static void finish(void) {
     CHECK(held_now(&caps_held) == caps_after_start, "%zu bytes of the app task's own still held (%zu after start)",
           held_now(&caps_held), caps_after_start);
     CHECK(errors == 0, "%d errors, the first: %s", errors, error_note);
-    CHECK(atomic_load(&longest_receive) <= pdMS_TO_TICKS(1000), "the app task waited %u ticks for an event: at most 1000 (C22)",
+    CHECK(!atomic_load(&events_full), "the event log filled up (%d events): the case's checks can't be trusted", EVENTS_MAX);
+    CHECK(atomic_load(&longest_receive) <= 1000, "the app task waited %u ticks for an event: at most 1000 (C22)",
           (unsigned)atomic_load(&longest_receive));
+    CHECK(atomic_load(&lvgl_longest_send) == 0, "the LVGL task waited %u ticks to post: it never waits",
+          (unsigned)atomic_load(&lvgl_longest_send));
+    CHECK(atomic_load(&launch_longest_send) == 0, "apps_task_launch waited %u ticks to post: it never waits (C5)",
+          (unsigned)atomic_load(&launch_longest_send));
     atomic_store(&lvgl_quit, true);
 }
 
@@ -1231,8 +1422,10 @@ static void task_shape(void) {
     ORDERED(0, "port init", "task muse_apps");
     ORDERED(0, "build screen", "task muse_apps");
     /* Idle, its loop still comes round at least once a second (C22: finish() checks the waits). */
-    sleep_ms(1200);
-    CHECK(atomic_load(&longest_receive) > 0, "the app task waits for events");
+    for (int64_t until = real_ms() + 5000; atomic_load(&longest_receive) == 0;) {
+        CHECK(real_ms() < until, "the app task never waited for an event");
+        sleep_ms(1);
+    }
     apps_status_t *st = new_status();
     apps_task_status(st);
     CHECK(st->state == APPS_STATE_STOPPED && st->id[0] == '\0' && !st->front, "no app yet");
@@ -1251,6 +1444,13 @@ static void run_and_status(void) {
     CHECK(st->limit_kb == 256 && st->mem_kb > 0 && st->peak_kb >= st->mem_kb && st->instructions > 0, "memory %u/%u/%u, %llu instructions",
           st->mem_kb, st->peak_kb, st->limit_kb, (unsigned long long)st->instructions);
     CHECK(st->widgets == 1 && st->front && st->stack_free == 40000, "widgets %d front %d stack %u", st->widgets, st->front, st->stack_free);
+    /* show() comes from the LVGL task's fronting, which a stalled host can put after the settle: wait for it, then for a
+     * refresh of the record (at most once a second while the app runs), rather than for the clock. */
+    CHECK(strcmp(st->log_tail, "start") == 0 || strcmp(st->log_tail, "start\nshow") == 0, "the log: '%s'", st->log_tail);
+    WAIT(from, "print hello show");
+    clock_jump(1001);
+    FIFO_SYNC();
+    apps_task_status(st);
     CHECK(strcmp(st->log_tail, "start\nshow") == 0, "the log: '%s'", st->log_tail);
     CHECK(strstr(st->ui_dump, "\"id\":\"label#0\"") != NULL && st->ui_truncated == 0, "the dump: %s", st->ui_dump);
     CHECK(st->warnings[0] == '\0' && st->last_error[0] == '\0', "no warnings: '%s', no error: '%s'", st->warnings, st->last_error);
@@ -1266,7 +1466,7 @@ static void run_and_status(void) {
           apps_state_name(again->state), again->id, again->front);
     /* Stop: stop() runs, the app goes, the layer goes behind. */
     from = mark();
-    apps_task_stop();
+    CHECK(stop_app(err, sizeof err) && err[0] == '\0', "stop: '%s'", err);
     ORDERED(from, "print hello stop", "set_ui NULL");
     WAIT(from, "front 0");
     CHECK(at_from(from, "log I stop hello: stopped, peak ") >= 0, "the stop line");
@@ -1285,7 +1485,7 @@ static void stop_tears_down_in_order(void) {
     WAIT(0, "object image pic/a.bin");
     WAIT_FRAMES(3);
     int from = mark();
-    apps_task_stop();
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
     WAIT(from, "free pkg pic");
     ORDERED(from, "print pic stop", "set_ui NULL");
     ORDERED(from, "set_ui NULL", "free table#1");
@@ -1302,14 +1502,13 @@ static void a_late_reset_parks_the_images(void) {
     char err[200];
     CHECK(apps_task_run(make_pkg("one", "One", PICTURE, 2), true, 100, NULL, err, sizeof err), "run: %s", err);
     WAIT(0, "object image one/a.bin");
-    atomic_store(&lvgl_paused, true);
-    sleep_ms(20);  /* a frame that had begun is over */
+    pause_lvgl();
     int from = mark();
     int64_t start = real_ms();
-    apps_task_stop();
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
     int64_t took = real_ms() - start;
-    CHECK(took >= APPS_TASK_RESET_MS - 20 && took < APPS_TASK_WAIT_MS, "the stop waited for the reset, at most %d ms: %lld ms",
-          APPS_TASK_RESET_MS, (long long)took);
+    CHECK(took >= 500 - 20 && took < 2000, "the stop waited for the reset, at most 500 ms: %lld ms", (long long)took);
+    CHECK(count_from(from, "log W the screen didn't take the app down within 500 ms") == 1, "the wait's end is logged");
     ORDERED(from, "print one stop", "set_ui NULL");
     CHECK(at_from(from, "free table#1") >= 0, "the runtime is freed, its table unpublished");
     ABSENT(from, "reset");
@@ -1358,6 +1557,9 @@ static const char APP_START_CRASH[] =
     "end\n"
     "return app\n";
 
+/* A crash in start(): the run fails with it and the record keeps it. Its table was never published, so nothing points
+ * into its package: it goes at once, with no reset asked and no wait (F1), and its card comes at the next frame. After
+ * an app whose reset hasn't run yet (LVGL paused), the card waits for that reset. */
 static void a_crash_in_start_is_contained(void) {
     const file_t files[] = {LUA("main.lua", APP_START_CRASH)};
     apps_status_t *st = new_status();
@@ -1368,15 +1570,28 @@ static void a_crash_in_start_is_contained(void) {
     CHECK(st->state == APPS_STATE_CRASHED && strncmp(st->last_error, "main.lua:4: boom\nstack traceback:", 33) == 0,
           "the record: %s '%s'", apps_state_name(st->state), st->last_error);
     CHECK(strcmp(st->log_tail, "starting") == 0, "the log: '%s'", st->log_tail);
-    int reset = WAIT(from, "reset");
-    int card = WAIT(from, "crash Crashy | main.lua:4: boom");
-    CHECK(reset < card, "the card after the reset: %d %d", reset, card);
-    ORDERED(from, "reset", "free pkg crashy");
+    WAIT(from, "free pkg crashy");
+    WAIT(from, "crash Crashy | main.lua:4: boom");
+    ABSENT(from, "reset");
+    ABSENT(from, "log W the screen didn't take");
     ABSENT(from, "set_ui table");
     ABSENT(from, "front 1");
     CHECK(at_from(from, "log I stop crashy: crashed, peak ") >= 0, "the stop line");
     apps_task_status(st);
     CHECK(st->state == APPS_STATE_CRASHED && strcmp(st->id, "crashy") == 0, "the status: %s %s", apps_state_name(st->state), st->id);
+    CHECK(apps_task_run(make_pkg("pic", "Picture", PICTURE, 2), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "object image pic/a.bin");
+    pause_lvgl();
+    int later = mark();
+    CHECK(!apps_task_run(make_pkg("crashy", "Crashy", files, 1), true, 0, NULL, err, sizeof err), "a crash isn't a run");
+    WAIT(later, "free pkg crashy");
+    CHECK(count_from(later, "log W the screen didn't take the app down") == 1, "only the picture's end waited");
+    ABSENT(later, "crash ");
+    atomic_store(&lvgl_paused, false);
+    int card = WAIT(later, "crash Crashy | main.lua:4: boom");
+    int reset = WAIT(later, "reset");
+    CHECK(reset < card, "the card after the reset it waits for: %d %d", reset, card);
+    ORDERED(later, "reset", "free pkg pic");
     heap_caps_free(st);
 }
 
@@ -1420,9 +1635,10 @@ static void a_crash_at_the_top_level_is_contained(void) {
     CHECK(strcmp(err, "crashed loading main.lua: main.lua:2: top") == 0, "err: '%s'", err);
     CHECK(st->state == APPS_STATE_CRASHED && strcmp(st->log_tail, "loading") == 0, "the record: %s '%s'", apps_state_name(st->state),
           st->log_tail);
-    int reset = WAIT(from, "reset");
-    CHECK(reset < WAIT(from, "crash Top | main.lua:2: top"), "the card after the reset");
-    ORDERED(from, "reset", "free pkg top");
+    /* Its table was never published: the package goes at once, no reset is asked, and the card comes (F1). */
+    WAIT(from, "free pkg top");
+    WAIT(from, "crash Top | main.lua:2: top");
+    ABSENT(from, "reset");
     heap_caps_free(st);
 }
 
@@ -1487,9 +1703,9 @@ static void a_hung_call_is_abandoned(void) {
     queued_pkg = make_pkg("queued", "Queued", HELLO, 1);
     pthread_t caller;
     CHECK(pthread_create(&caller, NULL, queued_caller, NULL) == 0, "no caller thread");
-    sleep_ms(50);  /* it has posted, and waits */
+    WAIT(from, "queue RUN wait");  /* it has posted, and waits */
     CHECK(!atomic_load(&queued_done), "the run waits behind the stuck call");
-    clock_stop_at(t0 + APPS_TASK_HUNG_MS);
+    clock_stop_at(t0 + 3000);
     WAIT_FRAMES(10);
     ABSENT(from, "crash ");
     ABSENT(from, "priority muse_apps");
@@ -1497,7 +1713,7 @@ static void a_hung_call_is_abandoned(void) {
     apps_status_t *st = new_status();
     apps_task_status(st);
     CHECK(st->state == APPS_STATE_RUNNING, "3000 ms isn't hung: %s", apps_state_name(st->state));
-    clock_stop_at(t0 + APPS_TASK_HUNG_MS + 1);
+    clock_stop_at(t0 + 3001);
     int card = WAIT(from, "crash Hangy | (stopped responding)");
     CHECK(at_from(from, "front 0") >= 0 && at_from(from, "front 0") < card, "the layer goes behind");
     CHECK(at_from(from, "priority muse_apps 1") >= 0, "the app task drops to priority 1");
@@ -1509,8 +1725,7 @@ static void a_hung_call_is_abandoned(void) {
     CHECK(atomic_load(&queued_done), "the waiting run gave up when the app hung");
     pthread_join(caller, NULL);
     CHECK(!queued_ok && strcmp(queued_err, HUNG_MESSAGE) == 0, "the waiting run: '%s'", queued_err);
-    /* Every call answers at once, and none posts. */
-    int64_t start = real_ms();
+    /* Every call answers at once: none posts. */
     apps_task_status(st);
     CHECK(st->state == APPS_STATE_HUNG, "the status: %s", apps_state_name(st->state));
     int asked = mark();
@@ -1520,9 +1735,10 @@ static void a_hung_call_is_abandoned(void) {
     apps_pkg_t *p = make_pkg("other", "Other", HELLO, 1);
     CHECK(!apps_task_compile(p, err, sizeof err) && strcmp(err, HUNG_MESSAGE) == 0, "compile: '%s'", err);
     free_pkg(p);
-    apps_task_stop();
-    apps_task_launch("hangy", true);
-    CHECK(real_ms() - start < 500, "they answered at once: %lld ms", (long long)(real_ms() - start));
+    CHECK(!stop_app(err, sizeof err) && strcmp(err, HUNG_MESSAGE) == 0, "stop: '%s'", err);
+    CHECK(count_from(asked, "log W stop: " HUNG_MESSAGE) == 1, "a refused stop says so, once");
+    launch("hangy", true);
+    ABSENT(asked, "queue ");
     ABSENT(from, "front 1");
     ABSENT(from, "print other");
     /* The call comes back: nothing of the app runs again (no stop()), its state goes in the teardown's order, and the task
@@ -1553,9 +1769,12 @@ static const char APP_SLOW_STOP[] =
     "function app.stop() print('stopping') end\n"
     "return app\n";
 
+static char stop_caller_err[200];
+static bool stop_caller_ok;
+
 static void *stop_caller(void *arg) {
     (void)arg;
-    apps_task_stop();
+    stop_caller_ok = stop_app(stop_caller_err, sizeof stop_caller_err);
     return NULL;
 }
 
@@ -1574,10 +1793,13 @@ static void a_hung_stop_is_abandoned(void) {
     CHECK(pthread_create(&caller, NULL, stop_caller, NULL) == 0, "no caller thread");
     WAIT_PRINT_BLOCKED();
     int64_t start = real_ms();
-    clock_stop_at(t0 + APPS_TASK_HUNG_MS + 1);
+    clock_stop_at(t0 + 3001);
     int card = WAIT(from, "crash Slow | (stopped responding)");
     pthread_join(caller, NULL);
     CHECK(real_ms() - start < 1500, "the stop's caller returned once the app hung: %lld ms", (long long)(real_ms() - start));
+    CHECK(!stop_caller_ok && strcmp(stop_caller_err, HUNG_MESSAGE) == 0, "the stop failed with the hung message: '%s'",
+          stop_caller_err);
+    CHECK(count_from(from, "log W stop: " HUNG_MESSAGE) == 1, "and logged it once");
     CHECK(at_from(from, "front 0") >= 0 && at_from(from, "front 0") < card, "the layer goes behind");
     CHECK(at_from(from, "priority muse_apps 1") >= 0, "the app task drops to priority 1");
     ABSENT(from, "set_ui NULL");  /* nothing is taken from the app while its stop() runs */
@@ -1598,8 +1820,8 @@ static void a_hung_stop_is_abandoned(void) {
     heap_caps_free(st);
 }
 
-/* C5: a launch posts and returns, even while the app task is busy in a call (the clock stopped: busy, not hung). The
- * status doesn't wait either. */
+/* C5: a launch posts and returns, even while the app task is busy in a call (the clock stopped: busy, not hung). What
+ * it passes the queue is recorded and must be no wait (finish() checks it); the status posts nothing. */
 static void a_launch_never_waits(void) {
     char err[200];
     CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 50, NULL, err, sizeof err), "run: %s", err);
@@ -1609,12 +1831,13 @@ static void a_launch_never_waits(void) {
     TAP(0);
     WAIT_PRINT_BLOCKED();
     int from = mark();
-    int64_t start = real_ms();
-    apps_task_launch("busy", true);
-    apps_task_launch("nosuch", true);
+    launch("busy", true);
+    launch("nosuch", true);
+    CHECK(count_from(from, "queue RUN wait 0") == 2, "both launches posted with no wait");
     apps_status_t *st = new_status();
+    int asked = mark();
     apps_task_status(st);
-    CHECK(real_ms() - start < 200, "a launch and a status don't wait: %lld ms", (long long)(real_ms() - start));
+    ABSENT(asked, "queue ");
     CHECK(st->state == APPS_STATE_RUNNING && strcmp(st->id, "busy") == 0, "the status: %s", apps_state_name(st->state));
     WAIT_FRAMES(5);
     ABSENT(from, "front 1");
@@ -1623,21 +1846,21 @@ static void a_launch_never_waits(void) {
     WAIT(from, "front 1");
     WAIT(from, "print busy show");
     WAIT(from, "log W launch nosuch: ");
-    /* Nor does it wait for room in a full queue: it is dropped, and the log says so. */
+    /* Nor does it wait for room in a queue full of requests: it is dropped, and the log says so. */
     clock_stop_at(apps_port_mono_ms());
     block_print("busy");
     TAP(0);
     WAIT_PRINT_BLOCKED();
-    for (int i = 0; i < 20; i++) {
-        TAP(0);
-    }
     int full = mark();
-    start = real_ms();
-    apps_task_launch("busy", true);
-    CHECK(real_ms() - start < 200, "a launch into a full queue doesn't wait: %lld ms", (long long)(real_ms() - start));
-    CHECK(at_from(full, "log W launch busy: the app task is busy; try again") >= 0, "the log says it was dropped");
+    for (int i = 0; i < 16; i++) {
+        launch("busy", false);
+    }
+    ABSENT(full, "log W launch busy: ");
+    launch("busy", false);
+    CHECK(at_from(full, "log W launch busy: the app task is busy; try again") >= 0, "the 17th is dropped, and logged");
     release_print();
     clock_go();
+    FIFO_SYNC();
     heap_caps_free(st);
 }
 
@@ -1657,6 +1880,9 @@ static int overflow_of(const apps_widget_t *w) {
     if (strcmp(w->text, "line one\nline two") == 0) {
         return 3;
     }
+    if (strcmp(w->text, "zero width") == 0) {
+        return 4;  /* the fake lays it out 0 px wide: nothing of it is on screen */
+    }
     return strncmp(w->text, "xxxx", 4) == 0 ? 7 : 0;
 }
 
@@ -1669,12 +1895,15 @@ static const char APP_WIDE[] =
     "  ui.label{text = 'hidden', hidden = true}\n"
     "  ui.label{text = 'line one\\nline two'}\n"
     "  ui.label{text = string.rep('x', 60)}\n"
+    "  ui.label{text = 'zero width'}\n"
     "end\n"
     "app.strat = function() end\n"
     "return app\n";
 
 /* Run step 7: after a pass has laid the widgets out, each visible one past the round edge is a warning, after the
- * manifest's and main.lua's. */
+ * manifest's and main.lua's. A hidden widget (the fake leaves a stale overflow on it) and one laid out 0 px wide are
+ * not on screen, so they are not warned about. The text is a contract (Task 13 hands it to the developer as it is), so
+ * it is compared whole. */
 static void overflow_warnings(void) {
     overflow_rule = overflow_of;
     const file_t files[] = {LUA("main.lua", APP_WIDE)};
@@ -1683,24 +1912,20 @@ static void overflow_warnings(void) {
     apps_status_t *st = new_status();
     char err[200];
     CHECK(apps_task_run(p, true, 50, st, err, sizeof err), "run: %s", err);
-    static const char overflow[] =
-        "; label#0 'Time's up' extends 14 px past the round edge"
-        "; box#1 'box' extends 5 px past the round edge"
-        "; label#4 'line one?line two' extends 3 px past the round edge"
-        "; label#5 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...' extends 7 px past the round edge";
-    size_t len = strlen(st->warnings);
-    CHECK(strncmp(st->warnings, "manifest says hi; main.lua returned unknown handler 'strat'", 59) == 0 &&
-              len > strlen(overflow) && strcmp(st->warnings + len - strlen(overflow), overflow) == 0,
-          "warnings: '%s'", st->warnings);
+#define WIDE_WARNINGS                                                                     \
+    "main.lua returned unknown handler 'strat' (did you mean 'start'?)"                   \
+    "; label#0 'Time's up' extends 14 px past the round edge"                             \
+    "; box#1 'box' extends 5 px past the round edge"                                      \
+    "; label#4 'line one?line two' extends 3 px past the round edge"                      \
+    "; label#5 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...' extends 7 px past the round edge"
+    CHECK(strcmp(st->warnings, "manifest says hi; " WIDE_WARNINGS) == 0, "warnings: '%s'", st->warnings);
     /* With no settle at all the run still waits for a pass that has laid the new widgets out. */
     CHECK(apps_task_run(make_pkg("wide", "Wide", files, 1), true, 0, st, err, sizeof err), "run: %s", err);
-    len = strlen(st->warnings);
-    CHECK(len > strlen(overflow) && strcmp(st->warnings + len - strlen(overflow), overflow) == 0, "warnings with no settle: '%s'",
-          st->warnings);
+    CHECK(strcmp(st->warnings, WIDE_WARNINGS) == 0, "warnings with no settle: '%s'", st->warnings);
     heap_caps_free(st);
 }
 
-/* C8: the screen sleeps (the frames run the supervisor, not the apply step): a run waits at most APPS_TASK_LAYOUT_MS for
+/* C8: the screen sleeps (the frames run the supervisor, not the apply step): a run waits at most 500 ms for
  * a pass and says so. The reset still runs, so a stop frees the package at once. */
 static void the_layout_waits_for_the_screen(void) {
     atomic_store(&lvgl_asleep, true);
@@ -1711,11 +1936,11 @@ static void the_layout_waits_for_the_screen(void) {
     CHECK(apps_task_run(make_pkg("hello", "Hello", HELLO, 1), true, 50, st, err, sizeof err), "run: %s", err);
     int64_t took = real_ms() - start;
     CHECK(strcmp(st->warnings, "layout not checked: the screen was asleep") == 0, "warnings: '%s'", st->warnings);
-    CHECK(took >= 50 + APPS_TASK_LAYOUT_MS - 20 && took < 50 + APPS_TASK_LAYOUT_MS + 1500, "it waited for a pass, bounded: %lld ms",
+    CHECK(took >= 50 + 500 - 20 && took < 50 + 500 + 400, "it waited for a pass, at most 500 ms: %lld ms",
           (long long)took);
     CHECK(at_from(from, "set_ui table#1") >= 0, "published");
     from = mark();
-    apps_task_stop();
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
     ORDERED(from, "set_ui NULL", "reset");
     ORDERED(from, "reset", "free pkg hello");
     atomic_store(&lvgl_asleep, false);
@@ -1823,46 +2048,101 @@ static void the_launcher_lists_the_resident_app(void) {
     WAIT(during, "launcher 1 busy:Busy");
 }
 
-/* The caller of a run gives up while the app task is held up outside any call (another thread holds the UI lock, and
- * the clock moves past the wait): the answer that comes later writes nothing to the caller's buffers, which are gone. */
-static apps_pkg_t *late_pkg;
-static bool late_ok;
-static char late_err[200];
+/* A caller that gives up: its buffers are the case's, kept alive after it returns, so a late write by the app task
+ * shows as changed bytes even without sanitizers (and as a use-after-free with them, once they are freed). */
+static struct {
+    apps_pkg_t *pkg;
+    bool front;
+    int settle_ms;
+    char *err;
+    apps_status_t *st;
+    bool ok;
+} late;
 
 static void *late_caller(void *arg) {
     (void)arg;
-    char *err = malloc(200);
-    apps_status_t *st = new_status();
-    late_ok = apps_task_run(late_pkg, true, 0, st, err, 200);
-    snprintf(late_err, sizeof late_err, "%s", err);
-    free(err);
-    heap_caps_free(st);
+    late.ok = apps_task_run(late.pkg, late.front, late.settle_ms, late.st, late.err, 200);
     return NULL;
+}
+
+/* An app that, once start() has returned, runs nothing until it is stopped: the clock can jump with no call under way. */
+static const char APP_QUIET[] =
+    "local app = {}\n"
+    "function app.start() print('start') end\n"
+    "return app\n";
+static const file_t QUIET[] = {LUA("main.lua", APP_QUIET)};
+
+/* Runs pkg from another thread; once wait_for is logged, moves the clock jump_ms on, which makes its caller give up, and
+ * keeps a copy of the caller's buffers as it left them. The case makes pkg before it holds the UI lock, if it does. */
+static void late_run_at(int line, apps_pkg_t *pkg, bool front, int settle_ms, int from, const char *wait_for, int64_t jump_ms,
+                        char *err_copy, apps_status_t *st_copy) {
+    late.pkg = pkg;
+    late.front = front;
+    late.settle_ms = settle_ms;
+    pthread_t caller;
+    if (pthread_create(&caller, NULL, late_caller, NULL) != 0) {
+        fail_at(line, "no caller thread");
+    }
+    wait_event_at(line, from, wait_for, 5000);
+    clock_jump(jump_ms);
+    pthread_join(caller, NULL);
+    memcpy(err_copy, late.err, 200);
+    memcpy(st_copy, late.st, sizeof *st_copy);
 }
 
 static void a_late_answer_writes_nothing(void) {
     char err[200];
     CHECK(apps_task_run(make_pkg("one", "One", HELLO, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
-    late_pkg = make_pkg("two", "Two", HELLO, 1);
+    late.err = malloc(200);
+    late.st = new_status();
+    char *err_copy = malloc(200);
+    apps_status_t *st_copy = new_status();
+    /* Given up before the old app has ended (the app task waits for the UI lock in its unpublish, which the case holds):
+     * the run is dropped once the old app is gone (F2), and its answer writes nothing. */
+    apps_pkg_t *two = make_pkg("two", "two", HELLO, 1);
     int from = mark();
     apps_port_ui_lock();
-    pthread_t caller;
-    CHECK(pthread_create(&caller, NULL, late_caller, NULL) == 0, "no caller thread");
-    WAIT(from, "print one stop");  /* the run has begun: the old app's stop() ran, its unpublish waits for the lock */
-    sleep_ms(20);
-    clock_jump(APPS_TASK_RUN_EXTRA_MS + 1000);
-    pthread_join(caller, NULL);
-    CHECK(!late_ok && strcmp(late_err, "the app task didn't answer within 7000 ms") == 0, "the caller gave up: '%s'", late_err);
+    late_run_at(__LINE__, two, true, 0, from, "ui_lock wait app", 7000 + 1000, err_copy, st_copy);
+    CHECK(!late.ok && strcmp(late.err, "the app task didn't answer within 7000 ms") == 0, "the caller gave up: '%s'", late.err);
+    CHECK(at_from(from, "print one stop") >= 0, "the old app's stop() ran first");
     apps_port_ui_unlock();
-    WAIT(from, "set_ui table#2");
-    WAIT(from, "print two show");  /* the layer was in front, and stays: the new app is shown */
+    WAIT(from, "free pkg two");
+    FIFO_SYNC();  /* the dropped run has been answered */
+    CHECK(memcmp(late.err, err_copy, 200) == 0 && memcmp(late.st, st_copy, sizeof *st_copy) == 0,
+          "the app task wrote into the buffers of a caller that had given up");
+    ABSENT(from, "log I launch two");
+    ABSENT(from, "set_ui table#2");
+    WAIT(from, "front 0");  /* the old app is gone and nothing took its place */
     apps_status_t *st = new_status();
     apps_task_status(st);
-    CHECK(st->state == APPS_STATE_RUNNING && strcmp(st->id, "two") == 0, "the run went on: %s %s", apps_state_name(st->state), st->id);
+    CHECK(st->state == APPS_STATE_STOPPED && strcmp(st->id, "one") == 0, "the record: %s %s", apps_state_name(st->state), st->id);
+    /* Given up once the new app has begun (its start() has returned and its table is up; the caller's deadline passes in
+     * the settle): the run goes on, and its answer writes nothing. */
+    from = mark();
+    late_run_at(__LINE__, make_pkg("three", "three", QUIET, 1), false, 20000, from, "set_ui table#2", 20000 + 7000 + 1, err_copy,
+                st_copy);
+    CHECK(!late.ok && strcmp(late.err, "the app task didn't answer within 27000 ms") == 0, "the caller gave up: '%s'",
+          late.err);
+    FIFO_SYNC();  /* the settle is over and the run answered */
+    CHECK(memcmp(late.err, err_copy, 200) == 0 && memcmp(late.st, st_copy, sizeof *st_copy) == 0,
+          "the app task wrote into the buffers of a caller that had given up");
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_RUNNING && strcmp(st->id, "three") == 0, "the run went on: %s %s", apps_state_name(st->state),
+          st->id);
+    free(late.err);
+    free(err_copy);
+    heap_caps_free(late.st);
+    heap_caps_free(st_copy);
     heap_caps_free(st);
 }
 
-/* Touches the queue has no room for are dropped, never waited for, and counted. */
+/* Touches the queue has no room for are dropped, never waited for, and counted; they leave 2 slots for requests, so a
+ * stop still gets in (F3). */
+static void *stop_thread(void *arg) {
+    *(bool *)arg = stop_app(NULL, 0);
+    return NULL;
+}
+
 static void touches_past_a_full_queue_are_counted(void) {
     char err[200];
     CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 50, NULL, err, sizeof err), "run: %s", err);
@@ -1870,19 +2150,436 @@ static void touches_past_a_full_queue_are_counted(void) {
     block_print("busy");
     TAP(0);
     WAIT_PRINT_BLOCKED();
-    int64_t start = real_ms();
     for (int i = 0; i < 30; i++) {
-        TAP(0);
+        TAP(0);  /* the LVGL task's posts are recorded: finish() checks none waited */
     }
-    CHECK(real_ms() - start < 2000, "30 touches in %lld ms", (long long)(real_ms() - start));
     apps_status_t *st = new_status();
     apps_task_status(st);
-    CHECK(st->dropped_events >= 30 - 16, "dropped: %u", st->dropped_events);
+    CHECK(st->dropped_events == 30 - (16 - 2), "dropped: %u, not 16 (14 queued, 2 slots kept for requests)", st->dropped_events);
     int from = mark();
+    bool stopped = false;
+    pthread_t stopper;
+    CHECK(pthread_create(&stopper, NULL, stop_thread, &stopped) == 0, "no stop thread");
+    WAIT(from, "queue STOP wait");
     release_print();
     clock_go();
-    WAIT(from, "print busy busy");
+    pthread_join(stopper, NULL);
+    CHECK(stopped, "the stop went through a queue full of touches");
+    WAIT(from, "print busy stop");
+    CHECK(count_from(from, "print busy busy") == 14, "the 14 queued touches ran before the stop: %d", count_from(from, "print busy busy"));
     heap_caps_free(st);
+}
+
+/* ---- Fix round 1 ---- */
+
+/* F1: with LVGL paused (battery sleep), only an app whose table was published can have objects up, so only its package
+ * is parked; an app whose table never was is freed at once, with no reset asked and no wait. At most one package is
+ * parked: a table is published only once no reset is outstanding. */
+static void parking_is_bounded(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("a", "A", PICTURE, 2), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "object image a/a.bin");
+    pause_lvgl();
+    int from = mark();
+    apps_status_t *st = new_status();
+    const char *const next[] = {"b", "c", "d"};
+    for (size_t i = 0; i < ARRAY_LEN(next); i++) {
+        CHECK(apps_task_run(make_pkg(next[i], next[i], PICTURE, 2), true, 0, st, err, sizeof err), "run %s: %s", next[i], err);
+        CHECK(strcmp(st->warnings, "layout not checked: the screen was asleep") == 0, "warnings: '%s'", st->warnings);
+    }
+    CHECK(count_from(from, "log W the screen didn't take the app down within 500 ms") == 1,
+          "only a's end waited for a reset: %d waits", count_from(from, "log W the screen didn't take the app down"));
+    WAIT(from, "free pkg b");
+    WAIT(from, "free pkg c");
+    ABSENT(from, "free pkg a");
+    ABSENT(from, "free image a/a.bin");
+    ABSENT(from, "set_ui table#2");
+    ABSENT(from, "reset");
+    /* The screen wakes: the one reset runs, then a's package goes and d's table is published. */
+    int woke = mark();
+    atomic_store(&lvgl_paused, false);
+    int reset = WAIT(woke, "reset");
+    int freed = WAIT(woke, "free pkg a");
+    int published = WAIT(woke, "set_ui table#2");
+    CHECK(reset < freed && reset < published, "reset %d, free %d, publish %d", reset, freed, published);
+    WAIT(woke, "object image d/a.bin");
+    WAIT_FRAMES(5);
+    CHECK(count_from(woke, "reset") == 1, "one reset: %d", count_from(woke, "reset"));
+    heap_caps_free(st);
+}
+
+/* F2: the old app's stop() hangs while a new run replaces it. The caller hears the HUNG message; when stop() returns,
+ * the run it gave up on is dropped: the new app isn't started and its package goes. */
+static void a_replace_whose_stop_hangs_drops_the_run(void) {
+    const file_t slow[] = {LUA("main.lua", APP_SLOW_STOP)};
+    char err[200];
+    CHECK(apps_task_run(make_pkg("slow", "Slow", slow, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "front 1");
+    const int64_t t0 = apps_port_mono_ms();
+    clock_stop_at(t0);
+    block_print("stopping");
+    int from = mark();
+    late.pkg = make_pkg("next", "Next", HELLO, 1);
+    late.front = true;
+    late.settle_ms = 0;
+    late.err = malloc(200);
+    late.st = NULL;
+    pthread_t caller;
+    CHECK(pthread_create(&caller, NULL, late_caller, NULL) == 0, "no caller thread");
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 3001);
+    WAIT(from, "crash Slow | (stopped responding)");
+    pthread_join(caller, NULL);
+    CHECK(!late.ok && strcmp(late.err, HUNG_MESSAGE) == 0, "the caller: '%s'", late.err);
+    int back = mark();
+    clock_go();
+    release_print();
+    WAIT(back, "priority muse_apps 2");
+    WAIT(back, "free pkg next");
+    ABSENT(from, "log I launch next");
+    ABSENT(from, "print next");
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_HUNG && strcmp(st->id, "slow") == 0, "the record: %s %s", apps_state_name(st->state), st->id);
+    free(late.err);
+    heap_caps_free(st);
+}
+
+/* F5 (a): a new app that runs behind (front=false) has its table published in the frame where a voice turn ends. The
+ * turn's end is decided after the frame's front requests, for the app that is current: the new app is not fronted
+ * and gets no show(), so its show() and hide() still follow the layer. The gate holds the app task just after the
+ * publication, where, before the fix, the table was up and its back request not yet sent. */
+static void a_back_request_in_the_turns_last_frame(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("first", "First", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print first show");
+    int from = mark();
+    TURN(true);
+    WAIT(from, "print first hide");
+    gate_arm(MUTEX_NAMES, true, from, "set_ui table#2");
+    late.pkg = make_pkg("second", "Second", HELLO, 1);
+    late.front = false;
+    late.settle_ms = 0;
+    late.err = malloc(200);
+    late.st = NULL;
+    pthread_t caller;
+    CHECK(pthread_create(&caller, NULL, late_caller, NULL) == 0, "no caller thread");
+    WAIT(from, "gate 3");
+    TURN(false);
+    WAIT_FRAMES(5);
+    gate_open();
+    pthread_join(caller, NULL);
+    CHECK(late.ok, "run: %s", late.err);
+    WAIT_FRAMES(5);
+    ABSENT(from, "print second show");
+    CHECK(!apps_lv_front(), "the new app stays behind");
+    /* Fronted later, it gets its show(). */
+    int later = mark();
+    launch("second", true);
+    WAIT(later, "front 1");
+    WAIT(later, "print second show");
+    free(late.err);
+}
+
+/* F5 (b): a front asked during a voice turn by an app whose table isn't up yet (LVGL was paused, so the old app's reset
+ * came late) is kept past the turn's end and carried out once the table is published, not dropped. */
+static void a_front_asked_during_a_turn_waits_for_the_table(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("first", "First", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print first show");
+    TURN(true);
+    pause_lvgl();
+    int from = mark();
+    CHECK(apps_task_run(make_pkg("second", "Second", BUSY, 1), true, 0, NULL, err, sizeof err), "run: %s", err);
+    ABSENT(from, "set_ui table#2");
+    apps_port_ui_lock();  /* the publication that follows the reset waits for the case */
+    atomic_store(&lvgl_paused, false);
+    WAIT(from, "reset");
+    WAIT(from, "ui_lock wait app");
+    WAIT_FRAMES(3);  /* frames in the turn have seen the front request */
+    TURN(false);
+    WAIT_FRAMES(5);
+    ABSENT(from, "front 1");  /* no table yet: the front waits for it */
+    apps_port_ui_unlock();
+    WAIT(from, "set_ui table#2");
+    WAIT(from, "front 1");
+    WAIT(from, "print second show");
+}
+
+/* F6: an app crashes while LVGL is paused, and its card waits; a new app that begins before it shows drops it, so the
+ * old crash card doesn't come up over the new app when the screen wakes. */
+static void a_new_app_drops_an_old_crash_card(void) {
+    pause_lvgl();
+    const file_t crashy[] = {LUA("main.lua", APP_START_CRASH)};
+    char err[300];
+    int from = mark();
+    CHECK(!apps_task_run(make_pkg("crashy", "Crashy", crashy, 1), true, 0, NULL, err, sizeof err), "a crash isn't a run");
+    CHECK(apps_task_run(make_pkg("fixed", "Fixed", BUSY, 1), true, 0, NULL, err, sizeof err), "run: %s", err);
+    atomic_store(&lvgl_paused, false);
+    WAIT(from, "front 1");
+    WAIT(from, "print fixed show");
+    WAIT_FRAMES(5);
+    ABSENT(from, "crash ");
+}
+
+/* F6: the supervisor's card for a hung app, held back by a voice turn, goes when a new app begins: it doesn't come up
+ * over the new app at the turn's end. */
+static void a_new_app_drops_an_old_hung_card(void) {
+    const file_t files[] = {LUA("main.lua", APP_HANG)};
+    char err[200];
+    CHECK(apps_task_run(make_pkg("hangy", "Hangy", files, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "front 1");
+    TURN(true);
+    const int64_t t0 = apps_port_mono_ms();
+    clock_stop_at(t0);
+    block_print("hang");
+    int from = mark();
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 3001);
+    WAIT(from, "priority muse_apps 1");
+    WAIT_FRAMES(3);
+    ABSENT(from, "crash ");  /* the turn holds the card back */
+    clock_go();
+    release_print();
+    WAIT(from, "priority muse_apps 2");  /* the call came back, and the hung app is gone */
+    CHECK(apps_task_run(make_pkg("fixed", "Fixed", BUSY, 1), true, 0, NULL, err, sizeof err), "run: %s", err);
+    TURN(false);
+    WAIT(from, "print fixed show");
+    WAIT_FRAMES(5);
+    ABSENT(from, "crash ");
+}
+
+/* F9: cpu_pct is the share of the last whole second spent in calls: it falls to 0 when the app idles, and a call across
+ * a second's end counts in both seconds. worst_dispatch_ms is the longest call. On the stoppable clock. */
+static void cpu_pct_follows_idle_time(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    const int64_t t0 = (apps_port_mono_ms() / 1000 + 3) * 1000;  /* a whole second, ahead */
+    apps_status_t *st = new_status();
+    clock_stop_at(t0);
+    block_print("busy");
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 400);
+    release_print();
+    FIFO_SYNC();  /* the 400 ms call is over */
+    clock_stop_at(t0 + 1001);
+    FIFO_SYNC();  /* its second has closed */
+    apps_task_status(st);
+    CHECK(st->cpu_pct == 40 && st->worst_dispatch_ms == 400, "a 400 ms call: cpu %u%%, worst %u ms", st->cpu_pct,
+          st->worst_dispatch_ms);
+    clock_stop_at(t0 + 3000);
+    FIFO_SYNC();
+    apps_task_status(st);
+    CHECK(st->cpu_pct == 0 && st->worst_dispatch_ms == 400, "idle: cpu %u%%, worst %u ms", st->cpu_pct, st->worst_dispatch_ms);
+    clock_stop_at(t0 + 3900);
+    block_print("busy");
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 4300);
+    release_print();
+    FIFO_SYNC();
+    apps_task_status(st);
+    CHECK(st->cpu_pct == 10, "100 ms of the second that closed during the call: cpu %u%%", st->cpu_pct);
+    clock_stop_at(t0 + 5400);
+    FIFO_SYNC();
+    apps_task_status(st);
+    CHECK(st->cpu_pct == 30 && st->worst_dispatch_ms == 400, "300 ms of the next: cpu %u%%, worst %u ms", st->cpu_pct,
+          st->worst_dispatch_ms);
+    clock_go();
+    heap_caps_free(st);
+}
+
+/* F10: a status read while touches are dropped and a new app begins never reports a count from before the app's base.
+ * The gate holds the status call at the record's lock while the touches are dropped and the new app begins. */
+static apps_status_t *gated_st;
+
+static void *gated_status(void *arg) {
+    (void)arg;
+    gated_thread = true;
+    apps_task_status(gated_st);
+    return NULL;
+}
+
+static void dropped_is_read_with_its_base(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    clock_stop_at(apps_port_mono_ms());
+    block_print("busy");
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    int from = mark();
+    gated_st = new_status();
+    gate_arm(MUTEX_RECORD, false, from, NULL);
+    pthread_t reader;
+    CHECK(pthread_create(&reader, NULL, gated_status, NULL) == 0, "no reader thread");
+    WAIT(from, "gate 1");
+    for (int i = 0; i < 5; i++) {
+        TAP(0);
+    }
+    late.pkg = make_pkg("next", "Next", HELLO, 1);
+    late.front = false;
+    late.settle_ms = 0;
+    late.err = malloc(200);
+    late.st = NULL;
+    pthread_t runner;
+    CHECK(pthread_create(&runner, NULL, late_caller, NULL) == 0, "no runner thread");
+    WAIT(from, "queue RUN wait");
+    for (int i = 0; i < 15; i++) {
+        TAP(0);  /* the queue fills, and the rest are dropped */
+    }
+    release_print();
+    clock_go();
+    WAIT(from, "log I launch next");
+    gate_open();
+    pthread_join(reader, NULL);
+    pthread_join(runner, NULL);
+    CHECK(late.ok, "run: %s", late.err);
+    CHECK(strcmp(gated_st->id, "next") == 0 && gated_st->dropped_events == 0, "%s: %u dropped since it began", gated_st->id,
+          gated_st->dropped_events);
+    free(late.err);
+    heap_caps_free(gated_st);
+}
+
+/* T1 (C11): an app behind the face is asked to the front during a voice turn: nothing is fronted during the turn, and
+ * the turn's end fronts it and runs its show(). */
+static void a_front_asked_during_a_turn_comes_after_it(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 50, NULL, err, sizeof err), "run: %s", err);
+    CHECK(!apps_lv_front(), "behind before the turn");
+    TURN(true);
+    int from = mark();
+    launch("busy", true);
+    FIFO_SYNC();      /* the launch has been handled: its front request is out */
+    WAIT_FRAMES(2);   /* and the LVGL task has seen it */
+    ABSENT(from, "front 1");
+    ABSENT(from, "print busy show");
+    TURN(false);
+    WAIT(from, "front 1");
+    WAIT(from, "print busy show");
+}
+
+/* T9: a crash card that comes during a voice turn waits for its end. */
+static void a_card_waits_for_the_turn_to_end(void) {
+    TURN(true);
+    const file_t crashy[] = {LUA("main.lua", APP_START_CRASH)};
+    char err[300];
+    int from = mark();
+    CHECK(!apps_task_run(make_pkg("crashy", "Crashy", crashy, 1), true, 0, NULL, err, sizeof err), "a crash isn't a run");
+    WAIT_FRAMES(5);
+    ABSENT(from, "crash ");
+    TURN(false);
+    WAIT(from, "crash Crashy | main.lua:4: boom");
+}
+
+/* T9: the app in front when a voice turn began has ended by its end: nothing is fronted. */
+static void a_turn_after_the_app_ended_fronts_nothing(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print busy show");
+    TURN(true);
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    int from = mark();
+    TURN(false);
+    WAIT_FRAMES(5);
+    ABSENT(from, "front 1");
+    ABSENT(from, "queue SHOW");
+}
+
+/* F3: apps_task_stop says when it didn't stop the app, and why, with one W line each time: no answer within 2000 ms,
+ * no room in the queue within 2000 ms, no memory for the request (the hung message: the hung cases). It is true when
+ * the app stopped, and when none was running. While the app task is stuck in a call that prints, the clock stands
+ * still (busy, not hung) until the case moves it past the stop's 2000 ms, short of the supervisor's 3000. */
+static void stop_reports_failure(void) {
+    char err[200] = "x";
+    CHECK(stop_app(err, sizeof err) && err[0] == '\0', "no app running: '%s'", err);
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    int from = mark();
+    /* No answer within 2000 ms. */
+    int64_t t0 = apps_port_mono_ms();
+    clock_stop_at(t0);
+    block_print("busy");
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    int asked = mark();
+    pthread_t caller;
+    CHECK(pthread_create(&caller, NULL, stop_caller, NULL) == 0, "no caller thread");
+    WAIT(asked, "queue STOP wait");
+    clock_stop_at(t0 + 2001);
+    pthread_join(caller, NULL);
+    CHECK(!stop_caller_ok && strcmp(stop_caller_err, "the app task didn't answer within 2000 ms") == 0, "no answer: '%s'",
+          stop_caller_err);
+    release_print();
+    clock_go();
+    WAIT(asked, "print busy stop");  /* the stop still happens when the app task gets to it */
+    FIFO_SYNC();
+    /* No room within 2000 ms: 14 touches and 2 launches fill the queue behind a stuck call. */
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    t0 = apps_port_mono_ms();
+    clock_stop_at(t0);
+    block_print("busy");
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    for (int i = 0; i < 16; i++) {
+        TAP(0);
+    }
+    launch("busy", false);
+    launch("busy", false);
+    asked = mark();
+    CHECK(pthread_create(&caller, NULL, stop_caller, NULL) == 0, "no caller thread");
+    WAIT(asked, "queue STOP wait");
+    clock_stop_at(t0 + 2001);
+    pthread_join(caller, NULL);
+    CHECK(!stop_caller_ok && strcmp(stop_caller_err, "the app task is busy; try again") == 0, "no room: '%s'",
+          stop_caller_err);
+    release_print();
+    clock_go();
+    FIFO_SYNC();
+    ABSENT(asked, "print busy stop");
+    /* No memory for the request. */
+    atomic_store(&caps_failures, 1);
+    CHECK(!stop_app(err, sizeof err) && strcmp(err, "out of memory: no room for the request") == 0, "no memory: '%s'", err);
+    CHECK(atomic_load(&caps_failures) == 0, "the stop's request was the block that failed");
+    /* And a stop that stops it. */
+    CHECK(stop_app(err, sizeof err) && err[0] == '\0', "stop: '%s'", err);
+    WAIT(asked, "print busy stop");
+    CHECK(count_from(from, "log W stop: ") == 3, "a W line for each failure: %d", count_from(from, "log W stop: "));
+    WAIT(from, "log W stop: the app task didn't answer within 2000 ms");
+    WAIT(from, "log W stop: the app task is busy; try again");
+    WAIT(from, "log W stop: out of memory: no room for the request");
+}
+
+/* T9, F7: muse_apps_ui_tick is true while the layer is in front or a card is shown (frame_tick then draws nothing under
+ * it), and muse_apps_covering says the same to any task, at once for a change the LVGL task makes. */
+static void the_tick_says_when_the_apps_cover(void) {
+    WAIT_FRAMES(3);
+    CHECK(!atomic_load(&last_tick) && !muse_apps_covering(), "nothing covers at first");
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "front 1");
+    WAIT_FRAMES(3);
+    CHECK(atomic_load(&last_tick) && muse_apps_covering(), "the layer in front covers");
+    int from = mark();
+    ON_LVGL(swipe_job, NULL);
+    CHECK(!muse_apps_covering(), "a right swipe uncovers at once");
+    WAIT(from, "front 0");
+    WAIT_FRAMES(3);
+    CHECK(!atomic_load(&last_tick), "and the tick says so");
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 1 busy:Busy");
+    WAIT_FRAMES(3);
+    CHECK(atomic_load(&last_tick) && muse_apps_covering() && !apps_lv_front(), "the launcher covers");
+    TURN(true);
+    CHECK(!muse_apps_covering(), "a voice turn closes it, and uncovers at once");
+    WAIT_FRAMES(3);
+    CHECK(!atomic_load(&last_tick), "and the tick says so");
+    TURN(false);
+    const file_t crashy[] = {LUA("main.lua", APP_START_CRASH)};
+    CHECK(!apps_task_run(make_pkg("crashy", "Crashy", crashy, 1), true, 0, NULL, err, sizeof err), "a crash isn't a run");
+    WAIT(from, "crash Crashy | ");
+    WAIT_FRAMES(3);
+    CHECK(atomic_load(&last_tick) && muse_apps_covering() && !apps_lv_front(), "a crash card covers, the layer behind");
 }
 
 int main(int argc, char **argv) {
@@ -1910,6 +2607,19 @@ int main(int argc, char **argv) {
         {"the_launcher_lists_the_resident_app", the_launcher_lists_the_resident_app},
         {"a_late_answer_writes_nothing", a_late_answer_writes_nothing},
         {"touches_past_a_full_queue_are_counted", touches_past_a_full_queue_are_counted},
+        {"parking_is_bounded", parking_is_bounded},
+        {"a_replace_whose_stop_hangs_drops_the_run", a_replace_whose_stop_hangs_drops_the_run},
+        {"a_back_request_in_the_turns_last_frame", a_back_request_in_the_turns_last_frame},
+        {"a_front_asked_during_a_turn_waits_for_the_table", a_front_asked_during_a_turn_waits_for_the_table},
+        {"a_new_app_drops_an_old_crash_card", a_new_app_drops_an_old_crash_card},
+        {"a_new_app_drops_an_old_hung_card", a_new_app_drops_an_old_hung_card},
+        {"cpu_pct_follows_idle_time", cpu_pct_follows_idle_time},
+        {"dropped_is_read_with_its_base", dropped_is_read_with_its_base},
+        {"a_front_asked_during_a_turn_comes_after_it", a_front_asked_during_a_turn_comes_after_it},
+        {"a_card_waits_for_the_turn_to_end", a_card_waits_for_the_turn_to_end},
+        {"a_turn_after_the_app_ended_fronts_nothing", a_turn_after_the_app_ended_fronts_nothing},
+        {"stop_reports_failure", stop_reports_failure},
+        {"the_tick_says_when_the_apps_cover", the_tick_says_when_the_apps_cover},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

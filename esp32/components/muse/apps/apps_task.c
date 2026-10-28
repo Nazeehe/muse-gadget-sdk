@@ -61,8 +61,14 @@
  * An app's end, the reset and the package's bytes: apps_task.h. The reset is a pair of counters: the app task asks
  * (reset_req), the LVGL task runs apps_lv_reset in muse_apps_ui_supervise, before any apply in the frame and while the
  * screen sleeps, and says so (reset_done). A table is published only while no reset is outstanding, so no pass meets
- * a new table before the old one's objects are gone. A package whose reset didn't come in time is parked, and freed
- * by the app task once reset_done reaches it.
+ * a new table before the old one's objects are gone. Only an app whose table was published asks for a reset when it
+ * ends; its package, if the reset didn't come in time, is parked, and freed by the app task once reset_done reaches
+ * it. So at most one package is parked: until its reset has run no table is published, and an app that ends with its
+ * table unpublished frees its package at once.
+ *
+ * The layer's place. The app task asks (front_req, tagged with the asking app); the LVGL task carries it out in
+ * muse_apps_ui_supervise, holds a front back during a voice turn and until the app's table is published, and decides
+ * at the turn's end, after it has seen the frame's requests. What it knows of an app goes when another begins.
  */
 
 static const char *TAG = "muse_apps";
@@ -80,7 +86,7 @@ static const char *TAG = "muse_apps";
 
 #define RECEIVE_MS 1000      /* C22: the loop comes round at least once a second */
 #define POLL_MS 10           /* how often a task waiting on another looks again */
-#define POST_MS 100          /* a caller's wait for room in the queue */
+#define REQ_ROOM 2           /* slots of the queue a touch leaves to requests */
 #define STATUS_LOCK_MS 200   /* apps_task_status's wait for the record */
 #define LOCK_MS 1000         /* the app task's for the record and the names, held by others only for copies */
 #define NAMES_LOCK_MS 2      /* the LVGL task's: it tries again next frame */
@@ -138,7 +144,7 @@ typedef struct {
     atomic_uint waiting;       /* app task: it waits for a reset, with a table to publish or a package to free */
     atomic_uint reset_req;     /* app task: resets asked for */
     atomic_uint reset_done;    /* LVGL task: resets run */
-    atomic_uint front_req;     /* app task: (requests << 1) | in front */
+    atomic_uint front_req;     /* app task: the last front or back request (front_word) */
     /* The supervisor sets it, and the app task clears it once the hung app is gone: never at once, as the supervisor
      * sets it only during a call, and the app task acts on it only after the call has returned. */
     atomic_uint hung;
@@ -180,6 +186,7 @@ static struct {
     bool shown;              /* show() came last, not hide() */
     bool abandoned;          /* it hung: none of its code runs again */
     bool publish;            /* its table waits for a reset to be published */
+    bool was_published;      /* its table was published: objects may draw from its package */
     req_t *pending;          /* the run that waits for its settle */
     int64_t settle_until;
     char what[WHAT_MAX];     /* what a crash now is, to the pending run */
@@ -196,11 +203,18 @@ static struct {
 /* ---- The LVGL task's own ---- */
 
 static struct {
-    bool in_turn, front_before_turn, want_front;
+    bool in_turn;
+    bool turn_ended;         /* the next supervise decides the layer's place */
+    uint32_t gen;            /* the app (app_gen) the two below are about */
+    bool front_before_turn;  /* it was in front when the voice turn began */
+    bool want_front;         /* it asked for the front: carried out out of a turn, once its table is published */
     uint32_t front_seen;
     bool hung_card;          /* the supervisor's card, still to show (a voice turn holds it back) */
+    uint32_t hung_gen;       /* the app it is about */
     char hung_name[25];
 } L;
+
+static atomic_bool s_covering;  /* the LVGL task's: the layer is in front or a card is shown */
 
 /* ---- Small things ---- */
 
@@ -461,6 +475,7 @@ static void try_publish(void) {
         apps_port_ui_unlock();
         atomic_store(&s_rec->published, 1);
         T.publish = false;
+        T.was_published = true;
     }
     update_waiting();
 }
@@ -530,10 +545,20 @@ static void free_parked(void) {
     update_waiting();
 }
 
-/* Every front and back goes through here (C11): the LVGL task carries it out, or defers a front past a voice turn. */
+/* A front or back request is one word, so the LVGL task reads it whole: a count (only a change matters), the low bits
+ * of the asking app's app_gen (the LVGL task drops a request of an app that has ended since), and front. */
+#define FRONT_GEN_BITS 16
+#define FRONT_GEN_MASK ((1u << FRONT_GEN_BITS) - 1u)
+
+static uint32_t front_word(uint32_t count, uint32_t gen, bool front) {
+    return (count << (FRONT_GEN_BITS + 1)) | ((gen & FRONT_GEN_MASK) << 1) | (front ? 1u : 0u);
+}
+
+/* Every front and back of the current app goes through here (C11): the LVGL task carries it out, holding a front back
+ * during a voice turn and until the app's table is published. */
 static void request_front(bool front) {
-    uint32_t n = (atomic_load(&s_rec->front_req) >> 1) + 1;
-    atomic_store(&s_rec->front_req, (n << 1) | (front ? 1u : 0u));
+    uint32_t count = (atomic_load(&s_rec->front_req) >> (FRONT_GEN_BITS + 1)) + 1;
+    atomic_store(&s_rec->front_req, front_word(count, T.gen, front));
 }
 
 /* ---- An app's end ---- */
@@ -543,13 +568,36 @@ static const char *const END_NAMES[] = {"stopped", "replaced", "exited", "crashe
 
 static void finish_run(void);
 
+/* Calls' time is counted in whole seconds of apps_port_mono_ms (windows): cpu_pct is the share of the last whole one.
+ * This brings the count to `second`. */
+static void roll_to(int64_t second) {
+    if (second == T.window) {
+        return;
+    }
+    T.cpu_pct = second == T.window + 1 ? (uint8_t)(T.window_busy >= 1000 ? 100 : T.window_busy / 10) : 0;
+    T.window = second;
+    T.window_busy = 0;
+}
+
+/* The loop calls it every round, at least once a second (C22), so an idle app's cpu_pct falls to 0; the record takes a
+ * change at once. */
+static void roll_window(void) {
+    uint8_t was = T.cpu_pct;
+    roll_to(apps_port_mono_ms() / 1000);
+    if (T.cpu_pct != was && T.rt != NULL && rec_take(LOCK_MS)) {
+        s_rec->st.cpu_pct = T.cpu_pct;
+        rec_give();
+    }
+}
+
 static void call_begin(void) {
     T.call_began = apps_port_mono_ms();
+    roll_to(T.call_began / 1000);
     atomic_store(&s_rec->call_started, (uint32_t)T.call_began);
     atomic_store(&s_rec->in_call, 1);
 }
 
-/* The call is over: the counters. */
+/* The call is over: the counters. Its time goes to the windows it spans. */
 static void call_finish(void) {
     atomic_store(&s_rec->in_call, 0);
     int64_t now = apps_port_mono_ms();
@@ -557,12 +605,14 @@ static void call_finish(void) {
     if (took > (int64_t)T.worst_ms) {
         T.worst_ms = took > UINT32_MAX ? UINT32_MAX : (uint32_t)took;
     }
-    if (now / 1000 != T.window) {
-        T.cpu_pct = now / 1000 == T.window + 1 ? (uint8_t)(T.window_busy >= 1000 ? 100 : T.window_busy / 10) : 0;
-        T.window = now / 1000;
-        T.window_busy = 0;
+    for (int64_t at = T.call_began; at < now;) {
+        roll_to(at / 1000);
+        int64_t upto = (at / 1000 + 1) * 1000;
+        upto = upto < now ? upto : now;
+        T.window_busy += upto - at;
+        at = upto;
     }
-    T.window_busy += took;
+    roll_to(now / 1000);
     T.dirty = true;
 }
 
@@ -582,8 +632,9 @@ static void recover(void) {
  * 3. the LVGL task takes the app's objects down (apps_lv_reset), and the app task waits for it, bounded;
  * 6. the package's bytes, which image objects drew from, go once that reset has run, parked until it does;
  * 7. a crash card, which the LVGL task shows once that reset has run.
- * The ruling allows 4 and 5 before 3, never 6 or 7. A new run (END_REPLACED) decides the layer's place; any other end
- * puts it behind.
+ * The ruling allows 4 and 5 before 3, never 6 or 7. Only an app whose table was published can have objects up: any
+ * other skips 3, its package goes at once in 6, and its card waits for the reset that is outstanding, if one is. A new
+ * run (END_REPLACED) decides the layer's place; any other end puts it behind.
  */
 static void end_app(end_t how) {
     if (T.rt == NULL && T.pkg == NULL) {
@@ -625,9 +676,15 @@ static void end_app(end_t how) {
     set_resident(false);
     apps_rt_free(T.rt);
     T.rt = NULL;
-    uint32_t reset = ask_reset();
-    (void)wait_reset(reset);
-    release_pkg(T.pkg, reset);
+    uint32_t reset;
+    if (T.was_published) {
+        reset = ask_reset();
+        (void)wait_reset(reset);
+        release_pkg(T.pkg, reset);
+    } else {
+        reset = atomic_load(&s_rec->reset_req);  /* the outstanding one, if any: a card mustn't come before it */
+        free_pkg(T.pkg);
+    }
     T.pkg = NULL;
     if (how == END_CRASHED) {
         post_card(line, reset);
@@ -667,9 +724,10 @@ static void begin_app(apps_pkg_t *pkg) {
     const apps_manifest_t *m = &pkg->manifest;
     T.pkg = pkg;
     T.rt = NULL;
-    T.shown = T.abandoned = T.publish = T.dirty = false;
+    T.shown = T.abandoned = T.publish = T.was_published = T.dirty = false;
     T.worst_ms = 0;
     T.cpu_pct = 0;
+    T.window = apps_port_mono_ms() / 1000;
     T.window_busy = 0;
     T.gen++;
     atomic_store(&s_rec->app_gen, T.gen);
@@ -687,6 +745,7 @@ static void begin_app(apps_pkg_t *pkg) {
     }
     if (names_take(LOCK_MS)) {
         s_rec->names.resident = false;
+        s_rec->names.card = false;  /* an earlier app's crash card not shown yet would come up over this one */
         put_text(s_rec->names.id, sizeof s_rec->names.id, m->id);
         put_text(s_rec->names.name, sizeof s_rec->names.name, m->name[0] != '\0' ? m->name : m->id);
         names_give();
@@ -794,6 +853,14 @@ static void finish_run(void) {
  */
 static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms) {
     end_app(END_REPLACED);
+    if (r != NULL && !wanted(r)) {
+        /* Its caller gave up while the old app ended (its stop() hung, or the waits ran long): the run is dropped, as from
+         * the queue, and the layer goes behind with nothing on it. */
+        free_pkg(pkg);
+        complete(r, false, NULL);
+        request_front(false);
+        return;
+    }
     begin_app(pkg);
     T.pending = r;
     snprintf(T.what, sizeof T.what, "crashed loading %s", pkg->manifest.main);
@@ -933,6 +1000,7 @@ static void housekeeping(void) {
     if (atomic_load(&s_rec->hung)) {
         abandon();  /* marked when its call had already come back */
     }
+    roll_window();
     free_parked();
     try_publish();
     if (T.pending != NULL && apps_port_mono_ms() >= T.settle_until) {
@@ -967,14 +1035,23 @@ static void apps_task(void *arg) {
 
 /* ---- The LVGL task ---- */
 
-static void post_from_lvgl(uint8_t type) {
-    apps_event_t ev = {.type = type, .app_gen = atomic_load(&s_rec->app_gen)};
+static void post_from_lvgl(uint8_t type, uint32_t app_gen) {
+    apps_event_t ev = {.type = type, .app_gen = app_gen};
     if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
         ESP_LOGW(TAG, "the app task's queue is full: %s() is lost", type == APPS_EV_SHOW ? "show" : "hide");
     }
 }
 
-/* A touch on a widget, from apps_lv's callback: posted with no wait, and counted when there is no room. */
+/* The layer is in front or a card is shown: muse_apps_covering's flag, set at each change this file makes and at every
+ * frame (a card's own tap closes it between frames). */
+static bool update_covering(void) {
+    bool covering = apps_lv_front() || apps_lv_cards_shown();
+    atomic_store(&s_covering, covering);
+    return covering;
+}
+
+/* A touch on a widget, from apps_lv's callback: posted with no wait, and counted when there is no room. It leaves the
+ * last REQ_ROOM slots to requests, so a stop gets in however fast the taps come. */
 static void on_widget_event(uint16_t slot, uint16_t gen, uint8_t event) {
     if (!atomic_load(&s_up)) {
         return;
@@ -982,7 +1059,7 @@ static void on_widget_event(uint16_t slot, uint16_t gen, uint8_t event) {
     apps_event_t ev = {
         .type = APPS_EV_TOUCH, .code = event, .slot = slot, .gen = gen, .app_gen = atomic_load(&s_rec->app_gen),
     };
-    if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
+    if (uxQueueSpacesAvailable(s_queue) <= REQ_ROOM || xQueueSend(s_queue, &ev, 0) != pdTRUE) {
         atomic_store(&s_rec->dropped, atomic_load(&s_rec->dropped) + 1);
     }
 }
@@ -994,7 +1071,8 @@ static void on_close(void) {
         return;
     }
     apps_lv_set_front(false);
-    post_from_lvgl(APPS_EV_HIDE);
+    post_from_lvgl(APPS_EV_HIDE, atomic_load(&s_rec->app_gen));
+    update_covering();
 }
 
 /* The launcher's pick, inside the row's tap. */
@@ -1002,12 +1080,13 @@ static void on_pick(const char *id) {
     apps_task_launch(id, true);
 }
 
+/* Fronts L's app: show() goes to that app alone. */
 static void front_now(void) {
     apps_lv_hide_cards();  /* opening an app closes the launcher (C12), and a card would cover it */
     if (!apps_lv_front()) {
         apps_lv_set_front(true);
     }
-    post_from_lvgl(APPS_EV_SHOW);
+    post_from_lvgl(APPS_EV_SHOW, L.gen);
 }
 
 /* The supervisor: a call that has run for more than APPS_TASK_HUNG_MS is hung. */
@@ -1024,6 +1103,7 @@ static void watch_for_hang(void) {
     L.want_front = L.front_before_turn = false;
     vTaskPrioritySet(s_task, APPS_TASK_HUNG_PRIORITY);
     put_text(L.hung_name, sizeof L.hung_name, "The app");
+    L.hung_gen = atomic_load(&s_rec->app_gen);  /* the app task, stuck in the call, can't move on from it */
     if (names_take(NAMES_LOCK_MS)) {
         if (s_rec->names.name[0] != '\0') {
             put_text(L.hung_name, sizeof L.hung_name, s_rec->names.name);
@@ -1047,22 +1127,43 @@ static void run_reset(void) {
     }
 }
 
+/* The app task's last request, when it is new: a back is carried out at once, a front is noted for carry_out_front. What
+ * L knew of an app goes when another has begun, and a request of an app that has ended since is dropped. */
 static void follow_front(void) {
     uint32_t asked = atomic_load(&s_rec->front_req);
+    uint32_t gen = atomic_load(&s_rec->app_gen);  /* read after: the asking app's, or a later one's */
+    if (gen != L.gen) {
+        L.gen = gen;
+        L.want_front = L.front_before_turn = false;
+    }
     if (asked == L.front_seen) {
         return;
     }
     L.front_seen = asked;
+    if (((asked >> 1) & FRONT_GEN_MASK) != (gen & FRONT_GEN_MASK)) {
+        return;
+    }
     if ((asked & 1u) == 0) {
         if (apps_lv_front()) {
             apps_lv_set_front(false);
         }
         L.want_front = L.front_before_turn = false;
-    } else if (atomic_load(&s_rec->hung)) {
-        /* a hung app stays behind */
-    } else if (L.in_turn) {
-        L.want_front = true;
-    } else {
+    } else if (!atomic_load(&s_rec->hung)) {
+        L.want_front = true;  /* a hung app stays behind */
+    }
+}
+
+/* Out of a voice turn, after follow_front has seen the frame's requests: a turn's end fronts the app again if it was in
+ * front when the turn began, and a front the app asked for is carried out once its table is published. */
+static void carry_out_front(void) {
+    if (L.turn_ended) {
+        L.turn_ended = false;
+        L.want_front = L.want_front || L.front_before_turn;
+        L.front_before_turn = false;
+    }
+    if (L.want_front && atomic_load(&s_rec->published) && !atomic_load(&s_rec->hung) &&
+        atomic_load(&s_rec->app_gen) == L.gen) {  /* read after published: that table is L's app's */
+        L.want_front = false;
         front_now();
     }
 }
@@ -1071,7 +1172,9 @@ static void follow_front(void) {
 static void show_cards(void) {
     if (L.hung_card) {
         L.hung_card = false;
-        apps_lv_show_crash(L.hung_name, NULL);
+        if (L.hung_gen == L.gen) {  /* an app that began since drops it, as it does a crash card */
+            apps_lv_show_crash(L.hung_name, NULL);
+        }
     }
     bool launcher = atomic_load(&s_launcher_wanted);
     bool card = false, resident = false;
@@ -1116,8 +1219,10 @@ void muse_apps_ui_supervise(void) {
     run_reset();
     follow_front();
     if (!L.in_turn) {
+        carry_out_front();
         show_cards();
     }
+    update_covering();
 }
 
 bool muse_apps_ui_tick(void) {
@@ -1128,7 +1233,7 @@ bool muse_apps_ui_tick(void) {
         bool published = atomic_load(&s_rec->published) != 0;
         (void)apps_lv_apply(published && atomic_load(&s_rec->in_call) != 0);
     }
-    return apps_lv_front() || apps_lv_cards_shown();
+    return update_covering();
 }
 
 void muse_apps_ui_turn(bool in_turn) {
@@ -1137,20 +1242,17 @@ void muse_apps_ui_turn(bool in_turn) {
     }
     L.in_turn = in_turn;
     if (in_turn) {
+        L.turn_ended = false;
         L.front_before_turn = apps_lv_front();
-        L.want_front = false;
         apps_lv_hide_cards();
         if (L.front_before_turn) {
             apps_lv_set_front(false);
-            post_from_lvgl(APPS_EV_HIDE);
+            post_from_lvgl(APPS_EV_HIDE, atomic_load(&s_rec->app_gen));
         }
-        return;
+    } else {
+        L.turn_ended = true;  /* muse_apps_ui_supervise decides, once it has seen the frame's requests */
     }
-    bool again = (L.want_front || L.front_before_turn) && atomic_load(&s_rec->published) && !atomic_load(&s_rec->hung);
-    L.want_front = L.front_before_turn = false;
-    if (again) {
-        front_now();
-    }
+    update_covering();
 }
 
 void muse_apps_open_launcher(void) {
@@ -1159,6 +1261,10 @@ void muse_apps_open_launcher(void) {
 
 bool muse_apps_front(void) {
     return apps_lv_front();
+}
+
+bool muse_apps_covering(void) {
+    return atomic_load(&s_covering);
 }
 
 /* ---- The callers ---- */
@@ -1177,15 +1283,27 @@ static const char *refusal(bool waits) {
     return NULL;
 }
 
-static bool post_req(uint8_t type, req_t *r, int wait_ms) {
+/* Posts r, waiting for room in the queue until `until` (apps_port_mono_ms), and no longer once the app hangs: NULL once
+ * it is in the queue, otherwise why not. Touches leave REQ_ROOM slots to requests. */
+static const char *post_req(uint8_t type, req_t *r, int64_t until) {
     apps_event_t ev = {.type = type, .req = r};
-    return xQueueSend(s_queue, &ev, pdMS_TO_TICKS(wait_ms)) == pdTRUE;
+    for (;;) {
+        if (xQueueSend(s_queue, &ev, pdMS_TO_TICKS(POLL_MS)) == pdTRUE) {
+            return NULL;
+        }
+        if (atomic_load(&s_rec->hung)) {
+            return MSG_HUNG;
+        }
+        if (apps_port_mono_ms() >= until) {
+            return MSG_BUSY;
+        }
+    }
 }
 
-/* Waits for r's answer, at most ms, and not at all once the app hangs. True when it came (it is in the caller's
- * buffers). Otherwise r is abandoned, so the app task writes nothing more to them, and err says why. */
-static bool await(req_t *r, int ms, char *err, size_t err_len) {
-    int64_t until = apps_port_mono_ms() + ms;
+/* Waits for r's answer until `until`, the end of the caller's bound of ms, and not at all once the app hangs. True when
+ * it came (it is in the caller's buffers). Otherwise r is abandoned, so the app task writes nothing more to them, and
+ * err says why. */
+static bool await(req_t *r, int64_t until, int ms, char *err, size_t err_len) {
     for (;;) {
         bool hung = atomic_load(&s_rec->hung) != 0;
         bool late = apps_port_mono_ms() >= until;
@@ -1238,15 +1356,17 @@ bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st
     r->err = err;
     r->err_len = err_len;
     int wait_ms = r->settle_ms + APPS_TASK_RUN_EXTRA_MS;
-    if (!post_req(APPS_EV_RUN, r, POST_MS)) {
+    int64_t until = apps_port_mono_ms() + wait_ms;
+    const char *busy = post_req(APPS_EV_RUN, r, until);
+    if (busy != NULL) {
         free_req(r);
-        put_text(err, err_len, MSG_BUSY);
+        put_text(err, err_len, busy);
         if (st != NULL) {
             apps_task_status(st);
         }
         return false;
     }
-    bool answered = await(r, wait_ms, err, err_len);
+    bool answered = await(r, until, wait_ms, err, err_len);
     bool ok = answered && r->ok;
     if (!answered && st != NULL) {
         apps_task_status(st);
@@ -1314,12 +1434,14 @@ bool apps_task_compile(const apps_pkg_t *pkg, char *err, size_t err_len) {
     }
     r->err = err;
     r->err_len = err_len;
-    if (!post_req(APPS_EV_COMPILE, r, POST_MS)) {
+    int64_t until = apps_port_mono_ms() + APPS_TASK_WAIT_MS;
+    const char *busy = post_req(APPS_EV_COMPILE, r, until);
+    if (busy != NULL) {
         free_req(r);
-        put_text(err, err_len, MSG_BUSY);
+        put_text(err, err_len, busy);
         return false;
     }
-    bool ok = await(r, APPS_TASK_WAIT_MS, err, err_len) && r->ok;
+    bool ok = await(r, until, APPS_TASK_WAIT_MS, err, err_len) && r->ok;
     release(r);
     return ok;
 }
@@ -1338,26 +1460,38 @@ void apps_task_launch(const char *id, bool front) {
     r->holders = 1;
     r->front = front;
     put_text(r->id, sizeof r->id, id);
-    if (!post_req(APPS_EV_RUN, r, 0)) {
+    apps_event_t ev = {.type = APPS_EV_RUN, .req = r};
+    if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
         ESP_LOGW(TAG, "launch %s: %s", id, MSG_BUSY);
         free_req(r);
     }
 }
 
-void apps_task_stop(void) {
-    if (refusal(true) != NULL) {
-        return;
+bool apps_task_stop(char *err, size_t err_len) {
+    char why[128] = "";
+    const char *refused = refusal(true);
+    req_t *r = refused == NULL ? new_req(REQ_STOP, 0) : NULL;
+    bool ok = false;
+    if (refused != NULL || r == NULL) {
+        put_text(why, sizeof why, refused != NULL ? refused : "out of memory: no room for the request");
+    } else {
+        r->err = why;  /* the caller's own buffer, which outlives its wait */
+        r->err_len = sizeof why;
+        int64_t until = apps_port_mono_ms() + APPS_TASK_WAIT_MS;
+        const char *busy = post_req(APPS_EV_STOP, r, until);
+        if (busy != NULL) {
+            free_req(r);
+            put_text(why, sizeof why, busy);
+        } else {
+            ok = await(r, until, APPS_TASK_WAIT_MS, why, sizeof why) && r->ok;
+            release(r);
+        }
     }
-    req_t *r = new_req(REQ_STOP, 0);
-    if (r == NULL) {
-        return;
+    if (!ok) {
+        ESP_LOGW(TAG, "stop: %s", why);
     }
-    if (!post_req(APPS_EV_STOP, r, POST_MS)) {
-        free_req(r);
-        return;
-    }
-    (void)await(r, APPS_TASK_WAIT_MS, NULL, 0);
-    release(r);
+    put_text(err, err_len, why);
+    return ok;
 }
 
 void apps_task_status(apps_status_t *st) {
@@ -1368,11 +1502,11 @@ void apps_task_status(apps_status_t *st) {
         memset(st, 0, sizeof *st);
         return;
     }
-    uint32_t dropped = atomic_load(&s_rec->dropped);
     if (rec_take(STATUS_LOCK_MS)) {
         memcpy(st, &s_rec->st, sizeof *st);
         if (s_rec->loaded) {
-            st->dropped_events = dropped - s_rec->dropped_base;
+            /* Read under the lock, as its base is: dropped only grows, so the difference can't wrap. */
+            st->dropped_events = atomic_load(&s_rec->dropped) - s_rec->dropped_base;
         }
         rec_give();
     } else {

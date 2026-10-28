@@ -21,7 +21,8 @@
  * fakes of apps_lv.c (LVGL's types, esp_log, esp_timer, the heap caps), and adds what the app task needs: tasks,
  * queues and mutexes. tests/muse_apps_task_harness.c makes them real with pthreads, so the app task, the LVGL task
  * and a caller run at once, as they do on the gadget. The declarations follow ESP-IDF v6.0.1's (freertos/task.h,
- * queue.h, semphr.h, idf_additions.h), as functions where FreeRTOS has macros: only what apps_task.c calls.
+ * queue.h, semphr.h, idf_additions.h), as functions where FreeRTOS has macros: only what apps_task.c calls, and what
+ * apps_port_idf.c does (tests/muse_apps_port_harness.c, with its own definitions).
  */
 
 #include <stdbool.h>
@@ -42,6 +43,7 @@ typedef int esp_err_t;
 #define MALLOC_CAP_INTERNAL (1u << 11)
 void *heap_caps_malloc(size_t size, uint32_t caps);
 void *heap_caps_calloc(size_t n, size_t size, uint32_t caps);
+void *heap_caps_realloc(void *ptr, size_t size, uint32_t caps);  /* apps_port_idf.c's (tests/muse_apps_port_harness.c) */
 void heap_caps_free(void *ptr);
 
 /* ---- FreeRTOS ---- */
@@ -78,6 +80,7 @@ QueueHandle_t xQueueCreateWithCaps(UBaseType_t length, UBaseType_t item_size, UB
 void vQueueDeleteWithCaps(QueueHandle_t queue);
 BaseType_t xQueueSend(QueueHandle_t queue, const void *item, TickType_t wait);
 BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t wait);
+UBaseType_t uxQueueSpacesAvailable(QueueHandle_t queue);
 
 SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer);
 BaseType_t xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t wait);

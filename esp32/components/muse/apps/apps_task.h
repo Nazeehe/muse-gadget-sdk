@@ -22,11 +22,13 @@
  * PSRAM and a queue of 16 apps_event_t in PSRAM. One app at a time.
  *
  * Callers. apps_task_run, apps_task_compile and apps_task_stop post a request and wait for its answer, always with
- * a bound: a run waits settle_ms + APPS_TASK_RUN_EXTRA_MS, the others APPS_TASK_WAIT_MS. A caller that gives up
- * abandons the request, and the app task writes nothing to its buffers after that. They are for the tasks that
- * install and drive apps (the I/O worker, the console, Link), never the app task itself (a call from it fails at
- * once) and never the LVGL task, which posts and doesn't wait: apps_task_launch. apps_task_status reads the task's
- * record under a short lock and posts nothing.
+ * a bound: a run waits settle_ms + APPS_TASK_RUN_EXTRA_MS, the others APPS_TASK_WAIT_MS, for room in the queue and
+ * the answer together. Touches leave the queue's last 2 slots to requests, so taps can't keep a request out; a
+ * request that finds no room within its bound fails with "the app task is busy; try again". A caller that gives up
+ * abandons the request, and the app task writes nothing to its buffers after that: a run abandoned before its app
+ * has begun doesn't start it. They are for the tasks that install and drive apps (the I/O worker, the console,
+ * Link), never the app task itself (a call from it fails at once) and never the LVGL task, which posts and doesn't
+ * wait: apps_task_launch. apps_task_status reads the task's record under a short lock and posts nothing.
  *
  * A hung app. A call into the app (a handler, main.lua's top level) that has run for more than APPS_TASK_HUNG_MS is
  * hung: the supervisor, on the LVGL task (muse_apps_ui_supervise), puts the layer behind, drops the app task to
@@ -35,14 +37,22 @@
  * "the app stopped responding; no app can run until its stuck call returns or the gadget restarts" (status reads
  * the record as ever). If the call does return, nothing of the app runs again: the task frees its state (as the
  * teardown below), goes back to priority 2 and serves calls again; the record keeps the state HUNG until the next
- * app.
+ * app. The supervisor runs in frame_tick, so it stops while LVGL is paused (asleep and dark on battery): a call
+ * stuck in C then is marked HUNG on the first frame after the screen wakes. Until then the VM's 1 s backstop still
+ * stops Lua that runs too long, and the callers' waits stay bounded: they end with their own timeout rather than
+ * the hung message.
  *
  * An app's end (stop, a new run, sys.exit, a crash, a hang) is one order, the rulings': the pending request is
  * answered; the table is unpublished (apps_lv_set_ui(NULL) under the UI lock); the record takes the crash record,
  * the log and the widget dump; the runtime is freed; the LVGL task is asked to reset the layer (apps_lv_reset) and
  * the app task waits for it, at most APPS_TASK_RESET_MS; the package's bytes, which image objects draw from, are
  * freed only once that reset has run (they wait for a later one if it didn't come in time); and a crash card is
- * shown after the reset. A new app's table is published only once the old app's reset has run.
+ * shown after the reset. A new app's table is published only once the old app's reset has run. Only an app whose
+ * table was published asks for a reset: one that ends before its table is (a crash in main.lua or start(), or an
+ * app replaced while its table still waited) frees its package at once, and its crash card waits for the reset
+ * that is outstanding. So at most one package waits for a reset at a time: no table is published while a reset is
+ * outstanding, so every app that ends in the meantime ends unpublished. A new app drops an earlier app's crash card
+ * that isn't on screen yet.
  */
 
 #include <stdbool.h>
@@ -143,8 +153,13 @@ bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st
  */
 void apps_task_launch(const char *id, bool front);
 
-/* Stops the current app (its stop() runs) and puts the layer behind. Waits at most APPS_TASK_WAIT_MS. */
-void apps_task_stop(void);
+/*
+ * Stops the current app (its stop() runs) and puts the layer behind. Waits at most APPS_TASK_WAIT_MS. True once the
+ * app has stopped, or when none was running. Otherwise false, with why in err (may be NULL), and a W log line: a
+ * refusal ("Muse apps aren't running", from the app task, or the hung message), no memory, no room in the queue
+ * within the bound, or no answer within it. Task 13's >app.stop reports the result.
+ */
+bool apps_task_stop(char *err, size_t err_len);
 
 /* A copy of the record (never NULL st). It posts nothing, and waits only for the record's lock, which is held for
  * copies. */

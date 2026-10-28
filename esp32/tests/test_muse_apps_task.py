@@ -135,6 +135,47 @@ class AppTaskTest(unittest.TestCase):
     def test_touches_past_a_full_queue_are_counted(self):
         self.run_case("touches_past_a_full_queue_are_counted")
 
+    # ---- Fix round 1 ----
+
+    def test_parking_is_bounded_to_one_package(self):  # F1
+        self.run_case("parking_is_bounded")
+
+    def test_a_replace_whose_stop_hangs_drops_the_run(self):  # F2
+        self.run_case("a_replace_whose_stop_hangs_drops_the_run")
+
+    def test_a_back_request_in_the_turns_last_frame_gets_no_show(self):  # F5 (a)
+        self.run_case("a_back_request_in_the_turns_last_frame")
+
+    def test_a_front_asked_during_a_turn_waits_for_the_table(self):  # F5 (b)
+        self.run_case("a_front_asked_during_a_turn_waits_for_the_table")
+
+    def test_a_new_app_drops_an_old_crash_card(self):  # F6
+        self.run_case("a_new_app_drops_an_old_crash_card")
+
+    def test_a_new_app_drops_an_old_hung_card(self):  # F6, the supervisor's card
+        self.run_case("a_new_app_drops_an_old_hung_card")
+
+    def test_cpu_pct_follows_idle_time(self):  # F9, T9 (1)
+        self.run_case("cpu_pct_follows_idle_time")
+
+    def test_dropped_is_read_with_its_base(self):  # F10
+        self.run_case("dropped_is_read_with_its_base")
+
+    def test_a_front_asked_during_a_turn_comes_after_it(self):  # T1, C11's want_front
+        self.run_case("a_front_asked_during_a_turn_comes_after_it")
+
+    def test_a_card_waits_for_the_turn_to_end(self):  # T9 (2)
+        self.run_case("a_card_waits_for_the_turn_to_end")
+
+    def test_a_turn_after_the_app_ended_fronts_nothing(self):  # T9 (3)
+        self.run_case("a_turn_after_the_app_ended_fronts_nothing")
+
+    def test_stop_reports_why_it_failed(self):  # F3
+        self.run_case("stop_reports_failure")
+
+    def test_the_tick_says_when_the_apps_cover(self):  # T9 (1), F7
+        self.run_case("the_tick_says_when_the_apps_cover")
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))

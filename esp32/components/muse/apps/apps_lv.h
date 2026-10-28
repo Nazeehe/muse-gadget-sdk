@@ -192,8 +192,8 @@ void apps_lv_stats(apps_lv_stats_t *out);
 /* The launcher: "Apps", and a row for each app, ids[i] named names[i] (NULL: the id), at most APPS_LV_LAUNCHER_ROWS,
  * or, for n 0, "No apps yet. Ask Muse to make one." Both are copied. A tap on a row closes the launcher and calls pick
  * with the row's id, on the LVGL task inside the tap (pick posts and returns). A tap anywhere else (the text
- * included: it isn't clickable, so LVGL gives the tap to the launcher) or a right swipe closes it. Showing it again
- * makes its rows again. */
+ * included: it isn't clickable, so LVGL gives the tap to the launcher) or a right swipe closes it. Any other swipe
+ * does nothing, even one that begins on a row: it picks nothing. Showing it again makes its rows again. */
 void apps_lv_show_launcher(const char *const *ids, const char *const *names, int n, void (*pick)(const char *id));
 
 /* The crash card: "<name> stopped" over first_line (the crash record's first line), or "<name> stopped responding"

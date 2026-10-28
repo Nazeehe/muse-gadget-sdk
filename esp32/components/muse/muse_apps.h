@@ -44,7 +44,8 @@ void muse_apps_ui_build(lv_obj_t *screen);
 
 /* The LVGL task, every frame, before update_sleep(): the hang supervisor (a call into the app that has run more than
  * APPS_TASK_HUNG_MS), the reset of an app that ended (before any apply in the frame), the front and back the app task
- * asked for, and the cards it asked for (not during a voice turn). */
+ * asked for (a front once the app's table is published), the layer's place after a voice turn has ended, and the
+ * cards (neither of these two during a turn). */
 void muse_apps_ui_supervise(void);
 
 /* The LVGL task, every frame the screen is awake: the apply step (apps_lv_apply). True while the app layer or a card
@@ -61,5 +62,9 @@ void muse_apps_open_launcher(void);
 
 /* Any task: the app layer is in front. */
 bool muse_apps_front(void);
+
+/* Any task: the app layer is in front or a card (the launcher, a crash card) is shown, as of the LVGL task's last
+ * frame or change. The watch yields to it (muse_ui_clock_showing). */
+bool muse_apps_covering(void);
 
 #endif

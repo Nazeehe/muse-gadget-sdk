@@ -1872,7 +1872,7 @@ void muse_ui_show_face(void)
 bool muse_ui_clock_showing(void)
 {
 #if CONFIG_MUSE_APPS
-    return s_on_clock && !muse_apps_front();   /* an app in front covers the watch */
+    return s_on_clock && !muse_apps_covering();   /* an app in front, or a card, covers the watch */
 #else
     return s_on_clock;
 #endif

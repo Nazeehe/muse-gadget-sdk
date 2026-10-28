@@ -4137,6 +4137,34 @@ static void launcher_closes_on_a_right_swipe(void) {
     CHECK(picks == 0, "the row the swipe began on isn't picked: %d", picks);
 }
 
+/* F4: only a right swipe does anything to the launcher. A left, up or down swipe that begins on a row, followed
+ * through the lift, neither picks the row (LVGL would click it: nothing scrolled) nor closes the launcher. */
+static void launcher_ignores_every_other_swipe(void) {
+    static const struct {
+        lv_dir_t dir;
+        const char *name;
+    } ways[] = {{LV_DIR_LEFT, "a left"}, {LV_DIR_TOP, "an up"}, {LV_DIR_BOTTOM, "a down"}};
+    const char *ids[] = {"hello"};
+    const char *names[] = {"Hello"};
+    for (size_t i = 0; i < sizeof ways / sizeof ways[0]; i++) {
+        cards_scene();
+        apps_lv_show_launcher(ids, names, 1, pick);
+        int row = fake_parent(fake_label("Hello")), launcher = fake_parent(row);
+        fake_press(row);
+        fake_swipe(ways[i].dir);
+        fake_lift();
+        CHECK(picks == 0, "%s swipe on a row picks it: %d", ways[i].name, picks);
+        CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && apps_lv_cards_shown(), "%s swipe closes the launcher", ways[i].name);
+    }
+    cards_scene();
+    apps_lv_show_launcher(ids, names, 1, pick);
+    int row = fake_parent(fake_label("Hello")), launcher = fake_parent(row);
+    fake_press(row);
+    fake_swipe(LV_DIR_RIGHT);
+    fake_lift();
+    CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "a right swipe closes it, picking nothing");
+}
+
 static void launcher_rows_are_its_own(void) {
     cards_scene();
     char first[] = "alpha";
@@ -4276,6 +4304,7 @@ int main(int argc, char **argv) {
         {"launcher_closes_on_a_tap_elsewhere", launcher_closes_on_a_tap_elsewhere},
         {"launcher_empty_state", launcher_empty_state},
         {"launcher_closes_on_a_right_swipe", launcher_closes_on_a_right_swipe},
+        {"launcher_ignores_every_other_swipe", launcher_ignores_every_other_swipe},
         {"launcher_rows_are_its_own", launcher_rows_are_its_own},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},

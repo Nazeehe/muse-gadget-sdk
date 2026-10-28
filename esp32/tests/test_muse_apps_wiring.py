@@ -479,17 +479,17 @@ class MuseAppsWiringTest(unittest.TestCase):
                 self.assertIn("if CONFIG_MUSE_APPS", open_conditions(ui, index))
 
     def test_clock_showing_yields_to_apps(self):
-        # An app in front covers the watch, whatever tile is under it: muse_input's talk button then talks instead of
-        # turning to the face. With the option off it is s_on_clock, as before.
+        # An app in front or a card (the launcher, a crash card) covers the watch, whatever tile is under it: muse_input's
+        # talk button then talks instead of turning to the face (F7). With the option off it is s_on_clock, as before.
         body = c_function((MUSE / "muse_ui.c").read_text(), "bool muse_ui_clock_showing(void)")
         source = ("#include <stdbool.h>\n#include <stdio.h>\n"
-                  "static bool s_on_clock, front;\n"
-                  "__attribute__((unused)) static bool muse_apps_front(void) { return front; }\n" + body +
+                  "static bool s_on_clock, covering;\n"
+                  "__attribute__((unused)) static bool muse_apps_covering(void) { return covering; }\n" + body +
                   "\nint main(void) {\n"
                   "    for (int on = 0; on < 2; on++) {\n"
                   "        for (int f = 0; f < 2; f++) {\n"
                   "            s_on_clock = on;\n"
-                  "            front = f;\n"
+                  "            covering = f;\n"
                   "            printf(\"%d%d%d\\n\", on, f, muse_ui_clock_showing());\n"
                   "        }\n"
                   "    }\n"
@@ -534,13 +534,30 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertIn("MALLOC_CAP_SPIRAM", args[7])
         queue = call_arguments(task, "xQueueCreateWithCaps")
         self.assertEqual([value(queue[0]), queue[1], queue[2]], ["16", "sizeof(apps_event_t)", "MALLOC_CAP_SPIRAM"])
+        # T6: the spec's waits, as literals here: the harness moves its clock by these numbers, not by the macros.
+        header = dict(re.findall(r"^#define\s+(\w+)\s+(\S+)", (MUSE / "apps/apps_task.h").read_text(), re.M))
+        for name, ms in (("APPS_TASK_HUNG_MS", "3000"),  # the brief's supervisor, the global constraint
+                         ("APPS_TASK_LAYOUT_MS", "500"),  # C8
+                         ("APPS_TASK_RESET_MS", "500"),  # the reset's acknowledgement (the rulings)
+                         ("APPS_TASK_WAIT_MS", "2000"),  # C7: compile and stop
+                         ("APPS_TASK_RUN_EXTRA_MS", "7000")):  # C7: a run's settle_ms + 7000
+            with self.subTest(name):
+                self.assertEqual(header.get(name), ms)
 
     def test_task_header_compiles_on_the_host(self):
         # C29: apps_task.h stays portable C (the host harness and later tasks' host tests include it): the runtime's and
-        # the package's headers and the standard ones, no FreeRTOS.
+        # the package's headers and the standard ones, no FreeRTOS. A file that includes only it compiles with nothing
+        # but the apps directory on the include path, so no type can come in through whatever is included first (T2).
         header = (MUSE / "apps/apps_task.h").read_text()
         includes = re.findall(r'^#include\s+[<"]([^>"]+)[>"]', header, re.M)
         self.assertEqual(sorted(name for name in includes if not name.startswith("std")), ["apps_pkg.h", "apps_rt.h"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "only_apps_task.c"
+            path.write_text('#include "apps_task.h"\n')
+            args = [*apps_host.cc(), "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", f"-I{MUSE / 'apps'}",
+                    str(path)]
+            done = subprocess.run(args, capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     def test_device_port(self):
         port = (MUSE / "apps/apps_port_idf.c").read_text()
@@ -548,9 +565,11 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertHasText(port, "psa_crypto_init()", "apps_port_idf.c")
         self.assertHasText(port, "psa_hash_compute(PSA_ALG_SHA_256,", "apps_port_idf.c")
         self.assertHasText(port, "mbedtls/sha256.h", "apps_port_idf.c", absent=True)
-        # The apps' heap is PSRAM, and a line of an app's log is one console line.
+        # The apps' heap is PSRAM, and a line of an app's log is one console line, within the echo's budget (F8:
+        # tests/test_muse_apps_port.py runs it).
         self.assertHasText(port, "MUSE_BIG_CAPS", "apps_port_idf.c")
-        self.assertHasText(port, '"@app.log %s %s\\n"', "apps_port_idf.c")
+        self.assertHasText(port, '"%s@app.log %s %s\\n"', "apps_port_idf.c")
+        self.assertHasText(port, "apps_echo_take(&s_echo, apps_port_mono_ms(), bytes)", "apps_port_idf.c")
 
 
 if __name__ == "__main__":

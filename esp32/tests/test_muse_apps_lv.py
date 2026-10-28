@@ -300,6 +300,9 @@ class HarnessTest(unittest.TestCase):
     def test_a_right_swipe_closes_the_launcher(self):  # C12
         self.run_case("launcher_closes_on_a_right_swipe")
 
+    def test_the_launcher_ignores_every_other_swipe(self):  # fix round 1, F4
+        self.run_case("launcher_ignores_every_other_swipe")
+
     def test_the_launcher_keeps_its_own_rows(self):
         self.run_case("launcher_rows_are_its_own")
 

@@ -63,10 +63,10 @@ if(CONFIG_MUSE_ENABLED)
     endif()
     if(CONFIG_MUSE_APPS)
         # Lua mini-apps (apps/): the sandboxed Lua state, its did-you-mean helper, JSON, the package rules, the
-        # runtime of one app and its widgets (the ui module and the shadow table), and the big digit fonts
-        # (apps/fonts/, made by tools/muse/gen_app_fonts.sh).
+        # runtime of one app, its widgets (the ui module and the shadow table) and the LVGL task's step that draws
+        # them, and the big digit fonts (apps/fonts/, made by tools/muse/gen_app_fonts.sh).
         list(APPEND srcs "apps/apps_vm.c" "apps/apps_suggest.c" "apps/apps_json.c" "apps/apps_pkg.c"
-            "apps/apps_rt.c" "apps/apps_ui.c"
+            "apps/apps_rt.c" "apps/apps_ui.c" "apps/apps_lv.c"
             "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
     endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default

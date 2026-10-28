@@ -258,6 +258,14 @@ menu "Muse"
     config MUSE_APPS
         bool "Muse apps: small Lua programs Muse installs on the gadget"
         depends on MUSE_ENABLED && SPIRAM && HOMEHUB_DAEMON_REQUESTS && !MUSE_UI_FREEINK && MUSE_CLOCK
+        # Every LVGL font an app can name (font = "sans14" ... "mono16"), so a board that turns apps on links
+        # whether or not its overlay enables them. The digits fonts fall back to Montserrat 28.
+        select LV_FONT_MONTSERRAT_14
+        select LV_FONT_MONTSERRAT_16
+        select LV_FONT_MONTSERRAT_20
+        select LV_FONT_MONTSERRAT_28
+        select LV_FONT_UNSCII_8
+        select LV_FONT_UNSCII_16
         default n
         help
             Apps are small Lua 5.4 programs that Muse writes and installs on

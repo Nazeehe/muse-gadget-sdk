@@ -190,6 +190,30 @@ class MuseAppsWiringTest(unittest.TestCase):
             if other != overlay:
                 self.assertNotIn("CONFIG_MUSE_APPS=y", other.read_text(), other.name)
 
+    def test_option_selects_every_font_an_app_can_name(self):
+        # font = "sans14" ... "mono16" are lv_font_montserrat_14/16/20/28 and lv_font_unscii_8/16, which a build
+        # only has when its sdkconfig enables them; the option does, so no board's overlay has to remember.
+        apps = kconfig_block((MUSE / "Kconfig").read_text(), "MUSE_APPS")
+        selected = set(re.findall(r"^\s*select (\w+)", apps, re.M))
+        wanted = {f"LV_FONT_MONTSERRAT_{size}" for size in (14, 16, 20, 28)} | {f"LV_FONT_UNSCII_{size}" for size in (8, 16)}
+        self.assertEqual(wanted - selected, set(), "LVGL fonts an app can name that the option doesn't select")
+        # They are the ones apps_lv.c draws with, no more and no fewer.
+        source = (MUSE / "apps/apps_lv.c").read_text()
+        used = set(re.findall(r"&lv_font_((?:montserrat|unscii)_\d+)", source))
+        self.assertEqual({font.removeprefix("LV_FONT_").lower() for font in wanted}, used)
+
+    def test_every_apps_source_is_built_by_the_option(self):
+        # A .c under apps/ that isn't in CONFIG_MUSE_APPS's block never links: its functions are missing when the
+        # task that calls them lands, and the host tests (which compile it by path) can't tell.
+        cmake = (MUSE / "CMakeLists.txt").read_text()
+        block = cmake[cmake.index("    if(CONFIG_MUSE_APPS)\n"):]
+        block = block[:block.index("    endif()")]
+        listed = set(re.findall(r'"(apps/[\w/]+\.c)"', block))
+        on_disk = {str(path.relative_to(MUSE)) for path in (MUSE / "apps").rglob("*.c")}
+        self.assertEqual(sorted(on_disk - listed), [], "apps/ sources that CMakeLists.txt doesn't build")
+        self.assertEqual(sorted(listed - on_disk), [], "CMakeLists.txt lists sources that don't exist")
+        self.assertIn("apps/apps_lv.c", listed)
+
     def test_board_sh_and_ci(self):
         board = (ROOT / "tools/muse/board.sh").read_text()
         flag = 'B=$B-apps; defaults="$defaults;devices/sdkconfig.muse-apps"'

@@ -128,6 +128,14 @@ void apps_port_free(void *ptr) {
  * its housekeeping, prints each queued entry with one printf (so another task's line can't land inside the note or the
  * line) and ends it with apps_port_console_flush, as a reply ends, so the host doesn't keep one that lands on a 64-byte
  * USB packet. The app task is the only caller of both, so the bucket, the count and the queue are its own.
+ *
+ * The drain holds stdout's lock once, for the whole queue (Task 13's N1). Taking it again for each line, the app task
+ * (priority 2) would lose the console after every line to a waiting writer such as the serial task (priority 5), and
+ * wait behind one long reply per line: tens of seconds under back-to-back statuses. picolibc's stdio lock is recursive
+ * (ESP-IDF's esp_libc locks.c makes it a FreeRTOS recursive mutex; POSIX's flockfile is recursive on the host too), so
+ * the printf and the flush inside take it again freely. So a drain waits behind at most one other writer's line, and
+ * another writer waits behind at most the queue, APPS_ECHO_QUEUE bytes (about 0.18 s at the UART's pace), and its
+ * flushes. With nothing queued, the drain never takes the lock.
  */
 #define ECHO_EOL_BYTES 2  /* the console ends a line with CRLF (CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF) */
 
@@ -159,12 +167,17 @@ void apps_port_log(const char *app_id, const char *line) {
 }
 
 void apps_port_log_drain(void) {
+    if (s_echo_used == 0) {
+        return;  /* nothing queued: the housekeeping never waits for the console */
+    }
+    flockfile(stdout);  /* once for the whole queue (Task 13's N1): see the echo above */
     for (size_t at = 0; at < s_echo_used;) {
         const char *entry = s_echo_queue + at;
         printf("%s", entry);
         apps_port_console_flush();
         at += strlen(entry) + 1;
     }
+    funlockfile(stdout);
     s_echo_used = 0;
     s_echo_bytes = 0;
 }

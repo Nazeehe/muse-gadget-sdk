@@ -130,6 +130,55 @@ def function_bodies(source):
     return bodies
 
 
+def top_level_split(text, sep=","):
+    """text cut at each sep outside parentheses, brackets and braces."""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == sep and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    return [*parts, text[start:]]
+
+
+def local_arrays(body):
+    """Every array a (blanked) function body declares, as (type, name, size): every declarator of every declaration, read
+    up to its initializer (Task 13's N2: `char c, buf[512];` declares an array too; a subscript in an initializer
+    doesn't)."""
+    found = []
+    for kind, declarators in re.findall(r"^\s+(?!(?:return|else|case|goto|do)\b)(?:static\s+)?(?:const\s+)?"
+                                        r"([A-Za-z_]\w*(?: [A-Za-z_]\w*)?)\s+(\**\w+[^;]*);", body, re.M):
+        for declarator in top_level_split(declarators):
+            head = declarator.split("=", 1)[0]
+            found += [(kind, name, size) for name, size in re.findall(r"(\w+)\s*\[([^\]]+)\]", head)]
+    return found
+
+
+class FrameGuard(unittest.TestCase):
+    def test_the_frame_guard_reads_every_declarator(self):
+        # Task 13's N2: the guard's own reading (local_arrays, which test_console_frames_are_small runs on
+        # apps_console.c), on probe lines: an array anywhere in a declaration is one, first declarator or not; a
+        # subscript in an initializer or a statement isn't.
+        probe = """
+static void probe(staged_t *stage, int i, int k) {
+    char c, buf[512];
+    uint8_t *p, arr[300];
+    char shown[64], big[512];
+    char one[128];
+    char a = 'x', b[4] = "abc";
+    staged_t *g = &stage->files[i];
+    size_t n = lens[3], m = sizes[k + 1];
+    n = table[2];
+}
+"""
+        body = function_bodies(probe)["probe"]
+        self.assertEqual(local_arrays(body), [("char", "buf", "512"), ("uint8_t", "arr", "300"), ("char", "shown", "64"),
+                                              ("char", "big", "512"), ("char", "one", "128"), ("char", "b", "4")])
+
+
 class ConsoleHookChain(unittest.TestCase):
     def test_console_hooks_chain_in_order(self):
         # muse_input_add_console_hook and run_console_hooks, compiled on their own: up to 4 hooks, in the order added,
@@ -329,17 +378,13 @@ class Console(unittest.TestCase):
         self.assertEqual(sorted(set(found_bodies) - defined), [])
         self.assertIn("stage_read", found_bodies)
         self.assertGreater(len(found_bodies), 30, "the function bodies weren't found")
-        bodies = list(found_bodies.values())
         found = 0
-        for body in bodies:
-            # Each declaration that has an array in it (a type, then a declarator with '['), and each array it declares.
-            for kind, declarators in re.findall(r"^\s+(?!(?:return|else|case|goto|do)\b)(?:static\s+)?(?:const\s+)?"
-                                                r"([A-Za-z_]\w*(?: [A-Za-z_]\w*)?)\s+(\**\w+\[[^;]*);", body, re.M):
-                for name, size in re.findall(r"(\w+)\[([^\]]+)\]", declarators):
-                    with self.subTest(name):
-                        found += 1
-                        self.assertIn(kind, ("char", "unsigned char", "uint8_t"), f"{kind} {name}[{size}]: a byte array only")
-                        self.assertLessEqual(value(size), 128, f"{name}[{size}]")
+        for body in found_bodies.values():
+            for kind, name, size in local_arrays(body):  # FrameGuard checks the reading itself
+                with self.subTest(name):
+                    found += 1
+                    self.assertIn(kind, ("char", "unsigned char", "uint8_t"), f"{kind} {name}[{size}]: a byte array only")
+                    self.assertLessEqual(value(size), 128, f"{name}[{size}]")
         self.assertGreater(found, 0, "no local arrays: the pattern no longer reads the file")
 
     def test_every_case_of_the_harness_has_a_test(self):

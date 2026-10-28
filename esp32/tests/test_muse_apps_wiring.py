@@ -586,6 +586,9 @@ class MuseAppsWiringTest(unittest.TestCase):
                 self.assertNotRegex(echo, rf"(?<![\w.]){call}\(")
         drain = function_source(port, "void apps_port_log_drain(void)")
         self.assertRegex(drain, r'printf\("%s", \w+\);\s*apps_port_console_flush\(\);')
+        # N1: it holds stdout's lock once around the whole queue, and not at all with nothing queued.
+        self.assertRegex(drain, r"if \(s_echo_used == 0\) \{\s*return;[^}]*\}\s*flockfile\(stdout\);[^\n]*\n\s*for \("
+                                r"[\s\S]*\}\s*funlockfile\(stdout\);")
         # The app task drains after every call, once in_call is clear, and in its housekeeping.
         task = (MUSE / "apps/apps_task.c").read_text()
         finish = function_source(task, "static void call_finish(void)")

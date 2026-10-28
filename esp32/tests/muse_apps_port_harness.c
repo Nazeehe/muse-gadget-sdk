@@ -28,11 +28,13 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "apps_echo.h"
@@ -241,6 +243,19 @@ static void console_end(void) {
     unlink(console_path);
 }
 
+/* apps_port_console_flush ends each line with fsync(fileno(stdout)). The console here is a file, which needs no sync, so
+ * this fsync stands in for the system's (the port's calls bind to it): a case can act between two lines of a drain, at
+ * the point where a drain that let the console go after each line would have let it go. */
+static void (*between_lines)(void);
+
+int fsync(int fd) {
+    (void)fd;
+    if (between_lines != NULL) {
+        between_lines();
+    }
+    return 0;
+}
+
 /* ---- Cases ---- */
 
 /* F8: the bucket's arithmetic (apps_echo.h). It starts full, earns APPS_ECHO_RATE bytes a second to the thousandth of
@@ -363,11 +378,12 @@ static void echo_queues_until_the_drain(void) {
     pthread_mutex_unlock(&hold_mu);
     alarm(5);
     int64_t t0 = wall_ms();
+    apps_port_log_drain();  /* nothing queued: the app task's housekeeping never waits for the console */
     apps_port_log("hello", "one");
     apps_port_log("hello", "two");
     int64_t took = wall_ms() - t0;
     alarm(0);
-    CHECK(took < 100, "two prints took %lld ms with the console held", (long long)took);
+    CHECK(took < 100, "an empty drain and two prints took %lld ms with the console held", (long long)took);
     pthread_mutex_lock(&hold_mu);
     console_release = true;
     pthread_cond_broadcast(&hold_cv);
@@ -409,6 +425,90 @@ static void echo_queue_is_bounded(void) {
     strcat(expect, "@app.log hello (3 lines not echoed)\n@app.log hello after\n");
     char *got = console_text();
     CHECK(strcmp(got, expect) == 0, "the console:\n%s\nexpected:\n%s", got, expect);
+    free(got);
+    console_end();
+}
+
+/* Another task that keeps printing long lines (back-to-back status replies): it takes the console, holds it for
+ * CONTEND_HOLD_MS, gives it back, and takes it again CONTEND_GAP_MS later, until the case stops it. Each time it has the
+ * console it notes whether a drain was part-way through its lines. */
+#define CONTEND_HOLD_MS 20
+#define CONTEND_GAP_MS 5
+#define DRAIN_LINES 8
+#define OTHER_LINE "@app {\"op\":\"status\"} (another task's long reply)\n"
+
+static atomic_bool contend_stop, contender_holding;
+static atomic_int contender_lines, drained_lines, held_mid_drain;
+
+static void sleep_ms(int ms) {
+    struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+static void *contend_for_the_console(void *arg) {
+    (void)arg;
+    while (!atomic_load(&contend_stop)) {
+        flockfile(stdout);
+        int done = atomic_load(&drained_lines);
+        if (done > 0 && done < DRAIN_LINES) {
+            atomic_fetch_add(&held_mid_drain, 1);
+        }
+        fputs(OTHER_LINE, stdout);
+        atomic_fetch_add(&contender_lines, 1);
+        atomic_store(&contender_holding, true);
+        sleep_ms(CONTEND_HOLD_MS);
+        atomic_store(&contender_holding, false);
+        funlockfile(stdout);
+        sleep_ms(CONTEND_GAP_MS);
+    }
+    return NULL;
+}
+
+/* Between two lines of the drain: time enough for the other task to take the console, if the drain lets it go. */
+static void a_line_was_drained(void) {
+    atomic_fetch_add(&drained_lines, 1);
+    sleep_ms(CONTEND_HOLD_MS + CONTEND_GAP_MS);
+}
+
+/* Task 13's N1: a drain holds the console once, for its whole queue. While another task keeps taking the console for
+ * long lines, a drain of many lines waits once, behind the line in progress, then prints all of its lines with nothing
+ * between them: the other task never has the console between the drain's first line and its last. (A drain that took
+ * the console again for each line would wait behind one long line per line: on the gadget, the app task at priority 2
+ * loses the console to the serial task at priority 5 every time.) */
+static void echo_drain_holds_the_console(void) {
+    console_start();
+    apps_port_init();
+    clock_at_ms(40000);
+    char want[512] = "";
+    for (int i = 1; i <= DRAIN_LINES; i++) {
+        char text[16], line[64];
+        snprintf(text, sizeof text, "line %d", i);
+        apps_port_log("hello", text);
+        snprintf(line, sizeof line, "@app.log hello %s\n", text);
+        strcat(want, line);
+    }
+    pthread_t other;
+    CHECK(pthread_create(&other, NULL, contend_for_the_console, NULL) == 0, "no thread");
+    while (!atomic_load(&contender_holding)) {
+        sleep_ms(1);
+    }
+    alarm(10);
+    between_lines = a_line_was_drained;
+    apps_port_log_drain();  /* behind the other task's line in progress */
+    between_lines = NULL;
+    alarm(0);
+    atomic_store(&contend_stop, true);
+    pthread_join(other, NULL);
+    CHECK(atomic_load(&drained_lines) == DRAIN_LINES, "%d of %d lines drained", atomic_load(&drained_lines), DRAIN_LINES);
+    CHECK(atomic_load(&held_mid_drain) == 0, "the other task had the console %d times between the drain's first line and "
+          "its last", atomic_load(&held_mid_drain));
+    CHECK(atomic_load(&contender_lines) >= 2, "the other task printed %d lines: it should have kept at it",
+          atomic_load(&contender_lines));
+    char *got = console_text();
+    const char *first = strstr(got, "@app.log hello line 1\n");
+    CHECK(first != NULL && strncmp(first, want, strlen(want)) == 0, "the drain's lines, one after another:\n%s", got);
+    CHECK(first == got + strlen(OTHER_LINE) && strncmp(got, OTHER_LINE, strlen(OTHER_LINE)) == 0,
+          "the drain waited once, behind the one line in progress:\n%s", got);
     free(got);
     console_end();
 }
@@ -468,6 +568,7 @@ static const struct {
     {"echo_lines", echo_lines},
     {"echo_queues_until_the_drain", echo_queues_until_the_drain},
     {"echo_queue_is_bounded", echo_queue_is_bounded},
+    {"echo_drain_holds_the_console", echo_drain_holds_the_console},
     {"breach_kinds", breach_kinds},
 };
 

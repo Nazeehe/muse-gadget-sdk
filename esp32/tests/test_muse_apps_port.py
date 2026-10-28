@@ -90,6 +90,9 @@ class AppPortTest(unittest.TestCase):
     def test_the_echo_queue_is_bounded(self):  # Task 13's F3
         self.run_case("echo_queue_is_bounded")
 
+    def test_a_drain_holds_the_console_once(self):  # Task 13's N1: one wait for the whole queue, its lines together
+        self.run_case("echo_drain_holds_the_console")
+
     def test_each_kind_of_breach_is_logged_once(self):  # F11
         self.run_case("breach_kinds")
 

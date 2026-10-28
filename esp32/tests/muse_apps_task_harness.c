@@ -539,13 +539,23 @@ void apps_port_sha256(const void *data, size_t len, uint8_t out[32]) {
 
 /* The console. A print of block_line doesn't return until the case lets it go: a call stuck in C. Any other print only
  * queues its line ("print <id> <line>"), as the device's port does (F3); apps_port_log_drain, on the app task, echoes
- * the queue ("echo <id> <line>") holding console_mu, which a case holds as another task's long reply holds the
- * console. */
+ * the queue ("echo <id> <line>") with the device's locking (N1): console_mu, recursive like picolibc's stdio lock, held
+ * once for the whole queue (flockfile) and taken again for each line (its printf and flush), never with nothing queued.
+ * A case holds it as another task's long reply holds the console. */
 static pthread_mutex_t print_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t print_cv = PTHREAD_COND_INITIALIZER;
 static const char *block_line;
 static bool print_blocked;
-static pthread_mutex_t console_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t console_mu;
+
+__attribute__((constructor)) static void console_mu_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&console_mu, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
 static pthread_mutex_t echo_mu = PTHREAD_MUTEX_INITIALIZER;
 static char *echo_queue[64];
 static int echo_queued;
@@ -582,10 +592,12 @@ void apps_port_log_drain(void) {
     if (n == 0) {
         return;
     }
-    event("drain %d", n);  /* then it waits for the console */
+    event("drain %d", n);  /* then it waits for the console, once */
     pthread_mutex_lock(&console_mu);
     for (int i = 0; i < n; i++) {
+        pthread_mutex_lock(&console_mu);  /* the line's printf and flush: the holder takes it again at once */
         event("echo %s", lines[i]);
+        pthread_mutex_unlock(&console_mu);
         free(lines[i]);
     }
     pthread_mutex_unlock(&console_mu);

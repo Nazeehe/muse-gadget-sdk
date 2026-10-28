@@ -56,8 +56,9 @@ void apps_port_log(const char *app_id, const char *line);
 
 /* Prints the lines apps_port_log queued, in order, each ended with apps_port_console_flush. The app task calls it after
  * every call into the app ends and in its housekeeping, never inside a call, so the time the console takes (another
- * task's long reply holding it) never counts against an app's wall clock. A port that prints at once (the host runner)
- * has nothing to do here. */
+ * task's long reply holding it) never counts against an app's wall clock. It holds the console once for the whole queue,
+ * so it waits behind at most one other writer's line, and with nothing queued it returns without waiting for the
+ * console. A port that prints at once (the host runner) has nothing to do here. */
 void apps_port_log_drain(void);
 
 /* Ends a console line printed with printf (a reply of the ">app.*" protocol, an echoed log line): flushes stdout, then

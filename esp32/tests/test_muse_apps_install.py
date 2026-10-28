@@ -1,0 +1,162 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The install pipeline of Muse apps (apps_install.c) and its RAM store.
+
+tests/muse_apps_install_harness.c runs the real pipeline with the real cJSON, package rules (apps_pkg, apps_json) and
+apps_vm_excerpt (apps_vm and Lua), a fake source that serves files from a table and records every read, and fake ops
+(compile, commit, run) that record what they were given. Every result the harness prints is checked here to be valid
+JSON within APPS_RESULT_MAX bytes. The stack case runs apps_install_run on exactly the I/O worker's 6,144 bytes (R13.7),
+in a build without the sanitizers. Needs the cJSON sources: CJSON_SOURCE_DIR (~/.cache/muse-cjson), or an IDF build's
+managed_components.
+"""
+
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import apps_host
+
+ROOT = Path(__file__).resolve().parents[1]
+MUSE = ROOT / "components/muse"
+APPS = MUSE / "apps"
+TESTS = ROOT / "tests"
+HARNESS = TESTS / "muse_apps_install_harness.c"
+SOURCES = [HARNESS, APPS / "apps_install.c", APPS / "apps_pkg.c", APPS / "apps_json.c", APPS / "apps_vm.c",
+           APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_ui.c", ROOT / "tools/muse/apphost/sha256.c"]
+SDKCONFIG = "#pragma once\n#define CONFIG_MUSE_APPS 1\n#define CONFIG_MUSE_APPS_HEAP_MAX_KB 1024\n"
+RESULT_MAX = 6144
+
+
+class Install(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cjson = apps_host.cjson_object()
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        cls.tmp = tmp.name
+        staged = Path(tmp.name) / "staged"
+        staged.mkdir()
+        (staged / "sdkconfig.h").write_text(SDKCONFIG)
+        cls.includes = [apps_host.LUA_SRC, APPS, MUSE, staged, TESTS, apps_host.CJSON_DIR]
+        cls.harness = apps_host.build("muse_apps_install_harness", [*SOURCES, *apps_host.lua_sources()], tmp.name,
+                                      include_dirs=cls.includes, objects=[cjson])
+
+    def run_case(self, case, harness=None):
+        try:
+            done = apps_host.run(harness or self.harness, case, timeout=300)
+        except subprocess.TimeoutExpired:
+            self.fail(f"{case} took more than 300 s")
+        self.assertEqual(done.returncode, 0, done.stdout[-4000:] + done.stderr[-8000:])
+        results, stacks = [], []
+        for line in done.stdout.splitlines():
+            kind, _, text = line.partition(" ")
+            self.assertIn(kind, ("@result", "@stack"), f"not a line of the harness: {line[:200]!r}")
+            if kind == "@stack":
+                stacks.append(json.loads(text))
+                continue
+            self.assertLessEqual(len(text.encode()), RESULT_MAX, f"a result of {len(text.encode())} bytes")
+            try:
+                results.append(json.loads(text))
+            except ValueError as e:
+                self.fail(f"not valid JSON ({e}): {text[:300]!r}")
+        return results, stacks
+
+    def test_manifest_errors_propagate(self):  # bad id, net, api 2
+        self.run_case("manifest_errors_propagate")
+
+    def test_path_checked_before_read(self):  # the source never sees ../x.lua
+        self.run_case("path_checked_before_read")
+
+    def test_compiled_chunk_refused(self):
+        self.run_case("compiled_chunk_refused")
+
+    def test_oversize_and_totals(self):
+        self.run_case("oversize_and_totals")
+
+    def test_compile_error_has_excerpt(self):  # C17: the raw message, the excerpt from the package's file
+        self.run_case("compile_error_has_excerpt")
+
+    def test_crash_in_start_message(self):
+        results, _ = self.run_case("crash_in_start_message")
+        message = results[0]["error"]["message"]
+        for part in ("installed but crashed in start():", "stack traceback:", "log:"):
+            self.assertIn(part, message)
+        self.assertEqual(message.split("log:\n")[1].split("\n"), [f"l{i:02d}" for i in range(3, 13)])
+
+    def test_crash_in_top_level_message(self):  # Task 8's F2
+        results, _ = self.run_case("crash_in_top_level_message")
+        self.assertTrue(results[0]["error"]["message"].startswith("installed but crashed while loading main.lua: "))
+
+    def test_result_fits_6144_bytes(self):  # C3: 32 files, an 8 KB log, a 128-entry dump
+        results, _ = self.run_case("result_fits_6144_bytes")
+        full = results[0]["payload"]
+        self.assertEqual(len(full["files"]), 32)
+        self.assertEqual(full["log"], [])  # the oldest lines go first: all of them, before the dump's entries
+        self.assertEqual(len(full["ui"]) + full["ui_truncated"], 128)
+        self.assertGreater(len(full["ui"]), 0)
+        logged = results[1]["payload"]
+        self.assertEqual(logged["log"][-1][:8], "line 39 ")
+        self.assertNotIn("ui_truncated", logged)
+
+    def test_busy(self):
+        self.run_case("busy")
+
+    def test_success_payload(self):
+        results, _ = self.run_case("success_payload")
+        files = results[0]["payload"]["files"]
+        self.assertEqual([f["path"] for f in files], ["main.lua", "data.json", "logo.bin"])
+        main = "local app = {}\nfunction app.start() print('started') end\nreturn app\n".encode()
+        self.assertEqual(files[0]["bytes"], len(main))
+        self.assertEqual(files[0]["sha256"], hashlib.sha256(main).hexdigest())
+
+    def test_read_and_commit_failures(self):
+        self.run_case("read_and_commit_failures")
+
+    def test_the_deadline_is_one_absolute_time(self):  # E24, D3
+        self.run_case("deadline_is_one_absolute_time")
+
+    def test_the_ram_store(self):  # C4, E26
+        self.run_case("ram_store")
+
+    def test_status_json(self):  # E13: instructions
+        self.run_case("status_json")
+
+    def test_out_of_memory_anywhere(self):
+        self.run_case("out_of_memory")
+
+    def test_install_stack(self):  # R13.7: the pipeline on exactly the I/O worker's 6,144 bytes
+        harness = apps_host.build("muse_apps_install_stack", [*SOURCES, *apps_host.lua_sources()], self.tmp,
+                                  include_dirs=self.includes, objects=[apps_host.cjson_object()], sanitize=False)
+        _, stacks = self.run_case("install_stack", harness=harness)
+        self.assertEqual([s["case"] for s in stacks], ["success", "crash", "compile"])
+        for s in stacks:
+            print(f"install_stack: {s['case']} used {s['used']} of {s['of']} bytes (host frames)", file=sys.stderr,
+                  flush=True)
+
+    def test_every_case_of_the_harness_has_a_test(self):
+        cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
+        tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))
+        self.assertTrue(cases)
+        self.assertEqual(sorted(cases - tested), [])
+        self.assertEqual(sorted(tested - cases), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

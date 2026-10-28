@@ -21,14 +21,15 @@
  * firmware asks of it. muse_apps_start() (muse_apps.h) makes it: "muse_apps", core 1, priority 2, a 56 KB stack in
  * PSRAM and a queue of 16 apps_event_t in PSRAM. One app at a time.
  *
- * Callers. apps_task_run, apps_task_compile and apps_task_stop post a request and wait for its answer, always with
- * a bound: a run waits settle_ms + APPS_TASK_RUN_EXTRA_MS, the others APPS_TASK_WAIT_MS, for room in the queue and
- * the answer together. Touches leave the queue's last 2 slots to requests, so taps can't keep a request out; a
- * request that finds no room within its bound fails with "the app task is busy; try again". A caller that gives up
- * abandons the request, and the app task writes nothing to its buffers after that: a run abandoned before its app
- * has begun doesn't start it. They are for the tasks that install and drive apps (the I/O worker, the console,
- * Link), never the app task itself (a call from it fails at once) and never the LVGL task, which posts and doesn't
- * wait: apps_task_launch. apps_task_status reads the task's record under a short lock and posts nothing.
+ * Callers. apps_task_run, apps_task_compile, apps_task_stop and apps_task_message post a request and wait for its
+ * answer, always with a bound: a run waits settle_ms + APPS_TASK_RUN_EXTRA_MS, a message its own timeout, the others
+ * APPS_TASK_WAIT_MS, for room in the queue and the answer together. Touches leave the queue's last 2 slots to
+ * requests, so taps can't keep a request out; a request that finds no room within its bound fails with "the app task
+ * is busy; try again". A caller that gives up abandons the request, and the app task writes nothing to its buffers
+ * after that: a run abandoned before its app has begun doesn't start it. They are for the tasks that install and drive
+ * apps (the I/O worker, the console, Link), never the app task itself (a call from it fails at once) and never the
+ * LVGL task, which posts and doesn't wait: apps_task_launch. apps_task_status reads the task's record under a short
+ * lock and posts nothing.
  *
  * A hung app. A call into the app (a handler, main.lua's top level) that has run for more than APPS_TASK_HUNG_MS is
  * hung: the supervisor, on the LVGL task (muse_apps_ui_supervise), puts the layer behind, drops the app task to
@@ -107,7 +108,7 @@ typedef enum {
     APPS_EV_RUN,        /* a run or a launch */
     APPS_EV_STOP,
     APPS_EV_COMPILE,
-    APPS_EV_MESSAGE,    /* Task 13 */
+    APPS_EV_MESSAGE,    /* apps_task_message */
     APPS_EV_SHOW,       /* the layer came to the front: show() */
     APPS_EV_HIDE,       /* it went behind: hide() */
     APPS_EV_ALARM,      /* Task 17 */
@@ -148,7 +149,8 @@ bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st
 /*
  * Posts a launch of the app id and returns: it never waits, for the answer or for a frame, so the LVGL task (the
  * launcher's pick) can call it. The app task fronts the resident app when it is that app (front) and leaves it
- * where it is otherwise; Task 13's RAM store and Task 20's flash store add the apps that aren't loaded. A full
+ * where it is otherwise (an app that isn't loaded logs "launch <id>: no such app on the gadget"; the console's
+ * app.launch runs a stored app through the I/O worker instead, and Task 20's store adds stored apps here). A full
  * queue drops it, with a log line.
  */
 void apps_task_launch(const char *id, bool front);
@@ -164,3 +166,19 @@ bool apps_task_stop(char *err, size_t err_len);
 /* A copy of the record (never NULL st). It posts nothing, and waits only for the record's lock, which is held for
  * copies. */
 void apps_task_status(apps_status_t *st);
+
+/*
+ * Sends message(event, data_json) to the app id, which must be the one running (Task 24 adds starting a stored app
+ * that isn't), and returns its reply: JSON text in a block of apps_port_realloc that the caller frees with
+ * apps_port_free ("null" when the handler returned nothing). data_json is JSON text, or NULL or "" for nil. With show,
+ * a message that succeeded asks for the layer in front (after the voice turn, if one is on). Waits at most timeout_ms
+ * (APPS_TASK_WAIT_MS when it is 0 or less), for room in the queue and the answer together.
+ * NULL, with why in err (may be NULL), cut to err_len:
+ * - the app's own: its handler's error, which leaves it running ("main.lua:7: unknown event"), "data: <message>" for
+ *   data that isn't JSON, "message: <message>" for a reply that can't be encoded, "<main> has no message(event, data)
+ *   handler", or the crash record when the handler was killed or ran out of memory (the app has ended, as any crash);
+ * - "<id> isn't running" when no app of that id runs, and "not an app id" for an id that can't be one;
+ * - the waits' and the refusals', as for the calls above ("the app task didn't answer within N ms", ...).
+ */
+char *apps_task_message(const char *id, const char *event, const char *data_json, bool show, int timeout_ms, char *err,
+                        size_t err_len);

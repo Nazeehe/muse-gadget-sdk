@@ -34,9 +34,25 @@
 
 #if CONFIG_MUSE_APPS
 
-/* Makes the app task (apps_task.h). Call it once, after muse_ui_start() and before muse_input_start(). Out of memory
- * it returns ESP_ERR_NO_MEM, and the firmware runs on without apps. */
+/* Makes the app task (apps_task.h) and adds muse_apps_console to the console's hooks. Call it once, after
+ * muse_ui_start() and before muse_input_start(). Out of memory it returns ESP_ERR_NO_MEM, and the firmware runs on
+ * without apps (the console then answers that they aren't running). */
 esp_err_t muse_apps_start(void);
+
+/*
+ * The USB console's ">app.*" lines (apps_console.c), as a muse_input console hook: line comes without its '>', and it
+ * returns false for a line that doesn't start "app.". It runs on the console's task (muse_serial: a 3,584-byte stack),
+ * keeps its frames small and never waits long: an install or a launch is a job for the I/O worker, which prints the
+ * result. Every reply is one line: "@app.ack <path> <seq>", "@app {...}" or "@app.err {...}" (valid JSON).
+ *   app.put <id> <path> <seq> <base64>   a piece of a file: seq 0 starts it again, each later one is the last + 1
+ *   app.commit <id> [run]                installs what was put (apps_install.h), in RAM, and runs it with "run"
+ *   app.launch <id>                      runs an installed app in front
+ *   app.stop                             stops the app that runs
+ *   app.status                           the app task's record
+ *   app.list                             the installed apps
+ *   app.send <id> <event> [json]         message(event, data) to the app that runs, and its reply
+ */
+bool muse_apps_console(const char *line);
 
 /* Makes the app layer on screen (apps_lv_build) and takes its touches and swipes. In build_overlays(), after the
  * page dots and before the downloaded image, under the display lock and before the frame timer exists. */

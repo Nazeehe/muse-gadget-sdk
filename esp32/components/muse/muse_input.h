@@ -73,11 +73,15 @@ void muse_input_clear_call_pending(uint32_t mark);
 uint32_t muse_input_call_epoch(void);
 
 /*
- * Console '>' lines go to hook first, without the '>'; it returns false for a
- * line that isn't its own. The app sets the SDK token this way
- * (main/sdk_token_console.h). Set it before muse_input_start().
+ * Console '>' lines go to the hooks first, without the '>', in the order they
+ * were added; each returns false for a line that isn't its own, and the first
+ * to return true has it. Up to 4: a 5th is ignored, with a log line. The app
+ * sets the SDK token this way (main/sdk_token_console.h), and Muse apps take
+ * their ">app." lines (muse_apps.h). They run on the console's task, whose
+ * stack is 3,584 bytes, and only for a whole line: one longer than 1,023
+ * bytes after the '>' reaches none of them. Add them before muse_input_start().
  */
-void muse_input_set_console_hook(bool (*hook)(const char *line));
+void muse_input_add_console_hook(bool (*hook)(const char *line));
 
 /* LVGL microphone press/release edges; handled by the existing input task. */
 void muse_input_touch_talk(bool pressed);

@@ -20,7 +20,8 @@
  *
  * Three threads, as on the gadget: the app task (the fake FreeRTOS of tests/muse_apps_task_fakes.h, made of pthreads
  * here), an LVGL task that runs a frame every few ms (muse_apps_ui_supervise, then muse_apps_ui_tick unless the screen
- * "sleeps"; a paused one runs nothing, as LVGL paused on battery), and the case's own thread, the caller. Under the app
+ * "sleeps"; a paused one runs nothing, as LVGL paused on battery), and the case's own thread, the caller. The I/O
+ * worker (apps_io.c, made on demand) is a fourth in the cases that submit jobs. Under the app
  * task is the real runtime (apps_rt, apps_ui, apps_vm, Lua); apps_lv is a fake that writes what is done to the screen
  * into one log of events, in the order it happens, and that keeps the image objects a pass makes and draws each from
  * the package's bytes at every frame, before the supervisor (LVGL's refresh may come first in a round of its timers),
@@ -45,6 +46,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "apps_io.h"
 #include "apps_lv.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
@@ -53,6 +55,7 @@
 #include "apps_ui.h"
 #include "muse_apps.h"
 #include "muse_apps_task_fakes.h"
+#include "muse_input.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 #define HUNG_MESSAGE "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"
@@ -428,9 +431,11 @@ void heap_caps_free(void *ptr) {
     free(b);
 }
 
+/* What heap_caps_get_free_size says of internal RAM (apps_io_submit's admission): a case can make it short. */
+static atomic_size_t internal_free = 200u * 1024;
+
 size_t heap_caps_get_free_size(uint32_t caps) {
-    (void)caps;
-    return 4u * 1024 * 1024;
+    return (caps & MALLOC_CAP_INTERNAL) != 0 ? atomic_load(&internal_free) : 4u * 1024 * 1024;
 }
 
 /* ---- The port: the UI lock, the console, the rest ---- */
@@ -573,6 +578,17 @@ void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
     event("log %c %s", level, msg);
 }
 
+/* muse_input's console hooks, which muse_apps_start adds the apps' to (tests/test_muse_apps_console.py has the chain
+ * and the console itself). */
+void muse_input_add_console_hook(bool (*hook)(const char *line)) {
+    event("console hook %s", hook == muse_apps_console ? "muse_apps_console" : "?");
+}
+
+bool muse_apps_console(const char *line) {
+    (void)line;
+    return false;
+}
+
 /* ---- The fake FreeRTOS: tasks, queues and mutexes on pthreads ---- */
 
 struct fake_task {
@@ -583,7 +599,7 @@ struct fake_task {
     UBaseType_t priority;
 };
 
-static struct fake_task app_tasks[2];
+static struct fake_task app_tasks[16];  /* the app task, then each I/O worker made */
 static int n_app_tasks;
 static _Thread_local struct fake_task thread_task;  /* what a thread of the harness is to FreeRTOS */
 static _Thread_local struct fake_task *current_task;
@@ -594,9 +610,9 @@ static struct fake_task *self_task(void) {
     return current_task != NULL ? current_task : &thread_task;
 }
 
-/* The app task, when this thread is it; NULL on the LVGL task and the case's threads. */
+/* The app task, when this thread is it; NULL on the LVGL task, the I/O worker and the case's threads. */
 static struct fake_task *app_task_of_thread(void) {
-    return current_task;
+    return current_task != NULL && strcmp(current_task->name, "muse_apps") == 0 ? current_task : NULL;
 }
 
 static void *task_main(void *arg) {
@@ -606,14 +622,13 @@ static void *task_main(void *arg) {
     return NULL;
 }
 
-BaseType_t xTaskCreatePinnedToCoreWithCaps(TaskFunction_t code, const char *const name, const uint32_t stack, void *const arg,
-                                           UBaseType_t priority, TaskHandle_t *const created, const BaseType_t core,
-                                           UBaseType_t caps) {
-    event("task %s stack %u priority %u core %d caps 0x%x", name, (unsigned)stack, priority, core, caps);
-    if (n_app_tasks >= (int)ARRAY_LEN(app_tasks)) {
+static BaseType_t make_task(TaskFunction_t code, const char *name, void *arg, UBaseType_t priority, TaskHandle_t *created) {
+    pthread_mutex_lock(&tasks_mu);
+    struct fake_task *task = n_app_tasks < (int)ARRAY_LEN(app_tasks) ? &app_tasks[n_app_tasks++] : NULL;
+    pthread_mutex_unlock(&tasks_mu);
+    if (task == NULL) {
         return pdFAIL;
     }
-    struct fake_task *task = &app_tasks[n_app_tasks++];
     snprintf(task->name, sizeof task->name, "%s", name);
     task->code = code;
     task->arg = arg;
@@ -630,6 +645,36 @@ BaseType_t xTaskCreatePinnedToCoreWithCaps(TaskFunction_t code, const char *cons
     return rc == 0 ? pdPASS : pdFAIL;
 }
 
+BaseType_t xTaskCreatePinnedToCoreWithCaps(TaskFunction_t code, const char *const name, const uint32_t stack, void *const arg,
+                                           UBaseType_t priority, TaskHandle_t *const created, const BaseType_t core,
+                                           UBaseType_t caps) {
+    event("task %s stack %u priority %u core %d caps 0x%x", name, (unsigned)stack, priority, core, caps);
+    return make_task(code, name, arg, priority, created);
+}
+
+/* The I/O worker's: its stack in internal RAM, on either core. */
+BaseType_t xTaskCreatePinnedToCore(TaskFunction_t code, const char *const name, const uint32_t stack, void *const arg,
+                                   UBaseType_t priority, TaskHandle_t *const created, const BaseType_t core) {
+    char where[16];
+    snprintf(where, sizeof where, core == tskNO_AFFINITY ? "any" : "%d", (int)core);
+    event("task %s stack %u priority %u core %s internal", name, (unsigned)stack, priority, where);
+    return make_task(code, name, arg, priority, created);
+}
+
+/* Only a task's own end (vTaskDelete(NULL)), as the I/O worker's. */
+void vTaskDelete(TaskHandle_t task) {
+    if (task != NULL && task != current_task) {
+        error("vTaskDelete of another task");
+        return;
+    }
+    if (current_task == NULL) {
+        error("vTaskDelete(NULL) from a thread that isn't a task");
+        return;
+    }
+    event("task %s deleted", current_task->name);
+    pthread_exit(NULL);
+}
+
 TaskHandle_t xTaskGetCurrentTaskHandle(void) {
     return self_task();
 }
@@ -642,9 +687,10 @@ void vTaskPrioritySet(TaskHandle_t task, UBaseType_t priority) {
     event("priority %s %u", t->name[0] != '\0' ? t->name : "?", priority);
 }
 
+/* 40000 bytes for the app task (the status says so), 3000 for any other. */
 UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task) {
-    (void)task;
-    return 40000;
+    const struct fake_task *t = task != NULL ? task : self_task();
+    return strcmp(t->name, "muse_apps") == 0 ? 40000 : 3000;
 }
 
 void vTaskDelay(const TickType_t ticks) {
@@ -730,6 +776,13 @@ UBaseType_t uxQueueSpacesAvailable(QueueHandle_t q) {
     return spaces;
 }
 
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t q) {
+    pthread_mutex_lock(&q->mu);
+    UBaseType_t waiting = (UBaseType_t)q->count;
+    pthread_mutex_unlock(&q->mu);
+    return waiting;
+}
+
 BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t wait) {
     note_send(item, q->item_size, wait);
     pthread_mutex_lock(&q->mu);
@@ -745,7 +798,7 @@ BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t wait) {
 }
 
 BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t wait) {
-    if (current_task != NULL && wait > atomic_load(&longest_receive)) {
+    if (app_task_of_thread() != NULL && wait > atomic_load(&longest_receive)) {
         atomic_store(&longest_receive, wait);
     }
     pthread_mutex_lock(&q->mu);
@@ -766,7 +819,8 @@ struct fake_mutex {
     pthread_cond_t cv;
     bool held;
     pthread_t holder;
-    int number;  /* in the order made: muse_apps_start makes the record's (1), the requests' (2) and the names' (3) */
+    int number;  /* in the order made: muse_apps_start makes the record's (1), the requests' (2), the names' (3), then
+                  * the I/O worker's (4) */
 };
 _Static_assert(sizeof(struct fake_mutex) <= sizeof(StaticSemaphore_t), "a fake mutex fits in its buffer");
 
@@ -1425,6 +1479,10 @@ static void task_shape(void) {
     snprintf(want, sizeof want, "queue 16 x %zu caps 0x400", sizeof(apps_event_t));
     CHECK(at_from(0, want) >= 0, "16 events in PSRAM: %s", want);
     CHECK(at_from(0, "log I up: stack 57344 in PSRAM") >= 0, "the boot line");
+    CHECK(count_from(0, "console hook muse_apps_console") == 1, "the console's hook, added once");
+    snprintf(want, sizeof want, "queue %d x %zu caps 0x400", APPS_IO_JOBS, 2 * sizeof(void *));
+    CHECK(at_from(0, want) >= 0, "the I/O worker's queue of %d jobs in PSRAM: %s", APPS_IO_JOBS, want);
+    ABSENT(0, "task muse_apps_io");  /* made when a job comes */
     ORDERED(0, "port init", "task muse_apps");
     ORDERED(0, "build screen", "task muse_apps");
     /* Idle, its loop still comes round at least once a second (C22: finish() checks the waits). */
@@ -2610,6 +2668,7 @@ static void a_turn_during_a_new_apps_load_fronts_nothing(void) {
     WAIT_FRAMES(3);        /* the LVGL task has seen the new app */
     CHECK(apps_lv_front(), "the layer is still in front, from the app that was replaced");
     TURN(true);
+    CHECK(!apps_lv_front(), "a turn puts the leftover layer behind");
     TURN(false);
     WAIT_FRAMES(3);        /* the turn's end has been decided */
     apps_port_ui_lock();   /* the publication waits for the case */
@@ -2629,6 +2688,184 @@ static void a_turn_during_a_new_apps_load_fronts_nothing(void) {
     ABSENT(from, "print second show");
     CHECK(!apps_lv_front(), "the new app stays behind");
     free(late.err);
+}
+
+/* ---- Task 13 ---- */
+
+/* Kills `L.front_before_turn = false;` (Task 12's last review): an app in front with its table up comes back after a
+ * turn with no request. */
+static void a_turn_brings_back_the_app_that_was_in_front(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print busy show");
+    int from = mark();
+    TURN(true);
+    WAIT(from, "print busy hide");
+    WAIT_FRAMES(3);
+    ABSENT(from, "front 1");
+    int ended = mark();
+    TURN(false);
+    WAIT(ended, "front 1");
+    WAIT(ended, "print busy show");
+}
+
+static const char APP_MSG[] =
+    "local app = {}\n"
+    "local n = 0\n"
+    "function app.start() ui.label{text = 'Msg'} end\n"
+    "function app.show() print('show') end\n"
+    "function app.hide() print('hide') end\n"
+    "function app.message(event, data)\n"
+    "  if event == 'add' then n = n + data.by return {n = n} end\n"
+    "  if event == 'fail' then error('unknown event') end\n"
+    "  if event == 'stuck' then print('stuck') return {late = true} end\n"
+    "  if event == 'spin' then while true do end end\n"
+    "  return nil\n"
+    "end\n"
+    "return app\n";
+static const file_t MSG[] = {LUA("main.lua", APP_MSG)};
+
+/* apps_task_message: the reply, the app's own errors (which leave it running), the ids, and show. */
+static void a_message_gets_its_reply(void) {
+    char err[300];
+    CHECK(apps_task_run(make_pkg("msg", "Msg", MSG, 1), false, 50, NULL, err, sizeof err), "run: %s", err);
+    int from = mark();
+    char *reply = apps_task_message("msg", "add", "{\"by\":2}", false, 0, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "{\"n\":2}") == 0 && err[0] == '\0', "the reply: %s, '%s'",
+          reply != NULL ? reply : "(null)", err);
+    apps_port_free(reply);
+    reply = apps_task_message("msg", "add", "{\"by\":3}", false, 2000, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "{\"n\":5}") == 0, "the app keeps its state: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    /* No event is "", no data is nil, and no reply is null. */
+    reply = apps_task_message("msg", NULL, NULL, false, 0, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "null") == 0, "nil: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    /* The app's own errors fail the message, and the app runs on. */
+    CHECK(apps_task_message("msg", "fail", "", false, 0, err, sizeof err) == NULL &&
+              strcmp(err, "main.lua:8: unknown event") == 0,
+          "the handler's error: '%s'", err);
+    CHECK(apps_task_message("msg", "add", "{bad", false, 0, err, sizeof err) == NULL && strncmp(err, "data: ", 6) == 0,
+          "data that isn't JSON: '%s'", err);
+    CHECK(apps_task_message("other", "add", "{}", false, 0, err, sizeof err) == NULL &&
+              strcmp(err, "other isn't running") == 0,
+          "another id: '%s'", err);
+    CHECK(apps_task_message("Not an id", "add", "{}", false, 0, err, sizeof err) == NULL &&
+              strcmp(err, "not an app id") == 0,
+          "not an id: '%s'", err);
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_RUNNING && !st->front, "running, behind: %s %d", apps_state_name(st->state), st->front);
+    /* With show, a message that failed leaves the layer where it is, and one that worked brings it to the front. */
+    CHECK(apps_task_message("msg", "fail", NULL, true, 0, err, sizeof err) == NULL, "fail");
+    FIFO_SYNC();
+    WAIT_FRAMES(5);
+    ABSENT(from, "front 1");
+    reply = apps_task_message("msg", "add", "{\"by\":0}", true, 0, err, sizeof err);
+    CHECK(reply != NULL, "show: %s", err);
+    apps_port_free(reply);
+    WAIT(from, "front 1");
+    WAIT(from, "print msg show");
+    heap_caps_free(st);
+}
+
+/* A caller that gives up: the reply that comes later is the app task's to free (finish() checks that nothing is held).
+ * A handler that never returns is killed, and the app ends as on any crash. */
+static void a_message_after_its_caller_gave_up(void) {
+    char err[300];
+    CHECK(apps_task_run(make_pkg("msg", "Msg", MSG, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    int from = mark();
+    block_print("stuck");
+    CHECK(apps_task_message("msg", "stuck", NULL, false, 300, err, sizeof err) == NULL &&
+              strcmp(err, "the app task didn't answer within 300 ms") == 0,
+          "the caller gave up: '%s'", err);
+    WAIT_PRINT_BLOCKED();
+    release_print();
+    FIFO_SYNC();
+    WAIT(from, "print msg stuck");
+    from = mark();
+    CHECK(apps_task_message("msg", "spin", NULL, false, 5000, err, sizeof err) == NULL && err[0] != '\0',
+          "killed: '%s'", err);
+    WAIT(from, "log I stop msg: crashed");
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_CRASHED && strcmp(st->last_error, err) == 0, "the record: %s '%s'",
+          apps_state_name(st->state), st->last_error);
+    CHECK(apps_task_message("msg", "add", "{\"by\":1}", false, 0, err, sizeof err) == NULL &&
+              strcmp(err, "msg isn't running") == 0,
+          "after the crash: '%s'", err);
+    heap_caps_free(st);
+}
+
+/* The I/O worker's jobs: "hold" waits while io_hold is set, "chain" submits "chained". */
+static atomic_bool io_hold, io_held;
+
+static void io_job(void *arg) {
+    const char *label = arg;
+    const struct fake_task *t = self_task();
+    event("job %s on %s priority %u", label, t->name, t->priority);
+    if (strcmp(label, "hold") == 0) {
+        atomic_store(&io_held, true);
+        while (atomic_load(&io_hold)) {
+            sleep_ms(1);
+        }
+    }
+    if (strcmp(label, "chain") == 0) {
+        CHECK(apps_io_submit(io_job, "chained"), "a job submits another");
+    }
+}
+
+/* apps_io: one worker, made when a job comes, runs the jobs in order and goes after 2 s without one. */
+static void io_runs_jobs_in_order(void) {
+    int from = mark();
+    CHECK(apps_io_submit(io_job, "one") && apps_io_submit(io_job, "chain") && apps_io_submit(io_job, "three"), "submit");
+    WAIT(from, "job chained on muse_apps_io priority 3");
+    ORDERED(from, "job one on muse_apps_io priority 3", "job chain on muse_apps_io priority 3");
+    ORDERED(from, "job chain on", "job three on");
+    ORDERED(from, "job three on", "job chained on");
+    CHECK(count_from(from, "task muse_apps_io") == 1 &&
+              at_from(from, "task muse_apps_io stack 6144 priority 3 core any internal") >= 0,
+          "one worker: 6 KB of internal RAM, priority 3, either core");
+    int64_t started = real_ms();
+    WAIT(from, "log I io: idle, stack 3000 of 6144 free");
+    CHECK(real_ms() - started >= APPS_IO_IDLE_MS - 100, "it went only once idle for %d ms", APPS_IO_IDLE_MS);
+    WAIT(from, "task muse_apps_io deleted");
+    int again = mark();
+    CHECK(apps_io_submit(io_job, "four"), "submit four");
+    WAIT(again, "job four on muse_apps_io");
+    CHECK(count_from(again, "task muse_apps_io stack") == 1, "a new worker for it");
+}
+
+/* Admission: internal RAM short of the worker's stack and 16 KB, or APPS_IO_JOBS jobs waiting, refuse a job, which
+ * never runs. */
+static void io_refuses_when_short(void) {
+    int from = mark();
+    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    CHECK(!apps_io_submit(io_job, "short"), "refused without the room");
+    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
+    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM);
+    CHECK(apps_io_submit(io_job, "enough"), "taken with just the room");
+    WAIT(from, "job enough on muse_apps_io");
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    for (int i = 0; i < APPS_IO_JOBS; i++) {
+        CHECK(apps_io_submit(io_job, "queued"), "job %d of %d waiting", i + 1, APPS_IO_JOBS);
+    }
+    int full = mark();
+    CHECK(!apps_io_submit(io_job, "over"), "one more is refused");
+    WAIT(full, "log W io: 8 jobs wait already: job refused");
+    atomic_store(&io_hold, false);
+    for (int64_t until = real_ms() + 5000; count_from(from, "job queued on") < APPS_IO_JOBS;) {
+        CHECK(real_ms() < until, "the waiting jobs never ran");
+        sleep_ms(1);
+    }
+    ABSENT(from, "job short");
+    ABSENT(from, "job over");
+    atomic_store(&internal_free, 200u * 1024);
 }
 
 int main(int argc, char **argv) {
@@ -2670,6 +2907,11 @@ int main(int argc, char **argv) {
         {"stop_reports_failure", stop_reports_failure},
         {"the_tick_says_when_the_apps_cover", the_tick_says_when_the_apps_cover},
         {"a_turn_during_a_new_apps_load_fronts_nothing", a_turn_during_a_new_apps_load_fronts_nothing},
+        {"a_turn_brings_back_the_app_that_was_in_front", a_turn_brings_back_the_app_that_was_in_front},
+        {"a_message_gets_its_reply", a_message_gets_its_reply},
+        {"a_message_after_its_caller_gave_up", a_message_after_its_caller_gave_up},
+        {"io_runs_jobs_in_order", io_runs_jobs_in_order},
+        {"io_refuses_when_short", io_refuses_when_short},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

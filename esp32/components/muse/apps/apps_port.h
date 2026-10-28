@@ -50,6 +50,12 @@ void apps_port_free(void *ptr);  /* NULL is ignored. Any task. */
  * NUL-terminated. It returns promptly: the app task is waiting on it, with its CPU budget running. */
 void apps_port_log(const char *app_id, const char *line);
 
+/* Ends a console line printed with printf (a reply of the ">app.*" protocol): flushes stdout, then syncs it. On the
+ * USB-Serial-JTAG console the sync sends the zero-length packet that ends a line landing on a 64-byte packet boundary;
+ * without it the host keeps such a line until the console prints something else. Only the console (apps_console.c)
+ * calls it, from the serial task and the I/O worker, so the host runner has none. */
+void apps_port_console_flush(void);
+
 /* Makes what the port needs before anything here is used: the firmware's UI lock (a static mutex). The app task's
  * glue calls it once, first thing in muse_apps_start(), before the app task and the LVGL task can use the lock. A
  * port with nothing to make (the host runner) doesn't need it. */

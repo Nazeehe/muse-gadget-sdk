@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -134,6 +135,18 @@ void apps_port_log(const char *app_id, const char *line) {
     printf("%s@app.log %s %s\n", note, app_id, line);
     fflush(stdout);
     s_unechoed = 0;
+}
+
+/*
+ * The end of a console reply. The USB-Serial-JTAG port sends a line as 64-byte packets, flushing at its newline, and the
+ * host hands a transfer to the reader only once a packet shorter than 64 bytes ends it. A line whose length, CRLF
+ * included, is a multiple of 64 ends on a full packet, so the host kept it until the console printed again. ESP-IDF's
+ * console forwards fsync to that port, which waits (50 ms at most) for the host to take the last packet and then sends
+ * a zero-length one. The UART's fsync waits for its FIFO to empty, about 11 ms at most at 115200 baud.
+ */
+void apps_port_console_flush(void) {
+    fflush(stdout);
+    (void)fsync(fileno(stdout));
 }
 
 void apps_port_ui_lock(void) {

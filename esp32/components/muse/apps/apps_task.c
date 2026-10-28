@@ -29,12 +29,14 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "apps_io.h"
 #include "apps_json.h"
 #include "apps_lv.h"
 #include "apps_port.h"
 #include "apps_ui.h"
 #include "apps_vm.h"
 #include "muse_apps.h"
+#include "muse_input.h"
 
 /*
  * The app task, and the glue muse_ui calls on the LVGL task (muse_apps.h). apps_task.h has the contract; this is how
@@ -107,7 +109,7 @@ _Static_assert(ARRAY_LEN(KINDS) == APPS_W_IMAGE + 1, "a name for each kind of wi
 
 /* ---- Requests ---- */
 
-typedef enum { REQ_RUN, REQ_LAUNCH, REQ_STOP, REQ_COMPILE } req_op_t;
+typedef enum { REQ_RUN, REQ_LAUNCH, REQ_STOP, REQ_COMPILE, REQ_MESSAGE } req_op_t;
 
 typedef struct {
     const char *path;
@@ -115,22 +117,25 @@ typedef struct {
     size_t len;
 } code_t;
 
-/* A caller's request (run, stop, compile), which it waits for, or a launch, which nobody waits for. One PSRAM block; a
- * compile's copy of the package's code follows it. */
+/* A caller's request (run, stop, compile, message), which it waits for, or a launch, which nobody waits for. One PSRAM
+ * block; a compile's copy of the package's code follows it, or a message's event and data. */
 typedef struct {
     uint8_t op;
-    bool front;
+    bool front;                 /* a run's and a launch's place; a message's show */
     int settle_ms;
     apps_pkg_t *pkg;            /* a run's: the request's until the app task takes it */
-    char id[APPS_ID_MAX + 1];   /* a launch's */
+    char id[APPS_ID_MAX + 1];   /* a launch's and a message's */
     uint16_t memory_kb;         /* a compile's, and its copy of the .lua files, main first */
     int n_code;
     code_t code[APPS_MAX_FILES];
+    const char *event, *data;   /* a message's, in the block: NUL-terminated, data data_len bytes */
+    size_t data_len;
     apps_status_t *st;          /* the caller's buffers */
     char *err;
     size_t err_len;
     /* Under s_req_lock. */
     bool finished, abandoned, ok;
+    char *reply;                /* a message's answer: the caller takes it; the block's until then */
     uint8_t holders;            /* the caller and the app task (a launch: the app task); the last to let go frees it */
 } req_t;
 
@@ -352,6 +357,7 @@ static req_t *new_req(uint8_t op, size_t extra) {
 
 static void free_req(req_t *r) {
     free_pkg(r->pkg);
+    apps_port_free(r->reply);
     heap_caps_free(r);
 }
 
@@ -410,14 +416,18 @@ static void refresh_record(void) {
     T.refresh_at = apps_port_mono_ms() + REFRESH_MS;
 }
 
-/* The app task answers r: if its caller still waits, it gets ok, err and the status; then the app task lets go. */
-static void complete(req_t *r, bool ok, const char *err) {
+/* The app task answers r: if its caller still waits, it gets ok, err, the status and a message's reply (which the app
+ * task frees otherwise); then the app task lets go. */
+static void complete_with(req_t *r, bool ok, const char *err, char *reply) {
     if (r == NULL) {
+        apps_port_free(reply);
         return;
     }
     req_take();
-    if (!r->abandoned) {
+    bool waits = !r->abandoned;
+    if (waits) {
         r->ok = ok;
+        r->reply = reply;
         put_text(r->err, r->err_len, err);
         if (r->st != NULL) {
             memcpy(r->st, &s_rec->st, sizeof *r->st);
@@ -430,9 +440,16 @@ static void complete(req_t *r, bool ok, const char *err) {
     r->finished = true;
     bool last = --r->holders == 0;
     req_give();
+    if (!waits) {
+        apps_port_free(reply);
+    }
     if (last) {
         free_req(r);
     }
+}
+
+static void complete(req_t *r, bool ok, const char *err) {
+    complete_with(r, ok, err, NULL);
 }
 
 static void set_resident(bool resident) {
@@ -899,7 +916,8 @@ static bool app_runs(uint32_t gen) {
     return T.rt != NULL && !T.abandoned && gen == T.gen && apps_rt_state(T.rt) == APPS_STATE_RUNNING;
 }
 
-/* Until Task 13's RAM store, the only app there is to launch is the one that runs. */
+/* The launcher's pick: the app that runs is the one there is to launch here (the console's app.launch runs a stored app
+ * through the I/O worker, and Task 20's store adds stored apps here). */
 static void launch(const req_t *r) {
     if (app_runs(T.gen) && strcmp(T.pkg->manifest.id, r->id) == 0) {
         if (r->front) {
@@ -955,6 +973,28 @@ static void on_compile(req_t *r) {
     complete(r, ok, ok ? NULL : err);
 }
 
+/* message(event, data) to the app that runs, if it is r's: its reply, or why not. A handler that was killed or ran out
+ * of memory crashed the app, which ends as on any crash; its own error leaves it running. */
+static void on_message(req_t *r) {
+    if (!wanted(r)) {
+        complete(r, false, NULL);
+        return;
+    }
+    char err[APPS_ERROR_MAX] = "";
+    if (!app_runs(T.gen) || strcmp(T.pkg->manifest.id, r->id) != 0) {
+        snprintf(err, sizeof err, "%s isn't running", r->id);
+        complete(r, false, err);
+        return;
+    }
+    call_begin();
+    char *reply = apps_rt_message(T.rt, r->event, r->data, r->data_len, err, sizeof err);
+    bool alive = call_end();
+    if (reply != NULL && alive && r->front) {
+        request_front(true);  /* after the voice turn, if one is on: the LVGL task decides */
+    }
+    complete_with(r, reply != NULL, reply != NULL ? NULL : err, reply);
+}
+
 static void handle(const apps_event_t *ev) {
     switch (ev->type) {
     case APPS_EV_TOUCH:
@@ -985,13 +1025,16 @@ static void handle(const apps_event_t *ev) {
     case APPS_EV_COMPILE:
         on_compile(ev->req);
         break;
+    case APPS_EV_MESSAGE:
+        on_message(ev->req);
+        break;
     case APPS_EV_EXIT:
         if (T.rt != NULL && ev->app_gen == T.gen) {
             end_app(END_EXITED);
         }
         break;
     default:
-        break;  /* WAKE: the round's housekeeping is the work. MESSAGE and ALARM arrive with Tasks 13 and 17. */
+        break;  /* WAKE: the round's housekeeping is the work. ALARM arrives with Task 17. */
     }
 }
 
@@ -1497,6 +1540,55 @@ bool apps_task_stop(char *err, size_t err_len) {
     return ok;
 }
 
+char *apps_task_message(const char *id, const char *event, const char *data_json, bool show, int timeout_ms, char *err,
+                        size_t err_len) {
+    put_text(err, err_len, "");
+    if (id == NULL || !apps_id_valid(id)) {
+        put_text(err, err_len, "not an app id");
+        return NULL;
+    }
+    event = event != NULL ? event : "";
+    size_t event_len = strlen(event), data_len = data_json != NULL ? strlen(data_json) : 0;
+    int wait_ms = timeout_ms > 0 ? timeout_ms : APPS_TASK_WAIT_MS;
+    const char *why = refusal(true);
+    req_t *r = why == NULL ? new_req(REQ_MESSAGE, event_len + 1 + data_len + 1) : NULL;
+    if (why == NULL && r == NULL) {
+        why = "out of memory: no room for the request";
+    }
+    if (why != NULL) {
+        put_text(err, err_len, why);
+        return NULL;
+    }
+    put_text(r->id, sizeof r->id, id);
+    char *at = (char *)(r + 1);
+    memcpy(at, event, event_len + 1);
+    r->event = at;
+    at += event_len + 1;
+    if (data_len > 0) {
+        memcpy(at, data_json, data_len);
+    }
+    at[data_len] = '\0';
+    r->data = at;
+    r->data_len = data_len;
+    r->front = show;
+    r->err = err;
+    r->err_len = err_len;
+    int64_t until = apps_port_mono_ms() + wait_ms;
+    const char *busy = post_req(APPS_EV_MESSAGE, r, until);
+    if (busy != NULL) {
+        free_req(r);
+        put_text(err, err_len, busy);
+        return NULL;
+    }
+    char *reply = NULL;
+    if (await(r, until, wait_ms, err, err_len) && r->ok) {
+        reply = r->reply;  /* finished: the app task writes nothing more */
+        r->reply = NULL;
+    }
+    release(r);
+    return reply;
+}
+
 void apps_task_status(apps_status_t *st) {
     if (st == NULL) {
         return;
@@ -1522,6 +1614,7 @@ void apps_task_status(apps_status_t *st) {
 }
 
 esp_err_t muse_apps_start(void) {
+    static bool console_added;
     if (s_task != NULL) {
         return ESP_OK;
     }
@@ -1529,6 +1622,12 @@ esp_err_t muse_apps_start(void) {
     s_rec_lock = xSemaphoreCreateMutexStatic(&s_rec_lock_buf);
     s_req_lock = xSemaphoreCreateMutexStatic(&s_req_lock_buf);
     s_names_lock = xSemaphoreCreateMutexStatic(&s_names_lock_buf);
+    apps_io_init();
+    if (!console_added) {
+        /* Even if the task can't be made below: the console then says that Muse apps aren't running. */
+        muse_input_add_console_hook(muse_apps_console);
+        console_added = true;
+    }
     s_rec = heap_caps_calloc(1, sizeof *s_rec, CAPS_PSRAM);
     s_queue = xQueueCreateWithCaps(APPS_QUEUE_LEN, sizeof(apps_event_t), MALLOC_CAP_SPIRAM);
     if (s_rec != NULL && s_queue != NULL &&

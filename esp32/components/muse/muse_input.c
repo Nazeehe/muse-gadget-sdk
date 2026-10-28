@@ -80,7 +80,9 @@ static const char *TAG = "muse_input";
 #define CHAT_MAX (192 * 1024)  /* a typed message, assembled from "chat+=" lines */
 
 static QueueHandle_t s_queue;
-static bool (*s_console_hook)(const char *line);
+#define CONSOLE_HOOKS_MAX 4    /* the SDK token's (main/), Muse apps' (muse_apps.h) and room for two more */
+static bool (*s_console_hooks[CONSOLE_HOOKS_MAX])(const char *line);
+static int s_console_hook_count;
 static TaskHandle_t s_input;
 static bool s_talk_down;
 /* A push-to-talk press the voice task hasn't taken up yet: the speaker
@@ -764,13 +766,27 @@ static void set_face(const char *name)
     fflush(stdout);
 }
 
+/* The console's hooks, in the order they were added: the first that takes
+ * the line has it. */
+static bool run_console_hooks(const char *line)
+{
+    for (int i = 0; i < s_console_hook_count; i++) {
+        if (s_console_hooks[i](line)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * Console-only commands; false for setup commands. Their buffers are taken
  * per command: without PSRAM, static ones would hold internal RAM for good.
+ * Only a whole line reaches the hooks: one longer than SERIAL_LINE - 1 bytes
+ * never does.
  */
 static bool console_command(char *line, bool whole)
 {
-    if (whole && s_console_hook && s_console_hook(line)) {
+    if (whole && run_console_hooks(line)) {
         return true;
     }
 #if CONFIG_MUSE_VIDEO
@@ -929,9 +945,16 @@ static void serial_task(void *arg)
     }
 }
 
-void muse_input_set_console_hook(bool (*hook)(const char *line))
+void muse_input_add_console_hook(bool (*hook)(const char *line))
 {
-    s_console_hook = hook;
+    if (hook == NULL) {
+        return;
+    }
+    if (s_console_hook_count == CONSOLE_HOOKS_MAX) {
+        ESP_LOGW(TAG, "console: no room for another hook (%d): it is ignored", CONSOLE_HOOKS_MAX);
+        return;
+    }
+    s_console_hooks[s_console_hook_count++] = hook;
 }
 
 esp_err_t muse_input_start(QueueHandle_t queue)

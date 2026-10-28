@@ -27,7 +27,7 @@
 // change a gadget's token.
 
 // Handles one console line, without its leading '>'. False if the line isn't
-// this command. Muse boards' console calls it (muse_input_set_console_hook).
+// this command. Muse boards' console calls it (muse_input_add_console_hook).
 bool sdk_token_console_command(const char *line);
 
 // Reads '>' lines on boards without the Muse console: on the console UART,

@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 import apps_host
+from test_link_ota import function_source
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT.parent
@@ -570,6 +571,12 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertHasText(port, "MUSE_BIG_CAPS", "apps_port_idf.c")
         self.assertHasText(port, '"%s@app.log %s %s\\n"', "apps_port_idf.c")
         self.assertHasText(port, "apps_echo_take(&s_echo, apps_port_mono_ms(), bytes)", "apps_port_idf.c")
+        # Task 13: a console reply ends with fflush, then fsync. ESP-IDF's console forwards the fsync to the
+        # USB-Serial-JTAG port, which sends the zero-length packet that ends a line landing on a 64-byte boundary
+        # (tests/test_muse_apps_console.py checks that every reply calls it).
+        self.assertHasText(port, "void apps_port_console_flush(void) {", "apps_port_idf.c")
+        flush = function_source(port, "void apps_port_console_flush(void)")
+        self.assertRegex(flush, r"fflush\(stdout\);\s*\(void\)fsync\(fileno\(stdout\)\);")
 
 
 if __name__ == "__main__":

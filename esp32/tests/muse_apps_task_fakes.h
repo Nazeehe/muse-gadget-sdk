@@ -16,13 +16,14 @@
 #pragma once
 
 /*
- * The FreeRTOS and ESP-IDF that apps_task.c sees on the host (tests/test_muse_apps_task.py stages its FreeRTOS and
- * ESP-IDF headers, lvgl.h among them, as one line each that includes this). It builds on muse_apps_lv_fakes.h, the
- * fakes of apps_lv.c (LVGL's types, esp_log, esp_timer, the heap caps), and adds what the app task needs: tasks,
- * queues and mutexes. tests/muse_apps_task_harness.c makes them real with pthreads, so the app task, the LVGL task
- * and a caller run at once, as they do on the gadget. The declarations follow ESP-IDF v6.0.1's (freertos/task.h,
- * queue.h, semphr.h, idf_additions.h), as functions where FreeRTOS has macros: only what apps_task.c calls, and what
- * apps_port_idf.c does (tests/muse_apps_port_harness.c, with its own definitions).
+ * The FreeRTOS and ESP-IDF that apps_task.c and apps_io.c see on the host (tests/test_muse_apps_task.py stages their
+ * FreeRTOS and ESP-IDF headers, lvgl.h among them, as one line each that includes this). It builds on
+ * muse_apps_lv_fakes.h, the fakes of apps_lv.c (LVGL's types, esp_log, esp_timer, the heap caps), and adds what the
+ * app task and the I/O worker need: tasks, queues and mutexes. tests/muse_apps_task_harness.c makes them real with
+ * pthreads, so the app task, the LVGL task, the I/O worker and a caller run at once, as they do on the gadget. The
+ * declarations follow ESP-IDF v6.0.1's (freertos/task.h, queue.h, semphr.h, idf_additions.h), as functions where
+ * FreeRTOS has macros: only what apps_task.c and apps_io.c call, and what apps_port_idf.c does
+ * (tests/muse_apps_port_harness.c, with its own definitions).
  */
 
 #include <stdbool.h>
@@ -67,6 +68,7 @@ typedef struct {
 #define configTICK_RATE_HZ 1000
 #define portMAX_DELAY ((TickType_t)0xffffffffu)
 #define pdMS_TO_TICKS(ms) ((TickType_t)(((uint64_t)(ms) * configTICK_RATE_HZ) / 1000u))
+#define tskNO_AFFINITY ((BaseType_t)0x7FFFFFFF)
 
 void vTaskDelay(const TickType_t ticks);
 TaskHandle_t xTaskGetCurrentTaskHandle(void);
@@ -75,12 +77,16 @@ UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task);
 BaseType_t xTaskCreatePinnedToCoreWithCaps(TaskFunction_t code, const char *const name, const uint32_t stack, void *const arg,
                                            UBaseType_t priority, TaskHandle_t *const created, const BaseType_t core,
                                            UBaseType_t caps);
+BaseType_t xTaskCreatePinnedToCore(TaskFunction_t code, const char *const name, const uint32_t stack, void *const arg,
+                                   UBaseType_t priority, TaskHandle_t *const created, const BaseType_t core);
+void vTaskDelete(TaskHandle_t task);
 
 QueueHandle_t xQueueCreateWithCaps(UBaseType_t length, UBaseType_t item_size, UBaseType_t caps);
 void vQueueDeleteWithCaps(QueueHandle_t queue);
 BaseType_t xQueueSend(QueueHandle_t queue, const void *item, TickType_t wait);
 BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t wait);
 UBaseType_t uxQueueSpacesAvailable(QueueHandle_t queue);
+UBaseType_t uxQueueMessagesWaiting(QueueHandle_t queue);
 
 SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer);
 BaseType_t xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t wait);

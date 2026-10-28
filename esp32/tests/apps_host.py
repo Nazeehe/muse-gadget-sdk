@@ -153,7 +153,8 @@ def _define(define: str) -> str:
 
 def build(name: str, sources: Sequence[str | Path], tmp: str | Path, *,
           include_dirs: Sequence[str | Path] = (), defines: Sequence[str] = (),
-          lua_extra_defines: Sequence[str] = (), sanitize: bool = True) -> Path:
+          lua_extra_defines: Sequence[str] = (), sanitize: bool = True,
+          objects: Sequence[str | Path] = ()) -> Path:
     """Compiles and links `sources` into tmp/name, and returns that path.
 
     Lua's own files (components/lua/src) get the device's options and defines,
@@ -163,8 +164,8 @@ def build(name: str, sources: Sequence[str | Path], tmp: str | Path, *,
     -std=c11 -O1 -g. Every file gets -D_GNU_SOURCE and -pthread, as the other
     host tests do, and a fixed string-hash seed, so tables iterate the same on
     every run. sanitize=False skips ASan and UBSan, for tests whose stack use
-    they would change. A compile or link error raises AssertionError with the
-    compiler's output.
+    they would change. objects are linked in as they are (cjson_object()'s).
+    A compile or link error raises AssertionError with the compiler's output.
     """
     cmd, tmp = cc(), Path(tmp)
     san, leaks = _probe(tmp) if sanitize else ([], False)
@@ -197,7 +198,7 @@ def build(name: str, sources: Sequence[str | Path], tmp: str | Path, *,
         raise AssertionError("\n".join(errors))
 
     exe = tmp / name
-    args = [*cmd, *san, "-pthread", *(str(job[2]) for job in jobs), "-lm", "-o", str(exe)]
+    args = [*cmd, *san, "-pthread", *(str(job[2]) for job in jobs), *(str(o) for o in objects), "-lm", "-o", str(exe)]
     done = subprocess.run(args, cwd=ROOT, capture_output=True, text=True)
     if done.returncode != 0:
         raise AssertionError(fail(args, done))
@@ -213,6 +214,35 @@ def build(name: str, sources: Sequence[str | Path], tmp: str | Path, *,
         state = "ASan+UBSan, no leak checks (LeakSanitizer isn't available here)"
     print(f"apps_host: {name}: sanitizers {state}", file=sys.stderr, flush=True)
     return exe
+
+
+# The real cJSON, as the firmware has it: CI supplies pinned upstream sources, and a device build leaves them in
+# managed_components (which board.sh deletes again: X16), so the suite runs with CJSON_SOURCE_DIR set.
+CJSON_DIR = Path(os.environ.get("CJSON_SOURCE_DIR", ROOT / "managed_components/espressif__cjson/cJSON"))
+_cjson: Path | None = None
+
+
+def cjson_object() -> Path:
+    """cJSON.c compiled once per process, the way test_link_discovery.py compiles it (-std=c11 -Wall -Wextra -Werror
+    -D_DEFAULT_SOURCE -DCJSON_NESTING_LIMIT=16) and without the sanitizers, which on macOS turn its sprintf calls into
+    deprecation errors. Link it with build(..., objects=[...]) and add CJSON_DIR to include_dirs. Skips the test when the
+    sources aren't on this machine.
+    """
+    global _cjson
+    if _cjson is None:
+        source = CJSON_DIR / "cJSON.c"
+        if not source.is_file():
+            raise unittest.SkipTest(f"cJSON sources not found in {CJSON_DIR}: set CJSON_SOURCE_DIR "
+                                    "(~/.cache/muse-cjson) or run an IDF build once")
+        out = Path(tempfile.mkdtemp(prefix="muse-apps-cjson-"))
+        atexit.register(shutil.rmtree, out, ignore_errors=True)
+        args = [*cc(), "-std=c11", "-Wall", "-Wextra", "-Werror", "-D_DEFAULT_SOURCE", "-DCJSON_NESTING_LIMIT=16",
+                "-c", str(source), "-o", str(out / "cJSON.o")]
+        done = subprocess.run(args, capture_output=True, text=True)
+        if done.returncode != 0:
+            raise AssertionError(f"{shlex.join(args)}\n{done.stdout}{done.stderr}")
+        _cjson = out / "cJSON.o"
+    return _cjson
 
 
 def apphost_sources() -> list[Path]:

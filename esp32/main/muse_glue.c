@@ -649,7 +649,7 @@ void muse_glue_start(void) {
     muse_input_power_init();
     s_ready = xEventGroupCreate();
     muse_link_register(&s_ops);
-    muse_input_set_console_hook(sdk_token_console_command);
+    muse_input_add_console_hook(sdk_token_console_command);
     muse_ble_set_name(identity_ble_name());
     ble_companion_t companion = {
         .svcs = muse_ble_services(),

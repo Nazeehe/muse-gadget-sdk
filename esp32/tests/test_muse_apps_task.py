@@ -15,7 +15,7 @@
 """apps_task, the app task of Muse apps: its services, its supervisor and the order in which an app ends.
 
 tests/muse_apps_task_harness.c runs the real apps_task.c over the real runtime (apps_rt, apps_ui, apps_vm and Lua),
-with the app task, an LVGL task and the caller as threads: the fake FreeRTOS of tests/muse_apps_task_fakes.h is made of
+and the real I/O worker (apps_io.c), with the app task, an LVGL task, the worker and the caller as threads: the fake FreeRTOS of tests/muse_apps_task_fakes.h is made of
 pthreads there. Its FreeRTOS and ESP-IDF headers are staged as one line each that includes the fakes, as
 test_muse_apps_lv.py stages apps_lv.c's. apps_lv is a fake that logs what is done to the screen and draws every image
 object from the package's bytes each frame, so a package freed before the layer's reset is an AddressSanitizer report.
@@ -36,8 +36,8 @@ MUSE = ROOT / "components/muse"
 APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_task_harness.c"
-SOURCES = [HARNESS, APPS / "apps_task.c", APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c",
-           APPS / "apps_pkg.c", APPS / "apps_suggest.c"]
+SOURCES = [HARNESS, APPS / "apps_task.c", APPS / "apps_io.c", APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c",
+           APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c"]
 
 # What apps_task.c and muse_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one is a line that includes the fakes.
 FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/idf_additions.h", "freertos/queue.h", "freertos/semphr.h",
@@ -180,6 +180,23 @@ class AppTaskTest(unittest.TestCase):
 
     def test_a_turn_during_a_new_apps_load_fronts_nothing(self):  # N1
         self.run_case("a_turn_during_a_new_apps_load_fronts_nothing")
+
+    # ---- Task 13 ----
+
+    def test_a_turn_brings_back_the_app_that_was_in_front(self):  # Task 12's last review
+        self.run_case("a_turn_brings_back_the_app_that_was_in_front")
+
+    def test_a_message_gets_its_reply(self):  # apps_task_message
+        self.run_case("a_message_gets_its_reply")
+
+    def test_a_message_after_its_caller_gave_up(self):
+        self.run_case("a_message_after_its_caller_gave_up")
+
+    def test_the_io_worker_runs_jobs_in_order(self):  # apps_io: made on demand, gone when idle
+        self.run_case("io_runs_jobs_in_order")
+
+    def test_the_io_worker_refuses_when_short(self):  # apps_io's admission
+        self.run_case("io_refuses_when_short")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

@@ -784,7 +784,9 @@ SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer) {
 
 /* A gate on one mutex: the next take of it by the app task (or by a thread of the case that marked itself), after a
  * given event, stops before taking it until the case opens the gate. It puts another task's step in between two of
- * the app task's, or between a caller's read and its lock, where only a race could otherwise put it. */
+ * the app task's, or between a caller's read and its lock, where only a race could otherwise put it. gate_open counts
+ * releases, and a held thread waits for the count to pass the one it saw, so arming the gate again right after opening
+ * it can't hold that thread a second time. */
 static struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -792,7 +794,8 @@ static struct {
     bool by_app_task;
     char after[80];
     int from;
-    bool armed, open;
+    bool armed;
+    unsigned releases;
 } gate = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 static _Thread_local bool gated_thread;
 
@@ -803,33 +806,32 @@ static void gate_arm(int number, bool by_app_task, int from, const char *after) 
     gate.from = from;
     snprintf(gate.after, sizeof gate.after, "%s", after != NULL ? after : "");
     gate.armed = true;
-    gate.open = false;
     pthread_mutex_unlock(&gate.mu);
 }
 
+/* Lets the thread the gate holds go on. */
 static void gate_open(void) {
     pthread_mutex_lock(&gate.mu);
-    gate.open = true;
+    gate.releases++;
     pthread_cond_broadcast(&gate.cv);
     pthread_mutex_unlock(&gate.mu);
 }
 
 static void gate_check(const struct fake_mutex *m) {
     pthread_mutex_lock(&gate.mu);
-    bool mine = gate.armed && m->number == gate.number && (gate.by_app_task ? app_task_of_thread() != NULL : gated_thread);
-    int from = gate.from;
-    char after[80];
-    snprintf(after, sizeof after, "%s", gate.after);
-    pthread_mutex_unlock(&gate.mu);
-    if (!mine || (after[0] != '\0' && at_from(from, after) < 0)) {
+    bool mine = gate.armed && m->number == gate.number &&
+                (gate.by_app_task ? app_task_of_thread() != NULL : gated_thread) &&
+                (gate.after[0] == '\0' || at_from(gate.from, gate.after) >= 0);
+    if (!mine) {
+        pthread_mutex_unlock(&gate.mu);
         return;
     }
-    pthread_mutex_lock(&gate.mu);
-    gate.armed = false;
+    gate.armed = false;  /* decided and disarmed at once: one thread, one hold */
+    unsigned seen = gate.releases;
     pthread_mutex_unlock(&gate.mu);
     event("gate %d", m->number);
     pthread_mutex_lock(&gate.mu);
-    while (!gate.open) {
+    while (gate.releases == seen) {
         pthread_cond_wait(&gate.cv, &gate.mu);
     }
     pthread_mutex_unlock(&gate.mu);
@@ -1140,7 +1142,7 @@ static void *lvgl_main(void *arg) {
     atomic_store(&lvgl_up, true);
     while (!atomic_load(&lvgl_quit)) {
         pthread_mutex_lock(&frame_mu);
-        if (job != NULL) {
+        if (job != NULL && !atomic_load(&lvgl_paused)) {  /* a paused LVGL task runs no event either */
             void (*fn)(void *) = job;
             job = NULL;
             pthread_mutex_unlock(&frame_mu);
@@ -1165,7 +1167,8 @@ static void *lvgl_main(void *arg) {
     return NULL;
 }
 
-/* LVGL pauses (as on battery, asleep and dark): once this returns, no frame is under way and none starts. */
+/* LVGL pauses (as on battery, asleep and dark): once this returns, no frame is under way and none starts, and no job
+ * runs (ON_LVGL fails while it is paused: on the gadget a touch wakes the screen before anything of it runs). */
 static void pause_lvgl(void) {
     atomic_store(&lvgl_paused, true);
     unsigned seen = atomic_load(&paused_rounds);
@@ -1176,8 +1179,11 @@ static void pause_lvgl(void) {
     }
 }
 
-/* Runs fn(arg) on the LVGL task, between frames, and waits for it. */
+/* Runs fn(arg) on the LVGL task, between frames, and waits for it. Never while it is paused (pause_lvgl). */
 static void on_lvgl_at(int line, void (*fn)(void *), void *arg) {
+    if (atomic_load(&lvgl_paused)) {
+        fail_at(line, "a job for a paused LVGL task: the gadget runs nothing on it then; unpause it first");
+    }
     struct timespec deadline = deadline_in(5000);
     pthread_mutex_lock(&frame_mu);
     job = fn;
@@ -2582,6 +2588,49 @@ static void the_tick_says_when_the_apps_cover(void) {
     CHECK(atomic_load(&last_tick) && muse_apps_covering() && !apps_lv_front(), "a crash card covers, the layer behind");
 }
 
+/* N1: a voice turn begins after a new app (run behind) has begun, while the layer is still in front from the app it
+ * replaced, and ends before the new app's table is published. The layer in front then held nothing of the new app, so
+ * the turn's end fronts nothing, and a frame between the publication and the new app's back request gives it no show().
+ * The gates hold the app task after start() (before the publication), then between the publication and the back
+ * request. */
+static void a_turn_during_a_new_apps_load_fronts_nothing(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("first", "First", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print first show");
+    int from = mark();
+    gate_arm(MUTEX_RECORD, true, from, "print second start");
+    late.pkg = make_pkg("second", "Second", HELLO, 1);
+    late.front = false;
+    late.settle_ms = 0;
+    late.err = malloc(200);
+    late.st = NULL;
+    pthread_t caller;
+    CHECK(pthread_create(&caller, NULL, late_caller, NULL) == 0, "no caller thread");
+    WAIT(from, "gate 1");  /* start() has run; the table isn't published */
+    WAIT_FRAMES(3);        /* the LVGL task has seen the new app */
+    CHECK(apps_lv_front(), "the layer is still in front, from the app that was replaced");
+    TURN(true);
+    TURN(false);
+    WAIT_FRAMES(3);        /* the turn's end has been decided */
+    apps_port_ui_lock();   /* the publication waits for the case */
+    gate_open();
+    WAIT(from, "ui_lock wait app");
+    gate_arm(MUTEX_NAMES, true, from, "set_ui table#2");
+    apps_port_ui_unlock();
+    WAIT(from, "gate 3");  /* published; the back request not sent yet */
+    WAIT_FRAMES(3);
+    gate_open();
+    pthread_join(caller, NULL);
+    CHECK(late.ok, "run: %s", late.err);
+    WAIT_FRAMES(5);
+    FIFO_SYNC();
+    FIFO_SYNC();  /* a SHOW posted in those frames has been handled */
+    ABSENT(from, "front 1");
+    ABSENT(from, "print second show");
+    CHECK(!apps_lv_front(), "the new app stays behind");
+    free(late.err);
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -2620,6 +2669,7 @@ int main(int argc, char **argv) {
         {"a_turn_after_the_app_ended_fronts_nothing", a_turn_after_the_app_ended_fronts_nothing},
         {"stop_reports_failure", stop_reports_failure},
         {"the_tick_says_when_the_apps_cover", the_tick_says_when_the_apps_cover},
+        {"a_turn_during_a_new_apps_load_fronts_nothing", a_turn_during_a_new_apps_load_fronts_nothing},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

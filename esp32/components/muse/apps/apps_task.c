@@ -1243,9 +1243,12 @@ void muse_apps_ui_turn(bool in_turn) {
     L.in_turn = in_turn;
     if (in_turn) {
         L.turn_ended = false;
-        L.front_before_turn = apps_lv_front();
+        bool front = apps_lv_front();
+        /* The app was in front only if its table was up: after a new run the layer stays in front, with nothing of the
+         * new app on it, until the app's own request decides. */
+        L.front_before_turn = front && atomic_load(&s_rec->published);
         apps_lv_hide_cards();
-        if (L.front_before_turn) {
+        if (front) {
             apps_lv_set_front(false);
             post_from_lvgl(APPS_EV_HIDE, atomic_load(&s_rec->app_gen));
         }

@@ -176,6 +176,11 @@ class AppTaskTest(unittest.TestCase):
     def test_the_tick_says_when_the_apps_cover(self):  # T9 (1), F7
         self.run_case("the_tick_says_when_the_apps_cover")
 
+    # ---- Fix round 2 ----
+
+    def test_a_turn_during_a_new_apps_load_fronts_nothing(self):  # N1
+        self.run_case("a_turn_during_a_new_apps_load_fronts_nothing")
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))

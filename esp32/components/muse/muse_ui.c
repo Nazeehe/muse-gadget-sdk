@@ -1785,6 +1785,18 @@ static uint32_t snap_crc32(uint32_t crc, const uint8_t *p, size_t n)
     }
     return ~crc;
 }
+
+/* The stream holds the console (muse_console.h) from before its first byte until its last has left the chip, so a line
+ * another task prints meanwhile waits and follows END. Its own waits are bounded: for each row, which the console takes
+ * at once unless the host has stopped reading, and then the stream stops; and for the last bytes to leave. A host that
+ * stops reading mid-stream costs the other tasks one wait of SNAP_WRITE_MS, and then the console is theirs again. */
+#define SNAP_WRITE_MS 2000
+#define SNAP_DRAIN_MS 2000
+
+static bool snap_write(const void *data, size_t n)
+{
+    return muse_console_write_timeout(data, n, SNAP_WRITE_MS);
+}
 #endif
 
 /* Streams the screen over the USB cable as base64 RGB565 (bench testing; needs
@@ -1792,7 +1804,8 @@ static uint32_t snap_crc32(uint32_t crc, const uint8_t *p, size_t n)
  * ends with the CRC-32 of the pixel bytes, in the order they were sent, so
  * snap.py can tell a capture a log line broke into from a good one. BEGIN and
  * END each start with a newline, so each is a line of its own whatever the log
- * wrote just before it: snap.py reads them at column 0 only. */
+ * wrote just before it: snap.py reads them at column 0 only. The console is
+ * held for the stream, so a log line comes out after END, not inside a row. */
 static void send_snapshot(void)
 {
 #if LV_USE_SNAPSHOT
@@ -1803,25 +1816,36 @@ static void send_snapshot(void)
     enum { RAW = 144 };   /* lines must fit the driver's 256-byte TX ring */
     char hdr[48];
     int n = snprintf(hdr, sizeof(hdr), "\nSNAP BEGIN %d %d %d\n", (int)buf->header.w, (int)buf->header.h, RAW);
-    muse_console_write(hdr, n);
     static unsigned char b64[4 * RAW / 3 + 4];
     uint32_t crc = 0;
-    for (uint32_t y = 0; y < buf->header.h; y++) {
+    muse_console_hold();
+    bool ok = snap_write(hdr, n);
+    for (uint32_t y = 0; ok && y < buf->header.h; y++) {
         const unsigned char *p = buf->data + y * buf->header.stride;
         size_t left = buf->header.w * 2;
-        while (left) {
+        while (ok && left) {
             size_t chunk = left > RAW ? RAW : left, olen;
             mbedtls_base64_encode(b64, sizeof(b64), &olen, p, chunk);
             b64[olen++] = '\n';
-            muse_console_write(b64, olen);
+            ok = snap_write(b64, olen);
             crc = snap_crc32(crc, p, chunk);
             p += chunk;
             left -= chunk;
         }
     }
-    char end[24];
-    n = snprintf(end, sizeof(end), "\nSNAP END %08x\n", (unsigned)crc);
-    muse_console_write(end, n);
+    bool ended = false, drained = false;
+    if (ok) {
+        char end[24];
+        n = snprintf(end, sizeof(end), "\nSNAP END %08x\n", (unsigned)crc);
+        ended = snap_write(end, n);
+        drained = ended && muse_console_flush(SNAP_DRAIN_MS);
+    }
+    muse_console_release();
+    if (!ended) {
+        ESP_LOGW(TAG, "snapshot: the console took nothing for %d ms, so the stream stopped", SNAP_WRITE_MS);
+    } else if (!drained) {
+        ESP_LOGW(TAG, "snapshot: the end of the stream hadn't left the chip after %d ms", SNAP_DRAIN_MS);
+    }
     lv_draw_buf_destroy(buf);
 #else
     muse_console_write("\nSNAP OFF\n", 10);   /* so snap.py can say why */

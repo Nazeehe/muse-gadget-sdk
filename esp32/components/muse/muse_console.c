@@ -18,6 +18,9 @@
 
 #include "freertos/FreeRTOS.h"
 #include "sdkconfig.h"
+#if CONFIG_LV_USE_SNAPSHOT
+#include <stdio.h>
+#endif
 
 #if !CONFIG_MUSE_CONSOLE_UART
 #include "driver/usb_serial_jtag.h"
@@ -38,6 +41,19 @@ void muse_console_write(const void *buf, size_t n)
 {
     usb_serial_jtag_write_bytes(buf, n, portMAX_DELAY);
 }
+
+#if CONFIG_LV_USE_SNAPSHOT
+bool muse_console_write_timeout(const void *buf, size_t n, uint32_t ms)
+{
+    /* The ring takes the whole write or none of it. */
+    return usb_serial_jtag_write_bytes(buf, n, pdMS_TO_TICKS(ms)) == (int)n;
+}
+
+bool muse_console_flush(uint32_t ms)
+{
+    return usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS(ms)) == ESP_OK;
+}
+#endif
 
 bool muse_console_host(void)
 {
@@ -115,7 +131,8 @@ static void wake_on_rx(void)
 #endif
 
 /* The log goes through the driver too, so it can't break into one of our
- * writes (a snapshot line). It still comes between them, a character at a time. */
+ * writes (a snapshot line). It still comes between them, a character at a time:
+ * a snapshot holds the console (muse_console_hold) to keep it out. */
 esp_err_t muse_console_install(size_t rx_buf)
 {
     esp_err_t err = uart_driver_install(PORT, rx_buf, 0, 0, NULL, 0);
@@ -146,8 +163,40 @@ void muse_console_write(const void *buf, size_t n)
     uart_write_bytes(PORT, buf, n);
 }
 
+#if CONFIG_LV_USE_SNAPSHOT
+bool muse_console_write_timeout(const void *buf, size_t n, uint32_t ms)
+{
+    (void)ms;   /* a UART's FIFO empties at its baud rate whether or not anyone reads, so a write always ends */
+    return uart_write_bytes(PORT, buf, n) == (int)n;
+}
+
+bool muse_console_flush(uint32_t ms)
+{
+    return uart_wait_tx_done(PORT, pdMS_TO_TICKS(ms)) == ESP_OK;
+}
+#endif
+
 bool muse_console_host(void)
 {
     return false;
+}
+#endif
+
+#if CONFIG_LV_USE_SNAPSHOT
+/* printf and the log take stdout's lock for every call, whichever port is behind it, so holding it keeps them out of a
+ * stream the console writes (see the header). flockfile waits for whoever has the lock, with no bound of its own, and
+ * nothing here can bound it: ftrylockfile in this libc takes a global lock and returns 0 whatever the stream, so it
+ * neither tells that stdout is busy nor holds it (a board run showed the log landing inside the stream, and the global
+ * lock never given back), and the FILE's own lock is internal to the libc. The wait is for another task's line, which
+ * the console bounds: a reply takes 0.5 s at most (6 KB at 115200 baud), the app echo's queue about 0.2 s, and each
+ * flush after one of its lines 50 ms at most. */
+void muse_console_hold(void)
+{
+    flockfile(stdout);
+}
+
+void muse_console_release(void)
+{
+    funlockfile(stdout);
 }
 #endif

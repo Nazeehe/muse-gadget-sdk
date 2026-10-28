@@ -60,6 +60,85 @@ def build_bench(name, program, tmp):
     return apps_host.build(name, [path], tmp, include_dirs=[include, MUSE])
 
 
+SNAPSHOT_PRELUDE = r"""
+#include <pthread.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#define UNUSED __attribute__((unused))
+typedef struct { struct { uint32_t w, h, stride; } header; uint8_t *data; } lv_draw_buf_t;
+typedef struct lv_obj lv_obj_t;
+#define LV_COLOR_FORMAT_RGB565 18
+static lv_draw_buf_t g_buf;
+static lv_obj_t *lv_screen_active(void) { return NULL; }
+static lv_draw_buf_t *lv_snapshot_take(lv_obj_t *obj, int format) { (void)obj; (void)format; return &g_buf; }
+static void lv_draw_buf_destroy(lv_draw_buf_t *buf) { (void)buf; }
+static UNUSED const char *TAG = "muse_ui";
+#define ESP_LOGW(tag, fmt, ...) fprintf(stderr, "W %s: " fmt "\n", tag, ##__VA_ARGS__)
+static int mbedtls_base64_encode(unsigned char *dst, size_t dlen, size_t *olen, const unsigned char *src, size_t slen)
+{
+    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t n = 4 * ((slen + 2) / 3);
+    if (dlen < n + 1) {
+        return -1;
+    }
+    for (size_t i = 0, o = 0; i < slen; i += 3, o += 4) {
+        uint32_t v = (uint32_t)src[i] << 16 | (i + 1 < slen ? (uint32_t)src[i + 1] << 8 : 0) |
+                     (i + 2 < slen ? src[i + 2] : 0);
+        dst[o] = (unsigned char)t[v >> 18 & 63];
+        dst[o + 1] = (unsigned char)t[v >> 12 & 63];
+        dst[o + 2] = i + 1 < slen ? (unsigned char)t[v >> 6 & 63] : '=';
+        dst[o + 3] = i + 2 < slen ? (unsigned char)t[v & 63] : '=';
+    }
+    *olen = n;
+    return 0;
+}
+/* The picture: noise in g_buf, rows padded to the stride, and its pixels (no padding) written to the file `dump`. */
+static void make_picture(uint32_t w, uint32_t h, uint32_t pad, const char *dump)
+{
+    g_buf.header.w = w;
+    g_buf.header.h = h;
+    g_buf.header.stride = w * 2 + pad;
+    g_buf.data = malloc((size_t)g_buf.header.stride * h);
+    uint32_t seed = 12345;
+    FILE *f = fopen(dump, "wb");
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < g_buf.header.stride; x++) {
+            seed = seed * 1103515245u + 12345u;
+            uint8_t b = (uint8_t)(seed >> 16);
+            g_buf.data[y * g_buf.header.stride + x] = b;
+            if (x < w * 2) {
+                fputc(b, f);
+            }
+        }
+    }
+    fclose(f);
+}
+"""
+
+
+def code_only(source):
+    """C source without its comments, for a search for calls (a comment may name what it explains)."""
+    return re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+
+
+def snap_defines(source):
+    """The SNAP_* limits muse_ui.c's snapshot code is written with (the #define lines), as C."""
+    return "\n".join(re.findall(r"^#define SNAP_\w+ .*$", source, re.M))
+
+
+def console_variant(source, name):
+    """muse_console.c from the line that starts the USB-Serial-JTAG variant ("usb") or the UART's ("uart") on."""
+    head = source.index("#if !CONFIG_MUSE_CONSOLE_UART")
+    split = source.index("\n#else", head)
+    return source[head:split] if name == "usb" else source[split:]
+
+
 def pixels(w, h, seed=1):
     """w*h RGB565 pixels of noise."""
     return random.Random(seed).randbytes(w * h * 2)
@@ -637,68 +716,40 @@ int main(int argc, char **argv)
             done = apps_host.run(exe, 0, input=b"123456789", text=False)
             self.assertEqual(done.stdout.decode().strip(), "cbf43926")
 
+    # The console as send_snapshot() sees it, for a stream read back by the tool's parser (hold, release, write and
+    # flush do nothing but write to stdout).
+    SNAPSHOT_CONSOLE = r"""
+static UNUSED void muse_console_write(const void *buf, size_t n) { fwrite(buf, 1, n, stdout); }
+static UNUSED void muse_console_hold(void) {}
+static UNUSED void muse_console_release(void) {}
+static UNUSED bool muse_console_write_timeout(const void *buf, size_t n, uint32_t ms)
+{
+    (void)ms;
+    fwrite(buf, 1, n, stdout);
+    return true;
+}
+static UNUSED bool muse_console_flush(uint32_t ms) { (void)ms; return true; }
+"""
+
+    @staticmethod
+    def snapshot_functions(source):
+        """What muse_ui.c's screenshot stream is made of, as C: its limits, the CRC, snap_write(), send_snapshot()."""
+        return "\n".join([snap_defines(source), c_function(source, "static uint32_t snap_crc32("),
+                          c_function(source, "static bool snap_write("),
+                          c_function(source, "static void send_snapshot(void)")])
+
     def test_send_snapshot_streams_what_snap_parses(self):
         # The firmware's own stream (send_snapshot, its chunks and its SNAP END line) read by the tool's parser.
         snap = load_snap()
         source = (MUSE / "muse_ui.c").read_text()
-        program = r"""
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-typedef struct { struct { uint32_t w, h, stride; } header; uint8_t *data; } lv_draw_buf_t;
-typedef struct lv_obj lv_obj_t;
-#define LV_COLOR_FORMAT_RGB565 18
-static lv_draw_buf_t g_buf;
-static lv_obj_t *lv_screen_active(void) { return NULL; }
-static lv_draw_buf_t *lv_snapshot_take(lv_obj_t *obj, int format) { (void)obj; (void)format; return &g_buf; }
-static void lv_draw_buf_destroy(lv_draw_buf_t *buf) { (void)buf; }
-static void muse_console_write(const void *buf, size_t n) { fwrite(buf, 1, n, stdout); }
-static int mbedtls_base64_encode(unsigned char *dst, size_t dlen, size_t *olen, const unsigned char *src, size_t slen)
-{
-    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t n = 4 * ((slen + 2) / 3);
-    if (dlen < n + 1) {
-        return -1;
-    }
-    for (size_t i = 0, o = 0; i < slen; i += 3, o += 4) {
-        uint32_t v = (uint32_t)src[i] << 16 | (i + 1 < slen ? (uint32_t)src[i + 1] << 8 : 0) |
-                     (i + 2 < slen ? src[i + 2] : 0);
-        dst[o] = (unsigned char)t[v >> 18 & 63];
-        dst[o + 1] = (unsigned char)t[v >> 12 & 63];
-        dst[o + 2] = i + 1 < slen ? (unsigned char)t[v >> 6 & 63] : '=';
-        dst[o + 3] = i + 2 < slen ? (unsigned char)t[v & 63] : '=';
-    }
-    *olen = n;
-    return 0;
-}
-""" + c_function(source, "static uint32_t snap_crc32(") + "\n" + \
-    c_function(source, "static void send_snapshot(void)") + r"""
+        program = SNAPSHOT_PRELUDE + self.SNAPSHOT_CONSOLE + self.snapshot_functions(source) + r"""
 
 int main(int argc, char **argv)
 {
     if (argc < 5) {
         return 2;
     }
-    uint32_t w = (uint32_t)atoi(argv[1]), h = (uint32_t)atoi(argv[2]), pad = (uint32_t)atoi(argv[3]);
-    g_buf.header.w = w;
-    g_buf.header.h = h;
-    g_buf.header.stride = w * 2 + pad;
-    g_buf.data = malloc((size_t)g_buf.header.stride * h);
-    uint32_t seed = 12345;
-    FILE *dump = fopen(argv[4], "wb");
-    for (uint32_t y = 0; y < h; y++) {
-        for (uint32_t x = 0; x < g_buf.header.stride; x++) {
-            seed = seed * 1103515245u + 12345u;
-            uint8_t b = (uint8_t)(seed >> 16);
-            g_buf.data[y * g_buf.header.stride + x] = b;
-            if (x < w * 2) {
-                fputc(b, dump);
-            }
-        }
-    }
-    fclose(dump);
+    make_picture((uint32_t)atoi(argv[1]), (uint32_t)atoi(argv[2]), (uint32_t)atoi(argv[3]), argv[4]);
     send_snapshot();
     free(g_buf.data);
     return 0;
@@ -722,9 +773,528 @@ int main(int argc, char **argv)
                     self.assertTrue(ok)
                     self.assertFalse(snap.parse(flip_first_data_char(log))[3])
 
+    # The console shared by two writers. While a screenshot streams, text printed with printf or the log by another
+    # task must wait: the harness runs the real send_snapshot() and the real muse_console_hold(), a task that prints
+    # one line in the middle of the stream's third row (a call of the stream's write), a task that has stdout when the
+    # stream starts, and a "cable" that records what arrives in what order. events: L the hold taken, W a row written,
+    # w a write that gave up, F the flush, f a flush that timed out, U the hold given back.
+    SNAPSHOT_CABLE = r"""
+static char g_events[8192];
+static size_t g_nevents;
+static int g_calls, g_inject_at, g_vanish_at = -1, g_flush_ok = 1, g_bad_ms, g_log_blocked = -1;
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+static int g_go, g_done, g_held;
+
+static void event(char c)
+{
+    if (g_nevents + 1 < sizeof g_events) {
+        g_events[g_nevents++] = c;
+    }
+}
+
+static void put(const void *buf, size_t n)
+{
+    for (size_t off = 0; off < n;) {
+        ssize_t r = write(1, (const char *)buf + off, n - off);
+        if (r <= 0) {
+            abort();
+        }
+        off += (size_t)r;
+    }
+}
+
+/* Another task: prints one line the moment it is told to, with printf and a flush, as a log line is. */
+static void *log_thread(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&g_mutex);
+    while (!g_go) {
+        pthread_cond_wait(&g_cond, &g_mutex);
+    }
+    pthread_mutex_unlock(&g_mutex);
+    printf("I (1) app: LOG LINE\n");
+    fflush(stdout);
+    pthread_mutex_lock(&g_mutex);
+    g_done = 1;
+    pthread_cond_broadcast(&g_cond);
+    pthread_mutex_unlock(&g_mutex);
+    return NULL;
+}
+
+/* Tells that task to print and waits up to 300 ms for it: it can't finish while the console is held. */
+static void trigger_log_and_wait(void)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += 300 * 1000000L;
+    until.tv_sec += until.tv_nsec / 1000000000L;
+    until.tv_nsec %= 1000000000L;
+    pthread_mutex_lock(&g_mutex);
+    g_go = 1;
+    pthread_cond_broadcast(&g_cond);
+    while (!g_done) {
+        if (pthread_cond_timedwait(&g_cond, &g_mutex, &until) != 0) {
+            break;
+        }
+    }
+    g_log_blocked = !g_done;
+    pthread_mutex_unlock(&g_mutex);
+}
+
+/* A task in the middle of printing when the stream starts: it has stdout for 100 ms, prints its line, lets go. */
+static void *holder_thread(void *arg)
+{
+    (void)arg;
+    (flockfile)(stdout);
+    pthread_mutex_lock(&g_mutex);
+    g_held = 1;
+    pthread_cond_broadcast(&g_cond);
+    pthread_mutex_unlock(&g_mutex);
+    usleep(100 * 1000);
+    fputs("I (1) app: HOLDER LINE\n", stdout);
+    fflush(stdout);
+    (funlockfile)(stdout);
+    return NULL;
+}
+
+/* The hold and its release are the host's flockfile and funlockfile, as the board's libc has them, noted. */
+static void harness_lock(FILE *f)
+{
+    (flockfile)(f);
+    event('L');
+}
+static void harness_unlock(FILE *f)
+{
+    event('U');
+    (funlockfile)(f);
+}
+#define flockfile(f) harness_lock(f)
+#define funlockfile(f) harness_unlock(f)
+
+/* The cable: a write of the stream; the one that is the injected call gets the other task's line in the middle. */
+static UNUSED void muse_console_write(const void *buf, size_t n)
+{
+    event('W');
+    g_calls++;
+    if (g_calls == g_inject_at) {
+        put(buf, n / 2);
+        trigger_log_and_wait();
+        put((const char *)buf + n / 2, n - n / 2);
+    } else {
+        put(buf, n);
+    }
+}
+static UNUSED bool muse_console_write_timeout(const void *buf, size_t n, uint32_t ms)
+{
+    if (ms == 0 || ms > 10000) {
+        g_bad_ms++;   /* every wait is bounded, and not by much */
+    }
+    if (g_vanish_at >= 0 && g_calls >= g_vanish_at) {
+        event('w');   /* a host that has stopped reading: the console takes nothing */
+        return false;
+    }
+    muse_console_write(buf, n);
+    return true;
+}
+static UNUSED bool muse_console_flush(uint32_t ms)
+{
+    if (ms == 0 || ms > 10000) {
+        g_bad_ms++;
+    }
+    event(g_flush_ok ? 'F' : 'f');
+    return g_flush_ok;
+}
+"""
+
+    SNAPSHOT_CABLE_MAIN = r"""
+int main(int argc, char **argv)
+{
+    /* w h pad dump inject_at vanish_at flush_ok holder */
+    if (argc < 9) {
+        return 2;
+    }
+    alarm(20);   /* a hold never given back leaves the other task waiting for ever: the run ends, and the test fails */
+    make_picture((uint32_t)atoi(argv[1]), (uint32_t)atoi(argv[2]), (uint32_t)atoi(argv[3]), argv[4]);
+    g_inject_at = atoi(argv[5]);
+    g_vanish_at = atoi(argv[6]);
+    g_flush_ok = atoi(argv[7]);
+    int holder = atoi(argv[8]);
+    pthread_t log_task, holder_task;
+    if (g_inject_at) {
+        pthread_create(&log_task, NULL, log_thread, NULL);
+    }
+    if (holder) {
+        pthread_create(&holder_task, NULL, holder_thread, NULL);
+        pthread_mutex_lock(&g_mutex);
+        while (!g_held) {
+            pthread_cond_wait(&g_cond, &g_mutex);
+        }
+        pthread_mutex_unlock(&g_mutex);
+    }
+    send_snapshot();
+    if (holder) {
+        pthread_join(holder_task, NULL);
+    }
+    if (g_inject_at) {
+        pthread_join(log_task, NULL);
+    }
+    g_events[g_nevents] = 0;
+    fprintf(stderr, "events=%s blocked=%d bad_ms=%d\n", g_events, g_log_blocked, g_bad_ms);
+    free(g_buf.data);
+    return 0;
+}
+"""
+
+    def run_snapshot_cable(self, *, inject_at=0, vanish_at=-1, flush_ok=1, holder=0, hold=True, w=200, h=6, pad=8):
+        """send_snapshot() on the shared cable: (what arrived on the cable, the raw pixels, the harness's report as
+        a dict, the warnings it logged). hold=False takes the muse_console_hold() call out, as a stream without it."""
+        ui = (MUSE / "muse_ui.c").read_text()
+        console = (MUSE / "muse_console.c").read_text()
+        functions = self.snapshot_functions(ui)
+        if not hold:
+            # The stream without the lock: no hold taken, so none given back.
+            self.assertIn("muse_console_hold();", functions)
+            self.assertIn("muse_console_release();", functions)
+            functions = functions.replace("muse_console_hold();", ";").replace("muse_console_release();", ";")
+        program = SNAPSHOT_PRELUDE + self.SNAPSHOT_CABLE + "\n".join([
+            c_function(console, "void muse_console_hold("), c_function(console, "void muse_console_release(")
+        ]) + "\n" + functions + self.SNAPSHOT_CABLE_MAIN
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "snapshot_cable.c"
+            path.write_text(program)
+            exe = apps_host.build("snapshot_cable", [path], tmp, defines=["LV_USE_SNAPSHOT=1"])
+            dump = Path(tmp) / "dump"
+            done = apps_host.run(exe, w, h, pad, dump, inject_at, vanish_at, flush_ok, holder, text=False)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            stderr = done.stderr.decode("latin1")
+            report = dict(re.findall(r"(\w+)=(\S*)", stderr.splitlines()[-1]))
+            warnings = [line for line in stderr.splitlines() if line.startswith("W ")]
+            return done.stdout.decode("latin1"), dump.read_bytes(), report, warnings
+
+    def test_the_stream_holds_the_console_so_another_tasks_log_waits_for_the_end(self):
+        snap = load_snap()
+        w, h = 200, 6
+        rows = h * -(-w * 2 // 144)
+        # Another task prints one line in the middle of the third row: it can't (it waits for the console), and its
+        # line comes out after END, with the stream whole.
+        log, raw, report, warnings = self.run_snapshot_cable(inject_at=4)
+        self.assertEqual(report["blocked"], "1")
+        self.assertEqual(log.count("LOG LINE"), 1)
+        self.assertGreater(log.index("LOG LINE"), log.index("SNAP END"))
+        self.assertEqual(snap.parse(log), (w, h, raw, True))
+        self.assertTrue(log.endswith("I (1) app: LOG LINE\n"))
+        # What the stream did: took the hold, wrote the header, every row and the END line, flushed, gave the hold back.
+        self.assertEqual(report["events"], "L" + "W" * (rows + 2) + "FU")
+        self.assertEqual((report["bad_ms"], warnings), ("0", []))
+        # With nobody else writing it is the same stream.
+        log, raw, report, warnings = self.run_snapshot_cable()
+        self.assertEqual(report["events"], "L" + "W" * (rows + 2) + "FU")
+        self.assertEqual(snap.parse(log), (w, h, raw, True))
+
+    def test_without_the_hold_another_tasks_log_lands_inside_the_stream(self):
+        # The same harness with the hold taken out of send_snapshot(): the line goes through, inside a row, and the
+        # CRC fails. So the test above has teeth: it fails for a stream that doesn't hold the console.
+        snap = load_snap()
+        log, raw, report, _ = self.run_snapshot_cable(inject_at=4, hold=False)
+        self.assertEqual(report["blocked"], "0")
+        self.assertNotIn("L", report["events"])
+        self.assertLess(log.index("SNAP BEGIN"), log.index("LOG LINE"))
+        self.assertLess(log.index("LOG LINE"), log.index("SNAP END"))
+        self.assertFalse(snap.parse(log)[3])
+
+    def test_the_stream_stops_and_lets_go_when_the_host_stops_reading(self):
+        # The console takes nothing after the 5th write (the host has gone): the stream stops there, with no END and
+        # no flush, the hold is given back, and the log says why.
+        log, raw, report, warnings = self.run_snapshot_cable(vanish_at=5)
+        self.assertEqual(report["events"], "L" + "W" * 5 + "wU")
+        self.assertEqual(report["bad_ms"], "0")
+        self.assertNotIn("SNAP END", log)
+        self.assertEqual(len(warnings), 1)
+        self.assertRegex(warnings[0], r"snapshot.*(stopped|took nothing)")
+        # Gone before the first byte: nothing was written, and the hold is still given back.
+        log, raw, report, warnings = self.run_snapshot_cable(vanish_at=0)
+        self.assertEqual(report["events"], "LwU")
+        self.assertEqual(log, "")
+
+    def test_the_hold_is_given_back_when_the_last_bytes_do_not_leave(self):
+        w, h = 200, 6
+        rows = h * -(-w * 2 // 144)
+        log, raw, report, warnings = self.run_snapshot_cable(flush_ok=0)
+        self.assertEqual(report["events"], "L" + "W" * (rows + 2) + "fU")
+        self.assertEqual(len(warnings), 1)
+        self.assertRegex(warnings[0], r"snapshot.*(drain|left)")
+        self.assertTrue(log.endswith("\n"))
+
+    def test_the_stream_waits_for_a_task_that_has_the_console_and_then_goes_whole(self):
+        snap = load_snap()
+        w, h = 200, 6
+        rows = h * -(-w * 2 // 144)
+        # Another task has stdout when the stream starts and prints its line before it lets go: the stream's hold
+        # waits for that, so the line comes out before BEGIN and the stream is whole.
+        log, raw, report, warnings = self.run_snapshot_cable(holder=1)
+        self.assertEqual(log.count("HOLDER LINE"), 1)
+        self.assertLess(log.index("HOLDER LINE"), log.index("SNAP BEGIN"))
+        self.assertEqual(report["events"], "L" + "W" * (rows + 2) + "FU")
+        self.assertEqual(snap.parse(log[log.index("\nSNAP BEGIN"):]), (w, h, raw, True))
+        self.assertEqual((report["bad_ms"], warnings), ("0", []))
+        # The same harness without the hold: the stream doesn't wait, and the line comes after it.
+        log, raw, report, _ = self.run_snapshot_cable(holder=1, hold=False)
+        self.assertLess(log.index("SNAP END"), log.index("HOLDER LINE"))
+
+    def test_the_limits_of_the_stream_are_finite(self):
+        ui = (MUSE / "muse_ui.c").read_text()
+        limits = {name: int(value) for name, value in re.findall(r"^#define (SNAP_\w+_MS) (\d+)", ui, re.M)}
+        self.assertEqual(sorted(limits), ["SNAP_DRAIN_MS", "SNAP_WRITE_MS"])
+        for name, value in limits.items():
+            with self.subTest(name):
+                self.assertTrue(0 < value <= 5000, value)   # seconds, not minutes, and not zero
+        # Everything the stream waits for is one of the two: its writes, through snap_write(), and its flush. The plain
+        # muse_console_write() waits for ever.
+        stream = c_function(ui, "static void send_snapshot(void)")
+        stream = stream[:stream.index("#else")]
+        self.assertNotIn("muse_console_write(", stream)
+        self.assertIn("muse_console_flush(SNAP_DRAIN_MS)", stream)
+        self.assertIn("muse_console_write_timeout(data, n, SNAP_WRITE_MS)", c_function(ui, "static bool snap_write("))
+
+    # The two consoles' side of it: a write that gives up and a flush that waits, each for at most ms. The functions are
+    # muse_console.c's own text, compiled against stand-ins for the driver's calls.
+    CONSOLE_STUBS = {
+        "usb": r"""
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_ERR_TIMEOUT 0x107
+#define portTICK_PERIOD_MS 10
+#define pdMS_TO_TICKS(ms) ((uint32_t)(ms) / portTICK_PERIOD_MS)
+static int g_takes = 1;
+static uint32_t g_ticks;
+static int usb_serial_jtag_write_bytes(const void *src, size_t size, uint32_t ticks)
+{
+    (void)src;
+    g_ticks = ticks;
+    return g_takes == 2 ? (int)size - 1 : g_takes ? (int)size : 0;   /* the whole write, none of it, or less */
+}
+static esp_err_t usb_serial_jtag_wait_tx_done(uint32_t ticks)
+{
+    g_ticks = ticks;
+    return g_takes ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+#define PORT_NOTE 0
+""",
+        "uart": r"""
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_ERR_TIMEOUT 0x107
+#define portTICK_PERIOD_MS 10
+#define pdMS_TO_TICKS(ms) ((uint32_t)(ms) / portTICK_PERIOD_MS)
+#define CONFIG_ESP_CONSOLE_UART_NUM 1
+#define PORT CONFIG_ESP_CONSOLE_UART_NUM
+static int g_takes = 1;
+static uint32_t g_ticks;
+static int g_port = -1;
+static int uart_write_bytes(int port, const void *src, size_t size)
+{
+    (void)src;
+    g_port = port;
+    return g_takes == 2 ? (int)size - 1 : g_takes ? (int)size : -1;
+}
+static esp_err_t uart_wait_tx_done(int port, uint32_t ticks)
+{
+    g_port = port;
+    g_ticks = ticks;
+    return g_takes ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+#define PORT_NOTE g_port
+""",
+    }
+    CONSOLE_MAIN = r"""
+int main(void)
+{
+    for (int takes = 1; takes >= 0; takes--) {
+        g_takes = takes;
+        g_ticks = 0;
+        bool wrote = muse_console_write_timeout("hello", 5, 250);
+        printf("write takes=%d ok=%d ticks=%u port=%d\n", takes, wrote, (unsigned)g_ticks, PORT_NOTE);
+        g_ticks = 0;
+        bool wrote_now = muse_console_write_timeout("hello", 5, 0);
+        printf("write0 takes=%d ok=%d ticks=%u\n", takes, wrote_now, (unsigned)g_ticks);
+        g_ticks = 0;
+        bool flushed = muse_console_flush(300);
+        printf("flush takes=%d ok=%d ticks=%u port=%d\n", takes, flushed, (unsigned)g_ticks, PORT_NOTE);
+    }
+    g_takes = 2;
+    printf("short ok=%d\n", muse_console_write_timeout("hello", 5, 250));
+    return 0;
+}
+"""
+
+    def test_each_console_writes_with_a_timeout_and_flushes_with_one(self):
+        console = (MUSE / "muse_console.c").read_text()
+        for variant in ("usb", "uart"):
+            with self.subTest(variant), tempfile.TemporaryDirectory() as tmp:
+                part = console_variant(console, variant)
+                program = self.CONSOLE_STUBS[variant] + "\n".join(
+                    [c_function(part, "bool muse_console_write_timeout("), c_function(part, "bool muse_console_flush(")]
+                ) + self.CONSOLE_MAIN
+                path = Path(tmp) / f"console_{variant}.c"
+                path.write_text(program)
+                exe = apps_host.build(f"console_{variant}", [path], tmp)
+                done = apps_host.run(exe)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                lines = dict(line.split(" ", 1) for line in done.stdout.splitlines())
+                if variant == "usb":
+                    # The ring's wait is the timeout in ticks (10 ms each): 250 ms is 25, and 0 doesn't wait.
+                    self.assertEqual(lines["write"], "takes=0 ok=0 ticks=25 port=0")   # the last of the two passes
+                    self.assertEqual(lines["write0"], "takes=0 ok=0 ticks=0")
+                    self.assertEqual(lines["flush"], "takes=0 ok=0 ticks=30 port=0")
+                else:
+                    # A UART takes its bytes at the baud rate whether or not anyone reads, so a write has no timeout to
+                    # give up by; a flush waits for the FIFO for the time it is given, on the console's port.
+                    self.assertEqual(lines["write"], "takes=0 ok=0 ticks=0 port=1")
+                    self.assertEqual(lines["write0"], "takes=0 ok=0 ticks=0")
+                    self.assertEqual(lines["flush"], "takes=0 ok=0 ticks=30 port=1")
+                self.assertEqual(lines["short"], "ok=0")   # less than all of it taken is not sent
+                # The same calls when the console takes the bytes: true each time.
+                first = [line for line in done.stdout.splitlines() if " takes=1 " in f" {line} "]
+                self.assertEqual(len(first), 3)
+                for line in first:
+                    self.assertIn("ok=1", line)
+
+    def test_the_snapshot_console_calls_exist_for_both_consoles_and_only_with_snapshots(self):
+        header = (MUSE / "muse_console.h").read_text()
+        source = (MUSE / "muse_console.c").read_text()
+        ui = (MUSE / "muse_ui.c").read_text()
+        with_snapshots = "if CONFIG_LV_USE_SNAPSHOT"
+        for name in ("muse_console_hold", "muse_console_release", "muse_console_write_timeout", "muse_console_flush"):
+            with self.subTest(name):
+                self.assertEqual(open_conditions(header, header.index(name)), [with_snapshots])
+                defined = [m.start() for m in re.finditer(rf"^(?:bool|void) {name}\(", source, re.M)]
+                if name in ("muse_console_hold", "muse_console_release"):
+                    # One for both consoles: the lock is stdout's, whatever the port behind it.
+                    self.assertEqual([open_conditions(source, at) for at in defined], [[with_snapshots]])
+                else:
+                    self.assertEqual([open_conditions(source, at) for at in defined],
+                                     [["if !CONFIG_MUSE_CONSOLE_UART", with_snapshots], ["else", with_snapshots]])
+        # Only the snapshot stream calls them, and only where there is one: no plain build refers to them.
+        names = re.compile(r"\bmuse_console_(?:hold|release|write_timeout|flush)\b")
+        for path in [*MUSE.rglob("*.[ch]"), *MUSE.rglob("*.cpp"), *(ROOT / "main").rglob("*.[ch]")]:
+            if path.name not in ("muse_console.c", "muse_console.h", "muse_ui.c"):
+                with self.subTest(path.name):
+                    found = names.search(code_only(path.read_text()))
+                    self.assertIsNone(found, f"{path} calls the snapshot's console API")
+        calls = [m.start() for m in re.finditer(r"\bmuse_console_(?:hold|release|write_timeout|flush)\(", ui)]
+        self.assertGreaterEqual(len(calls), 4)
+        for at in calls:
+            with self.subTest(at=ui[at:at + 24]):
+                self.assertIn("if LV_USE_SNAPSHOT", open_conditions(ui, at))
+
+    def test_the_hold_takes_stdouts_lock_with_flockfile_and_nothing_calls_ftrylockfile(self):
+        # The toolchain's picolibc has an ftrylockfile that takes a global lock, never the FILE's, and returns 0: a
+        # hold polling it holds nothing (the log landed inside the stream on the board) and the global lock is never
+        # given back. The host's ftrylockfile is POSIX's and works, so no host run can tell. This keeps it out of the
+        # source: flockfile and funlockfile are the real ones.
+        console = (MUSE / "muse_console.c").read_text()
+        self.assertIn("flockfile(stdout)", c_function(console, "void muse_console_hold("))
+        self.assertIn("funlockfile(stdout)", c_function(console, "void muse_console_release("))
+        for path in [*MUSE.rglob("*.[ch]"), *MUSE.rglob("*.cpp"), *(ROOT / "main").rglob("*.[ch]")]:
+            with self.subTest(path.name):
+                self.assertNotIn("ftrylockfile", code_only(path.read_text()))
+
+    # The apps port's console flush as the stream sees it. fsync takes none of stdio's locks and its flushes reach the
+    # USB port's FIFO from the task that calls it, so one that began just before the stream took the console would
+    # still be flushing while the first rows go out (on the board it cost the stream a byte, about one capture in forty
+    # with an app echoing 70 lines a second). The real apps_port_console_flush() is run with an fsync that stays in
+    # flight until the "stream" is taking the console, and the stream's hold asks whether it still is when it gets it.
+    CONSOLE_FLUSH = r"""
+#include <pthread.h>
+#include <stdio.h>
+#include <unistd.h>
+static int g_in_fsync, g_entered, g_taking;
+static int fake_fsync(int fd)
+{
+    (void)fd;
+    __atomic_store_n(&g_in_fsync, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_entered, 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < 2000 && !__atomic_load_n(&g_taking, __ATOMIC_SEQ_CST); i++) {
+        usleep(1000);
+    }
+    usleep(50 * 1000);   /* the host picking up the packet */
+    __atomic_store_n(&g_in_fsync, 0, __ATOMIC_SEQ_CST);
+    return 0;
+}
+#define fsync(fd) fake_fsync(fd)
+"""
+    CONSOLE_FLUSH_MAIN = r"""
+static void *flusher(void *arg)
+{
+    (void)arg;
+    apps_port_console_flush();
+    return NULL;
+}
+
+int main(void)
+{
+    pthread_t task;
+    pthread_create(&task, NULL, flusher, NULL);
+    while (!__atomic_load_n(&g_entered, __ATOMIC_SEQ_CST)) {
+        usleep(100);
+    }
+    __atomic_store_n(&g_taking, 1, __ATOMIC_SEQ_CST);
+    flockfile(stdout);   /* the stream's hold */
+    int overlapped = __atomic_load_n(&g_in_fsync, __ATOMIC_SEQ_CST);
+    funlockfile(stdout);
+    pthread_join(task, NULL);
+    printf("overlapped=%d\n", overlapped);
+    return 0;
+}
+"""
+
+    def run_console_flush(self, flush=None):
+        port = (MUSE / "apps" / "apps_port_idf.c").read_text()
+        flush = flush or c_function(port, "void apps_port_console_flush(void)")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "console_flush.c"
+            path.write_text(self.CONSOLE_FLUSH + flush + self.CONSOLE_FLUSH_MAIN)
+            exe = apps_host.build("console_flush", [path], tmp)
+            done = apps_host.run(exe)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout.strip()
+
+    def test_a_console_flush_that_began_before_the_stream_is_over_when_the_stream_has_the_console(self):
+        self.assertEqual(self.run_console_flush(), "overlapped=0")
+        # Without the lock around fflush and fsync the fsync is still flushing when the hold is taken: the same harness
+        # with the two calls taken out has teeth.
+        port = (MUSE / "apps" / "apps_port_idf.c").read_text()
+        flush = c_function(port, "void apps_port_console_flush(void)")
+        self.assertIn("flockfile(stdout);", flush)
+        self.assertIn("funlockfile(stdout);", flush)
+        unlocked = flush.replace("flockfile(stdout);", "").replace("funlockfile(stdout);", "")
+        self.assertEqual(self.run_console_flush(unlocked), "overlapped=1")
+
+    def test_the_simulator_stands_in_for_the_snapshot_console_calls(self):
+        # The simulator compiles muse_ui.c, snapshot stream included, and links its own console (sim_services.c); it
+        # isn't part of this suite, so what it needs is read here: a definition of every call, and
+        # CONFIG_LV_USE_SNAPSHOT set wherever its lv_conf.h turns LV_USE_SNAPSHOT on.
+        sim = ROOT / "simulator"
+        services = (sim / "src/sim_services.c").read_text()
+        for name in ("muse_console_hold", "muse_console_release", "muse_console_write_timeout", "muse_console_flush"):
+            with self.subTest(name):
+                self.assertRegex(services, rf"(?m)^(?:bool|void) {name}\(")
+        self.assertRegex((sim / "lv_conf.h").read_text(), r"(?m)^#define LV_USE_SNAPSHOT 1\b")
+        self.assertRegex((sim / "compat/sdkconfig.h").read_text(), r"(?m)^#define CONFIG_LV_USE_SNAPSHOT 1\b")
+
     def test_snapshot_streaming_stays_on_lvgl_snapshot(self):
         ui = (MUSE / "muse_ui.c").read_text()
-        for text in ("static uint32_t snap_crc32(", "lv_snapshot_take(", '"\\nSNAP END %08x\\n"'):
+        for text in ("static uint32_t snap_crc32(", "lv_snapshot_take(", '"\\nSNAP END %08x\\n"', "muse_console_hold(",
+                     "muse_console_flush(", "static bool snap_write("):
             with self.subTest(text):
                 self.assertIn("if LV_USE_SNAPSHOT", open_conditions(ui, ui.index(text)))
         self.assertIn('"\\nSNAP OFF\\n"', ui)   # a build without it still says why

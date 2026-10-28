@@ -188,10 +188,18 @@ void apps_port_log_drain(void) {
  * included, is a multiple of 64 ends on a full packet, so the host kept it until the console printed again. ESP-IDF's
  * console forwards fsync to that port, which waits (50 ms at most) for the host to take the last packet and then sends
  * a zero-length one. The UART's fsync waits for its FIFO to empty, about 11 ms at most at 115200 baud.
+ *
+ * Both calls are made holding stdout's lock. fflush takes it for itself, but fsync takes none, and its flushes reach
+ * the USB port's FIFO while another task may be filling it. A screenshot (muse_console_hold) streams through that
+ * FIFO, and an fsync that began just before its hold lost a byte of the stream's first rows: about one capture in forty
+ * with the app echoing 70 lines a second. Held, such an fsync is over before the screenshot takes the console, and
+ * none begins until it lets go.
  */
 void apps_port_console_flush(void) {
+    flockfile(stdout);
     fflush(stdout);
     (void)fsync(fileno(stdout));
+    funlockfile(stdout);
 }
 
 void apps_port_ui_lock(void) {

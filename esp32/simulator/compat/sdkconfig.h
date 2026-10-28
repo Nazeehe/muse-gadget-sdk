@@ -22,5 +22,7 @@
 #define CONFIG_MUSE_WATCHER_CAMERA 0
 #define CONFIG_MUSE_HATCH 1
 #define CONFIG_MUSE_CONSOLE_UART 0
+/* Screenshots, as lv_conf.h has them: muse_console.h declares the stream's console calls with them. */
+#define CONFIG_LV_USE_SNAPSHOT 1
 #define CONFIG_PM_PROFILING 0
 #define CONFIG_MUSE_BOARD_SIMULATOR 1

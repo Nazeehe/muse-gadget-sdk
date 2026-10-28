@@ -245,6 +245,29 @@ void muse_console_write(const void *buf, size_t n)
     }
 }
 
+/* The snapshot stream's console calls: one task writes to stdout here, so there is nothing to hold off, wait for or
+ * give up on. */
+void muse_console_hold(void)
+{
+}
+
+void muse_console_release(void)
+{
+}
+
+bool muse_console_write_timeout(const void *buf, size_t n, uint32_t ms)
+{
+    (void)ms;
+    muse_console_write(buf, n);
+    return true;
+}
+
+bool muse_console_flush(uint32_t ms)
+{
+    (void)ms;
+    return fflush(stdout) == 0;
+}
+
 void muse_input_touch_talk(bool pressed)
 {
     (void)pressed;

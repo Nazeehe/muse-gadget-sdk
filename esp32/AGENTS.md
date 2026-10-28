@@ -180,7 +180,10 @@ as a finger would, on a touch screen that LVGL polls. `snap.py` sends `w` first,
 since LVGL doesn't read its input while the screen sleeps on battery, and waits
 for the script to finish before the picture (`snap.capture()` does both for
 every caller). Each screenshot ends with a CRC-32 that `snap.py` checks, retaking
-a capture a log line broke into. Or run `idf.py` directly:
+a capture a log line broke into. The firmware holds the console while it streams
+one, so the log lines an app or the system prints meanwhile come out after END and
+can't land inside it; it stops, and lets the console go, if the host takes nothing
+for 2 s. Or run `idf.py` directly:
 
 ```sh
 idf.py -B build-muse-aipi -DIDF_TARGET=esp32s3 \

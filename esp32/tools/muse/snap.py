@@ -30,7 +30,9 @@ script has run and 0.6 s more have passed. --settle S sets that wait, in seconds
 command (the others take 0.35 s).
 Screenshots are off by default; build and flash with MUSE_BENCH=1 tools/muse/board.sh.
 Each one ends with a CRC-32 of its pixels, and a capture that doesn't match is retaken
-(three tries). With reset_wait_s the board is reset first and given that long to boot.
+(three tries). The firmware holds the console while it streams one, so what the log prints
+meanwhile comes after the END line, and the CRC catches what still gets in. With
+reset_wait_s the board is reset first and given that long to boot.
 The PNG is scaled 3x so small screens are readable.
 
 As a module: parse(log) reads a captured stream, capture(ser, keys, settle) does the whole

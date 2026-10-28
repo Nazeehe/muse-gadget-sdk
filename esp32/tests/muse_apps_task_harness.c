@@ -55,7 +55,7 @@
 #include "muse_apps_task_fakes.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
-#define HUNG_MESSAGE "the app is not responding; it is abandoned until the gadget restarts"
+#define HUNG_MESSAGE "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"
 
 /* ---- Time ---- */
 

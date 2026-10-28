@@ -90,7 +90,7 @@ static const char *TAG = "muse_apps";
 #define SHOWN_MAX 40         /* text an app supplied, as a message shows it (apps_ui.h) */
 #define WHAT_MAX (APPS_PATH_MAX + 32)
 
-#define MSG_HUNG "the app is not responding; it is abandoned until the gadget restarts"
+#define MSG_HUNG "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"
 #define MSG_BUSY "the app task is busy; try again"
 #define MSG_DOWN "Muse apps aren't running"
 #define MSG_SELF "the app task can't wait for itself"

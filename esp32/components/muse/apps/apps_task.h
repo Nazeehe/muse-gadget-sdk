@@ -32,9 +32,10 @@
  * hung: the supervisor, on the LVGL task (muse_apps_ui_supervise), puts the layer behind, drops the app task to
  * priority 1, shows the card "<name> stopped responding" and marks the app HUNG. The device is never restarted.
  * While the call doesn't return the app task can't answer anything, so every call here returns at once with
- * "the app is not responding; it is abandoned until the gadget restarts" (status reads the record as ever). If the
- * call does return, nothing of the app runs again: the task frees its state (as the teardown below), goes back to
- * priority 2 and serves calls again; the record keeps the state HUNG until the next app.
+ * "the app stopped responding; no app can run until its stuck call returns or the gadget restarts" (status reads
+ * the record as ever). If the call does return, nothing of the app runs again: the task frees its state (as the
+ * teardown below), goes back to priority 2 and serves calls again; the record keeps the state HUNG until the next
+ * app.
  *
  * An app's end (stop, a new run, sys.exit, a crash, a hang) is one order, the rulings': the pending request is
  * answered; the table is unpublished (apps_lv_set_ui(NULL) under the UI lock); the record takes the crash record,

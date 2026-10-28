@@ -23,7 +23,8 @@
  * slot is validated again, whatever apps_ui promised, and a slot that fails is dropped (its bits are cleared and
  * it counts a reject, logged once per app), never drawn.
  *
- * One pass, with the UI lock held for all of it (apps_port_ui_trylock(2): a pass that can't get it is skipped):
+ * One pass, with the UI lock held for all of it (apps_port_ui_trylock(2): a pass that can't get it is skipped).
+ * The table is the one apps_lv_set_ui published, read once the lock is held:
  * 1. The table's clear flag: lv_obj_clean(layer), every object pointer dropped. The background, when it changed
  *    (the first take of a table says so).
  * 2. Deletes first. A widget inside a box that is deleted in the same pass goes with the box (LVGL deletes a
@@ -79,12 +80,19 @@
  * hidden (the app is behind) the pass still runs, so the layout is current when it comes to the front. A swipe
  * right on it (one that starts on a widget too: widgets pass a swipe up) calls the close callback.
  *
+ * The table's owner. This file holds the pointer to the app's table, and the pass reads it only with the UI lock
+ * held, so the app task can end safely: with the lock held it publishes NULL (apps_lv_set_ui), then frees the table.
+ * A pass that already holds the lock finishes first, and any later one finds NULL and does nothing. A caller that
+ * kept the pointer itself and passed it in would have no such guarantee: it could read it, lose the lock to the app
+ * task, and pass a table that is gone. Nothing else here keeps a pointer into the table past the end of a pass.
+ *
  * Threads. Everything here runs on the LVGL task (the pass, build, reset, set_front, the callbacks LVGL calls)
- * except apps_lv_front and apps_lv_stats, which any task may call. The pass keeps no pointer to the table between
- * calls, and a pointer to the table is used only inside apps_lv_apply, so once apps_lv_reset has run on the LVGL
- * task nothing here refers to the app any more and its runtime may be freed (apps_rt_free; the package's images
- * too: an image widget draws from their bytes, so the objects go first). The records are one block from the apps'
- * heap (apps_port_realloc, PSRAM on the device), made before the pass takes the lock and freed by apps_lv_reset.
+ * except apps_lv_set_ui (any task, with the UI lock held), and apps_lv_front and apps_lv_stats (any task). The
+ * table may be freed as soon as its pointer has been cleared. What an object refers to is not the table but the
+ * package's images, which an image widget draws from in place: free those only after apps_lv_reset has run on the
+ * LVGL task, which takes the objects down. The records are one block from the apps' heap (apps_port_realloc, PSRAM
+ * on the device), made by the first pass that has a table and freed by apps_lv_reset; the heap is not used with the
+ * lock held, so that pass lets go of the lock to make them and reads the pointer again after.
  */
 
 #include <stdbool.h>
@@ -109,16 +117,25 @@ void apps_lv_set_event_cb(apps_lv_event_cb_t cb);
 void apps_lv_set_close_cb(void (*cb)(void));
 
 /*
- * One pass over the table, the apply step above. in_callback says the app task is inside a callback (its widgets
- * may be half changed): the pass is skipped for up to 3 frames in a row, and the 4th applies anyway. False when
- * the pass was skipped (the lock was not free within 2 ms, the app is mid-callback, or there is no table or no
- * layer): nothing was read or changed. A pass that took more than 2 ms logs "apply %u us" and counts slow.
- * ui may be NULL (no app is running).
+ * Publishes the app's table (NULL: there is none), the one apps_lv_apply works on. The caller holds apps_port_ui_lock,
+ * so a pass is never half way through reading the pointer: the app task publishes its table when the app starts and
+ * clears it, with the lock held, before it frees the table. Any task. Only the pointer is kept (no memory, no LVGL
+ * call), and apps_lv_reset leaves it alone.
  */
-bool apps_lv_apply(apps_ui_t *ui, bool in_callback);
+void apps_lv_set_ui(apps_ui_t *ui);
 
-/* Deletes every app object and forgets them, and puts the layer back to black. Call it when an app ends (before
- * its runtime is freed), on the LVGL task. Whether the layer is in front is not changed. */
+/*
+ * One pass over the published table, the apply step above. in_callback says the app task is inside a callback (its
+ * widgets may be half changed): the pass is skipped for up to 3 frames in a row, and the 4th applies anyway. It
+ * takes the lock, reads the pointer with it held, and applies. False when no pass ran: it was skipped (the lock
+ * was not free within 2 ms, the app is mid-callback, or the pass's records couldn't be made: each counted as a
+ * skip), or there was nothing to apply (no layer, or no table published: neither counted, not a reject either).
+ * A pass that took more than 2 ms logs "apply %u us" and counts slow.
+ */
+bool apps_lv_apply(bool in_callback);
+
+/* Deletes every app object and forgets them, and puts the layer back to black. Call it when an app ends, with its
+ * table no longer published, on the LVGL task. Whether the layer is in front is not changed. */
 void apps_lv_reset(void);
 
 /* The layer in front (shown) or behind (hidden). apps_lv_front: any task. */

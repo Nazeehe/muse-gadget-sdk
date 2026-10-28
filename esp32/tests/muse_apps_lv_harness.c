@@ -78,6 +78,10 @@ static bool apply_active;   /* inside apps_lv_apply */
 static int trylock_refusals;  /* the next calls of apps_port_ui_trylock say no */
 static int trylock_ms;      /* what it was last asked to wait */
 static long trylock_calls;
+static void (*trylock_hook)(void *);  /* run once, as the next call of apps_port_ui_trylock begins: another task's turn */
+static void *trylock_hook_arg;
+static void (*realloc_hook)(void *);  /* the same for the next call of apps_port_realloc */
+static void *realloc_hook_arg;
 static int lock_errors;
 static char lock_note[96];
 
@@ -88,6 +92,15 @@ static void lock_error(const char *what) {
 }
 
 void *apps_port_realloc(void *ptr, size_t n) {
+    if (realloc_hook != NULL) {
+        /* Another task's turn, as this call begins: the heap is a place where a task can be overtaken. */
+        void (*hook)(void *) = realloc_hook;
+        realloc_hook = NULL;
+        bool was_active = apply_active;
+        apply_active = false;
+        hook(realloc_hook_arg);
+        apply_active = was_active;
+    }
     if (lock_held) {
         lock_error("the heap was used while the lock was held");
     }
@@ -147,6 +160,15 @@ void apps_port_ui_lock(void) {
 bool apps_port_ui_trylock(int ms) {
     trylock_ms = ms;
     trylock_calls++;
+    if (trylock_hook != NULL) {
+        /* Another task got the lock first, did its work and gave it back, while this call waited. */
+        void (*hook)(void *) = trylock_hook;
+        trylock_hook = NULL;
+        bool was_active = apply_active;
+        apply_active = false;
+        hook(trylock_hook_arg);
+        apply_active = was_active;
+    }
     if (trylock_refusals > 0) {
         trylock_refusals--;
         return false;
@@ -1152,7 +1174,21 @@ typedef struct {
     apps_ui_t *ui;
 } env_t;
 
-/* False when the heap refused (what was made is still there for env_close). */
+/* The app task's side of Task 12's C6: the table is published, and cleared, with the UI lock held. */
+static void publish(const env_t *e) {
+    apps_port_ui_lock();
+    apps_lv_set_ui(e->ui);
+    apps_port_ui_unlock();
+}
+
+static void unpublish(void) {
+    apps_port_ui_lock();
+    apps_lv_set_ui(NULL);
+    apps_port_ui_unlock();
+}
+
+/* False when the heap refused (what was made is still there for env_close). Otherwise the table is published,
+ * as a running app's is. */
 static bool env_open(env_t *e, const apps_asset_t *assets, int n_assets) {
     apps_vm_config_t cfg = {.mem_limit = 1024 * 1024,
                             .realloc_fn = apps_port_realloc,
@@ -1165,10 +1201,13 @@ static bool env_open(env_t *e, const apps_asset_t *assets, int n_assets) {
     }
     apps_ui_set_assets(e->ui, assets, n_assets);
     apps_ui_open(apps_vm_lua(e->vm), e->ui);
+    publish(e);
     return true;
 }
 
+/* An app's end, as C6 has it: the pointer is cleared with the lock held, and only then is the table freed. */
 static void env_close(env_t *e) {
+    unpublish();
     apps_vm_free(e->vm);  /* the VM first: no handle is left to use the table */
     apps_ui_free(e->ui);
     e->vm = NULL;
@@ -1207,7 +1246,7 @@ static void after(int line, env_t *e) {
 
 static bool apply_at(int line, env_t *e, bool in_callback) {
     apply_active = true;
-    bool applied = apps_lv_apply(e->ui, in_callback);
+    bool applied = apps_lv_apply(in_callback);
     apply_active = false;
     after(line, e);
     return applied;
@@ -1818,10 +1857,9 @@ static void lock_discipline(void) {
     CHECK(!lock_held, "nothing was left locked");
     CHECK(APPLY(&e) && log_has_line("text 2 \"y\""), "the next frame applies it\n%s", log_peek());
 
-    /* No table, no layer: not a pass, and not a skip. */
-    apply_active = true;
-    CHECK(!apps_lv_apply(NULL, false), "no table");
-    apply_active = false;
+    /* No table published: not a pass, and not a skip. */
+    unpublish();
+    CHECK(!APPLY(&e), "no table");
     CHECK(stats_since().skips == 1 && stats_since().applies == 2, "not counted: skips %u applies %u", stats_since().skips, stats_since().applies);
     FINISH(&e);
 }
@@ -1842,6 +1880,157 @@ static void no_layer_no_pass(void) {
     apps_lv_reset();  /* harmless */
     apps_lv_stats(NULL);
     FINISH(&e);
+}
+
+/* ---- Who holds the table ---- */
+
+/* An app ends as Task 12's C6 has it: the pointer is cleared with the lock held, and then the table is freed. The
+ * frames that come after find nothing, and nothing they do touches the freed table: this harness runs under
+ * AddressSanitizer, which stops on a read of it. */
+static void a_cleared_table_can_be_freed(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "a = ui.label{text = 'x'} b = ui.arc{w = 100, h = 100, value = 3} c = ui.box{} d = ui.label{text = 'in', parent = c}");
+    CHECK(APPLY(&e), "made");
+    int alive = fake_alive();
+    apps_lv_stats_t base = stats_since();
+    log_clear();
+
+    env_close(&e);
+    long calls = lvgl_calls;
+    for (int i = 0; i < 4; i++) {
+        CHECK(!APPLY(&e), "frame %d: nothing is published", i);
+    }
+    apps_lv_stats_t s = stats_since();
+    CHECK(lvgl_calls == calls, "%ld LVGL calls", lvgl_calls - calls);
+    LOG_EMPTY();
+    CHECK(s.applies == base.applies && s.skips == base.skips && s.rejects == base.rejects &&
+              s.refused_creates == base.refused_creates && s.slow == base.slow,
+          "nothing counted: applies %u skips %u rejects %u", s.applies - base.applies, s.skips - base.skips, s.rejects - base.rejects);
+    CHECK(fake_alive() == alive, "the objects stay until the layer is reset: %d, was %d", fake_alive(), alive);
+    apps_lv_reset();
+    CHECK(fake_alive() == 1, "only the layer is left: %d", fake_alive());
+
+    /* The next app: a new table, applied from nothing. */
+    CHECK(env_open(&e, ASSETS, 2), "env_open");
+    RUN(&e, "z = ui.label{text = 'new'}");
+    CHECK(APPLY(&e), "the next app's table is applied");
+    CHECK(log_count("create label") == 1 && log_has_line("bg_color 1 #000000"), "made from nothing\n%s", log_peek());
+    FINISH(&e);
+}
+
+/* What the app task does while the tick waits for the lock. */
+static void app_task_ends_first(void *arg) {
+    env_close((env_t *)arg);
+}
+
+/* The pass has to read the pointer with the lock held. Read before it, the pointer is one the app task may clear and
+ * free while the pass waits: here it does, in the lock call itself. */
+static void the_table_is_read_under_the_lock(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "a = ui.label{text = 'x'}");
+    apps_lv_stats_t base = stats_since();
+    long calls = lvgl_calls;
+    trylock_hook = app_task_ends_first;
+    trylock_hook_arg = &e;
+    CHECK(!APPLY(&e), "the app ended while the pass waited: nothing to apply");
+    CHECK(trylock_hook == NULL && e.ui == NULL && e.vm == NULL, "the app task's turn came");
+    apps_lv_stats_t s = stats_since();
+    CHECK(lvgl_calls == calls && s.applies == base.applies && s.skips == base.skips && s.rejects == base.rejects,
+          "no call, nothing counted: %ld calls, applies %u skips %u rejects %u", lvgl_calls - calls, s.applies - base.applies,
+          s.skips - base.skips, s.rejects - base.rejects);
+    FINISH(&e);
+}
+
+/* The first pass of a layer lets go of the lock to make its records, and the app task can end in that gap: the
+ * pointer read before it is a table that may be gone, so it is read again after. */
+static void the_app_can_end_while_the_records_are_made(void) {
+    env_t e;
+    scene_raw(&e);  /* no pass yet: no records */
+    RUN(&e, "a = ui.label{text = 'x'}");
+    apps_lv_stats_t base = stats_since();
+    long calls = lvgl_calls;
+    realloc_hook = app_task_ends_first;
+    realloc_hook_arg = &e;
+    CHECK(!APPLY(&e), "the app ended while the records were made: nothing to apply");
+    CHECK(realloc_hook == NULL && e.ui == NULL, "the app task's turn came");
+    apps_lv_stats_t s = stats_since();
+    CHECK(lvgl_calls == calls && s.applies == base.applies && s.skips == base.skips && s.rejects == base.rejects,
+          "no call, nothing counted: %ld calls, applies %u skips %u rejects %u", lvgl_calls - calls, s.applies - base.applies,
+          s.skips - base.skips, s.rejects - base.rejects);
+    FINISH(&e);
+}
+
+static void refuse_the_next_lock(void *arg) {
+    (void)arg;
+    trylock_refusals = 1;
+}
+
+/* And the lock may not be free when the pass comes back for it: a skip, nothing left locked, and the next frame is the
+ * pass, with the records already there. */
+static void the_lock_may_be_refused_after_the_records_are_made(void) {
+    env_t e;
+    scene_raw(&e);
+    RUN(&e, "a = ui.label{text = 'x'}");
+    apps_lv_stats_t base = stats_since();
+    long calls = lvgl_calls;
+    realloc_hook = refuse_the_next_lock;
+    CHECK(!APPLY(&e), "the lock was refused the second time");
+    apps_lv_stats_t s = stats_since();
+    CHECK(lvgl_calls == calls && s.skips == base.skips + 1 && s.applies == base.applies, "no call, a skip: %ld calls, skips %u applies %u",
+          lvgl_calls - calls, s.skips - base.skips, s.applies - base.applies);
+    CHECK(APPLY(&e) && log_count("create label") == 1, "the next frame applies it\n%s", log_peek());
+    FINISH(&e);
+}
+
+/* No table published is a frame with nothing to do: not a skip, not a reject, not an apply, no LVGL call, and no
+ * memory made for it. The pointer is read under the lock, so the lock was asked for. */
+static void no_table_is_no_pass(void) {
+    env_t e;
+    scene_raw(&e);  /* the layer and a published table, but no pass yet: no records */
+    unpublish();
+    size_t before = held;
+    long grown = growths, trylocks = trylock_calls, takes = lock_takes, calls = lvgl_calls;
+    for (int i = 0; i < 5; i++) {
+        CHECK(!APPLY(&e), "frame %d: nothing is published", i);
+    }
+    CHECK(trylock_calls == trylocks + 5 && lock_takes == takes + 5 && trylock_ms == 2,
+          "the pointer is read under the lock: %ld tries, %ld taken, asked for %d ms", trylock_calls - trylocks, lock_takes - takes,
+          trylock_ms);
+    CHECK(lvgl_calls == calls && held == before && growths == grown, "no LVGL call, nothing allocated");
+    apps_lv_stats_t s = stats_since();
+    CHECK(s.applies == 0 && s.skips == 0 && s.rejects == 0 && s.refused_creates == 0 && s.slow == 0,
+          "nothing counted: applies %u skips %u rejects %u refused %u slow %u", s.applies, s.skips, s.rejects, s.refused_creates, s.slow);
+    /* Published, the table is applied: what the app made meanwhile is drawn. */
+    RUN(&e, "a = ui.label{text = 'x'}");
+    publish(&e);
+    CHECK(APPLY(&e), "published");
+    CHECK(log_count("create label") == 1, "made\n%s", log_peek());
+    FINISH(&e);
+}
+
+/* Passes are the published table's, whichever it is; the one that isn't published is left as it was. */
+static void the_published_table_is_the_one_applied(void) {
+    env_t first, second;
+    scene(&first);
+    RUN(&first, "a = ui.label{text = 'one'}");
+    CHECK(APPLY(&first), "the first app's label is made");
+    RUN(&first, "a:set{text = 'changed'}");
+    log_clear();
+
+    CHECK(env_open(&second, ASSETS, 2), "env_open");  /* an empty table, published */
+    CHECK(APPLY(&first), "a pass for the second table");
+    LOG_IS("bg_color 1 #000000\n");  /* its first take of the background, and nothing of the first's change */
+    CHECK(W(&first, 0)->dirty == APPS_DIRTY_TEXT, "the first table is untouched: bits %u", W(&first, 0)->dirty);
+
+    publish(&first);
+    CHECK(APPLY(&first), "a pass for the first again");
+    LOG_IS(
+        "text 2 \"changed\"\n"
+        "update_layout 1\n");
+    env_close(&second);
+    FINISH(&first);
 }
 
 /* ---- Round-screen feedback ---- */
@@ -2925,7 +3114,10 @@ static void a_pass_with_no_memory_is_a_skip(void) {
     refuse_from = growths + 1;
     long trylocks = trylock_calls, calls = lvgl_calls;
     CHECK(!APPLY(&e), "no memory for the pass's records");
-    CHECK(lvgl_calls == calls && trylock_calls == trylocks && W(&e, 0)->dirty != 0, "no lock taken, no call, the bits wait");
+    /* The table is read under the lock, and the heap isn't used with it held: the lock was taken once to find a table,
+     * given back, and the pass stopped there. */
+    CHECK(lvgl_calls == calls && trylock_calls == trylocks + 1 && !lock_held && W(&e, 0)->dirty != 0,
+          "one look at the table, no call, the bits wait: %ld trylocks", trylock_calls - trylocks);
     CHECK(stats_since().skips == 1 && stats_since().applies == 0, "a skip: %u", stats_since().skips);
     CHECK(!APPLY(&e) && stats_since().skips == 2, "and again");
     refuse_from = -1;
@@ -3154,6 +3346,15 @@ static void fuzz_seed(uint32_t seed) {
                     n_evs = 0;
                 }
                 break;
+            case 98:  /* the app ends (the pointer cleared, the layer reset, the table freed) and the next one starts */
+                unpublish();
+                apply_at(__LINE__, &e, false);  /* a frame in between finds nothing */
+                apps_lv_reset();
+                env_close(&e);
+                apply_at(__LINE__, &e, false);
+                CHECK(env_open(&e, ASSETS, 2), "env_open");
+                RUN(&e, "H = {} N = 0");
+                break;
             default: snprintf(src, sizeof src, "collectgarbage()"); break;
         }
         if (src[0] != '\0') {
@@ -3206,6 +3407,12 @@ int main(int argc, char **argv) {
         {"skips_mid_callback_at_most_three_frames", skips_mid_callback_at_most_three_frames},
         {"lock_discipline", lock_discipline},
         {"no_layer_no_pass", no_layer_no_pass},
+        {"a_cleared_table_can_be_freed", a_cleared_table_can_be_freed},
+        {"the_table_is_read_under_the_lock", the_table_is_read_under_the_lock},
+        {"the_app_can_end_while_the_records_are_made", the_app_can_end_while_the_records_are_made},
+        {"the_lock_may_be_refused_after_the_records_are_made", the_lock_may_be_refused_after_the_records_are_made},
+        {"no_table_is_no_pass", no_table_is_no_pass},
+        {"the_published_table_is_the_one_applied", the_published_table_is_the_one_applied},
         {"overflow_from_coords", overflow_from_coords},
         {"overflow_corner_rule", overflow_corner_rule},
         {"overflow_round_shapes", overflow_round_shapes},

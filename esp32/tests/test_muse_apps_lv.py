@@ -216,6 +216,29 @@ class HarnessTest(unittest.TestCase):
     def test_no_layer_no_pass(self):
         self.run_case("no_layer_no_pass")
 
+    # ---- Who holds the table: the apply step does (apps_lv_set_ui, read under the lock) ----
+
+    def test_a_table_cleared_under_the_lock_can_be_freed(self):
+        # The app task's end: clear the pointer with the lock held, free the table. What the harness's ASan watches for.
+        self.run_case("a_cleared_table_can_be_freed")
+
+    def test_the_table_is_read_under_the_lock(self):
+        # The app task ends while the pass waits for the lock: a pointer read before the lock would be a freed table.
+        self.run_case("the_table_is_read_under_the_lock")
+
+    def test_the_app_can_end_while_the_records_are_made(self):
+        # The first pass lets go of the lock to make its records; the pointer has to be read again after.
+        self.run_case("the_app_can_end_while_the_records_are_made")
+
+    def test_the_lock_may_be_refused_after_the_records_are_made(self):
+        self.run_case("the_lock_may_be_refused_after_the_records_are_made")
+
+    def test_no_table_is_neither_a_skip_nor_a_reject(self):
+        self.run_case("no_table_is_no_pass")
+
+    def test_the_published_table_is_the_one_applied(self):
+        self.run_case("the_published_table_is_the_one_applied")
+
     def test_a_slow_apply_is_logged_and_counted(self):
         self.run_case("slow_apply_is_logged_and_counted")
 

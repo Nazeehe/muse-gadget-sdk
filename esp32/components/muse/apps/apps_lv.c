@@ -65,14 +65,15 @@ typedef struct {
 } node_t;
 
 /* The records of the app on the layer, and the descriptors its images are drawn from: one block, from the apps'
- * heap (PSRAM on the device, so it takes no internal RAM), made before the pass takes the lock (the heap is not
- * used under it) and freed by apps_lv_reset. */
+ * heap (PSRAM on the device, so it takes no internal RAM), made by the first pass that has a table, with the lock
+ * given back (the heap is not used under it), and freed by apps_lv_reset. */
 typedef struct {
     node_t node[APPS_UI_SLOTS];
     lv_image_dsc_t image[APPS_UI_ASSETS_MAX];  /* per asset; data NULL until the asset is first drawn */
 } state_t;
 
 static lv_obj_t *s_layer;
+static apps_ui_t *s_ui;          /* the app's table: written with the UI lock held, and read only with it held */
 static state_t *s_state;
 static apps_lv_event_cb_t s_event_cb;
 static void (*s_close_cb)(void);
@@ -759,8 +760,22 @@ static void run_pass(pass_t *p) {
     }
 }
 
-bool apps_lv_apply(apps_ui_t *ui, bool in_callback) {
-    if (ui == NULL || s_layer == NULL) {
+/* The records, once per layer. Called without the lock: the heap is not used with it held. */
+static bool make_state(void) {
+    s_state = apps_port_realloc(NULL, sizeof *s_state);
+    if (s_state == NULL) {
+        return false;
+    }
+    memset(s_state, 0, sizeof *s_state);
+    return true;
+}
+
+void apps_lv_set_ui(apps_ui_t *ui) {
+    s_ui = ui;
+}
+
+bool apps_lv_apply(bool in_callback) {
+    if (s_layer == NULL) {
         return false;
     }
     if (!in_callback) {
@@ -771,17 +786,25 @@ bool apps_lv_apply(apps_ui_t *ui, bool in_callback) {
         return false;
     }
 
-    /* The records, before the lock: the heap is not used under it. */
-    if (s_state == NULL) {
-        s_state = apps_port_realloc(NULL, sizeof *s_state);
-        if (s_state == NULL) {
+    /* The table is read with the lock held. The app task clears the pointer under it before it frees the table, so
+     * a table seen here stays until the unlock: a pass that holds the lock finishes first, a later one sees NULL. */
+    if (!apps_port_ui_trylock(LOCK_MS)) {
+        s_skips++;
+        return false;
+    }
+    apps_ui_t *ui = s_ui;
+    if (ui != NULL && s_state == NULL) {
+        /* The first pass of a layer needs its records. Let go of the lock to make them, and look again: the app may
+         * have ended meanwhile. */
+        apps_port_ui_unlock();
+        if (!make_state() || !apps_port_ui_trylock(LOCK_MS)) {
             s_skips++;
             return false;
         }
-        memset(s_state, 0, sizeof *s_state);
+        ui = s_ui;
     }
-    if (!apps_port_ui_trylock(LOCK_MS)) {
-        s_skips++;
+    if (ui == NULL) {
+        apps_port_ui_unlock();
         return false;
     }
     pass_t pass = {.ui = ui, .st = s_state, .reject_slot = -1};

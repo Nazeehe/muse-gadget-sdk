@@ -54,11 +54,13 @@ header to it. Set build options in `CMakeLists.txt` instead.
   - While Lua handles that error it lets the count go on to 1.1 times the
     limit, 44 C levels.
   - Measured on the ESP32-S3 with `tests/muse_apps_fixtures/torture`, which
-    `tools/muse/app.py` pushes: the four chains (`pcall`, `coroutine.resume`,
-    `__index` through `table.concat`, `__tostring` through `string.format`) run
+    `tools/muse/app.py` pushes: five chains (`pcall`, `coroutine.resume`,
+    `__index` through `table.concat`, `__tostring` through `string.format`, and
+    a message handler under `xpcall` that nests `pcall` as deep as error
+    handling allows, until one is refused with "error in error handling") run
     to the limit with a 16-deep `json.encode` and `json.decode`, each ending in
-    a float, at the bottom of each. The worst of them used 42,076 bytes of the
-    stack and left 15,268 free.
+    a float, at the bottom of each. The worst of them used 44,132 bytes of the
+    stack and left 13,212 free.
   - A chunk compiled on its own (the install compiles every `.lua` file of a
     package so) takes a parenthesis nested 37 deep and refuses 38 with "C stack
     overflow": the parser spends a level on the statement, one on the expression

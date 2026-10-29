@@ -40,11 +40,13 @@ if(CONFIG_MUSE_APPS)
     # overflow" (200 by default). The app task runs on a 56 KB stack in PSRAM
     # (57,344 bytes), and error handling may go on to 1.1 times this limit, 44
     # levels. Measured on the S3 with tests/muse_apps_fixtures/torture, which
-    # tools/muse/app.py pushes: the four C-call chains (pcall, coroutine.resume,
-    # __index through table.concat, __tostring through string.format) run to the
-    # limit with a 16-deep json.encode and json.decode, each ending in a float, at
-    # the bottom of each. The worst of them used 42,076 bytes of the stack and left
-    # 15,268 free. Lua-to-Lua calls don't count. README.md has the rest.
+    # tools/muse/app.py pushes: five C-call chains (pcall, coroutine.resume,
+    # __index through table.concat, __tostring through string.format, and a
+    # message handler under xpcall that nests pcall as deep as error handling
+    # allows) run to the limit with a 16-deep json.encode and json.decode, each
+    # ending in a float, at the bottom of each. The worst of them used 44,132
+    # bytes of the stack and left 13,212 free. Lua-to-Lua calls don't count.
+    # README.md has the rest.
     target_compile_definitions(${COMPONENT_LIB} PRIVATE LUAI_MAXCCALLS=40)
 else()
     idf_component_register()

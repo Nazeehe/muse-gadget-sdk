@@ -22,6 +22,7 @@ waited. One class (WireTest) runs the real chat.Board over a fake serial port of
 apphost, with the sanitizers where the compiler has them.
 """
 
+import ast
 import base64
 import contextlib
 import importlib
@@ -30,9 +31,12 @@ import json
 import os
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -47,6 +51,40 @@ TORTURE = ROOT / "tests" / "muse_apps_fixtures" / "torture"
 APP_PY = TOOLS / "app.py"
 COPYRIGHT = (ROOT / "components/muse/muse_clock.h").read_text().splitlines()[1].lstrip("* ").strip()
 LUA_HEADER = [f"-- {COPYRIGHT}", "-- SPDX-License-Identifier: Apache-2.0"]   # X7
+
+
+def c_define(header, name):
+    """What `#define NAME ...` is in a C header of components/muse/apps: a number (a product of them, like `(8 * 1024)`, or
+    a string with no escapes). The tests read the board's limits and wordings here, so that the tool is held to the C."""
+    text = (APPS / header).read_text()
+    match = re.search(rf"^#define\s+{name}\s+(.+?)\s*(?:/\*.*\*/)?\s*$", text, re.M)
+    assert match, f"no #define {name} in {header}"
+    value = match.group(1)
+    if value.startswith('"'):
+        assert value.endswith('"') and "\\" not in value, value
+        return value[1:-1]
+    assert re.fullmatch(r"[0-9 *()+]+", value), value
+    return eval(value, {"__builtins__": {}})
+
+
+BAD_ID_MESSAGE = c_define("apps_pkg.h", "APPS_MSG_BAD_ID")   # "app id '%s' must match ^[a-z][a-z0-9_]{1,23}$"
+ACK_FORMAT = re.search(r'printf\("(@app\.ack %s %u)\\n", path, seq\)', (APPS / "apps_console.c").read_text()).group(1)
+
+
+@contextlib.contextmanager
+def no_longer_than(seconds):
+    """Fails the test, in the thread that waits, when what is inside takes more than `seconds`: a read of a FIFO that
+    nobody writes never ends, and nothing else in unittest would say so."""
+    def give_up(signum, frame):
+        raise AssertionError(f"still waiting after {seconds} s: something blocked, or read what it shouldn't")
+
+    before = signal.signal(signal.SIGALRM, give_up)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, before)
 
 
 def load_app():
@@ -77,11 +115,16 @@ class FakeClock:
 
     time = monotonic
 
-    def sleep(self, seconds):
-        self.slept.append(seconds)
-        self.now += seconds
+    def advance_to(self, when):
+        """Moves the clock on to `when` (never back). An hour past the start is a loop that never ends: the test fails
+        there, whoever was waiting (a sleep, a read of the board, a read of the port)."""
+        self.now = max(self.now, when)
         if self.now > self.START + self.HOUR:
             raise AssertionError("an hour went by on the test's clock: a loop that never ends")
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.advance_to(self.now + seconds)
 
 
 class FakeBoard:
@@ -115,9 +158,9 @@ class FakeBoard:
     def read_line(self, deadline):
         if self.queue and self.queue[0][0] <= deadline:
             ready, line = self.queue.pop(0)
-            self.clock.now = max(self.clock.now, ready)
+            self.clock.advance_to(ready)
             return line
-        self.clock.now = max(self.clock.now, deadline)
+        self.clock.advance_to(deadline)
         if self.on_wait:
             self.on_wait()
         return None
@@ -148,7 +191,8 @@ class Gadget:
 
     @staticmethod
     def err(op, message, **more):
-        return "@app.err " + json.dumps({"op": op, **more, "message": message}, separators=(",", ":"))
+        # As cJSON prints it: UTF-8 as it is (U+009B too), and only the control characters under U+0020 escaped.
+        return "@app.err " + json.dumps({"op": op, **more, "message": message}, separators=(",", ":"), ensure_ascii=False)
 
     def __call__(self, command):
         words = command.split(" ")
@@ -165,7 +209,7 @@ class Gadget:
         b64 = words[4] if len(words) > 4 else ""
         if not self.ID.match(app_id):
             delay = self.query_delays.pop(0) if self.query_delays else 0.01
-            return [(delay, self.err("put", f"app id '{app_id}' must match ^[a-z][a-z0-9_]{{1,23}}$", path=path))]
+            return [(delay, self.err("put", BAD_ID_MESSAGE % app_id, path=path))]   # apps_pkg.h's own words
         if self.stage != app_id:
             self.files, self.next, self.stage = {}, {}, app_id
         if seq == 0:
@@ -180,7 +224,7 @@ class Gadget:
         echo = [(0.001, line) for line in self.echo]
         if (path, seq) in self.silent:
             return echo
-        return echo + [(self.ack_after.get((path, seq), self.ack_delay), f"@app.ack {path} {seq}")]
+        return echo + [(self.ack_after.get((path, seq), self.ack_delay), ACK_FORMAT % (path, seq))]   # apps_console.c's
 
     def commit(self, words):
         app_id, run = words[1], len(words) > 2 and words[2] == "run"
@@ -196,7 +240,8 @@ class Gadget:
                 "ui": [{"id": "label#0", "kind": "label", "text": "Hi", "x": 0, "y": 0, "w": 10, "h": 10,
                         "hidden": False, "overflow": 0}] if run else [], "mem_kb": 12, "peak_kb": 14}}
         return [(0.001, line) for line in self.echo] + \
-            [(self.commit_delay, "@app " + json.dumps({"op": "commit", **result}, separators=(",", ":")))]
+            [(self.commit_delay, "@app " + json.dumps({"op": "commit", **result}, separators=(",", ":"),
+                                                     ensure_ascii=False))]
 
 
 def make_package(root, app_id="demo", main="return {}\n", files=None, manifest=None):
@@ -257,7 +302,7 @@ class PackageTest(ToolTestCase):
         data = bytes((i * 7 + 3) % 256 for i in range(300 * 1024))
         app_id, path = "a" * 24, "d" * 60 + ".lua"
         self.assertEqual(len(path), 64)
-        commands = self.app.put_commands(app_id, path, data)
+        commands = list(self.app.put_commands(app_id, path, data))
         lines = [b">" + c.encode() + b"\n" for c in commands]
         self.assertGreater(len(lines), 500)
         self.assertLessEqual(max(len(line) for line in lines), 1000)
@@ -274,8 +319,8 @@ class PackageTest(ToolTestCase):
         self.assertEqual({len(c.split(" ")[4]) for c in commands[:-1]}, {768}, "only the last piece is short")
 
     def test_an_empty_file_is_one_empty_piece(self):
-        self.assertEqual(self.app.put_commands("demo", "empty.json", b""), ["app.put demo empty.json 0"])
-        self.assertEqual(self.app.put_commands("demo", "x.lua", b"x"), ["app.put demo x.lua 0 eA=="])
+        self.assertEqual(list(self.app.put_commands("demo", "empty.json", b"")), ["app.put demo empty.json 0"])
+        self.assertEqual(list(self.app.put_commands("demo", "x.lua", b"x")), ["app.put demo x.lua 0 eA=="])
 
     def test_manifest_first_then_files_in_order(self):
         folder = make_package(self.tmp, files={"util.lua": "return 1", "lib/more.lua": "return 2", "data.json": "{}"})
@@ -363,8 +408,14 @@ class PackageTest(ToolTestCase):
         self.assertEqual(len(self.PATHS_OK[-1]), 63)
         for path in self.PATHS_OK:
             with self.subTest(ok=path):
-                paths = [p for p, _ in self.app.read_package(make_package(self.tmp, files={path: "x"})).files]
-                self.assertEqual(paths, list(dict.fromkeys(["manifest.json", "main.lua", path])))
+                self.assertTrue(self.app.PATH_RULE.fullmatch(path))
+                if path.endswith((".lua", ".json", ".bin")):
+                    paths = [p for p, _ in self.app.read_package(make_package(self.tmp, files={path: "x"})).files]
+                    self.assertEqual(paths, list(dict.fromkeys(["manifest.json", "main.lua", path])))
+                else:   # a path the rule takes and the board has no use for: no kind
+                    with self.assertRaises(self.app.AppError) as raised:
+                        self.app.read_package(make_package(self.tmp, files={path: "x"}))
+                    self.assertIn("unsupported type", str(raised.exception))
         for path in self.PATHS_BAD:
             with self.subTest(bad=path), self.assertRaises(self.app.AppError) as raised:
                 self.app.read_package(make_package(self.tmp, manifest={"files": [path]}))
@@ -384,6 +435,190 @@ class PackageTest(ToolTestCase):
                 with self.assertRaises(self.app.AppError) as raised:
                     self.app.read_package(folder)
                 self.assertIn(word, str(raised.exception))
+
+    # ---- What a folder may hold (C and D): looked at before it is read ----
+
+    def make_hazards(self):
+        """A package per kind of file that isn't an ordinary one, each listing util.lua or its manifest: {name: folder}."""
+        secret = self.tmp / "secret-notes.lua"
+        secret.write_text("SECRET_LINE\nlocal b = = 2\n")
+        found = {}
+        folder = make_package(self.tmp, app_id="fifo", manifest={"files": ["util.lua"]})
+        os.mkfifo(folder / "util.lua")
+        found["a FIFO in the folder"] = folder
+        folder = make_package(self.tmp, app_id="dir", manifest={"files": ["util.lua"]})
+        (folder / "util.lua").mkdir()
+        found["a folder"] = folder
+        folder = make_package(self.tmp, app_id="mfifo")
+        (folder / "manifest.json").unlink()
+        os.mkfifo(folder / "manifest.json")
+        found["a FIFO for a manifest"] = folder
+        folder = make_package(self.tmp, app_id="linked", manifest={"files": ["util.lua"]})
+        os.symlink(secret, folder / "util.lua")
+        found["a link out of the folder"] = folder
+        folder = make_package(self.tmp, app_id="fifolink", manifest={"files": ["util.lua"]})
+        os.mkfifo(folder / "pipe")
+        os.symlink(folder / "pipe", folder / "util.lua")
+        found["a link to a FIFO"] = folder
+        return found
+
+    def test_a_file_that_is_not_regular_or_not_in_the_folder_is_refused_before_it_is_opened(self):
+        words = {"a FIFO in the folder": "regular file", "a folder": "regular file", "a FIFO for a manifest": "regular file",
+                 "a link out of the folder": "outside the app's folder", "a link to a FIFO": "regular file"}
+        for what, folder in self.make_hazards().items():
+            with self.subTest(what), no_longer_than(10), self.assertRaises(self.app.AppError) as raised:
+                self.app.read_package(folder)
+            message = str(raised.exception)
+            self.assertIn(words[what], message)
+            self.assertNotIn("SECRET_LINE", message)
+
+    def test_a_file_over_the_boards_limit_is_refused_by_its_size_before_it_is_read(self):
+        # D: os.stat first. A sparse file of a gigabyte would take a long time and 1 GB to read, and the board refuses it at
+        # 256 KB.
+        folder = make_package(self.tmp, manifest={"files": ["big.lua"]})
+        with open(folder / "big.lua", "wb") as f:
+            f.truncate(1 << 30)
+        with no_longer_than(20), self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(folder)
+        self.assertEqual(str(raised.exception), "big.lua is larger than 256 KB")
+        # Nor is it opened: a file that nobody may read is refused for its size all the same, and not for being unreadable.
+        os.chmod(folder / "big.lua", 0)
+        self.addCleanup(os.chmod, folder / "big.lua", 0o644)
+        if not os.access(folder / "big.lua", os.R_OK):
+            with self.assertRaises(self.app.AppError) as raised:
+                self.app.read_package(folder)
+            self.assertEqual(str(raised.exception), "big.lua is larger than 256 KB")
+
+    def test_a_file_that_grew_since_it_was_looked_at_is_read_one_byte_past_its_limit_and_no_further(self):
+        # D: the size was right when it was looked at; what is read is bounded all the same.
+        with mock.patch("builtins.open", mock.mock_open(read_data=b"-" * 5000)) as opened:
+            with self.assertRaises(self.app.AppError) as raised:
+                self.app.read_listed(self.tmp / "util.lua", "util.lua", 2048)
+        self.assertEqual(str(raised.exception), "util.lua is larger than 2 KB")
+        opened().read.assert_called_once_with(2049)
+
+    def test_the_limits_are_the_boards_and_a_file_exactly_at_one_is_taken(self):
+        # The values come from the C headers: apps_pkg.h's, the ones the console's stage and the install check.
+        manifest_max, lua_max = c_define("apps_pkg.h", "APPS_MANIFEST_MAX"), c_define("apps_pkg.h", "APPS_LUA_MAX")
+        json_max, image_max = c_define("apps_pkg.h", "APPS_JSON_FILE_MAX"), c_define("apps_pkg.h", "APPS_IMAGE_MAX")
+        app_max, images_max = c_define("apps_pkg.h", "APPS_APP_MAX"), c_define("apps_pkg.h", "APPS_IMAGES_TOTAL_MAX")
+        files_max = c_define("apps_pkg.h", "APPS_MAX_FILES")
+        self.assertEqual((self.app.MANIFEST_MAX, self.app.FILE_MAX), (manifest_max, {
+            ".lua": lua_max, ".json": json_max, ".bin": image_max}))
+        self.assertEqual((self.app.APP_MAX, self.app.IMAGES_MAX, self.app.FILES_MAX), (app_max, images_max, files_max))
+        self.assertEqual((manifest_max, lua_max, json_max, image_max, app_max, images_max, files_max),
+                         (8 * 1024, 256 * 1024, 32 * 1024, 512 * 1024, 2 * 1024 * 1024, 1536 * 1024, 32), "the numbers")
+        for name, limit in (("x.lua", lua_max), ("x.json", json_max), ("x.bin", image_max)):
+            folder = make_package(self.tmp, app_id="limits", files={name: b" " * limit})
+            self.assertEqual(dict(self.app.read_package(folder).files)[name], b" " * limit, name)
+            folder = make_package(self.tmp, app_id="limits", files={name: b" " * (limit + 1)})
+            with self.subTest(name), self.assertRaises(self.app.AppError) as raised:
+                self.app.read_package(folder)
+            self.assertEqual(str(raised.exception), f"{name} is larger than {limit // 1024} KB")
+        # The main file too, named as it is.
+        folder = make_package(self.tmp, main=" " * (lua_max + 1))
+        with self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(folder)
+        self.assertEqual(str(raised.exception), "main.lua is larger than 256 KB")
+
+    def test_the_manifest_is_at_most_8_kb_and_that_is_checked_before_it_is_parsed(self):
+        folder = make_package(self.tmp)
+        base = (folder / "manifest.json").read_text()
+        (folder / "manifest.json").write_text(base + " " * (8192 - len(base)))
+        self.assertEqual(len(self.app.read_package(folder).files[0][1]), 8192)
+        # One byte more is refused whatever it holds, before json.loads sees it: 100,000 nested arrays are 200 KB.
+        for text in (base + " " * (8193 - len(base)), "[" * 100_000 + "]" * 100_000, "{not json" + " " * 9000):
+            (folder / "manifest.json").write_text(text)
+            with self.subTest(len(text)), mock.patch.object(self.app.json, "loads", side_effect=AssertionError("parsed")), \
+                    self.assertRaises(self.app.AppError) as raised:
+                self.app.read_package(folder)
+            self.assertEqual(str(raised.exception), "manifest.json is larger than 8 KB")
+
+    def test_a_manifest_nested_deeper_than_python_parses_is_an_app_error_not_a_traceback(self):
+        # 8 KB of arrays is 4,000 levels, which 3.12 parses; an interpreter with less room says RecursionError (100,000
+        # levels do, on 3.12), and the watch must not end in it.
+        folder = make_package(self.tmp)
+        deep = '{"id":"demo","name":"x","api":1,"deep":' + "[" * 200 + "]" * 200 + "}"
+        (folder / "manifest.json").write_text(deep)
+        self.assertEqual(self.app.read_package(folder).id, "demo")
+        with mock.patch.object(self.app.json, "loads", side_effect=RecursionError("maximum recursion depth exceeded")), \
+                self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(folder)
+        self.assertIn("nested too deeply", str(raised.exception))
+
+    def test_the_totals_and_the_file_count_are_the_boards(self):
+        # Each file under its own limit, and together over the app's 2 MB (the manifest counts) or the images' 1.5 MB.
+        def lua(n):
+            return {f"m{i}.lua": b"-" * (250 * 1024) for i in range(n)}
+
+        folder = make_package(self.tmp, app_id="total", files=lua(8))   # main.lua is small: 2,000 KB and a little
+        self.assertEqual(len(self.app.read_package(folder).files), 10)
+        folder = make_package(self.tmp, app_id="total", files=lua(9))
+        with self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(folder)
+        self.assertEqual(str(raised.exception), "the app is larger than 2 MB")
+        images = {f"i{i}.bin": b"I" * (500 * 1024) for i in range(3)}   # 1,500 KB
+        self.assertEqual(len(self.app.read_package(make_package(self.tmp, app_id="img", files=images)).files), 5)
+        images["i3.bin"] = b"I" * (500 * 1024)
+        with self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(make_package(self.tmp, app_id="img", files=images))
+        self.assertEqual(str(raised.exception), "images add up to more than 1.5 MB")
+        # 32 files, main among them; a 33rd is one too many, whatever it holds.
+        few = {f"f{i}.lua": b"-" for i in range(31)}
+        paths = [p for p, _ in self.app.read_package(make_package(self.tmp, app_id="few", files=few)).files]
+        self.assertEqual(len(paths), 1 + 32)
+        many = {f"f{i}.lua": b"-" for i in range(32)}
+        with self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(make_package(self.tmp, app_id="many", files=many))
+        self.assertEqual(str(raised.exception), "more than 32 files besides manifest.json")
+        # The same file listed twice is one.
+        twice = make_package(self.tmp, app_id="twice", files={"a.lua": b"-"}, manifest={"files": ["a.lua", "a.lua", "main.lua"]})
+        self.assertEqual([p for p, _ in self.app.read_package(twice).files], ["manifest.json", "main.lua", "a.lua"])
+
+    def test_a_file_the_board_has_no_kind_for_is_refused_before_it_is_read(self):
+        folder = make_package(self.tmp, files={"notes.txt": b"x"})
+        with self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(folder)
+        self.assertEqual(str(raised.exception), "'notes.txt' has an unsupported type (use .lua, .json or .bin)")
+        os.chmod(folder / "notes.txt", 0)   # said for its type, and not opened to find that it can't be read
+        self.addCleanup(os.chmod, folder / "notes.txt", 0o644)
+        if not os.access(folder / "notes.txt", os.R_OK):
+            with self.assertRaises(self.app.AppError) as raised:
+                self.app.read_package(folder)
+            self.assertEqual(str(raised.exception), "'notes.txt' has an unsupported type (use .lua, .json or .bin)")
+        folder = make_package(self.tmp, main="{}", manifest={"main": "main.json"})
+        with self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(folder)
+        self.assertRegex(str(raised.exception), r'^"main" in .*manifest\.json must be the path of a \.lua file$')
+
+    def test_a_file_that_cannot_be_read_is_an_app_error_whatever_the_reason(self):
+        folder = make_package(self.tmp, files={"util.lua": b"-"})
+        os.chmod(folder / "util.lua", 0)
+        self.addCleanup(os.chmod, folder / "util.lua", 0o644)
+        if os.access(folder / "util.lua", os.R_OK):
+            self.skipTest("this user reads what mode 0 says no to (root)")
+        with self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(folder)
+        self.assertIn("util.lua", str(raised.exception))
+
+    def test_the_pieces_are_made_as_they_are_sent(self):
+        # D: put_commands is lazy, so a refusal of the first piece of a big file leaves the rest unmade.
+        pieces = self.app.put_commands("demo", "big.lua", b"x" * 100_000)
+        self.assertIs(iter(pieces), pieces, "an iterator, not a list")
+        with mock.patch.object(self.app.base64, "b64encode", wraps=base64.b64encode) as encode:
+            first = next(pieces)
+            self.assertEqual(encode.call_count, 1)
+        self.assertTrue(first.startswith("app.put demo big.lua 0 "))
+        self.assertEqual(len(list(pieces)), -(-100_000 // self.app.PIECE_BYTES) - 1)
+        gadget = Gadget()
+        gadget.refuse[("main.lua", 0)] = "main.lua is larger than 256 KB"
+        with mock.patch.object(self.app.base64, "b64encode", wraps=base64.b64encode) as encode:
+            board = self.board(gadget)
+            console = self.app.Console(board)
+            console.sync()
+            reply = self.app.push(console, self.app.Package("demo", [("main.lua", b"x = 1\n" * 50_000)]))
+        self.assertEqual(reply.kind, "err")
+        self.assertEqual(encode.call_count, 1, "one piece was made, the refused one, and not the 300 after it")
 
 
 class ReplyTest(ToolTestCase):
@@ -455,9 +690,160 @@ class ReplyTest(ToolTestCase):
         reply = self.app.Console(self.board(backlog=stream)).result("commit", 1)
         self.assertEqual((reply.kind, reply.data["message"]), ("err", "busy"))
 
+    def test_a_refusal_for_another_files_piece_is_not_this_pieces(self):
+        # J: the console puts the path in every refusal of a put past its usage check, so a late refusal of main.lua's
+        # piece that turns up while util.lua's first is waited for is not util.lua's.
+        stale = '@app.err {"op":"put","path":"main.lua","message":"expected seq 3"}'
+        console = self.app.Console(self.board(backlog=[stale, "@app.ack util.lua 0"]))
+        reply = console.ack("util.lua", 0, 5)
+        self.assertEqual((reply.kind, reply.path, reply.seq), ("ack", "util.lua", 0))
+        # Its own file's refusal ends the wait, and so does one with no path (the usage error has none).
+        for line in ('@app.err {"op":"put","path":"util.lua","message":"bad base64 at character 3"}',
+                     '@app.err {"op":"put","message":"usage: app.put <id> <path> <seq> <base64>"}'):
+            with self.subTest(line):
+                reply = self.app.Console(self.board(backlog=[line])).ack("util.lua", 0, 5)
+                self.assertEqual((reply.kind, reply.data["op"]), ("err", "put"))
+        # A refusal of another file's piece, with nothing after it, is waited out and not taken.
+        with self.assertRaises(self.app.AppError):
+            self.app.Console(self.board(backlog=[stale])).ack("util.lua", 0, 1)
+
+    def test_the_fakes_wire_contracts_are_the_boards_c(self):
+        # K: the Gadget fake says what the C says, and app.py reads what the C prints. A later task that rewords the
+        # refusal of an id, the ack or the fields of a refusal fails here, and not on a gadget.
+        self.assertIn("'%s'", BAD_ID_MESSAGE, "is_sync_reply looks for the nonce in the id's refusal, in single quotes")
+        self.assertEqual(BAD_ID_MESSAGE % "0abc", "app id '0abc' must match ^[a-z][a-z0-9_]{1,23}$")
+        self.assertEqual(ACK_FORMAT, "@app.ack %s %u")
+        reply = self.app.parse_reply(ACK_FORMAT % ("lib/util.lua", 12))
+        self.assertEqual((reply.kind, reply.path, reply.seq), ("ack", "lib/util.lua", 12))
+        refusal = Gadget()("app.put 0abc sync 0")[0][1]
+        self.assertEqual(self.app.parse_reply(refusal).data["message"], BAD_ID_MESSAGE % "0abc")
+        self.assertTrue(self.app.is_sync_reply(refusal, "abc", False))
+        # The console's refusals of a put carry the path (it is how a refusal is matched to a piece), but for the usage
+        # error, which has none; and none carries an id of its own.
+        source = (APPS / "apps_console.c").read_text()
+        calls = re.findall(r'fail\("put",\s*(\w+),\s*(\w+),', source)
+        self.assertGreater(len(calls), 8)
+        self.assertEqual([c for c in calls if c[1] == "NULL"], [("NULL", "NULL")], "only the usage error has no path")
+        self.assertEqual({c[0] for c in calls}, {"NULL"}, "a put's refusal says no id")
+        self.assertIn('take_id("put", id_w, shown, id)', source, "the refusal of the id says the path too")
+        self.assertIn('fail(op, strcmp(op, "put") == 0 ? NULL : shown, path, APPS_MSG_BAD_ID, shown)', source)
+        self.assertEqual(Gadget.err("put", "m", path="x.lua"), '@app.err {"op":"put","path":"x.lua","message":"m"}')
+
     def test_there_is_no_str_splitlines_in_the_tool(self):
         # U+2028 and U+2029 break lines for str.splitlines() and for nothing else: an app may print them.
         self.assertNotIn("splitlines", re.sub(r"#[^\n]*", "", APP_PY.read_text()))
+
+
+class TerminalTest(ToolTestCase):
+    """What app.py prints is for a terminal that obeys what it is sent, and the board's and an app's text is not the
+    tool's (B): human text shows each control character but newline and tab, DEL and each C1 character (U+009B is CSI) as
+    \\xNN, and a JSON line printed whole keeps its meaning, with U+007F to U+009F as \\u00XX."""
+
+    ESC, CSI = "\x1b", "\u009b"
+    BAD = "boom \x1b]0;owned\x07 \u009b2J \x7f end"
+    SHOWN = "boom \\x1b]0;owned\\x07 \\x9b2J \\x7f end"
+
+    @staticmethod
+    def unsafe(text):
+        """What a terminal could act on in text: C0 but newline and tab, DEL and C1."""
+        return re.findall("[\x00-\x08\x0b-\x1f\x7f-\x9f]", text)
+
+    def test_a_result_prints_as_the_same_json_and_is_described_without_the_bytes(self):
+        message = self.BAD + "\nlog:\ntab\there"
+        failed = {"ok": False, "error": {"code": "crashed", "message": message}}
+        code, out, err, _ = self.cli(["push", "/dev/x", str(make_package(self.tmp)), "--run"],
+                                     self.board(Gadget(result=failed)))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.unsafe(out), [], repr(out))
+        (line,) = out.splitlines()
+        self.assertEqual(json.loads(line)["error"]["message"], message, "the same JSON, whatever the escapes")
+        self.assertIn("\\u009b", line)
+        self.assertIn("\\u001b", line)
+        self.assertEqual(err, f"crashed: {self.SHOWN}\nlog:\ntab\there\n")
+
+    def test_a_refusal_is_shown_the_same_way(self):
+        code, out, err, _ = self.cli(["push", "/dev/x", str(make_package(self.tmp))],
+                                     self.board(Gadget(commit_error=self.BAD)))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.unsafe(out + err), [], repr(out + err))
+        self.assertEqual(json.loads(out)["message"], self.BAD)
+        self.assertEqual(err, f"app.commit was refused: {self.SHOWN}\n")
+        gadget = Gadget()
+        gadget.refuse[("main.lua", 0)] = self.BAD
+        code, out, err, _ = self.cli(["push", "/dev/x", str(make_package(self.tmp))], self.board(gadget))
+        self.assertEqual((json.loads(out)["message"], err), (self.BAD, f"app.put was refused: {self.SHOWN}\n"))
+        self.assertEqual(self.unsafe(out + err), [])
+
+    def test_a_log_line_is_shown_without_the_bytes(self):
+        line = f"@app.log demo {self.BAD} \ttab"
+        board = self.board(later=[(0.1, line), (0.2, "@app.log demo plain")])
+        board.on_wait = mock.Mock(side_effect=[None, KeyboardInterrupt])
+        code, out, err, _ = self.cli(["logs", "/dev/x"], board)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, f"@app.log demo {self.SHOWN} \ttab\n@app.log demo plain\n")
+        # watch prints the app's lines between pushes the same way.
+        board = self.board(later=[(1.2, line)])
+        board.on_wait = mock.Mock(side_effect=[None, None, None, KeyboardInterrupt])
+        code, out, err, _ = self.cli(["watch", "/dev/x", str(make_package(self.tmp))], board)
+        self.assertEqual(self.unsafe(out), [], repr(out))
+        self.assertIn(f"@app.log demo {self.SHOWN} \ttab\n", out)
+
+    def test_a_message_of_the_tool_names_the_file_without_the_bytes(self):
+        # What the package says about itself is as foreign as what the board says: a path in a manifest.
+        folder = make_package(self.tmp, manifest={"files": ["x\x1b]0;owned\x07.lua"]})
+        code, out, err, _ = self.cli(["push", "/dev/x", str(folder)], self.board())
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(self.unsafe(err), [], repr(err))
+        self.assertIn("'x\\x1b]0;owned\\x07.lua' is not an allowed path", err)
+
+    def test_a_lone_surrogate_in_a_reply_is_text_too(self):
+        # json.loads decodes "\ud800" to a character no output encoding takes: strict stderr would end the run in a
+        # traceback.
+        reply = self.app.parse_reply('@app {"op":"commit","ok":false,"error":{"code":"x","message":"a\\ud800b"}}')
+        self.assertEqual(reply.data["error"]["message"], "a\ud800b")
+        stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+        stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(self.app.report(reply), 1)
+        stdout.flush()
+        stderr.flush()
+        self.assertEqual(stderr.buffer.getvalue(), b"x: a\\ud800b\n")
+        self.assertEqual(stdout.buffer.getvalue(), reply.text.encode() + b"\n")
+
+    def test_the_two_helpers_leave_ordinary_text_alone(self):
+        text = "plain é 世界 \U0001f600\ttab\nnext line   ¡  "
+        self.assertEqual(self.app.printable(text), text)
+        line = json.dumps({"s": text}, ensure_ascii=False)
+        self.assertEqual(self.app.printable_json(line), line)
+        self.assertEqual(self.app.printable("\x00\x01\x08\x0b\x0c\r\x1f\x7f\x80\x9f  "),
+                         "\\x00\\x01\\x08\\x0b\\x0c\\x0d\\x1f\\x7f\\x80\\x9f  ")
+        raw = '{"a":"\x7f\u0080\u009f ","b":["\u009b"]}'
+        printed = self.app.printable_json(raw)
+        self.assertEqual(printed, '{"a":"\\u007f\\u0080\\u009f ","b":["\\u009b"]}')
+        self.assertEqual(json.loads(printed), json.loads(raw))
+        # Something that isn't JSON is text.
+        self.assertEqual(self.app.printable_json("not json \x1b[2J"), "not json \\x1b[2J")
+        self.assertEqual(self.app.printable_json('{"a":1}\r'), '{"a":1} ', "a CR between tokens is a space, in JSON too")
+
+    def test_nothing_is_printed_but_through_the_one_helper(self):
+        # Every line of output goes through say() or say_json(), so there is no print in the tool that skips them.
+        tree = ast.parse(APP_PY.read_text())
+        found = []
+
+        def walk(node, inside):
+            for child in ast.iter_child_nodes(node):
+                here = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else inside
+                if isinstance(child, ast.Call):
+                    func = child.func
+                    name = func.id if isinstance(func, ast.Name) else ast.unparse(func)
+                    if name == "print" or name in ("sys.stdout.write", "sys.stderr.write", "sys.stdout.buffer.write",
+                                                   "sys.stderr.buffer.write"):
+                        found.append((here, name))
+                walk(child, here)
+
+        walk(tree, None)
+        self.assertTrue(found, "the helpers print")
+        self.assertEqual({where for where, _ in found}, {"say", "say_json"}, found)
 
 
 class SyncTest(ToolTestCase):
@@ -625,6 +1011,17 @@ class PushTest(ToolTestCase):
         self.assertIn(f"{self.app.COMMIT_S:g} s", str(raised.exception))
         self.assertGreaterEqual(self.app.COMMIT_S, 15, "an install with a run takes about 2.2 s, and may take more")
 
+    def test_the_commit_is_waited_for_the_devices_deadline_and_five_seconds_more(self):
+        # G: the board's install deadline is APPS_INSTALL_DEADLINE_MS (apps_install.h), and a commit can take all of it.
+        deadline_s = c_define("apps_install.h", "APPS_INSTALL_DEADLINE_MS") / 1000
+        self.assertEqual(deadline_s, 90)
+        self.assertEqual(self.app.COMMIT_S, deadline_s + 5)
+        reply, _, _ = self.push(make_package(self.tmp), Gadget(commit_delay=deadline_s + 4))
+        self.assertEqual(reply.kind, "result", "an install that ends 4 s after the board's own deadline")
+        with self.assertRaises(self.app.AppError) as raised:
+            self.push(make_package(self.tmp), Gadget(commit_delay=deadline_s + 6))
+        self.assertIn("no result of app.commit within 95 s", str(raised.exception))
+
     def test_echo_lines_while_waiting_are_not_replies(self):
         gadget = Gadget(echo=["@app.log demo hello", "@app.log demo (3 lines not echoed)"])
         reply, _, _ = self.push(make_package(self.tmp), gadget)
@@ -775,6 +1172,27 @@ class OpenTest(ToolTestCase):
         self.assertIn("Input/output error", err)
         self.assertTrue(board.closed)
 
+    def test_a_board_that_goes_away_is_the_boards_and_a_checks_failure_is_the_hosts(self):
+        # I: an OSError of push, watch or logs is the port's; one of check never had a board to lose.
+        for argv in (["push", "/dev/x", str(make_package(self.tmp))], ["logs", "/dev/x"],
+                     ["watch", "/dev/x", str(make_package(self.tmp))]):
+            with self.subTest(argv[0]):
+                board = self.board()
+                board.read_line = mock.Mock(side_effect=OSError(5, "Input/output error"))
+                code, _, err, _ = self.cli(argv, board)
+                self.assertEqual(code, 1)
+                self.assertIn("lost the board: [Errno 5] Input/output error", err)
+        out, err = io.StringIO(), io.StringIO()
+        failing = OSError(28, "No space left on device")
+        with mock.patch.object(self.app.apphost_build, "ensure", side_effect=failing), \
+                mock.patch.object(self.app, "open_board", side_effect=AssertionError("check needs no gadget")), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.app.main(["check", str(make_package(self.tmp))])
+        self.assertEqual((code, out.getvalue()), (1, ""))
+        self.assertIn("No space left on device", err.getvalue())
+        self.assertNotIn("board", err.getvalue())
+        self.assertIn("check", err.getvalue())
+
     def test_the_help_names_the_four_commands(self):
         for argv, words in ((["--help"], ("check", "push", "watch", "logs")),
                             (["push", "--help"], ("--run", "--snap", "PORT", "DIR")),
@@ -819,6 +1237,7 @@ class WatchTest(ToolTestCase):
 
         def on_wait():
             waits.append(self.clock.now)
+            board.events.append(("wait", self.clock.now))   # in the order of what was sent: a test says what came before
             if len(waits) in edits:
                 edits[len(waits)](folder)
             if len(waits) >= polls:
@@ -843,6 +1262,11 @@ class WatchTest(ToolTestCase):
         }, polls=8)
         self.assertEqual(code, 0, err)
         self.assertEqual(board.sent("app.commit"), ["app.commit demo run"] * 3)
+        # Q: at once is before the first poll, and a change is pushed before the next one: commit, two polls (the edit is
+        # made in the second and seen as it ends), a commit, three polls (the next edit is in the fifth), a commit.
+        marks = ["wait" if e[0] == "wait" else "commit" for e in board.events
+                 if e[0] == "wait" or (e[0] == "line" and e[1].startswith("app.commit"))]
+        self.assertEqual(marks[:9], ["commit", "wait", "wait", "commit", "wait", "wait", "wait", "commit", "wait"])
         self.assertEqual(board.raw_writes.count(b"w\n"), 3, "each push wakes the screen: one looks away while editing")
         self.assertEqual([json.loads(line)["op"] for line in out.splitlines()], ["commit"] * 3)
         gaps = [round(b - a, 3) for a, b in zip(waits, waits[1:])]
@@ -894,6 +1318,53 @@ class WatchTest(ToolTestCase):
         self.assertIn("isn't JSON", err)
         self.assertEqual(len(board.sent("app.commit")), 2, "the first push, and the one after the manifest is mended")
 
+    def test_a_package_the_tool_refuses_is_said_and_the_watch_goes_on(self):
+        # D: every refusal of reading the folder is an AppError, whatever is wrong with it, so the watch says what and
+        # polls on, and the push after the folder is mended goes through. (Each case: what to do to util.lua at the
+        # second wait, what to do to mend it at the fourth.)
+        def replace(folder, make):
+            path = folder / "util.lua"
+            if path.is_dir() and not path.is_symlink():
+                path.rmdir()
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+            make(path)
+
+        def sparse(path):
+            with open(path, "wb") as f:
+                f.truncate(1 << 30)
+
+        def nested_manifest(folder):
+            self.edit(folder / "manifest.json", "[" * 100_000 + "]" * 100_000, 7)
+
+        def mend_manifest(folder):
+            self.edit(folder / "manifest.json", self.good_manifest, 9)
+
+        def mend(folder):
+            replace(folder, lambda path: self.edit(path, "return 2\n", 8))
+
+        elsewhere = self.tmp / "elsewhere.lua"
+        elsewhere.write_text("return 'elsewhere'")
+        cases = {
+            "a FIFO": (lambda f: replace(f, os.mkfifo), mend, "regular file"),
+            "a folder": (lambda f: replace(f, os.mkdir), mend, "regular file"),
+            "a link out": (lambda f: replace(f, lambda path: os.symlink(elsewhere, path)), mend, "outside the app's folder"),
+            "a huge file": (lambda f: replace(f, sparse), mend, "util.lua is larger than 256 KB"),
+            "a manifest of nested arrays": (nested_manifest, mend_manifest, "manifest.json is larger than 8 KB"),
+            "a manifest that is a FIFO": (lambda f: (f / "manifest.json").unlink() or os.mkfifo(f / "manifest.json"),
+                                          lambda f: (f / "manifest.json").unlink() or self.edit(
+                                              f / "manifest.json", self.good_manifest, 9), "regular file"),
+        }
+        for what, (hurt, mended, words) in cases.items():
+            with self.subTest(what), no_longer_than(60):
+                folder = make_package(self.tmp, files={"util.lua": "return 1"})
+                self.good_manifest = (folder / "manifest.json").read_text()
+                code, out, err, board, _ = self.watch(folder, {2: hurt, 4: mended}, polls=8)
+                self.assertEqual(code, 0, err)
+                self.assertIn(words, err)
+                self.assertNotIn("Traceback", err)
+                self.assertEqual(len(board.sent("app.commit")), 2, "the first push, and the one after it was mended")
+
     def test_a_crash_or_a_refusal_is_printed_and_the_watch_goes_on(self):
         crashed = {"ok": False, "error": {"code": "crashed", "message": "installed but crashed in start(): boom"}}
         folder = make_package(self.tmp)
@@ -923,6 +1394,13 @@ class WatchTest(ToolTestCase):
                                               gadget=gadget, polls=5)
         self.assertEqual(code, 0)
         self.assertIn("@app.ack", err)
+        # Q: the watch goes on: the push that gave up at its second piece never committed, and the edit at the second wait
+        # (the first is the ack's own) is pushed whole, and committed, before the third.
+        marks = ["wait" if e[0] == "wait" else "commit" for e in board.events
+                 if e[0] == "wait" or (e[0] == "line" and e[1].startswith("app.commit"))]
+        self.assertEqual(marks[:4], ["wait", "wait", "commit", "wait"])
+        self.assertEqual(len(board.sent("app.commit")), 1)
+        self.assertEqual(json.loads(out)["op"], "commit")
 
     def test_the_apps_log_is_printed_between_pushes(self):
         folder = make_package(self.tmp)
@@ -991,11 +1469,49 @@ class RawSerial:
     def read(self, size=1):
         self._deliver()
         if not self.incoming:
-            self.clock.now += 0.05   # the port's timeout
+            self.clock.advance_to(self.clock.now + 0.05)   # the port's timeout
             return b""
         chunk = bytes(self.incoming[:min(size, self.piece)])
         del self.incoming[:len(chunk)]
         return chunk
+
+
+class FakesTest(unittest.TestCase):
+    """The fakes of this file fail a test that waits for ever: an hour on the test's clock is a loop that doesn't end,
+    whoever is waiting (M)."""
+
+    def test_a_sleep_a_board_read_and_a_port_read_all_reach_the_hour_guard(self):
+        clock = FakeClock()
+        clock.sleep(FakeClock.HOUR - 1)
+        with self.assertRaises(AssertionError):
+            clock.sleep(2)
+        clock = FakeClock()
+        with self.assertRaises(AssertionError):
+            FakeBoard(clock).read_line(clock.now + 2 * FakeClock.HOUR)
+        # A loop that ignores that nothing came goes on to the guard: 36 reads of 100 s.
+        clock, reads = FakeClock(), 0
+        board = FakeBoard(clock)
+        with self.assertRaises(AssertionError):
+            while True:
+                board.read_line(clock.now + 100)
+                reads += 1
+        self.assertEqual(reads, 36)
+        # A line that is due after the hour is no escape either.
+        clock = FakeClock()
+        board = FakeBoard(clock, later=[(2 * FakeClock.HOUR, "late")])
+        with self.assertRaises(AssertionError):
+            board.read_line(clock.now + 3 * FakeClock.HOUR)
+        clock = FakeClock()
+        port = RawSerial(clock, lambda command: [])
+        with self.assertRaises(AssertionError):
+            for _ in range(int(FakeClock.HOUR / 0.05) + 100):
+                port.read()
+        self.assertGreater(clock.now, clock.START + FakeClock.HOUR)
+        # Time inside the hour is just time, and a clock never goes back.
+        clock = FakeClock()
+        clock.advance_to(clock.now + 10)
+        clock.advance_to(clock.START)
+        self.assertEqual(clock.now, FakeClock.START + 10)
 
 
 class WireTest(ToolTestCase):
@@ -1368,10 +1884,133 @@ class BuildTest(unittest.TestCase):
             root = Path(home) / ".cache" / "muse-apphost"
             self.assertEqual(list(root.iterdir()) if root.exists() else [], [])
 
+    def test_a_dot_file_or_a_dangling_link_beside_the_headers_is_no_key_input(self):
+        # H: pathlib's `*` takes dot-files: Emacs's lock file `.#apps_vm.h` is a dangling link, and reading it failed the
+        # key (and so `app.py check`) for as long as the buffer was unsaved. The compiler never includes a dot-file.
+        build = self.build
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = self.copy_tree(tmp)
+            key = build.cache_key(["cc"], tree)
+            apps = tree / "components/muse/apps"
+            os.symlink("zero@host.1234:5678", apps / ".#apps_vm.h")            # an Emacs lock file: dangling
+            (apps / "._apps_rt.h").write_bytes(b"AppleDouble")                  # a regular hidden header
+            os.symlink("apps_rt.h", apps / ".linked.h")                         # a link to a real one, hidden
+            (apps / "dir.h").mkdir()                                            # not a file
+            os.symlink("no-such-file.h", apps / "dangling.h")                   # dangling, and not hidden
+            names = [p.name for p in build.key_inputs(tree)]
+            for name in (".#apps_vm.h", "._apps_rt.h", ".linked.h", "dir.h", "dangling.h"):
+                self.assertNotIn(name, names)
+            self.assertEqual(build.cache_key(["cc"], tree), key, "none of them is part of the build")
+            (apps / "visible.h").write_bytes(b"/* a header */")
+            self.assertNotEqual(build.cache_key(["cc"], tree), key, "an ordinary new header is")
 
-class CheckTest(unittest.TestCase):
+    def test_the_strict_build_passes_with_the_host_compiler(self):
+        # O: `app.py check`'s own flags, as the manual zig run and CI build them (-Werror), with the compiler of this
+        # machine: a call that wants a feature macro under -std=c11, or a warning the test build's flags hide, fails here
+        # and not on someone's Linux.
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self.build.build(tmp, strict=True)
+            self.assertTrue(os.access(exe, os.X_OK))
+            done = subprocess.run([str(exe), str(HELLO)], capture_output=True, text=True, timeout=60)
+            self.assertEqual((done.returncode, done.stderr), (0, ""))
+            self.assertIn('"event":"started"', done.stdout)
+
+    def test_a_change_to_the_build_recipe_is_another_key(self):
+        # R: the include list and the order of the commands are in apphost_build.py, not in the flags the key lists:
+        # a define or an include directory added there changes the binary, so it must change the key.
+        build = self.build
+        recipe = Path(build.__file__).read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            key = build.cache_key(["cc"], ROOT)
+            copy = Path(tmp) / "apphost_build.py"
+            copy.write_bytes(recipe)
+            with mock.patch.object(build, "__file__", str(copy)):
+                self.assertEqual(build.cache_key(["cc"], ROOT), key, "a copy of the recipe is the same recipe")
+                copy.write_bytes(recipe + b"\n# a new -I, a new define\n")
+                longer = build.cache_key(["cc"], ROOT)
+                self.assertNotEqual(longer, key)
+                # The same length and one byte different (a -I swapped for a -D, say): the text is in the key, not only how
+                # long it is.
+                copy.write_bytes(recipe[:-2] + bytes([recipe[-2] ^ 1]) + recipe[-1:])
+                self.assertNotIn(build.cache_key(["cc"], ROOT), (key, longer))
+
+
+class RuleTest(unittest.TestCase):
+    """app.py checks an id and a path before it sends anything (PATH_RULE, ID_RULE), so that the board's refusal is the
+    tool's. They are two more copies of the C's rule (apps_id_valid and apps_path_valid), and are held to it here: the
+    same texts go to the pkg harness's own `check id` and `check path`, which run the real functions (L)."""
+
     @classmethod
     def setUpClass(cls):
+        cls.app = load_app()
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        import test_muse_apps_pkg as pkg
+        cls.harness = apps_host.build("muse_apps_pkg_harness", [*pkg.SOURCES, *apps_host.lua_sources()], tmp.name,
+                                      include_dirs=pkg.INCLUDES, defines=["ESP_PLATFORM"])
+
+    def board_says(self, what, texts):
+        done = apps_host.run(self.harness, "check", what, input="".join(f"{t}\n" for t in texts).encode(), text=False,
+                             timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        answers = done.stdout.decode().split("\n")[:-1]
+        self.assertEqual(len(answers), len(texts))
+        return [answer == "1" for answer in answers]
+
+    def agree(self, what, rule, texts):
+        texts = [t for t in dict.fromkeys(texts) if "\n" not in t and "\0" not in t]   # the harness reads a line a text
+        board = self.board_says(what, texts)
+        tool = [rule.fullmatch(t) is not None for t in texts]
+        wrong = [(t, b) for t, b, m in zip(texts, board, tool) if b != m]
+        self.assertEqual(wrong, [], f"{len(wrong)} of {len(texts)} {what}s: the board's verdict is the second")
+        self.assertGreater(sum(board), 50, f"{what}s that are valid are in the set")
+        self.assertGreater(len(board) - sum(board), 50, f"{what}s that aren't are in the set")
+
+    @staticmethod
+    def exhaustive(alphabet, longest):
+        found = [""]
+        last = [""]
+        for _ in range(longest):
+            last = [text + c for text in last for c in alphabet]
+            found += last
+        return found
+
+    def test_ids_are_the_boards(self):
+        import random
+        rng = random.Random(0x1D)
+        alphabet = "abzAZ09_-. /é\t"
+        texts = [*PackageTest.IDS_OK, *PackageTest.IDS_BAD, *self.exhaustive("aZ0_-. é", 4)]
+        for length in (0, 1, 2, 3, 23, 24, 25, 26, 64):
+            texts += ["".join(rng.choice("abcxyz09_") for _ in range(length)) for _ in range(40)]
+            texts += ["".join(rng.choice(alphabet) for _ in range(length)) for _ in range(300)]
+        self.agree("id", self.app.ID_RULE, texts)
+
+    def test_paths_are_the_boards(self):
+        import random
+        rng = random.Random(0x9A7)
+        pieces = ["a", "b.c", ".", "..", "", "-", "_", "x.lua", ".x", "a.", "a..b", "A", "a b", "é", "0", "a-b_c.d",
+                  "lib", ".hidden", "x.", "a:b", "~1", "a" * 30]
+        texts = [*PackageTest.PATHS_OK, *PackageTest.PATHS_BAD, *self.exhaustive("a0_-./A é", 4)]
+        for _ in range(4000):
+            texts.append("/".join(rng.choice(pieces) for _ in range(rng.randint(1, 5))))
+        for length in (1, 2, 62, 63, 64, 65, 66, 100):   # the length limit, whatever is in the text
+            texts += ["".join(rng.choice("ab./-_") for _ in range(length)) for _ in range(200)]
+            texts += [("a" * (length - 4) + ".lua") if length > 4 else "a" * length]
+            texts += [("a/" * (length // 2))[:length], "a" * length]
+        self.agree("path", self.app.PATH_RULE, texts)
+
+
+class CheckTest(unittest.TestCase):
+    @staticmethod
+    def say_sanitizers():
+        """X13: the other apphost builds of this suite say which sanitizers they have (apps_host); this one is the dev
+        loop's own, which the tests below run their scratch apps on, and has none."""
+        print("apps_host: apphost (app.py check's build): sanitizers off, the dev loop's own build", file=sys.stderr,
+              flush=True)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.say_sanitizers()
         cls.app = load_app()
         home = tempfile.TemporaryDirectory()
         cls.addClassCleanup(home.cleanup)
@@ -1459,20 +2098,124 @@ class CheckTest(unittest.TestCase):
                          "compile failed: main.lua:2: unexpected symbol near '='\n 1| local x = 1\n>2| x = = 2")
 
     def test_a_crash_with_unicode_line_separators_in_it_is_still_a_crash(self):
-        # The event is one line of JSON with U+2028 in it as it is. Split with str.splitlines() it is two lines that
-        # aren't JSON, and the crash goes unseen.
+        # The event is one line of JSON with U+2028 in it as it is. (apphost's own status is 1 for a crash, so the exit
+        # status says nothing of how the line was read: this one shows it comes through whole, and the test for an `error`
+        # event, whose status is 0, is the one that lets the tool's reading of the line decide the exit status.)
         folder, _ = self.make("return {start = function() error('a\\u{2028}b\\u{2029}c', 0) end}")
         code, out, _ = self.check(folder)
         self.assertEqual(code, 1)
         (crash,) = [json.loads(line) for line in out.split("\n")[:-1] if '"crash"' in line]
         self.assertIn("a b c", crash["message"])
 
+    def refused_before_apphost(self, folder, *args):
+        """check on a folder it refuses on its own: exit 1, a word on stderr, nothing on stdout, and apphost never
+        started. -> stderr."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), no_longer_than(30), \
+                mock.patch.object(self.app.subprocess, "Popen", side_effect=AssertionError("apphost was started")), \
+                mock.patch.object(self.app, "open_board", side_effect=AssertionError("check needs no gadget")):
+            code = self.app.main(["check", str(folder), *args])
+        self.assertEqual((code, out.getvalue()), (1, ""))
+        return err.getvalue()
+
+    def test_a_file_that_push_refuses_is_refused_by_check_before_apphost_starts(self):
+        # C: one rule for both. A link out of the folder is no way to read a file of someone else's (its lines would be
+        # quoted by the compile's message), and a FIFO listed in a manifest is no reason for check to wait for ever.
+        secret = Path(tempfile.mkdtemp(dir=self.home)) / "id_secret.lua"
+        secret.write_text("SECRET_LINE_ONE\nlocal b = = 2\n")
+        for what, make, words in (
+                ("a link out", lambda path: os.symlink(secret, path), "outside the app's folder"),
+                ("a FIFO", os.mkfifo, "regular file"),
+                ("a folder", os.mkdir, "regular file")):
+            with self.subTest(what):
+                folder, _ = self.make("return {}", manifest={"files": ["notes.lua"]})
+                make(folder / "notes.lua")
+                err = self.refused_before_apphost(folder)
+                self.assertIn(words, err)
+                self.assertIn("notes.lua", err)
+                self.assertNotIn("SECRET_LINE", err)
+        folder, _ = self.make("return {}")
+        (folder / "manifest.json").unlink()
+        os.mkfifo(folder / "manifest.json")
+        self.assertIn("regular file", self.refused_before_apphost(folder))
+
+    def test_check_and_push_agree_on_which_folders_are_acceptable(self):
+        # The same package, the same verdict: what push says before it sends anything is what check says before it runs.
+        cases = {
+            "an id the board refuses": dict(manifest={"id": "Bad"}),
+            "a path the board refuses": dict(manifest={"files": ["../x.lua"]}),
+            "a file nobody made": dict(manifest={"files": ["missing.lua"]}),
+            "a file with no kind": dict(files={"notes.txt": "x"}),
+            "a file over its limit": dict(files={"big.lua": b" " * (256 * 1024 + 1)}),
+        }
+        for what, kw in cases.items():
+            with self.subTest(what):
+                folder, _ = self.make("return {}", **kw)
+                with self.assertRaises(self.app.AppError) as raised:
+                    self.app.read_package(folder)
+                err = self.refused_before_apphost(folder)
+                self.assertEqual(err, f"app.py: {raised.exception}\n")
+
+    def test_what_apphost_says_is_printed_without_a_control_character_a_terminal_would_act_on(self):
+        # B: an app's data round-trips (a reply), so U+009B (CSI) in it reaches the line apphost prints, and DEL.
+        folder, script = self.make('return {message = function() return "\\u{9B}2J\\u{7F}" end}', script="message x\n")
+        code, out, err = self.check(folder, "--script", str(script))
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(re.findall("[\x00-\x08\x0b-\x1f\x7f-\x9f]", out), [], repr(out))
+        (reply,) = [json.loads(line) for line in out.split("\n")[:-1] if '"reply"' in line]
+        self.assertEqual(reply["data"], "\u009b2J\u007f", "the same JSON")
+        self.assertIn('{"event":"reply","data":"\\u009b2J\\u007f"}', out)
+        # apphost's stderr (its usage, a script it can't read) is text for a person.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "apphost"
+            fake.write_text("#!/bin/sh\nprintf 'apphost: \\033]0;owned\\007 \\302\\233 2J\\n' >&2\nexit 2\n")
+            fake.chmod(0o755)
+            with mock.patch.object(self.app.apphost_build, "ensure", return_value=fake):
+                code, out, err = self.check(folder)
+        self.assertEqual((code, out), (2, ""))
+        self.assertEqual(err, "apphost: \\x1b]0;owned\\x07 \\x9b 2J\n")
+
+    def test_an_error_event_with_unicode_line_separators_decides_the_exit_status(self):
+        # N: a message the app refuses is an `error` event and apphost's own status is 0, so the exit status is the tool's
+        # alone, and it comes from reading the event: its line has U+2028 and U+2029 in it as they are. Split at
+        # str.splitlines() the line is three that aren't JSON, no event is seen, and check says all is well.
+        folder, script = self.make("return {message = function() error('a\\u{2028}b\\u{2029}c', 0) end}",
+                                   script="message x\n")
+        code, out, err = self.check(folder, "--script", str(script))
+        self.assertEqual((code, err, self.kinds(out)), (1, "", ["started", "error"]))
+        self.assertEqual(json.loads(out.split("\n")[1])["message"], "a\u2028b\u2029c")
+        self.assertEqual(out.count("\n"), 2, "two lines of events, however many the text would split into")
+
+    def test_the_notice_that_the_dev_loops_apphost_has_no_sanitizers_is_given(self):
+        # X13: CheckTest's own scratch apps (the 38-deep and the crash ones) run on the unsanitized binary the dev loop
+        # builds, and the output says so.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            CheckTest.say_sanitizers()
+        self.assertEqual(err.getvalue(), "apps_host: apphost (app.py check's build): sanitizers off, the dev loop's own build\n")
+
     def test_a_package_that_cannot_load_is_an_error_event_and_exits_one(self):
+        # What the tool's own look at the folder can't see: a .json file that isn't JSON, an image that isn't one, a
+        # manifest apphost reads further (its api) - those are apphost's `error` events, in the install's words. (A file that
+        # is missing, or not a file at all, or outside the folder, is the tool's to say before it starts apphost, as push's.)
+        for files, manifest, words in (({"d.json": "{\"a\":}"}, None, "d.json: unexpected '}' at byte 6"),
+                                       ({"i.bin": b"not an image"}, None, "i.bin: image: not an LVGL v9 image file"),
+                                       (None, {"api": 2}, "manifest: this gadget supports api 1")):
+            with self.subTest(words):
+                folder, _ = self.make("return {}", files=files, manifest=manifest)
+                code, out, _ = self.check(folder)
+                self.assertEqual((code, self.kinds(out)), (1, ["error"]))
+                self.assertIn(words, json.loads(out)["message"])
+
+    def test_a_folder_that_is_not_there_or_lacks_a_file_is_said_on_stderr_as_push_says_it(self):
         folder, _ = self.make("return {}", manifest={"files": ["missing.lua"]})
-        code, out, _ = self.check(folder)
-        self.assertEqual((code, self.kinds(out)), (1, ["error"]))
-        code, out, _ = self.check(Path(tempfile.gettempdir()) / "no-such-muse-app-folder")
-        self.assertEqual((code, self.kinds(out)), (1, ["error"]))
+        code, out, err = self.check(folder)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("missing.lua is listed in", err)
+        code, out, err = self.check(Path(tempfile.gettempdir()) / "no-such-muse-app-folder")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("no-such-muse-app-folder", err)
+        self.assertIn("manifest.json", err)
 
     def test_a_failed_command_of_the_script_exits_one_though_the_app_lives(self):
         # apphost's own status is 0 for a message the app refuses (the app didn't crash): the error event is the tool's.
@@ -1577,13 +2320,21 @@ class HelloTest(AppsTestCase):
 
     def test_the_button_prints_and_the_label_says_tapped(self):
         events = self.run_app(HELLO, ['tap "Tap me"', "dump"])
-        self.assertEqual(len(self.of(events, "log")), 1, "a tap prints one line")
+        self.assertEqual([e["line"] for e in self.of(events, "log")], ["tapped"], "a tap prints one line, and says so")
         labels = [w["text"] for w in self.of(events, "dump")[0]["widgets"] if w["kind"] == "label"]
         self.assertEqual(labels, ["12:34", "Tapped"])
 
 
 class TortureTest(AppsTestCase):
-    NAMES = ("pcall", "resume", "index", "tostring")
+    NAMES = ("pcall", "resume", "index", "tostring", "xpcall")
+    # The C-call levels each chain reaches, exactly: Lua's own count (LUAI_MAXCCALLS is 40), the same on the host as on
+    # the board, which is what lets the board's stack readings stand for the deepest the sandbox goes. xpcall's is the
+    # __index chain's, with the message handler running at the limit.
+    DEPTHS = {"pcall": 37, "resume": 37, "index": 36, "tostring": 36, "xpcall": 36}
+    NESTING = 34   # the deepest of deep26..deep36 a require loads: a top-level chunk takes 37, a require a few levels less
+    # How far the handler gets under xpcall: it is called at level 41, guarded_handler's call of it is 42, and each nested
+    # pcall one more, to 43 (Lua stops at 44, LUAI_MAXCCALLS / 10 * 11): its own frame and one nest, and the next is refused.
+    HANDLER = {"levels": 2, "refused": "error in error handling"}
 
     def test_the_fixture_is_what_the_rulings_say(self):
         manifest = json.loads((TORTURE / "manifest.json").read_text())
@@ -1599,6 +2350,8 @@ class TortureTest(AppsTestCase):
             body = [line for line in text.splitlines() if line.strip() and not line.startswith("--")]
             self.assertEqual(body, ["return " + "(" * n + "1" + ")" * n], f"deep{n}.lua nests {n} deep")
         self.assertEqual((TORTURE / "main.lua").read_text().splitlines()[:2], LUA_HEADER)
+        self.assertEqual(sorted(manifest["messages"]), sorted(
+            ["chains", "json", "xpcall", "floats", "floats_exact", "floats_time", "widgets", "hits"]))
 
     def test_start_runs_the_two_cases_and_the_chains(self):
         events = self.run_app(TORTURE)
@@ -1609,28 +2362,41 @@ class TortureTest(AppsTestCase):
         self.assertEqual(index[1], "false")
         self.assertTrue(index[2].endswith("C stack overflow"), index)
         (deepest,) = [row for row in logs if row[0] == "deepest nesting that loads"]
-        # 40 is LUAI_MAXCCALLS: the parser takes a C level for each parenthesis, and the require, the pcall and the
-        # handler hold a few: the first that loads is a little under the 37 of a top-level chunk.
-        self.assertTrue(30 <= int(deepest[1]) <= 35, deepest)
+        self.assertEqual(int(deepest[1]), self.NESTING, deepest)
         chains = {row[1]: (int(row[2]), row[3]) for row in logs if row[0] == "chain"}
         self.assertEqual(sorted(chains), sorted(self.NAMES))
         for name, (depth, err) in chains.items():
-            self.assertTrue(30 <= depth <= 40, (name, depth))
-            self.assertIn("C stack overflow", err)
+            self.assertEqual(depth, self.DEPTHS[name], name)
+            self.assertEqual(err, "C stack overflow", name)
 
     def test_the_chains_reach_the_limit_and_json_runs_at_the_bottom_of_each(self):
         events = self.run_app(TORTURE, ["message chains", "message json"])
         plain, with_json = [e["data"] for e in self.of(events, "reply")]
         for name in self.NAMES:
             with self.subTest(name):
-                self.assertTrue(30 <= plain[name]["depth"] <= 40, plain[name])
-                self.assertIn("C stack overflow", plain[name]["err"])
+                self.assertEqual(plain[name]["depth"], self.DEPTHS[name])
+                self.assertEqual(plain[name]["err"], "C stack overflow")
                 self.assertNotIn("json", plain[name])
                 self.assertEqual(with_json[name]["depth"], plain[name]["depth"], "the same depth, with work there")
                 leaf = with_json[name]["json"]
                 self.assertEqual(leaf["decoded_levels"], 16)
                 self.assertGreater(leaf["encoded"], 100)
                 self.assertEqual(leaf["tail"], 0.1 + 0.2, "the 17-digit float at the deepest point reads back")
+
+    def test_the_handler_of_an_xpcall_at_the_limit_runs_on_to_the_end_of_error_handling_with_json_there(self):
+        # U: the one reachable part of the C-call budget the other chains don't run, levels 41 to 44, where the message
+        # handler sits on every frame of the chain it was raised in. It nests pcall until Lua refuses with "error in error
+        # handling", and json.encode and json.decode run at the deepest level it reached.
+        events = self.run_app(TORTURE, ["message xpcall", "message json"])
+        alone, everything = [e["data"] for e in self.of(events, "reply")]
+        self.assertEqual({k: alone[k] for k in ("depth", "err", "handler")},
+                         {"depth": self.DEPTHS["xpcall"], "err": "C stack overflow", "handler": self.HANDLER})
+        self.assertEqual(alone["json"]["decoded_levels"], 16)
+        self.assertEqual(alone["json"]["tail"], 0.1 + 0.2)
+        self.assertGreater(alone["json"]["encoded"], 100)
+        self.assertEqual(everything["xpcall"], alone, "the same in the run of every chain")
+        # No chain but this one has a handler: it is the only one that goes past 40.
+        self.assertEqual([name for name in self.NAMES if "handler" in everything[name]], ["xpcall"])
 
     def test_floats_print_in_the_fewest_digits_that_read_back_and_round_trip(self):
         events = self.run_app(TORTURE, ["message floats"])
@@ -1673,9 +2439,15 @@ class TortureTest(AppsTestCase):
         widgets = self.of(events, "dump")[0]["widgets"]
         self.assertEqual(len(widgets), 128)
         self.assertEqual({w["kind"] for w in widgets}, {"label", "button", "box", "arc", "bar", "image"})
-        self.assertEqual([w["kind"] for w in widgets[:5]], ["box", "box", "box", "box", "button"])
+        self.assertEqual([w["kind"] for w in widgets[:6]], ["box", "box", "box", "box", "button", "box"])
         self.assertEqual(built["deepest"], widgets[4]["id"])
-        self.assertEqual(max(len(w["text"] or "") for w in widgets), 256, "a text as long as text gets")
+        # The dump has no parent field. The boxes nest as deep as a widget may (four box ancestors: the button, and the
+        # fifth box beside it), which is known from the runtime's refusal of a box in that fifth one; a widget that was
+        # made without its parent would take it.
+        self.assertEqual(c_define("apps_ui.h", "APPS_UI_BOX_DEPTH_MAX"), 4)
+        self.assertEqual(built["nest"], {"ok": False, "err": "ui.box: boxes nest at most 4 deep"})
+        text_max = c_define("apps_ui.h", "APPS_UI_TEXT_MAX")
+        self.assertEqual(max(len(w["text"] or "") for w in widgets), text_max, "a text as long as text gets")
         hits = self.of(events, "reply")[1]["data"]
         self.assertEqual((hits["count"], hits["last"]), (1, f"{built['deepest']} tap"))
         again = self.run_app(TORTURE, ["message widgets", "message widgets"])

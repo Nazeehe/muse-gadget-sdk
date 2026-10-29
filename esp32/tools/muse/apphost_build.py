@@ -24,8 +24,9 @@ what it does on the board. This module knows what it is built from:
 - how to compile them with the compiler on the machine ($CC, else cc): plain C11 with the warnings on, no feature
   macros, no sanitizers, Lua's own seed for its string hashes as on the device. ensure() builds it once and keeps the
   binary in ~/.cache/muse-apphost/<sha1>/apphost, where the sha1 is of everything it was built from: the sources, every
-  header beside them, the two files that say what is built, the compiler command and the machine. Anything that
-  changes one of those is another directory, so a stale apphost can't run.
+  header beside them, the two files that say what is built, this file (the recipe: the include directories, the order
+  and form of the commands), the compiler command and the machine. Anything that changes one of those is another
+  directory, so a stale apphost can't run.
 
 The parsers don't evaluate CMake's if(): the Lua component keeps its sources, defines and options each in one call.
 """
@@ -193,24 +194,30 @@ def key_inputs(root=ROOT):
     """Every file apphost is built from: the sources it lists (its own and Lua's), every header beside them (all of
     components/muse/apps, tools/muse/apphost and Lua's src: a header one of them includes is among them, and so are the
     ones that no listed source includes yet), and the two files that say what is built and with what: sources.txt and
-    Lua's CMakeLists.txt."""
+    Lua's CMakeLists.txt. A header is a regular file whose name doesn't start with '.': the compiler never includes an
+    editor's dot-file (Emacs's lock file, `.#apps_vm.h`, is a link to nothing) or an AppleDouble `._x.h`, and reading one
+    would fail the key, or change it for nothing."""
     root = Path(root).resolve()
     files = {*apphost_sources(root), *lua_sources(root), root / "tools" / "muse" / "apphost" / "sources.txt",
              root / "components" / "lua" / "CMakeLists.txt"}
     for directory in ("components/muse/apps", "tools/muse/apphost", "components/lua/src"):
-        files.update((root / directory).glob("*.h"))
+        files.update(p for p in (root / directory).glob("*.h") if p.is_file() and not p.name.startswith("."))
     return sorted(files)
 
 
 def cache_key(cc, root=ROOT):
-    """The sha1 of key_inputs's names and contents, and of how they are built: the compiler command, the machine and
-    the flags."""
+    """The sha1 of key_inputs's names and contents, and of how they are built: the compiler command, the machine, the
+    flags and this file, which says the rest (the -I list, anything put into a command in compile_commands or
+    link_command)."""
     root = Path(root).resolve()
     digest = hashlib.sha1()
     for path in key_inputs(root):
         data = path.read_bytes()
         digest.update(f"{path.relative_to(root).as_posix()}\0{len(data)}\0".encode())
         digest.update(data)
+    recipe = Path(__file__).read_bytes()
+    digest.update(f"recipe\0{len(recipe)}\0".encode())
+    digest.update(recipe)
     how = {"cc": shlex.join(cc), "system": platform.system(), "machine": platform.machine(), "muse": MUSE_FLAGS,
            "lua": [*lua_options(root), *lua_defines(root)], "link": LINK_FLAGS}
     digest.update(json.dumps(how, sort_keys=True).encode())

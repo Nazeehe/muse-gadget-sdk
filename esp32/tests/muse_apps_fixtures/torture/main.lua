@@ -82,7 +82,38 @@ function chains.tostring(stop, leaf)
     return depth, (not ok) and err or nil, result
 end
 
-local CHAIN_NAMES = {"pcall", "resume", "index", "tostring"}
+-- The __index chain under xpcall, the one place the C-call count goes past the limit: the error is raised at level 40
+-- (LUAI_MAXCCALLS), in the deepest level, and Lua calls the message handler right there, on top of every frame of the
+-- chain (nothing has unwound yet), and lets it run on until level 44 (LUAI_MAXCCALLS / 10 * 11: room to handle an
+-- error, lstate.c). guarded_handler (apps_vm.c) and the handler's own call take two of them, and the handler nests pcall
+-- for the rest, until one is refused with "error in error handling", and runs leaf() at the deepest level that ran.
+-- `stop` isn't used: the chain always runs to the error. The fourth result is how far the handler got.
+function chains.xpcall(_, leaf)
+    local depth, levels, refused, result = 0, 0, nil, nil
+    local meta = {}
+    local function handler(message)
+        local function nest(n)
+            levels = n
+            local ok, why = pcall(nest, n + 1)
+            if not ok then
+                refused = why
+                if leaf then
+                    result = leaf()
+                end
+            end
+        end
+        nest(1)
+        return message
+    end
+    meta.__index = function()
+        depth = depth + 1
+        return table.concat(setmetatable({}, meta), "", 1, 1)
+    end
+    local ok, message = xpcall(table.concat, handler, setmetatable({}, meta), "", 1, 1)
+    return depth, (not ok) and message or nil, result, {levels = levels, refused = refused}
+end
+
+local CHAIN_NAMES = {"pcall", "resume", "index", "tostring", "xpcall"}
 
 -- ---- JSON at the bottom of a chain ----
 
@@ -213,7 +244,10 @@ local function on_event(w, name)
 end
 
 -- 128 widgets: the box chain of the depth the screen allows, a button at the bottom of it, a field of every
--- kind, and a label with the longest text there is, each with a handler or two.
+-- kind, and a label with the longest text there is, each with a handler or two. A widget may have four box ancestors
+-- (apps_ui.h): the button has four, and so has a fifth box beside it; a box inside that one is one too many, and the
+-- runtime says so ("nest" in the result: the dump has no parent field, so this refusal is how the chain is known to
+-- be four boxes deep).
 local function widgets()
     ui.clear()
     ui.bg("#000000")
@@ -232,6 +266,9 @@ local function widgets()
     local deepest = ui.button{parent = parent, text = "deepest", align = "center", w = 120, h = 44}
     deepest:on("tap", on_event):on("press", on_event):on("release", on_event):on("long_press", on_event)
     made = made + 1
+    local fifth = ui.box{parent = parent, align = "center", x = 0, y = 40, w = 40, h = 20, bg = "#203040"}
+    made = made + 1
+    local ok, why = pcall(ui.box, {parent = fifth, w = 10, h = 10})
 
     local words = string.rep("0123456789abcdef", 16)   -- 256 bytes: as long as text gets
     local i = 0
@@ -273,7 +310,8 @@ local function widgets()
         end
         made = made + 1
     end
-    return {count = made, tap = {x = ui.W // 2, y = ui.H // 2 + 70}, deepest = tostring(deepest)}
+    return {count = made, tap = {x = ui.W // 2, y = ui.H // 2 + 70}, deepest = tostring(deepest),
+            nest = {ok = ok, err = why}}
 end
 
 -- ---- The brief's two cases, and what they cost ----
@@ -298,16 +336,20 @@ local function deepest_nesting()
     return nil
 end
 
+local function run_chain(name, with_json)
+    local depth, err, _, handler = chains[name](nil, nil)
+    local row = {depth = depth, err = err, handler = handler}
+    if with_json then
+        local _, _, result = chains[name](depth, json_leaf)
+        row.json = result
+    end
+    return row
+end
+
 local function run_chains(with_json)
     local out = {}
     for _, name in ipairs(CHAIN_NAMES) do
-        local depth, err = chains[name](nil, nil)
-        local row = {depth = depth, err = err}
-        if with_json then
-            local _, _, result = chains[name](depth, json_leaf)
-            row.json = result
-        end
-        out[name] = row
+        out[name] = run_chain(name, with_json)
     end
     return out
 end
@@ -327,6 +369,8 @@ function app.message(event, data)
         return run_chains(false)
     elseif event == "json" then
         return run_chains(true)
+    elseif event == "xpcall" then
+        return run_chain("xpcall", true)
     elseif event == "floats" then
         return floats()
     elseif event == "floats_exact" then

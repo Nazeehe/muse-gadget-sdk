@@ -39,8 +39,8 @@ HARNESS = TESTS / "muse_apps_alarm_harness.c"
 SOURCES = [HARNESS, TESTS / "muse_apps_fake_esp_timer.c", APPS / "apps_alarm.c"]
 
 # What apps_alarm.c, muse_input.h and muse_voice.h include of FreeRTOS and ESP-IDF: each one is a line that includes the fakes.
-FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/queue.h", "freertos/semphr.h", "freertos/task.h", "esp_err.h", "esp_log.h",
-                "esp_timer.h"]
+FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/queue.h", "freertos/semphr.h", "freertos/task.h", "esp_attr.h", "esp_err.h",
+                "esp_log.h", "esp_timer.h"]
 
 
 def stage_fakes(directory):
@@ -76,6 +76,9 @@ class AlarmTest(unittest.TestCase):
     def test_four_to_an_app_eight_in_all_and_what_a_name_and_a_time_may_be(self):
         self.run_case("limits_and_names")
 
+    def test_an_id_is_an_apps_id(self):  # S: ^[a-z][a-z0-9_]{1,23}$, as apps_id_valid has it
+        self.run_case("ids_follow_the_apps_rule")
+
     # ---- Firing ----
 
     def test_a_fired_alarm_rings_wakes_and_waits_in_its_slot_until_it_is_taken(self):
@@ -102,6 +105,9 @@ class AlarmTest(unittest.TestCase):
     def test_a_cancelled_or_early_or_spent_timer_call_does_nothing(self):  # the callback was already on its way
         self.run_case("a_stale_call_does_nothing")
 
+    def test_a_launch_is_wanted_while_a_firing_it_was_asked_for_waits(self):  # D: the identity of an alarm launch
+        self.run_case("a_launch_is_wanted_while_a_firing_it_was_asked_for_waits")
+
     # ---- The ring ----
 
     def test_the_ring_chirps_every_1500_ms_and_ends_after_a_minute(self):
@@ -121,6 +127,41 @@ class AlarmTest(unittest.TestCase):
 
     def test_cancelling_a_firing_ends_the_ring_it_started(self):
         self.run_case("cancelling_a_firing_ends_its_ring")
+
+    def test_a_firing_in_a_ring_asks_for_no_chirp_of_its_own(self):  # C: one chirp per period of the ring
+        self.run_case("firings_in_a_ring_ask_for_no_chirp_of_their_own")
+
+    # ---- The ring is never silenced while something waits to be told or the app that was told runs (B) ----
+
+    def test_a_dropped_firing_leaves_the_ring_to_the_one_still_waiting(self):
+        self.run_case("a_dropped_firing_leaves_the_ring_to_the_one_still_waiting")
+
+    def test_a_crash_in_alarm_while_another_apps_firing_waits_leaves_the_ring_going(self):
+        self.run_case("a_crash_while_another_firing_waits_leaves_the_ring_going")
+
+    def test_the_told_app_ending_with_nothing_waiting_ends_the_ring_with_its_reason(self):
+        self.run_case("the_told_app_ending_with_nothing_waiting_stops_the_ring")
+
+    # ---- An app can't take the gadget over: the id-cancel and the budget (P1, A) ----
+
+    def test_every_alarm_of_an_app_can_be_cancelled_by_its_id(self):
+        self.run_case("cancelling_an_apps_alarms_by_its_id")
+
+    def test_the_budget_is_six_firings_in_less_than_a_minute(self):
+        self.run_case("the_budget_is_six_firings_in_less_than_a_minute")
+
+    def test_an_app_that_arms_alarms_all_the_time_gets_six_and_what_it_costs_is_bounded(self):  # A, C
+        self.run_case("an_app_that_arms_alarms_all_the_time_is_cut_off_after_six")
+
+    # ---- What the esp_timer task records, and what comes out (C) ----
+
+    def test_a_flood_of_firings_is_logged_at_the_rate_of_the_bucket_and_counted(self):
+        self.run_case("a_flood_of_firings_is_logged_at_the_rate_of_the_bucket")
+
+    # ---- Memory (G, H) ----
+
+    def test_no_memory_for_a_timer_is_told_and_tried_again(self):
+        self.run_case("no_memory_for_a_timer_is_told_and_tried_again")
 
     # ---- The esp_timer task never waits ----
 
@@ -155,23 +196,69 @@ class AlarmStaticTest(unittest.TestCase):
                 for waits in (r"\block\(\)", r"portMAX_DELAY", r"vTaskDelay", r"xQueueSend", r"xQueueReceive", r"ulTaskNotifyTake"):
                     self.assertNotRegex(body, waits)
 
+    def test_the_esp_timer_callbacks_neither_log_nor_print(self):  # C: a console line can wait for another task's whole reply
+        source = (APPS / "apps_alarm.c").read_text()
+        for name in ("fire_cb", "ring_cb"):
+            with self.subTest(name):
+                body = function_source(source, f"static void {name}(void *arg) {{")
+                for prints in (r"ESP_LOG", r"\bprintf\b", r"\bputs\b", r"\bfputs\b", r"\bputchar\b", r"\bfprintf\b", r"\bfflush\b",
+                               r"log_drain", r"\bstdout\b", r"\bstderr\b"):
+                    self.assertNotRegex(body, prints)
+                self.assertIn("journal_locked(", body if name == "ring_cb" else body + function_source(source, "static void ring_sound_locked("))
+
+    def test_only_ready_and_the_drain_write_a_log_line(self):  # C: the rest records what it would say
+        source = (APPS / "apps_alarm.c").read_text()
+        where = {}
+        current = None
+        for line in source.splitlines():
+            head = re.match(r"^(?:static )?(?:const )?\w+[\s*]+(\w+)\(.*\{$", line)
+            if head:
+                current = head.group(1)
+            if "ESP_LOG" in line and not line.lstrip().startswith(("/*", "*", "//")):
+                where.setdefault(current, 0)
+                where[current] += 1
+        self.assertEqual(sorted(where), ["apps_alarm_log_drain", "ready"], where)
+
     def test_the_apps_task_posts_the_alarm_event_without_waiting(self):
-        body = function_source((APPS / "apps_task.c").read_text(), "static void on_alarm_fired(")
+        task = (APPS / "apps_task.c").read_text()
+        body = function_source(task, "static void on_alarm_fired(")
         self.assertRegex(body, r"xQueueSend\(s_queue, &ev, 0\)")
-        self.assertIn("apps_alarm_set_fired_cb(on_alarm_fired)", function_source((APPS / "apps_task.c").read_text(), "esp_err_t muse_apps_start(void)"))
+        self.assertIn("apps_alarm_set_fired_cb(on_alarm_fired)", function_source(task, "esp_err_t muse_apps_start(void)"))
+
+    def test_the_post_is_one_at_a_time_and_leaves_the_requests_their_room(self):  # R
+        task = (APPS / "apps_task.c").read_text()
+        body = function_source(task, "static void on_alarm_fired(")
+        self.assertRegex(body, r"atomic_exchange\(&s_alarm_posted, true\)")
+        self.assertRegex(body, r"uxQueueSpacesAvailable\(s_queue\) > REQ_ROOM")
+        self.assertRegex(body, r"atomic_store\(&s_alarm_posted, false\)")  # a post that doesn't go in loses nothing, and the next may try
+        deliver = function_source(task, "static void deliver_alarms(")
+        self.assertLess(deliver.index("atomic_store(&s_alarm_posted, false)"), deliver.index("apps_alarm_pending()"),
+                        "the flag is cleared before the table is read, or a firing in between would post to no one")
 
     def test_the_table_and_the_pending_word_are_static(self):
         source = (APPS / "apps_alarm.c").read_text()
         for heap in ("malloc", "calloc", "heap_caps", "apps_port_realloc"):
             self.assertNotIn(heap, source)
-        self.assertRegex(source, r"(?m)^static slot_t s_slot\[APPS_ALARMS_MAX\];$")
+        self.assertIn('#include "esp_attr.h"', source)
+        self.assertRegex(source, r"(?m)^static EXT_RAM_BSS_ATTR slot_t s_slot\[APPS_ALARMS_MAX\];$")
         self.assertRegex(source, r"(?m)^static atomic_uint s_pending;")
         self.assertRegex(source, r"(?m)^static StaticSemaphore_t s_lock_buf;$")
+
+    def test_what_is_atomic_or_a_lock_is_internal_and_the_rest_is_psram(self):  # Q
+        source = (APPS / "apps_alarm.c").read_text()
+        for name in ("s_pending", "s_init", "s_lock_buf", "s_lock", "s_fired_cb", "s_ringing", "s_j_count", "s_skipped"):
+            with self.subTest(name):
+                self.assertRegex(source, rf"(?m)^static [^\n]*\b{name}\b", name)
+                self.assertNotRegex(source, rf"(?m)^static [^\n]*EXT_RAM_BSS_ATTR[^\n]*\b{name}\b", f"{name} is read without the lock: internal RAM")
+        for name in ("s_ring_app", "s_ring_told", "s_budget", "s_journal"):
+            with self.subTest(name):
+                self.assertRegex(source, rf"(?m)^static EXT_RAM_BSS_ATTR [^\n]*\b{name}\b", f"{name} is touched under the lock alone: PSRAM")
 
     def test_the_limits_are_the_briefs(self):
         header = (APPS / "apps_alarm.h").read_text()
         for name, value in (("APPS_ALARMS_MAX", 8), ("APPS_ALARMS_PER_APP", 4), ("APPS_ALARM_NAME_MAX", 23),
-                            ("APPS_ALARM_MAX_MS", 604800000), ("APPS_RING_PERIOD_MS", 1500), ("APPS_RING_MAX_MS", 60000)):
+                            ("APPS_ALARM_MAX_MS", 604800000), ("APPS_RING_PERIOD_MS", 1500), ("APPS_RING_MAX_MS", 60000),
+                            ("APPS_ALARM_BUDGET", 6), ("APPS_ALARM_BUDGET_MS", 60000), ("APPS_ALARM_LOG_BURST", 8)):
             self.assertRegex(header, rf"(?m)^#define {name} {value}\b", name)
 
 
@@ -231,8 +318,19 @@ class InputWakeTest(unittest.TestCase):
     def test_the_input_task_applies_a_wake_first_in_every_round(self):
         source = (MUSE / "muse_input.c").read_text()
         task = function_source(source, "static void input_task(void *arg)")
-        self.assertRegex(task, r"for \(;;\) \{\s+apply_wake\(\);\s+unsigned ev = ")
+        self.assertRegex(task, r"for \(;;\) \{\s+#if CONFIG_MUSE_APPS\s+apply_wake\(\);\s+#endif\s+unsigned ev = ")
         self.assertIn("void muse_input_wake(const char *why);", (MUSE / "muse_input.h").read_text())
+
+    def test_a_build_without_muse_apps_has_no_wake_in_it(self):  # O: nothing but an alarm of Muse apps asks for one
+        source = (MUSE / "muse_input.c").read_text()
+        blocks = re.findall(r"^#if CONFIG_MUSE_APPS\n(.*?)^#endif\n", source, re.S | re.M)
+        inside = "\n".join(blocks)
+        for name in ("s_wake_why", "muse_input_wake", "apply_wake"):
+            with self.subTest(name):
+                self.assertEqual(len(re.findall(rf"\b{name}\b", source)), len(re.findall(rf"\b{name}\b", inside)),
+                                 f"{name} is used outside #if CONFIG_MUSE_APPS")
+                self.assertIn(name, inside)
+        self.assertEqual(len(re.findall(r"^static void apply_wake\(void\)", inside, re.M)), 1)
 
 
 if __name__ == "__main__":

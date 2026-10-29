@@ -484,6 +484,17 @@ class MuseAppsWiringTest(unittest.TestCase):
             with self.subTest(line.strip()):
                 self.assertIn("if CONFIG_MUSE_APPS", open_conditions(ui, index))
 
+    def test_a_build_without_the_apps_has_no_alarm_wake_in_the_input_task(self):  # X5, O
+        # muse_input_wake and what it leaves for the input task (s_wake_why, apply_wake and its call) are only for the alarms of
+        # Muse apps: with the option off the plain build has none of them, so every mention sits inside #if CONFIG_MUSE_APPS.
+        source = (MUSE / "muse_input.c").read_text()
+        mentions = [m.start() for m in re.finditer(r"s_wake_why|muse_input_wake|apply_wake", source)]
+        self.assertGreaterEqual(len(mentions), 6)
+        for index in mentions:
+            line = source[source.rindex("\n", 0, index) + 1:source.index("\n", index)]
+            with self.subTest(line.strip()):
+                self.assertIn("if CONFIG_MUSE_APPS", open_conditions(source, index))
+
     def test_clock_showing_yields_to_apps(self):
         # An app in front or a card (the launcher, a crash card) covers the watch, whatever tile is under it: muse_input's
         # talk button then talks instead of turning to the face (F7). With the option off it is s_on_clock, as before.
@@ -523,7 +534,9 @@ class MuseAppsWiringTest(unittest.TestCase):
 
     def test_task_shape(self):
         task = (MUSE / "apps/apps_task.c").read_text()
-        defines = dict(re.findall(r"^#define\s+(\w+)\s+(\S+)", task, re.M))
+        # The queue's length is in the header (the harnesses size their floods by it), the rest are the task's own.
+        defines = dict(re.findall(r"^#define\s+(\w+)\s+(\S+)", (MUSE / "apps/apps_task.h").read_text(), re.M))
+        defines.update(dict(re.findall(r"^#define\s+(\w+)\s+(\S+)", task, re.M)))
 
         def value(arg):
             while arg in defines:
@@ -597,9 +610,13 @@ class MuseAppsWiringTest(unittest.TestCase):
         # The app task drains after every call, once in_call is clear, and in its housekeeping.
         task = (MUSE / "apps/apps_task.c").read_text()
         finish = function_source(task, "static void call_finish(void)")
-        self.assertRegex(finish, r"atomic_store\(&s_rec->in_call, 0\);[\s\S]*apps_port_log_drain\(\);[^;]*\}\s*$")
-        self.assertIn("apps_port_log_drain();", function_source(task, "static void housekeeping(void)"))
-        self.assertNotIn("apps_port_log_drain", function_source(task, "static void call_begin(void)"))
+        # What the alarms recorded to log goes out with it (C: the esp_timer task never prints), from one helper, outside any call.
+        self.assertRegex(finish, r"atomic_store\(&s_rec->in_call, 0\);[\s\S]*drain_logs\(\);[^;]*\}\s*$")
+        self.assertIn("drain_logs();", function_source(task, "static void housekeeping(void)"))
+        drain_logs = function_source(task, "static void drain_logs(void)")
+        self.assertRegex(drain_logs, r"apps_alarm_log_drain\(\);\s*apps_port_log_drain\(\);")
+        for name in ("call_begin", "tell_alarm", "on_alarm_fired"):
+            self.assertNotRegex(function_source(task, f"static void {name}("), r"log_drain|drain_logs")
 
     def test_the_apps_option_says_the_app_tasks_stack_as_it_is(self):  # S: it was 32 KB once, and is measured at 56
         task = (MUSE / "apps/apps_task.c").read_text()

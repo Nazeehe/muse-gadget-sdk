@@ -309,6 +309,9 @@ class Console(unittest.TestCase):
     def test_a_launch_by_id_prints_nothing(self):  # P2: muse_apps_launch, app.launch's job with a place
         self.run_case("launch_by_id_prints_nothing")
 
+    def test_a_launch_for_alarms_tells_the_app_task_what_came_of_it(self):  # D: started, failed or missing; a revoked launch runs nothing
+        self.run_case("launch_for_alarms_tells_the_app_task_what_came_of_it")
+
     def test_status_prints_the_record(self):  # E13: instructions; C3's trim; "ui_truncated"
         parsed = self.run_case("status_prints_the_record")
         status = [r[1] for r in parsed if r[0] == "result" and r[1]["op"] == "status"]

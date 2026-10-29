@@ -27,6 +27,7 @@
  */
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "lvgl.h"
@@ -62,6 +63,16 @@ bool muse_apps_console(const char *line);
  * be queued: one log line says why. apps_task_launch calls it for an app that isn't running.
  */
 bool muse_apps_launch(const char *id, bool front);
+
+/*
+ * muse_apps_launch for an app's alarms (apps_task.c's deliver_alarms asks, never waiting): always in front, and the job has an identity,
+ * upto, the gen of the last firing of the app that it was asked for (apps_alarm_wanted). The job, on the I/O worker, runs nothing when
+ * none of those firings waits by the time it comes to the front of the queue (they were told, cancelled or given up on); otherwise it
+ * runs the app through apps_task_run_for_alarm and tells the app task what came of it, whichever way it went
+ * (apps_task_alarm_launch_result: started, failed, or missing from the store). False, with nothing queued, for a launch that can't be
+ * queued (one log line says why), which the app task asks for again. upto is never 0.
+ */
+bool muse_apps_launch_alarm(const char *id, uint32_t upto);
 
 /* Makes the app layer on screen (apps_lv_build) and takes its touches and swipes. In build_overlays(), after the
  * page dots and before the downloaded image, under the display lock and before the frame timer exists. */

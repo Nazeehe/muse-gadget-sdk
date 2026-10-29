@@ -79,12 +79,16 @@
  * app's wall clock.
  *
  * The alarms. They are the system's (apps_alarm.h): the esp_timer task marks one fired, rings and wakes the screen, and posts
- * APPS_EV_ALARM with no payload and no wait (on_alarm_fired); the app task delivers on every round, whatever woke it
- * (deliver_alarms), so a post that finds the queue full loses nothing: the alarm keeps its slot in the table, and the loop
- * comes round at least once a second (C22). An alarm of the app that runs fronts it (request_front, C11) and calls alarm(name);
- * any other is a launch of that app (the I/O worker's job, C5: launch_id) that the alarm waits for, in its slot, until the app
- * runs, and then it is delivered as above, after start(). Launches go one app at a time, and give up after
- * APPS_TASK_ALARM_LAUNCH_MS: the alarm is dropped, with a log line (a ring it started ends).
+ * APPS_EV_ALARM with no payload and no wait (on_alarm_fired: once while the loop hasn't looked, and never into the last REQ_ROOM
+ * slots); the app task delivers on every round, whatever woke it (deliver_alarms), so a post that finds the queue full loses
+ * nothing: the alarm keeps its slot in the table, and the loop comes round at least once a second (C22). An alarm of the app that
+ * runs fronts it (request_front, C11) and calls alarm(name); any other is a launch of that app (the I/O worker's job, C5:
+ * muse_apps_launch_alarm) that the alarm waits for, in its slot, until the app runs, and then it is delivered as above, after
+ * start(). A launch has an identity, the gen of the last firing it was asked for, and the worker reports each outcome with a post
+ * (APPS_EV_ALARM_LAUNCH): one the worker refused is asked for again each second and given up after APPS_TASK_ALARM_REFUSED_MS, one it
+ * took is waited for until APPS_TASK_ALARM_BACKSTOP_MS, and a launch whose alarms are gone runs nothing. Every app's end tells the
+ * alarms (end_alarms): the ring ends with the app that was told it, and an app that its alarm launched and that crashed loses its
+ * alarms. What they record to log, the app task prints (drain_logs: in housekeeping and after each call, never inside one).
  */
 
 static const char *TAG = "muse_apps";
@@ -97,7 +101,6 @@ static const char *TAG = "muse_apps";
 #define APPS_TASK_PRIORITY 2       /* under the draw threads, at 3 */
 #define APPS_TASK_HUNG_PRIORITY 1  /* a hung call's: whatever it spins on, the rest comes first */
 #define APPS_TASK_CORE 1
-#define APPS_QUEUE_LEN 16
 #define CAPS_PSRAM (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 #define RECEIVE_MS 1000      /* C22: the loop comes round at least once a second */
@@ -109,6 +112,7 @@ static const char *TAG = "muse_apps";
 #define REFRESH_MS 1000      /* while an app runs, the record's log and dump are at most this old */
 #define SETTLE_MAX_MS 60000
 #define ALARM_RETRY_MS 1000  /* a launch the I/O worker refused is asked for again this much later */
+#define ALARM_PASSES 3       /* looks at the table in one round: another comes when telling an app ended it, or a launch was given up */
 #define FIRST_LINE_MAX 160   /* a crash card's line, and a failed run's */
 #define SHOWN_MAX 40         /* text an app supplied, as a message shows it (apps_ui.h) */
 #define WHAT_MAX (APPS_PATH_MAX + 32)
@@ -142,6 +146,7 @@ typedef struct {
     const char *event, *data;   /* a message's, in the block: NUL-terminated, data data_len bytes */
     size_t data_len;
     bool by_id;                 /* a run's: a launch by id, which fronts an app of pkg's id that runs (F10) */
+    uint32_t alarm_upto;        /* a run's: the identity of a launch for alarms (apps_alarm_wanted), or 0 */
     apps_status_t *st;          /* the caller's buffers */
     char *err;
     size_t err_len;
@@ -191,6 +196,7 @@ static record_t *s_rec;
 static StaticSemaphore_t s_rec_lock_buf, s_req_lock_buf, s_names_lock_buf;
 static SemaphoreHandle_t s_rec_lock, s_req_lock, s_names_lock;
 static atomic_bool s_launcher_wanted;  /* any task asks; the LVGL task shows it */
+static atomic_bool s_alarm_posted;     /* the esp_timer task posted APPS_EV_ALARM and the loop hasn't looked at the table since */
 
 /* ---- The app task's own ---- */
 
@@ -219,9 +225,14 @@ static struct {
     size_t warned;           /* the bytes of apps_rt_warnings that the record has taken; NO_WARNED until the run has taken
                               * main.lua's own, after start() */
     parked_t *parked;
-    char alarm_app[APPS_ID_MAX + 1];  /* the app a fired alarm waits for the launch of ("" for none) */
-    int64_t alarm_since, alarm_retry; /* when its launch was first asked for, and when it may be asked for again */
-    bool alarm_asked;                 /* the launch is queued: asked again only if the worker refused it */
+    /* The launch for alarms in flight (one app at a time): its app ("" for none), its identity (the gen of the last firing it was asked
+     * for, which apps_alarm_wanted answers for), when it was first asked for, when a refused one may be asked for again, and whether the
+     * worker took it (queued, since alarm_queued_at): then only its result, or the backstop, ends the wait. */
+    char alarm_app[APPS_ID_MAX + 1];
+    uint32_t alarm_upto;
+    int64_t alarm_since, alarm_retry, alarm_queued_at;
+    bool alarm_queued;
+    bool run_alarm;           /* the app that runs was launched for its alarms, and no delivery round has come since it began (P1) */
 } T;
 
 /* ---- The LVGL task's own ---- */
@@ -325,6 +336,14 @@ static uint32_t kb(size_t bytes) {
 
 static uint32_t now32(void) {
     return (uint32_t)apps_port_mono_ms();
+}
+
+/* What was recorded to be logged, printed by the app task outside any call (its wall clock must not run for the console, which
+ * another task's long reply can hold): the alarms' (what the esp_timer task did, and the calls that changed the table), then the
+ * apps' echo. */
+static void drain_logs(void) {
+    apps_alarm_log_drain();
+    apps_port_log_drain();
 }
 
 /* The LVGL task has run reset n, or a later one. */
@@ -606,6 +625,22 @@ static const char *const END_NAMES[] = {"stopped", "replaced", "exited", "crashe
 
 static void finish_run(void);
 
+/* What the app's end means to the system's alarms (apps_alarm.h), the app being the one in the record. An app that its alarm launched
+ * and that crashed (or hung) in start() or in the alarm() it was launched for loses every alarm it has (P1): it would arm its next in
+ * start() before it raised, and the alarm would launch it again, for ever. Then the end is told, with how, so that a ring ends with the
+ * app that was told it unless a firing with sound still waits. The window of the first closes with the app (and at the end of the
+ * first delivery round after the run, whichever comes first). */
+static void end_alarms(end_t how) {
+    const char *id = s_rec->st.id;
+    if (T.run_alarm && (how == END_CRASHED || how == END_HUNG)) {
+        apps_alarm_cancel_app(id, how == END_HUNG ? "hung when its alarm launched it" : "crashed when its alarm launched it");
+    }
+    T.run_alarm = false;
+    char why[24];
+    snprintf(why, sizeof why, "app %s", END_NAMES[how]);
+    apps_alarm_app_ended(id, why);
+}
+
 /* The time of the app's calls is counted by its runtime, in the windows of the duty cycle (whole seconds of apps_port_mono_ms:
  * apps_rt.h), where the same booking decides what is hot: cpu_pct is the share of the last whole window that its calls took. The
  * loop asks every round, at least once a second (C22), so an idle app's cpu_pct falls to 0 (and the windows that have ended are
@@ -638,7 +673,7 @@ static void call_finish(void) {
         T.worst_ms = took > UINT32_MAX ? UINT32_MAX : (uint32_t)took;
     }
     T.dirty = true;
-    apps_port_log_drain();  /* the call's echo, now that its wall clock has stopped */
+    drain_logs();  /* the call's echo, and the alarms' lines, now that its wall clock has stopped */
 }
 
 /* The hung app is gone: the task goes back to its priority and serves calls again. */
@@ -698,6 +733,7 @@ static void end_app(end_t how) {
     }
     ESP_LOGI(TAG, "stop %s: %s, peak %u KB, stack %u free", s_rec->st.id, END_NAMES[how], (unsigned)s_rec->st.peak_kb,
              (unsigned)s_rec->st.stack_free);
+    end_alarms(how);
     set_running(false);  /* the launcher lists it still while the store has it */
     apps_rt_free(T.rt);
     T.rt = NULL;
@@ -891,9 +927,10 @@ static void finish_run(void) {
 /*
  * A run, on the app task: apps_task_run's, with r waiting for the settle, and (Task 13 on) a launch's and the alarm
  * path's, with r NULL. It owns pkg. The current app ends first; the new one's table is published after start() once no
- * reset is outstanding; then the layer goes in front or behind.
+ * reset is outstanding; then the layer goes in front or behind. alarm: the app is launched for its alarms, whose delivery round
+ * (the one that follows this event) is the window in which its crash costs it its alarms (end_alarms).
  */
-static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms) {
+static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms, bool alarm) {
     end_app(END_REPLACED);
     if (r != NULL && !wanted(r)) {
         /* Its caller gave up while the old app ended (its stop() hung, or the waits ran long): the run is dropped, as from
@@ -904,6 +941,7 @@ static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms) {
         return;
     }
     begin_app(pkg);
+    T.run_alarm = alarm;
     T.pending = r;
     snprintf(T.what, sizeof T.what, "crashed loading %s", pkg->manifest.main);
     char err[512];
@@ -973,6 +1011,13 @@ static void on_run(req_t *r) {
         complete(r, false, NULL);
         return;
     }
+    if (r->alarm_upto != 0 && !apps_alarm_wanted(pkg->manifest.id, r->alarm_upto)) {
+        /* The alarms it was launched for were told, cancelled or given up on while it waited for the worker (or the worker loaded it):
+         * nothing is replaced for them, and no app comes to the front. */
+        free_pkg(pkg);
+        complete(r, false, APPS_TASK_ALARM_GONE);
+        return;
+    }
     if (r->by_id && app_runs(T.gen) && strcmp(T.pkg->manifest.id, pkg->manifest.id) == 0) {
         /* A launch by id of the app that runs by now (F10): fronted (or left where it is), not started again. */
         free_pkg(pkg);
@@ -982,7 +1027,7 @@ static void on_run(req_t *r) {
         complete(r, true, NULL);
         return;
     }
-    run_locked(pkg, r->front, r, r->settle_ms);
+    run_locked(pkg, r->front, r, r->settle_ms, r->alarm_upto != 0);
 }
 
 static void on_compile(req_t *r) {
@@ -1012,6 +1057,8 @@ static void on_message(req_t *r) {
     }
     complete_with(r, reply != NULL, reply != NULL ? NULL : err, reply);
 }
+
+static void on_alarm_launch(uint8_t outcome, uint32_t upto);
 
 static void handle(const apps_event_t *ev) {
     switch (ev->type) {
@@ -1051,6 +1098,9 @@ static void handle(const apps_event_t *ev) {
             end_app(END_EXITED);
         }
         break;
+    case APPS_EV_ALARM_LAUNCH:
+        on_alarm_launch(ev->code, ev->app_gen);
+        break;
     default:
         break;  /* WAKE: the round's housekeeping is the work. ALARM too: deliver_alarms, every round, is the delivery. */
     }
@@ -1059,8 +1109,8 @@ static void handle(const apps_event_t *ev) {
 /* ---- Alarms ---- */
 
 /* The alarm f is told to the app that runs (it checked): the alarm leaves its slot, the layer is asked to the front (after the
- * voice turn, if one is on), and alarm(name) is called, which is a call of the app like any other. When the app has crashed in
- * it, no one is left to stop a ring, so it ends. */
+ * voice turn, if one is on), and alarm(name) is called, which is a call of the app like any other. A crash in it ends the app as
+ * any crash does, and end_app tells the alarms (a ring ends with the app that was told it). */
 static void tell_alarm(const apps_alarm_fired_t *f) {
     if (!apps_alarm_take(f, true)) {
         return;  /* cancelled, replaced or given up on since it was copied: nothing to tell */
@@ -1068,93 +1118,158 @@ static void tell_alarm(const apps_alarm_fired_t *f) {
     request_front(true);
     call_begin();
     (void)apps_rt_alarm(T.rt, f->name);
-    if (!call_end()) {
-        apps_alarm_ring_end("alarm() crashed");
-    }
+    (void)call_end();
 }
 
-/* Alarms that waited for their app's launch have waited long enough: they are dropped (taken, not delivered), one log line each. */
-static void give_up_alarms(const apps_alarm_fired_t *due, bool *done, int from, int n) {
-    for (int j = from; j < n; j++) {
-        if (!done[j] && strcmp(due[j].app, due[from].app) == 0) {
-            done[j] = true;
-            if (apps_alarm_take(&due[j], false)) {
-                ESP_LOGW(TAG, "alarm %s: %s did not start within %d ms: dropped", due[j].name, due[j].app,
-                         APPS_TASK_ALARM_LAUNCH_MS);
-            }
-        }
-    }
+/* Whether gen is later than upto (both are firings' gens, which wrap: compared as a difference). */
+static bool gen_after(uint32_t gen, uint32_t upto) {
+    return (int32_t)(gen - upto) > 0;
+}
+
+static void alarm_launch_clear(void) {
     T.alarm_app[0] = '\0';
+    T.alarm_upto = 0;
+    T.alarm_queued = false;
 }
 
-/*
- * Every round: the fired alarms (apps_alarm_fired, which copies and changes nothing, after a lock-free look at the pending word)
- * of the app that runs are delivered, earliest first. For the others a launch is asked for, one app at a time: the first alarm
- * whose app doesn't run starts it (launch_id: fronted, from the store, through the I/O worker), and the alarms of every other
- * app wait their turn, all of them in their slots. When the app is up it is the app that runs, and its alarms are delivered by the
- * rule above, after start(): in the same round as the run, whose event this loop handled just before. A launch that isn't up
- * within APPS_TASK_ALARM_LAUNCH_MS gives up its alarms (give_up_alarms), and one the worker refused is asked again each second
- * until then. The worker tells when the store has no such app (apps_task_launch_missing).
- */
-static void deliver_alarms(void) {
-    if (!apps_alarm_pending()) {
-        T.alarm_app[0] = '\0';
-        return;
-    }
+typedef enum { DROP_MISSING, DROP_FAILED, DROP_REFUSED, DROP_BACKSTOP } drop_t;
+
+/* The firings of app that a launch was asked for (gens up to upto) are given up on: taken and not delivered, one log line each,
+ * and a ring they started ends if nothing else could stop it (apps_alarm_take). A firing later than the launch's is not its own. */
+static void drop_alarms(const char *app, uint32_t upto, drop_t why) {
     apps_alarm_fired_t due[APPS_ALARMS_MAX];
-    bool done[APPS_ALARMS_MAX] = {false};
     int n = apps_alarm_fired(due, APPS_ALARMS_MAX);
-    bool waiting = false;  /* an alarm of the app being launched is still in its slot */
     for (int i = 0; i < n; i++) {
-        if (done[i]) {
+        if (strcmp(due[i].app, app) != 0 || gen_after(due[i].gen, upto) || !apps_alarm_take(&due[i], false)) {
             continue;
         }
+        switch (why) {
+        case DROP_MISSING:
+            ESP_LOGW(TAG, "alarm %s for missing app %s", due[i].name, app);
+            break;
+        case DROP_FAILED:
+            ESP_LOGW(TAG, "alarm %s: %s did not start: dropped", due[i].name, app);
+            break;
+        case DROP_REFUSED:
+            ESP_LOGW(TAG, "alarm %s: %s did not start within %d ms: dropped", due[i].name, app, APPS_TASK_ALARM_REFUSED_MS);
+            break;
+        case DROP_BACKSTOP:
+            ESP_LOGW(TAG, "alarm %s: %s did not start within %d ms: dropped", due[i].name, app, APPS_TASK_ALARM_BACKSTOP_MS);
+            break;
+        }
+    }
+}
+
+/* The worker's report on the launch with identity upto (APPS_EV_ALARM_LAUNCH). One for a launch that isn't the one in flight (it was
+ * given up on, or its alarms went, and another began) says nothing to this task. */
+static void on_alarm_launch(uint8_t outcome, uint32_t upto) {
+    if (T.alarm_app[0] == '\0' || T.alarm_upto != upto) {
+        return;
+    }
+    char app[APPS_ID_MAX + 1];
+    snprintf(app, sizeof app, "%s", T.alarm_app);
+    alarm_launch_clear();
+    if (outcome == APPS_ALARM_LAUNCH_MISSING) {
+        drop_alarms(app, upto, DROP_MISSING);
+    } else if (outcome == APPS_ALARM_LAUNCH_FAILED) {
+        drop_alarms(app, upto, DROP_FAILED);
+    }  /* started: the app runs, and the next delivery tells it (it may have, already) */
+}
+
+/* A launch for the alarms of due[first]'s app begins: its identity is the latest firing of that app in the copy. */
+static void begin_launch(const apps_alarm_fired_t *due, int n, int first, int64_t now) {
+    put_text(T.alarm_app, sizeof T.alarm_app, due[first].app);
+    T.alarm_upto = due[first].gen;
+    for (int j = first + 1; j < n; j++) {
+        if (strcmp(due[j].app, T.alarm_app) == 0 && gen_after(due[j].gen, T.alarm_upto)) {
+            T.alarm_upto = due[j].gen;
+        }
+    }
+    T.alarm_since = now;
+    T.alarm_retry = 0;
+    T.alarm_queued = false;
+}
+
+/* One look at the firings, earliest first. Those of the app that runs are told. For the others a launch is asked for, one app at a
+ * time (the first firing whose app doesn't run begins it; the other apps wait their turn, all of them in their slots): the I/O worker
+ * loads the app and runs it in front (muse_apps_launch_alarm), and its report ends the wait. A launch the worker refused is asked
+ * for again ALARM_RETRY_MS after, and given up on after APPS_TASK_ALARM_REFUSED_MS; one it took is waited for until the backstop.
+ * True when the table should be looked at again: telling a firing ended the app (what that cancelled is not asked for), or a launch
+ * was given up (the next firing begins its own). */
+static bool deliver_pass(void) {
+    apps_alarm_fired_t due[APPS_ALARMS_MAX];
+    int n = apps_alarm_fired(due, APPS_ALARMS_MAX);
+    int64_t now = apps_port_mono_ms();
+    bool waiting = false;  /* a firing of the app being launched for is still in its slot */
+    for (int i = 0; i < n; i++) {
         if (app_runs(T.gen) && strcmp(T.pkg->manifest.id, due[i].app) == 0) {
-            done[i] = true;
+            uint32_t gen = T.gen;
             tell_alarm(&due[i]);
+            if (!app_runs(gen)) {
+                return true;
+            }
             continue;
         }
         if (T.alarm_app[0] != '\0' && strcmp(T.alarm_app, due[i].app) != 0) {
             continue;  /* another app's launch goes first */
         }
-        int64_t now = apps_port_mono_ms();
         if (T.alarm_app[0] == '\0') {
-            put_text(T.alarm_app, sizeof T.alarm_app, due[i].app);
-            T.alarm_since = now;
-            T.alarm_retry = 0;
-            T.alarm_asked = false;
-        }
-        if (now - T.alarm_since > APPS_TASK_ALARM_LAUNCH_MS) {
-            give_up_alarms(due, done, i, n);
-            continue;
+            begin_launch(due, n, i, now);
         }
         waiting = true;
-        if (!T.alarm_asked && now >= T.alarm_retry) {  /* the first time at once, and again no sooner than ALARM_RETRY_MS after a refusal */
-            T.alarm_asked = launch_id(due[i].app, true);
+        if (T.alarm_queued) {
+            if (now - T.alarm_queued_at > APPS_TASK_ALARM_BACKSTOP_MS) {
+                drop_alarms(T.alarm_app, T.alarm_upto, DROP_BACKSTOP);
+                alarm_launch_clear();
+                return true;
+            }
+        } else if (now - T.alarm_since > APPS_TASK_ALARM_REFUSED_MS) {
+            drop_alarms(T.alarm_app, T.alarm_upto, DROP_REFUSED);
+            alarm_launch_clear();
+            return true;
+        } else if (now >= T.alarm_retry) {  /* the first time at once, and again no sooner than ALARM_RETRY_MS after a refusal */
+            T.alarm_queued = muse_apps_launch_alarm(T.alarm_app, T.alarm_upto);
+            T.alarm_queued_at = now;
             T.alarm_retry = now + ALARM_RETRY_MS;
         }
     }
     if (!waiting) {
-        T.alarm_app[0] = '\0';
+        alarm_launch_clear();
+    }
+    return false;
+}
+
+/*
+ * Every round: the fired alarms (apps_alarm_fired, which copies and changes nothing, after a lock-free look at the pending word)
+ * are looked at as deliver_pass says, at most ALARM_PASSES times. The flag that the esp_timer task's post sets is cleared first,
+ * before the table is read, so a firing that comes after the look posts again, and one that came before it is seen by the look.
+ */
+static void deliver_alarms(void) {
+    atomic_store(&s_alarm_posted, false);
+    for (int pass = 0; pass < ALARM_PASSES; pass++) {
+        if (!apps_alarm_pending()) {
+            alarm_launch_clear();
+            return;
+        }
+        if (!deliver_pass()) {
+            return;
+        }
     }
 }
 
 /* The esp_timer task's (apps_alarm_set_fired_cb): an alarm fired. It posts, with no wait and no payload, to bring the loop round
- * at once; a full queue loses nothing, as the alarm stays in its slot for the round that comes within a second. */
+ * at once, and only one is on its way at a time (a flood of firings is one post: the loop's next look finds them all). It leaves the
+ * queue's last REQ_ROOM slots to requests, as a touch does; a post that doesn't go in loses nothing, as the alarm stays in its slot
+ * for the round that comes within a second, and the next firing may post again. */
 static void on_alarm_fired(const char *app, const char *name) {
     (void)app;
     (void)name;
+    if (atomic_exchange(&s_alarm_posted, true)) {
+        return;
+    }
     apps_event_t ev = {.type = APPS_EV_ALARM};
-    (void)xQueueSend(s_queue, &ev, 0);
-}
-
-void apps_task_launch_missing(const char *id) {
-    apps_alarm_fired_t due[APPS_ALARMS_MAX];
-    int n = id != NULL && apps_alarm_pending() ? apps_alarm_fired(due, APPS_ALARMS_MAX) : 0;
-    for (int i = 0; i < n; i++) {
-        if (strcmp(due[i].app, id) == 0 && apps_alarm_take(&due[i], false)) {
-            ESP_LOGW(TAG, "alarm %s for missing app %s", due[i].name, id);
-        }
+    if (!(uxQueueSpacesAvailable(s_queue) > REQ_ROOM && xQueueSend(s_queue, &ev, 0) == pdTRUE)) {
+        atomic_store(&s_alarm_posted, false);
     }
 }
 
@@ -1172,7 +1287,7 @@ static void housekeeping(void) {
     if (T.rt != NULL && T.dirty && apps_port_mono_ms() >= T.refresh_at) {
         refresh_record();
     }
-    apps_port_log_drain();
+    drain_logs();
 }
 
 /* How long the loop waits for an event: until the pending run settles or the app's earliest timer is due, and never more
@@ -1233,6 +1348,7 @@ static void apps_task(void *arg) {
             handle(&ev);
         }
         deliver_alarms();
+        T.run_alarm = false;  /* the delivery round that followed a run for alarms is over: a crash from here on is only a crash */
         run_timers();
     }
 }
@@ -1581,8 +1697,8 @@ static bool await(req_t *r, int64_t until, int ms, char *err, size_t err_len) {
     }
 }
 
-static bool run_request(apps_pkg_t *pkg, bool front, bool by_id, int settle_ms, apps_status_t *st, char *err,
-                        size_t err_len) {
+static bool run_request(apps_pkg_t *pkg, bool front, bool by_id, uint32_t alarm_upto, int settle_ms, apps_status_t *st,
+                        char *err, size_t err_len) {
     put_text(err, err_len, "");
     if (pkg == NULL) {
         put_text(err, err_len, "no package to run");
@@ -1604,6 +1720,7 @@ static bool run_request(apps_pkg_t *pkg, bool front, bool by_id, int settle_ms, 
     r->pkg = pkg;
     r->front = front;
     r->by_id = by_id;
+    r->alarm_upto = alarm_upto;
     r->settle_ms = settle_ms < 0 ? 0 : settle_ms > SETTLE_MAX_MS ? SETTLE_MAX_MS : settle_ms;
     r->st = st;
     r->err = err;
@@ -1629,11 +1746,29 @@ static bool run_request(apps_pkg_t *pkg, bool front, bool by_id, int settle_ms, 
 }
 
 bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
-    return run_request(pkg, front, false, settle_ms, st, err, err_len);
+    return run_request(pkg, front, false, 0, settle_ms, st, err, err_len);
 }
 
 bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
-    return run_request(pkg, front, true, settle_ms, st, err, err_len);
+    return run_request(pkg, front, true, 0, settle_ms, st, err, err_len);
+}
+
+bool apps_task_run_for_alarm(apps_pkg_t *pkg, uint32_t upto, apps_status_t *st, char *err, size_t err_len) {
+    return run_request(pkg, true, true, upto, 0, st, err, err_len);
+}
+
+void apps_task_alarm_launch_result(uint32_t upto, apps_alarm_launch_t outcome) {
+    if (!atomic_load(&s_up) || upto == 0 || xTaskGetCurrentTaskHandle() == s_task) {
+        return;
+    }
+    apps_event_t ev = {.type = APPS_EV_ALARM_LAUNCH, .code = (uint8_t)outcome, .app_gen = upto};
+    int64_t until = apps_port_mono_ms() + APPS_TASK_WAIT_MS;
+    while (xQueueSend(s_queue, &ev, pdMS_TO_TICKS(POLL_MS)) != pdTRUE) {
+        if (atomic_load(&s_rec->hung) || apps_port_mono_ms() >= until) {
+            ESP_LOGW(TAG, "the app task's queue is full: a launch's result is lost (its alarms are given up on later)");
+            return;
+        }
+    }
 }
 
 static void add_code(req_t *r, char **at, const apps_blob_t *b) {

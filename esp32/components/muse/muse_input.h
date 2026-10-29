@@ -91,7 +91,8 @@ void muse_input_touch_talk(bool pressed);
  * block, so this records why and notifies the input task and returns. The input task wakes the screen on its next pass (at
  * once, if it waits for a button) and pokes the idle timer, so the screen stays on a while: the log says "waking (<why>)"
  * when it was asleep. It is read later, by that task: why is a string that stays (a literal), NULL for "wake". Asked twice
- * before the input task looks, one wake is made with the last why.
+ * before the input task looks, one wake is made with the last why. Defined only in a build with CONFIG_MUSE_APPS (the alarms of
+ * Muse apps are what calls it).
  */
 void muse_input_wake(const char *why);
 

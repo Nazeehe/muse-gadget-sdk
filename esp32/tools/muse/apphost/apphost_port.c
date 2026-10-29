@@ -21,8 +21,8 @@
  * is, and time stands still inside a call, so the VM's wall-clock backstop (APPS_WALL_MS) never fires and a runaway app is
  * stopped by its instruction budget alone, the same way on every run. The monotonic clock starts at FAKE_MONO_MS; the wall
  * clock is unset until a script syncs it (as on the gadget before SNTP), and then moves with the monotonic one. The
- * screen is lit until a script says it is dark. The alarms (the system's, as apps_alarm.c is on the gadget) are on the same
- * clock.
+ * screen is lit until a script says it is dark. The alarms (the system's: apps_alarm.c itself, over the fakes of apphost_esp.c) are on
+ * the same clock.
  *
  * The heap is malloc with a header that records each block's size, so that apphost can say how many bytes the
  * apps' heap holds (apphost_heap_held): a leak check that needs no LeakSanitizer, which macOS doesn't have.
@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "apphost_esp.h"
 #include "apphost_port.h"
 #include "apps_alarm.h"
 #include "apps_port.h"
@@ -85,140 +86,38 @@ void apphost_set_dark(bool dark) {
 
 /* ---- The system's alarms and sound ---- */
 
-/* The table of apps_alarm.c, without its timers: an alarm is due when the clock reaches it, and apphost.c asks after each step. */
-typedef struct {
-    bool used, sound, wake;
-    char app[APPS_ID_MAX + 1];
-    char name[APPS_ALARM_NAME_MAX + 1];
-    int64_t due_ms;
-    uint64_t order;  /* armed in this order: of two due together the first runs first */
-} alarm_t;
-
-static alarm_t alarms[APPS_ALARMS_MAX];
-static uint64_t alarm_order;
+/* The table is apps_alarm.c's (see apphost_port.h): what the Lua bindings ask of the port goes to it, and the ring is told to the sink. */
 static const apphost_sound_t *sound_sink;
-static bool ringing;
-static int64_t ring_end_ms;
+static bool ring_shown;
 
-static bool name_valid(const char *name) {
-    size_t n = name != NULL ? strlen(name) : 0;
-    for (size_t i = 0; i < n; i++) {
-        bool ok = (name[i] >= 'a' && name[i] <= 'z') || (name[i] >= '0' && name[i] <= '9') || name[i] == '_';
-        if (!ok) {
-            return false;
-        }
-    }
-    return n >= 1 && n <= APPS_ALARM_NAME_MAX;
-}
-
-static alarm_t *find_alarm(const char *app, const char *name) {
-    for (int i = 0; i < APPS_ALARMS_MAX; i++) {
-        if (alarms[i].used && strcmp(alarms[i].app, app) == 0 && strcmp(alarms[i].name, name) == 0) {
-            return &alarms[i];
-        }
-    }
-    return NULL;
-}
-
-static bool runs_first(const alarm_t *a, const alarm_t *b) {
-    return a->due_ms < b->due_ms || (a->due_ms == b->due_ms && a->order < b->order);
-}
-
-bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
-    size_t app_len = app != NULL ? strlen(app) : 0;
-    if (app_len < 1 || app_len > APPS_ID_MAX || !name_valid(name) || ms < 1 || ms > APPS_ALARM_MAX_MS) {
-        return false;
-    }
-    alarm_t *a = find_alarm(app, name);
-    if (a == NULL) {
-        int mine = 0;
-        for (int i = 0; i < APPS_ALARMS_MAX; i++) {
-            mine += alarms[i].used && strcmp(alarms[i].app, app) == 0 ? 1 : 0;
-            a = a == NULL && !alarms[i].used ? &alarms[i] : a;
-        }
-        if (mine >= APPS_ALARMS_PER_APP || a == NULL) {
-            return false;
-        }
-    }
-    *a = (alarm_t){.used = true, .sound = sound, .wake = wake, .due_ms = mono_ms + ms, .order = ++alarm_order};
-    snprintf(a->app, sizeof a->app, "%s", app);
-    snprintf(a->name, sizeof a->name, "%s", name);
-    return true;
+apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    return apps_alarm_arm(app, name, ms, sound, wake);
 }
 
 void apps_port_alarm_cancel(const char *app, const char *name) {
-    alarm_t *a = name_valid(name) ? find_alarm(app, name) : NULL;
-    if (a != NULL) {
-        a->used = false;
-    }
+    apps_alarm_cancel(app, name);
+    apphost_ring_sync();  /* a firing that waits is dropped with it, and a ring it started may end */
 }
 
 int64_t apps_port_alarm_remaining(const char *app, const char *name) {
-    const alarm_t *a = name_valid(name) ? find_alarm(app, name) : NULL;
-    if (a == NULL) {
-        return -1;
-    }
-    return a->due_ms > mono_ms ? a->due_ms - mono_ms : 0;
+    return apps_alarm_remaining(app, name);
 }
 
 int apps_port_alarm_list(const char *app, char names[4][24], int64_t remaining[4]) {
-    const alarm_t *mine[APPS_ALARMS_PER_APP];
-    int n = 0;
-    for (int i = 0; i < APPS_ALARMS_MAX && n < APPS_ALARMS_PER_APP; i++) {
-        if (alarms[i].used && strcmp(alarms[i].app, app) == 0) {
-            int at = n++;
-            for (; at > 0 && runs_first(&alarms[i], mine[at - 1]); at--) {
-                mine[at] = mine[at - 1];
-            }
-            mine[at] = &alarms[i];
-        }
-    }
-    for (int i = 0; i < n; i++) {
-        snprintf(names[i], 24, "%s", mine[i]->name);
-        remaining[i] = mine[i]->due_ms > mono_ms ? mine[i]->due_ms - mono_ms : 0;
-    }
-    return n;
+    return apps_alarm_list(app, names, remaining);
 }
 
 void apphost_set_sound(const apphost_sound_t *sink) {
     sound_sink = sink;
 }
 
-bool apphost_alarm_next_due(apphost_alarm_t *out) {
-    alarm_t *pick = NULL;
-    for (int i = 0; i < APPS_ALARMS_MAX; i++) {
-        if (alarms[i].used && alarms[i].due_ms <= mono_ms && (pick == NULL || runs_first(&alarms[i], pick))) {
-            pick = &alarms[i];
-        }
-    }
-    if (pick == NULL) {
-        return false;
-    }
-    snprintf(out->app, sizeof out->app, "%s", pick->app);
-    snprintf(out->name, sizeof out->name, "%s", pick->name);
-    out->sound = pick->sound;
-    out->wake = pick->wake;
-    pick->used = false;
-    return true;
-}
-
-static void set_ringing(bool on) {
-    if (ringing != on) {
-        ringing = on;
+void apphost_ring_sync(void) {
+    bool on = apps_alarm_ringing();
+    if (on != ring_shown) {
+        ring_shown = on;
         if (sound_sink != NULL && sound_sink->ring != NULL) {
             sound_sink->ring(on);
         }
-    }
-}
-
-void apphost_ring(void) {
-    ring_end_ms = mono_ms + APPS_RING_MAX_MS;
-    set_ringing(true);
-}
-
-void apphost_ring_tick(void) {
-    if (ringing && mono_ms >= ring_end_ms) {
-        set_ringing(false);
     }
 }
 
@@ -229,8 +128,18 @@ void apps_port_sound_chirp(void) {
 }
 
 void apps_port_sound_stop(void) {
-    set_ringing(false);
+    apps_alarm_ring_stop();
+    apphost_ring_sync();
 }
+
+/* What an alarm asks of the rest of the gadget (apps_alarm.c calls them from its timer): the screen wakes, which here is lit; the voice
+ * task's chirp for the ring has no counterpart (the ring is an event, and a chirp is the app's own sound.chirp). */
+void muse_input_wake(const char *why) {
+    (void)why;
+    apphost_set_dark(false);
+}
+
+void muse_voice_request_chirp(void) {}
 
 static bool ui_locked;
 static unsigned long ui_takes;

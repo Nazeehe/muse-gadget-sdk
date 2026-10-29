@@ -130,13 +130,13 @@ bool apps_port_dark(void) {
 }
 
 /* The system's alarms and sound (apps_port.h): none here, as no case runs an app's alarm. */
-bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
     (void)app;
     (void)name;
     (void)ms;
     (void)sound;
     (void)wake;
-    return false;
+    return APPS_ALARM_REFUSED;
 }
 
 void apps_port_alarm_cancel(const char *app, const char *name) {

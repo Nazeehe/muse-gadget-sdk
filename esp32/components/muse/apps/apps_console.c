@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "apps_alarm.h"
 #include "apps_install.h"
 #include "apps_io.h"
 #include "apps_port.h"
@@ -74,6 +75,7 @@ typedef struct {
     bool run;        /* a commit's "run" */
     bool front;      /* a launch's place */
     bool print;      /* a launch the console asked for: it settles, and its result is printed */
+    uint32_t alarm_upto;  /* a launch for an app's alarms: its identity (apps_alarm_wanted), and the app task is told what came of it; else 0 */
     stage_t *stage;
     char why[192];   /* a launch's failure, said once (a frame keeps no array over 128 bytes) */
 } job_t;
@@ -556,9 +558,16 @@ static void commit(const char *args) {
 
 /* The store's copy of job->id, run. The console's (R13.5) runs it through apps_task_run in front, settles and prints its
  * result; anyone else's (muse_apps_launch) runs it by id where it was asked to, with no settle, and says only a failure,
- * in one log line. */
+ * in one log line. A launch for an app's alarms (muse_apps_launch_alarm) first asks whether any of the firings it was for still
+ * waits (it may have waited behind a long job of this worker): when none does it is skipped, and nothing is loaded or replaced.
+ * Otherwise it runs the app in front through apps_task_run_for_alarm, and tells the app task what came of it, whichever way
+ * it went (apps_task_alarm_launch_result): the app task never waits for this worker. */
 static void launch_job(void *arg) {
     job_t *job = arg;
+    if (job->alarm_upto != 0 && !apps_alarm_wanted(job->id, job->alarm_upto)) {
+        apps_port_free(job);
+        return;
+    }
     apps_pkg_t *pkg = apps_port_realloc(NULL, sizeof *pkg);
     snprintf(job->why, sizeof job->why, "out of memory: no room to load the app");
     if (pkg != NULL && apps_ram_load(job->id, pkg, job->why, sizeof job->why)) {
@@ -566,6 +575,16 @@ static void launch_job(void *arg) {
             cJSON *r = apps_install_launch(pkg, &USB_OPS);  /* it takes the copy: the app task frees it */
             print_result("launch", job->id, r);
             cJSON_Delete(r);
+        } else if (job->alarm_upto != 0) {
+            bool ok = apps_task_run_for_alarm(pkg, job->alarm_upto, NULL, job->why, sizeof job->why);  /* it takes it too */
+            if (!ok && strcmp(job->why, APPS_TASK_ALARM_GONE) == 0) {
+                apps_port_free(job);  /* its alarms went while it was loaded: nothing ran, and nothing waits to be told */
+                return;
+            }
+            if (!ok) {
+                ESP_LOGW(TAG, "launch %s: %s", job->id, job->why);
+            }
+            apps_task_alarm_launch_result(job->alarm_upto, ok ? APPS_ALARM_LAUNCH_STARTED : APPS_ALARM_LAUNCH_FAILED);
         } else if (!apps_task_run_by_id(pkg, job->front, 0, NULL, job->why, sizeof job->why)) {  /* it takes it too */
             ESP_LOGW(TAG, "launch %s: %s", job->id, job->why);
         }
@@ -576,8 +595,8 @@ static void launch_job(void *arg) {
         } else {
             ESP_LOGW(TAG, "launch %s: %s", job->id, job->why);
         }
-        if (!apps_ram_has(job->id)) {
-            apps_task_launch_missing(job->id);  /* the alarms that fired for it and wait for this launch are given up */
+        if (job->alarm_upto != 0) {  /* the alarms that fired for it are given up on: the store has no such app, or it can't be loaded now */
+            apps_task_alarm_launch_result(job->alarm_upto, apps_ram_has(job->id) ? APPS_ALARM_LAUNCH_FAILED : APPS_ALARM_LAUNCH_MISSING);
         }
     }
     apps_port_free(job);
@@ -615,7 +634,8 @@ static void launch(const char *args) {
     }
 }
 
-bool muse_apps_launch(const char *id, bool front) {
+/* Queues the launch of id (by id, nothing printed), for an app's alarms when upto is not 0. */
+static bool queue_launch(const char *id, bool front, uint32_t upto) {
     if (id == NULL || !apps_id_valid(id)) {
         ESP_LOGW(TAG, "launch: not an app id");
         return false;
@@ -625,11 +645,20 @@ bool muse_apps_launch(const char *id, bool front) {
         ESP_LOGW(TAG, "launch %s: out of memory: no room for the launch", id);
         return false;
     }
+    job->alarm_upto = upto;
     if (!apps_io_submit(launch_job, job)) {  /* it says why, in one log line */
         apps_port_free(job);
         return false;
     }
     return true;
+}
+
+bool muse_apps_launch(const char *id, bool front) {
+    return queue_launch(id, front, 0);
+}
+
+bool muse_apps_launch_alarm(const char *id, uint32_t upto) {
+    return upto != 0 && queue_launch(id, true, upto);
 }
 
 static bool no_args(const char *op, const char *args) {

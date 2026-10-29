@@ -62,6 +62,7 @@ static atomic_bool task_self_set;
 static uint64_t sync_asked, sync_done;
 static esp_timer_handle_t call_pending;  /* fake_esp_timer_call's timer, until its callback has run */
 static bool behind_next_stop;            /* fake_esp_timer_start_behind_next_stop's */
+static int timers_limit = TIMERS_MAX;    /* fake_esp_timer_set_limit's: how many timers esp_timer_create makes */
 
 static void fail(const char *what) {
     fprintf(stderr, "FAIL the fake esp_timer: %s\n", what);
@@ -129,9 +130,9 @@ esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle
         return ESP_ERR_INVALID_ARG;
     }
     pthread_mutex_lock(&mu);
-    if (n_timers == TIMERS_MAX) {
+    if (n_timers >= timers_limit) {
         pthread_mutex_unlock(&mu);
-        return ESP_ERR_NO_MEM;
+        return ESP_ERR_NO_MEM;  /* the esp_timer task's own memory is internal RAM, which can run out */
     }
     struct fake_esp_timer *t = &timers[n_timers++];
     memset(t, 0, sizeof *t);
@@ -266,6 +267,12 @@ int64_t fake_esp_timer_next_due_us(void) {
     }
     pthread_mutex_unlock(&mu);
     return next;
+}
+
+void fake_esp_timer_set_limit(int max_timers) {
+    pthread_mutex_lock(&mu);
+    timers_limit = max_timers < TIMERS_MAX ? max_timers : TIMERS_MAX;
+    pthread_mutex_unlock(&mu);
 }
 
 void fake_esp_timer_start_behind_next_stop(void) {

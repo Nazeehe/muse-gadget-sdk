@@ -228,10 +228,10 @@ static struct {
     int64_t ms;
     bool sound, wake;
     int arms, cancels, asks, lists, stops, chirps;
-    bool answer;
+    apps_alarm_result_t answer;
 } alarm_calls;
 
-bool apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+apps_alarm_result_t apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
     snprintf(alarm_calls.app, sizeof alarm_calls.app, "%s", app);
     snprintf(alarm_calls.name, sizeof alarm_calls.name, "%s", name);
     alarm_calls.ms = ms;
@@ -657,15 +657,18 @@ static void the_wall_clock_counts_when_the_helper_says(void) {
 /* The alarms and the sound are other modules' (apps_alarm.c, the voice task): the port passes what it is given on, and what it is
  * told back, and a chirp is the voice task's request and a stop is the ring's. */
 static void alarms_and_sound_go_to_their_owners(void) {
-    alarm_calls.answer = true;
-    CHECK(apps_port_alarm_arm("clock", "wake_up", 90000, true, false) && alarm_calls.arms == 1, "arm");
+    alarm_calls.answer = APPS_ALARM_ARMED;
+    CHECK(apps_port_alarm_arm("clock", "wake_up", 90000, true, false) == APPS_ALARM_ARMED && alarm_calls.arms == 1, "arm");
     CHECK(strcmp(alarm_calls.app, "clock") == 0 && strcmp(alarm_calls.name, "wake_up") == 0 && alarm_calls.ms == 90000 &&
               alarm_calls.sound && !alarm_calls.wake,
           "arm passed %s/%s %lld %d %d", alarm_calls.app, alarm_calls.name, (long long)alarm_calls.ms, alarm_calls.sound,
           alarm_calls.wake);
-    alarm_calls.answer = false;
-    CHECK(!apps_port_alarm_arm("clock", "x", 1, false, true) && alarm_calls.arms == 2 && !alarm_calls.sound && alarm_calls.wake,
+    alarm_calls.answer = APPS_ALARM_REFUSED;
+    CHECK(apps_port_alarm_arm("clock", "x", 1, false, true) == APPS_ALARM_REFUSED && alarm_calls.arms == 2 && !alarm_calls.sound &&
+              alarm_calls.wake,
           "a refusal is told");
+    alarm_calls.answer = APPS_ALARM_NO_MEMORY;  /* and so is the other kind of refusal (G): the binding says which */
+    CHECK(apps_port_alarm_arm("clock", "y", 1, true, true) == APPS_ALARM_NO_MEMORY && alarm_calls.arms == 3, "a want of memory is told"); 
     apps_port_alarm_cancel("clock", "wake_up");
     CHECK(alarm_calls.cancels == 1 && strcmp(alarm_calls.name, "wake_up") == 0, "cancel");
     CHECK(apps_port_alarm_remaining("clock", "t") == 4321 && alarm_calls.asks == 1 && strcmp(alarm_calls.name, "t") == 0, "remaining");

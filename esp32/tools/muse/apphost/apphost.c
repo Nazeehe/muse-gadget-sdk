@@ -36,7 +36,11 @@
  * Output is one JSON object a line on stdout, flushed as it is written, whatever the app printed or raised:
  * every string is escaped, and bytes that aren't valid UTF-8 come out as U+FFFD.
  *   {"event":"warning","message":"…"}      a manifest or runtime warning (each one, split at "; "), at launch, and the
- *                                          runtime's that come later (the CPU duty cycle's), as they come
+ *                                          runtime's that come later (the CPU duty cycle's), as they come; and a warning
+ *                                          the alarm table logs (apps_alarm.c: the same table the gadget runs, over fakes
+ *                                          of esp_timer, its lock and its log), which is the gadget's own line: the alarms
+ *                                          of an app cancelled because it crashed in the start() or the alarm() its alarm
+ *                                          launched, or fired more than 6 in a minute
  *   {"event":"started","id":"…","name":"…"}   the app is running: at launch, and for each `start` that returns
  *   {"event":"log","app":"…","line":"…"}     a line the app printed, as it is printed; and the lines of `log`
  *   {"event":"reply","data":<json>}        what message() returned
@@ -52,8 +56,10 @@
  *   {"event":"alarm","name":"t","sound":true,"wake":true}
  *                                          an alarm of the app came due, as the system fires it: before the ring, the screen
  *                                          and the app's own alarm(name), which follow
- *   {"event":"ring","on":true}             the ring began (an alarm with sound fired and none was ringing), or ended:
- *                                          sound.stop, a minute after the last alarm with sound, or never if nothing rang
+ *   {"event":"ring","on":true}             the ring began (an alarm with sound fired and none was ringing), or ended, as the
+ *                                          gadget's ring does: sound.stop, a minute after the last alarm with sound, or when
+ *                                          nothing is left that could stop it (the app that was told the ring was stopped or
+ *                                          crashed, and no alarm with sound waits to be told); never if nothing rang
  *   {"event":"chirp"}                      sound.chirp()
  *   {"event":"dump","widgets":[...]}       the `dump` command: one object an alive widget (apps_ui.h), with
  *                                          "dropped":N after them when N didn't fit the size asked for
@@ -83,7 +89,9 @@
  *                          step the alarms that are due fire first (below), and a ring whose minute is over ends. An alarm
  *                          is the system's (apps_alarm.h): the app's stop doesn't disarm it, and when one fires, an app that
  *                          doesn't run is launched again (a new runtime, as on the gadget: main.lua's top level runs, then
- *                          start() and its `started` event), then alarm(name) is called.
+ *                          start() and its `started` event), then alarm(name) is called. An app that such a launch finds
+ *                          crashing, in start() or in the alarm(name) it was launched for, loses every alarm it has, and one
+ *                          that fires more than 6 in a minute loses them too (apps_alarm.h): the table is the gadget's.
  *   dark on | dark off     the screen goes dark (no timer runs) or wakes; nothing runs at once. An alarm with wake wakes it
  *   sync EPOCH_MS          the wall clock is set (to 2025 or later, in ms since 1970, as SNTP sets the gadget's), and moves
  *                          with the monotonic clock from then on. Unset, time.now() is nil. The time zone is UTC0.
@@ -127,7 +135,9 @@
 #include <string.h>
 #include <time.h>
 
+#include "apphost_esp.h"
 #include "apphost_port.h"
+#include "apps_alarm.h"
 #include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
@@ -241,6 +251,15 @@ static void emit_ring(bool on) {
 }
 
 static const apphost_sound_t SOUND_EVENTS = {.chirp = emit_chirp, .ring = emit_ring};
+
+/* What the alarm table logs (apps_alarm.c, through apphost_esp.h's log): the warnings and errors are events, since they are what
+ * the gadget's console shows someone who watches it; the rest of its lines (a firing, a chirp, the ring's end) are events of their own
+ * here, or nothing. */
+static void emit_esp_log(char level, const char *text) {
+    if (level == 'W' || level == 'E') {
+        emit_text("warning", text);
+    }
+}
 
 /* ---- The package ---- */
 
@@ -392,16 +411,32 @@ typedef struct {
     apps_rt_t *rt;                    /* NULL when the runtime couldn't be made */
     char crash_text[APPS_ERROR_MAX];  /* then, the reason: the crash record of an app that never ran */
     size_t warned;                    /* the bytes of apps_rt_warnings that have been printed as events */
+    bool alarm_window;                /* the app was launched for its alarms, and the step that did it isn't over: a crash costs it its alarms */
 } app_t;
 
 static bool crashed(const app_t *app) {
     return app->rt == NULL || apps_rt_state(app->rt) == APPS_STATE_CRASHED;
 }
 
-/* A call that may have crashed the app: if it did just now, the crash event (a crash is reported once). */
-static void report_crash(const app_t *app, bool was_crashed) {
+/* What the app task tells the alarms when the app ends (apps_task.c's end_alarms): one that its alarm launched and that crashed (in
+ * start() or in the alarm(name) it was launched for) loses every alarm it has, since it would arm its next before it raised and be
+ * launched again for ever; and the end, how it came, so that a ring ends with the app that was told it unless an alarm with sound still
+ * waits. The ring's end, if it came, is an event, and so is the cancel's warning, in the order they happen. */
+static void end_alarms(app_t *app, bool crash, const char *why) {
+    const char *id = app->pkg->manifest.id;
+    if (crash && app->alarm_window) {
+        apps_alarm_cancel_app(id, "crashed when its alarm launched it");
+    }
+    app->alarm_window = false;
+    apps_alarm_app_ended(id, why);
+    apphost_ring_sync();
+}
+
+/* A call that may have crashed the app: if it did just now, the crash event (a crash is reported once), and the alarms are told. */
+static void report_crash(app_t *app, bool was_crashed) {
     if (!was_crashed && crashed(app)) {
         emit_text("crash", apps_rt_last_error(app->rt));
+        end_alarms(app, true, "app crashed");
     }
 }
 
@@ -631,50 +666,61 @@ static void cmd_handler(app_t *app, const char *name) {
     }
     flush_warnings(app);
     report_crash(app, was_crashed);
+    if (strcmp(name, "stop") == 0 && !crashed(app)) {
+        end_alarms(app, false, "app stopped");  /* a ring that only this app could stop ends with it */
+    }
 }
 
 static void make_and_start(app_t *app);
 
-/* An alarm has fired: the app is told, alarm(name), after it is launched again if it doesn't run. A stopped or a crashed app's
- * runtime is freed and a new one made from the package, as a launch of the stored package does on the gadget (a stop or a
- * crash ends the app there, and its alarm launches it): main.lua's top level runs again, then start(). */
-static void tell_app(app_t *app, const char *name) {
-    if (app->rt != NULL && apps_rt_state(app->rt) != APPS_STATE_RUNNING) {
-        apps_rt_free(app->rt);
-        app->rt = NULL;
-        app->warned = 0;
-        make_and_start(app);
-    }
-    if (app->rt == NULL || apps_rt_state(app->rt) != APPS_STATE_RUNNING) {
-        return;
-    }
-    bool was_crashed = crashed(app);
-    (void)apps_rt_alarm(app->rt, name);
-    flush_warnings(app);
-    report_crash(app, was_crashed);
-    if (!was_crashed && crashed(app)) {
-        apps_port_sound_stop();  /* no one is left to stop a ring: the app task ends it when the app crashes in alarm() */
-    }
-}
-
-/* What the gadget does by itself as the clock moves: a ring whose minute is over ends, and each alarm that is due fires, in the
- * order the system does it in (apps_alarm.h): the alarm, the ring, the screen, then the app. */
-static void fire_alarms(app_t *app) {
-    apphost_ring_tick();
-    apphost_alarm_t a;
-    while (apphost_alarm_next_due(&a)) {
+/* What the app task's round does with the alarms (apps_task.c's deliver_alarms), after the esp_timer task has run: the table's timers that came
+ * due in the step fire (the gadget's own code: its budget, its ring, its journal of lines, which print as warnings), and what fired is
+ * announced, in the order it fired, with the ring's start, then told to the app, each, earliest first. An app that doesn't run, stopped
+ * or crashed, is launched again by the alarm, a new run of the package as a launch of the stored one is on the gadget (main.lua's top level runs
+ * again, then start(), with the alarm that fired still in its slot, listed with nothing left), and then alarm(name) is called: the alarm is
+ * taken just before, so it is gone from the table in it. An app that crashes in start() or in alarm(name) when its alarm launched it loses
+ * its alarms (end_alarms), and the firings that were copied are not asked for any more. */
+static void deliver_alarms(app_t *app) {
+    apphost_esp_run_timers();
+    apps_alarm_log_drain();
+    apps_alarm_fired_t due[APPS_ALARMS_MAX];
+    int n = apps_alarm_fired(due, APPS_ALARMS_MAX);
+    for (int i = 0; i < n; i++) {
         begin("alarm");
-        field("name", a.name, strlen(a.name));
-        printf(",\"sound\":%s,\"wake\":%s", a.sound ? "true" : "false", a.wake ? "true" : "false");
+        field("name", due[i].name, strlen(due[i].name));
+        printf(",\"sound\":%s,\"wake\":%s", due[i].sound ? "true" : "false", due[i].wake ? "true" : "false");
         end_event();
-        if (a.sound) {
-            apphost_ring();
-        }
-        if (a.wake) {
-            apphost_set_dark(false);
-        }
-        tell_app(app, a.name);
     }
+    apphost_ring_sync();
+    const char *id = app->pkg->manifest.id;
+    for (int i = 0; i < n; i++) {
+        if (!apps_alarm_wanted(id, due[i].gen)) {
+            continue;  /* cancelled or told since the copy: nothing is launched for it */
+        }
+        if (app->rt != NULL && apps_rt_state(app->rt) != APPS_STATE_RUNNING) {
+            apps_rt_free(app->rt);
+            app->rt = NULL;
+            app->warned = 0;
+            app->alarm_window = true;
+            make_and_start(app);
+            if (crashed(app)) {
+                end_alarms(app, true, "app crashed");
+            }
+        }
+        if (app->rt == NULL || apps_rt_state(app->rt) != APPS_STATE_RUNNING) {
+            (void)apps_alarm_take(&due[i], false);  /* it didn't start: given up on, and a ring it started ends if nothing else could stop it */
+            apphost_ring_sync();
+            continue;
+        }
+        if (!apps_alarm_take(&due[i], true)) {
+            continue;
+        }
+        bool was_crashed = crashed(app);
+        (void)apps_rt_alarm(app->rt, due[i].name);
+        flush_warnings(app);
+        report_crash(app, was_crashed);
+    }
+    app->alarm_window = false;
 }
 
 /* The most `advance` moves the clock in one command: a day. */
@@ -696,7 +742,7 @@ static void cmd_advance(app_t *app, long ms) {
         done += step;
         if (app->rt != NULL) {
             begin_command();
-            fire_alarms(app);  /* an app that crashed in alarm() was reported there */
+            deliver_alarms(app);  /* an app that crashed in alarm() was reported there */
             bool was_crashed = crashed(app);
             apps_rt_run_timers(app->rt, apps_port_mono_ms());
             flush_warnings(app);
@@ -914,8 +960,10 @@ static void make_and_start(app_t *app) {
     app->rt = apps_rt_new(app->pkg, app->crash_text, sizeof app->crash_text);
     if (app->rt == NULL) {  /* nothing could be made (main.lua doesn't compile, ...): the reason */
         emit_text("crash", app->crash_text);
+        end_alarms(app, true, "app crashed");
     } else if (apps_rt_state(app->rt) == APPS_STATE_CRASHED) {  /* main.lua ran and failed: its record */
         emit_text("crash", apps_rt_last_error(app->rt));
+        end_alarms(app, true, "app crashed");
     } else {
         emit_warnings(apps_rt_warnings(app->rt));
         app->warned = strlen(apps_rt_warnings(app->rt));
@@ -936,6 +984,7 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name,
     }
     app_t app = {.pkg = pkg};
     apphost_set_log(emit_log);
+    apphost_esp_set_log(emit_esp_log);
     apphost_set_sound(&SOUND_EVENTS);
     emit_warnings(pkg->manifest.warnings);
     begin_command();

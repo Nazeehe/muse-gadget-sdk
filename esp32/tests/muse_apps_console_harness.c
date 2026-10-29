@@ -225,13 +225,13 @@ bool apps_port_dark(void) {
 }
 
 /* The system's alarms and sound (apps_port.h): none here, as no case runs an app's alarm. */
-bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
     (void)app;
     (void)name;
     (void)ms;
     (void)sound;
     (void)wake;
-    return false;
+    return APPS_ALARM_REFUSED;
 }
 
 void apps_port_alarm_cancel(const char *app, const char *name) {
@@ -446,13 +446,50 @@ bool apps_task_stop(char *err, size_t err_len) {
     return stop_ok;
 }
 
-/* The job tells apps_task when the store has no such app, so that the alarms waiting for its launch are given up: who it told. */
-static int missing_calls;
-static char missing_id[APPS_ID_MAX + 1];
+/* A launch for an app's alarms (muse_apps_launch_alarm): the job asks whether any firing it was for still waits (alarm_wanted, which a case
+ * sets), runs the app through apps_task_run_for_alarm (counted, with the identity it was given; it answers as apps_task_run does, or says
+ * why not as alarm_run_err does) and tells the app task what came of it (the results, in order: "started", "failed", "missing"). */
+static bool alarm_wanted = true;
+static int wanted_calls;
+static uint32_t wanted_upto;
+static char wanted_id[APPS_ID_MAX + 1];
 
-void apps_task_launch_missing(const char *id) {
-    missing_calls++;
-    snprintf(missing_id, sizeof missing_id, "%s", id);
+bool apps_alarm_wanted(const char *app, uint32_t upto) {
+    wanted_calls++;
+    wanted_upto = upto;
+    snprintf(wanted_id, sizeof wanted_id, "%s", app);
+    return alarm_wanted;
+}
+
+static int alarm_runs;
+static uint32_t alarm_run_upto;
+static const char *alarm_run_err;  /* NULL: as apps_task_run says */
+
+bool apps_task_run_for_alarm(apps_pkg_t *pkg, uint32_t upto, apps_status_t *st, char *err, size_t err_len) {
+    alarm_runs++;
+    alarm_run_upto = upto;
+    if (alarm_run_err != NULL) {
+        snprintf(run_id, sizeof run_id, "%s", pkg->manifest.id);
+        apps_pkg_free(pkg, apps_port_free);
+        apps_port_free(pkg);
+        snprintf(err, err_len, "%s", alarm_run_err);
+        return false;
+    }
+    return apps_task_run(pkg, true, 0, st, err, err_len);
+}
+
+static int results;
+static uint32_t result_upto[8];
+static const char *result_name[8];
+
+void apps_task_alarm_launch_result(uint32_t upto, apps_alarm_launch_t outcome) {
+    if (results < 8) {
+        result_upto[results] = upto;
+        result_name[results] = outcome == APPS_ALARM_LAUNCH_STARTED ? "started"
+                               : outcome == APPS_ALARM_LAUNCH_FAILED ? "failed"
+                               : outcome == APPS_ALARM_LAUNCH_MISSING ? "missing" : "?";
+    }
+    results++;
 }
 
 static apps_status_t status_record; /* what apps_task_status copies */
@@ -997,16 +1034,14 @@ static void launch_by_id_prints_nothing(void) {
     CHECK(runs == before + 2, "nothing ran");
     CHECK(logs == logged + 1 && strcmp(last_log, "W muse_apps: launch nosuch: no such app on the gadget") == 0,
           "one log line: '%s'", last_log);
-    /* The store has no such app: the alarms that wait for it are given up. */
-    CHECK(missing_calls == 1 && strcmp(missing_id, "nosuch") == 0, "apps_task_launch_missing: %d calls, '%s'", missing_calls,
-          missing_id);
+    CHECK(results == 0 && wanted_calls == 0, "a launch that isn't for alarms tells the app task nothing: %d results, %d questions", results,
+          wanted_calls);
     run_ok = false;
     snprintf(run_err, sizeof run_err, "crashed in start(): main.lua:2: boom");
     CHECK(muse_apps_launch("hello", true), "queued");
     run_jobs();
     EXPECT("");
     CHECK(strcmp(last_log, "W muse_apps: launch hello: crashed in start(): main.lua:2: boom") == 0, "'%s'", last_log);
-    CHECK(missing_calls == 1, "an app the store has isn't missing: %d calls", missing_calls);
     run_ok = true;
     logged = logs;
     submit_refuses = true;
@@ -1016,6 +1051,71 @@ static void launch_by_id_prints_nothing(void) {
     CHECK(runs == before + 3 && logs == logged + 1, "a refused submit logs nothing here; a bad id logs once (%d)",
           logs - logged);
     CHECK(runs_by_id == 3, "every launch by id ran by id: %d", runs_by_id);
+    EXPECT("");
+}
+
+/* A launch for an app's alarms (muse_apps_launch_alarm: the app task's, with the identity apps_alarm_wanted answers for) is app.launch's job in
+ * front with nothing printed, and it tells the app task what came of it, whichever way it went: started (the run came back true), failed (the
+ * run did not, with the line "launch <id>: <why>"; a store that has the app but can't load it now), missing (the store has no such app, with
+ * the line the others have). Before it loads anything it asks whether any firing it was for still waits: when none does nothing is loaded,
+ * run, said or told. A run that says its alarms are gone (they went while the app was loaded) is quiet too, and tells nothing. */
+static void launch_for_alarms_tells_the_app_task_what_came_of_it(void) {
+    install_hello();
+    int before = alarm_runs;
+    CHECK(muse_apps_launch_alarm("hello", 7), "queued");
+    EXPECT("");
+    run_jobs();
+    EXPECT("");
+    CHECK(wanted_calls == 1 && wanted_upto == 7 && strcmp(wanted_id, "hello") == 0, "asked first: %d calls, %u, %s", wanted_calls, wanted_upto,
+          wanted_id);
+    CHECK(alarm_runs == before + 1 && alarm_run_upto == 7 && run_front && run_settle == 0 && strcmp(run_id, "hello") == 0,
+          "run in front with its identity: runs %d upto %u front %d", alarm_runs - before, alarm_run_upto, run_front);
+    CHECK(runs_by_id == 0, "it isn't a launch by id of the launcher's kind: %d", runs_by_id);
+    CHECK(results == 1 && result_upto[0] == 7 && strcmp(result_name[0], "started") == 0, "started: %d results, %s", results, result_name[0]);
+    int logged = logs;
+    /* The run did not come up: failed, with the line, and the app task is told. */
+    run_ok = false;
+    snprintf(run_err, sizeof run_err, "crashed in start(): main.lua:2: boom");
+    CHECK(muse_apps_launch_alarm("hello", 9), "queued");
+    run_jobs();
+    CHECK(results == 2 && result_upto[1] == 9 && strcmp(result_name[1], "failed") == 0, "failed: %d results", results);
+    CHECK(logs == logged + 1 && strcmp(last_log, "W muse_apps: launch hello: crashed in start(): main.lua:2: boom") == 0, "'%s'", last_log);
+    run_ok = true;
+    /* The store has no such app: missing, with the line. */
+    logged = logs;
+    CHECK(muse_apps_launch_alarm("nosuch", 11), "queued");
+    run_jobs();
+    CHECK(results == 3 && result_upto[2] == 11 && strcmp(result_name[2], "missing") == 0, "missing: %d results", results);
+    CHECK(logs == logged + 1 && strcmp(last_log, "W muse_apps: launch nosuch: no such app on the gadget") == 0, "'%s'", last_log);
+    /* No firing waits any more: nothing is loaded, run, said or told. */
+    alarm_wanted = false;
+    int runs_then = alarm_runs, results_then = results;
+    logged = logs;
+    CHECK(muse_apps_launch_alarm("hello", 13), "queued");
+    CHECK(muse_apps_launch_alarm("nosuch", 15), "queued");
+    run_jobs();
+    CHECK(alarm_runs == runs_then && results == results_then && logs == logged, "skipped: %d runs, %d results, %d lines", alarm_runs - runs_then,
+          results - results_then, logs - logged);
+    CHECK(wanted_upto == 15 && strcmp(wanted_id, "nosuch") == 0, "each was asked about: %u, %s", wanted_upto, wanted_id);
+    alarm_wanted = true;
+    /* Its alarms went while the app was loaded: the run says so, and that is no failure to log or to tell. */
+    alarm_run_err = APPS_TASK_ALARM_GONE;
+    logged = logs;
+    CHECK(muse_apps_launch_alarm("hello", 17), "queued");
+    run_jobs();
+    CHECK(alarm_run_upto == 17 && results == results_then && logs == logged, "quiet: %d results, %d lines", results - results_then, logs - logged);
+    alarm_run_err = NULL;
+    /* Not a launch: no identity, a bad id, and a queue that refuses (apps_io_submit says why, once). */
+    CHECK(!muse_apps_launch_alarm("hello", 0), "no identity");
+    logged = logs;
+    CHECK(!muse_apps_launch_alarm("Not An Id", 19), "not an id");
+    CHECK(logs == logged + 1, "a bad id logs once (%d)", logs - logged);
+    submit_refuses = true;
+    CHECK(!muse_apps_launch_alarm("hello", 21), "refused");
+    submit_refuses = false;
+    run_jobs();
+    CHECK(results == results_then && alarm_runs == runs_then + 1, "nothing of those ran: %d results, %d runs", results - results_then,
+          alarm_runs - runs_then);
     EXPECT("");
 }
 
@@ -1379,6 +1479,7 @@ int main(int argc, char **argv) {
         {"stop_reports_the_task", stop_reports_the_task},
         {"replies_end_with_a_push", replies_end_with_a_push},
         {"launch_by_id_prints_nothing", launch_by_id_prints_nothing},
+        {"launch_for_alarms_tells_the_app_task_what_came_of_it", launch_for_alarms_tells_the_app_task_what_came_of_it},
         {"status_prints_the_record", status_prints_the_record},
         {"list_shows_installed_apps", list_shows_installed_apps},
         {"send_returns_the_reply", send_returns_the_reply},

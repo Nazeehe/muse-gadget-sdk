@@ -55,15 +55,25 @@
  *
  * Alarms. The system's alarms (apps_alarm.h) are delivered by this task, on every round of the loop, whatever woke it, and so at
  * least once a second: the esp_timer task that fires one only marks it (it keeps its slot until its app has been told), rings,
- * wakes the screen and posts APPS_EV_ALARM with no wait and no payload. The one for the app that runs fronts it (request_front,
+ * wakes the screen and posts APPS_EV_ALARM with no wait and no payload, once while the loop has not looked (a flood of firings
+ * is one post, and the post leaves the queue's last 2 slots to requests). The one for the app that runs fronts it (request_front,
  * deferred past a voice turn like every front) and calls alarm(name) (apps_rt_alarm: a call of the app like any other, so the
  * duty cycle counts it and the supervisor watches it). One for an app that doesn't run starts it: the same launch as the
- * launcher's pick (muse_apps_launch: the I/O worker loads the last package installed with that id, from RAM now and from the
- * store later, and runs it in front), and alarm(name) follows start(). The alarm waits in its slot for that, at most
- * APPS_TASK_ALARM_LAUNCH_MS; the app task never waits for the worker. An app the store doesn't have is
- * "alarm <name> for missing app <id>" in the log, and an app that doesn't come up in time "alarm <name>: <id> did not start within
- * <N> ms: dropped"; either way the alarm is dropped, and a ring it started ends. Launches go one app at a time, in the order
- * the alarms fired.
+ * launcher's pick, but with an identity (the gen of the last of that app's firings that the launch is asked for: apps_alarm_wanted):
+ * the I/O worker loads the last package installed with that id, from RAM now and from the store later, and runs it in front
+ * (apps_task_run_for_alarm), and alarm(name) follows start(). The worker says what came of every launch it took, by a post
+ * (APPS_EV_ALARM_LAUNCH, apps_task_alarm_launch_result): started, failed (the package didn't run), or missing (the store has no
+ * such app). The alarm waits in its slot for that, and the app task never waits for the worker. A launch the worker refused is asked
+ * for again each second, and given up after APPS_TASK_ALARM_REFUSED_MS; one it took is waited for, however long its jobs ahead of it
+ * run, until APPS_TASK_ALARM_BACKSTOP_MS. A launch whose alarms are gone (told, cancelled or given up on) runs nothing: the worker
+ * and the app task each ask apps_alarm_wanted before they load or replace anything. An app the store doesn't have is "alarm <name>
+ * for missing app <id>" in the log, one that didn't run "alarm <name>: <id> did not start: dropped", and one that wasn't up in time
+ * "alarm <name>: <id> did not start within <N> ms: dropped"; each drops only the firings the launch was for, and a ring they
+ * started ends if nothing else could stop it. Launches go one app at a time, in the order the alarms fired. An app that its alarm
+ * launched and that crashes in start() or in the alarm() it was launched for loses every alarm it has (apps_alarm_cancel_app: it
+ * would arm its next in start() and be launched again for ever), and every app's end is told to the alarms
+ * (apps_alarm_app_ended), whose ring ends with the app that was told it unless a firing with sound still waits. What the esp_timer
+ * task and these calls record to log is printed here, in housekeeping and after each call (apps_alarm_log_drain).
  *
  * An app's end (stop, a new run, sys.exit, a crash, a hang) is one order, the rulings': the pending request is
  * answered; the table is unpublished (apps_lv_set_ui(NULL) under the UI lock); the record takes the crash record,
@@ -91,7 +101,10 @@
 #define APPS_TASK_HUNG_MS 3000       /* a call that has run longer is hung (strictly longer) */
 #define APPS_TASK_RESET_MS 500       /* the app task's wait for the LVGL task's reset */
 #define APPS_TASK_LAYOUT_MS 500      /* a run's wait for a pass of the apply step that has laid its widgets out */
-#define APPS_TASK_ALARM_LAUNCH_MS 10000  /* a fired alarm waits this long for its app to start (the launch's run waits 7 s) */
+#define APPS_QUEUE_LEN 16            /* the queue's events: a touch or an alarm's post leaves the last 2 to requests */
+#define APPS_TASK_ALARM_REFUSED_MS 10000   /* a launch for alarms that the I/O worker refused is asked for again each second this long, then given up */
+#define APPS_TASK_ALARM_BACKSTOP_MS 120000  /* a launch the worker took must be reported by then (above its longest job: an install's 90 s) */
+#define APPS_TASK_ALARM_GONE "its alarm is gone"  /* what a run for alarms says when they were told, cancelled or given up on first: not a failure */
 
 /*
  * What the app task knows of the current app (or the last one: the record keeps it until the next run). It is
@@ -138,6 +151,7 @@ typedef enum {
     APPS_EV_ALARM,      /* an alarm fired (apps_alarm.h): brings the loop round, which delivers; no payload */
     APPS_EV_EXIT,       /* sys.exit() (Task 18): the app ends once the current callback returns */
     APPS_EV_WAKE,       /* the LVGL task ran a reset the app task waits for, or the screen was lit: the round's housekeeping */
+    APPS_EV_ALARM_LAUNCH,  /* the I/O worker's launch for an app's alarms is over: code the outcome (apps_alarm_launch_t), app_gen its identity */
 } apps_event_type_t;
 
 typedef struct {
@@ -189,12 +203,31 @@ bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status
 void apps_task_launch(const char *id, bool front);
 
 /*
- * The I/O worker's launch job (apps_console.c) found that the store has no app id. The alarms that fired for it and wait for
- * its launch are dropped, each with "alarm <name> for missing app <id>" in the log, and a ring they started ends: nothing
- * will start the app, and with no app there is no one to stop the ring. Any task; it waits only for the alarm table's lock,
- * which is held for copies.
+ * apps_task_run_by_id for a launch for an app's alarms (the I/O worker's, apps_console.c), with no settle and in front: upto is the
+ * launch's identity, the gen of the last firing of the app that it was asked for (apps_alarm_wanted). When no firing of the app up
+ * to it waits any more, nothing is replaced and nothing runs: false, with APPS_TASK_ALARM_GONE in err, which is no failure to
+ * log. Otherwise as apps_task_run_by_id. The app is the one that its alarms may cancel (see above) if it crashes in start() or in
+ * the alarm() that follows it.
  */
-void apps_task_launch_missing(const char *id);
+bool apps_task_run_for_alarm(apps_pkg_t *pkg, uint32_t upto, apps_status_t *st, char *err, size_t err_len);
+
+/* What came of a launch for alarms that the worker took. */
+typedef enum {
+    APPS_ALARM_LAUNCH_STARTED = 1,  /* the app runs: its alarms are told by the loop */
+    APPS_ALARM_LAUNCH_FAILED,       /* the app didn't run: it didn't compile, crashed in start(), or there was no memory */
+    APPS_ALARM_LAUNCH_MISSING,      /* the store has no such app */
+} apps_alarm_launch_t;
+
+/*
+ * The I/O worker says what came of the launch for alarms whose identity is upto (the worker has taken it, and reports each one it
+ * ran, however it ended; one it skipped, as its alarms were gone, it doesn't): a post to the app task's queue, which the app task
+ * answers in its next round. Started: the loop tells the alarms (nothing is needed). Failed: the firings the launch was for are
+ * dropped, "alarm <name>: <id> did not start: dropped". Missing: they are dropped, "alarm <name> for missing app <id>"; a ring they
+ * started ends if nothing else could stop it. A result for a launch the app task no longer waits for is ignored. It waits for room
+ * in the queue like a request (at most APPS_TASK_WAIT_MS, in tries of 10 ms, and not at all once the app hangs): when none comes
+ * the launch's backstop gives its alarms up. Any task but the app task.
+ */
+void apps_task_alarm_launch_result(uint32_t upto, apps_alarm_launch_t outcome);
 
 /*
  * Stops the current app (its stop() runs) and puts the layer behind. Waits at most APPS_TASK_WAIT_MS. True once the

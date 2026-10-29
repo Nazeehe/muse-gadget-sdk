@@ -3,8 +3,9 @@
 # these and from the Lua files of components/lua/CMakeLists.txt, which both read through the same parser
 # (tools/muse/apphost_build.py: lua_sources, lua_defines), so Lua's list and its defines (LUAI_MAXCCALLS) live
 # in that one file. Only components/muse/apps/*.c and tools/muse/apphost/*.c belong here. Later tasks
-# append their files. A change to this file, or to any file it lists or any *.h beside them, is a new
-# apphost for app.py check (its cache is keyed by their contents).
+# append their files. A change to this file, or to any file it lists or any *.h beside them (the fake
+# ESP-IDF and FreeRTOS headers of tools/muse/apphost, and the folders under it, included), is a new apphost
+# for app.py check (its cache is keyed by their contents).
 components/muse/apps/apps_vm.c
 components/muse/apps/apps_suggest.c
 components/muse/apps/apps_json.c
@@ -12,6 +13,8 @@ components/muse/apps/apps_pkg.c
 components/muse/apps/apps_rt.c
 components/muse/apps/apps_ui.c
 components/muse/apps/apps_svc.c
+components/muse/apps/apps_alarm.c
 tools/muse/apphost/apphost.c
+tools/muse/apphost/apphost_esp.c
 tools/muse/apphost/apphost_port.c
 tools/muse/apphost/sha256.c

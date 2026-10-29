@@ -158,18 +158,23 @@ static int fake_alarms_of(const char *app) {
     return n;
 }
 
-bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+static bool fake_no_memory;  /* a case sets it: there is no memory for the alarm's timer just now */
+
+apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    if (fake_no_memory) {
+        return APPS_ALARM_NO_MEMORY;
+    }
     fake_alarm_t *a = fake_find(app, name);
     for (int i = 0; a == NULL && i < APPS_ALARMS_MAX; i++) {
         a = !fake_alarms[i].used ? &fake_alarms[i] : NULL;
     }
     if (a == NULL || (!a->used && fake_alarms_of(app) >= APPS_ALARMS_PER_APP)) {
-        return false;
+        return APPS_ALARM_REFUSED;
     }
     *a = (fake_alarm_t){.used = true, .sound = sound, .wake = wake, .ms = ms};
     snprintf(a->app, sizeof a->app, "%s", app);
     snprintf(a->name, sizeof a->name, "%s", name);
-    return true;
+    return APPS_ALARM_ARMED;
 }
 
 void apps_port_alarm_cancel(const char *app, const char *name) {
@@ -208,7 +213,7 @@ static void fake_fill(const char *owner, int count) {
     for (int k = 0; k < count; k++) {
         char name[APPS_ALARM_NAME_MAX + 1];
         snprintf(name, sizeof name, "x%d", k);
-        CHECK(apps_port_alarm_arm(owner, name, 1000, true, true), "filling for %s: %d", owner, k);
+        CHECK(apps_port_alarm_arm(owner, name, 1000, true, true) == APPS_ALARM_ARMED, "filling for %s: %d", owner, k);
     }
 }
 
@@ -1716,6 +1721,40 @@ static const char *const FULL_APP =
     "  return alarm.remaining(data)\n"
     "end}\n";
 
+/* G: a gadget with no memory for an alarm's timer says so (the table may well have room), and the same call can work later. */
+static void alarm_no_memory(void) {
+    fake_clear();
+    fake_no_memory = false;
+    apps_pkg_t *pkg = make_pkg_perms(FULL_APP, APPS_PERM_ALARM);
+    char err[256] = "";
+    apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt != NULL && apps_rt_start(rt), "%s", err);
+    if (rt == NULL) {
+        free_pkg(pkg);
+        return;
+    }
+    fake_no_memory = true;
+    char *reply = apps_rt_message(rt, "arm", "\"a\"", 3, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "null") == 0, "no memory: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    expect_logged("alarm: the gadget is short of memory; try again");
+    forget_logged();
+    fake_no_memory = false;  /* memory is back: the next try works, and says nothing */
+    reply = apps_rt_message(rt, "arm", "\"a\"", 3, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "1000") == 0, "a later try: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    expect_logged("ok");
+    forget_logged();
+    fake_fill("other1", 4);  /* a full table is the other refusal, and says what it always said */
+    fake_fill("other2", 3);
+    reply = apps_rt_message(rt, "arm", "\"b\"", 3, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "null") == 0, "a ninth: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    expect_logged("alarm: the gadget has no free alarm slots (8 in all); cancel one");
+    finish(rt, pkg);
+    fake_clear();
+}
+
 static void alarm_table_full(void) {
     fake_clear();
     fake_fill("other1", 4);  /* the first of the others has its four, the second three: seven of the eight are taken */
@@ -2852,6 +2891,7 @@ int main(int argc, char **argv) {
         {"time_zone", time_zone},
         {"services_refused", services_refused},
         {"alarm_table_full", alarm_table_full},
+        {"alarm_no_memory", alarm_no_memory},
         {"timer_api", timer_api},
         {"timer_tie", timer_tie},
         {"os_time_charge", os_time_charge},

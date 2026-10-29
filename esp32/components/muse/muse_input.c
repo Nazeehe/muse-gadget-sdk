@@ -175,7 +175,9 @@ static void set_asleep(bool asleep, const char *why)
     }
 }
 
-/* muse_input_wake's request: why, until the input task takes it at the top of its loop. */
+#if CONFIG_MUSE_APPS
+/* muse_input_wake's request: why, until the input task takes it at the top of its loop. Only the system's alarms of Muse apps
+ * (apps_alarm.c) wake the screen from another task, so a build without them has none of this. */
 static _Atomic(const char *) s_wake_why;
 
 void muse_input_wake(const char *why)
@@ -195,6 +197,7 @@ static void apply_wake(void)
         muse_state_poke();
     }
 }
+#endif
 
 static void toggle_phone_setup(void)
 {
@@ -610,7 +613,9 @@ static void input_task(void *arg)
     TickType_t powered = xTaskGetTickCount() - pdMS_TO_TICKS(POWER_MS);
 
     for (;;) {
+#if CONFIG_MUSE_APPS
         apply_wake();
+#endif
         unsigned ev = muse_board->poll_buttons() | atomic_exchange(&s_touch_talk_events, 0);
 #if CONFIG_MUSE_VIDEO
         /* Any press leaves the video view (its release then does nothing). */

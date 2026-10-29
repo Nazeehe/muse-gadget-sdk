@@ -46,7 +46,7 @@ CONSOLE_SOURCES = [APPS / "apps_console.c", APPS / "apps_install.c"]
 
 # What apps_task.c and muse_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one is a line that includes the fakes.
 FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/idf_additions.h", "freertos/queue.h", "freertos/semphr.h",
-                "freertos/task.h", "esp_err.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h", "lvgl.h"]
+                "freertos/task.h", "esp_attr.h", "esp_err.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h", "lvgl.h"]
 SDKCONFIG = "#define CONFIG_MUSE_APPS 1\n#define CONFIG_SPIRAM 1\n#define CONFIG_MUSE_APPS_HEAP_MAX_KB 1024\n"
 
 
@@ -277,11 +277,17 @@ class AppTaskTest(HarnessCase):
     def test_an_alarm_of_the_running_app_fronts_it_and_calls_alarm(self):  # the esp_timer task marks, rings, wakes and posts
         self.run_case("an_alarm_of_the_running_app_fronts_it_and_calls_it")
 
-    def test_an_alarms_delivery_does_not_depend_on_the_post(self):  # C22: the loop's own round finds it within a second
+    def test_an_alarms_delivery_does_not_depend_on_the_post(self):  # C22, J: any event's round delivers it, not only a timeout's
         self.run_case("a_delivery_does_not_depend_on_the_post")
 
-    def test_an_alarm_posted_to_a_full_queue_is_told(self):  # C22: the post is dropped and nothing is lost
+    def test_a_firing_with_no_post_and_no_event_is_told_when_the_loops_second_ends(self):  # C22: the wait's end delivers too
+        self.run_case("a_firing_with_no_post_and_no_event_is_told_when_the_loops_second_ends")
+
+    def test_an_alarm_is_not_posted_to_a_queue_that_is_full_to_the_requests_room_and_is_told_later(self):  # C22, M, R
         self.run_case("an_alarm_posted_to_a_full_queue_is_told")
+
+    def test_a_flood_of_firings_posts_one_event_and_leaves_room_for_requests(self):  # R
+        self.run_case("a_flood_of_firings_posts_one_event_and_leaves_room_for_requests")
 
     def test_alarms_are_told_in_the_order_they_fired(self):
         self.run_case("alarms_are_told_in_the_order_they_fired")
@@ -297,6 +303,9 @@ class AppTaskTest(HarnessCase):
 
     def test_an_alarm_cancelled_between_the_copy_and_the_take_is_not_told(self):  # the same alarm is never told twice
         self.run_case("an_alarm_cancelled_before_it_is_taken_is_not_told")
+
+    def test_a_run_for_alarms_that_are_gone_replaces_nothing(self):  # D: the app task asks too, before it replaces the app that runs
+        self.run_case("a_run_for_alarms_that_are_gone_replaces_nothing")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
@@ -362,14 +371,53 @@ class AppTaskStoreTest(HarnessCase):
     def test_an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends(self):  # "alarm <name> for missing app <id>"
         self.run_case("an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends")
 
-    def test_an_alarm_whose_app_does_not_start_is_dropped_after_ten_seconds(self):  # every wait bounded
-        self.run_case("a_launch_that_does_not_come_gives_up")
+    def test_an_alarm_launch_behind_a_long_job_of_the_worker_is_waited_for(self):  # D: no give-up of a launch the worker has
+        self.run_case("an_alarm_launch_behind_a_long_job_is_waited_for")
+
+    def test_a_launch_the_worker_never_reports_is_given_up_at_the_backstop_and_then_runs_nothing(self):  # D
+        self.run_case("an_unreported_alarm_launch_is_given_up_and_runs_nothing")
+
+    def test_an_alarm_cancelled_while_its_launch_waits_launches_nothing(self):  # D: the revoked launch
+        self.run_case("an_alarm_cancelled_while_its_launch_waits_launches_nothing")
 
     def test_a_refused_alarm_launch_is_asked_for_again_a_second_later(self):  # not at every round
         self.run_case("a_refused_alarm_launch_is_asked_for_again")
 
+    def test_a_refused_alarm_launch_is_given_up_after_ten_seconds(self):  # D: every wait bounded
+        self.run_case("a_refused_alarm_launch_is_given_up_after_ten_seconds")
+
+    def test_a_failed_alarm_launch_drops_only_the_firings_it_was_for(self):  # D
+        self.run_case("a_failed_alarm_launch_drops_only_the_firings_it_was_for")
+
+    def test_a_failed_alarm_launch_drops_every_firing_it_was_asked_for(self):  # D: the identity is the last of them
+        self.run_case("a_failed_alarm_launch_drops_every_firing_it_was_asked_for")
+
+    def test_a_result_for_another_launch_is_ignored(self):  # D: the identity is what ties a result to its launch
+        self.run_case("a_result_for_another_launch_is_ignored")
+
+    def test_an_app_that_crashes_in_start_when_its_alarm_launches_it_loses_its_alarms(self):  # P1
+        self.run_case("a_crash_in_start_of_an_alarm_launch_cancels_the_alarms")
+
+    def test_an_app_that_crashes_in_the_alarm_it_was_launched_for_loses_its_alarms(self):  # P1
+        self.run_case("a_crash_in_the_launching_alarm_cancels_the_alarms")
+
+    def test_a_crash_after_the_launch_costs_the_app_nothing(self):  # P1's window is the first round after the launch
+        self.run_case("a_crash_after_the_launch_costs_the_app_nothing")
+
     def test_alarms_of_two_stopped_apps_are_told_one_after_the_other(self):
         self.run_case("alarms_of_two_stopped_apps_are_told_one_after_the_other")
+
+    def test_a_launch_whose_alarm_went_does_not_hold_back_the_next_apps(self):  # D: one at a time, and none is remembered for nothing
+        self.run_case("a_launch_whose_alarm_went_does_not_hold_back_the_next_apps")
+
+    def test_a_crash_in_alarm_makes_the_loop_look_again_for_the_next_app(self):  # the pass is cut short by an app's end
+        self.run_case("a_crash_in_alarm_makes_the_loop_look_again_for_the_next_app")
+
+    def test_a_launch_given_up_lets_the_next_apps_be_asked_for_in_the_same_round(self):  # the pass is cut short by a give-up
+        self.run_case("a_launch_given_up_lets_the_next_apps_be_asked_for_in_the_same_round")
+
+    def test_a_launch_given_up_at_the_backstop_lets_the_next_apps_be_asked_for_in_the_same_round(self):  # and so is the backstop's
+        self.run_case("a_launch_given_up_at_the_backstop_lets_the_next_apps_be_asked_for_in_the_same_round")
 
 
 if __name__ == "__main__":

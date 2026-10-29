@@ -68,9 +68,17 @@ int64_t fake_esp_timer_next_due_us(void);  /* when the earliest armed timer is d
  * armed: a call that was on its way when the timer was stopped or restarted, which a real esp_timer task can still make.
  * Returns when it has run. */
 void fake_esp_timer_call(const char *name, uintptr_t arg);
+/* From now on esp_timer_create makes timers while there are fewer than max_timers of them (made ones stay), and says
+ * ESP_ERR_NO_MEM for the next: the esp_timer task's memory, which is internal RAM, run out. 32 is the most there is. */
+void fake_esp_timer_set_limit(int max_timers);
 /* The next esp_timer_stop of a timer that is armed is followed at once by a start of it (10 ms on), as if another task's start
  * came between that stop and the caller's next call: the caller's own start then finds it armed (ESP_ERR_INVALID_STATE). */
 void fake_esp_timer_start_behind_next_stop(void);
+
+/* ---- esp_attr.h: where a static goes. On the gadget EXT_RAM_BSS_ATTR puts it in PSRAM (when the build lets statics go there); here
+ * everything is one memory ---- */
+
+#define EXT_RAM_BSS_ATTR
 
 /* ---- esp_heap_caps.h: what muse_apps_lv_fakes.h doesn't declare ---- */
 

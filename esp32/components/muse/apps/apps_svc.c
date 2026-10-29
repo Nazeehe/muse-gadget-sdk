@@ -542,15 +542,12 @@ static void need(lua_State *L, unsigned perm, const char *module) {
 
 #define ALARM_MS_RULE "ms must be a whole number from 1 to " STR(APPS_ALARM_MAX_MS)
 
-/* The name at idx: a string of 1 to 23 characters of a-z, 0-9 and _. A number isn't taken for text. */
+/* The name at idx: a string of 1 to 23 characters of a-z, 0-9 and _ (the rule is apps_alarm.h's, which the table applies too). A number
+ * isn't taken for text, and a string with a NUL in it isn't a name: the rule reads to the first one. */
 static const char *alarm_name(lua_State *L, int idx) {
     size_t len = 0;
     const char *name = lua_type(L, idx) == LUA_TSTRING ? lua_tolstring(L, idx, &len) : NULL;
-    bool ok = name != NULL && len >= 1 && len <= APPS_ALARM_NAME_MAX;
-    for (size_t i = 0; ok && i < len; i++) {
-        ok = (name[i] >= 'a' && name[i] <= 'z') || (name[i] >= '0' && name[i] <= '9') || name[i] == '_';
-    }
-    if (!ok) {
+    if (name == NULL || strlen(name) != len || !apps_alarm_name_valid(name)) {
         luaL_error(L, "alarm: name must be 1-" STR(APPS_ALARM_NAME_MAX) " characters of a-z, 0-9 and _");
     }
     return name;
@@ -608,7 +605,11 @@ static int alarm_after(lua_State *L) {
     if (apps_port_alarm_remaining(app, name) < 0 && apps_port_alarm_list(app, names, left) >= APPS_ALARMS_PER_APP) {
         return luaL_error(L, "alarm: no more than " STR(APPS_ALARMS_PER_APP) " alarms per app");
     }
-    if (!apps_port_alarm_arm(app, name, ms, sound, wake)) {
+    apps_alarm_result_t result = apps_port_alarm_arm(app, name, ms, sound, wake);
+    if (result == APPS_ALARM_NO_MEMORY) {
+        return luaL_error(L, "alarm: the gadget is short of memory; try again");
+    }
+    if (result != APPS_ALARM_ARMED) {
         return luaL_error(L, "alarm: the gadget has no free alarm slots (" STR(APPS_ALARMS_MAX) " in all); cancel one");
     }
     return 0;

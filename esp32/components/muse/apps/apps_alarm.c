@@ -16,10 +16,12 @@
 
 #include "apps_alarm.h"
 
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -30,34 +32,55 @@
 #include "muse_voice.h"
 
 /*
- * The system's alarms (apps_alarm.h has the contract). Three kinds of task meet here: the app task (arming, cancelling,
- * asking, and taking what has fired), the esp_timer task (every callback below), and whoever else asks (the console). One
- * mutex guards the table and the ring's state, held for copies and calls that don't wait (esp_timer_start_* and _stop, the
- * voice and input requests): never across a log line, which can wait for the console, nor a wait for another task. The
- * esp_timer task takes it with a short try, since it serves every timer of the gadget; a try that fails is made again 10 ms
- * later. The pending word is atomic, so the app task asks whether anything has fired without the lock. All of it is static,
- * so in internal RAM (a flag or a lock in PSRAM would not be atomic on the S3).
+ * The system's alarms (apps_alarm.h has the contract). Three kinds of task meet here: the app task (arming, cancelling, asking,
+ * taking what has fired, and saying that an app has ended), the esp_timer task (every callback below), and whoever else asks (the
+ * console). One mutex guards the table, the ring's state, the budget and the journal, held for copies and calls that don't wait
+ * (esp_timer_start_* and _stop, the voice and input requests): never across a log line, which can wait for the console, nor a wait for
+ * another task. The esp_timer task takes it with a short try, since it serves every timer of the gadget; a try that fails is made
+ * again 10 ms later. The pending word is atomic, so the app task asks whether anything has fired without the lock.
  *
- * A slot has two halves that are told apart because an app's start() may arm the name its own alarm launched it for: the
- * arming (used: a timer runs for due_us) and the firing that is waiting to be told to the app (fired). They are independent: a
- * slot is free when neither is, arming a name that fired and hasn't been told leaves that firing to be delivered, and a
- * firing is taken, or cancelled, without touching an arming made since.
+ * Where it lives. What a lock, a flag or a counter is made of stays in internal RAM (a flag or a lock in PSRAM would not be atomic on
+ * the S3): the mutex's buffer, the pending word, the init state, the fired callback and the journal's counters, all statics here with
+ * no attribute. The table, the ring's names, the budget and the journal's lines, which are touched under the lock alone, are in PSRAM
+ * (EXT_RAM_BSS_ATTR: an attribute that is empty unless the build lets statics go there, which the apps build does).
  *
- * An alarm's esp_timer is made the first time its slot is used and never deleted: a callback that was already on its way to
- * the esp_timer task when the alarm is cancelled or replaced still finds its timer, and looks at the slot, which says whether
- * anything is due: armed, and its time reached. The same test runs a timer that came late as it is.
+ * A slot has two halves that are told apart because an app's start() may arm the name its own alarm launched it for: the arming (used:
+ * a timer runs for due_us) and the firing that is waiting to be told to the app (fired). They are independent: a slot is free when
+ * neither is, arming a name that fired and hasn't been told leaves that firing to be delivered, and a firing is taken, or cancelled,
+ * without touching an arming made since.
+ *
+ * An alarm's esp_timer is made the first time its slot is used and never deleted: a callback that was already on its way to the
+ * esp_timer task when the alarm is cancelled or replaced still finds its timer, and looks at the slot, which says whether anything is
+ * due: armed, and its time reached. The same test runs a timer that came late as it is.
+ *
+ * The ring is one for the gadget, whichever alarm started it. What ends it is decided under the lock in one place each: the minute
+ * (ring_cb), sound.stop (apps_alarm_ring_stop), and the lack of anything that could stop it (ring_orphaned_locked, run by every call
+ * that takes a firing out of the table or says an app has ended): no firing with sound waits, and the app last told one is not there.
+ *
+ * The esp_timer task never logs: a console line can wait for another task's whole reply, and every timer of the gadget waits behind
+ * it. What a callback would say it records, as a line of the journal (a small ring, under the lock), and the app task prints the
+ * journal in its next round (apps_alarm_log_drain); a call that changes the table from another task prints what it recorded when it
+ * has let go of the lock. The lines of firings and of cancels pass a token bucket, so no app makes the console busy with them.
  */
 
 static const char *TAG = "muse_apps";
 
 #define LOCK_TRY_MS 20
 #define RETRY_US 10000
+#define JOURNAL_LEN 24            /* lines waiting for the app task: a second's worth is about a dozen at the most */
+#define LINE_LEN 112              /* a line's text, with its NUL */
+#define BUCKET_US 250000          /* the bucket's refill: one line of firing or cancel every 250 ms, APPS_ALARM_LOG_BURST of them in all */
+#define QUIET_US 1000000          /* lines refused, and quiet this long: the count of them is printed */
+#define BUDGET_US ((int64_t)APPS_ALARM_BUDGET_MS * 1000)
+#define BUDGET_APPS APPS_ALARMS_MAX /* apps whose firings are counted: the least recent is forgotten for a new one */
+#define RING_PERIOD_US ((uint64_t)APPS_RING_PERIOD_MS * 1000)
+#define RING_MAX_US ((int64_t)APPS_RING_MAX_MS * 1000)
 
 typedef struct {
     bool used;                      /* armed: its timer runs, for due_us */
     bool fired;                     /* it fired, and its app hasn't been told */
     bool sound, wake;               /* the arming's */
-    bool fired_sound;               /* the firing's (an arming made since may differ) */
+    bool fired_sound, fired_wake;   /* the firing's (an arming made since may differ; a second firing that merged adds its own) */
     char app[APPS_ID_MAX + 1];
     char name[APPS_ALARM_NAME_MAX + 1];
     int64_t due_us;                 /* the arming's, on esp_timer's clock */
@@ -67,11 +90,26 @@ typedef struct {
     esp_timer_handle_t timer;
 } slot_t;
 
+/* The last APPS_ALARM_BUDGET firings of an app, oldest first from head. */
+typedef struct {
+    char app[APPS_ID_MAX + 1];
+    int64_t at_us[APPS_ALARM_BUDGET];
+    uint8_t n, head;
+    int64_t last_us;                /* of its newest: the least recent record is the one that is given up */
+} budget_t;
+
+/* A line the esp_timer task, or a call that holds the lock, means to print (apps_alarm_log_drain does). */
+typedef struct {
+    char level;                     /* 'I', 'W' or 'E' */
+    unsigned skipped;               /* lines the bucket refused since the last that was printed: their count is printed first */
+    char line[LINE_LEN];            /* empty for the count alone */
+} entry_t;
+
 typedef void (*fired_cb_t)(const char *app, const char *name);
 
-typedef enum { INIT_NONE, INIT_MAKING, INIT_READY, INIT_FAILED } init_t;
+typedef enum { INIT_NONE, INIT_MAKING, INIT_READY } init_t;
 
-static slot_t s_slot[APPS_ALARMS_MAX];
+static EXT_RAM_BSS_ATTR slot_t s_slot[APPS_ALARMS_MAX];
 static atomic_uint s_pending;  /* bit i: slot i has fired and its app hasn't been told */
 static uint32_t s_gen;         /* the last gen given */
 static atomic_int s_init;
@@ -81,35 +119,62 @@ static _Atomic(fired_cb_t) s_fired_cb;
 
 /* The ring: one for the gadget, whichever alarm started it. */
 static esp_timer_handle_t s_ring_timer;
-static bool s_ringing;
+static atomic_bool s_ringing;
 static int64_t s_ring_end_us;
 static unsigned s_ring_chirps;
-static char s_ring_app[APPS_ID_MAX + 1], s_ring_name[APPS_ALARM_NAME_MAX + 1];
+static EXT_RAM_BSS_ATTR char s_ring_app[APPS_ID_MAX + 1], s_ring_name[APPS_ALARM_NAME_MAX + 1];  /* the alarm that rang last */
+static EXT_RAM_BSS_ATTR char s_ring_told[APPS_ID_MAX + 1];  /* the app last told an alarm with sound while it rings, or "" */
+
+static EXT_RAM_BSS_ATTR budget_t s_budget[BUDGET_APPS];
+
+static EXT_RAM_BSS_ATTR entry_t s_journal[JOURNAL_LEN];
+static unsigned s_j_head;
+static atomic_uint s_j_count;   /* the lines waiting: changed under the lock, read without it (the drain's quick look) */
+static atomic_uint s_skipped;   /* lines refused (or lost, with no room) that no line has counted yet; the same */
+static int64_t s_last_refusal_us;
+static int64_t s_credit_us, s_credit_at_us;  /* the bucket: what it holds, as the time to print that many lines, and when it was read */
 
 static void fire_cb(void *arg);
 static void ring_cb(void *arg);
 
-/* The lock and the ring's timer, made once, by whichever task comes first (the others wait for it: a few microseconds of
- * work). False when there was no memory for them. */
+/* The lock and the ring's timer, made once, by whichever task comes first (the others wait for it: a few microseconds of work). A
+ * timer that can't be made leaves it all to be made again by the next call, so the gadget that was short of memory once is not
+ * without alarms for good. False when there was no memory for them. */
 static bool ready(void) {
-    int state = atomic_load(&s_init);
-    if (state == INIT_NONE) {
+    for (;;) {
+        int state = atomic_load(&s_init);
+        if (state == INIT_READY) {
+            return true;
+        }
+        if (state == INIT_MAKING) {
+            vTaskDelay(1);
+            continue;
+        }
         int none = INIT_NONE;
-        if (atomic_compare_exchange_strong(&s_init, &none, INIT_MAKING)) {
+        if (!atomic_compare_exchange_strong(&s_init, &none, INIT_MAKING)) {
+            continue;
+        }
+        if (s_lock == NULL) {
+            s_lock = xSemaphoreCreateMutexStatic(&s_lock_buf);
+        }
+        bool ok = s_lock != NULL;
+        if (ok && s_ring_timer == NULL) {
             const esp_timer_create_args_t ring = {
                 .callback = ring_cb, .dispatch_method = ESP_TIMER_TASK, .name = "muse_ring"};
-            s_lock = xSemaphoreCreateMutexStatic(&s_lock_buf);
-            bool ok = s_lock != NULL && esp_timer_create(&ring, &s_ring_timer) == ESP_OK;
+            ok = esp_timer_create(&ring, &s_ring_timer) == ESP_OK;
             if (!ok) {
-                ESP_LOGE(TAG, "alarms: no memory for the ring's timer");
+                s_ring_timer = NULL;
             }
-            atomic_store(&s_init, ok ? INIT_READY : INIT_FAILED);
         }
+        if (ok) {
+            s_credit_us = (int64_t)APPS_ALARM_LOG_BURST * BUCKET_US;
+            s_credit_at_us = esp_timer_get_time();
+        } else {
+            ESP_LOGE(TAG, "alarms: no memory for the ring's timer: the next alarm.after tries again");
+        }
+        atomic_store(&s_init, ok ? INIT_READY : INIT_NONE);
+        return ok;
     }
-    while ((state = atomic_load(&s_init)) == INIT_MAKING) {
-        vTaskDelay(1);
-    }
-    return state == INIT_READY;
 }
 
 static void lock(void) {
@@ -125,20 +190,105 @@ static void unlock(void) {
     xSemaphoreGive(s_lock);
 }
 
+/* An app's id as apps_id_valid says (apps_pkg.c: ^[a-z][a-z0-9_]{1,23}$), which that file can't be asked here: it is built with Lua. */
 static bool id_valid(const char *app) {
-    size_t n = app != NULL ? strlen(app) : 0;
-    return n >= 1 && n <= APPS_ID_MAX;
-}
-
-static bool name_valid(const char *name) {
-    size_t n = name != NULL ? strlen(name) : 0;
-    for (size_t i = 0; i < n; i++) {
-        bool ok = (name[i] >= 'a' && name[i] <= 'z') || (name[i] >= '0' && name[i] <= '9') || name[i] == '_';
-        if (!ok) {
+    size_t n = 0;
+    for (; app != NULL && app[n] != '\0'; n++) {
+        char c = app[n];
+        bool ok = (c >= 'a' && c <= 'z') || (n > 0 && ((c >= '0' && c <= '9') || c == '_'));
+        if (!ok || n >= APPS_ID_MAX) {
             return false;
         }
     }
-    return n >= 1 && n <= APPS_ALARM_NAME_MAX;
+    return n >= 2;
+}
+
+/* ---- The journal (the lock held) ---- */
+
+/* Whether a line of a firing or a cancel may be printed now: the bucket holds a line's worth, which it then spends. */
+static bool bucket_take_locked(int64_t now_us) {
+    const int64_t cap = (int64_t)APPS_ALARM_LOG_BURST * BUCKET_US;
+    s_credit_us += now_us - s_credit_at_us;
+    s_credit_at_us = now_us;
+    if (s_credit_us > cap) {
+        s_credit_us = cap;
+    }
+    if (s_credit_us < BUCKET_US) {
+        return false;
+    }
+    s_credit_us -= BUCKET_US;
+    return true;
+}
+
+/* Records a line, to be printed by apps_alarm_log_drain; bucketed lines (firings, cancels) are counted instead when the bucket is
+ * empty, and the count goes with the next line that is let in. With no room the oldest line is the one that is lost, and counted. */
+static void journal_locked(char level, bool bucketed, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void journal_locked(char level, bool bucketed, const char *fmt, ...) {
+    int64_t now_us = esp_timer_get_time();
+    if (bucketed && !bucket_take_locked(now_us)) {
+        atomic_fetch_add(&s_skipped, 1);
+        s_last_refusal_us = now_us;
+        return;
+    }
+    unsigned count = atomic_load(&s_j_count);
+    if (count == JOURNAL_LEN) {
+        atomic_fetch_add(&s_skipped, 1 + s_journal[s_j_head].skipped);
+        s_last_refusal_us = now_us;
+        s_j_head = (s_j_head + 1) % JOURNAL_LEN;
+        count--;
+    }
+    entry_t *e = &s_journal[(s_j_head + count) % JOURNAL_LEN];
+    e->level = level;
+    e->skipped = atomic_exchange(&s_skipped, 0);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(e->line, sizeof e->line, fmt, ap);
+    va_end(ap);
+    atomic_store(&s_j_count, count + 1);
+}
+
+/* Prints what has been recorded, oldest first: the lock is taken for one line at a time and let go of before it is printed. With
+ * nothing recorded and no refusals counted it is two loads. */
+void apps_alarm_log_drain(void) {
+    if (atomic_load(&s_init) != INIT_READY) {
+        return;
+    }
+    while (atomic_load(&s_j_count) > 0 || atomic_load(&s_skipped) > 0) {
+        entry_t e = {0};
+        bool got = false;
+        lock();
+        if (atomic_load(&s_j_count) > 0) {
+            e = s_journal[s_j_head];
+            s_j_head = (s_j_head + 1) % JOURNAL_LEN;
+            atomic_fetch_sub(&s_j_count, 1);
+            got = true;
+        } else if (atomic_load(&s_skipped) > 0 && esp_timer_get_time() - s_last_refusal_us >= QUIET_US) {
+            e.level = 'I';
+            e.skipped = atomic_exchange(&s_skipped, 0);  /* the lines have been quiet: the count is not held back for another line */
+            got = true;
+        }
+        unlock();
+        if (!got) {
+            break;
+        }
+        if (e.skipped > 0) {
+            ESP_LOGI(TAG, "(%u alarm lines not logged)", e.skipped);
+        }
+        if (e.line[0] == '\0') {
+            continue;
+        }
+        switch (e.level) {
+        case 'E':
+            ESP_LOGE(TAG, "%s", e.line);
+            break;
+        case 'W':
+            ESP_LOGW(TAG, "%s", e.line);
+            break;
+        default:
+            ESP_LOGI(TAG, "%s", e.line);
+            break;
+        }
+    }
 }
 
 /* ---- The table (the lock held) ---- */
@@ -221,38 +371,68 @@ static int collect(const slot_t **out, int max, const char *app, bool fired_only
     return n;
 }
 
-/* ---- The ring ---- */
-
-/* Under the lock: the ring starts, or goes on and lasts APPS_RING_MAX_MS more, and one chirp is asked for. Returns the number
- * of that chirp. The call to the voice task sets a flag and an event-group bit and returns: nothing that waits. */
-static unsigned ring_chirp_locked(const char *app, const char *name, int64_t now_us, bool start) {
-    snprintf(s_ring_app, sizeof s_ring_app, "%s", app);
-    snprintf(s_ring_name, sizeof s_ring_name, "%s", name);
-    s_ring_end_us = now_us + (int64_t)APPS_RING_MAX_MS * 1000;
-    if (start) {
-        s_ring_chirps = 0;
-        esp_err_t err = esp_timer_start_periodic(s_ring_timer, (uint64_t)APPS_RING_PERIOD_MS * 1000);
-        s_ringing = err == ESP_OK || err == ESP_ERR_INVALID_STATE;  /* already going: the ring only goes on */
+/* Disarms every alarm of app and drops every firing of it that waits; how many slots that freed. */
+static int cancel_app_locked(const char *app) {
+    int n = 0;
+    for (int i = 0; i < APPS_ALARMS_MAX; i++) {
+        slot_t *s = &s_slot[i];
+        if (occupied(s) && strcmp(s->app, app) == 0) {
+            if (s->timer != NULL) {
+                (void)esp_timer_stop(s->timer);
+            }
+            s->used = false;
+            clear_fired(s);
+            n++;
+        }
     }
-    muse_voice_request_chirp();
-    return ++s_ring_chirps;
+    return n;
 }
 
-/* The ring ends, if one is going; why is what the log says. */
-void apps_alarm_ring_end(const char *why) {
-    if (atomic_load(&s_init) != INIT_READY) {
+/* ---- The ring (the lock held) ---- */
+
+/* The ring ends, with why in the log. Nothing is left that waits for it. */
+static void ring_stop_locked(const char *why) {
+    atomic_store(&s_ringing, false);
+    s_ring_told[0] = '\0';
+    (void)esp_timer_stop(s_ring_timer);
+    journal_locked('I', false, "ring stopped (%s)", why);
+}
+
+static bool sounding_pending_locked(void) {
+    for (int i = 0; i < APPS_ALARMS_MAX; i++) {
+        if (s_slot[i].fired && s_slot[i].fired_sound) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A ring with nothing left that could stop it, or that has to be told of it, ends: no firing with sound waits to be told, and no app that
+ * was told one is there. Every change that could make that so ends here, with the lock held through the look and the stop: no firing
+ * can come between them. */
+static void ring_orphaned_locked(const char *why) {
+    if (atomic_load(&s_ringing) && s_ring_told[0] == '\0' && !sounding_pending_locked()) {
+        ring_stop_locked(why);
+    }
+}
+
+/* An alarm with sound has fired. A ring that is going goes on, a minute from now, and its log names this alarm from now on; that is
+ * all: no chirp is asked for, since the ring's period asks for one every 1.5 s, which keeps a flood of firings to the one chirp. One
+ * that isn't going starts, with its first chirp. The call to the voice task sets a flag and an event-group bit and returns: nothing
+ * that waits. */
+static void ring_sound_locked(const char *app, const char *name, int64_t now_us) {
+    snprintf(s_ring_app, sizeof s_ring_app, "%s", app);
+    snprintf(s_ring_name, sizeof s_ring_name, "%s", name);
+    s_ring_end_us = now_us + RING_MAX_US;
+    if (atomic_load(&s_ringing)) {
         return;
     }
-    lock();
-    bool was = s_ringing;
-    if (was) {
-        s_ringing = false;
-        (void)esp_timer_stop(s_ring_timer);
-    }
-    unlock();
-    if (was) {
-        ESP_LOGI(TAG, "ring stopped (%s)", why);
-    }
+    s_ring_told[0] = '\0';
+    s_ring_chirps = 1;
+    esp_err_t err = esp_timer_start_periodic(s_ring_timer, RING_PERIOD_US);
+    atomic_store(&s_ringing, err == ESP_OK || err == ESP_ERR_INVALID_STATE);  /* already going: the ring only goes on */
+    muse_voice_request_chirp();
+    journal_locked('I', false, "ring %s/%s chirp %u", s_ring_app, s_ring_name, s_ring_chirps);
 }
 
 /* Every APPS_RING_PERIOD_MS while it rings, in the esp_timer task: a chirp, or the end when its minute is over. A tick of a ring
@@ -263,42 +443,89 @@ static void ring_cb(void *arg) {
     if (!try_lock()) {
         return;
     }
-    char app[APPS_ID_MAX + 1], name[APPS_ALARM_NAME_MAX + 1];
-    unsigned chirp = 0;
-    bool timed_out = false;
-    if (!s_ringing) {
+    if (!atomic_load(&s_ringing)) {
         (void)esp_timer_stop(s_ring_timer);
         unlock();
         return;
     }
-    int64_t now_us = esp_timer_get_time();
-    if (now_us >= s_ring_end_us) {
-        s_ringing = false;
-        (void)esp_timer_stop(s_ring_timer);
-        timed_out = true;
+    if (esp_timer_get_time() >= s_ring_end_us) {
+        ring_stop_locked("timeout");
     } else {
-        snprintf(app, sizeof app, "%s", s_ring_app);
-        snprintf(name, sizeof name, "%s", s_ring_name);
         muse_voice_request_chirp();
-        chirp = ++s_ring_chirps;
+        journal_locked('I', false, "ring %s/%s chirp %u", s_ring_app, s_ring_name, ++s_ring_chirps);
     }
     unlock();
-    if (timed_out) {
-        ESP_LOGI(TAG, "ring stopped (timeout)");
-    } else {
-        ESP_LOGI(TAG, "ring %s/%s chirp %d", app, name, (int)chirp);
-    }
 }
 
 void apps_alarm_ring_stop(void) {
-    apps_alarm_ring_end("sound.stop");
+    if (atomic_load(&s_init) != INIT_READY) {
+        return;
+    }
+    lock();
+    if (atomic_load(&s_ringing)) {
+        ring_stop_locked("sound.stop");
+    }
+    unlock();
+    apps_alarm_log_drain();
+}
+
+bool apps_alarm_ringing(void) {
+    return atomic_load(&s_ringing);
+}
+
+void apps_alarm_app_ended(const char *app, const char *why) {
+    if (!id_valid(app) || atomic_load(&s_init) != INIT_READY) {
+        return;
+    }
+    lock();
+    if (atomic_load(&s_ringing) && strcmp(s_ring_told, app) == 0) {
+        s_ring_told[0] = '\0';
+        ring_orphaned_locked(why != NULL ? why : "app ended");
+    }
+    unlock();
+    apps_alarm_log_drain();
+}
+
+/* ---- The budget (the lock held) ---- */
+
+/* Counts a firing of app at now_us toward its budget; true when it is the one past it, APPS_ALARM_BUDGET_MS having not yet gone since
+ * the first of the last APPS_ALARM_BUDGET it had. The one that is over isn't counted: what it costs is its app's alarms, and the window
+ * goes on from the firings that were. */
+static bool budget_over_locked(const char *app, int64_t now_us) {
+    budget_t *b = NULL, *least = &s_budget[0];
+    for (int i = 0; i < BUDGET_APPS; i++) {
+        if (s_budget[i].n > 0 && strcmp(s_budget[i].app, app) == 0) {
+            b = &s_budget[i];
+            break;
+        }
+        if (s_budget[i].n == 0 || (least->n > 0 && s_budget[i].last_us < least->last_us)) {
+            least = &s_budget[i];
+        }
+    }
+    if (b == NULL) {
+        b = least;
+        memset(b, 0, sizeof *b);
+        snprintf(b->app, sizeof b->app, "%s", app);
+    }
+    if (b->n == APPS_ALARM_BUDGET && now_us - b->at_us[b->head] < BUDGET_US) {
+        return true;
+    }
+    if (b->n < APPS_ALARM_BUDGET) {
+        b->at_us[(b->head + b->n++) % APPS_ALARM_BUDGET] = now_us;
+    } else {
+        b->at_us[b->head] = now_us;
+        b->head = (uint8_t)((b->head + 1) % APPS_ALARM_BUDGET);
+    }
+    b->last_us = now_us;
+    return false;
 }
 
 /* ---- Firing ---- */
 
-/* An alarm's timer, in the esp_timer task (see the top of the file: a stale call finds nothing due and does nothing). The arming
- * is spent and its firing waits in the slot for the app task, which is told by the bit and by the post. A firing that is still
- * waiting when the next one comes (an app that started late, and had armed the name again) is told once, not twice. */
+/* An alarm's timer, in the esp_timer task (see the top of the file: a stale call finds nothing due and does nothing). Over its app's budget
+ * it cancels every alarm of the app, this one too, and that is all. Otherwise the arming is spent and its firing waits in the slot for
+ * the app task, which is told by the bit and by the post. A firing that is still waiting when the next one comes (an app that started
+ * late, and had armed the name again) is told once, not twice. */
 static void fire_cb(void *arg) {
     slot_t *s = &s_slot[(uintptr_t)arg];
     if (!try_lock()) {
@@ -311,25 +538,34 @@ static void fire_cb(void *arg) {
         return;
     }
     s->used = false;
-    if (!s->fired) {
-        s->fired = true;
-        s->fired_sound = false;
-        s->fired_us = now_us;
-        s->fired_due_us = s->due_us;
-        s->fired_gen = next_gen();
-    }
-    s->fired_sound = s->fired_sound || s->sound;
-    atomic_fetch_or(&s_pending, bit_of(s));
     char app[APPS_ID_MAX + 1], name[APPS_ALARM_NAME_MAX + 1];
     snprintf(app, sizeof app, "%s", s->app);
     snprintf(name, sizeof name, "%s", s->name);
     bool sound = s->sound, wake = s->wake;
-    unsigned chirp = 0;
+    if (budget_over_locked(app, now_us)) {
+        (void)cancel_app_locked(app);
+        journal_locked('W', true, "alarm: %s fired more than %d alarms in a minute; its alarms are cancelled", app, APPS_ALARM_BUDGET);
+        ring_orphaned_locked("alarms cancelled");
+        unlock();
+        return;
+    }
+    if (!s->fired) {
+        s->fired = true;
+        s->fired_sound = false;
+        s->fired_wake = false;
+        s->fired_us = now_us;
+        s->fired_due_us = s->due_us;
+        s->fired_gen = next_gen();
+    }
+    s->fired_sound = s->fired_sound || sound;
+    s->fired_wake = s->fired_wake || wake;
+    atomic_fetch_or(&s_pending, bit_of(s));
+    journal_locked('I', true, "alarm %s/%s fired (sound %d, wake %d)", app, name, sound, wake);
     if (sound) {
-        chirp = ring_chirp_locked(app, name, now_us, !s_ringing);
+        ring_sound_locked(app, name, now_us);
     }
     unlock();
-    /* What matters first, then the log: a line can wait for the console, which the screen's wake and the app's post must not. */
+    /* What matters first: the wake and the app task's post, which a line must not hold up. The lines are printed by the app task. */
     if (wake) {
         muse_input_wake("alarm");
     }
@@ -337,17 +573,16 @@ static void fire_cb(void *arg) {
     if (cb != NULL) {
         cb(app, name);
     }
-    ESP_LOGI(TAG, "alarm %s/%s fired (sound %d, wake %d)", app, name, sound, wake);
-    if (sound) {
-        ESP_LOGI(TAG, "ring %s/%s chirp %d", app, name, (int)chirp);
-    }
 }
 
 /* ---- The API ---- */
 
-bool apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
-    if (!id_valid(app) || !name_valid(name) || ms < 1 || ms > APPS_ALARM_MAX_MS || !ready()) {
-        return false;
+apps_alarm_result_t apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    if (!id_valid(app) || !apps_alarm_name_valid(name) || ms < 1 || ms > APPS_ALARM_MAX_MS) {
+        return APPS_ALARM_REFUSED;
+    }
+    if (!ready()) {
+        return APPS_ALARM_NO_MEMORY;
     }
     lock();
     slot_t *s = find(app, name);
@@ -359,7 +594,7 @@ bool apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, b
         }
         if (mine >= APPS_ALARMS_PER_APP || s == NULL) {
             unlock();
-            return false;
+            return APPS_ALARM_REFUSED;
         }
     }
     if (s->timer == NULL) {
@@ -368,9 +603,9 @@ bool apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, b
                                               .dispatch_method = ESP_TIMER_TASK,
                                               .name = "muse_alarm"};
         if (esp_timer_create(&args, &s->timer) != ESP_OK) {
-            s->timer = NULL;
+            s->timer = NULL;  /* the slot is as it was: free, and tried again by the next call */
             unlock();
-            return false;
+            return APPS_ALARM_NO_MEMORY;
         }
     }
     (void)esp_timer_stop(s->timer);  /* a replaced alarm's is running; one that fired is not, and says so: nothing to do */
@@ -391,30 +626,40 @@ bool apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, b
     bool armed = err == ESP_OK;
     s->used = armed;
     unlock();
-    return armed;
+    return armed ? APPS_ALARM_ARMED : APPS_ALARM_REFUSED;
 }
 
 void apps_alarm_cancel(const char *app, const char *name) {
-    if (!id_valid(app) || !name_valid(name) || atomic_load(&s_init) != INIT_READY) {
+    if (!id_valid(app) || !apps_alarm_name_valid(name) || atomic_load(&s_init) != INIT_READY) {
         return;
     }
     lock();
     slot_t *s = find(app, name);
-    bool drops_ring = false;
     if (s != NULL) {
         (void)esp_timer_stop(s->timer);
         s->used = false;
-        drops_ring = s->fired && s->fired_sound;  /* what fired and wasn't told is dropped too, and the ring it started */
-        clear_fired(s);
+        clear_fired(s);  /* what fired and wasn't told is dropped too, and the ring it started if that leaves nothing to stop it */
+        ring_orphaned_locked("alarm cancelled");
     }
     unlock();
-    if (drops_ring) {
-        apps_alarm_ring_end("alarm cancelled");
+    apps_alarm_log_drain();
+}
+
+void apps_alarm_cancel_app(const char *app, const char *why) {
+    if (!id_valid(app) || atomic_load(&s_init) != INIT_READY) {
+        return;
     }
+    lock();
+    if (cancel_app_locked(app) > 0) {
+        journal_locked('W', true, "alarm: %s %s; its alarms are cancelled", app, why != NULL ? why : "was stopped");
+        ring_orphaned_locked("alarms cancelled");
+    }
+    unlock();
+    apps_alarm_log_drain();
 }
 
 int64_t apps_alarm_remaining(const char *app, const char *name) {
-    if (!id_valid(app) || !name_valid(name) || atomic_load(&s_init) != INIT_READY) {
+    if (!id_valid(app) || !apps_alarm_name_valid(name) || atomic_load(&s_init) != INIT_READY) {
         return -1;
     }
     lock();
@@ -462,6 +707,7 @@ int apps_alarm_fired(apps_alarm_fired_t *out, int max) {
         snprintf(out[i].app, sizeof out[i].app, "%s", fired[i]->app);
         snprintf(out[i].name, sizeof out[i].name, "%s", fired[i]->name);
         out[i].sound = fired[i]->fired_sound;
+        out[i].wake = fired[i]->fired_wake;
         out[i].fired_ms = fired[i]->fired_us / 1000;
         out[i].slot = (uint8_t)(fired[i] - s_slot);
         out[i].gen = fired[i]->fired_gen;
@@ -477,13 +723,32 @@ bool apps_alarm_take(const apps_alarm_fired_t *f, bool delivered) {
     lock();
     slot_t *s = &s_slot[f->slot];
     bool mine = s->fired && s->fired_gen == f->gen;
-    bool drops_ring = mine && !delivered && s->fired_sound;
     if (mine) {
+        bool sounding = s->fired_sound;
+        char app[APPS_ID_MAX + 1];
+        snprintf(app, sizeof app, "%s", s->app);
         clear_fired(s);
+        if (!delivered) {
+            ring_orphaned_locked("alarm dropped");
+        } else if (sounding && atomic_load(&s_ringing)) {
+            snprintf(s_ring_told, sizeof s_ring_told, "%s", app);  /* it can stop the ring now, and the ring waits for its end */
+        }
     }
     unlock();
-    if (drops_ring) {
-        apps_alarm_ring_end("alarm dropped");
-    }
+    apps_alarm_log_drain();
     return mine;
+}
+
+bool apps_alarm_wanted(const char *app, uint32_t upto) {
+    if (!id_valid(app) || upto == 0 || atomic_load(&s_init) != INIT_READY) {
+        return false;
+    }
+    bool wanted = false;
+    lock();
+    for (int i = 0; i < APPS_ALARMS_MAX && !wanted; i++) {
+        const slot_t *s = &s_slot[i];
+        wanted = s->fired && strcmp(s->app, app) == 0 && (int32_t)(upto - s->fired_gen) >= 0;
+    }
+    unlock();
+    return wanted;
 }

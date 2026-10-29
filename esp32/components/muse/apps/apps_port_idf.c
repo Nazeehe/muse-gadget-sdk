@@ -240,7 +240,7 @@ void apps_port_ui_unlock(void) {
 
 /* The alarms and the sound: apps_alarm.c keeps the first (its table, its timers and its ring), the voice task plays the second. */
 
-bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
     return apps_alarm_arm(app, name, ms, sound, wake);
 }
 

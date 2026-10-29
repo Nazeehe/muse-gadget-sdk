@@ -54,33 +54,24 @@ void apphost_sync(int64_t epoch_ms);
 void apphost_set_dark(bool dark);
 
 /*
- * The system's alarms and sound, on the fake clock (what apps_alarm.c is on the gadget: the table of apps_alarm.h, the same
- * limits, and the ring, which lasts APPS_RING_MAX_MS from the last alarm with sound that fired). The port keeps them, and
- * apphost.c is the system: after each step of the clock it asks which are due, prints them, rings, wakes the screen and tells
- * the app. A chirp (sound.chirp) and the ring's start and end are told to apphost.c as they happen, inside whatever call
- * made them, so that they print in order with what the app printed. The ring's period has no counterpart: it is on or off.
+ * The system's alarms and sound. The alarms are apps_alarm.c itself, the gadget's table, ring and budget, run over a fake of esp_timer, of
+ * its lock and of its log (apphost_esp.h) on this clock: apphost.c is only what the app task is around it. After each step of the clock
+ * it runs the timers that came due (apphost_esp_run_timers), announces the alarms that fired (apps_alarm_fired), launches the app again
+ * if it doesn't run and tells it (apps_alarm_take, then alarm(name)), as apps_task.c's deliver_alarms does, and tells the alarms how an
+ * app ended (apps_alarm_app_ended, apps_alarm_cancel_app), as its end_app does. What the port does of its own is the sound module
+ * (a chirp, sound.stop) and the screen an alarm with wake lights. A chirp and the ring's start and end are told to apphost.c as they
+ * happen, inside whatever call made them, so that they print in order with what the app printed. The ring's period has no counterpart:
+ * it is on or off.
  */
 typedef struct {
-    void (*chirp)(void);   /* sound.chirp() */
-    void (*ring)(bool on);  /* the ring began (a first alarm with sound fired), or ended (sound.stop, its minute, a drop) */
+    void (*chirp)(void);    /* sound.chirp() */
+    void (*ring)(bool on);  /* the ring began (a first alarm with sound fired), or ended (sound.stop, its minute, nothing left to stop it) */
 } apphost_sound_t;
 
 /* Where the sound goes: NULL (the start, and --cycles) is nowhere. sink must outlive the run. */
 void apphost_set_sound(const apphost_sound_t *sink);
 
-typedef struct {
-    char app[APPS_ID_MAX + 1];
-    char name[APPS_ALARM_NAME_MAX + 1];
-    bool sound, wake;
-} apphost_alarm_t;
-
-/* The alarm that is due at the clock's now (the earliest, and of two together the one armed first), taken out of the table:
- * true with it in *out; false when none is due. Nothing happens with it here: the ring and the screen are apphost.c's to
- * start (apphost_ring), since an alarm's event comes before its ring's. */
-bool apphost_alarm_next_due(apphost_alarm_t *out);
-
-/* An alarm with sound has fired: the ring begins, and tells the sink so, or goes on and lasts a minute more. */
-void apphost_ring(void);
-
-/* The ring's end, if its minute is over: it tells the sink. apphost.c calls it after each step of the clock. */
-void apphost_ring_tick(void);
+/* Tells the sink if the ring is on and was off, or off and was on, as apps_alarm_ringing() says: the real ring state, which sound.stop, the
+ * ring's minute, a firing, a cancel and the end of an app each may change. The port calls it after the calls of the app that can, and
+ * apphost.c after each step of the clock and each end of the app. */
+void apphost_ring_sync(void);

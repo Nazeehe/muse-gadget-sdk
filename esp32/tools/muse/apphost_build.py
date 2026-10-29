@@ -192,16 +192,18 @@ def build(dest, cc=None, strict=False, root=ROOT):
 
 def key_inputs(root=ROOT):
     """Every file apphost is built from: the sources it lists (its own and Lua's), every header beside them (all of
-    components/muse/apps, tools/muse/apphost and Lua's src: a header one of them includes is among them, and so are the
-    ones that no listed source includes yet), and the two files that say what is built and with what: sources.txt and
-    Lua's CMakeLists.txt. A header is a regular file whose name doesn't start with '.': the compiler never includes an
-    editor's dot-file (Emacs's lock file, `.#apps_vm.h`, is a link to nothing) or an AppleDouble `._x.h`, and reading one
-    would fail the key, or change it for nothing."""
+    components/muse/apps, tools/muse/apphost and the folders under it, and Lua's src: a header one of them includes is
+    among them, and so are the ones that no listed source includes yet), and the two files that say what is built and
+    with what: sources.txt and Lua's CMakeLists.txt. A header is a regular file whose name doesn't start with '.': the
+    compiler never includes an editor's dot-file (Emacs's lock file, `.#apps_vm.h`, is a link to nothing) or an
+    AppleDouble `._x.h`, and reading one would fail the key, or change it for nothing."""
     root = Path(root).resolve()
     files = {*apphost_sources(root), *lua_sources(root), root / "tools" / "muse" / "apphost" / "sources.txt",
              root / "components" / "lua" / "CMakeLists.txt"}
-    for directory in ("components/muse/apps", "tools/muse/apphost", "components/lua/src"):
+    for directory in ("components/muse/apps", "components/lua/src"):
         files.update(p for p in (root / directory).glob("*.h") if p.is_file() and not p.name.startswith("."))
+    # apphost's own are in folders too (freertos/, which the alarm table's fakes of FreeRTOS headers are in): all of them.
+    files.update(p for p in (root / "tools" / "muse" / "apphost").rglob("*.h") if p.is_file() and not p.name.startswith("."))
     return sorted(files)
 
 

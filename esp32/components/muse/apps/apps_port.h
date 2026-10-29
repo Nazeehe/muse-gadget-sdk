@@ -95,10 +95,17 @@ void apps_port_sha256(const void *data, size_t len, uint8_t out[32]);
  * to 23 characters of a-z, 0-9 and _; the arrays of names hold 24 bytes with the NUL. Any task.
  */
 
+/* What arming an alarm came to. */
+typedef enum {
+    APPS_ALARM_ARMED = 0,
+    APPS_ALARM_REFUSED,    /* the app has 4 of other names, the gadget has 8 in all, or an argument isn't valid */
+    APPS_ALARM_NO_MEMORY,  /* the gadget has no memory for the alarm's timer just now: asking again later may work */
+} apps_alarm_result_t;
+
 /* Arms `name` of `app` to fire ms from now, 1 to 604800000 (a week), replacing the one of that name. With sound the ring
- * goes when it fires, and with wake the screen wakes. False, with nothing changed, when the app has 4 of other names or the
- * gadget has 8 in all, or an argument isn't valid. */
-bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake);
+ * goes when it fires, and with wake the screen wakes. Not armed, and nothing else changed (but see apps_alarm.h: a replaced
+ * arming that couldn't be started again is gone), for the reasons of apps_alarm_result_t. */
+apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake);
 
 /* Disarms it. Nothing for a name that isn't armed. */
 void apps_port_alarm_cancel(const char *app, const char *name);

@@ -67,13 +67,15 @@ header to it. Set build options in `CMakeLists.txt` instead.
   `math.atan2`, `cosh`, `sinh`, `tanh`, `pow`, `frexp`, `ldexp` and `log10` are
   absent.
 
-`tests/apps_host.py` reads the source list, the definition and the options
-from `CMakeLists.txt`, so the host tests build Lua the way the firmware does.
-It adds `-D_GNU_SOURCE`, `-pthread` and `luai_makeseed`, a fixed string
-hash seed, so a table's keys come in the same order on every run, and links
-`-lm`. The device keeps Lua's own seed. Sanitized builds (`sanitize=True`, the
-default) also compile Lua's own files with ASan and UBSan, which inflate stack
-frames: take stack measurements from `build(..., sanitize=False)`.
+`tools/muse/apphost_build.py` reads the source list, the definition and the
+options from `CMakeLists.txt`, so the host tests (through `tests/apps_host.py`)
+and `tools/muse/app.py check` build Lua the way the firmware does. The tests add
+`-D_GNU_SOURCE`, `-pthread` and `luai_makeseed`, a fixed string hash seed, so a
+table's keys come in the same order on every run, and link `-lm`. The device
+keeps Lua's own seed, and so does `app.py check`. Sanitized builds
+(`sanitize=True`, the default) also compile Lua's own files with ASan and UBSan,
+which inflate stack frames: take stack measurements from
+`build(..., sanitize=False)`.
 
 ### Known build warning
 

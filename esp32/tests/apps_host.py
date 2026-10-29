@@ -26,8 +26,8 @@ from __future__ import annotations
 import atexit
 import concurrent.futures
 import hashlib
+import importlib.util
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -57,47 +57,30 @@ def cc() -> list[str]:
     return cmd
 
 
-def _lua_cmake() -> str:
-    # Without its comments (the file has no quoted '#').
-    return re.sub(r"#[^\n]*", "", (LUA / "CMakeLists.txt").read_text())
+def _load_apphost_build():
+    """tools/muse/apphost_build.py by its path (tools/muse isn't on sys.path): the parsers of
+    components/lua/CMakeLists.txt and apphost's sources.txt, which tools/muse/app.py check builds apphost
+    with too. One parser and one Lua for the host tests, the dev loop and the firmware."""
+    path = ROOT / "tools" / "muse" / "apphost_build.py"
+    spec = importlib.util.spec_from_file_location("apphost_build", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def _lua_private(command: str) -> list[str]:
-    """What the Lua component's one `command(${COMPONENT_LIB} PRIVATE ...)` call passes.
+apphost_build = _load_apphost_build()
 
-    The host build doesn't evaluate if(), so it only takes a file it can read whole:
-    exactly one such call, and nothing PUBLIC or INTERFACE, which the muse
-    component would pick up too.
-    """
-    calls = re.findall(rf"\b{command}\s*\(([^)]*)\)", _lua_cmake(), re.IGNORECASE)
-    if len(calls) != 1:
-        raise AssertionError(
-            f"components/lua/CMakeLists.txt needs exactly one {command}() call, found {len(calls)}: "
-            "tests/apps_host.py doesn't evaluate if(), so all of them go in that one call")
-    words = calls[0].split()
-    if words[:2] != ["${COMPONENT_LIB}", "PRIVATE"] or {"PUBLIC", "INTERFACE"} & set(words):
-        raise AssertionError(
-            f"components/lua/CMakeLists.txt: {command}() must be (${{COMPONENT_LIB}} PRIVATE ...) "
-            f"and nothing else, got ({' '.join(words)})")
-    return words[2:]
-
-
-def lua_sources() -> list[Path]:
-    """The Lua files the component compiles (its quoted "src/<name>.c" entries)."""
-    names = re.findall(r'"(src/\w+\.c)"', _lua_cmake())
-    if not names:
-        raise AssertionError("components/lua/CMakeLists.txt lists no sources")
-    return [LUA / name for name in names]
-
-
-def lua_defines() -> list[str]:
-    """The component's compile definitions, as NAME or NAME=VALUE (no -D)."""
-    return _lua_private("target_compile_definitions")
-
-
-def lua_options() -> list[str]:
-    """The component's compile options: -O2 -w."""
-    return _lua_private("target_compile_options")
+# lua_sources(): the Lua files the component compiles (its quoted "src/<name>.c" entries). lua_defines(): its
+# compile definitions, as NAME or NAME=VALUE (no -D). lua_options(): its compile options, -O2 -w. The host build
+# doesn't evaluate if(), so it only takes a file it can read whole: exactly one definitions call and one options
+# call, both PRIVATE (apphost_build raises AssertionError for anything else).
+lua_sources = apphost_build.lua_sources
+lua_defines = apphost_build.lua_defines
+lua_options = apphost_build.lua_options
+# apphost_sources(): the C files of tools/muse/apphost/sources.txt (one path a line, relative to esp32/; blank lines
+# and lines starting with # are skipped), as paths. Only components/muse/apps/*.c and tools/muse/apphost/*.c may be
+# listed: the Lua files come from components/lua/CMakeLists.txt, so there is one list of them and one set of defines.
+apphost_sources = apphost_build.apphost_sources
 
 
 # cc -> (flags, leak checks work): what this compiler can run, probed once.
@@ -243,28 +226,6 @@ def cjson_object() -> Path:
             raise AssertionError(f"{shlex.join(args)}\n{done.stdout}{done.stderr}")
         _cjson = out / "cJSON.o"
     return _cjson
-
-
-def apphost_sources() -> list[Path]:
-    """The C files of tools/muse/apphost/sources.txt (one path a line, relative to esp32/; blank lines and
-    lines starting with # are skipped), as paths. Only components/muse/apps/*.c and tools/muse/apphost/*.c
-    may be listed: the Lua files come from components/lua/CMakeLists.txt, so there is one list of them
-    and one set of defines.
-    """
-    listed = []
-    for line in (APPHOST / "sources.txt").read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        path = (ROOT / line).resolve()
-        if path.suffix != ".c" or path.parent not in (APPS, APPHOST) or not path.is_file():
-            raise AssertionError(
-                f"tools/muse/apphost/sources.txt: '{line}' must be an existing components/muse/apps/*.c or "
-                "tools/muse/apphost/*.c (Lua's files come from components/lua/CMakeLists.txt)")
-        listed.append(path)
-    if not listed:
-        raise AssertionError("tools/muse/apphost/sources.txt lists no sources")
-    return listed
 
 
 def build_apphost(tmp: str | Path, *, sanitize: bool = True) -> Path:

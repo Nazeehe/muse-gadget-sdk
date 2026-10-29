@@ -17,7 +17,8 @@
 # utf8. Not io, os, debug or package, and not linit.c (the apps runtime opens
 # the libraries one at a time), nor the lua and luac programs.
 #
-# tests/apps_host.py reads this file for the host builds and doesn't evaluate
+# tools/muse/apphost_build.py reads this file for the host builds (tests/apps_host.py
+# and tools/muse/app.py check build with what it finds) and doesn't evaluate
 # if(): keep every source a quoted "src/<name>.c", all the definitions in the one
 # target_compile_definitions call and all the options in the one
 # target_compile_options call, both PRIVATE.

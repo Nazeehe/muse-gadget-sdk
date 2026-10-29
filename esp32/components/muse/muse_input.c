@@ -843,20 +843,26 @@ static bool console_command(char *line, bool whole)
     }
 #if CONFIG_MUSE_BENCH
     /* Memory report for the bench, in bytes: internal RAM free, lowest ever and
-     * largest block, DMA and PSRAM free (PSRAM's lowest ever too), and the LVGL
-     * task's unused stack, -1 when no task is named "lvgl". */
+     * largest block, DMA and PSRAM free (PSRAM's lowest ever too), and the unused
+     * stack of the LVGL task and of this one (muse_serial, which runs every console
+     * command, the >app.* ones too), each -1 when no task has that name. Both are
+     * high-water marks: the least that was free since boot. */
     if (!strcmp(line, "mem")) {
         TaskHandle_t lvgl = xTaskGetHandle("lvgl");
+        TaskHandle_t serial = xTaskGetHandle("muse_serial");
         int lvgl_stack_free =
             lvgl ? (int)(uxTaskGetStackHighWaterMark(lvgl) * sizeof(StackType_t)) : -1;
+        int serial_stack_free =
+            serial ? (int)(uxTaskGetStackHighWaterMark(serial) * sizeof(StackType_t)) : -1;
         printf("@mem {\"int_free\":%u,\"int_min\":%u,\"int_largest\":%u,\"dma_free\":%u,"
-               "\"psram_free\":%u,\"psram_min\":%u,\"lvgl_stack_free\":%d}\n",
+               "\"psram_free\":%u,\"psram_min\":%u,\"lvgl_stack_free\":%d,\"serial_stack_free\":%d}\n",
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), lvgl_stack_free);
+               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), lvgl_stack_free,
+               serial_stack_free);
         fflush(stdout);
         return true;
     }

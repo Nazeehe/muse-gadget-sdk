@@ -219,6 +219,7 @@ class MuseBenchTest(unittest.TestCase):
         block = inp[inp.index("#if CONFIG_MUSE_BENCH"):]
         self.assertIn('!strcmp(line, "mem")', block[:block.index("#endif")])
         self.assertIn('"lvgl"', inp)
+        self.assertIn('xTaskGetHandle("muse_serial")', inp)
 
     def test_register_size_is_logged(self):
         # The size comes from the log line every session already prints when it sends
@@ -324,8 +325,11 @@ typedef unsigned StackType_t;
 static unsigned heap_caps_get_free_size(int caps) { return 1000u + (unsigned)caps; }
 static unsigned heap_caps_get_minimum_free_size(int caps) { return 100u + (unsigned)caps; }
 static unsigned heap_caps_get_largest_free_block(int caps) { return 10u + (unsigned)caps; }
-static TaskHandle_t xTaskGetHandle(const char *name) { return strcmp(name, "lvgl") ? NULL : (TaskHandle_t)name; }
-static unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task) { (void)task; return 970; }
+static TaskHandle_t xTaskGetHandle(const char *name)
+{
+    return strcmp(name, "lvgl") && strcmp(name, "muse_serial") ? NULL : (TaskHandle_t)name;
+}
+static unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task) { return strcmp((const char *)task, "lvgl") ? 321 : 970; }
 static const struct { int width, height; } board = { 466, 466 };
 #define muse_board (&board)
 void muse_ui_bench_page(muse_ui_page_t page) { printf("page %d\n", (int)page); }
@@ -384,8 +388,10 @@ int main(void)
     def test_mem_stays_in_the_block(self):
         out = self.run_bench_block(["mem"])
         self.assertEqual(len(out), 2, out)
-        self.assertRegex(out[0], r'^@mem \{"int_free":1001,"int_min":101,"int_largest":11,"dma_free":1002,'
-                                 r'"psram_free":1004,"psram_min":104,"lvgl_stack_free":\d+\}$')
+        # Each task's unused stack, in bytes: the LVGL task's (970 words of 4 bytes here) and muse_serial's, the task
+        # that runs the console and so every >app.* command (Task 15 reads it after a session of pushes).
+        self.assertEqual(out[0], '@mem {"int_free":1001,"int_min":101,"int_largest":11,"dma_free":1002,'
+                                 '"psram_free":1004,"psram_min":104,"lvgl_stack_free":3880,"serial_stack_free":1284}')
         self.assertEqual(out[1], "[mem] taken=1")
 
     # ---- Task 14: touch scripts through LVGL's read callback ----

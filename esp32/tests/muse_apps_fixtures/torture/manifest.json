@@ -1,0 +1,29 @@
+{
+  "id": "torture",
+  "name": "Torture",
+  "version": "1",
+  "api": 1,
+  "files": [
+    "deep36.lua",
+    "deep35.lua",
+    "deep34.lua",
+    "deep33.lua",
+    "deep32.lua",
+    "deep31.lua",
+    "deep30.lua",
+    "deep29.lua",
+    "deep28.lua",
+    "deep27.lua",
+    "deep26.lua",
+    "tile.bin"
+  ],
+  "messages": {
+    "chains": "run the four C-call chains (pcall, resume, __index through table.concat, __tostring through string.format) to the limit",
+    "json": "the same chains, with json.encode of a 16-deep table and json.decode of a 16-deep array at the bottom of each",
+    "floats": "json round trips of 0.1, 5e-324, 1e+100, -9.9999999999999995e-08 and 9007199254740993: the host's text, and whether the text reads back",
+    "floats_exact": "1000 floats of 17 digits through encode and decode: how many come back as the same double",
+    "floats_time": "{n, decode}: n encodes (or decodes) of an array of 1000 floats",
+    "widgets": "128 widgets of every kind, boxes 4 deep, handlers, a 256-byte text; returns where to tap the deepest",
+    "hits": "the events the handlers have seen"
+  }
+}

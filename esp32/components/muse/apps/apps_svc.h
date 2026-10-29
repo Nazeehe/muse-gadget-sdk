@@ -94,20 +94,22 @@
  * store (the app's own keys and values, kept across restarts; the "store" permission of the manifest is needed for all of them:
  * without it each raises `store: add "store" to "permissions" in manifest.json`, before anything else is looked at). A key is a
  * string of 1 to 32 characters (valid UTF-8, no NUL; another is `store: key must be a string of 1 to 32 characters`), a value
- * anything json.encode takes, at most 15 containers deep. The saved object, counted after encoding as it is saved, may be 16 KB:
+ * anything json.encode takes, as deep as it takes it (16 levels). The saved object, counted after encoding as it is saved, may be 16 KB:
  * more is `store: more than 16 KB stored; remove keys you don't need`, and nothing is changed.
  *   store.get(key, default)   the value, a copy (decoded afresh from what is kept: change it and the store doesn't change); the
  *                         default, as it is (nil if none is given), when there is no such key. A json.null stored is json.null
  *   store.set(key, value) keeps value (a copy: what the app does to its table afterwards isn't seen). Raises
- *                         `store.set: ` and json.encode's message ("store.set: can't encode a function"), with "nested deeper
- *                         than 15" for one level more than fits. nil removes the key, as store.remove does; a write of what is
- *                         there is no change. Returns nothing
+ *                         `store.set: ` and json.encode's message ("store.set: can't encode a function", "store.set: nested
+ *                         deeper than 16"). A value that can never fit in the 16 KB (a string or a table of more than that) is
+ *                         refused with the 16 KB message before anything is made of it. nil removes the key, as store.remove
+ *                         does; a write of what is there is no change. Returns nothing
  *   store.remove(key)     removes it; nothing for a key that isn't there
- *   The values are cached and saved 2 s after the last change and when the app ends (apps_rt.h says how, and what a refused
- *   save does), loaded before main.lua runs, whose top level may use them. The flush isn't a timer: it isn't one of the 16.
+ *   The values are cached and saved 2 s after the last change, and at the latest 10 s after the first change that isn't saved yet
+ *   (an app that writes every second is saved all the same), and when the app ends (apps_rt.h says how, and what a refused save
+ *   does), loaded before main.lua runs, whose top level may use them. The flush isn't a timer: it isn't one of the 16.
  *
  * sys (the device, and the app's own life):
- *   sys.battery()         {pct = 0 to 100, charging = bool, usb = bool}; no pct when the gadget can't tell
+ *   sys.battery()         {pct = 0 to 100, charging = bool, usb = bool}; pct is always a number, -1 when the gadget can't tell
  *   sys.wifi()            {connected = bool, ssid = "..."}: the network's name, "" when it isn't connected
  *   sys.show()            asks for the front. Allowed in message() and alarm(), and in any callback within 10 s of a tap (the 10th
  *                         second included); otherwise `sys.show: allowed only in message() or alarm(), or within 10 s of a tap`

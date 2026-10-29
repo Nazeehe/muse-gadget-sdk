@@ -76,12 +76,16 @@ def build_harness(cls, name, console, defines=()):
 class HarnessCase(unittest.TestCase):
     harness = None
 
-    def run_case(self, case, timeout=120):
+    def run_case(self, case, timeout=120, aborts=False):
+        """Runs one case of the harness: it must exit 0, or, for a case that is about an assert, end the process (aborts=True)."""
         try:
             done = apps_host.run(self.harness, case, timeout=timeout)
         except subprocess.TimeoutExpired:
             self.fail(f"{case} took more than {timeout} s")
-        self.assertEqual(done.returncode, 0, done.stdout[-3000:] + done.stderr[-12000:])
+        if aborts:
+            self.assertNotEqual(done.returncode, 0, f"{case} ran to its end: {done.stdout[-3000:]}{done.stderr[-12000:]}")
+        else:
+            self.assertEqual(done.returncode, 0, done.stdout[-3000:] + done.stderr[-12000:])
         return done
 
 
@@ -330,17 +334,39 @@ class AppTaskTest(HarnessCase):
     def test_the_loop_wakes_for_the_store_save(self):  # the loop's wait ends at the save's time, not a round later
         self.run_case("the_loop_wakes_for_the_store_save")
 
-    def test_a_stop_saves_and_the_next_run_reads_it_even_when_the_save_is_slow(self):  # the ops' order: load after save
-        self.run_case("a_stop_saves_and_the_next_run_reads_it_after_a_slow_save")
+    def test_a_stop_saves_and_the_next_run_reads_it_though_the_save_waits_in_the_ring(self):  # the ops' order: load after save
+        self.run_case("a_stop_saves_and_the_next_run_reads_it_though_the_save_waits_in_the_ring")
 
     def test_sys_exit_saves_the_store(self):
         self.run_case("sys_exit_saves_the_store")
 
-    def test_a_save_the_worker_refuses_is_asked_for_again_at_the_next_tick(self):  # X11: a refused flush retries
-        self.run_case("a_refused_save_is_asked_for_again_at_the_next_tick")
+    def test_a_save_the_worker_refuses_is_kept_and_offered_every_two_seconds(self):  # P1: kept in PSRAM, offered again by the loop
+        self.run_case("a_save_the_worker_refuses_is_kept_and_offered_every_two_seconds")
 
-    def test_a_final_save_that_cannot_be_queued_is_logged_and_lost(self):  # X11: what happens when it can't be submitted at stop
-        self.run_case("a_final_save_that_cannot_be_queued_is_logged_and_lost")
+    def test_a_final_save_the_worker_refuses_is_kept_and_a_restart_reads_it(self):  # P1: never lost to a transient refusal
+        self.run_case("a_final_save_the_worker_refuses_is_kept_and_a_restart_reads_it")
+
+    def test_a_writer_that_never_pauses_is_saved_at_ten_seconds(self):  # P2: the debounce's maximum wait, at the loop
+        self.run_case("a_writer_that_never_pauses_is_saved_at_ten_seconds")
+
+    def test_a_store_load_that_waits_polls_in_whole_ticks(self):  # A: the 100 Hz class runs it too
+        self.run_case("a_store_load_that_waits_polls_in_whole_ticks")
+
+    def test_a_job_that_runs_a_store_app_does_not_wait_for_its_load(self):  # T: the deadlock guard of the plain build
+        self.run_case("a_job_that_runs_a_store_app_does_not_wait_for_its_load")
+
+    def test_the_wait_for_the_stores_load_is_not_charged_to_the_app(self):  # M: the supervisor counts from the end of the load
+        self.run_case("the_wait_for_the_stores_load_is_not_charged_to_the_app")
+
+    def test_every_event_name_of_the_harness_is_tied_to_its_enum_value(self):  # Q
+        source = HARNESS.read_text()
+        table = re.search(r"EVENT_NAMES\[\] = \{(.*?)\n\};", source, re.S).group(1)
+        enum = re.search(r"typedef enum \{(.*?)\} apps_event_type_t;", (APPS / "apps_task.h").read_text(), re.S).group(1)
+        names = re.findall(r"^\s*(APPS_EV_\w+)", enum, re.M)
+        self.assertGreaterEqual(len(names), 10)
+        for name in names:
+            self.assertRegex(table, rf'\[{name}\] = "{name[len("APPS_EV_"):]}"', f"{name} has no designated entry in EVENT_NAMES")
+        self.assertIn(f'_Static_assert(ARRAY_LEN(EVENT_NAMES) == {names[-1]} + 1, "a name for each event");', source)
 
     def test_a_store_that_cannot_be_read_refuses_the_launch(self):  # never an app with an empty store over the real one
         self.run_case("a_store_that_cannot_be_read_refuses_the_launch")
@@ -366,6 +392,15 @@ class AppTaskTest(HarnessCase):
     def test_an_op_for_an_idle_worker_runs_when_its_wait_ends_and_the_worker_stays_for_it(self):
         self.run_case("io_op_for_an_idle_worker_runs_at_the_end_of_its_wait")
 
+    def test_an_op_from_a_task_that_is_not_the_app_task_asserts(self):  # D: apps_io_submit_op is the app task's
+        done = self.run_case("io_op_from_another_task_asserts", aborts=True)
+        self.assertIn("apps_io_submit_op", done.stderr, "the process ended, but not on the assert")
+        self.assertNotIn("FAIL line", done.stderr)
+        self.assertNotIn("the submit came back", done.stderr)
+
+    def test_the_idle_line_of_a_worker_that_ran_only_ops_is_debug(self):  # N: a save every 2 s makes a worker and says it goes
+        self.run_case("the_idle_line_of_a_worker_that_ran_only_ops_is_debug")
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))
@@ -390,6 +425,9 @@ class AppTaskTickTest(HarnessCase):
 
     def test_timers_run_on_the_app_task_at_100_hz(self):
         self.run_case("timers_run_on_the_app_task")
+
+    def test_a_store_load_that_waits_polls_in_whole_ticks_at_100_hz(self):  # A: 5 ms is no tick here, and a delay of none is a spin
+        self.run_case("a_store_load_that_waits_polls_in_whole_ticks")
 
 
 class AppTaskStoreTest(HarnessCase):

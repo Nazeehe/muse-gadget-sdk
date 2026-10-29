@@ -413,6 +413,60 @@ static int c_encode_nomem(lua_State *L) {
     return 1;
 }
 
+/* c_encode_max(v, max) -> text | nil, err, and how many times realloc_fn was asked for memory: apps_json_encode_value_max. */
+static long probe_realloc_calls;
+
+static void *probe_realloc(void *ptr, size_t n) {
+    probe_realloc_calls++;
+    return count_realloc(ptr, n);
+}
+
+static int c_encode_max(lua_State *L) {
+    luaL_checkany(L, 1);
+    size_t max = (size_t)luaL_checkinteger(L, 2);
+    lua_settop(L, 1);
+    size_t len = 99;
+    char err[96];
+    memset(err, 'x', sizeof err - 1);
+    err[sizeof err - 1] = '\0';
+    probe_realloc_calls = 0;
+    char *out = apps_json_encode_value_max(L, 1, probe_realloc, max, &len, err, sizeof err);
+    CHECK(lua_gettop(L) == 1, "the bounded encode left %d values, wanted 1", lua_gettop(L));
+    if (out != NULL) {
+        CHECK(len <= max || max == 0, "%zu bytes past the limit of %zu", len, max);
+        CHECK(out[len] == '\0' && err[0] == '\0', "no NUL, or err '%s' after success", err);
+        lua_pushlstring(L, out, len);
+        lua_pushnil(L);
+        count_free(out);
+    } else {
+        CHECK(len == 0 && err[0] != '\0' && ascii_text(err), "failure left len %zu and err '%s'", len, err);
+        lua_pushnil(L);
+        lua_pushstring(L, err);
+    }
+    lua_pushinteger(L, probe_realloc_calls);
+    return 3;
+}
+
+/* c_escape(s) -> the escaped bytes, how many apps_json_escape counted with no output, and how many it wrote. */
+static int c_escape(lua_State *L) {
+    size_t n;
+    const char *s = luaL_checklstring(L, 1, &n);
+    size_t counted = apps_json_escape(NULL, s, n);
+    char *out = malloc(counted + 1);
+    if (out == NULL) {
+        fputs("out of memory in the harness\n", stderr);
+        exit(2);
+    }
+    memset(out, 'x', counted + 1);
+    size_t written = apps_json_escape(out, s, n);
+    CHECK(out[counted] == 'x', "the escape wrote past what it counted");
+    lua_pushlstring(L, out, written);
+    free(out);
+    lua_pushinteger(L, (lua_Integer)counted);
+    lua_pushinteger(L, (lua_Integer)written);
+    return 3;
+}
+
 /* lightud() -> a light userdata that isn't json.null; fulluserdata() -> a full one. */
 static int lightud(lua_State *L) {
     static char other;
@@ -435,6 +489,8 @@ static apps_vm_t *new_json_vm(size_t cap) {
         {"c_validate", c_validate},
         {"c_encode", c_encode},
         {"c_encode_nomem", c_encode_nomem},
+        {"c_encode_max", c_encode_max},
+        {"c_escape", c_escape},
         {"lightud", lightud},
         {"fulluserdata", fulluserdata},
     };
@@ -2361,6 +2417,203 @@ static void reader_strict(void) {
     reader_skip_and_depth();
 }
 
+/* ---- apps_json_escape: the encoder's escape table, written once (the store counts its keys with it) ---- */
+
+/* The escape is what the encoder writes between the quotes, for every byte there is, and what it counts is what it writes. */
+static void escape_matches_the_encoder(void) {
+    apps_vm_t *vm = new_json_vm(1 * MB);
+    run_ok(vm,
+           "for b = 0, 127 do\n"
+           "  local s = string.char(b)\n"
+           "  local want = json.encode(s):sub(2, -2)\n"
+           "  local got, counted, written = c_escape(s)\n"
+           "  eq(got, want, 'byte ' .. b) eq(counted, #want, 'counted ' .. b) eq(written, #want, 'written ' .. b)\n"
+           "end\n"
+           "-- two bytes for \" \\ \\b \\f \\n \\r \\t, six for the other controls, one for DEL, '/' and the rest\n"
+           "eq(select(2, c_escape('\"')), 2) eq(select(2, c_escape('\\\\')), 2) eq(select(2, c_escape('\\n')), 2)\n"
+           "eq(select(2, c_escape('\\1')), 6) eq(select(2, c_escape('\\0')), 6) eq(select(2, c_escape('\\127')), 1)\n"
+           "eq(select(2, c_escape('/')), 1) eq(c_escape('\\31'), '\\\\u001f') eq(c_escape('\\1'), '\\\\u0001')\n"
+           "-- whole strings: ASCII and multi-byte UTF-8 pass as they are\n"
+           "for _, s in ipairs({'', 'plain', 'a\"b\\\\c\\n\\t\\1\\0\\127/', '\\u{e9}\\u{20ac}\\u{1F600}', 'tab\\there \\u{e9}\\r\\f\\b'}) do\n"
+           "  local want = json.encode(s):sub(2, -2)\n"
+           "  local got, counted, written = c_escape(s)\n"
+           "  eq(got, want) eq(counted, #want) eq(written, #want)\n"
+           "end\n");
+    apps_vm_free(vm);
+    CHECK(held == 0, "%zu bytes held", held);
+}
+
+/* ---- apps_json_encode_value_max: a bound on the output, so that a value that can never fit costs no memory ---- */
+
+static void encode_bounded(void) {
+    apps_vm_t *vm = new_json_vm(1 * MB);
+    run_ok(vm,
+           "local TOO = 'output larger than the limit'\n"
+           "-- A string's text is the string and its two quotes: exactly the limit passes, one more doesn't, and nothing is allocated for it.\n"
+           "local t, e, calls = c_encode_max(('x'):rep(98), 100) eq(#t, 100) eq(e, nil) eq(calls, 1)\n"
+           "t, e, calls = c_encode_max(('x'):rep(99), 100) eq(t, nil) eq(e, TOO) eq(calls, 0)\n"
+           "-- Escapes count as they are written: 49 quotes are 98 bytes and 2 more.\n"
+           "t, e = c_encode_max(('\"'):rep(49), 100) eq(#t, 100)\n"
+           "t, e = c_encode_max(('\"'):rep(50), 100) eq(t, nil) eq(e, TOO)\n"
+           "-- A table: [1,2,3] is 7 bytes, and so is the limit; [1,2,30] is 8.\n"
+           "t = c_encode_max({1, 2, 3}, 7) eq(t, '[1,2,3]')\n"
+           "t, e, calls = c_encode_max({1, 2, 30}, 7) eq(t, nil) eq(e, TOO) eq(calls, 0)\n"
+           "-- Nested: the one value that takes it past ends the walk, whatever the shape.\n"
+           "t, e = c_encode_max({{('x'):rep(30)}, {('y'):rep(30)}}, 50) eq(t, nil) eq(e, TOO)\n"
+           "t, e = c_encode_max({a = ('x'):rep(20), b = ('y'):rep(20)}, 55) eq(#t, 55)\n"
+           "t, e = c_encode_max({a = ('x'):rep(20), b = ('y'):rep(20)}, 54) eq(t, nil) eq(e, TOO)\n"
+           "-- No limit: as json.encode, which has none (0 is that).\n"
+           "t = c_encode_max(('x'):rep(100000), 0) eq(#t, 100002)\n"
+           "-- A value that doesn't encode says why, not that it is too large.\n"
+           "t, e = c_encode_max(function() end, 100) eq(t, nil) eq(e, \"can't encode a function\")\n"
+           "t, e = c_encode_max('\\255', 100) eq(t, nil) eq(e, \"can't encode a string that isn't valid UTF-8\")\n");
+    apps_vm_free(vm);
+    CHECK(held == 0, "%zu bytes held", held);
+
+    /* The reviewer's input: a string of 400 KB in an app of 1 MB. json.encode needs its output userdata, which doubles to 512 KB, and
+     * then the string of its result, with the one that is encoded held: the call ends out of memory, which no pcall of the app catches.
+     * A bound of 16 KB refuses at once, with no memory spent past the limit, in as many calls as the app cares to make. */
+    vm = new_json_vm(1 * MB);
+    char err[512] = "";
+    int rc = call(vm, "local big = ('x'):rep(400 * 1024)\nlocal ok = pcall(json.encode, big)\nreturn ok\n", 0, APPS_BUDGET_CALL, err, sizeof err);
+    CHECK(rc == APPS_CALL_NOMEM, "the unbounded encode of 400 KB in 1 MB: %s '%s'", call_name(rc), err);
+    apps_vm_free(vm);
+    vm = new_json_vm(1 * MB);
+    run_ok(vm,
+           "local big = ('x'):rep(400 * 1024)\n"
+           "for i = 1, 50 do\n"
+           "  local t, e, calls = c_encode_max(big, 16384)\n"
+           "  eq(t, nil) eq(e, 'output larger than the limit') eq(calls, 0)\n"
+           "  t, e, calls = c_encode_max({big}, 16384)\n"
+           "  eq(t, nil) eq(e, 'output larger than the limit') eq(calls, 0)\n"
+           "  t, e, calls = c_encode_max({s = {big, 1}}, 16384)\n"
+           "  eq(t, nil) eq(e, 'output larger than the limit') eq(calls, 0)\n"
+           "end\n"
+           "local t = c_encode_max({1, 'two'}, 16384) eq(t, '[1,\"two\"]')\n");
+    apps_vm_free(vm);
+    CHECK(held == 0, "%zu bytes held", held);
+}
+
+/* ---- the pull reader's keys of any kind, and a container of the caller's own ---- */
+
+/* apps_jr_key_any: a key that doesn't fit the room, or holds \u0000, is consumed and reported (2), with its value still to come, where
+ * apps_jr_key stops for good on it. The text of the key is checked as every string is: what isn't JSON is still an error. */
+static void reader_keys_that_cannot_be_held(void) {
+    apps_jr_t r;
+    char key[8];
+    static const char doc[] = "{\"a\":1,\"toolongkey\":[1,{\"x\":2}],\"b\\u0000c\":\"v\",\"\\u0000\":true,\"d\\u00e9\":null,\"\":0}";
+    jr_init_text(&r, doc);
+    CHECK(apps_jr_object(&r), "the object: %s", r.err);
+    CHECK(apps_jr_key_any(&r, key, sizeof key) == 1 && strcmp(key, "a") == 0 && apps_jr_skip(&r), "a: '%s' %s", key, r.err);
+    CHECK(apps_jr_key_any(&r, key, sizeof key) == 2 && key[0] == '\0', "a key longer than the room: '%s' %s", key, r.err);
+    CHECK(apps_jr_skip(&r), "its value, which is the caller's to skip: %s", r.err);
+    CHECK(apps_jr_key_any(&r, key, sizeof key) == 2 && key[0] == '\0', "a key with \\u0000 in it: '%s' %s", key, r.err);
+    CHECK(apps_jr_skip(&r), "its value: %s", r.err);
+    CHECK(apps_jr_key_any(&r, key, sizeof key) == 2 && key[0] == '\0' && apps_jr_skip(&r), "a key that is only \\u0000: %s", r.err);
+    CHECK(apps_jr_key_any(&r, key, sizeof key) == 1 && strcmp(key, "d\303\251") == 0 && apps_jr_skip(&r), "an escaped key: '%s' %s", key, r.err);
+    CHECK(apps_jr_key_any(&r, key, sizeof key) == 1 && key[0] == '\0' && apps_jr_skip(&r), "an empty key is a key: %s", r.err);
+    CHECK(apps_jr_key_any(&r, key, sizeof key) == 0 && apps_jr_end(&r), "the end: %s", r.err);
+
+    /* A key that just fits (7 bytes and the NUL), and one byte more. */
+    jr_init_text(&r, "{\"1234567\":1,\"12345678\":2}");
+    CHECK(apps_jr_object(&r) && apps_jr_key_any(&r, key, sizeof key) == 1 && strcmp(key, "1234567") == 0 && apps_jr_skip(&r), "7 bytes: %s", r.err);
+    CHECK(apps_jr_key_any(&r, key, sizeof key) == 2 && apps_jr_skip(&r) && apps_jr_key_any(&r, key, sizeof key) == 0 && apps_jr_end(&r),
+          "8 bytes: %s", r.err);
+
+    /* A long key whose text is not JSON is an error, and stays one: the strictness is the decoder's. */
+    static const char *const bad[] = {"{\"toolongkey\001\":1}", "{\"toolongkey\303\":1}", "{\"toolongkey\\ud800\":1}", "{\"toolongkey",
+                                      "{\"a\\u0000\\x\":1}", "{\"toolongkey\" 1}", "{\"toolongkey\":1,}"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        jr_init_text(&r, bad[i]);
+        int k = 0;
+        bool failed = !apps_jr_object(&r);
+        while (!failed && (k = apps_jr_key_any(&r, key, sizeof key)) > 0) {
+            failed = !apps_jr_skip(&r);
+        }
+        CHECK(failed || k < 0, "case %zu was read: '%s'", i, bad[i]);
+        CHECK(r.err[0] != '\0', "case %zu: no message", i);
+    }
+
+    /* apps_jr_key is as it was: a key that can't be held ends the reading. */
+    jr_init_text(&r, "{\"toolongkey\":1}");
+    CHECK(apps_jr_object(&r) && apps_jr_key(&r, key, sizeof key) == -1 && r.err[0] != '\0', "apps_jr_key on a long key");
+    jr_init_text(&r, "{\"a\\u0000\":1}");
+    CHECK(apps_jr_object(&r) && apps_jr_key(&r, key, sizeof key) == -1 && r.err[0] != '\0', "apps_jr_key on \\u0000");
+}
+
+/* A caller whose own container is one level of what it reads (the store's saved object, which holds values that json.encode takes 16
+ * deep) raises max_depth by one: its container and 16 more fit, 17 more don't, and apps_jr_init's is the decoder's 16. */
+static void reader_depth_allowance(void) {
+    apps_jr_t r;
+    char text[80], key[8];
+    jr_init_text(&r, "[]");
+    CHECK(r.max_depth == APPS_JSON_MAX_DEPTH, "the default is %d", r.max_depth);
+    for (int inner = 15; inner <= 18; inner++) {
+        size_t n = 5;
+        memcpy(text, "{\"x\":", n);
+        memset(text + n, '[', (size_t)inner);
+        n += (size_t)inner;
+        text[n++] = '1';
+        memset(text + n, ']', (size_t)inner);
+        n += (size_t)inner;
+        text[n++] = '}';
+        for (int raised = 0; raised <= 1; raised++) {
+            apps_jr_init(&r, text, n);
+            r.max_depth = APPS_JSON_MAX_DEPTH + raised;
+            bool ok = apps_jr_object(&r) && apps_jr_key(&r, key, sizeof key) == 1 && apps_jr_skip(&r) && apps_jr_key(&r, key, sizeof key) == 0 &&
+                      apps_jr_end(&r);
+            bool want = inner + 1 <= APPS_JSON_MAX_DEPTH + raised;
+            CHECK(ok == want, "%d levels in an object, max_depth %d: ok %d, want %d ('%s')", inner, r.max_depth, ok, want, r.err);
+            if (!ok) {
+                CHECK(strcmp(r.err, "nested deeper than 16") == 0, "the message: '%s'", r.err);
+            }
+        }
+    }
+    /* 17 levels, each with an element before the next level and one after it: the comma rules of the extra level. Skipped whole, and
+     * then opened one by one by the caller, whose own containers are the ones the bits of `started` are for. */
+    char deep[112];
+    size_t n = 0;
+    for (int i = 0; i < 16; i++) {
+        memcpy(deep + n, "[1,", 3);
+        n += 3;
+    }
+    memcpy(deep + n, "[1]", 3);
+    n += 3;
+    for (int i = 0; i < 16; i++) {
+        memcpy(deep + n, ",2]", 3);
+        n += 3;
+    }
+    deep[n] = '\0';
+    apps_jr_init(&r, deep, n);
+    CHECK(!apps_jr_skip(&r) && strcmp(r.err, "nested deeper than 16") == 0, "17 levels, as the decoder reads: '%s'", r.err);
+    apps_jr_init(&r, deep, n);
+    r.max_depth = 17;
+    CHECK(apps_jr_skip(&r) && apps_jr_end(&r), "17 levels, skipped: %s", r.err);
+
+    int64_t v;
+    bool ok = true;
+    apps_jr_init(&r, deep, n);
+    r.max_depth = 17;
+    for (int level = 1; level <= 17 && ok; level++) {
+        ok = apps_jr_array(&r) && apps_jr_next(&r) == 1 && apps_jr_integer(&r, &v) && v == 1;
+        if (ok && level < 17) {
+            ok = apps_jr_next(&r) == 1;  /* the comma: the next level is at the cursor */
+        }
+    }
+    ok = ok && apps_jr_next(&r) == 0;  /* the innermost closes */
+    for (int level = 16; level >= 1 && ok; level--) {
+        ok = apps_jr_next(&r) == 1 && apps_jr_integer(&r, &v) && v == 2 && apps_jr_next(&r) == 0;
+    }
+    CHECK(ok && apps_jr_end(&r), "17 levels, opened by the caller: '%s'", r.err);
+
+    apps_jr_init(&r, deep, n);
+    for (int level = 1; level <= 16; level++) {
+        ok = apps_jr_array(&r) && apps_jr_next(&r) == 1 && apps_jr_integer(&r, &v) && apps_jr_next(&r) == 1;
+        CHECK(ok, "level %d: %s", level, r.err);
+    }
+    CHECK(!apps_jr_array(&r) && strcmp(r.err, "nested deeper than 16") == 0, "the 17th container: '%s'", r.err);
+}
+
 /* ---- compact (ruling R6.14) ---- */
 
 static void expect_compact(const char *in, const char *want, int line) {
@@ -2772,6 +3025,10 @@ int main(int argc, char **argv) {
         {"allocation_sweep", allocation_sweep},
         {"reader_manifest", reader_manifest},
         {"reader_strict", reader_strict},
+        {"reader_keys_that_cannot_be_held", reader_keys_that_cannot_be_held},
+        {"reader_depth_allowance", reader_depth_allowance},
+        {"escape_matches_the_encoder", escape_matches_the_encoder},
+        {"encode_bounded", encode_bounded},
         {"compact", compact},
         {"fuzz_agreement", fuzz_agreement},
         {"stack_discipline", stack_discipline},

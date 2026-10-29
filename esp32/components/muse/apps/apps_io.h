@@ -38,6 +38,12 @@
  * in the order they were submitted, whichever job is running: the worker runs those that are waiting after each job and before it goes, and
  * a job that waits for the app task runs them as it looks (apps_io_assist, which the app task's callers call each time they look).
  * An op must be short and must not wait for another task.
+ *
+ * Only the app task submits ops (it registers itself as it starts: apps_io_register_op_task, and a submit from any other task asserts),
+ * so the ring has one pusher, which the take-back of a refused op relies on. An op may run nested inside a job's wait: the job is the
+ * worker, and apps_io_assist runs the ops from its await, so an op must never take a lock that a job can hold across a call of
+ * apps_task_* (the job would wait for the app task with the lock, and the op for the lock, in the job's own stack). Task 20's flash ops
+ * inherit this.
  */
 
 #include <stdbool.h>
@@ -69,10 +75,15 @@ void apps_io_init(void);
  */
 bool apps_io_submit(void (*fn)(void *arg), void *arg);
 
+/* The calling task is the one that submits ops: the app task calls this as it starts, before it can ask the store for anything. A later
+ * call, by another task, makes that the submitter instead (a test's own thread does, in the cases that have no app task of their own). */
+void apps_io_register_op_task(void);
+
 /*
  * Queues op(arg) for the worker, to run on it in the order of the ops queued (an op never runs before one queued before it has
- * ended), as soon as the worker is between jobs or a job that waits for the app task looks (apps_io_assist). Any task, but the
- * order is for one submitter: the app task. It never waits. True once the op is queued: op(arg) then runs exactly once. False, with
+ * ended), as soon as the worker is between jobs or a job that waits for the app task looks (apps_io_assist). ONLY THE APP TASK (the one
+ * that registered itself with apps_io_register_op_task): the take-back below needs one pusher, and any other task asserts. It never
+ * waits. True once the op is queued: op(arg) then runs exactly once. False, with
  * nothing queued (op never runs and arg stays the caller's), when APPS_IO_OPS are waiting already, or when there is no worker and none
  * can be made (apps_io_submit's admission, and one W log line says why), so that nothing could ever run it. When a worker is there but
  * a job couldn't be queued to bring it, the op is queued all the same: the worker runs it when its job ends, or the app task's callers

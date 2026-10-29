@@ -406,13 +406,19 @@ static size_t held_now(size_t *counter) {
     return n;
 }
 
-/* heap_caps_*: the app task's own blocks (its record and its requests), which must be PSRAM. A case can make the next
- * ones fail (out of memory). */
+/* heap_caps_*: the app task's own blocks (its record and its requests), which must be PSRAM, but for a small internal block, which is what
+ * an atomic that no read-modify-write may reach in PSRAM needs (the store's load request: counted in internal_blocks). A case can make the
+ * next ones fail (out of memory). */
 static atomic_int caps_failures;
+static atomic_uint internal_blocks;
 
 void *heap_caps_malloc(size_t size, uint32_t caps) {
-    if ((caps & MALLOC_CAP_SPIRAM) == 0) {
+    bool small_internal = (caps & MALLOC_CAP_INTERNAL) != 0 && size <= 64;
+    if ((caps & MALLOC_CAP_SPIRAM) == 0 && !small_internal) {
         error("heap_caps_malloc of %zu bytes not in PSRAM (caps 0x%x)", size, (unsigned)caps);
+    }
+    if (small_internal) {
+        atomic_fetch_add(&internal_blocks, 1);
     }
     if (atomic_load(&caps_failures) > 0) {
         atomic_fetch_sub(&caps_failures, 1);
@@ -748,7 +754,9 @@ static _Thread_local struct fake_task thread_task;  /* what a thread of the harn
 static _Thread_local struct fake_task *current_task;
 static pthread_mutex_t tasks_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic(TickType_t) longest_receive;  /* the longest wait the app task asked of xQueueReceive */
+static _Atomic(TickType_t) last_receive;     /* and the last: what its loop is waiting for now */
 static atomic_uint zero_receives;            /* how many times it asked for no wait at all: it never blocked then */
+static atomic_uint zero_delays;              /* how many times it asked vTaskDelay for no ticks: a bare yield, a loop that spins */
 
 static struct fake_task *self_task(void) {
     return current_task != NULL ? current_task : &thread_task;
@@ -838,189 +846,87 @@ UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task) {
 }
 
 void vTaskDelay(const TickType_t ticks) {
+    if (ticks == 0 && app_task_of_thread() != NULL) {
+        atomic_fetch_add(&zero_delays, 1);
+    }
     sleep_ms((int)ticks_to_ms(ticks));
 }
 
-/* ---- The store (apps_port.h), made as the device's port makes it: the app task's calls are ops of the I/O worker (apps_io_submit_op),
- * which alone touches the map, and a load waits for its op at most APPS_STORE_WAIT_MS (the request is abandoned past that, and the op frees
- * it). A case can slow a save (a slow flash: a load that jumped the queue would read what was there before it) and can make the worker
- * refuse saves. The events say what was queued and what was done, in the order each thread did it. ---- */
+/* ---- The store (apps_port.h): the real one. apps_store_ram.c is compiled into this file (included, not linked, so that a case can read
+ * what the worker keeps: store_peek), and runs over the real I/O worker (apps_io.c): the app task's saves and loads are ops of the worker,
+ * which alone touches the map. What a case can't read off the store itself it reads off the events: what the runtime asked of the port, in the
+ * order the app task asked it, and the log lines the store and the worker write. apps_port_idf.c forwards the two calls as these do. ---- */
 
-#define STORE_APPS_MAX 8
-static pthread_mutex_t store_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct {
-    char app[APPS_ID_MAX + 1];
-    char *json;
-    size_t len;
-} store_map[STORE_APPS_MAX];
-static atomic_int store_save_delay_ms;
-static atomic_bool store_refuse_saves;
-static atomic_int store_ops_queued, store_ops_done;  /* what the worker was given, and what it has done */
-
-typedef struct {
-    char app[APPS_ID_MAX + 1];
-    size_t len;
-    char json[];
-} store_save_t;
-
-enum { LOAD_WAITING, LOAD_DONE, LOAD_ABANDONED };
-
-typedef struct {
-    atomic_int state;
-    char app[APPS_ID_MAX + 1];
-    char *json;
-    size_t len;
-} store_load_t;
-
-/* X11: every access of the store is the I/O worker's. */
-static void store_on_worker(const char *what) {
-    if (strcmp(self_task()->name, "muse_apps_io") != 0) {
-        error("a store %s on '%s': the I/O worker's (X11)", what, self_task()->name);
-    }
-}
-
-static void store_put_op(void *arg) {
-    store_save_t *save = arg;
-    store_on_worker("save");
-    int delay = atomic_load(&store_save_delay_ms);
-    if (delay > 0) {
-        sleep_ms(delay);
-    }
-    pthread_mutex_lock(&store_mu);
-    int at = -1, free_at = -1;
-    for (int i = 0; i < STORE_APPS_MAX; i++) {
-        if (store_map[i].json != NULL && strcmp(store_map[i].app, save->app) == 0) {
-            at = i;
-        }
-        if (store_map[i].json == NULL && free_at < 0) {
-            free_at = i;
-        }
-    }
-    at = at >= 0 ? at : free_at;
-    char *copy = at >= 0 ? apps_port_realloc(NULL, save->len + 1) : NULL;
-    if (copy != NULL) {
-        memcpy(copy, save->json, save->len + 1);
-        apps_port_free(store_map[at].json);
-        snprintf(store_map[at].app, sizeof store_map[at].app, "%s", save->app);
-        store_map[at].json = copy;
-        store_map[at].len = save->len;
-    }
-    pthread_mutex_unlock(&store_mu);
-    event(copy != NULL ? "store saved %s %s" : "store NOT saved %s %s", save->app, save->json);
-    apps_port_free(save);
-    atomic_fetch_add(&store_ops_done, 1);
-}
-
-static void store_get_op(void *arg) {
-    store_load_t *r = arg;
-    store_on_worker("load");
-    pthread_mutex_lock(&store_mu);
-    const char *json = "{}";
-    size_t len = 2;
-    for (int i = 0; i < STORE_APPS_MAX; i++) {
-        if (store_map[i].json != NULL && strcmp(store_map[i].app, r->app) == 0) {
-            json = store_map[i].json;
-            len = store_map[i].len;
-        }
-    }
-    char *copy = apps_port_realloc(NULL, len + 1);
-    if (copy != NULL) {
-        memcpy(copy, json, len);
-        copy[len] = '\0';
-    }
-    pthread_mutex_unlock(&store_mu);
-    event("store load %s", r->app);
-    r->json = copy;
-    r->len = copy != NULL ? len : 0;
-    int waiting = LOAD_WAITING;
-    if (!atomic_compare_exchange_strong(&r->state, &waiting, LOAD_DONE)) {
-        event("store load abandoned %s", r->app);
-        apps_port_free(copy);
-        apps_port_free(r);
-    }
-    atomic_fetch_add(&store_ops_done, 1);
-}
+#include "apps_store_ram.c"
 
 char *apps_port_store_load(const char *app, size_t *len) {
-    *len = 0;
-    store_load_t *r = apps_port_realloc(NULL, sizeof *r);
-    CHECK(r != NULL, "no memory for a load");
-    atomic_init(&r->state, LOAD_WAITING);
-    snprintf(r->app, sizeof r->app, "%s", app);
-    r->json = NULL;
-    r->len = 0;
-    atomic_fetch_add(&store_ops_queued, 1);
-    if (!apps_io_submit_op(store_get_op, r)) {
-        atomic_fetch_sub(&store_ops_queued, 1);
-        apps_port_free(r);
-        event("store load refused %s", app);
-        return NULL;
-    }
-    int64_t until = apps_port_mono_ms() + APPS_STORE_WAIT_MS;
-    while (atomic_load(&r->state) != LOAD_DONE) {
-        if (apps_port_mono_ms() >= until) {
-            int waiting = LOAD_WAITING;
-            if (atomic_compare_exchange_strong(&r->state, &waiting, LOAD_ABANDONED)) {
-                event("store load gave up %s", app);
-                return NULL;
-            }
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    char *json = r->json;
-    *len = r->len;
-    apps_port_free(r);
+    char *json = apps_store_load(app, len);
+    apps_task_call_restart();  /* as apps_port_idf.c does: what the load waited for is the gadget's, not the app's */
+    event(json != NULL ? "store load %s" : "store load failed %s", app);
     return json;
 }
 
 bool apps_port_store_save(const char *app, const char *json, size_t len) {
-    if (atomic_load(&store_refuse_saves)) {
-        event("store save refused %s", app);
-        return false;
-    }
-    store_save_t *save = apps_port_realloc(NULL, sizeof *save + len + 1);
-    CHECK(save != NULL, "no memory for a save");
-    snprintf(save->app, sizeof save->app, "%s", app);
-    save->len = len;
-    memcpy(save->json, json, len);
-    save->json[len] = '\0';
-    atomic_fetch_add(&store_ops_queued, 1);
-    if (!apps_io_submit_op(store_put_op, save)) {
-        atomic_fetch_sub(&store_ops_queued, 1);
-        apps_port_free(save);
-        event("store save refused %s", app);
-        return false;
-    }
-    event("store save queued %s %s", app, json);
-    return true;
+    bool taken = apps_store_save(app, json, len);
+    event(taken ? "store save queued %s %s" : "store save refused %s %s", app, json);
+    return taken;
 }
 
-/* What the store holds for app, as a copy the case frees; NULL for none. */
-static char *store_peek(const char *app) {
-    char *copy = NULL;
-    pthread_mutex_lock(&store_mu);
-    for (int i = 0; i < STORE_APPS_MAX; i++) {
-        if (store_map[i].json != NULL && strcmp(store_map[i].app, app) == 0) {
-            copy = strdup(store_map[i].json);
+/* How many saves the port holds for the worker, which hasn't taken them (apps_store.h). The app task's alone: a case reads it between rounds. */
+static int store_pending_count(void) {
+    int n = 0;
+    for (size_t i = 0; i < ARRAY_LEN(s_pending); i++) {
+        n += s_pending[i] != NULL ? 1 : 0;
+    }
+    return n;
+}
+
+/* The worker has done what it was given (the ops queued before this, whichever way they were nudged, and the jobs before it): a job
+ * of its own, waited for. A worker that can't be made leaves nothing to wait for. */
+static atomic_bool worker_synced;
+
+static void sync_job(void *arg) {
+    (void)arg;
+    atomic_store(&worker_synced, true);
+}
+
+static void worker_sync(void) {
+    atomic_store(&worker_synced, false);
+    if (!apps_io_submit(sync_job, NULL)) {
+        return;
+    }
+    for (int64_t until = real_ms() + 5000; !atomic_load(&worker_synced);) {
+        CHECK(real_ms() < until, "the worker never ran the sync job");
+        sleep_ms(1);
+    }
+}
+
+/* What the worker's map holds for app, as a copy the case frees; NULL for none. The map is the worker's, so this reads it only after the
+ * worker has run what it was given (store_peek) or while a case holds the worker in a job that isn't touching it (store_peek_now). */
+static char *store_peek_now(const char *app) {
+    for (const store_node_t *at = s_store; at != NULL; at = at->next) {
+        if (strcmp(at->app, app) == 0) {
+            return strdup(at->json);
         }
     }
-    pthread_mutex_unlock(&store_mu);
-    return copy;
+    return NULL;
 }
 
-/* The end of a case: once the worker has done what it was given, the map's blocks go back (finish() checks that nothing of the apps'
- * heap is held). */
+static char *store_peek(const char *app) {
+    worker_sync();
+    return store_peek_now(app);
+}
+
+/* The end of a case: once the worker has done what it was given, the map's blocks and the saves it never took go back (finish() checks
+ * that nothing of the apps' heap is held). */
 static void store_forget_all(void) {
-    for (int64_t until = real_ms() + 5000; atomic_load(&store_ops_done) < atomic_load(&store_ops_queued) && real_ms() < until;) {
-        sleep_ms(2);
+    worker_sync();
+    while (s_store != NULL) {
+        store_node_t *next = s_store->next;
+        apps_port_free(s_store);
+        s_store = next;
     }
-    pthread_mutex_lock(&store_mu);
-    for (int i = 0; i < STORE_APPS_MAX; i++) {
-        apps_port_free(store_map[i].json);
-        store_map[i].json = NULL;
-    }
-    pthread_mutex_unlock(&store_mu);
+    s_store_n = 0;
 }
 
 /* ---- sys: the battery and the network are fixed, and show, keep_awake and exit are the real app task's (apps_port_idf.c forwards
@@ -1108,8 +1014,20 @@ static bool has_item(const struct fake_queue *q) {
  * queue holds, so what they pass is recorded, not timed. */
 static _Atomic(TickType_t) lvgl_longest_send, launch_longest_send, timer_longest_send;
 static _Thread_local bool in_launch;  /* this thread is inside apps_task_launch (the case marks it) */
-static const char *const EVENT_NAMES[] = {"?", "TOUCH", "RUN", "STOP", "COMPILE", "MESSAGE", "SHOW", "HIDE", "ALARM", "WAKE",
-                                          "ALARM_LAUNCH"};
+static const char *const EVENT_NAMES[] = {
+    [0] = "?",
+    [APPS_EV_TOUCH] = "TOUCH",
+    [APPS_EV_RUN] = "RUN",
+    [APPS_EV_STOP] = "STOP",
+    [APPS_EV_COMPILE] = "COMPILE",
+    [APPS_EV_MESSAGE] = "MESSAGE",
+    [APPS_EV_SHOW] = "SHOW",
+    [APPS_EV_HIDE] = "HIDE",
+    [APPS_EV_ALARM] = "ALARM",
+    [APPS_EV_WAKE] = "WAKE",
+    [APPS_EV_ALARM_LAUNCH] = "ALARM_LAUNCH",
+};
+_Static_assert(ARRAY_LEN(EVENT_NAMES) == APPS_EV_ALARM_LAUNCH + 1, "a name for each event");
 
 static void note_send(const void *item, size_t item_size, TickType_t wait) {
     _Atomic(TickType_t) *longest = on_lvgl_task()            ? &lvgl_longest_send
@@ -1156,6 +1074,9 @@ BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t wait) {
 }
 
 BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t wait) {
+    if (app_task_of_thread() != NULL) {
+        atomic_store(&last_receive, wait);
+    }
     if (app_task_of_thread() != NULL && wait > atomic_load(&longest_receive)) {
         atomic_store(&longest_receive, wait);
     }
@@ -1853,6 +1774,7 @@ static void finish(void) {
     release_print();
     clock_go();
     (void)stop_app(NULL, 0);
+    CHECK(store_pending_count() == 0, "%d saves are still kept for a worker that hasn't taken them: the case ends with none", store_pending_count());
     store_forget_all();
     int64_t until = real_ms() + 5000;
     while ((held_now(&port_held) != 0 || held_now(&caps_held) != caps_after_start) && real_ms() < until) {
@@ -4007,6 +3929,18 @@ static void io_job(void *arg) {
     atomic_store(&io_job_end_ms, real_ms());
 }
 
+/* The worker is held by a long job (a commit that runs, an install: the worker's jobs can take longer than any bound the alarm could put on
+ * its own launch, which queues behind them): the case's "hold". Returns once the worker is in it. */
+static void hold_the_worker(void) {
+    atomic_store(&io_held, false);
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+}
+
 /* apps_io: one worker, made when a job comes, runs the jobs in order and goes after 2 s without one. */
 static void io_runs_jobs_in_order(void) {
     int from = mark();
@@ -4256,6 +4190,13 @@ static void keep_awake_pokes_the_idle_timer_while_in_front(void) {
         FIFO_SYNC();
     }
     CHECK(count_from(from, "poke at") == 1, "no more with the clock where it was: %d", count_from(from, "poke at"));
+    /* An app that says keep_awake(true) again and again, as a timer of 40 ms would, is still on: the call is no new start, and the pokes
+     * are the loop's, once a second. */
+    for (int i = 0; i < 3; i++) {
+        say("awake", "keep", "{\"on\":true}");
+        FIFO_SYNC();
+    }
+    CHECK(count_from(from, "poke at") == 1, "keep_awake(true) while it was on made %d pokes", count_from(from, "poke at"));
     clock_jump(999);
     FIFO_SYNC();
     CHECK(count_from(from, "poke at") == 1, "none before a second: %d", count_from(from, "poke at"));
@@ -4345,6 +4286,8 @@ static void the_store_is_saved_through_the_worker_two_seconds_after_the_last_cha
     CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
     WAIT(from, "print stored runs nil");
     ORDERED(from, "store load stored", "print stored runs nil");  /* the values are read before start() runs */
+    CHECK(atomic_load(&internal_blocks) == 1, "the load's request was %u small internal blocks: the house rule keeps an atomic out of PSRAM",
+          atomic_load(&internal_blocks));
     clock_jump(1999);
     ROUNDS();
     ABSENT(from, "store save queued");
@@ -4357,7 +4300,7 @@ static void the_store_is_saved_through_the_worker_two_seconds_after_the_last_cha
     ABSENT(from, "store save queued");
     clock_jump(1);
     ROUNDS();
-    WAIT(from, "store saved stored {");
+    WAIT(from, "store save queued stored {");
     CHECK(count_from(from, "store save queued stored") == 1, "one save for the two changes: %d", count_from(from, "store save queued stored"));
     EXPECT_STORED("\"a\":1");
     EXPECT_STORED("\"runs\":1");
@@ -4368,41 +4311,65 @@ static void the_store_is_saved_through_the_worker_two_seconds_after_the_last_cha
     clock_go();
 }
 
-/* With nothing else to wake it, the loop wakes for the save: its wait ends when the store is due (apps_rt_next_deadline), not at its next
- * round of up to a second later. The last write is at t, another round comes at t + 500 ms (which puts the rounds off the save's time), and
- * the save is queued about 2 s after t, not 2.5 s. */
+/* With nothing else to wake it, the loop wakes for the save: its wait ends when the store is due (apps_rt_next_deadline), not at its next round
+ * of up to a second later. Read off the wait the loop asked of its queue (the clock stands still, so no real time is measured): a second while
+ * the save is 2 s off, the 50 ms that are left once the clock is 1950 ms on, and the save is made when the last of them is over. */
 static void the_loop_wakes_for_the_store_save(void) {
     char err[300];
+    clock_stop_at(apps_port_mono_ms());
     int from = mark();
     CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
     WAIT(from, "print stored runs nil");
-    FIFO_SYNC();  /* start()'s change is saved 2 s after the run: let it be, so that the case's own is the last */
-    WAIT(from, "store saved stored {");
+    clock_jump(2000);  /* start()'s change is saved 2 s after the run: let it be, so that the case's own is the last */
+    ROUNDS();
+    WAIT(from, "store save queued stored {");
     from = mark();
-    say("stored", "set", "{\"k\":\"late\",\"v\":true}");
-    int64_t wrote = real_ms();
-    sleep_ms(500);
-    FIFO_SYNC();
-    wait_event_at(__LINE__, from, "store saved stored {", 3000);
-    int64_t took = real_ms() - wrote;
-    CHECK(took >= 1950 && took <= 2400, "the save came %lld ms after the change: 2 s, not the second round's 2.5 s", (long long)took);
+    say("stored", "set", "{\"k\":\"late\",\"v\":true}");  /* the save is due 2000 ms on */
+    ROUNDS();
+    CHECK(atomic_load(&last_receive) == (TickType_t)((1000ull * configTICK_RATE_HZ + 999u) / 1000u),
+          "the save is 2 s off and the loop waits %u ticks: its second", (unsigned)atomic_load(&last_receive));
+    clock_jump(1950);
+    ROUNDS();
+    CHECK(atomic_load(&last_receive) == (TickType_t)((50ull * configTICK_RATE_HZ + 999u) / 1000u),
+          "the save is 50 ms off and the loop waits %u ticks: for the save, not for its next round", (unsigned)atomic_load(&last_receive));
+    ABSENT(from, "store save queued stored");
+    clock_jump(50);
+    ROUNDS();
+    WAIT(from, "store save queued stored {");
     EXPECT_STORED("\"late\":true");
+    clock_go();
 }
 
-/* The next run reads what the last one left, even though the worker is slow over the save: the stop's save and the new run's load are ops
- * in one order. Without that order the load would read what was saved before (nothing). */
-static void a_stop_saves_and_the_next_run_reads_it_after_a_slow_save(void) {
+/* A thread that lets the held worker go after a while (a case's hold: hold_the_worker). */
+static void *let_the_worker_go_later(void *arg) {
+    sleep_ms((int)(intptr_t)arg);
+    event("worker released");
+    atomic_store(&io_hold, false);
+    return NULL;
+}
+
+/* The next run reads what the last one left, though the stop's save has to wait in the ring: the worker is in a job that doesn't look at its
+ * ops, so the save waits behind it (nothing is saved while it does), and the new run's load is queued behind the save. The ops are in one order:
+ * the load reads the save, not what was there before it (nothing). */
+static void a_stop_saves_and_the_next_run_reads_it_though_the_save_waits_in_the_ring(void) {
     char err[300];
-    atomic_store(&store_save_delay_ms, 300);
     clock_stop_at(apps_port_mono_ms());
     CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
     say("stored", "set", "{\"k\":\"n\",\"v\":5}");
+    hold_the_worker();
     int from = mark();
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    WAIT(from, "store save queued stored {");
+    char *waiting = store_peek_now("stored");  /* the worker is held: it has run none of its ops */
+    CHECK(waiting == NULL, "the save was written while the worker was held: '%s'", waiting != NULL ? waiting : "");
+    free(waiting);
+    pthread_t releaser;
+    CHECK(pthread_create(&releaser, NULL, let_the_worker_go_later, (void *)(intptr_t)300) == 0, "no thread to let the worker go");
     CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run again: %s", err);
+    pthread_join(releaser, NULL);
     WAIT(from, "print stored runs 1");  /* the second run read the first's: runs was 1 when it stopped */
-    ORDERED(from, "store save queued stored", "store load stored");
-    ORDERED(from, "store saved stored {", "store load stored");
+    ORDERED(from, "store save queued stored", "worker released");
+    ORDERED(from, "worker released", "store load stored");
     char *reply = apps_task_message("stored", "get", "{\"k\":\"n\"}", false, 5000, err, sizeof err);
     CHECK(reply != NULL && strcmp(reply, "{\"v\":5}") == 0, "the value came back: %s", reply != NULL ? reply : err);
     apps_port_free(reply);
@@ -4418,57 +4385,193 @@ static void sys_exit_saves_the_store(void) {
     int from = mark();
     say("stored", "exit", NULL);
     WAIT(from, "log I stop stored: exited");
-    WAIT(from, "store saved stored {");
-    FIFO_SYNC();
+    WAIT(from, "store save queued stored {");
     EXPECT_STORED("\"bye\":\"yes\"");
     clock_go();
 }
 
-/* A save the worker refuses is asked for again at the next 2 s tick, no oftener (a retry with no period would spin the loop), and goes
- * through once it takes it. */
-static void a_refused_save_is_asked_for_again_at_the_next_tick(void) {
+/* The worker is gone (it goes after 2 s without a job or an op), and the gadget has no room for a new one: what the store asks of it is refused
+ * until memory is back. The run that began this made one for its load. */
+static void no_worker_and_no_room_to_make_one(int from) {
+    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+}
+
+#define NO_ROOM_LINE "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused"
+
+/* A save the worker refuses isn't lost: the port keeps it in PSRAM, takes it as saved (the runtime has nothing to ask again), and offers it
+ * again every APPS_STORE_RETRY_MS, no oftener (a retry with no period would write a line at every round); the worker has it once it can. */
+static void a_save_the_worker_refuses_is_kept_and_offered_every_two_seconds(void) {
     char err[300];
     clock_stop_at(apps_port_mono_ms());
-    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
-    atomic_store(&store_refuse_saves, true);
     int from = mark();
-    clock_jump(2000);
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    no_worker_and_no_room_to_make_one(from);
+    from = mark();
+    clock_jump(2000);  /* start()'s change is due */
     ROUNDS();
-    CHECK(count_from(from, "store save refused stored") == 1, "asked at the tick: %d", count_from(from, "store save refused stored"));
+    WAIT(from, "store save queued stored {");  /* the port has it */
+    CHECK(count_from(from, NO_ROOM_LINE) == 1, "offered once: %d", count_from(from, NO_ROOM_LINE));
+    CHECK(store_pending_count() == 1, "kept: %d waiting", store_pending_count());
     for (int i = 0; i < 5; i++) {
         FIFO_SYNC();
     }
-    CHECK(count_from(from, "store save refused stored") == 1, "not again before the next tick: %d", count_from(from, "store save refused stored"));
+    CHECK(count_from(from, NO_ROOM_LINE) == 1, "not again before the next tick: %d", count_from(from, NO_ROOM_LINE));
     clock_jump(1999);
     ROUNDS();
-    CHECK(count_from(from, "store save refused stored") == 1, "not 1999 ms on: %d", count_from(from, "store save refused stored"));
+    CHECK(count_from(from, NO_ROOM_LINE) == 1, "not 1999 ms on: %d", count_from(from, NO_ROOM_LINE));
     clock_jump(1);
     ROUNDS();
-    CHECK(count_from(from, "store save refused stored") == 2, "again 2 s after the refusal: %d", count_from(from, "store save refused stored"));
-    atomic_store(&store_refuse_saves, false);
+    CHECK(count_from(from, NO_ROOM_LINE) == 2, "again 2 s after: %d", count_from(from, NO_ROOM_LINE));
+    CHECK(store_pending_count() == 1, "still kept");
+    ABSENT(from, "print stored store: the last changes");
+    atomic_store(&internal_free, 200u * 1024);
     clock_jump(2000);
     ROUNDS();
-    WAIT(from, "store saved stored {");
-    EXPECT_STORED("\"runs\":1");
+    EXPECT_STORED("\"runs\":1");  /* the worker has it, once there is one */
+    CHECK(store_pending_count() == 0, "taken: %d still waiting", store_pending_count());
+    CHECK(count_from(from, "store save queued stored") == 1, "the runtime asked once: %d", count_from(from, "store save queued stored"));
     clock_go();
 }
 
-/* The save at the app's end, which the worker refuses: it is tried once, said in the app's log in one line, and the changes since the last
- * save are lost (the runtime has no more ticks to ask again with). The next run reads the last save. */
-static void a_final_save_that_cannot_be_queued_is_logged_and_lost(void) {
+/* The save at the app's end, which the worker refuses, is kept too: no log line says it is lost, and a restart that comes before the worker can
+ * have it reads it (the load looks at what is kept first, and needs no worker for it). The next run's own final save takes its place, and the
+ * worker has that. */
+static void a_final_save_the_worker_refuses_is_kept_and_a_restart_reads_it(void) {
     char err[300];
     clock_stop_at(apps_port_mono_ms());
-    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
-    atomic_store(&store_refuse_saves, true);
     int from = mark();
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    no_worker_and_no_room_to_make_one(from);
+    from = mark();
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
-    WAIT(from, "print stored store: the last changes couldn't be saved");
-    CHECK(count_from(from, "store save refused stored") == 1, "tried once at the end: %d", count_from(from, "store save refused stored"));
-    CHECK(count_from(from, "print stored store: the last changes couldn't be saved") == 1, "one log line");
-    atomic_store(&store_refuse_saves, false);
-    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run again: %s", err);
-    WAIT(from, "print stored runs nil");  /* nothing was saved: the first run's count is lost with the rest */
+    CHECK(store_pending_count() == 1, "the final save is kept: %d waiting", store_pending_count());
+    CHECK(count_from(from, "store save queued stored") == 1, "asked once at the end: %d", count_from(from, "store save queued stored"));
+    ABSENT(from, "print stored store: the last changes couldn't be saved");
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run again, with the save still waiting: %s", err);
+    WAIT(from, "print stored runs 1");  /* the first run's count: read from what is kept */
+    ABSENT(from, "store load failed");
+    CHECK(store_pending_count() == 1, "still kept: the restart only read it");
+    atomic_store(&internal_free, 200u * 1024);
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);  /* runs is 2 now: this save replaces the kept one, and the worker takes it */
+    CHECK(store_pending_count() == 0, "the newer save went to the worker: %d kept", store_pending_count());
+    EXPECT_STORED("\"runs\":2");
     clock_go();
+}
+
+/* An app that writes every second never has the 2 s of quiet its save waits for, and the loop saves it 10 s after the first write that wasn't saved
+ * yet (APPS_STORE_MAX_WAIT_MS), with what it has written by then; the next write begins the next 10 s. */
+static void a_writer_that_never_pauses_is_saved_at_ten_seconds(void) {
+    char err[300];
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print stored runs nil");
+    clock_jump(2000);  /* start()'s change is saved: the writer begins from a store with nothing waiting */
+    ROUNDS();
+    WAIT(from, "store save queued stored {");
+    from = mark();
+    for (int i = 1; i <= 10; i++) {
+        char json[48];
+        snprintf(json, sizeof json, "{\"k\":\"w\",\"v\":%d}", i);
+        say("stored", "set", json);  /* at second i - 1 of the writer's */
+        clock_jump(1000);
+        ROUNDS();
+        if (i < 10) {
+            CHECK(count_from(from, "store save queued stored") == 0, "saved at second %d of a writer's 10 s", i);
+        }
+    }
+    WAIT(from, "store save queued stored {");  /* 10 s after the first write, as the writer wrote its tenth */
+    CHECK(count_from(from, "store save queued stored") == 1, "one save: %d", count_from(from, "store save queued stored"));
+    EXPECT_STORED("\"w\":10");
+    clock_go();
+}
+
+/* A load that has to wait for the worker polls in whole ticks: where a tick is 10 ms (the build at 100 Hz) 5 ms is no tick at all, and a delay of
+ * none is a bare yield, the app task spinning at its priority for as long as the load waits (a second at the most). */
+static void a_store_load_that_waits_polls_in_whole_ticks(void) {
+    char err[300];
+    hold_the_worker();
+    pthread_t releaser;
+    CHECK(pthread_create(&releaser, NULL, let_the_worker_go_later, (void *)(intptr_t)300) == 0, "no thread to let the worker go");
+    int from = mark();
+    unsigned before = atomic_load(&zero_delays);
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    pthread_join(releaser, NULL);
+    WAIT(from, "print stored runs nil");
+    CHECK(atomic_load(&zero_delays) == before, "the app task delayed for no ticks %u times while its load waited: a yield, not a wait",
+          atomic_load(&zero_delays) - before);
+}
+
+/* The deadlock the assist exists to prevent, with no console: a job of the worker that runs an app and waits for the app task (a launch's, an
+ * install's run). The app task, making the app, asks the worker for its values, which the job holds up; the job's wait runs that op as it
+ * looks (apps_io_assist), so the app starts, and not after the load's bound has refused it. */
+static atomic_bool store_job_done;
+
+static void run_stored_job(void *arg) {
+    (void)arg;
+    char err[300];
+    bool ok = apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err);
+    event("job run %s %s", ok ? "ok" : "failed", ok ? "" : err);
+    atomic_store(&store_job_done, true);
+}
+
+static void a_job_that_runs_a_store_app_does_not_wait_for_its_load(void) {
+    int from = mark();
+    CHECK(apps_io_submit(run_stored_job, NULL), "submit the job");
+    WAIT(from, "job run ");
+    CHECK(at_from(from, "job run ok") >= 0, "the job's run: %s", events[at_from(from, "job run ")]);
+    WAIT(from, "print stored runs nil");
+    ABSENT(from, "log W store: no answer");  /* a load that waited for its job would have refused the launch at its bound */
+    CHECK(count_from(from, "store load stored") == 1, "one load: %d", count_from(from, "store load stored"));
+}
+
+/* The store's load waits for the worker (at most a second) inside the call that makes the app, which the supervisor holds to APPS_TASK_HUNG_MS:
+ * that wait is the gadget's, not the app's, and the port begins the call again once the load is done (apps_task_call_restart). The load waits 900
+ * ms of the clock behind a held worker, then main.lua's top level is stuck in its print: the supervisor counts the 3000 ms from the end of the
+ * load and not from the call's start, 3900 ms ago, and the app is not hung until the 3001st. */
+static const char APP_BLOCKER[] = "print('blocked')\nreturn {}\n";
+static const file_t BLOCKER[] = {LUA("main.lua", APP_BLOCKER)};
+static apps_pkg_t *blocker_pkg;
+static atomic_bool blocker_done;
+
+static void *blocker_runner(void *arg) {
+    (void)arg;
+    char err[200];
+    (void)apps_task_run(blocker_pkg, false, 0, NULL, err, sizeof err);
+    atomic_store(&blocker_done, true);
+    return NULL;
+}
+
+static void the_wait_for_the_stores_load_is_not_charged_to_the_app(void) {
+    const int64_t t0 = (int64_t)5 << 32;
+    clock_stop_at(t0);
+    hold_the_worker();
+    block_print("blocked");
+    blocker_pkg = with_perms(make_pkg("blocker", "Blocker", BLOCKER, 1), APPS_PERM_STORE);
+    int from = mark();
+    unsigned requests = atomic_load(&internal_blocks);
+    pthread_t runner;
+    CHECK(pthread_create(&runner, NULL, blocker_runner, NULL) == 0, "no runner thread");
+    for (int64_t until = real_ms() + 5000; atomic_load(&internal_blocks) == requests;) {
+        CHECK(real_ms() < until, "the app task never began its load");
+        sleep_ms(1);
+    }
+    sleep_ms(50);  /* it has made its request, and is polling for the answer */
+    clock_jump(900);
+    atomic_store(&io_hold, false);  /* the worker goes on, and serves the load: 900 ms of the clock after the call began */
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 900 + APPS_TASK_HUNG_MS);
+    WAIT_FRAMES(10);
+    CHECK(count_from(from, "log W") == 0 && count_from(from, "crash ") == 0, "the app is hung at %d ms from the end of its load, and 3900 from the call's start: %s",
+          APPS_TASK_HUNG_MS, count_from(from, "log W") > 0 ? events[at_from(from, "log W")] : "a card");
+    clock_stop_at(t0 + 900 + APPS_TASK_HUNG_MS + 1);
+    int warned = WAIT(from, "log W ");
+    CHECK(strstr(events[warned], "stopped responding") != NULL, "the supervisor says: '%s'", events[warned]);
+    release_print();
+    clock_go();
+    pthread_join(runner, NULL);
+    WAIT(from, "priority muse_apps 2");
 }
 
 /* The worker's ops (apps_io.h): in the order queued; a worker that isn't there is made for the first; and while a job holds the worker they
@@ -4478,6 +4581,7 @@ static void io_op(void *arg) {
 }
 
 static void io_ops_run_in_order_between_jobs(void) {
+    apps_io_register_op_task();  /* this thread is the one that submits ops (apps_io.h) */
     int from = mark();
     CHECK(apps_io_submit_op(io_op, "a") && apps_io_submit_op(io_op, "b"), "two ops, with no worker");
     WAIT(from, "op b on muse_apps_io");
@@ -4513,6 +4617,7 @@ static void assisting_job(void *arg) {
 }
 
 static void io_ops_run_while_a_job_that_waits_assists(void) {
+    apps_io_register_op_task();  /* this thread is the one that submits ops (apps_io.h) */
     atomic_store(&io_held, false);
     atomic_store(&io_hold, true);
     int from = mark();
@@ -4546,6 +4651,7 @@ static void io_ops_run_while_a_job_that_waits_assists(void) {
 
 /* APPS_IO_OPS ops can wait; one more is refused with one log line, and never runs. */
 static void io_ops_are_bounded(void) {
+    apps_io_register_op_task();  /* this thread is the one that submits ops (apps_io.h) */
     atomic_store(&io_held, false);
     atomic_store(&io_hold, true);
     CHECK(apps_io_submit(io_job, "hold"), "submit hold");
@@ -4575,6 +4681,7 @@ static void io_ops_are_bounded(void) {
 /* With no worker and none that can be made, an op is refused (nothing could ever run it): the nudge's own refusal says why, and the op is
  * taken back, so it doesn't run when memory comes back. */
 static void io_op_with_no_worker_and_no_room_is_refused(void) {
+    apps_io_register_op_task();  /* this thread is the one that submits ops (apps_io.h) */
     int from = mark();
     atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
     CHECK(!apps_io_submit_op(io_op, "short"), "refused when no worker can be made");
@@ -4587,6 +4694,7 @@ static void io_op_with_no_worker_and_no_room_is_refused(void) {
 
 /* With a worker that runs, an op is queued even when the nudge that would wake it is refused: the worker looks at the ops when its job ends. */
 static void io_op_for_a_worker_that_runs_waits_for_its_job(void) {
+    apps_io_register_op_task();  /* this thread is the one that submits ops (apps_io.h) */
     atomic_store(&io_held, false);
     atomic_store(&io_hold, true);
     CHECK(apps_io_submit(io_job, "hold"), "submit hold");
@@ -4608,6 +4716,7 @@ static void io_op_for_a_worker_that_runs_waits_for_its_job(void) {
 
 /* An idle worker, whose nudge was refused, looks at the ops when its wait for a job runs out, and doesn't go before it has run them. */
 static void io_op_for_an_idle_worker_runs_at_the_end_of_its_wait(void) {
+    apps_io_register_op_task();  /* this thread is the one that submits ops (apps_io.h) */
     int from = mark();
     CHECK(apps_io_submit(io_job, "one"), "a worker, made by a job");
     WAIT(from, "job one on muse_apps_io");
@@ -4619,6 +4728,47 @@ static void io_op_for_an_idle_worker_runs_at_the_end_of_its_wait(void) {
     WAIT(from, "log I io: idle");
     ORDERED(from, "op idle on muse_apps_io", "log I io: idle");
     CHECK(count_from(from, "task muse_apps_io stack") == 1, "the worker that was there ran it: %d made", count_from(from, "task muse_apps_io stack"));
+}
+
+/* Only the app task submits ops (apps_io.h): the ring has one pusher, and the take-back of a refused op relies on it. The registered task's op
+ * is taken; another task's asserts, and the process ends (the Python test reads that off the exit status). */
+static void *submit_from_elsewhere(void *arg) {
+    (void)arg;
+    event("submitting from another thread");
+    apps_io_submit_op(io_op, "intruder");
+    event("the submit came back");
+    return NULL;
+}
+
+static void io_op_from_another_task_asserts(void) {
+    int from = mark();
+    apps_io_register_op_task();
+    CHECK(apps_io_submit_op(io_op, "mine"), "the registered task's op was refused");
+    WAIT(from, "op mine on muse_apps_io");
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, submit_from_elsewhere, NULL) == 0, "no thread");
+    pthread_join(thread, NULL);
+    fail_at(__LINE__, "an op from a task that isn't the submitter was taken: it should have asserted");
+}
+
+/* A worker that ran only ops (the drain jobs that bring it to them aren't work of its own) says it goes at debug level: a save every 2 s
+ * would otherwise write a line each. One that ran a job says it, as it did. */
+static void the_idle_line_of_a_worker_that_ran_only_ops_is_debug(void) {
+    apps_io_register_op_task();
+    int from = mark();
+    CHECK(apps_io_submit_op(io_op, "only"), "an op, with no worker");
+    WAIT(from, "op only on muse_apps_io");
+    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+    CHECK(count_from(from, "log D io: idle, stack") == 1 && count_from(from, "log I io: idle") == 0,
+          "the idle line of a worker that ran only ops: %d at debug, %d at info", count_from(from, "log D io: idle, stack"),
+          count_from(from, "log I io: idle"));
+    from = mark();
+    CHECK(apps_io_submit(io_job, "one"), "a job");
+    CHECK(apps_io_submit_op(io_op, "with"), "an op");
+    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+    CHECK(count_from(from, "log I io: idle, stack") == 1 && count_from(from, "log D io: idle") == 0,
+          "the idle line of a worker that ran a job: %d at info, %d at debug", count_from(from, "log I io: idle, stack"),
+          count_from(from, "log D io: idle"));
 }
 
 /* A store that can't be read refuses the launch (an app never starts with an empty store: a later save would replace the real one): with
@@ -4637,27 +4787,26 @@ static void a_store_that_cannot_be_read_refuses_the_launch(void) {
 }
 
 /* A worker that is held by a job that doesn't look at the ops: the load waits APPS_STORE_WAIT_MS and the launch is refused, inside the
- * supervisor's 3 s. The request it leaves is the worker's: it frees it when it gets to the op (finish() checks that nothing is held). */
+ * supervisor's 3 s. The request it leaves is the worker's: it frees it, and the answer it never gave, when it gets to the op (finish() checks
+ * too that nothing is held). */
 static void a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second(void) {
     char err[300];
-    atomic_store(&io_held, false);
-    atomic_store(&io_hold, true);
-    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
-    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
-        CHECK(real_ms() < until, "the job never ran");
-        sleep_ms(1);
-    }
+    hold_the_worker();
     int from = mark();
+    size_t apps_heap = held_now(&port_held), own = held_now(&caps_held);
     int64_t began = real_ms();
     CHECK(!apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "no app without its values");
     int64_t took = real_ms() - began;
     CHECK(took >= APPS_STORE_WAIT_MS && took < APPS_TASK_HUNG_MS, "the launch was refused after %lld ms: the load's bound is %d", (long long)took,
           APPS_STORE_WAIT_MS);
     CHECK(strstr(err, "can't read the app's saved values") != NULL, "it says why: '%s'", err);
-    WAIT(from, "store load gave up stored");
+    WAIT(from, "log W store: no answer from the I/O worker for stored within 1000 ms: launch refused");
     ABSENT(from, "print stored runs");
+    CHECK(held_now(&port_held) + held_now(&caps_held) > apps_heap + own, "the request is still held, for the worker to free");
     atomic_store(&io_hold, false);
-    WAIT(from, "store load abandoned stored");  /* the worker gets to the op, finds nobody waiting, and frees the request */
+    worker_sync();  /* the worker gets to the op, finds nobody waiting, and frees the request */
+    CHECK(held_now(&port_held) == apps_heap && held_now(&caps_held) == own, "%zu and %zu bytes held after the worker's turn, not %zu and %zu",
+          held_now(&port_held), held_now(&caps_held), apps_heap, own);
     CHECK(count_from(from, "log W launch stored: no app: ") == 1, "one log line for the refused launch: %d", count_from(from, "log W launch stored: no app: "));
 }
 
@@ -4929,18 +5078,6 @@ static void an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends(void) {
     CHECK(count_from(from, "chirp") == chirps && chirps == 1, "no chirp after the drop: %d", count_from(from, "chirp"));
     CHECK(count_from(from, "log W alarm t for missing app ghost") == 1, "said once");
     clock_go();
-}
-
-/* The worker is held by a long job (a commit that runs, an install: the worker's jobs can take longer than any bound the alarm could put on
- * its own launch, which queues behind them): the case's "hold". Returns once the worker is in it. */
-static void hold_the_worker(void) {
-    atomic_store(&io_held, false);
-    atomic_store(&io_hold, true);
-    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
-    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
-        CHECK(real_ms() < until, "the job never ran");
-        sleep_ms(1);
-    }
 }
 
 /* D: a launch that waits behind a long job of the worker is not given up (the worker has it, and says what came of it, by a post, when
@@ -5453,12 +5590,9 @@ static void a_launch_of_a_store_app_does_not_wait_for_its_own_load(void) {
     char err[200];
     store(stored_pkg());
     int from = mark();
-    int64_t began = real_ms();
     launch("stored", true);
-    WAIT(from, "print stored runs nil");
-    int64_t took = real_ms() - began;
-    CHECK(took < APPS_STORE_WAIT_MS / 2, "the app started after %lld ms: its load was served as the launch job looked, not at the load's bound", (long long)took);
-    ABSENT(from, "store load gave up");
+    WAIT(from, "print stored runs nil");  /* a load that waited for its job would have refused the launch at its bound, and this would never come */
+    ABSENT(from, "log W store: no answer");
     CHECK(count_from(from, "store load stored") == 1, "one load: %d", count_from(from, "store load stored"));
     ORDERED(from, "log I launch stored", "store load stored");
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
@@ -5569,10 +5703,14 @@ int main(int argc, char **argv) {
         {"sys_show_asks_for_the_front", sys_show_asks_for_the_front},
         {"the_store_is_saved_through_the_worker_two_seconds_after_the_last_change", the_store_is_saved_through_the_worker_two_seconds_after_the_last_change},
         {"the_loop_wakes_for_the_store_save", the_loop_wakes_for_the_store_save},
-        {"a_stop_saves_and_the_next_run_reads_it_after_a_slow_save", a_stop_saves_and_the_next_run_reads_it_after_a_slow_save},
+        {"a_stop_saves_and_the_next_run_reads_it_though_the_save_waits_in_the_ring", a_stop_saves_and_the_next_run_reads_it_though_the_save_waits_in_the_ring},
         {"sys_exit_saves_the_store", sys_exit_saves_the_store},
-        {"a_refused_save_is_asked_for_again_at_the_next_tick", a_refused_save_is_asked_for_again_at_the_next_tick},
-        {"a_final_save_that_cannot_be_queued_is_logged_and_lost", a_final_save_that_cannot_be_queued_is_logged_and_lost},
+        {"a_save_the_worker_refuses_is_kept_and_offered_every_two_seconds", a_save_the_worker_refuses_is_kept_and_offered_every_two_seconds},
+        {"a_final_save_the_worker_refuses_is_kept_and_a_restart_reads_it", a_final_save_the_worker_refuses_is_kept_and_a_restart_reads_it},
+        {"a_writer_that_never_pauses_is_saved_at_ten_seconds", a_writer_that_never_pauses_is_saved_at_ten_seconds},
+        {"a_store_load_that_waits_polls_in_whole_ticks", a_store_load_that_waits_polls_in_whole_ticks},
+        {"a_job_that_runs_a_store_app_does_not_wait_for_its_load", a_job_that_runs_a_store_app_does_not_wait_for_its_load},
+        {"the_wait_for_the_stores_load_is_not_charged_to_the_app", the_wait_for_the_stores_load_is_not_charged_to_the_app},
         {"a_store_that_cannot_be_read_refuses_the_launch", a_store_that_cannot_be_read_refuses_the_launch},
         {"a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second", a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second},
         {"io_ops_run_in_order_between_jobs", io_ops_run_in_order_between_jobs},
@@ -5581,6 +5719,8 @@ int main(int argc, char **argv) {
         {"io_op_with_no_worker_and_no_room_is_refused", io_op_with_no_worker_and_no_room_is_refused},
         {"io_op_for_a_worker_that_runs_waits_for_its_job", io_op_for_a_worker_that_runs_waits_for_its_job},
         {"io_op_for_an_idle_worker_runs_at_the_end_of_its_wait", io_op_for_an_idle_worker_runs_at_the_end_of_its_wait},
+        {"io_op_from_another_task_asserts", io_op_from_another_task_asserts},
+        {"the_idle_line_of_a_worker_that_ran_only_ops_is_debug", the_idle_line_of_a_worker_that_ran_only_ops_is_debug},
 #ifdef HARNESS_CONSOLE
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},

@@ -68,7 +68,7 @@ class AppPortTest(unittest.TestCase):
         cls.addClassCleanup(tmp.cleanup)
         cls.tmp = tmp.name
         stage = stage_fakes(Path(tmp.name) / "fake_headers")
-        cls.harness = apps_host.build("muse_apps_port_harness", [HARNESS, APPS / "apps_port_idf.c"], tmp.name,
+        cls.harness = apps_host.build("muse_apps_port_harness", [HARNESS, APPS / "apps_port_idf.c", APPS / "apps_store_ram.c"], tmp.name,
                                       include_dirs=[APPS, MUSE, stage, TESTS])
 
     def run_case(self, case, timeout=60):
@@ -125,6 +125,21 @@ class AppPortTest(unittest.TestCase):
 
     def test_the_store_keeps_16_apps_and_drops_the_oldest_saved(self):
         self.run_case("store_keeps_16_apps_and_drops_the_oldest_saved")
+
+    def test_the_loads_request_is_a_small_block_of_internal_ram(self):  # C: no read-modify-write in PSRAM
+        self.run_case("store_load_request_is_a_small_internal_block")
+
+    def test_a_save_the_worker_refuses_is_kept_and_offered_again(self):  # P1: kept in PSRAM, read back to a load, offered at the tick
+        self.run_case("store_a_save_the_worker_refuses_is_kept")
+
+    def test_kept_saves_are_one_for_each_app_and_bounded(self):  # P1: 16 slots, a tick offers until the ring is full
+        self.run_case("store_kept_saves_are_one_for_each_app_and_bounded")
+
+    def test_a_kept_save_comes_after_the_one_the_worker_took(self):  # P1: the order of one app's saves
+        self.run_case("store_a_kept_save_comes_after_the_one_the_worker_took")
+
+    def test_a_load_begins_the_app_tasks_call_again_once_it_has_waited(self):  # M: the wait isn't the app's
+        self.run_case("store_load_begins_the_call_again")
 
     def test_battery_and_wifi_are_the_systems(self):  # C33's device half: muse_state's power, muse_wifi's status, no log
         self.run_case("battery_and_wifi_are_the_systems")

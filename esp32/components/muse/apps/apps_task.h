@@ -294,6 +294,9 @@ char *apps_task_message(const char *id, const char *event, const char *data_json
  * - apps_task_keep_awake: while on, and the layer is in front, the loop's housekeeping pokes the idle timer (muse_state_poke) about once a
  *   second (never oftener, and the loop comes round at least each second, so never more than 2 s apart), so the screen isn't let go dark
  *   for being idle. It is off again when the app ends.
+ * - apps_task_call_restart: the call that is running begins again now, for the supervisor's APPS_TASK_HUNG_MS and the status's worst call
+ *   alike: the port calls it once its wait for the I/O worker, for the app's store, is over (apps_port.h), so that a wait that is the gadget's
+ *   is not counted against the app. Nothing outside a call.
  * - apps_task_exit: the app ends, as END_EXITED, once the call it was asked in has returned (call_end): that callback runs to its end,
  *   its reply is given, stop() runs, the store is saved, and no other callback of the app runs after it, a timer due in the same round
  *   included. At main.lua's top level it means the app is never started; in start(), that it ends after it. A run that hasn't settled
@@ -302,4 +305,5 @@ char *apps_task_message(const char *id, const char *event, const char *data_json
  */
 void apps_task_show(void);
 void apps_task_keep_awake(bool on);
+void apps_task_call_restart(void);
 void apps_task_exit(void);

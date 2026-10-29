@@ -42,7 +42,8 @@
  * same text for every double but the subnormals: 5e-324 is 4.94065645841247e-324 on a host and
  * 5e-324 on the board, and both decode to the same double. A string is escaped as RFC 8259 asks:
  * '"', '\' and every byte under 0x20 (\n \r \t \b \f, the rest as \u00xx); every other byte,
- * '/' included, passes through. nil and json.null are null. Encoding reads tables raw (lua_next,
+ * '/' included, passes through (apps_json_escape is that, for the firmware's own use). nil and
+ * json.null are null. Encoding reads tables raw (lua_next,
  * lua_rawgeti) and never calls a metamethod, so no app code runs inside it. It refuses: a
  * function, a thread or any userdata but json.null; NaN and infinity; a string that isn't valid
  * UTF-8 (value or key), which json.decode would refuse after a reboot; a key that is neither a
@@ -73,10 +74,12 @@
  *   can't encode a string that isn't valid UTF-8
  *   can't encode NaN or infinity
  *   out of memory                           the caller's realloc_fn returned NULL
+ *   output larger than the limit            APPS_JSON_TOO_LARGE: apps_json_encode_value_max's max
  * and from the pull reader, besides the decoder's:
  *   expected an integer at byte %u          apps_jr_integer on anything but an integer: a fraction, an exponent
  *   integer out of range at byte %u         outside int64
  *   string longer than %u bytes at byte %u  apps_jr_string and apps_jr_key, which never cut a string
+ *                                           (apps_jr_key_any reports a key that is too long instead)
  *   \u0000 isn't allowed in this string at byte %u
  */
 
@@ -89,6 +92,18 @@ typedef struct lua_State lua_State;
 
 #define APPS_JSON_MAX_DEPTH 16
 #define APPS_JSON_MAX_INPUT (32 * 1024)
+
+/* The message of an encoding that outgrew its limit (apps_json_encode_value_max), for a caller that says it its own way. */
+#define APPS_JSON_TOO_LARGE "output larger than the limit"
+
+/*
+ * The text a JSON string holds between its quotes, for the firmware's own counting and writing of text the encoder would write (the
+ * store sizes its saved keys with it): '"' and '\' as \" and \\, \b \f \n \r \t as their two-byte forms, every other byte under 0x20
+ * as \u00xx in lowercase hex, and every other byte, 0x7F, '/' and the bytes of UTF-8 included, as it is. The encoder's put_string is
+ * built on this, so the two can't differ. Writes into out, which needs the room the count says (at most 6 * n bytes, no NUL added), and
+ * returns the count; out may be NULL to only count. It doesn't check that the bytes are UTF-8.
+ */
+size_t apps_json_escape(char *out, const char *s, size_t n);
 
 /*
  * UTF-8 as the decoder reads it (RFC 3629, above), for the firmware's own checks of text that reaches Muse
@@ -151,6 +166,16 @@ char *apps_json_encode_value(lua_State *L, int idx, void *(*realloc_fn)(void *, 
                              size_t err_len);
 
 /*
+ * apps_json_encode_value with a limit: a text longer than max bytes (without the NUL; 0 is no limit) fails with APPS_JSON_TOO_LARGE as
+ * its message, before the memory for it is asked for. The output userdata never grows past max, the walk ends at the first byte over,
+ * and a string whose own length can't fit is refused without being read, so a value that can never fit costs the app a few hundred
+ * bytes and no scan, however large it is. (json.encode has no limit but the app's memory.) realloc_fn is called once, with the final
+ * length, and not at all on a failure.
+ */
+char *apps_json_encode_value_max(lua_State *L, int idx, void *(*realloc_fn)(void *, size_t), size_t max, size_t *len, char *err,
+                                 size_t err_len);
+
+/*
  * Drops the whitespace outside strings from s[0, len) into out, NUL-terminated, and returns the
  * length written; 0 if cap is too small (out then holds ""). It never grows the text, so
  * cap >= len + 1 always suffices. The input is JSON the reader already accepted.
@@ -171,9 +196,13 @@ typedef struct {
     const char *p, *end;
     int depth;     /* containers open, counting the ones the caller opened with apps_jr_object/array */
     char err[96];  /* "" while it is well; else "<what> at byte N" (see the messages above) */
+    /* The most containers open at once: APPS_JSON_MAX_DEPTH after apps_jr_init, the decoder's. A caller reading a document whose own
+     * container wraps values that json.encode wrote (the store's saved object) sets it one higher, so that the wrapped values keep all
+     * of theirs; the message stays "nested deeper than 16". At most 32. */
+    int max_depth;
     /* Private. */
     const char *start;  /* the first byte: positions count from it */
-    uint16_t started;   /* bit d-1: the container at depth d has begun its elements (comma rules) */
+    uint32_t started;   /* bit d-1: the container at depth d has begun its elements (comma rules) */
     uint32_t values;    /* values the decoder has built, for its clock check */
 } apps_jr_t;
 
@@ -184,6 +213,10 @@ bool apps_jr_array(apps_jr_t *r);   /* '[' */
 /* In an object: 1 with the next key in key (':' consumed), 0 at the '}' (consumed), -1 on an error.
  * The key is read as apps_jr_string reads a string. */
 int apps_jr_key(apps_jr_t *r, char *key, size_t cap);
+/* As apps_jr_key, for a caller that can do without a key it can't hold: one with more than cap - 1 bytes, or a \u0000 in it, is read to
+ * its end, checked like every string, and reported as 2 with key "" (its colon consumed and its value still to come, which the caller
+ * skips). An empty key is 1, with key "". Anything that isn't valid JSON is -1, as ever. */
+int apps_jr_key_any(apps_jr_t *r, char *key, size_t cap);
 /* In an array: 1 when another element follows (positioned at it), 0 at the ']' (consumed), -1 on an
  * error. Read the element with one of the calls below. */
 int apps_jr_next(apps_jr_t *r);

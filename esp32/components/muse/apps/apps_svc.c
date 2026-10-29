@@ -55,12 +55,11 @@
 
 #define TIMER_MT "muse.timer"
 
-/* The store: a lookup walks this many keys for an instruction of the call's budget (no count hook fires inside it), a value may be
- * this many containers deep (the saved object is the first level), and the limit as the message says it. */
+/* The store: a lookup walks this many keys for an instruction of the call's budget (no count hook fires inside it), and the limit as the
+ * message says it. */
 #define STORE_KEYS_PER_INSTR 32
-#define STORE_VALUE_DEPTH 15
 #define STORE_KB 16
-_Static_assert(STORE_VALUE_DEPTH == APPS_JSON_MAX_DEPTH - 1, "a stored value sits one level down, inside the saved object");
+#define STORE_FULL_MESSAGE "store: more than " STR(STORE_KB) " KB stored; remove keys you don't need"
 _Static_assert(STORE_KB * 1024 == APPS_STORE_MAX_BYTES, "the message says the limit in whole KB");
 
 /* A network name is at most this long (MUSE_SSID_MAX), and the API's number is sys.api. */
@@ -728,9 +727,10 @@ static int store_get(lua_State *L) {
     return 1;
 }
 
-/* store.set(key, value), upvalue 1 the runtime: the value is encoded (the same JSON as json.encode, and its errors, without its
- * prefix) and kept; nil removes the key. The saved object holds it one level down, so the value is encoded inside a one-element
- * array, which takes one of the encoder's 16 levels: a value may be 15 deep, and the error says 15. */
+/* store.set(key, value), upvalue 1 the runtime: the value is encoded (the same JSON as json.encode, with its 16 levels, and its errors, without
+ * its prefix) and kept; nil removes the key. A value whose text can never fit in the 16 KB is refused before anything is made for it: a string
+ * longer than that at once, and anything else by the encoder, which stops at the limit (apps_json_encode_value_max) and doesn't build a text
+ * and a copy of it first. */
 static int store_set(lua_State *L) {
     apps_vm_check(L);
     need(L, APPS_PERM_STORE, "store");
@@ -743,25 +743,25 @@ static int store_set(lua_State *L) {
         return 0;
     }
     lua_settop(L, 2);
-    lua_createtable(L, 1, 0);
-    lua_pushvalue(L, 2);
-    lua_rawseti(L, -2, 1);
+    if (lua_type(L, 2) == LUA_TSTRING && lua_rawlen(L, 2) > APPS_STORE_MAX_BYTES) {
+        return luaL_error(L, STORE_FULL_MESSAGE);
+    }
     char bare[96];
     size_t len = 0;
-    char *text = apps_json_encode_value(L, -1, apps_port_realloc, &len, bare, sizeof bare);
+    char *text = apps_json_encode_value_max(L, 2, apps_port_realloc, APPS_STORE_MAX_BYTES, &len, bare, sizeof bare);
     if (text == NULL) {
         if (strcmp(bare, "out of memory") == 0) {  /* the port's heap, not Lua's (that raises): the same try-again as the alarms' */
             return luaL_error(L, "store.set: the gadget is short of memory; try again");
         }
-        if (strcmp(bare, "nested deeper than " STR(APPS_JSON_MAX_DEPTH)) == 0) {
-            return luaL_error(L, "store.set: nested deeper than " STR(STORE_VALUE_DEPTH));
+        if (strcmp(bare, APPS_JSON_TOO_LARGE) == 0) {
+            return luaL_error(L, STORE_FULL_MESSAGE);
         }
         return luaL_error(L, "store.set: %s", bare);
     }
-    apps_store_result_t result = apps_rt_store_set(rt, key, key_len, text + 1, len - 2);  /* without the array's brackets */
+    apps_store_result_t result = apps_rt_store_set(rt, key, key_len, text, len);
     apps_port_free(text);
     if (result == APPS_STORE_FULL) {
-        return luaL_error(L, "store: more than " STR(STORE_KB) " KB stored; remove keys you don't need");
+        return luaL_error(L, STORE_FULL_MESSAGE);
     }
     if (result != APPS_STORE_OK) {  /* APPS_STORE_NO_MEMORY: the key was checked above */
         return luaL_error(L, "store.set: the gadget is short of memory; try again");
@@ -783,15 +783,14 @@ static int store_remove(lua_State *L) {
 
 /* ---- sys ---- */
 
-/* sys.battery(): {pct, charging, usb}; no pct when the gadget can't tell. */
+/* sys.battery(): {pct, charging, usb}; pct is always a number, 0 to 100, and -1 when the gadget can't tell (the port's convention), so that
+ * `sys.battery().pct < 20` and a format of it work on a gadget that has no reading yet. */
 static int sys_battery(lua_State *L) {
     apps_vm_check(L);
     apps_battery_t battery = apps_port_battery();
     lua_createtable(L, 0, 3);
-    if (battery.pct >= 0) {
-        lua_pushinteger(L, battery.pct > 100 ? 100 : battery.pct);
-        lua_setfield(L, -2, "pct");
-    }
+    lua_pushinteger(L, battery.pct < 0 ? -1 : battery.pct > 100 ? 100 : battery.pct);
+    lua_setfield(L, -2, "pct");
     lua_pushboolean(L, battery.charging);
     lua_setfield(L, -2, "charging");
     lua_pushboolean(L, battery.usb);

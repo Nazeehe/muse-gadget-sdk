@@ -34,6 +34,7 @@
 #include "apps_json.h"
 #include "apps_lv.h"
 #include "apps_port.h"
+#include "apps_store.h"
 #include "apps_ui.h"
 #include "apps_vm.h"
 #include "muse_apps.h"
@@ -1301,6 +1302,7 @@ static void housekeeping(void) {
         muse_state_poke();  /* sys.keep_awake(true): the screen isn't let go dark for idling while the app is in front */
         T.poke_at = apps_port_mono_ms() + KEEP_AWAKE_POKE_MS;
     }
+    apps_store_tick(apps_port_mono_ms());  /* the saves the worker hasn't taken yet, with or without an app (apps_store.h) */
     drain_logs();
 }
 
@@ -1354,6 +1356,7 @@ static void run_timers(void) {
 
 static void apps_task(void *arg) {
     (void)arg;
+    apps_io_register_op_task();  /* the store's loads and saves are ops of the I/O worker, and only this task submits them (apps_io.h) */
     ESP_LOGI(TAG, "up: stack %u in PSRAM", (unsigned)APPS_TASK_STACK);
     for (;;) {
         apps_event_t ev;
@@ -2008,8 +2011,17 @@ void apps_task_show(void) {
 }
 
 void apps_task_keep_awake(bool on) {
+    if (on && !T.keep_awake) {
+        T.poke_at = 0;  /* the first poke at once, at the next round: only for a change from off to on, so that the rate is the loop's */
+    }
     T.keep_awake = on;
-    T.poke_at = 0;  /* the first poke at once, at the next round */
+}
+
+void apps_task_call_restart(void) {
+    if (s_rec != NULL && atomic_load(&s_rec->in_call)) {
+        T.call_began = apps_port_mono_ms();  /* the call's time, for the supervisor and for the status's worst call, begins here */
+        atomic_store(&s_rec->call_started, (uint32_t)T.call_began);
+    }
 }
 
 void apps_task_exit(void) {

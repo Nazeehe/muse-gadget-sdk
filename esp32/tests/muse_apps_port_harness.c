@@ -42,6 +42,7 @@
 #include "apps_io.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
+#include "apps_store.h"
 #include "apps_task.h"
 #include "muse_apps_task_fakes.h"
 #include "muse_sntp.h"
@@ -113,6 +114,8 @@ static void dump_log(void) {
  * allocation but some fail (the Nth next: 0 is the very next). */
 static atomic_int blocks_held;
 static int alloc_fail_in = -1;
+static atomic_int internal_requests;  /* heap_caps_malloc calls for internal RAM, and the size of the last */
+static atomic_size_t internal_size;
 
 static int live_blocks(void) {
     return atomic_load(&blocks_held);
@@ -143,7 +146,10 @@ void *heap_caps_realloc(void *ptr, size_t size, uint32_t caps) {
 }
 
 void *heap_caps_malloc(size_t size, uint32_t caps) {
-    (void)caps;
+    if ((caps & MALLOC_CAP_INTERNAL) != 0) {
+        atomic_fetch_add(&internal_requests, 1);
+        atomic_store(&internal_size, size);
+    }
     if (alloc_fails()) {
         return NULL;
     }
@@ -326,12 +332,13 @@ typedef struct {
     void *arg;
 } queued_op_t;
 
-static queued_op_t pending[16];
-static int n_pending, ops_ran;
+static queued_op_t pending[APPS_IO_OPS];  /* the device's ring: a ninth op is refused there, and here */
+static int n_pending, ops_ran, submit_calls;
 static bool ops_refused;     /* the worker takes no more ops */
 static bool worker_answers;  /* the worker runs what waits whenever the caller sleeps (vTaskDelay) */
 
 bool apps_io_submit_op(void (*op)(void *arg), void *arg) {
+    submit_calls++;
     if (ops_refused || n_pending == (int)(sizeof pending / sizeof pending[0])) {
         return false;
     }
@@ -387,6 +394,14 @@ void apps_task_keep_awake(bool on) {
 
 void apps_task_exit(void) {
     exits++;
+}
+
+static int restamps;
+static int64_t restamp_at_ms;
+
+void apps_task_call_restart(void) {
+    restamps++;
+    restamp_at_ms = now_us / 1000;
 }
 
 /* ---- The console: stdout, into a file ---- */
@@ -818,7 +833,7 @@ static void expect_load(const char *app, const char *want, const char *what) {
 }
 
 /* An app with nothing saved reads "{}". A save only queues: the caller doesn't wait for the worker, and its own bytes are its
- * own again at once. The worker writes it, and a load, which sleeps in 5 ms steps until the worker answers, reads the object
+ * own again at once. The worker writes it, and a load, which sleeps in 10 ms steps until the worker answers, reads the object
  * whole. A second save replaces the first, an app's object is its own, and nothing is held but one node for each app. */
 static void store_round_trip_through_the_worker(void) {
     worker_answers = true;
@@ -851,7 +866,7 @@ static void store_ops_run_in_the_order_of_the_calls(void) {
     CHECK(n_pending == 0 && ops_ran == 4, "%d waiting, %d run", n_pending, ops_ran);
 }
 
-/* A load that the worker doesn't answer waits APPS_STORE_WAIT_MS and no longer (to the poll's 5 ms), gives nothing, and says so in one
+/* A load that the worker doesn't answer waits APPS_STORE_WAIT_MS and no longer (to the poll's 10 ms), gives nothing, and says so in one
  * log line that names the app and no values. The request it leaves behind is the worker's to free: when it does come to the op, it
  * frees the request and its answer, and the store works as before. */
 static void store_load_gives_up_when_the_worker_is_silent(void) {
@@ -862,7 +877,7 @@ static void store_load_gives_up_when_the_worker_is_silent(void) {
     char *got = apps_port_store_load("clock", &len);
     int64_t waited = now_us / 1000 - 5000;
     CHECK(got == NULL && len == 0, "a silent worker gave %p and length %zu", (void *)got, len);
-    CHECK(waited >= APPS_STORE_WAIT_MS && waited <= APPS_STORE_WAIT_MS + 5, "waited %lld ms for a bound of %d", (long long)waited,
+    CHECK(waited >= APPS_STORE_WAIT_MS && waited <= APPS_STORE_WAIT_MS + 10, "waited %lld ms for a bound of %d", (long long)waited,
           APPS_STORE_WAIT_MS);
     CHECK(n_logged == 1 && strcmp(logged[0], "W muse_apps: store: no answer from the I/O worker for clock within 1000 ms: launch refused") == 0,
           "%d lines logged, the first '%s'", n_logged, n_logged > 0 ? logged[0] : "");
@@ -899,8 +914,8 @@ static void store_load_answered_at_the_deadline(void) {
 }
 
 /* What the port refuses or can't do, it says with nothing held: a worker that takes no op (a load fails at once, without a wait; a
- * save says false), no memory for a copy or a request or an answer, an id or an object the runtime never makes. APPS_STORE_MAX_BYTES (16 KB) is the most
- * an object can be, to the byte. */
+ * save is kept for it, and says true), no memory for a copy or a request or an answer, an id or an object the runtime never makes.
+ * APPS_STORE_MAX_BYTES (16 KB) is the most an object can be, to the byte. */
 static void store_refusals(void) {
     worker_answers = true;
     clock_at_ms(5000);
@@ -910,9 +925,14 @@ static void store_refusals(void) {
     char *got = apps_port_store_load("clock", &len);
     CHECK(got == NULL && len == 0 && now_us == 5000000, "a load the worker refused gave %p, length %zu, after %lld us", (void *)got, len,
           (long long)(now_us - 5000000));
-    CHECK(!apps_port_store_save("clock", "{}", 2), "a save the worker refused says false");
-    CHECK(live_blocks() == before && n_pending == 0, "%d blocks held, %d waiting after the refusals", live_blocks() - before, n_pending);
+    CHECK(live_blocks() == before && n_pending == 0, "%d blocks held, %d waiting after the refused load", live_blocks() - before, n_pending);
+    CHECK(apps_port_store_save("clock", "{}", 2), "a save the worker refused is kept, and says true");
+    CHECK(live_blocks() - before == 1 && n_pending == 0, "one block kept, nothing queued: %d blocks, %d waiting", live_blocks() - before, n_pending);
     ops_refused = false;
+    apps_store_tick(100000);  /* the worker takes it now */
+    worker_runs(1);
+    CHECK(n_pending == 0 && live_blocks() - before == 1, "the worker's map holds it: %d blocks, %d waiting", live_blocks() - before, n_pending);
+    before = live_blocks();  /* what the map holds isn't what the cases below count */
     alloc_fail_in = 0;
     CHECK(!apps_port_store_save("clock", "{}", 2) && n_pending == 0, "a save with no memory for its copy says false and queues nothing");
     alloc_fail_in = 0;
@@ -979,6 +999,139 @@ static void store_keeps_16_apps_and_drops_the_oldest_saved(void) {
     CHECK(live_blocks() - before == 16, "%d blocks held, not the 16 nodes", live_blocks() - before);
 }
 
+/* The load's request is a small block of internal RAM, which no read-modify-write may reach in PSRAM, and it is freed once, by whoever finishes last. */
+static void store_load_request_is_a_small_internal_block(void) {
+    worker_answers = true;
+    int before = live_blocks();
+    int requests = atomic_load(&internal_requests);
+    expect_load("clock", "{}", "a load");
+    CHECK(atomic_load(&internal_requests) - requests == 1 && atomic_load(&internal_size) <= 64, "%d internal requests, the last of %zu bytes",
+          atomic_load(&internal_requests) - requests, atomic_load(&internal_size));
+    CHECK(live_blocks() == before, "%d blocks held after the load", live_blocks() - before);
+    /* A worker that never answers: the request is the worker's to free when it comes to it. */
+    worker_answers = false;
+    clock_at_ms(5000);
+    requests = atomic_load(&internal_requests);
+    CHECK(apps_port_store_load("clock", &(size_t){0}) == NULL, "a silent worker");
+    CHECK(atomic_load(&internal_requests) - requests == 1 && live_blocks() - before == 1, "the abandoned request is held: %d blocks", live_blocks() - before);
+    worker_runs(1);
+    CHECK(live_blocks() == before, "%d blocks held after the late answer", live_blocks() - before);
+    n_logged = 0;
+}
+
+/* A save the worker refuses isn't lost: the port keeps it in PSRAM, says true (it has it), reads it back to a load before the worker has it,
+ * replaces it with a newer save of the app, and offers it again at the tick, APPS_STORE_RETRY_MS after the refusal and no sooner. */
+static void store_a_save_the_worker_refuses_is_kept(void) {
+    worker_answers = false;
+    clock_at_ms(10000);
+    int before = live_blocks();
+    ops_refused = true;
+    CHECK(apps_port_store_save("clock", "{\"a\":1}", 7), "a refused save is kept: it says true");
+    CHECK(n_pending == 0 && live_blocks() - before == 1, "nothing queued, one block kept: %d waiting, %d blocks", n_pending, live_blocks() - before);
+    int calls = submit_calls;
+    expect_load("clock", "{\"a\":1}", "a load reads what is kept");
+    CHECK(submit_calls == calls && n_pending == 0, "the load asked the worker for nothing: %d submits", submit_calls - calls);
+    CHECK(apps_port_store_save("clock", "{\"a\":2}", 7), "a newer save");
+    CHECK(live_blocks() - before == 1, "it took the place of the first: %d blocks", live_blocks() - before);
+    expect_load("clock", "{\"a\":2}", "the newer is what is kept");
+    calls = submit_calls;
+    apps_store_tick(11999);
+    CHECK(submit_calls == calls, "offered again before the retry time: %d submits", submit_calls - calls);
+    apps_store_tick(12000);
+    CHECK(submit_calls - calls == 1 && n_pending == 0 && live_blocks() - before == 1, "offered at 12000 and refused again: %d submits, %d blocks",
+          submit_calls - calls, live_blocks() - before);
+    calls = submit_calls;
+    apps_store_tick(13999);
+    CHECK(submit_calls == calls, "offered 1999 ms after the second refusal: %d submits", submit_calls - calls);
+    ops_refused = false;
+    apps_store_tick(14000);
+    CHECK(submit_calls - calls == 1 && n_pending == 1, "offered at 14000 and taken: %d submits, %d queued", submit_calls - calls, n_pending);
+    worker_answers = true;
+    worker_runs(1);
+    CHECK(n_pending == 0 && live_blocks() - before == 1, "the worker has it, and the port keeps nothing: %d blocks", live_blocks() - before);
+    calls = submit_calls;
+    apps_store_tick(99999);
+    CHECK(submit_calls == calls, "nothing is kept: no submit at the tick");
+    expect_load("clock", "{\"a\":2}", "the worker's map has the newer");
+    CHECK(n_logged == 0, "%d lines logged for what was kept", n_logged);
+}
+
+/* Each app's save is kept in a slot of its own, and there are as many as the map has apps (16): a 17th is refused (the runtime says so in the
+ * log, and loses what it had). A tick offers them in turn and stops at the first refusal; the ring holds 8, so the rest wait for the next tick. */
+static void store_kept_saves_are_one_for_each_app_and_bounded(void) {
+    worker_answers = false;
+    clock_at_ms(10000);
+    int before = live_blocks();
+    char app[16], object[24];
+    ops_refused = true;
+    for (int i = 0; i < 16; i++) {
+        snprintf(app, sizeof app, "app%02d", i);
+        snprintf(object, sizeof object, "{\"n\":%d}", i);
+        CHECK(apps_port_store_save(app, object, strlen(object)), "save %d is kept", i);
+    }
+    CHECK(live_blocks() - before == 16, "%d blocks kept, wanted 16", live_blocks() - before);
+    CHECK(!apps_port_store_save("app16", "{}", 2), "a 17th app's save can't be kept");
+    CHECK(apps_port_store_save("app03", "{\"n\":33}", 8) && live_blocks() - before == 16, "a second save of an app takes its place");
+    CHECK(live_blocks() - before == 16, "%d blocks kept after the 17th was refused", live_blocks() - before);
+    ops_refused = false;
+    apps_store_tick(12000);
+    CHECK(n_pending == APPS_IO_OPS, "a tick offers them until the ring is full: %d queued of %d", n_pending, APPS_IO_OPS);
+    worker_answers = true;
+    worker_runs(1 << 20);
+    CHECK(n_pending == 0, "the worker ran them");
+    apps_store_tick(12001);
+    CHECK(n_pending == 0, "the next offer waits for its time (%d ms): %d queued", APPS_STORE_RETRY_MS, n_pending);
+    apps_store_tick(14000);
+    CHECK(n_pending == 8, "the rest are offered at the next: %d queued", n_pending);
+    worker_runs(1 << 20);
+    expect_load("app00", "{\"n\":0}", "the first");
+    expect_load("app03", "{\"n\":33}", "the one that was saved twice");
+    expect_load("app15", "{\"n\":15}", "the last");
+    CHECK(live_blocks() - before == 16, "the map's 16 nodes are all that is held: %d", live_blocks() - before);
+}
+
+/* The order of one app's saves is kept: one that the worker has taken is applied before a later one that waited, and a load that comes between
+ * them is given the later (what is kept is the newer). */
+static void store_a_kept_save_comes_after_the_one_the_worker_took(void) {
+    worker_answers = false;
+    clock_at_ms(10000);
+    CHECK(apps_port_store_save("clock", "{\"n\":1}", 7), "the first is taken");
+    CHECK(n_pending == 1, "queued");
+    ops_refused = true;
+    CHECK(apps_port_store_save("clock", "{\"n\":2}", 7), "the second is kept");
+    worker_runs(1);  /* the worker applies the first */
+    expect_load("clock", "{\"n\":2}", "a load between them is given the kept one");
+    ops_refused = false;
+    apps_store_tick(12000);
+    worker_runs(1);
+    worker_answers = true;
+    expect_load("clock", "{\"n\":2}", "the later is the object");
+    CHECK(n_pending == 0, "nothing waits");
+}
+
+/* The port begins the app task's call again once it has waited for the worker (apps_task_call_restart): what it waits for is the gadget's, not
+ * the app's, and the supervisor must not count it. Once for a load, answered, silent or refused, after it has waited. */
+static void store_load_begins_the_call_again(void) {
+    worker_answers = true;
+    clock_at_ms(5000);
+    restamps = 0;
+    expect_load("clock", "{}", "a load");
+    CHECK(restamps == 1, "%d restarts for a load that was answered", restamps);
+    worker_answers = false;
+    clock_at_ms(5000);
+    restamps = 0;
+    CHECK(apps_port_store_load("clock", &(size_t){0}) == NULL, "a silent worker");
+    CHECK(restamps == 1 && restamp_at_ms >= 5000 + APPS_STORE_WAIT_MS, "%d restarts, at %lld: after the wait of %d ms", restamps,
+          (long long)restamp_at_ms, APPS_STORE_WAIT_MS);
+    worker_runs(1);
+    ops_refused = true;
+    restamps = 0;
+    CHECK(apps_port_store_load("clock", &(size_t){0}) == NULL, "a refused load");
+    CHECK(restamps == 1, "%d restarts for a load that was refused", restamps);
+    ops_refused = false;
+    n_logged = 0;
+}
+
 /* sys.battery()'s numbers are muse_state's, a percentage clamped to 0 to 100 and -1 for none. sys.wifi() is connected only when the
  * station is joined, with that network's name, cut to the room the caller has (and never past the NUL a full-length name lacks), and
  * "" when it isn't, whatever name the status still holds. Nothing of it is logged. */
@@ -1003,7 +1156,7 @@ static void battery_and_wifi_are_the_systems(void) {
     memset(ssid, 'z', sizeof ssid);
     CHECK(apps_port_wifi(ssid, sizeof ssid) && strcmp(ssid, "muse-lab") == 0, "connected: '%s'", ssid);
     memset(ssid, 'z', sizeof ssid);
-    CHECK(apps_port_wifi(ssid, 4) && strcmp(ssid, "mus") == 0 && ssid[5] == 'z', "cut to 4 bytes with the NUL: '%s'", ssid);
+    CHECK(apps_port_wifi(ssid, 4) && strcmp(ssid, "mus") == 0 && ssid[4] == 'z', "cut to 4 bytes with the NUL, and nothing past them: '%s'", ssid);
     memset(ssid, 'z', sizeof ssid);
     CHECK(apps_port_wifi(ssid, 0) && ssid[0] == 'z', "no room: connected, nothing written");
     memset(fake_wifi.ssid, 'x', sizeof fake_wifi.ssid);  /* a name that fills the field, with no NUL: bytes from the air */
@@ -1051,6 +1204,11 @@ static const struct {
     {"store_load_answered_at_the_deadline", store_load_answered_at_the_deadline},
     {"store_refusals", store_refusals},
     {"store_keeps_16_apps_and_drops_the_oldest_saved", store_keeps_16_apps_and_drops_the_oldest_saved},
+    {"store_load_request_is_a_small_internal_block", store_load_request_is_a_small_internal_block},
+    {"store_a_save_the_worker_refuses_is_kept", store_a_save_the_worker_refuses_is_kept},
+    {"store_kept_saves_are_one_for_each_app_and_bounded", store_kept_saves_are_one_for_each_app_and_bounded},
+    {"store_a_kept_save_comes_after_the_one_the_worker_took", store_a_kept_save_comes_after_the_one_the_worker_took},
+    {"store_load_begins_the_call_again", store_load_begins_the_call_again},
     {"battery_and_wifi_are_the_systems", battery_and_wifi_are_the_systems},
     {"show_keep_awake_and_exit_go_to_the_app_task", show_keep_awake_and_exit_go_to_the_app_task},
 };

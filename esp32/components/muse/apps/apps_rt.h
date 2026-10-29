@@ -128,22 +128,29 @@
  *   period) isn't killed: its windows turn cool, the throttle ends, and the app speeds up again.
  *
  * The store. An app with the "store" permission has a store of keys and values, which the runtime keeps in its own cache, outside the
- * Lua heap (so the 16 KB it may hold never counts against memory_kb): per key, the text of its value, JSON as json.encode writes
- * it, which store.get decodes afresh each time (so what it returns is a copy, and what the app does to it changes nothing here).
+ * Lua heap (so the 16 KB it may hold never counts against memory_kb, or shows in sys.mem(); see APPS_STORE_MAX_BYTES for what it does
+ * cost): per key, the text of its value, JSON as json.encode writes it, which store.get decodes afresh each time (so what it returns is a
+ * copy, and what the app does to it changes nothing here).
  * - Loaded in apps_rt_new, before main.lua runs, from the port (apps_port_store_load: the object the last save left, or "{}"). An
- *   object that isn't what the store writes (it doesn't parse, a key it never makes, more than 16 KB) is an empty store, and the log
- *   says so: the next save replaces it. A port that can't give it (no memory, no answer in time) makes apps_rt_new fail, with
+ *   object that isn't what the store writes (it doesn't parse, more than 16 KB) is an empty store, and the log says so: the next save
+ *   replaces it. A key the store never writes, whatever its length (empty, over 32 characters, one with \u0000 in it, one longer than the
+ *   reader's room) is skipped with its value, whatever that is, and the log says so once for the load: the rest is kept, and the next
+ *   save leaves what was skipped out. A port that can't give the object (no memory, no answer in time) makes apps_rt_new fail, with
  *   an error that says to try again: an app never starts with an empty store in place of the real one, which a later save
  *   would overwrite. Only an app with the permission is loaded.
  * - The 16 KB is the object that is saved, counted after encoding (apps_rt_store_set): its braces, each key escaped as JSON
- *   escapes it and its two quotes and colon, each value's text, the commas. A key is 1 to 32 characters (code points of valid
- *   UTF-8, no NUL), a value at most 15 containers deep (it sits inside the object, which is the first).
+ *   escapes it (apps_json_escape) and its two quotes and colon, each value's text, the commas. A key is 1 to 32 characters (code
+ *   points of valid UTF-8, no NUL), a value as deep as json.encode takes it, 16 levels: the loader reads the object that holds them
+ *   one level deeper than json.decode would (apps_jr_t.max_depth).
  * - A write that changes something marks the store changed, and the save is due APPS_STORE_FLUSH_MS after the last change (a change
- *   inside the wait starts it again; one that changes nothing doesn't). The loop that serves the app asks apps_rt_next_deadline for
- *   it, dark or lit, and calls apps_rt_store_tick, which saves when it is due: the object whole, through apps_port_store_save. A
- *   save the port refuses is asked again APPS_STORE_FLUSH_MS later. The last save is made when the app ends, whichever way: in
- *   apps_rt_stop once stop() has returned, when it crashes, and in apps_rt_free for a runtime that is freed with a change in it. That
- *   one is asked once: a port that refuses it loses the changes, and the log has a line that says so.
+ *   inside the wait starts it again; one that changes nothing doesn't), but never later than APPS_STORE_MAX_WAIT_MS after the first
+ *   change that isn't saved yet: an app that writes every second, and never has 2 s of quiet, is saved all the same. The loop that
+ *   serves the app asks apps_rt_next_deadline for it, dark or lit, and calls apps_rt_store_tick, which saves when it is due: the
+ *   object whole, through apps_port_store_save. A save the port refuses is asked again APPS_STORE_FLUSH_MS later (and the 10 s begin
+ *   again, so that a writer that goes on doesn't have the port asked at every write). The last save is made when the app ends,
+ *   whichever way: in apps_rt_stop once stop() has returned (what stop() wrote is in it), when it crashes, and in apps_rt_free for a
+ *   runtime that is freed with a change in it. That one is asked once: a port that refuses it loses the changes, and the log has a
+ *   line that says so (the port keeps a save it takes until its worker has it: apps_port.h says what that guarantees).
  *
  * Show, tap and exit. sys.show() is allowed inside message() and alarm(), and inside any callback within APPS_SHOW_TAP_MS (10 s) of a
  * touch the runtime was given (apps_rt_touch), the 10 s included. The runtime knows nothing of the front: it asks the port.
@@ -164,7 +171,8 @@
  *
  * Memory: a runtime is one block from apps_port_realloc (itself, with its log and crash record), the VM's
  * heap, capped at the manifest's memory_kb, the widget table (apps_ui.h) with its text, and the store's cache (a block for each
- * key, and a table of them). apps_rt_free gives all of it back, saves a store that has a change in it, and runs no app code.
+ * key, and a table of them: outside memory_kb, and APPS_STORE_MAX_BYTES says how much). apps_rt_free gives all of it back, saves a
+ * store that has a change in it, and runs no app code.
  */
 
 #include <stdbool.h>
@@ -365,9 +373,17 @@ apps_vm_t *apps_rt_vm(apps_rt_t *rt);
 
 /* ---- The store, show and exit (above; the `store` and `sys` modules of apps_svc.c are built on these) ---- */
 
-#define APPS_STORE_MAX_BYTES 16384  /* the saved object, counted after encoding */
+/* The saved object, counted after encoding. That is what an app may keep, and not what the cache costs: the runtime holds it in the port's
+ * heap (PSRAM), outside memory_kb and not in sys.mem(), as a block for each key (8 bytes of its own, the key and the text of the value) and a
+ * table of pointers to them, which doubles from 8 slots. The most keys 16 KB holds is 2,730: every entry takes at least 6 bytes of the object
+ * ("k":1,), and a block is at most 4 bytes more than its entry's bytes (the key's escape is never shorter than the key), so the blocks are at
+ * most 27,303 bytes between them, and the table 4,096 slots (16,384 bytes of 4-byte pointers on the board, and as much again while it doubles
+ * from 2,048): about 44 KB, to which the allocator adds its own overhead on each block. (The keys are distinct, so a store that fills with the
+ * cheapest ones has about 2,350.) Only one app runs at a time. */
+#define APPS_STORE_MAX_BYTES 16384
 #define APPS_STORE_KEY_MAX 32       /* characters in a key */
 #define APPS_STORE_FLUSH_MS 2000    /* a save is due this long after the last change, and again this long after one the port refused */
+#define APPS_STORE_MAX_WAIT_MS 10000  /* and never later than this after the first change that isn't saved yet, writes or no writes */
 #define APPS_SHOW_TAP_MS 10000      /* sys.show() is allowed this long after a touch, the end of it included */
 
 typedef enum {

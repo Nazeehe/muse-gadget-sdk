@@ -70,6 +70,7 @@ static const char *const handler_names[H_COUNT] = {"start", "stop", "show", "hid
 /* What the store says to the log, and to apps_rt_new's caller when the store can't be had. */
 #define STORE_UNREADABLE "store: the saved values couldn't be read; starting with none"
 #define STORE_LOST "store: the last changes couldn't be saved"
+#define STORE_SKIPPED "store: some saved values had a key the store never writes and were skipped"
 #define STORE_LOAD_FAILED "can't read the app's saved values (the gadget is short of memory or busy); try again in a few seconds"
 
 /* The duty cycle (apps_rt.h): a window is a whole second of the monotonic clock, hot over APPS_DUTY_BUSY_PCT of it spent in
@@ -120,12 +121,13 @@ struct apps_rt {
     uint8_t cpu_pct;
     bool throttled, throttle_warned;
     /* The store (apps_rt.h): a block for each key, how many bytes of the saved object they take between them (each key's escape,
-     * its quotes and colon, its text), whether a change waits to be saved and when the save is due. */
+     * its quotes and colon, its text), whether a change waits to be saved, when the first change that isn't saved yet was made, and
+     * when the save is due. */
     store_entry_t **store;
     unsigned store_n, store_cap;
     size_t store_sum;
     bool store_dirty;
-    int64_t store_due;
+    int64_t store_first, store_due;
     /* sys.show (apps_rt_show_allowed): message() or alarm() is running, or a touch came at touch_ms. */
     bool show_ok, touched;
     int64_t touch_ms;
@@ -510,37 +512,6 @@ static void log_note(apps_rt_t *rt, const char *line) {
     apps_port_log(rt->pkg->manifest.id, line);
 }
 
-/* key[0, n) escaped as the encoder escapes a string (apps_json.c's put_string): '"' and '\\', and \b \f \n \r \t, take two bytes, any other
- * byte under 0x20 six (\u00xx), every other byte one. It is written to out, which has room for that many (NULL: only counted). */
-static size_t escape_key(char *out, const char *s, size_t n) {
-    static const char hex[] = "0123456789abcdef";
-    size_t used = 0;
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
-        char esc = c == '"' ? '"' : c == '\\' ? '\\' : c == '\b' ? 'b' : c == '\f' ? 'f' : c == '\n' ? 'n' : c == '\r' ? 'r' : c == '\t' ? 't' : 0;
-        if (esc != 0) {
-            if (out != NULL) {
-                out[used] = '\\';
-                out[used + 1] = esc;
-            }
-            used += 2;
-        } else if (c < 0x20) {
-            if (out != NULL) {
-                memcpy(out + used, "\\u00", 4);
-                out[used + 4] = hex[c >> 4];
-                out[used + 5] = hex[c & 15];
-            }
-            used += 6;
-        } else {
-            if (out != NULL) {
-                out[used] = (char)c;
-            }
-            used++;
-        }
-    }
-    return used;
-}
-
 bool apps_rt_store_key_valid(const char *key, size_t len) {
     const unsigned char *p = (const unsigned char *)key, *end = p + len;
     size_t chars = 0;
@@ -584,10 +555,16 @@ static int store_find(const apps_rt_t *rt, const char *key, size_t key_len) {
     return -1;
 }
 
-/* The save is due APPS_STORE_FLUSH_MS from now, whatever was due before: a change inside the wait starts it again. */
+/* The save is due APPS_STORE_FLUSH_MS from now: a change inside the wait starts it again. But never later than APPS_STORE_MAX_WAIT_MS after the
+ * first change that isn't saved yet, so an app that writes every second, and never has 2 s of quiet, is saved all the same. */
 static void store_changed(apps_rt_t *rt) {
+    int64_t now = apps_port_mono_ms();
+    if (!rt->store_dirty) {
+        rt->store_first = now;
+    }
     rt->store_dirty = true;
-    rt->store_due = apps_port_mono_ms() + APPS_STORE_FLUSH_MS;
+    int64_t quiet = now + APPS_STORE_FLUSH_MS, longest = rt->store_first + APPS_STORE_MAX_WAIT_MS;
+    rt->store_due = quiet < longest ? quiet : longest;
 }
 
 /* Stores the text under the key, as apps_rt_store_set does; changed says whether it counts as a change to save (what is loaded
@@ -603,7 +580,7 @@ static apps_store_result_t store_put(apps_rt_t *rt, const char *key, size_t key_
             return APPS_STORE_OK;  /* what is there already: no change, and no new save */
         }
     }
-    size_t esc = escape_key(NULL, key, key_len);
+    size_t esc = apps_json_escape(NULL, key, key_len);
     size_t sum = rt->store_sum + esc + 3 + len;
     if (at >= 0) {
         sum -= entry_cost(rt->store[at]);  /* the bytes it had count for nothing */
@@ -683,30 +660,44 @@ static void store_clear(apps_rt_t *rt) {
 }
 
 /* The object that is saved: the entries, each as `"key":text`, in braces. Given to the port, which copies it. False when the port
- * doesn't take it, or the heap has no room for the text. */
+ * doesn't take it, or the heap has no room for the text. The block is sized from the books (store_sum), and every entry is checked against the
+ * room that is left before it is written, from the bytes themselves and not from the books, so that books that are wrong make a save that is
+ * refused, never one that writes past its block. */
 static bool store_save(apps_rt_t *rt) {
     size_t total = doc_bytes(rt->store_sum, rt->store_n);
     char *doc = apps_port_realloc(NULL, total + 1);
     if (doc == NULL) {
         return false;
     }
+    const char *const brace = doc + total - 1;  /* where the closing brace goes: the last byte of the object */
     char *at = doc;
     *at++ = '{';
-    for (unsigned i = 0; i < rt->store_n; i++) {
+    bool ok = true;
+    for (unsigned i = 0; ok && i < rt->store_n; i++) {
         const store_entry_t *e = rt->store[i];
+        size_t esc = apps_json_escape(NULL, e->data, e->key_len);
+        size_t cost = (i > 0 ? 1u : 0u) + 1 + esc + 2 + e->text_len;  /* the comma, the key and its quotes, the colon, the text */
+        if (cost > (size_t)(brace - at)) {
+            ok = false;  /* the books said there was room for less than this */
+            break;
+        }
         if (i > 0) {
             *at++ = ',';
         }
         *at++ = '"';
-        at += escape_key(at, e->data, e->key_len);
+        at += apps_json_escape(at, e->data, e->key_len);
         *at++ = '"';
         *at++ = ':';
         memcpy(at, e->data + e->key_len, e->text_len);
         at += e->text_len;
     }
-    *at++ = '}';
-    *at = '\0';
-    bool ok = (size_t)(at - doc) == total && apps_port_store_save(rt->pkg->manifest.id, doc, total);
+    if (ok && at == brace) {  /* and all of the room is used: the books and the bytes agree */
+        *at++ = '}';
+        *at = '\0';
+        ok = apps_port_store_save(rt->pkg->manifest.id, doc, total);
+    } else {
+        ok = false;
+    }
     apps_port_free(doc);
     return ok;
 }
@@ -718,7 +709,10 @@ void apps_rt_store_tick(apps_rt_t *rt, int64_t now_ms) {
     if (store_save(rt)) {
         rt->store_dirty = false;
     } else {
-        rt->store_due = now_ms + APPS_STORE_FLUSH_MS;  /* the port was full, or short of memory: asked again then */
+        /* The port was full, or short of memory: asked again then. The longest wait begins again too, so that a writer that goes on, whose
+         * every write would find the first change's 10 s over, doesn't have the port asked at each of them. */
+        rt->store_first = now_ms;
+        rt->store_due = now_ms + APPS_STORE_FLUSH_MS;
     }
 }
 
@@ -735,18 +729,21 @@ static void store_flush_final(apps_rt_t *rt) {
 
 typedef enum { PARSED, UNREADABLE, NO_MEMORY } parse_t;
 
-/* The object the port gave, into the cache: what the store writes (an object whose values are JSON, in at most 16 KB). A key twice is
- * its last; a key the store never writes (empty, over 32 characters) is dropped. NO_MEMORY when the cache couldn't grow: that
- * is no reason to think the object is bad. */
-static parse_t store_parse(apps_rt_t *rt, const char *json, size_t len) {
+/* The object the port gave, into the cache: what the store writes (an object whose values are JSON, in at most 16 KB). A key twice is its last.
+ * A key the store never writes, at any length (empty, over 32 characters, one with \u0000 in it, one longer than any key could be) is skipped
+ * with its value, whatever that is, and counted in *skipped; the rest is kept. The values are as deep as json.encode takes them, 16 levels, and
+ * the object that holds them is read one level deeper than json.decode would. NO_MEMORY when the cache couldn't grow: that is no reason to
+ * think the object is bad. */
+static parse_t store_parse(apps_rt_t *rt, const char *json, size_t len, unsigned *skipped) {
     apps_jr_t r;
     char key[APPS_STORE_KEY_MAX * 4 + 1];  /* the longest key in bytes, and its NUL */
     apps_jr_init(&r, json, len);
+    r.max_depth = APPS_JSON_MAX_DEPTH + 1;
     if (len > APPS_STORE_MAX_BYTES || !apps_jr_object(&r)) {
         return UNREADABLE;
     }
     for (;;) {
-        int k = apps_jr_key(&r, key, sizeof key);
+        int k = apps_jr_key_any(&r, key, sizeof key);
         if (k < 0) {
             return UNREADABLE;
         }
@@ -759,7 +756,8 @@ static parse_t store_parse(apps_rt_t *rt, const char *json, size_t len) {
             return UNREADABLE;
         }
         size_t key_len = strlen(key);
-        if (!apps_rt_store_key_valid(key, key_len)) {
+        if (k == 2 || !apps_rt_store_key_valid(key, key_len)) {
+            (*skipped)++;
             continue;
         }
         apps_store_result_t put = store_put(rt, key, key_len, value, value_len, false);
@@ -781,13 +779,16 @@ static bool store_load(apps_rt_t *rt) {
     if (json == NULL) {
         return false;
     }
-    parse_t parsed = store_parse(rt, json, len);
+    unsigned skipped = 0;
+    parse_t parsed = store_parse(rt, json, len, &skipped);
     apps_port_free(json);
     if (parsed != PARSED) {
         store_clear(rt);
     }
     if (parsed == UNREADABLE) {
         log_note(rt, STORE_UNREADABLE);
+    } else if (parsed == PARSED && skipped > 0) {
+        log_note(rt, STORE_SKIPPED);  /* once for the load, whatever the number of keys */
     }
     return parsed != NO_MEMORY;
 }

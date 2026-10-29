@@ -128,10 +128,16 @@ void apps_port_sound_stop(void);
  * written by the runtime and read back by it, whole. The device keeps the objects behind the I/O worker (X11: no flash or NVS from
  * a task with a PSRAM stack, reads included), in a map in PSRAM until Task 20 gives them flash (they survive an app's restart, not
  * the gadget's); apphost keeps them in the process.
+ *
+ * The RAM map (apps_store_ram.c) holds at most 16 apps, and a save for a 17th drops the values of the app saved longest ago, with one
+ * log line that names it. That is a bound against growth that has no limit, for a map that is never cleaned (the values of an app that was
+ * removed stay until the gadget restarts); it is a RAM-only bound, and Task 20's flash backend does not inherit it: it deletes an app's
+ * values when the app is removed, and drops no other app's.
  */
 
-/* How long a load waits for the worker at most. The app task's call is watched for APPS_TASK_HUNG_MS (3 s), and the load is made
- * inside the launch's. */
+/* How long a load waits for the worker at most. The app task's call is watched for APPS_TASK_HUNG_MS (3 s), and the load is made inside
+ * the launch's: so that the wait isn't the app's, the port begins the call again once it has waited (apps_task_call_restart), and the
+ * supervisor counts what main.lua then does from there. */
 #define APPS_STORE_WAIT_MS 1000
 
 /* The object saved for `app`, as a block of apps_port_realloc with a NUL after its *len bytes, which the caller frees with
@@ -142,9 +148,11 @@ void apps_port_sound_stop(void);
 char *apps_port_store_load(const char *app, size_t *len);
 
 /* Saves json[0, len), one JSON object, as `app`'s store, in place of what was there. The bytes are copied before this returns and
- * written on the worker, in the order of the calls. True when that is queued, false when it isn't (the worker's queue is full, or no
- * memory, or the object is more than APPS_STORE_MAX_BYTES, which the runtime never makes): the caller tries again later (a periodic save)
- * or gives up (the last one, when the app ends). The app task. */
+ * written on the worker, in the order of the calls. True when the port has the object, whatever the worker says to it: queued for the worker,
+ * or, if the worker refuses it just now (its queue is full, or it can't be made), kept by the port until it takes it (apps_store.h), where a
+ * load of the app reads it. False when the port can't keep it (no memory for the copy, or the object is more than APPS_STORE_MAX_BYTES, which
+ * the runtime never makes): the caller tries again later (a periodic save) or says that the last changes are lost (the last one, when the
+ * app ends). The app task. */
 bool apps_port_store_save(const char *app, const char *json, size_t len);
 
 /* The battery, as muse_state_power() has it: pct in 0 to 100, or -1 when there is none or it can't be told. */

@@ -80,6 +80,7 @@ typedef union {
 } block_t;
 
 static size_t held;            /* bytes handed out and not freed */
+static size_t held_peak;       /* the most that was held at once, since a case last set it */
 static long growths;           /* growth requests so far */
 static long refuse_from = -1;  /* refuse every growth request from this one on (counted in growths); -1: none */
 
@@ -98,6 +99,9 @@ void *apps_port_realloc(void *ptr, size_t n) {
     }
     nb->size = n;
     held = held - old + n;
+    if (held > held_peak) {
+        held_peak = held;
+    }
     return nb + 1;
 }
 
@@ -1937,6 +1941,7 @@ static void alarm_table_full(void) {
 
 static const char *const STORE_UNREADABLE_LINE = "store: the saved values couldn't be read; starting with none";
 static const char *const STORE_LOST_LINE = "store: the last changes couldn't be saved";
+static const char *const STORE_SKIPPED_LINE = "store: some saved values had a key the store never writes and were skipped";
 static const char *const STORE_LOAD_FAILED_TEXT =
     "can't read the app's saved values (the gadget is short of memory or busy); try again in a few seconds";
 
@@ -2086,7 +2091,8 @@ static void store_api(void) {
 }
 
 /* When the store is saved: 2 s after the last change (a change inside the wait starts it again, and a write that changes nothing
- * is none), dark or lit, never as a call; a save the port refuses again 2 s later; the last one when the app ends (stop, a crash, a
+ * is none), but never later than 10 s after the first change that nobody has saved, for a writer that never pauses; dark or lit, never
+ * as a call; a save the port refuses again 2 s later, counted from the refusal; the last one when the app ends (stop, a crash, a
  * crash in main.lua's top level, the runtime freed), asked once. */
 static void store_flush(void) {
     fake_store_reset();
@@ -2161,6 +2167,19 @@ static void store_flush(void) {
     finish(rt, pkg);
     CHECK(fake_store.saves == 6 && strstr(fake_saved_json("app"), "\"e\":2") != NULL, "no save at free: %d", fake_store.saves);
 
+    /* What stop() itself writes is in the stop's save, with what the app wrote before: one save, once stop() has returned. */
+    fake_store_reset();
+    rt = launch_perms(&pkg, "return {start = function() store.set('s', 1) end, stop = function() store.set('bye', 'yes') end}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    CHECK(fake_store.attempts == 0, "saved before the stop");
+    apps_rt_stop(rt);
+    CHECK(fake_store.saves == 1 && strcmp(fake_saved_json("app"), "{\"s\":1,\"bye\":\"yes\"}") == 0, "%d saves; '%s'", fake_store.saves,
+          fake_saved_json("app") != NULL ? fake_saved_json("app") : "(none)");
+    finish(rt, pkg);
+    CHECK(fake_store.attempts == 1, "the free saved it again: %d asked", fake_store.attempts);
+
     /* The last save is asked once: a port that refuses it loses the changes, and the log says so. */
     fake_store_reset();
     rt = launch_perms(&pkg, "return {}", APPS_PERM_STORE);
@@ -2202,7 +2221,126 @@ static void store_flush(void) {
     CHECK(rt != NULL && apps_rt_state(rt) == APPS_STATE_CRASHED, "no crashed runtime");
     CHECK(fake_store.saves == 1 && strcmp(fake_saved_json("app"), "{\"boot\":1}") == 0, "a boot crash saved %d times", fake_store.saves);
     finish(rt, pkg);
+
+    /* A writer that never stops: its 2 s of quiet never come, and the save comes all the same, APPS_STORE_MAX_WAIT_MS after the first write
+     * that isn't saved yet (and the change that is left is what it is by then). The next write begins the next 10 s. */
     fake_store_reset();
+    port_mono_ms = 40000;
+    rt = launch_perms(&pkg, "return {}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    int64_t first = -1;
+    int taken = 0;
+    for (int64_t t = 40000; t <= 62000; t += 1000) {
+        port_mono_ms = t;
+        char value[16], want[32];
+        snprintf(value, sizeof value, "%lld", (long long)(t / 1000));
+        CHECK(STORE_SET(rt, "n", value) == APPS_STORE_OK, "n = %s", value);
+        first = first < 0 ? t : first;
+        int64_t due = apps_rt_next_deadline(rt), quiet = t + APPS_STORE_FLUSH_MS, longest = first + APPS_STORE_MAX_WAIT_MS;
+        CHECK(due == (quiet < longest ? quiet : longest), "at %lld, the first write at %lld: the save is due at %lld", (long long)t,
+              (long long)first, (long long)due);
+        int before = fake_store.saves;
+        apps_rt_store_tick(rt, t);
+        if (fake_store.saves > before) {
+            snprintf(want, sizeof want, "{\"n\":%lld}", (long long)(t / 1000));
+            CHECK(t == first + APPS_STORE_MAX_WAIT_MS, "saved at %lld, %lld ms after the first write", (long long)t, (long long)(t - first));
+            CHECK(strcmp(fake_saved_json("app"), want) == 0, "saved '%s', want '%s'", fake_saved_json("app"), want);
+            CHECK(apps_rt_next_deadline(rt) == INT64_MAX, "saved, and still due");
+            first = -1;
+            taken++;
+        } else {
+            CHECK(t < first + APPS_STORE_MAX_WAIT_MS, "not saved at %lld, %lld ms after the first write", (long long)t, (long long)(t - first));
+        }
+    }
+    CHECK(taken == 2 && fake_store.saves == 2, "%d saves of a writer that wrote for 22 s", fake_store.saves);
+    CHECK(fake_store.saved_at == 61000, "the second save was at %lld", (long long)fake_store.saved_at);
+    finish(rt, pkg);
+
+    /* Writes that change nothing are none, whatever the max wait: they don't begin the 10 s. */
+    fake_store_reset();
+    port_mono_ms = 40000;
+    rt = launch_perms(&pkg, "return {}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    CHECK(STORE_SET(rt, "n", "1") == APPS_STORE_OK, "n");
+    port_mono_ms = 41000;
+    apps_rt_store_tick(rt, 42000);
+    CHECK(fake_store.saves == 1, "saved at 42 s");
+    for (int64_t t = 43000; t < 60000; t += 1000) {
+        port_mono_ms = t;
+        CHECK(STORE_SET(rt, "n", "1") == APPS_STORE_OK && apps_rt_next_deadline(rt) == INT64_MAX, "a write of what is there made a save due");
+    }
+    port_mono_ms = 60000;
+    CHECK(STORE_SET(rt, "n", "2") == APPS_STORE_OK && apps_rt_next_deadline(rt) == 62000, "the first change after the save: due at %lld",
+          (long long)apps_rt_next_deadline(rt));
+    finish(rt, pkg);
+
+    /* A port that refuses what the 10 s brings is asked again at the next 2 s, and a writer that goes on doesn't make that every second: the
+     * 10 s begin again at the refusal. */
+    fake_store_reset();
+    port_mono_ms = 40000;
+    rt = launch_perms(&pkg, "return {}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    fake_store.refuse_saves = true;
+    for (int64_t t = 40000; t <= 70000; t += 1000) {
+        port_mono_ms = t;
+        char value[16];
+        snprintf(value, sizeof value, "%lld", (long long)(t / 1000));
+        CHECK(STORE_SET(rt, "n", value) == APPS_STORE_OK, "n = %s", value);
+        apps_rt_store_tick(rt, t);
+    }
+    CHECK(fake_store.attempts == 3 && fake_store.saves == 0, "a refusing port was asked %d times in 30 s of writes, wanted 3 (every 10 s)",
+          fake_store.attempts);
+    fake_store.refuse_saves = false;
+    port_mono_ms = 72000;
+    apps_rt_store_tick(rt, 72000);  /* the writer stopped at 70 s: the quiet is 2 s */
+    CHECK(fake_store.saves == 1 && strcmp(fake_saved_json("app"), "{\"n\":70}") == 0, "saved '%s' after the writer stopped",
+          fake_saved_json("app") != NULL ? fake_saved_json("app") : "(none)");
+    finish(rt, pkg);
+    fake_store_reset();
+}
+
+/* A load of json keeps `keys` keys, `a` is the text of the value of the key "a" ("(none)" for none), the log says once that keys were skipped,
+ * and nothing is due for what was only read. */
+static void expect_skipping_at(int line, const char *json, unsigned keys, const char *a) {
+    char err[256] = "";
+    fake_store_reset();
+    fake_preload("app", json);
+    apps_pkg_t *pkg = make_pkg_perms("return {}", APPS_PERM_STORE);
+    forget_logged();
+    apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK_AT(line, rt != NULL && apps_rt_state(rt) == APPS_STATE_STOPPED, "new: %p '%s'", (void *)rt, err);
+    if (rt != NULL) {
+        char got[32];
+        store_value(rt, "a", got, sizeof got);
+        CHECK_AT(line, apps_rt_store_count(rt) == keys && strcmp(got, a) == 0, "%u keys kept (wanted %u), a is '%s' (wanted '%s')",
+                 apps_rt_store_count(rt), keys, got, a);
+        CHECK_AT(line, apps_rt_next_deadline(rt) == INT64_MAX, "what was skipped made a save due");
+    }
+    const char *const want[] = {STORE_SKIPPED_LINE};
+    expect_logged_at(line, want, 1);
+    finish(rt, pkg);
+    CHECK_AT(line, fake_store.attempts == 0, "a store that was only read was saved");
+}
+#define EXPECT_SKIPPING(json, keys, a) expect_skipping_at(__LINE__, (json), (keys), (a))
+
+/* {"k":[[...[1]...]]}: a value nested `levels` deep in an object. */
+static void nested_value(char *out, size_t cap, int levels) {
+    size_t n = (size_t)snprintf(out, cap, "{\"k\":");
+    for (int i = 0; i < levels; i++) {
+        out[n++] = '[';
+    }
+    out[n++] = '1';
+    for (int i = 0; i < levels; i++) {
+        out[n++] = ']';
+    }
+    out[n++] = '}';
+    out[n] = '\0';
 }
 
 /* What a load makes of what the port gives: the keys, the last of a key that is there twice, none of a key the store doesn't write,
@@ -2256,10 +2394,12 @@ static void store_load(void) {
     CHECK(strcmp(fake_saved_json("app"), "{\"a\":1}") == 0 && strcmp(fake_saved_json("other"), "{\"b\":2,\"c\":3}") == 0,
           "'%s' and '%s'", fake_saved_json("app"), fake_saved_json("other"));
 
-    /* A key twice is its last; an empty key and one of 33 characters are not the store's: dropped; the rest is read. */
+    /* A key twice is its last. A key the store never writes (empty, over 32 characters, one with \u0000 in it, one longer than the reader's room,
+     * which is no matter) is skipped with its value, whatever that is: one line in the log for the load, and the rest is read. */
     fake_store_reset();
     fake_preload("app", "{\"a\":1,\"a\":2,\"\":3,\"abcdefghijklmnopqrstuvwxyz0123456\":4,\"b\":5}");
     pkg = make_pkg_perms("return {}", APPS_PERM_STORE);
+    forget_logged();
     rt = apps_rt_new(pkg, err, sizeof err);
     CHECK(rt != NULL, "new: %s", err);
     if (rt != NULL) {
@@ -2268,35 +2408,63 @@ static void store_load(void) {
         store_value(rt, "b", b, sizeof b);
         CHECK(apps_rt_store_count(rt) == 2 && strcmp(a, "2") == 0 && strcmp(b, "5") == 0, "%u keys, a '%s', b '%s'",
               apps_rt_store_count(rt), a, b);
+        CHECK(apps_rt_next_deadline(rt) == INT64_MAX, "what was skipped is no change to save");
     }
-    expect_no_logs();
+    expect_logged(STORE_SKIPPED_LINE);
     finish(rt, pkg);
+    CHECK(fake_store.attempts == 0, "a store that was only read was saved");
+
+    /* The same at any length: a key of 129 characters is more than the reader holds, and a key of 5000 more than any, and each is skipped with
+     * a value that has levels of its own. */
+    {
+        static char long129[200], long5000[5100], wide33[400];
+        snprintf(long129, sizeof long129, "{\"%0129d\":1,\"a\":2}", 0);
+        char *at = long5000;
+        at += snprintf(at, sizeof long5000, "{\"");
+        memset(at, 'k', 5000);
+        at += 5000;
+        snprintf(at, sizeof long5000 - (size_t)(at - long5000), "\":[1,{\"x\":[\"y\"]}],\"a\":2}");
+        at = wide33;
+        at += snprintf(at, sizeof wide33, "{\"a\":1,\"");
+        for (int i = 0; i < 33; i++) {
+            at += snprintf(at, sizeof wide33 - (size_t)(at - wide33), "\\u00e9");  /* 33 characters, 66 bytes: escaped in the text */
+        }
+        snprintf(at, sizeof wide33 - (size_t)(at - wide33), "\":2}");
+        EXPECT_SKIPPING("{\"abcdefghijklmnopqrstuvwxyz0123456\":1,\"a\":2}", 1, "2");  /* 33 characters: the review's input */
+        EXPECT_SKIPPING(long129, 1, "2");
+        EXPECT_SKIPPING(long5000, 1, "2");
+        EXPECT_SKIPPING(wide33, 1, "1");
+        EXPECT_SKIPPING("{\"a\":1,\"\\u0000\":2,\"b\":3}", 2, "1");                          /* only a NUL */
+        EXPECT_SKIPPING("{\"b\\u0000c\":[1,{\"x\":2}],\"a\":1}", 1, "1");                        /* a NUL inside */
+        EXPECT_SKIPPING("{\"\":1}", 0, "(none)");                                             /* nothing left: an empty store, no worse */
+        EXPECT_SKIPPING("{\"\":1,\"abcdefghijklmnopqrstuvwxyz0123456\":2,\"x\\u0000\":3,\"a\":4}", 1, "4");  /* three of them: one line */
+    }
+    {
+        /* A key that is bad and a value that isn't JSON is no store: the object is unreadable, as ever. */
+        static char long200_bad[300];
+        snprintf(long200_bad, sizeof long200_bad, "{\"%0200d\":}", 0);
+        static const char *const unreadable_with_a_long_key[] = {long200_bad, "{\"abcdefghijklmnopqrstuvwxyz0123456\":1,}",
+                                                                 "{\"\":NaN}", "{\"x\\u0000\":\"\xFF\"}"};
+        for (size_t i = 0; i < ARRAY_LEN(unreadable_with_a_long_key); i++) {
+            fake_store_reset();
+            fake_preload("app", unreadable_with_a_long_key[i]);
+            pkg = make_pkg_perms("return {}", APPS_PERM_STORE);
+            forget_logged();
+            rt = apps_rt_new(pkg, err, sizeof err);
+            CHECK(rt != NULL && apps_rt_store_count(rt) == 0, "case %zu: a store from an object that isn't JSON", i);
+            expect_logged(STORE_UNREADABLE_LINE);
+            finish(rt, pkg);
+        }
+    }
 
     /* An object the store didn't write: an empty store, one line in the log, and the app is made all the same. */
-    static char huge[APPS_STORE_MAX_BYTES + 100], deep[256], longkey[400];
+    static char huge[APPS_STORE_MAX_BYTES + 100], deep17[256];
     snprintf(huge, sizeof huge, "{\"a\":\"");
     memset(huge + 6, 'x', APPS_STORE_MAX_BYTES - 6 + 10);
     strcpy(huge + 6 + APPS_STORE_MAX_BYTES - 6 + 10, "\"}");
-    {
-        size_t n = 0;
-        n += (size_t)snprintf(deep + n, sizeof deep - n, "{\"k\":");
-        for (int i = 0; i < 16; i++) {
-            deep[n++] = '[';
-        }
-        deep[n++] = '1';
-        for (int i = 0; i < 16; i++) {
-            deep[n++] = ']';
-        }
-        deep[n++] = '}';
-        deep[n] = '\0';
-    }
-    {
-        size_t n = (size_t)snprintf(longkey, sizeof longkey, "{\"");
-        memset(longkey + n, 'k', 200);
-        strcpy(longkey + n + 200, "\":1}");
-    }
+    nested_value(deep17, sizeof deep17, 17);  /* a value of 17 levels is none json.encode writes: with the object that holds it, 18 */
     static const char *const unreadable[] = {"[]", "null", "5", "\"text\"", "{", "{\"a\":}", "{\"a\":1,}", "{\"a\" 1}", "{\"a\":1} x",
-                                             "", "{\"a\":\"\xFF\"}", huge, deep, longkey, "{\"a\":NaN}"};
+                                             "", "{\"a\":\"\xFF\"}", huge, deep17, "{\"a\":NaN}"};
     for (size_t i = 0; i < ARRAY_LEN(unreadable); i++) {
         fake_store_reset();
         forget_logged();
@@ -2328,6 +2496,37 @@ static void store_load(void) {
         finish(rt, pkg);
     }
 
+    /* A value is as deep as json.encode takes one, 16 levels; the object that holds it is one more, and is read whole: it is read, kept, saved
+     * with the rest, and read again. */
+    {
+        static char deep16[256];
+        nested_value(deep16, sizeof deep16, 16);
+        fake_store_reset();
+        fake_preload("app", deep16);
+        pkg = make_pkg_perms("return {}", APPS_PERM_STORE);
+        forget_logged();
+        rt = apps_rt_new(pkg, err, sizeof err);
+        CHECK(rt != NULL && apps_rt_store_count(rt) == 1, "an object with a value 16 levels deep wasn't read: %p, %u keys", (void *)rt,
+              rt != NULL ? apps_rt_store_count(rt) : 99);
+        expect_no_logs();
+        if (rt != NULL) {
+            char value[64];
+            store_value(rt, "k", value, sizeof value);
+            CHECK(strcmp(value, "[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]") == 0, "the value is '%s'", value);
+            port_mono_ms = 5000;
+            CHECK(STORE_SET(rt, "n", "1") == APPS_STORE_OK, "n");
+            apps_rt_store_tick(rt, 7000);
+            CHECK(fake_store.saves == 1 && strcmp(fake_saved_json("app"), "{\"k\":[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]],\"n\":1}") == 0, "saved '%s'",
+                  fake_saved_json("app") != NULL ? fake_saved_json("app") : "(none)");
+        }
+        finish(rt, pkg);
+        pkg = make_pkg_perms("return {}", APPS_PERM_STORE);
+        rt = apps_rt_new(pkg, err, sizeof err);
+        CHECK(rt != NULL && apps_rt_store_count(rt) == 2, "the saved object, with the value 16 deep in it, wasn't read back");
+        expect_no_logs();
+        finish(rt, pkg);
+    }
+
     /* A port that can't give the store: no app is made, and the message says to try again. Nothing is held, and nothing is saved over the
      * real store (there is none here to say so, but nothing was asked of the port either). */
     fake_store_reset();
@@ -2342,6 +2541,176 @@ static void store_load(void) {
     free_pkg(pkg);
     forget_logged();
     CHECK(held == 0, "%zu bytes held", held);
+    fake_store_reset();
+}
+
+/* A value that can never fit in the 16 KB is refused before anything is made for it: no output the size of the value in the app's heap, no
+ * copy of it in the port's. The most the port holds while an app of 1 MB sets a string of 400 KB (or a table that has it) is what the app
+ * itself holds: the same as the call that does nothing, where the encoder would have asked for 512 KB of output and 400 KB for the copy. */
+static const char *const TOO_BIG_APP =
+    "return {message = function(event)\n"
+    "  local big = ('x'):rep(400 * 1024)\n"
+    "  local m\n"
+    "  for i = 1, 5 do\n"
+    "    local ok\n"
+    "    if event == 'string' then ok, m = pcall(store.set, 'k', big)\n"
+    "    elseif event == 'table' then ok, m = pcall(store.set, 'k', {s = {big, 1}})\n"
+    "    else ok, m = pcall(error, 'idle') end\n"
+    "  end\n"
+    "  return m\n"
+    "end}\n";
+
+static void store_set_too_large(void) {
+    fake_store_reset();
+    port_mono_ms = 5000;
+    const file_t files[] = {{"main.lua", TOO_BIG_APP}};
+    apps_pkg_t *pkg = make_pkg_kb(1024, files, 1);
+    pkg->manifest.perms = APPS_PERM_STORE;
+    char err[256] = "";
+    apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt != NULL && apps_rt_start(rt), "new: %s", err);
+    if (rt != NULL) {
+        size_t peaks[3];
+        static const char *const events[] = {"idle", "string", "table"};
+        for (int i = 0; i < 3; i++) {
+            held_peak = held;
+            char *reply = apps_rt_message(rt, events[i], NULL, 0, err, sizeof err);
+            CHECK(reply != NULL, "%s: '%s'", events[i], err);
+            const char *want = i == 0 ? "\"idle\"" : "\"store: more than 16 KB stored; remove keys you don't need\"";
+            CHECK(reply != NULL && strcmp(reply, want) == 0, "%s: reply %s", events[i], reply != NULL ? reply : "(none)");
+            apps_port_free(reply);
+            peaks[i] = held_peak - held;
+        }
+        CHECK(peaks[1] <= peaks[0] + 64 * 1024 && peaks[2] <= peaks[0] + 64 * 1024,
+              "the port held %zu bytes at the most for a string and %zu for a table, %zu for nothing at all", peaks[1], peaks[2], peaks[0]);
+        CHECK(apps_rt_state(rt) == APPS_STATE_RUNNING && apps_rt_store_count(rt) == 0, "the app ended, or kept something");
+    }
+    finish(rt, pkg);
+    fake_store_reset();
+}
+
+/* A lookup walks the keys, and no count hook sees C walk: the module charges the walk to the call, an instruction for each 32 keys, for get, set
+ * and remove alike (apps_svc.c). 1600 keys are 50 instructions a call. */
+static const char *const KEY_WALK_APP =
+    "return {message = function(event, n)\n"
+    "  for i = 1, n do\n"
+    "    if event == 'get' then store.get('k1599')\n"
+    "    elseif event == 'set' then store.set('k0000', 0)\n"
+    "    elseif event == 'remove' then store.remove('nothing')\n"
+    "    else math.abs(1) end\n"
+    "  end\n"
+    "  return true\n"
+    "end}\n";
+
+static void expect_walk_cost_at(int line, apps_rt_t *rt, const char *event, unsigned n, unsigned per_call) {
+    char data[16], err[256] = "";
+    snprintf(data, sizeof data, "%u", n);
+    uint64_t before = apps_vm_instructions(apps_rt_vm(rt));
+    char *reply = apps_rt_message(rt, event, data, strlen(data), err, sizeof err);
+    CHECK_AT(line, reply != NULL, "%s x %u: '%s'", event, n, err);
+    apps_port_free(reply);
+    uint64_t cost = apps_vm_instructions(apps_rt_vm(rt)) - before;
+    uint64_t least = (uint64_t)n * per_call, most = least + (uint64_t)n * 40 + 2000;
+    CHECK_AT(line, cost >= least && cost <= most, "%s x %u cost %llu instructions: %u each, so from %llu to %llu", event, n, (unsigned long long)cost,
+             per_call, (unsigned long long)least, (unsigned long long)most);
+}
+#define EXPECT_WALK_COST(rt, event, n, per_call) expect_walk_cost_at(__LINE__, (rt), (event), (n), (per_call))
+
+static void store_key_walk(void) {
+    static char doc[17000];
+    char *at = doc;
+    *at++ = '{';
+    for (int i = 0; i < 1600; i++) {
+        at += snprintf(at, sizeof doc - (size_t)(at - doc), "%s\"k%04d\":0", i > 0 ? "," : "", i);
+    }
+    *at++ = '}';
+    *at = '\0';
+    CHECK(strlen(doc) <= APPS_STORE_MAX_BYTES, "the document is %zu bytes", strlen(doc));
+    fake_store_reset();
+    port_mono_ms = 5000;
+    fake_preload("app", doc);
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_perms(&pkg, KEY_WALK_APP, APPS_PERM_STORE);
+    if (rt != NULL) {
+        CHECK(apps_rt_store_count(rt) == 1600, "%u keys loaded", apps_rt_store_count(rt));
+        EXPECT_WALK_COST(rt, "idle", 200, 0);      /* the loop alone, as a baseline */
+        EXPECT_WALK_COST(rt, "get", 200, 50);
+        EXPECT_WALK_COST(rt, "set", 200, 50);      /* of the value that is there: no change, and the walk is charged before it is known */
+        EXPECT_WALK_COST(rt, "remove", 200, 50);   /* of a key that isn't there */
+        CHECK(apps_rt_next_deadline(rt) == INT64_MAX, "calls that changed nothing made a save due");
+    }
+    finish(rt, pkg);
+    fake_store_reset();
+}
+
+/* The cache's worst case, as apps_rt.h states it. What the 16 KB holds the most keys of is one-character keys with one-byte values, which are
+ * "k":1, a key, 6 bytes of the saved object; keys are distinct, so after the 94 of one ASCII character the next cost 7 (two characters). The
+ * port's heap holds a block for each key (8 bytes of header, the key and the text) and a table of pointers that doubles from 8 slots, and that
+ * is all of it. */
+static void store_cache_bound(void) {
+    fake_store_reset();
+    port_mono_ms = 5000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_perms(&pkg, "return {}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    size_t before = held, key_bytes = 0;
+    unsigned n = 0;
+    apps_store_result_t result = APPS_STORE_OK;
+    for (int c = 0x20; c <= 0x7F && result == APPS_STORE_OK; c++) {
+        if (c != '"' && c != '\\') {
+            char key[2] = {(char)c, '\0'};
+            result = STORE_SET(rt, key, "1");
+            n += result == APPS_STORE_OK ? 1u : 0u;
+            key_bytes += result == APPS_STORE_OK ? 1u : 0u;
+        }
+    }
+    CHECK(n == 94 && result == APPS_STORE_OK, "%u keys of one character", n);
+    static const char ALPHABET[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (size_t i = 0; i < 62 * 62 && result == APPS_STORE_OK; i++) {
+        char key[3] = {ALPHABET[i / 62], ALPHABET[i % 62], '\0'};
+        result = STORE_SET(rt, key, "1");
+        n += result == APPS_STORE_OK ? 1u : 0u;
+        key_bytes += result == APPS_STORE_OK ? 2u : 0u;
+    }
+    CHECK(result == APPS_STORE_FULL && n > 2300 && n <= 2730, "%u keys until the 16 KB were full (the bound is 2730)", n);
+    size_t slots = 8;
+    while (slots < n) {
+        slots *= 2;
+    }
+    size_t blocks = (size_t)n * 9 + key_bytes;  /* 8 bytes of header and the one byte of "1", for each key */
+    CHECK(held - before == blocks + slots * sizeof(void *), "the cache holds %zu bytes: %u blocks of %zu and a table of %zu slots", held - before, n,
+          blocks, slots);
+    CHECK(blocks <= (APPS_STORE_MAX_BYTES - 1) + 4 * 2730u && slots <= 4096, "%zu bytes of blocks and %zu slots: past what apps_rt.h says", blocks, slots);
+    apps_rt_store_tick(rt, 7000);
+    CHECK(fake_store.saves == 1 && fake_saved_for("app", false)->len <= APPS_STORE_MAX_BYTES, "the full store wasn't saved whole");
+    finish(rt, pkg);
+    fake_store_reset();
+}
+
+/* The save sizes its buffer from the store's books, and checks what it writes against them (apps_rt.c: store_save): in a build whose books are
+ * wrong (STORE_BOOKS_DRIFTED is set, and test_muse_apps_svc.py builds one that counts a byte too few for each entry) it finds that before it
+ * writes an entry that doesn't fit, refuses the save and gives the port nothing, and writes nothing past its block, which the sanitizer
+ * would report. With true books the save is made, whole. */
+static void store_books_drift(void) {
+    fake_store_reset();
+    port_mono_ms = 5000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_perms(&pkg, "return {}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    CHECK(STORE_SET(rt, "a", "1") == APPS_STORE_OK && STORE_SET(rt, "b", "22") == APPS_STORE_OK && STORE_SET(rt, "c", "\"three\"") == APPS_STORE_OK, "set");
+    apps_rt_store_tick(rt, 7000);
+    if (getenv("STORE_BOOKS_DRIFTED") != NULL) {
+        CHECK(fake_store.attempts == 0 && fake_store.saves == 0, "a save from books that were wrong reached the port (%d asked)", fake_store.attempts);
+        CHECK(apps_rt_next_deadline(rt) == 9000, "the refused save is due again at %lld", (long long)apps_rt_next_deadline(rt));
+    } else {
+        CHECK(fake_store.saves == 1 && strcmp(fake_saved_json("app"), "{\"a\":1,\"b\":22,\"c\":\"three\"}") == 0, "saved '%s'",
+              fake_saved_json("app") != NULL ? fake_saved_json("app") : "(none)");
+    }
+    finish(rt, pkg);
     fake_store_reset();
 }
 
@@ -2417,11 +2786,11 @@ static void store_refused(void) {
     fake_store_reset();
 }
 
-/* sys at the runtime: the battery and the Wi-Fi as the port gives them (a missing percentage is no field, a long one is cut at 100, a
- * name is clean text and "" when there is no network), the calls that go to the port (show, keep_awake, exit) and the memory. */
+/* sys at the runtime: the battery and the Wi-Fi as the port gives them (a missing percentage is -1, a number as the field always is, a
+ * long one is cut at 100, a name is clean text and "" when there is no network), the calls that go to the port (show, keep_awake, exit) and the memory. */
 static const char *const SYS_APP =
     "return {message = function(event)\n"
-    "  if event == 'battery' then local b = sys.battery() return {b.pct or 'none', b.charging, b.usb} end\n"
+    "  if event == 'battery' then local b = sys.battery() return {b.pct, math.type(b.pct), b.charging, b.usb} end\n"
     "  if event == 'wifi' then local w = sys.wifi() return {w.connected, w.ssid} end\n"
     "  if event == 'keep' then sys.keep_awake(true) sys.keep_awake(false) sys.keep_awake(true) return true end\n"
     "  if event == 'show' then sys.show() return true end\n"
@@ -2447,13 +2816,15 @@ static void sys_services(void) {
         return;
     }
     fake_battery = (apps_battery_t){.pct = 76, .charging = true, .usb = false};
-    expect_reply(rt, "battery", "[76,true,false]");
+    expect_reply(rt, "battery", "[76,\"integer\",true,false]");
     fake_battery = (apps_battery_t){.pct = 0, .charging = false, .usb = true};
-    expect_reply(rt, "battery", "[0,false,true]");
+    expect_reply(rt, "battery", "[0,\"integer\",false,true]");
     fake_battery = (apps_battery_t){.pct = -1, .charging = false, .usb = false};
-    expect_reply(rt, "battery", "[\"none\",false,false]");
+    expect_reply(rt, "battery", "[-1,\"integer\",false,false]");  /* unknown is -1, a number: b.pct < 20 and %d work on a gadget that can't tell */
+    fake_battery = (apps_battery_t){.pct = -7, .charging = false, .usb = false};
+    expect_reply(rt, "battery", "[-1,\"integer\",false,false]");  /* whatever the port gives under 0 */
     fake_battery = (apps_battery_t){.pct = 250, .charging = true, .usb = true};
-    expect_reply(rt, "battery", "[100,true,true]");
+    expect_reply(rt, "battery", "[100,\"integer\",true,true]");
 
     expect_reply(rt, "wifi", "[false,\"\"]");
     snprintf(fake_wifi_ssid, sizeof fake_wifi_ssid, "home net");
@@ -3682,6 +4053,10 @@ int main(int argc, char **argv) {
         {"store_flush", store_flush},
         {"store_load", store_load},
         {"store_refused", store_refused},
+        {"store_set_too_large", store_set_too_large},
+        {"store_key_walk", store_key_walk},
+        {"store_cache_bound", store_cache_bound},
+        {"store_books_drift", store_books_drift},
         {"sys_services", sys_services},
         {"show_window", show_window},
         {"timer_api", timer_api},

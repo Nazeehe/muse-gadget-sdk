@@ -102,6 +102,9 @@ static bool fail_unexpected(apps_jr_t *r, const char *p) {
     return false;
 }
 
+/* The levels the `started` bits have room for; max_depth is held to it. */
+#define JR_LEVELS 32
+
 static bool fail_depth(apps_jr_t *r) {
     if (r->err[0] == '\0') {
         snprintf(r->err, sizeof r->err, "nested deeper than %d", APPS_JSON_MAX_DEPTH);
@@ -209,11 +212,19 @@ typedef struct {
     size_t len;     /* the decoded length so far, counted with or without out */
     bool escaped;   /* the string has an escape, so its text isn't its value */
     bool no_nul;    /* refuse \u0000: the string is for C code */
+    bool lenient;   /* a string that outgrows out, or has a \u0000 that no_nul refuses, is still scanned to its end and checked, with
+                     * lost set, instead of failing (apps_jr_key_any) */
+    bool lost;      /* lenient, and out doesn't hold the string: only len is counted from here on */
 } jstr_t;
 
 static bool jstr_put(apps_jr_t *r, jstr_t *s, const char *open, const char *bytes, size_t n) {
-    if (s->out != NULL) {
+    if (s->out != NULL && !s->lost) {
         if (n > s->cap - s->len) {
+            if (s->lenient) {
+                s->lost = true;
+                s->len += n;
+                return true;
+            }
             if (r->err[0] == '\0') {
                 snprintf(r->err, sizeof r->err, "string longer than %u bytes at byte %u", (unsigned)s->cap, position(r, open));
             }
@@ -279,7 +290,10 @@ static bool scan_unicode(apps_jr_t *r, jstr_t *s, const char *open, const char *
         return fail_at(r, "invalid \\u escape", bs);
     }
     if (cp == 0 && s->no_nul) {
-        return fail_at(r, "\\u0000 isn't allowed in this string", bs);
+        if (!s->lenient) {
+            return fail_at(r, "\\u0000 isn't allowed in this string", bs);
+        }
+        s->lost = true;
     }
     char utf8[4];
     size_t n = utf8_encode(cp, utf8);
@@ -501,11 +515,11 @@ static bool literal(apps_jr_t *r, const char *word) {
 /* At the '{' or '[' at r->p: consumed, one level deeper. L (or NULL) is where the decoder is
  * building, which reserves the stack slots this level and its leaves use. */
 static bool enter(apps_jr_t *r, lua_State *L) {
-    if (r->depth >= APPS_JSON_MAX_DEPTH) {
+    if (r->depth >= r->max_depth || r->depth >= JR_LEVELS) {
         return fail_depth(r);
     }
     r->depth++;
-    r->started = (uint16_t)(r->started & ~(1u << (r->depth - 1)));
+    r->started &= ~(1u << (r->depth - 1));
     r->p++;
     if (L != NULL) {
         luaL_checkstack(L, DECODE_SLOTS, "json");
@@ -706,6 +720,7 @@ void apps_jr_init(apps_jr_t *r, const char *s, size_t len) {
         len = 0;
     }
     memset(r, 0, sizeof *r);
+    r->max_depth = APPS_JSON_MAX_DEPTH;
     r->start = r->p = s;
     r->end = s + len;
     if (len > APPS_JSON_MAX_INPUT) {
@@ -720,7 +735,7 @@ static bool level_started(const apps_jr_t *r) {
 }
 
 static void mark_started(apps_jr_t *r) {
-    r->started = (uint16_t)(r->started | (1u << (r->depth - 1)));
+    r->started |= 1u << (r->depth - 1);
 }
 
 bool apps_jr_object(apps_jr_t *r) {
@@ -765,11 +780,13 @@ static int next_element(apps_jr_t *r, char close, const char *caller) {
     return next;
 }
 
-int apps_jr_key(apps_jr_t *r, char *key_out, size_t cap) {
+/* The next key and its colon: 1 with the key in key_out, 0 at the '}', -1 on an error; and, when lenient, 2 for a key that didn't fit or
+ * had a \u0000, which is in key_out as "". */
+static int read_key(apps_jr_t *r, char *key_out, size_t cap, bool lenient, const char *caller) {
     if (key_out != NULL && cap > 0) {
         key_out[0] = '\0';  /* so that whatever goes wrong leaves an empty string, not stale text */
     }
-    int next = next_element(r, '}', "apps_jr_key");
+    int next = next_element(r, '}', caller);
     if (next != 1) {
         return next;
     }
@@ -782,13 +799,25 @@ int apps_jr_key(apps_jr_t *r, char *key_out, size_t cap) {
         fail_at(r, "no room for a string", r->p);
         return -1;
     }
-    jstr_t s = {.out = key_out, .cap = cap - 1, .no_nul = true};
+    jstr_t s = {.out = key_out, .cap = cap - 1, .no_nul = true, .lenient = lenient};
     if (!scan_string(r, &s)) {
         key_out[0] = '\0';
         return -1;
     }
+    if (s.lost) {
+        key_out[0] = '\0';
+        return expect(r, ':') ? 2 : -1;
+    }
     key_out[s.len] = '\0';
     return expect(r, ':') ? 1 : -1;
+}
+
+int apps_jr_key(apps_jr_t *r, char *key_out, size_t cap) {
+    return read_key(r, key_out, cap, false, "apps_jr_key");
+}
+
+int apps_jr_key_any(apps_jr_t *r, char *key_out, size_t cap) {
+    return read_key(r, key_out, cap, true, "apps_jr_key_any");
 }
 
 int apps_jr_next(apps_jr_t *r) {
@@ -915,6 +944,7 @@ typedef struct {
     int box;          /* the stack index of the userdata holding the output */
     char *buf;        /* that userdata's memory */
     size_t len, cap;  /* bytes written, bytes it holds */
+    size_t max;       /* the most output there may be, which the userdata never outgrows; 0 for no limit */
     unsigned values;  /* values visited, for the clock check */
     char err[96];     /* "" until the first error */
 } enc_t;
@@ -952,6 +982,9 @@ static void out_grow(enc_t *e, size_t need) {
         }
         cap *= 2;
     }
+    if (e->max != 0 && cap > e->max) {
+        cap = e->max;  /* need is within it: out_put refused anything past */
+    }
     char *grown = lua_newuserdatauv(e->L, cap, 0);
     memcpy(grown, e->buf, e->len);
     lua_replace(e->L, e->box);
@@ -959,8 +992,14 @@ static void out_grow(enc_t *e, size_t need) {
     e->cap = cap;
 }
 
+/* A failure is sticky: after a refusal nothing more is written, and encode_at, which every value passes through, ends the walk, so the
+ * callers that only write needn't check. That a text would outgrow the limit is a failure like any other: no memory is asked for it. */
 static void out_put(enc_t *e, const char *s, size_t n) {
-    if (n == 0) {
+    if (n == 0 || e->err[0] != '\0') {
+        return;
+    }
+    if (e->max != 0 && n > e->max - e->len) {
+        enc_fail(e, APPS_JSON_TOO_LARGE);
         return;
     }
     if (n > e->cap - e->len) {
@@ -970,10 +1009,53 @@ static void out_put(enc_t *e, const char *s, size_t n) {
     e->len += n;
 }
 
-/* A string: quoted, '"', '\' and the bytes under 0x20 escaped, valid UTF-8 or an error. */
-static bool put_string(enc_t *e, const char *s, size_t n) {
+/* The escape table of a JSON string, the only copy: the two-byte forms for '"' '\' and \b \f \n \r \t, \u00xx (lowercase hex) for every
+ * other byte under 0x20, and every other byte as it is. */
+size_t apps_json_escape(char *out, const char *s, size_t n) {
     static const char hex[] = "0123456789abcdef";
+    size_t len = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        char esc[6] = {'\\', 0, 0, 0, 0, 0};
+        size_t k = 2;
+        switch (c) {
+            case '"': esc[1] = '"'; break;
+            case '\\': esc[1] = '\\'; break;
+            case '\b': esc[1] = 'b'; break;
+            case '\f': esc[1] = 'f'; break;
+            case '\n': esc[1] = 'n'; break;
+            case '\r': esc[1] = 'r'; break;
+            case '\t': esc[1] = 't'; break;
+            default:
+                if (c >= 0x20) {
+                    esc[0] = (char)c;
+                    k = 1;
+                } else {
+                    memcpy(esc, "\\u00", 4);
+                    esc[4] = hex[c >> 4];
+                    esc[5] = hex[c & 0xF];
+                    k = 6;
+                }
+                break;
+        }
+        if (out != NULL) {
+            memcpy(out + len, esc, k);
+        }
+        len += k;
+    }
+    return len;
+}
+
+/* A string: quoted, '"', '\' and the bytes under 0x20 escaped (apps_json_escape), valid UTF-8 or an error. */
+static bool put_string(enc_t *e, const char *s, size_t n) {
     const unsigned char *p = (const unsigned char *)s, *end = p + n, *run = p;
+    if (e->err[0] != '\0') {
+        return false;
+    }
+    /* Its text is at least n bytes and the two quotes: a string that can't fit is refused without a scan, whatever its length. */
+    if (e->max != 0 && (e->max - e->len < 2 || n > e->max - e->len - 2)) {
+        return enc_fail(e, APPS_JSON_TOO_LARGE);
+    }
     out_put(e, "\"", 1);
     while (p < end) {
         unsigned char c = *p;
@@ -987,24 +1069,8 @@ static bool put_string(enc_t *e, const char *s, size_t n) {
             p++;
         } else {
             out_put(e, (const char *)run, (size_t)(p - run));
-            char esc[6] = {'\\', 0, 0, 0, 0, 0};
-            size_t k = 2;
-            switch (c) {
-                case '"': esc[1] = '"'; break;
-                case '\\': esc[1] = '\\'; break;
-                case '\b': esc[1] = 'b'; break;
-                case '\f': esc[1] = 'f'; break;
-                case '\n': esc[1] = 'n'; break;
-                case '\r': esc[1] = 'r'; break;
-                case '\t': esc[1] = 't'; break;
-                default:
-                    memcpy(esc, "\\u00", 4);
-                    esc[4] = hex[c >> 4];
-                    esc[5] = hex[c & 0xF];
-                    k = 6;
-                    break;
-            }
-            out_put(e, esc, k);
+            char esc[6];
+            out_put(e, esc, apps_json_escape(esc, (const char *)p, 1));
             p++;
             run = p;
         }
@@ -1144,6 +1210,9 @@ static bool encode_table(enc_t *e, int idx, int level) {
 /* The value at idx, depth containers deep. */
 static bool encode_at(enc_t *e, int idx, int depth) {
     lua_State *L = e->L;
+    if (e->err[0] != '\0') {
+        return false;  /* an earlier write was refused */
+    }
     if ((++e->values & CLOCK_EVERY_MASK) == 0) {
         apps_vm_charge(L, 0);  /* a float costs up to 109 us on the S3: the clock, inside one big table */
     }
@@ -1182,21 +1251,27 @@ static bool encode_at(enc_t *e, int idx, int depth) {
 
 /* Encodes the value at idx into a new userdata, left on top of the stack, with the text in e. False
  * with e->err set for a value that can't be encoded (the stack then holds whatever the walk left). */
-static bool encode_into_box(enc_t *e, lua_State *L, int idx) {
+static bool encode_into_box(enc_t *e, lua_State *L, int idx, size_t max) {
     idx = lua_absindex(L, idx);
     luaL_checkstack(L, ENCODE_SLOTS, "json");
     e->L = L;
     e->len = 0;
     e->cap = ENC_FIRST_CAP;
+    e->max = max;
     e->values = 0;
     e->err[0] = '\0';
     e->buf = lua_newuserdatauv(L, e->cap, 0);
     e->box = lua_gettop(L);
-    return encode_at(e, idx, 0);
+    return encode_at(e, idx, 0) && e->err[0] == '\0';
 }
 
 char *apps_json_encode_value(lua_State *L, int idx, void *(*realloc_fn)(void *, size_t), size_t *len, char *err,
                              size_t err_len) {
+    return apps_json_encode_value_max(L, idx, realloc_fn, 0, len, err, err_len);
+}
+
+char *apps_json_encode_value_max(lua_State *L, int idx, void *(*realloc_fn)(void *, size_t), size_t max, size_t *len, char *err,
+                                 size_t err_len) {
     int top = lua_gettop(L);
     enc_t e;
     char *text = NULL;
@@ -1204,7 +1279,7 @@ char *apps_json_encode_value(lua_State *L, int idx, void *(*realloc_fn)(void *, 
     if (len != NULL) {
         *len = 0;
     }
-    if (encode_into_box(&e, L, idx)) {
+    if (encode_into_box(&e, L, idx, max)) {
         text = realloc_fn != NULL ? realloc_fn(NULL, e.len + 1) : NULL;
         if (text != NULL) {
             memcpy(text, e.buf, e.len);
@@ -1240,7 +1315,7 @@ static int json_encode(lua_State *L) {
     apps_vm_check(L);
     luaL_checkany(L, 1);
     enc_t e;
-    if (!encode_into_box(&e, L, 1)) {
+    if (!encode_into_box(&e, L, 1, 0)) {
         return luaL_error(L, "json.encode: %s", e.err);
     }
     lua_pushlstring(L, e.buf, e.len);

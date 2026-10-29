@@ -165,6 +165,12 @@ class MuseAppsJsonTest(unittest.TestCase):
     def test_encode_limits_both_ways(self):
         self.run_case("encode_limits")
 
+    def test_the_escape_table_is_written_once_and_is_the_encoders(self):  # fix round 1, O: the store counts keys with it
+        self.run_case("escape_matches_the_encoder")
+
+    def test_an_encoding_may_be_bounded_so_a_value_that_cannot_fit_costs_no_memory(self):  # fix round 1, E
+        self.run_case("encode_bounded", timeout=20)
+
     def test_encode_large_nested(self):
         # Ruling B6: the output grows while lua_next is mid-table. A luaL_Buffer would break here.
         self.run_case("encode_large_nested")
@@ -216,6 +222,12 @@ class MuseAppsJsonTest(unittest.TestCase):
         # Ruling R6.13 and the coordinator's clarification: strings, numbers, commas and depth are
         # checked as the decoder checks them.
         self.run_case("reader_strict")
+
+    def test_a_key_that_cannot_be_held_is_consumed_and_reported_not_a_final_error(self):  # fix round 1, G: the store's loader skips it
+        self.run_case("reader_keys_that_cannot_be_held")
+
+    def test_a_caller_may_raise_the_reader_depth_by_the_level_of_its_own_container(self):  # fix round 1, F: the store's 16-deep values
+        self.run_case("reader_depth_allowance")
 
     def test_compact(self):
         self.run_case("compact")

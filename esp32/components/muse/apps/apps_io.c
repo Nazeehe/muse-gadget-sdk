@@ -16,6 +16,7 @@
 
 #include "apps_io.h"
 
+#include <assert.h>
 #include <stddef.h>
 
 #include "esp_heap_caps.h"
@@ -32,7 +33,7 @@
  * goes, as it looks at the queue under the lock), or it finds no worker and makes one. The worker never holds the lock
  * across a job, and a submit never waits for anything but the lock.
  *
- * The ops are a ring of APPS_IO_OPS under the same lock. One submitter (the app task) pushes; the worker's thread alone pops and runs
+ * The ops are a ring of APPS_IO_OPS under the same lock. One submitter (the app task, which registered itself: s_op_task) pushes; the worker's thread alone pops and runs
  * them, outside the lock: after each job, before it decides to go (it doesn't go with one waiting), and in apps_io_assist. A worker that
  * waits for a job would not see a new op, so a push queues a job to wake it (drain_job), one at a time: s_ops_nudged says one is on its
  * way, and the job clears it before it looks, so an op that comes after the look queues the next. When that job can't be queued and
@@ -57,6 +58,7 @@ static TaskHandle_t s_worker;  /* under s_lock: the worker, or NULL when there i
 static job_t s_ops[APPS_IO_OPS];  /* under s_lock: the ops waiting, a ring from s_ops_head */
 static unsigned s_ops_head, s_ops_n;
 static bool s_ops_nudged;         /* under s_lock: a drain job is queued, and has not looked yet */
+static TaskHandle_t s_op_task;    /* the task that submits ops: set by it, before it submits any */
 
 /* Runs the ops that are waiting, in order. The worker's thread alone calls it, and no lock is held while an op runs. */
 static void drain_ops(void) {
@@ -89,9 +91,11 @@ static void drain_job(void *arg) {
 
 static void worker(void *arg) {
     (void)arg;
+    bool ran_job = false;  /* a job of its own: the drain jobs that bring it to the ops are not */
     for (;;) {
         job_t job;
         if (xQueueReceive(s_jobs, &job, pdMS_TO_TICKS(APPS_IO_IDLE_MS)) == pdTRUE) {
+            ran_job = ran_job || job.fn != drain_job;
             job.fn(job.arg);
             drain_ops();  /* the ops that came while it ran */
             continue;
@@ -104,10 +108,19 @@ static void worker(void *arg) {
         }
         s_worker = NULL;
         xSemaphoreGive(s_lock);
-        ESP_LOGI(TAG, "io: idle, stack %u of %u free", (unsigned)uxTaskGetStackHighWaterMark(NULL),
-                 (unsigned)APPS_IO_STACK);
+        /* A worker that only ran ops is made for most saves of an app that keeps a store, which come 2 s or more apart, and says so each time:
+         * that is a debug line. One that ran a job (an install, a launch) says it as it did. */
+        if (ran_job) {
+            ESP_LOGI(TAG, "io: idle, stack %u of %u free", (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)APPS_IO_STACK);
+        } else {
+            ESP_LOGD(TAG, "io: idle, stack %u of %u free", (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)APPS_IO_STACK);
+        }
         vTaskDelete(NULL);
     }
+}
+
+void apps_io_register_op_task(void) {
+    s_op_task = xTaskGetCurrentTaskHandle();
 }
 
 void apps_io_init(void) {
@@ -163,6 +176,7 @@ bool apps_io_submit(void (*fn)(void *arg), void *arg) {
 }
 
 bool apps_io_submit_op(void (*op)(void *arg), void *arg) {
+    assert(s_op_task != NULL && xTaskGetCurrentTaskHandle() == s_op_task);  /* the ring has one pusher: the app task (apps_io.h) */
     if (s_lock == NULL || s_jobs == NULL || op == NULL) {
         ESP_LOGW(TAG, "io: not started: op refused");
         return false;

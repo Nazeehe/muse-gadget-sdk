@@ -29,12 +29,13 @@ import json
 import random
 import re
 import subprocess
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
 import apps_host
-from test_muse_apps_rt import BUDGET_CALL, AppHostTestCase, rt_harness, unknown_handler
+from test_muse_apps_rt import BUDGET_CALL, HARNESS_SOURCES, INCLUDES, AppHostTestCase, rt_harness, unknown_handler
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
@@ -1640,6 +1641,22 @@ class StoreTest(DeviceTestCase):
                                 script=[put("a", 5), "stop", "restart", 'message get {"key":"a"}'])
         self.assertEqual(replies(again), [True, 5])
 
+    def test_a_writer_that_never_pauses_is_saved_ten_seconds_after_its_first_unsaved_write(self):
+        # Its 2 s of quiet never come. The save comes 10 s after the first write that isn't saved yet, with what it has written by then, and
+        # the next write begins the next 10 s.
+        def writes(count, letter):
+            return [step for i in range(count) for step in (put("n", letter * (i + 1)), "advance 1000")]
+
+        run = self.device_app(PUT_HANDLERS, permissions=["store"], script=[
+            *writes(9, "x"), put("n", "x" * 10),              # 9 writes a second apart, and the tenth: 9 s after the first
+            "advance 999", "state",                           # 9.999 s after the first write: not yet
+            "advance 1", "state",                             # 10 s: saved
+            *writes(9, "y"), put("n", "y" * 10), "advance 999", "state", "advance 1", "state"])
+        kinds = [[e["event"] for e in c] for c in chunks(run)]
+        # No save in the first chunk, the 9.999 s included; one in the second, at the 10th; none among the next writes; one at their 10th.
+        self.assertEqual(kinds, [["started"] + ["reply"] * 10, ["store_save"], ["reply"] * 10, ["store_save"], []])
+        self.assertEqual(saved(run), [serialized({"n": "x" * 10}), serialized({"n": "y" * 10})])
+
     # ---- What the brief's don't cover: saving ----
 
     def test_a_crash_saves_what_was_written(self):
@@ -1659,10 +1676,21 @@ class StoreTest(DeviceTestCase):
             put("a", 1), "advance 2000", put("a", 1), "advance 2000", 'message remove "never"', "advance 2000", "stop",
             "advance 2000"])
         self.assertEqual(saved(run), [serialized({"a": 1})])
-        # A write of what is there is no change: it doesn't move the save either.
+        # A write of what is there is no change: it doesn't move the save either. The save is 2 s after the first write, so it is before the
+        # state that follows the advance (a save that the second write had moved would come at the end of the run, after it).
         run = self.device_app(PUT_HANDLERS, permissions=["store"],
-                              script=[put("a", 1), "advance 1500", put("a", 1), "advance 500"])
+                              script=[put("a", 1), "advance 1500", put("a", 1), "advance 500", "state"])
         self.assertEqual(saved(run), [serialized({"a": 1})])
+        self.assertEqual(run.kinds(), ["started", "reply", "reply", "store_save", "state"])
+
+    def test_a_write_inside_stop_is_carried_by_the_stops_save(self):
+        # stop() writes, and the save that follows it has what the app wrote before and what stop() wrote: one save, and nothing later.
+        run = self.device_app("""
+            function app.start() store.set("s", 1) end
+            function app.stop() print("stop") store.set("bye", "yes") end
+        """, permissions=["store"], script=["stop", "state", "advance 60000", "state"])
+        self.assertEqual(run.kinds(), ["started", "log", "store_save", "state", "state"])
+        self.assertEqual(saved(run), [serialized({"s": 1, "bye": "yes"})])
 
     def test_the_end_of_the_run_saves_what_is_left(self):
         # The runtime that is freed saves a store that still has a change in it (an owner may have forgotten to): the last event.
@@ -1739,6 +1767,39 @@ class StoreTest(DeviceTestCase):
         """, permissions=["store"])
         self.assertEqual(lines, [STORE_KEY_RULE] * 12 + ["ok", "1", "ok", "ok"] + [STORE_KEY_RULE] * 5)
 
+    def test_a_value_that_can_never_fit_is_refused_before_anything_is_made_for_it(self):
+        # The reviewer's input: 50 sets of a string of 400 KB in an app of 1 MB. Each is refused with the 16 KB message, as a table that holds
+        # it is, and the app lives (the encoder's output, which would have doubled to 512 KB with the 400 KB string held, never exists).
+        run = self.device_app(r"""
+            function app.start()
+                local big = ("x"):rep(400 * 1024)
+                local failed, last, others = 0, nil, {}
+                for i = 1, 50 do
+                    local ok, message = pcall(store.set, "k", big)
+                    if not ok then failed = failed + 1 last = bare(message) end
+                    ok, message = pcall(store.set, "t", {big})
+                    if not ok then others[bare(message)] = true end
+                    ok, message = pcall(store.set, "n", {a = {b = big}})
+                    if not ok then others[bare(message)] = true end
+                end
+                local kinds = 0 for _ in pairs(others) do kinds = kinds + 1 end
+                print(failed, last, kinds, store.get("k", "none"), store.get("t", "none"), store.get("n", "none"))
+            end
+        """, permissions=["store"], manifest={"memory_kb": 1024})
+        self.assertEqual(run.kinds(), ["log", "started"], run.events)
+        self.assertEqual(run.logs(), [f"50\t{STORE_FULL}\t1\tnone\tnone\tnone"])
+        # Half the app's memory is enough to end it, in a default app of 256 KB: a string of 128 KB gets the message too.
+        run = self.device_app(r"""
+            function app.start()
+                local big = "x" for i = 1, 17 do big = big .. big end    -- 128 KB
+                local ok, message = pcall(store.set, "k", big)
+                print(ok, bare(message))
+            end
+            function app.message() return "alive" end
+        """, permissions=["store"], script=["message ping"])
+        self.assertEqual(run.logs(), [f"false\t{STORE_FULL}"])
+        self.assertEqual(replies(run), ["alive"])
+
     def test_store_set_says_what_cannot_be_encoded(self):
         run = self.device_app(r"""
             function app.start()
@@ -1748,26 +1809,27 @@ class StoreTest(DeviceTestCase):
                 says(store.set, "s", "\255")
                 says(store.set, "k", {[{}] = 1}) says(store.set, "co", coroutine.create(print))
                 local deep = "x" for i = 1, 15 do deep = {deep} end says(store.set, "d15", deep)
-                says(store.set, "d16", {deep})
-                print(store.get("f", "none"), store.get("d15") ~= nil, store.get("d16", "none"))
+                local deeper = {deep} says(store.set, "d16", deeper)      -- 16 levels: what json.encode takes
+                says(store.set, "d17", {deeper})                           -- 17: what it doesn't
+                print(store.get("f", "none"), store.get("d15") ~= nil, store.get("d16") ~= nil, store.get("d17", "none"))
             end
-            function app.message()
-                local v, n = store.get("d15"), 0
+            function app.message(event)
+                local v, n = store.get(event), 0
                 while type(v) == "table" do n = n + 1 v = v[1] end
                 return n
             end
-        """, permissions=["store"], script=["restart", "message depth"])
-        # The json.encode message after "store.set: " (the bare text, as ruled). A value sits inside the store's object, so what
-        # json.encode takes 16 deep the store takes 15, and says so.
+        """, permissions=["store"], script=["restart", "message d15", "message d16"])
+        # The json.encode message after "store.set: " (the bare text, as ruled): a value is as deep as json.encode takes it, 16 levels, and the
+        # message of one that isn't is json.encode's own.
         want = ["store.set: can't encode a function",
                 "store.set: can't encode a function",
                 "store.set: can't encode NaN or infinity", "store.set: can't encode NaN or infinity",
                 "store.set: can't encode a string that isn't valid UTF-8",
                 "store.set: can't encode a table key", "store.set: can't encode a thread",
-                "ok", "store.set: nested deeper than 15",
-                "none\ttrue\tnone"]
+                "ok", "ok", "store.set: nested deeper than 16",
+                "none\ttrue\ttrue\tnone"]
         self.assertEqual(run.logs(), want * 2)  # and the restart's start() reads the same of what was saved
-        self.assertEqual(replies(run), [15])    # the value 15 deep is read back from the saved object, which is 16 deep
+        self.assertEqual(replies(run), [15, 16])  # the values are read back from the saved object, which holds the second 17 levels down
 
     def test_get_returns_a_copy_and_the_default_as_it_is(self):
         run = self.device_app("""
@@ -1936,6 +1998,21 @@ class SysTest(DeviceTestCase):
             function app.stop() print("stop") end
         """, script=["advance 500", "state", "timers"])
         self.assertEqual(run.logs(), ["every", "first", "first ends", "stop"])  # every at 50, then the two that are due at 100
+        self.assertEqual(run.of("state"), [{"event": "state", "state": "stopped"}])
+        self.assertEqual(run.of("timers"), [{"event": "timers", "count": 0}])
+
+    def test_sys_exit_in_alarm_runs_no_later_timer_of_the_same_advance(self):
+        run = self.device_app("""
+            function app.start()
+                alarm.after("t", 500, {sound = false})
+                timer.after(600, function() print("timer 600") end)       -- due inside the same advance, after the alarm
+                timer.after(700, function() print("timer 700") end)
+            end
+            function app.alarm(name) print("alarm " .. name) sys.exit() print("alarm ends") end
+            function app.stop() print("stop") end
+        """, permissions=["alarm"], script=["advance 1000", "state", "timers"])
+        # The callback runs to its end and the app ends after it, stop() included: neither timer runs.
+        self.assertEqual(run.logs(), ["alarm t", "alarm ends", "stop"])
         self.assertEqual(run.of("state"), [{"event": "state", "state": "stopped"}])
         self.assertEqual(run.of("timers"), [{"event": "timers", "count": 0}])
 
@@ -2188,8 +2265,9 @@ class SvcHarnessTest(unittest.TestCase):
         self.run_case("store_api")
 
     def test_when_the_store_is_saved(self):
-        # 2 s after the last change (a change inside the wait starts it again; one that changes nothing doesn't), dark or lit, never as a
-        # call; 2 s after a save the port refused; and when the app ends (stop, a crash, a crash in main.lua, free), asked once.
+        # 2 s after the last change (a change inside the wait starts it again; one that changes nothing doesn't) and never later than 10 s
+        # after the first change nobody has saved, writes going on or not, dark or lit, never as a call; 2 s after a save the port refused;
+        # and when the app ends (stop, a crash, a crash in main.lua, free), asked once.
         self.run_case("store_flush")
 
     def test_what_a_load_makes_of_what_the_port_gives(self):
@@ -2202,9 +2280,38 @@ class SvcHarnessTest(unittest.TestCase):
         # alone for one in the app; and every object that is saved is the real one with the changes. Nothing held at the end of each.
         self.run_case("store_refused")
 
+    def test_a_value_that_can_never_fit_asks_the_port_for_nothing(self):  # E
+        # 400 KB in an app of 1 MB, as a string and in a table: the port holds no more than the app itself does, and the reply is the 16 KB message.
+        self.run_case("store_set_too_large")
+
+    def test_the_walk_over_the_stores_keys_is_charged_to_the_call(self):
+        # get, set and remove each cost an instruction for every 32 keys, which no count hook sees C do.
+        self.run_case("store_key_walk")
+
+    def test_the_caches_worst_case_is_what_apps_rt_h_says(self):
+        # The most keys 16 KB holds (one-character keys with one-byte values), what the port's heap holds for them: blocks of 8 bytes, the key and
+        # the text, and a table of pointers that doubles from 8 slots.
+        self.run_case("store_cache_bound")
+
+    def test_a_save_checks_each_entry_against_the_room_before_writing_it(self):
+        self.run_case("store_books_drift")  # true books: the save is made
+        # A build of the runtime whose store counts a byte too few for each entry: the save finds out before it writes an entry that doesn't
+        # fit, and refuses, where the writes would have run past the block (the sanitizer aborts the harness).
+        source = (APPS / "apps_rt.c").read_text()
+        drifted = source.replace("size_t sum = rt->store_sum + esc + 3 + len;", "size_t sum = rt->store_sum + esc + 2 + len;", 1)
+        self.assertNotEqual(drifted, source)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        copy = Path(tmp.name) / "apps_rt.c"
+        copy.write_text(drifted)
+        sources = [copy if path.name == "apps_rt.c" else path for path in HARNESS_SOURCES]
+        exe = apps_host.build("muse_apps_rt_drift", [*sources, *apps_host.lua_sources()], tmp.name, include_dirs=INCLUDES)
+        done = apps_host.run(exe, "store_books_drift", env={"STORE_BOOKS_DRIFTED": "1"}, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
     def test_sys_at_the_runtime_with_the_ports_answers(self):
-        # A battery with no percentage is no field and one past 100 is 100; a Wi-Fi name is clean text, "" with no network, 32 bytes at
-        # most; keep_awake, show and exit go to the port; the exit lets the callback run to its end; mem.
+        # A battery with no percentage is -1, a number like every pct, and one past 100 is 100; a Wi-Fi name is clean text, "" with no
+        # network, 32 bytes at most; keep_awake, show and exit go to the port; the exit lets the callback run to its end; mem.
         self.run_case("sys_services")
 
     def test_sys_show_at_the_runtimes_clock(self):

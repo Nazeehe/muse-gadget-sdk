@@ -221,6 +221,24 @@ class MuseBenchTest(unittest.TestCase):
         self.assertIn('"lvgl"', inp)
         self.assertIn('xTaskGetHandle("muse_serial")', inp)
 
+    def test_the_docs_of_the_memory_report_name_each_stack_it_reports(self):
+        # The Kconfig help and the overlay's comment are where a bench user learns what >mem prints: each *_stack_free
+        # field of the line the firmware prints is named in both, with the task it is of (S).
+        inp = (MUSE / "muse_input.c").read_text()
+        printed = inp[inp.index('printf("@mem '):]
+        fields = re.findall(r'\\"(\w+_stack_free)\\"', printed[:printed.index(");")])
+        self.assertEqual(fields, ["lvgl_stack_free", "serial_stack_free"])
+        kconfig = (MUSE / "Kconfig").read_text()
+        help_text = kconfig[kconfig.index("    config MUSE_BENCH\n"):]
+        help_text = help_text[:help_text.index("    config MUSE_JC3248W535_MIC_GPIO")]
+        overlay = (ROOT / "devices/sdkconfig.muse-bench").read_text()
+        for name, text in (("the Kconfig help", " ".join(help_text.split())), ("the overlay", " ".join(
+                line.lstrip("# ") for line in overlay.splitlines()))):
+            for field in fields:
+                self.assertIn(field, text, f"{name} doesn't name {field}")
+            self.assertIn("muse_serial", text, f"{name} doesn't say which task the second stack is")
+            self.assertIn("console", text)
+
     def test_register_size_is_logged(self):
         # The size comes from the log line every session already prints when it sends
         # the registration: "sent link.register (N bytes)".

@@ -601,6 +601,14 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertIn("apps_port_log_drain();", function_source(task, "static void housekeeping(void)"))
         self.assertNotIn("apps_port_log_drain", function_source(task, "static void call_begin(void)"))
 
+    def test_the_apps_option_says_the_app_tasks_stack_as_it_is(self):  # S: it was 32 KB once, and is measured at 56
+        task = (MUSE / "apps/apps_task.c").read_text()
+        stack = int(re.search(r"^#define APPS_TASK_STACK\s+(\d+)", task, re.M).group(1))
+        block = " ".join(kconfig_block((MUSE / "Kconfig").read_text(), "MUSE_APPS").split())
+        self.assertEqual(stack % 1024, 0)
+        self.assertIn(f"and a {stack // 1024} KB task stack", block)
+        self.assertNotIn("32 KB", block)
+
     def test_one_table_of_limits_and_one_bad_id_message(self):  # Task 13's F9
         # The stage and the pipeline agree on limits because both read apps_pkg.c's apps_file_max, and say a bad id the
         # same way (APPS_MSG_BAD_ID).

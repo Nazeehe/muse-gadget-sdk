@@ -278,7 +278,7 @@ menu "Muse"
             Costs: about 130 KB of flash for Lua (measured on the S3) and
             perhaps another 100 to 150 KB for the apps runtime and its fonts
             (an estimate); PSRAM for the running app's Lua heap (up to
-            MUSE_APPS_HEAP_MAX_KB) and a 32 KB task stack; and two flash
+            MUSE_APPS_HEAP_MAX_KB) and a 56 KB task stack; and two flash
             partitions, 6 MB for the apps' files and 64 KB for what they
             save.
 
@@ -309,7 +309,10 @@ menu "Muse"
             of normal builds; devices/sdkconfig.muse-bench turns them on.
             ">mem" prints one "@mem" line of JSON, in bytes: free, lowest-ever
             free and largest free internal RAM, free DMA-capable RAM, free and
-            lowest-ever free PSRAM, and what is left of the LVGL task's stack.
+            lowest-ever free PSRAM, and the least that was left of two task
+            stacks since boot: the LVGL task's (lvgl_stack_free) and
+            muse_serial's (serial_stack_free), the console task that runs every
+            ">app.*" command. Each is -1 when no task has that name.
             ">ui=settings", ">ui=face" and ">ui=clock" pick the touch page for
             a screenshot. ">tap X Y", ">longpress X Y" and ">swipe left|right"
             inject a touch through LVGL's input, as a finger would arrive; they

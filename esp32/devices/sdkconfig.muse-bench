@@ -21,6 +21,8 @@
 CONFIG_LV_USE_SNAPSHOT=y
 
 # The bench's console commands, which don't need screenshots: ">mem" (one line
-# with the free internal RAM, DMA and PSRAM and the LVGL task's stack headroom),
-# ">ui=" (the touch page) and injected touch (">tap", ">longpress", ">swipe").
+# with the free internal RAM, DMA and PSRAM and the least stack left in the LVGL
+# task, lvgl_stack_free, and in muse_serial, serial_stack_free: the console task
+# that runs every ">app.*" command), ">ui=" (the touch page) and injected touch
+# (">tap", ">longpress", ">swipe").
 CONFIG_MUSE_BENCH=y

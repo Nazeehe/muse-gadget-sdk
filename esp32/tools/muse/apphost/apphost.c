@@ -55,7 +55,8 @@
  *   {"event":"timers","count":2}           the `timers` command: how many timers the app has armed
  *   {"event":"alarm","name":"t","sound":true,"wake":true}
  *                                          an alarm of the app came due, as the system fires it: before the ring, the screen
- *                                          and the app's own alarm(name), which follow
+ *                                          and the app's own alarm(name), which follow. One of another app (other_alarm, below)
+ *                                          has "app":"clock" too, is told to no one here, and waits
  *   {"event":"ring","on":true}             the ring began (an alarm with sound fired and none was ringing), or ended, as the
  *                                          gadget's ring does: sound.stop, a minute after the last alarm with sound, or when
  *                                          nothing is left that could stop it (the app that was told the ring was stopped or
@@ -66,6 +67,7 @@
  *                                          back. The runtime saves 2 s after the last change, when the app ends (stop, exit, a crash,
  *                                          a restart) and when it is freed with a change in it, after the script's last command
  *   {"event":"show"}                       sys.show(): the app asks for the front
+ *   {"event":"keep_awake","on":true}       sys.keep_awake(on): the app asks for the screen to stay lit, or takes the request back
  *   {"event":"dump","widgets":[...]}       the `dump` command: one object an alive widget (apps_ui.h), with
  *                                          "dropped":N after them when N didn't fit the size asked for
  *   {"event":"leak_check","bytes":0}       --cycles: what the apps' heap still holds
@@ -101,6 +103,19 @@
  *   sync EPOCH_MS          the wall clock is set (to 2025 or later, in ms since 1970, as SNTP sets the gadget's), and moves
  *                          with the monotonic clock from then on. Unset, time.now() is nil. The time zone is UTC0.
  *   timers                 -> timers: how many timers the app has armed
+ *   other_alarm APP NAME MS [sound]
+ *                          an alarm of another app (APP is an app id that isn't this app's) is armed MS ms ahead (1 to 604800000), with
+ *                          no wake and, with the word sound, a ring. The gadget's table is shared by every app (8 alarms in all, 4 to
+ *                          an app): this is how a test fills it, or has another app's ring going. Nothing here runs that app: when its
+ *                          alarm comes due it is announced (an `alarm` event with "app") and the ring begins if it has sound, and it
+ *                          waits to be told, as for an app whose task is busy. An error event when the table refuses it or a word
+ *                          isn't what it should be
+ *   other_cancel APP NAME  that alarm is cancelled (nothing, if it isn't armed)
+ *   hold_alarms on | off   on: the app's task is busy. What fires is announced, and the ring begins at once, as on the gadget, but the
+ *                          firing waits in the table and the app isn't told (nor launched, if it is stopped), so a command in that gap
+ *                          (a tap, a message) runs before it, as an event queued before the firing is told does on the gadget
+ *                          (apps_task.c handles its queue first); alarm.remaining says 0 for it, or the new arming's time if the
+ *                          app arms the name again. off: what waited is told now, in this command. A firing is announced once
  *   restart                the app is stopped if it runs (stop() runs, its store is saved, its alarms are told, as the stop command does),
  *                          its runtime freed and a new one made and started, as a launch is (main.lua's top level runs again, then
  *                          start()): the values it saved are read back. It works on an app that crashed, too
@@ -277,7 +292,14 @@ static void emit_show(void) {
     end_event();
 }
 
-static const apphost_system_t SYSTEM_EVENTS = {.store_saved = emit_store_saved, .show = emit_show};
+static void emit_keep_awake(bool on) {
+    begin("keep_awake");
+    printf(",\"on\":%s", on ? "true" : "false");
+    end_event();
+}
+
+static const apphost_system_t SYSTEM_EVENTS = {
+    .store_saved = emit_store_saved, .show = emit_show, .keep_awake = emit_keep_awake};
 
 /* What the alarm table logs (apps_alarm.c, through apphost_esp.h's log): the warnings and errors are events, since they are what
  * the gadget's console shows someone who watches it; the rest of its lines (a firing, a chirp, the ring's end) are events of their own
@@ -733,6 +755,12 @@ static void cmd_restart(app_t *app) {
     make_and_start(app);
 }
 
+/* hold_alarms: the app's task is busy, so what fires is announced but not told. announced_gen is the latest firing announced as an `alarm`
+ * event (firings' gens grow, compared as a difference), so that one that waits is announced once and not at each step. */
+static bool hold_alarms;
+static bool announced_some;
+static uint32_t announced_gen;
+
 /* What the app task's round does with the alarms (apps_task.c's deliver_alarms), after the esp_timer task has run: the table's timers that came
  * due in the step fire (the gadget's own code: its budget, its ring, its journal of lines, which print as warnings), and what fired is
  * announced, in the order it fired, with the ring's start, then told to the app, each, earliest first. An app that doesn't run, stopped
@@ -745,15 +773,29 @@ static void deliver_alarms(app_t *app) {
     apps_alarm_log_drain();
     apps_alarm_fired_t due[APPS_ALARMS_MAX];
     int n = apps_alarm_fired(due, APPS_ALARMS_MAX);
+    const char *id = app->pkg->manifest.id;
     for (int i = 0; i < n; i++) {
+        if (announced_some && (int32_t)(due[i].gen - announced_gen) <= 0) {
+            continue;  /* announced when it fired, and it waits: another app's, or this app's with hold_alarms on */
+        }
+        announced_some = true;
+        announced_gen = due[i].gen;
         begin("alarm");
         field("name", due[i].name, strlen(due[i].name));
         printf(",\"sound\":%s,\"wake\":%s", due[i].sound ? "true" : "false", due[i].wake ? "true" : "false");
+        if (strcmp(due[i].app, id) != 0) {
+            field("app", due[i].app, strlen(due[i].app));
+        }
         end_event();
     }
     apphost_ring_sync();
-    const char *id = app->pkg->manifest.id;
+    if (hold_alarms) {
+        return;  /* the app's task is busy: the firings wait */
+    }
     for (int i = 0; i < n; i++) {
+        if (strcmp(due[i].app, id) != 0) {
+            continue;  /* another app's: nothing here runs it, and it waits to be told */
+        }
         if (!apps_alarm_wanted(id, due[i].gen)) {
             continue;  /* cancelled or told since the copy: nothing is launched for it */
         }
@@ -892,6 +934,70 @@ static bool parse_epoch_ms(const char *s, int64_t *out) {
     return true;
 }
 
+/* The words of args, split in place: at most max of them go to words (a NUL ends each) and *n says how many there are; false when there
+ * are more than max. */
+static bool split_words(char *args, char *words[], int max, int *n) {
+    *n = 0;
+    for (char *p = skip_space(args); *p != '\0'; p = skip_space(p)) {
+        if (*n == max) {
+            return false;
+        }
+        words[(*n)++] = p;
+        p = word_end(p);
+        if (*p != '\0') {
+            *p++ = '\0';
+        }
+    }
+    return true;
+}
+
+#define OTHER_ALARM_USAGE                                                                                             \
+    "other_alarm needs another app's id, an alarm name, a time in ms (1 to 604800000) and, for a ring, sound: "      \
+    "other_alarm clock tea 5000 sound"
+#define OTHER_CANCEL_USAGE "other_cancel needs another app's id and an alarm name: other_cancel clock tea"
+
+/* other_alarm APP NAME MS [sound]: the gadget's table, which every app shares, is given an alarm of another app. */
+static void cmd_other_alarm(const app_t *app, char *args) {
+    char *w[4];
+    int n;
+    long ms = 0;
+    if (!split_words(args, w, 4, &n) || n < 3 || !apps_id_valid(w[0]) || !apps_alarm_name_valid(w[1]) ||
+        !parse_count(w[2], APPS_ALARM_MAX_MS + 1, &ms) || ms < 1 || ms > APPS_ALARM_MAX_MS ||
+        (n == 4 && strcmp(w[3], "sound") != 0)) {
+        emit_text("error", OTHER_ALARM_USAGE);
+        return;
+    }
+    if (strcmp(w[0], app->pkg->manifest.id) == 0) {
+        char text[96];
+        snprintf(text, sizeof text, "other_alarm is for another app than the one run (%s)", w[0]);
+        emit_text("error", text);
+        return;
+    }
+    apps_alarm_result_t result = apps_alarm_arm(w[0], w[1], ms, n == 4, false);
+    if (result == APPS_ALARM_NO_MEMORY) {
+        emit_text("error", "other_alarm: no memory for the alarm");
+    } else if (result != APPS_ALARM_ARMED) {
+        emit_text("error", "other_alarm: refused (the table has no free slot, or the app has 4 alarms)");
+    }
+}
+
+/* other_cancel APP NAME: that alarm is cancelled, if it is armed. */
+static void cmd_other_cancel(const app_t *app, char *args) {
+    char *w[2];
+    int n;
+    if (!split_words(args, w, 2, &n) || n != 2 || !apps_id_valid(w[0]) || !apps_alarm_name_valid(w[1])) {
+        emit_text("error", OTHER_CANCEL_USAGE);
+        return;
+    }
+    if (strcmp(w[0], app->pkg->manifest.id) == 0) {
+        char text[96];
+        snprintf(text, sizeof text, "other_cancel is for another app than the one run (%s)", w[0]);
+        emit_text("error", text);
+        return;
+    }
+    apps_alarm_cancel(w[0], w[1]);
+}
+
 /* One script line, which this edits in place. */
 static void run_line(app_t *app, char *line) {
     char *end = line + strlen(line);
@@ -907,7 +1013,7 @@ static void run_line(app_t *app, char *line) {
         *args++ = '\0';
         args = skip_space(args);
     }
-    char text[160];
+    char text[256];
     if (strcmp(cmd, "message") == 0) {
         char *data = word_end(args);  /* args is the event, a space and the data */
         if (*data != '\0') {
@@ -955,6 +1061,21 @@ static void run_line(app_t *app, char *line) {
         } else {
             apphost_sync(epoch_ms);
         }
+    } else if (strcmp(cmd, "other_alarm") == 0) {
+        cmd_other_alarm(app, args);
+    } else if (strcmp(cmd, "other_cancel") == 0) {
+        cmd_other_cancel(app, args);
+    } else if (strcmp(cmd, "hold_alarms") == 0) {
+        if (strcmp(args, "on") == 0) {
+            hold_alarms = true;
+        } else if (strcmp(args, "off") == 0) {
+            hold_alarms = false;
+            if (app->rt != NULL) {
+                deliver_alarms(app);  /* what waited is told now */
+            }
+        } else {
+            emit_text("error", "hold_alarms needs on or off: hold_alarms on | hold_alarms off");
+        }
     } else if (strcmp(cmd, "start") == 0 || strcmp(cmd, "stop") == 0 || strcmp(cmd, "show") == 0 ||
                strcmp(cmd, "hide") == 0 || strcmp(cmd, "state") == 0 || strcmp(cmd, "timers") == 0 ||
                strcmp(cmd, "restart") == 0) {
@@ -975,7 +1096,7 @@ static void run_line(app_t *app, char *line) {
     } else {
         snprintf(text, sizeof text,
                  "unknown command '%.60s' (commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, "
-                 "sync, timers, restart)",
+                 "sync, timers, restart, other_alarm, other_cancel, hold_alarms)",
                  cmd);
         emit_text("error", text);
     }

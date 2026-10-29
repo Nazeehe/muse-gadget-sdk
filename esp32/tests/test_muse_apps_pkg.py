@@ -1002,8 +1002,11 @@ class MuseAppsPkgTest(unittest.TestCase):
         images = ROOT / "tests/muse_apps_fixtures/lvgl_images"
         formats = {"RGB565": 0x12, "RGB565A8": 0x14, "A8": 0x0E}
         sizes = {"a5x3": (5, 3), "b4x4": (4, 4), "c7x2": (7, 2)}
-        self.assertEqual(sorted(p.relative_to(images).as_posix() for p in images.rglob("*")),
-                         sorted([*formats, *(f"{cf}/{name}.bin" for cf in formats for name in sizes)]))
+        # The .bin files and the three folders, not every entry: a Finder's .DS_Store or an editor's temp file in the folder is
+        # local state and has nothing to do with the images.
+        self.assertEqual(sorted(p.relative_to(images).as_posix() for p in images.rglob("*.bin")),
+                         sorted(f"{cf}/{name}.bin" for cf in formats for name in sizes))
+        self.assertEqual(sorted(p.name for p in images.iterdir() if p.is_dir()), sorted(formats))
         for cf, code in formats.items():
             for name, (w, h) in sizes.items():
                 with self.subTest(cf=cf, image=name):

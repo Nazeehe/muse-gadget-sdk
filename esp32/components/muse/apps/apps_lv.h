@@ -64,9 +64,10 @@
  * that was never reset) deletes it first, and what is inside it, and makes a new one.
  *
  * Re-validation checks the shape of what LVGL is told: kind, parent chain (alive boxes, at most
- * APPS_UI_BOX_DEPTH_MAX of them, and it ends: it is walked in at most 5 steps, so a loop can't hang the LVGL
- * task), every number and enum in its range, text (NULL is ""; at most APPS_UI_TEXT_MAX bytes of valid UTF-8),
- * min < max with value between, and an image of the asset table that apps_image_check passes.
+ * APPS_UI_BOX_DEPTH_MAX of them with the widget itself counted if it is a box, as apps_ui.h says, and it ends: it
+ * is walked in at most 5 steps, so a loop can't hang the LVGL task), every number and enum in its range, text
+ * (NULL is ""; at most APPS_UI_TEXT_MAX bytes of valid UTF-8), min < max with value between, and an image of the
+ * asset table that apps_image_check passes.
  *
  * Fonts: sans14 sans16 sans20 sans28 are lv_font_montserrat_14/16/20/28, mono8 and mono16 are lv_font_unscii_8/16,
  * digits48 and digits96 are apps_digits_48 and apps_digits_96 (fonts/). CONFIG_MUSE_APPS selects every LVGL font

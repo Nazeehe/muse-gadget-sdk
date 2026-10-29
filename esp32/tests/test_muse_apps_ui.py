@@ -1169,6 +1169,9 @@ class HarnessTest(unittest.TestCase):
     def test_a_create_that_raises_leaves_no_widget_behind(self):  # F5
         self.run_case("create_all_or_nothing")
 
+    def test_a_fifth_nested_box_is_refused_and_flags_nothing(self):  # R9.5, the table's invariant
+        self.run_case("box_depth")
+
     def test_a_touch_survives_a_heap_that_refuses_at_every_step(self):
         self.run_case("touch_refused")
 

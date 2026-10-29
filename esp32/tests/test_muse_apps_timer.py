@@ -27,6 +27,8 @@ What only a board can show (the round screen, the snapshots, the alarm from slee
 
 import json
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -47,6 +49,9 @@ SHOW = {"event": "show"}
 STARTED = {"event": "started", "id": "timer", "name": "Timer"}
 START_ERROR = "whole number from 1 to 5999"
 NO_SUCH_EVENT = "use start, pause, resume, reset or status"
+NO_SLOTS = "alarm: the gadget has no free alarm slots (8 in all); cancel one"   # what the system says when the table is full
+# The script lines that fill the gadget's table (8 alarms in all, 4 to an app) with the alarms of two other apps, a week away.
+FULL_TABLE = [f"other_alarm filler_{app} n{i} 604800000" for app in "ab" for i in range(4)]
 
 
 def clock(seconds):
@@ -57,7 +62,8 @@ def screen(event):
     """What a `dump` event shows: the digits, the hint above them, the main button, and which of the other three buttons
     are hidden. The widgets are the ring, two labels and four buttons, in the order the app makes them."""
     widgets = event["widgets"]
-    assert [w["kind"] for w in widgets] == ["arc", "label", "label"] + ["button"] * 4, widgets
+    if [w["kind"] for w in widgets] != ["arc", "label", "label"] + ["button"] * 4:   # not an assert: python -O would drop it
+        raise AssertionError(f"the screen isn't the ring, two labels and four buttons: {widgets}")
     labels = [w["text"] or "" for w in widgets if w["kind"] == "label"]
     buttons = [w for w in widgets if w["kind"] == "button"]
     (digits,) = [t for t in labels if CLOCK.fullmatch(t)]
@@ -123,9 +129,8 @@ class TimerTest(AppHostTestCase):
         self.assertTrue((TIMER / "manifest.json").read_text().startswith("{"), "a JSON file has no header")
         source = (TIMER / "main.lua").read_text()
         self.assertEqual(source.splitlines()[:2], LUA_HEADER)
-        # alarm.after takes sound and wake as booleans: begin() and resume() each say so.
-        self.assertEqual(source.count("alarm.after(ALARM, ms, { sound = true, wake = true })"), 1, "begin")
-        self.assertEqual(source.count("alarm.after(ALARM, s.left, { sound = true, wake = true })"), 1, "resume")
+        # alarm.after takes sound and wake as booleans, never the sketch's `sound = "alarm"`: that the alarm rings and wakes the screen
+        # from begin() and from resume() is shown by what the tests below see (the `alarm` event's sound and wake).
         self.assertNotIn('sound = "alarm"', source)
 
     # ---- The screen ----
@@ -238,11 +243,14 @@ class TimerTest(AppHostTestCase):
         self.assertEqual(run.of("reply"), [reply("running", 1), reply("running", 5999), reply("running", 5999)])
         self.assertEqual(self.screens(run), [running("99:59")])
 
-    def test_start_with_data_that_is_not_an_object_is_refused_and_changes_nothing(self):
-        # A number, a boolean and null (json.null, a userdata) can't be indexed: Lua's own message comes back, not the
-        # one above. The call is refused all the same, with the timer as it was.
-        run = self.go("message start 90", "message start true", "message start null", "message status", "dump")
-        self.assertEqual(self.kinds(run), ["started", "error", "error", "error", "reply", "dump"])
+    def test_start_with_data_that_is_not_an_object_gets_the_apps_own_error_and_changes_nothing(self):
+        # A number, a boolean, null (json.null, a userdata) and a string aren't objects, and have no seconds: the app says what it
+        # wants, not Lua's "attempt to index a number value". The timer is as it was.
+        run = self.go("message start 90", "message start true", "message start null", 'message start "90"', "message status", "dump")
+        self.assertEqual(self.kinds(run), ["started", "error", "error", "error", "error", "reply", "dump"])
+        for message in run.messages("error"):
+            self.assertIn("start needs data.seconds, a " + START_ERROR, message)
+            self.assertNotIn("attempt to", message)
         self.assertEqual(run.of("reply"), [reply("idle", 300)])
         self.assertEqual(self.screens(run), [idle()])
         self.assertEqual(run.of("show"), [])
@@ -306,12 +314,25 @@ class TimerTest(AppHostTestCase):
     # ---- What it keeps ----
 
     def test_persists_and_recovers_after_restart(self):
+        # The brief's two cases and one more. (1) Running, a restart, a second on: it is still counting down, from the alarm.
+        # (2) An alarm that fired while the app was stopped leaves `done` after start() (D13: the system launches the app again for it,
+        # a new run whose start() reads the store, and then tells it), and OK then ends the ring that began at the firing.
+        # (3) The countdown's end after a restart.
         run = self.go('tap "Start"', "advance 10000", "restart", "dump", "advance 1000", "dump", "message status")
         # Back from the store and the system's alarm, running: 4:50 straight away, and counting from the alarm.
         self.assertEqual(self.screens(run), [running("4:50"), running("4:49")])
         self.assertEqual(run.of("reply"), [reply("running", 289)])
         self.assertEqual(run.of("started"), [STARTED, STARTED])
         self.assertEqual(run.of("alarm"), [], "the restart neither rings nor loses the alarm")
+        stopped = self.go('tap "Start"', "stop", "advance 299999", "state", "advance 1", "state", "message status", "dump",
+                          'tap "OK"', "dump")
+        self.assertEqual(self.kinds(stopped), ["started", "state", "alarm", "ring", "started", "state", "reply", "dump", "ring", "dump"])
+        self.assertEqual([e["state"] for e in stopped.of("state")], ["stopped", "running"])
+        self.assertEqual(stopped.of("started"), [STARTED, STARTED])
+        self.assertEqual(stopped.of("alarm"), [ALARM_FIRED])
+        self.assertEqual(stopped.of("reply"), [reply("done", 0)])
+        self.assertEqual(stopped.of("ring"), [RING_ON, RING_OFF], "on at the firing, off at OK, which comes after the dump of done")
+        self.assertEqual(self.screens(stopped), [done(), idle()])
         rung = self.go('tap "Start"', "advance 5000", "restart", "advance 295000", "dump", "message status")
         self.assertEqual(rung.of("alarm"), [ALARM_FIRED])
         self.assertEqual(self.screens(rung), [done()])
@@ -331,27 +352,21 @@ class TimerTest(AppHostTestCase):
         ])
         self.assertEqual(run.of("alarm"), [ALARM_FIRED], "only the Resume's alarm ever fired")
 
-    def test_a_running_timer_whose_alarm_is_gone_comes_back_done(self):
-        # start() reads "running" from the store and finds no alarm for it: it rang while nobody was there to be told. The
-        # system takes alarms away from an app that fires more than 6 in a minute (apps_alarm.h), so the seventh
-        # countdown of a second in a row never rings and leaves the timer running with nothing to wait for.
-        run = self.go(*['message start {"seconds":1}', "advance 1000"] * 7, "message status", "restart", "dump",
-                      "message status")
+    def test_a_running_timer_whose_alarm_is_gone_is_done_and_keeps_it(self):
+        # The system takes the alarms of an app that fires more than 6 in a minute (apps_alarm.h), so the seventh countdown of a second
+        # in a row never rings. The timer finds its alarm gone (nil: an alarm that rang and isn't told yet says 0) the next time it reads
+        # the time left, and is done, on the screen, in its reply and in the store; it doesn't run at 0:00 for ever.
+        run = self.go(*['message start {"seconds":1}', "advance 1000"] * 7, "dump", "timers", "message status", "advance 3000", "restart",
+                      "dump", "message status")
         self.assertEqual(len(run.of("alarm")), 6)
         (warning,) = run.messages("warning")
         self.assertIn("6 alarms in a minute", warning)
-        self.assertEqual(run.of("reply")[-2:], [reply("running", 0), reply("done", 0)])
-        self.assertEqual(self.screens(run), [done()])
-
-    def test_an_alarm_that_fires_while_the_app_is_stopped_leaves_it_done(self):
-        # The system launches the app again for its alarm (a new runtime: start() reads the store) and tells it.
-        run = self.go('tap "Start"', "stop", "advance 299999", "state", "advance 1", "state", "message status", "dump")
-        self.assertEqual(self.kinds(run), ["started", "state", "alarm", "ring", "started", "state", "reply", "dump"])
-        self.assertEqual([e["state"] for e in run.of("state")], ["stopped", "running"])
-        self.assertEqual(run.of("started"), [STARTED, STARTED])
-        self.assertEqual(run.of("alarm"), [ALARM_FIRED])
-        self.assertEqual(run.of("reply"), [reply("done", 0)])
-        self.assertEqual(self.screens(run), [done()])
+        self.assertEqual(self.screens(run), [done(), done()])
+        self.assertEqual(run.of("timers"), [{"event": "timers", "count": 0}], "and the ticker that was redrawing it has stopped")
+        self.assertEqual(run.of("reply")[-2:], [reply("done", 0), reply("done", 0)])
+        # Saved as done: the store's last object has the bytes of the done state, not of the running one that the seventh start left.
+        done_bytes = len(json.dumps({"timer": {"state": "done", "total": 1000, "left": 0}}, separators=(",", ":")))
+        self.assertEqual(run.of("store_save")[-1]["bytes"], done_bytes)
 
     def test_a_stopped_timer_comes_back_counting_from_its_alarm(self):
         run = self.go('tap "Start"', "advance 10000", "stop", "advance 20000", "restart", "dump", "message status")
@@ -392,6 +407,161 @@ class TimerTest(AppHostTestCase):
         self.assertEqual(self.screens(run), [done()])
         self.assertEqual(run.of("alarm"), [ALARM_FIRED])
         self.assertEqual(run.of("ring"), [RING_ON])
+
+    # ---- The system refuses an alarm: arm first, then commit ----
+
+    def test_a_start_the_system_refuses_changes_nothing_and_a_tap_says_why(self):
+        run = self.go(*FULL_TABLE, 'tap "Start"', "dump", "message status", "restart", "dump", "other_cancel filler_b n3",
+                      'tap "Start"', "dump")
+        self.assertEqual(run.of("crash"), [])
+        refused, restarted, started = self.screens(run)
+        self.assertEqual(refused, {**idle(), "hint": NO_SLOTS}, "the screen is as it was, with the system's reason in the hint")
+        self.assertEqual(run.of("dump")[0]["widgets"][1]["w"], 320, "which is wide enough to wrap on the round screen, not one line")
+        self.assertEqual(run.of("reply"), [reply("idle", 300)], "and so is the state")
+        self.assertEqual(restarted, idle(), "and so is what was saved")
+        self.assertEqual(started, running("5:00"), "a slot given back, and the same tap starts it")
+
+    def test_a_start_message_the_system_refuses_replies_its_error_and_changes_nothing(self):
+        run = self.go(*FULL_TABLE, 'message start {"seconds":90}', "message status", "dump", "restart", "dump")
+        self.assertEqual(run.messages("error"), [NO_SLOTS], "the system's own words: no position of main.lua in front of them")
+        self.assertEqual(run.of("show"), [], "a refused start doesn't ask for the front")
+        self.assertEqual(run.of("reply"), [reply("idle", 300)])
+        self.assertEqual(self.screens(run), [idle(), idle()])
+
+    def test_a_resume_the_system_refuses_leaves_it_paused_with_its_time(self):
+        run = self.go('tap "Start"', "advance 1000", 'tap "Pause"', *FULL_TABLE, 'tap "Resume"', "dump", "message resume",
+                      "message status", "restart", "dump", "other_cancel filler_b n3", 'tap "Resume"', "dump", "advance 299000",
+                      "dump")
+        self.assertEqual(run.of("crash"), [])
+        self.assertEqual(run.messages("error"), [NO_SLOTS])
+        self.assertEqual(run.of("reply"), [reply("paused", 299)], "the message's refusal is its error, and status says paused")
+        self.assertEqual(self.screens(run), [
+            {**paused("4:59"), "hint": NO_SLOTS},   # the tap: the system's reason in the hint, the time and the buttons as they were
+            paused("4:59"),                          # a restart: what was saved was not touched by the refusal
+            running("4:59"),                         # a slot given back: Resume works
+            done(),
+        ])
+        self.assertEqual(run.of("alarm"), [ALARM_FIRED])
+
+    # ---- A pause the alarm got ahead of, and the budget's cut-off ----
+
+    def test_a_pause_that_lands_between_the_alarm_and_its_telling_can_be_resumed(self):
+        # The alarm has fired and the app's task is busy (hold_alarms), so a tap on Pause, which the screen still offers, comes first.
+        # The alarm says 0, so the pause stores 0 left and takes the firing (and its ring) away. Resume has nothing to count: the alarm
+        # refuses 0 ms, which crashed the sketch's resume(). It arms 1 ms, and that alarm finishes the countdown.
+        run = self.go('message start {"seconds":5}', "hold_alarms on", "advance 5000", 'tap "Pause"', "dump", 'tap "Resume"',
+                      "hold_alarms off", "advance 10", "dump")
+        self.assertEqual(run.of("crash"), [])
+        self.assertEqual(self.screens(run), [paused("0:00"), done()])
+        self.assertEqual(self.kinds(run), ["started", "show", "reply", "alarm", "ring", "ring", "dump", "alarm", "ring", "dump"])
+        self.assertEqual(run.of("ring"), [RING_ON, RING_OFF, RING_ON])
+        self.assertEqual(run.of("alarm"), [ALARM_FIRED, ALARM_FIRED])
+
+    def test_pause_then_resume_after_the_systems_budget_took_the_alarm_away_does_not_crash(self):
+        # More than 6 alarms in a minute cancel an app's alarms (apps_alarm.h). The app is behind, so nothing redraws it: it still says
+        # running when Pause is tapped, with no alarm, so 0 is stored. Resume arms 1 ms, which the budget drops again (the same minute).
+        # The next time the app reads the time left it finds no alarm: done.
+        run = self.go("hide", *['message start {"seconds":1}', "advance 1000"] * 7, 'tap "Pause"', 'tap "Resume"', "advance 10",
+                      "message status")
+        self.assertEqual(run.of("crash"), [])
+        self.assertEqual(len(run.messages("warning")), 2, "the seventh firing and the eighth were cut")
+        self.assertEqual(run.of("reply")[-1], reply("done", 0))
+
+    # ---- A new countdown, and the ring ----
+
+    def test_a_new_countdown_ends_the_timers_own_ring(self):
+        run = self.go('message start {"seconds":5}', "advance 5000", 'message start {"seconds":30}', "advance 1000", "message status")
+        self.assertEqual(self.kinds(run), ["started", "show", "reply", "alarm", "ring", "ring", "show", "reply", "reply"])
+        self.assertEqual(run.of("ring"), [RING_ON, RING_OFF], "off inside the start that began the new countdown")
+        self.assertEqual(run.of("reply")[-1], reply("running", 29))
+
+    def test_a_new_countdown_leaves_another_apps_ring_alone(self):
+        run = self.go("other_alarm clock tea 1000 sound", "advance 1000", 'message start {"seconds":30}', "advance 1000",
+                      "message status")
+        self.assertEqual(run.of("ring"), [RING_ON], "the ring is the gadget's: sound.stop would end that app's too")
+        self.assertEqual(run.of("reply")[-1], reply("running", 29))
+
+    def test_a_firing_that_a_newer_arming_replaced_is_ignored_and_its_ring_ended(self):
+        # The countdown's alarm fired and the app's task is busy (hold_alarms); a start comes in before the app is told. begin() arms again,
+        # and the old firing is told afterwards: it is not this countdown's, which goes on (the alarm says how long it has).
+        run = self.go('message start {"seconds":5}', "hold_alarms on", "advance 5000", 'message start {"seconds":30}',
+                      "hold_alarms off", "dump", "message status", "advance 29999", "dump", "advance 1", "dump")
+        self.assertEqual(self.screens(run), [running("0:30"), running("0:01"), done()])
+        self.assertEqual(self.kinds(run), ["started", "show", "reply", "alarm", "ring", "ring", "show", "reply", "dump", "reply", "dump",
+                                           "alarm", "ring", "dump"])
+        self.assertEqual(run.of("ring"), [RING_ON, RING_OFF, RING_ON], "the first ring ended by the new countdown, the second at its end")
+
+    def test_reset_leaves_another_apps_ring_alone(self):
+        # Paused, the timer has no alarm; running, its alarm is a long way off: neither has a ring of its own to end.
+        for how in ('tap "Reset"', "message reset"):
+            for before in (['tap "Start"', 'tap "Pause"'], ['tap "Start"']):
+                with self.subTest(how=how, before=before):
+                    run = self.go(*before, "other_alarm clock tea 1000 sound", "advance 1000", how, "dump")
+                    self.assertEqual(run.of("ring"), [RING_ON], "the ring is the clock's, and reset isn't told to end it")
+                    self.assertEqual(self.screens(run), [idle()])
+
+    def test_reset_ends_the_timers_own_ring_that_the_app_has_not_been_told_of(self):
+        # The alarm has rung and the app is busy (hold_alarms): the screen still says running, with Reset on it.
+        for how in ('tap "Reset"', "message reset"):
+            with self.subTest(how):
+                run = self.go('message start {"seconds":5}', "hold_alarms on", "advance 5000", how, "hold_alarms off", "dump")
+                self.assertEqual(run.of("ring"), [RING_ON, RING_OFF], "the timer's own ring: reset ends it")
+                self.assertEqual(self.screens(run), [idle("0:05")], "and the firing it dropped is not told afterwards")
+
+    # ---- The ticker ----
+
+    def test_the_ticker_runs_only_while_the_timer_runs_and_is_shown(self):
+        run = self.go('tap "Start"', "timers", 'tap "Pause"', "timers", 'tap "Resume"', "timers", "advance 300000", "timers",
+                      'tap "OK"', "timers", 'tap "Start"', "hide", "timers", 'tap "Pause"', "message resume", "timers", "show",
+                      "timers", "hide", "timers", "show", 'tap "Pause"', 'tap "Resume"', "timers")
+        # Start 1, Pause 0, Resume 1, after the alarm 0, OK 0; running and hidden 0; a `resume` message while hidden 0 (it used to arm
+        # the ticker behind another page); shown 1; hidden 0; shown again, and a Pause and a Resume tapped then, 1.
+        self.assertEqual([e["count"] for e in run.of("timers")], [1, 0, 1, 0, 0, 0, 0, 1, 0, 1])
+
+    # ---- What it reads back ----
+
+    def seeded(self, record, *script):
+        """The timer with `record` (a Lua expression) saved under its key before the app's own code runs: the store is keyed by the app's
+        id and outlives a reinstall, so a package of this id may have left anything there."""
+        manifest = json.loads((TIMER / "manifest.json").read_text())
+        folder = self.make_app("timer", f'store.set("timer", {record})\n' + (TIMER / "main.lua").read_text(), manifest=manifest)
+        return self.host(folder, script=list(script))
+
+    def test_a_stored_record_that_is_not_the_timers_is_not_trusted(self):
+        bad = ["5", '"soon"', "true", "{}", '{state = "paused"}', '{state = "bogus", total = 60000, left = 1000}',
+               '{state = 5, total = 60000, left = 1000}', '{state = "paused", total = "60000", left = 1000}',
+               '{state = "paused", total = 60000, left = "1000"}', '{state = "paused", total = 60000.5, left = 1000}',
+               '{state = "paused", total = 60000, left = 0.5}', '{state = "paused", total = 999, left = 0}',
+               '{state = "paused", total = 5999001, left = 0}', '{state = "paused", total = 60000, left = 60001}',
+               '{state = "paused", total = 60000, left = -1}', '{state = "paused", total = {}, left = {}}']
+        for record in bad:
+            with self.subTest(record):
+                run = self.seeded(record, "dump", 'tap "Start"', "advance 1000", "dump")
+                self.assertEqual(run.of("crash"), [])
+                self.assertEqual(run.of("error"), [])
+                self.assertEqual(self.screens(run), [idle(), running("4:59")], "the default, 5:00, and it works")
+
+    def test_a_stored_record_that_is_the_timers_is_kept(self):
+        good = [('{state = "paused", total = 90000, left = 45000}', paused("0:45")),
+                ('{state = "idle", total = 120000, left = 120000}', idle("2:00")),
+                ('{state = "done", total = 60000, left = 0}', done()),
+                ('{state = "paused", total = 1000, left = 0}', paused("0:00")),
+                ('{state = "idle", total = 5999000, left = 5999000}', idle("99:59")),
+                ('{state = "paused", total = 90000.0, left = 45000.0}', paused("0:45")),   # whole numbers, written as floats
+                ('{state = "running", total = 60000, left = 30000}', done())]             # running with no alarm to wait for: done
+        for record, shown in good:
+            with self.subTest(record):
+                run = self.seeded(record, "dump")
+                self.assertEqual(run.of("crash"), [])
+                self.assertEqual(self.screens(run), [shown])
+
+    # ---- The test helper ----
+
+    def test_screen_checks_the_widgets_even_under_python_O(self):
+        # screen() is what every screen assertion goes through; an `assert` in it would be dropped by -O and a missing ring unseen.
+        code = "import test_muse_apps_timer as t\ntry:\n    t.screen({'widgets': []})\nexcept AssertionError:\n    print('raised')\n"
+        result = subprocess.run([sys.executable, "-O", "-c", code], cwd=Path(__file__).resolve().parent, capture_output=True, text=True)
+        self.assertEqual((result.stdout.strip(), result.returncode), ("raised", 0), result.stderr)
 
 
 if __name__ == "__main__":

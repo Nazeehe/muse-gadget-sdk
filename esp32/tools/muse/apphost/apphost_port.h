@@ -80,16 +80,17 @@ void apphost_ring_sync(void);
  * The store, the front and the exit. apphost keeps the objects the runtime saves (apps_port_store_save) in the process, a copy for each app,
  * so that a `restart` reads them back (apps_port_store_load); a save is told to the sink at once (the device writes it later, on the I/O
  * worker). What sys asks of the gadget has a fixed answer here: the battery is 76% on a charger and USB (apps_port_battery) and the Wi-Fi
- * is the network "muse-lab", so a run is the same on every machine. sys.show() is told to the sink, as it happens, inside the call that
- * made it, so that it prints in order with what the app printed. sys.keep_awake has nothing to keep awake on a laptop. sys.exit() only sets
+ * is the network "muse-lab", so a run is the same on every machine. sys.show() and sys.keep_awake(on) are told to the sink, as they happen, inside the call that
+ * made them, so that they print in order with what the app printed (nothing on a laptop goes to sleep, so the request has no other effect). sys.exit() only sets
  * a flag, which apphost.c takes after each call (apphost_take_exit) to end the app as the app task does when a callback returns.
  */
 typedef struct {
     void (*store_saved)(size_t bytes);  /* the app's store was saved: the object's bytes */
     void (*show)(void);                 /* sys.show() */
+    void (*keep_awake)(bool on);        /* sys.keep_awake(on) */
 } apphost_system_t;
 
-/* Where saves and shows go: NULL (the start, and --cycles) is nowhere. sink must outlive the run. */
+/* Where saves, shows and keep-awake requests go: NULL (the start, and --cycles) is nowhere. sink must outlive the run. */
 void apphost_set_system(const apphost_system_t *sink);
 
 /* Whether sys.exit() was called since the last call of this, which clears it. */

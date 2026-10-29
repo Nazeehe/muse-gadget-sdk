@@ -165,12 +165,13 @@ static const char *check_widget(const pass_t *p, int slot, const apps_widget_t *
         return "kind";
     }
 
-    /* The parent chain: alive boxes, at most APPS_UI_BOX_DEPTH_MAX of them, so it is walked in at most one step
-     * more than that and a loop ends in a reject. */
+    /* The parent chain: alive boxes, at most APPS_UI_BOX_DEPTH_MAX of them, and a box counts itself (the rule of
+     * apps_ui.h: a box has at most APPS_UI_BOX_DEPTH_MAX - 1 boxes above it, any other widget at most
+     * APPS_UI_BOX_DEPTH_MAX), so it is walked in at most one step more than that and a loop ends in a reject. */
     if (w->parent < -1 || w->parent >= APPS_UI_SLOTS || w->parent == slot) {
         return "parent";
     }
-    int boxes = 0;
+    int boxes = w->kind == APPS_W_BOX;
     for (int up = w->parent; up != -1;) {
         const apps_widget_t *a = apps_ui_slot(p->ui, up);
         if (a == NULL || !a->alive || a->kind != APPS_W_BOX || ++boxes > APPS_UI_BOX_DEPTH_MAX || a->parent < -1) {

@@ -1376,6 +1376,35 @@ static void create_all_or_nothing(void) {
     }
 }
 
+/* ---- How deep boxes nest ---- */
+
+/* Boxes nest at most APPS_UI_BOX_DEPTH_MAX deep, and a box counts itself: four boxes in a chain with a label in the fourth is
+ * the most there may be, and a fifth box is refused with the rule in the message. A refusal changes nothing: no slot is
+ * taken and no bit is flagged for the apply step. What isn't a box still goes in the fourth, and a box goes in the third.
+ * check_invariants holds every table to the same rule after every chunk (a box has at most three boxes above it), so a
+ * binding that let the fifth box in fails here twice: the refusal doesn't come, and the table has a fifth box. */
+static void box_depth(void) {
+    OPEN(e);
+    RUN(&e, "b0 = ui.box{} b1 = ui.box{parent = b0} b2 = ui.box{parent = b1} b3 = ui.box{parent = b2} "
+            "l = ui.label{parent = b3, text = 'in'}");
+    CHECK(apps_ui_count(e.ui) == 5, "%d widgets alive", apps_ui_count(e.ui));
+    pass_t seen;
+    apply(&e, &seen);
+
+    RUN_FAILS(&e, "ui.box{parent = b3}", "ui.box: boxes nest at most 4 deep");
+    CHECK(apps_ui_count(e.ui) == 5, "the refused box took a slot: %d alive", apps_ui_count(e.ui));
+    apply(&e, &seen);
+    for (int i = 0; i < APPS_UI_SLOTS; i++) {
+        CHECK(seen.dirty[i] == 0, "slot %d: bits %u flagged by a refused box", i, seen.dirty[i]);
+    }
+
+    RUN(&e, "ui.button{parent = b3, text = 'Go'} ui.arc{parent = b3} x = ui.box{parent = b2}");
+    CHECK(apps_ui_count(e.ui) == 8, "%d widgets alive, want 8", apps_ui_count(e.ui));
+    RUN_FAILS(&e, "ui.box{parent = x}", "ui.box: boxes nest at most 4 deep");  /* x is the fourth box of its chain, too */
+    CHECK(apps_ui_count(e.ui) == 8, "the refused box took a slot: %d alive", apps_ui_count(e.ui));
+    finish(&e);
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -1403,6 +1432,7 @@ int main(int argc, char **argv) {
         {"refused", refused},
         {"touch_refused", touch_refused},
         {"create_all_or_nothing", create_all_or_nothing},
+        {"box_depth", box_depth},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

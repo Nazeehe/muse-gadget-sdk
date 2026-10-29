@@ -61,6 +61,7 @@ SOUND_PERMISSION = 'sound: add "sound" to "permissions" in manifest.json'
 ALARM_NAME_RULE = "alarm: name must be 1-23 characters of a-z, 0-9 and _"
 ALARM_MS_RULE = "alarm.after: ms must be a whole number from 1 to 604800000"
 TOO_MANY_ALARMS = "alarm: no more than 4 alarms per app"
+NO_ALARM_SLOTS = "alarm: the gadget has no free alarm slots (8 in all); cancel one"
 # The store and sys modules' (the brief's, exactly).
 STORE_KEY_RULE = "store: key must be a string of 1 to 32 characters"
 STORE_FULL = "store: more than 16 KB stored; remove keys you don't need"
@@ -935,6 +936,92 @@ class AlarmTest(SvcTestCase):
             "alarm.after: unknown option '<number>' (valid: sound, wake)",
             "ok", "ok", "ok",
         ])
+
+    # ---- What apphost gives a test of an app that shares the gadget's alarms with others, and whose task can be busy ----
+
+    OTHER_USAGE = ("other_alarm needs another app's id, an alarm name, a time in ms (1 to 604800000) and, for a ring, sound: "
+                   "other_alarm clock tea 5000 sound")
+
+    def other_apps_fill_the_table(self):
+        """The script lines that take the gadget's 8 slots (APPS_ALARMS_MAX, 4 to an app) for two apps that aren't the one run."""
+        return [f"other_alarm filler_{app} n{i} 604800000" for app in "ab" for i in range(4)]
+
+    def test_other_alarm_takes_a_slot_of_the_gadgets_table_and_other_cancel_gives_it_back(self):
+        run = self.alarm_app("""
+            function app.message(event)
+                local ok, why = pcall(alarm.after, "t", 5000)
+                return {ok = ok, why = why or false}
+            end
+        """, script=[*self.other_apps_fill_the_table(), "message full", "other_cancel filler_b n3", "message room",
+                     "other_alarm filler_b n3 604800000", "other_cancel filler_a n0", "other_alarm filler_b n3 604800000"])
+        # Eight others fill the table, and the app is refused, as it is on the gadget. One given back is a slot, and the app takes it:
+        # the other app that gave it up is refused when it asks again, and a second one given back is room for that.
+        self.assertEqual(replies(run), [{"ok": False, "why": NO_ALARM_SLOTS}, {"ok": True, "why": False}])
+        self.assertEqual(run.messages("error"), [
+            "other_alarm: refused (the table has no free slot, or the app has 4 alarms)"])
+        self.assertEqual(run.kinds(), ["started", "reply", "reply", "error"])
+
+    def test_other_alarm_checks_its_arguments(self):
+        run = self.alarm_app("function app.message() return true end", script=[
+            "other_alarm", "other_alarm clock tea", "other_alarm clock tea 1000 loud", "other_alarm clock tea 0",
+            "other_alarm clock tea 604800001", "other_alarm clock tea 10x", "other_alarm clock TEA 1000",
+            "other_alarm Clock tea 1000", "other_alarm clock tea 1000 sound extra", "other_alarm scratch tea 1000",
+            "other_cancel", "other_cancel clock", "other_cancel Clock tea", "other_alarm clock tea 1000 sound",
+            "other_cancel clock tea", "other_cancel clock tea", "advance 2000"])
+        own = "other_alarm is for another app than the one run (scratch)"
+        cancel = "other_cancel needs another app's id and an alarm name: other_cancel clock tea"
+        self.assertEqual(run.messages("error"), [self.OTHER_USAGE] * 9 + [own] + [cancel] * 3)
+        # What was armed and then cancelled is gone, and cancelling what isn't armed is no error: nothing fires, nothing rings.
+        self.assertEqual(run.kinds(), ["started"] + ["error"] * 13)
+
+    def test_another_apps_alarm_fires_as_the_systems_and_rings_until_its_minute_is_over(self):
+        run = self.alarm_app("""
+            function app.alarm(name) print("told " .. name) end
+        """, script=["other_alarm clock tea 1000 sound", "advance 999", "advance 1", "advance 59999", "advance 1", "advance 5000"])
+        # It is announced once, with its app's id, and the ring begins; it is told to no one here (the app run is not clock), and it
+        # waits, so the ring is that app's to stop, and goes on for the minute after the firing.
+        self.assertEqual(run.kinds(), ["started", "alarm", "ring", "ring"])
+        self.assertEqual(run.of("alarm"), [{"event": "alarm", "app": "clock", "name": "tea", "sound": True, "wake": False}])
+        self.assertEqual(run.of("ring"), [{"event": "ring", "on": True}, {"event": "ring", "on": False}])
+        self.assertEqual(run.logs(), [])
+
+    def test_sound_stop_ends_another_apps_ring_too(self):  # the ring is the gadget's, whichever app's it is
+        run = self.alarm_app("function app.message() sound.stop() return true end",
+                             script=["other_alarm clock tea 1000 sound", "advance 1000", "message stop"])
+        self.assertEqual(run.kinds(), ["started", "alarm", "ring", "ring", "reply"])  # the ring's end is told inside the call
+        self.assertEqual(run.of("ring"), [{"event": "ring", "on": True}, {"event": "ring", "on": False}])
+
+    def test_hold_alarms_keeps_a_firing_from_the_app_until_it_is_let_go(self):
+        run = self.alarm_app("""
+            function app.start() alarm.after("t", 1000) end
+            function app.alarm(name) print("told " .. name) end
+            function app.message() return alarm.remaining("t") or false end
+        """, script=["hold_alarms on", "advance 1000", "message left", "advance 1000", "message left", "hold_alarms off",
+                     "message left", "advance 5000"])
+        # The firing is announced, and the ring begins, as the gadget does at once; the app's task is busy, so it isn't told. It has
+        # fired and isn't told, so the alarm reports 0 and not nil (apps_alarm.h), and it is announced once, not at each step.
+        # Let go, it is told in that command, and nothing is announced again.
+        self.assertEqual(run.kinds(), ["started", "alarm", "ring", "reply", "reply", "log", "reply"])
+        self.assertEqual(replies(run), [0, 0, False])
+        self.assertEqual(run.logs(), ["told t"])
+        self.assertEqual(len(run.of("alarm")), 1)
+
+    def test_hold_alarms_takes_on_or_off(self):
+        run = self.alarm_app("function app.message() return true end",
+                             script=["hold_alarms", "hold_alarms maybe", "hold_alarms on extra", "hold_alarms off", "hold_alarms off"])
+        usage = "hold_alarms needs on or off: hold_alarms on | hold_alarms off"
+        self.assertEqual(run.messages("error"), [usage, usage, usage])
+        self.assertEqual(run.kinds(), ["started", "error", "error", "error"])
+
+    def test_a_firing_that_waits_is_told_to_an_app_that_was_stopped_when_it_is_let_go(self):
+        run = self.alarm_app("""
+            function app.start() print("start") end
+            function app.alarm(name) print("alarm " .. name) end
+            function app.message() alarm.after("t", 1000) return true end
+        """, script=["message arm", "stop", "hold_alarms on", "advance 5000", "state", "hold_alarms off", "state"])
+        # Held, nothing launches the stopped app; let go, the launch and the alarm come at once, as when the app task gets to them.
+        self.assertEqual(run.logs(), ["start", "start", "alarm t"])
+        self.assertEqual([e["state"] for e in run.of("state")], ["stopped", "running"])
 
 
 class TimeTest(SvcTestCase):
@@ -2091,9 +2178,14 @@ class SysTest(DeviceTestCase):
 
     def test_the_keep_awake_board_fixture_asks_to_stay_lit_and_takes_the_request_back(self):
         # tests/muse_apps_fixtures/keep_awake is Task 19's board check: in front, with the permission, it asks for the screen to
-        # stay lit, and the message "off" takes that back, so the same app is its own control. apphost only records the calls.
+        # stay lit, and the message "off" takes that back, so the same app is its own control. apphost tells each call as a
+        # keep_awake event, as it does sys.show, in order with what the app printed (the call, then the line about it).
         run = self.host(FIXTURES / "keep_awake", script=["message off", "message on", "message nope"])
         self.assertEqual(run.logs(), ["keep_awake on", "keep_awake off", "keep_awake on"])
+        self.assertEqual(run.of("keep_awake"), [{"event": "keep_awake", "on": True}, {"event": "keep_awake", "on": False},
+                                                {"event": "keep_awake", "on": True}])
+        self.assertEqual(run.kinds(), ["keep_awake", "log", "started", "keep_awake", "log", "reply", "keep_awake", "log", "reply",
+                                       "error"])
         self.assertEqual(replies(run), [{"keep_awake": False}, {"keep_awake": True}])
         (error,) = run.messages("error")
         self.assertIn("use on or off", error)

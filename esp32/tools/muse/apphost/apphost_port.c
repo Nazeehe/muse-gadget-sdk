@@ -249,7 +249,9 @@ void apps_port_show(void) {
 }
 
 void apps_port_keep_awake(bool on) {
-    (void)on;  /* nothing on a laptop goes to sleep */
+    if (system_sink != NULL && system_sink->keep_awake != NULL) {
+        system_sink->keep_awake(on);  /* nothing on a laptop goes to sleep: the request is only told */
+    }
 }
 
 void apps_port_exit(void) {

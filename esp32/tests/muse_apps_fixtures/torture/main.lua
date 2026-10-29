@@ -285,9 +285,9 @@ local function index_recursion()
 end
 
 -- The deepest parenthesised nesting that loads: a .lua file of each depth, 36 down to 26 (there is no load() to make
--- one here). Nothing deeper is in the package: the install compiles every file of it as a top-level chunk, and one
--- that nests 37 deep is refused there with "C stack overflow" (LUAI_MAXCCALLS is 40). A require has a few C levels
--- less to spend than that, so the first that loads is a little under 36.
+-- one here). The install compiles every file of a package as a top-level chunk, which takes 37 levels (LUAI_MAXCCALLS
+-- is 40) and refuses 38 with "C stack overflow". A require has a few C levels less to spend than that, so the first
+-- that loads is a little under 36: 34.
 local function deepest_nesting()
     for n = 36, 26, -1 do
         local ok = pcall(require, "deep" .. n)

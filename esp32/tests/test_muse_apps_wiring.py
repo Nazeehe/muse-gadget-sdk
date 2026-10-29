@@ -608,6 +608,19 @@ class MuseAppsWiringTest(unittest.TestCase):
                 self.assertIn("apps_file_max(", text)
                 self.assertIn("APPS_MSG_BAD_ID", text)
 
+    def test_one_compile_message(self):  # the pre-review round: check words a refusal as the install does
+        # apps_pkg.c makes the message, "compile failed: ", Lua's own and the excerpt of the file it names; the install
+        # pipeline and apphost both call it, so neither keeps a lookup or a wording of its own.
+        pkg = (MUSE / "apps/apps_pkg.c").read_text()
+        self.assertEqual(pkg.count('"compile failed: "'), 1)
+        self.assertEqual(pkg.count("apps_vm_excerpt("), 1)
+        for path in (MUSE / "apps/apps_install.c", ROOT / "tools/muse/apphost/apphost.c"):
+            text = path.read_text()
+            with self.subTest(path.name):
+                self.assertEqual(text.count("apps_pkg_compile_message("), 1)
+                self.assertNotIn('"compile failed: "', text)
+                self.assertNotIn("apps_vm_excerpt(", text)
+
     def test_the_io_worker_is_on_core_0(self):  # Task 13's F4: never in front of the app task or LVGL on core 1
         io = (MUSE / "apps/apps_io.c").read_text()
         args = call_arguments(io, "xTaskCreatePinnedToCore")

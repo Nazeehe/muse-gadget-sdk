@@ -34,13 +34,17 @@ if(CONFIG_MUSE_APPS)
             "src/lstrlib.c" "src/ltablib.c" "src/lutf8lib.c"
         INCLUDE_DIRS "src")
     # Upstream code, warnings and all. -O2, as the host tests build it: unoptimized,
-    # deep nesting needs more stack than the app task's 32 KB.
+    # deep nesting needs more stack than the app task's 56 KB.
     target_compile_options(${COMPONENT_LIB} PRIVATE -O2 -w)
     # How deep C calls and parser levels may nest before Lua raises "C stack
-    # overflow" (200 by default), sized to the app task's 32 KB stack: error
-    # handling may go on to 1.1 times this, 44 levels at an estimated 500 bytes
-    # each on the S3, and the task's own frames take a few KB more. Lua-to-Lua
-    # calls don't count. README.md has the arithmetic.
+    # overflow" (200 by default). The app task runs on a 56 KB stack in PSRAM
+    # (57,344 bytes), and error handling may go on to 1.1 times this limit, 44
+    # levels. Measured on the S3 with tests/muse_apps_fixtures/torture, which
+    # tools/muse/app.py pushes: the four C-call chains (pcall, coroutine.resume,
+    # __index through table.concat, __tostring through string.format) run to the
+    # limit with a 16-deep json.encode and json.decode, each ending in a float, at
+    # the bottom of each. The worst of them used 42,076 bytes of the stack and left
+    # 15,268 free. Lua-to-Lua calls don't count. README.md has the rest.
     target_compile_definitions(${COMPONENT_LIB} PRIVATE LUAI_MAXCCALLS=40)
 else()
     idf_component_register()

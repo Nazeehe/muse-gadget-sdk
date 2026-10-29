@@ -25,7 +25,6 @@
 
 #include "apps_json.h"
 #include "apps_port.h"
-#include "apps_vm.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
 
@@ -632,32 +631,6 @@ static void keep_infos(install_t *in, const apps_pkg_t *pkg) {
     }
 }
 
-/* Step 4's message: "compile failed: " and Lua's message with the excerpt of the file it names, if it names one. */
-static void compile_message(install_t *in, const apps_pkg_t *pkg) {
-    size_t at = (size_t)snprintf(in->msg, sizeof in->msg, "compile failed: ");
-    const char *src = NULL;
-    size_t len = 0;
-    /* "<file>:<line>: ...": the file is what comes before the first ":<digits>:". */
-    for (const char *colon = strchr(in->raw, ':'); colon != NULL && src == NULL; colon = strchr(colon + 1, ':')) {
-        const char *d = colon + 1;
-        while (*d >= '0' && *d <= '9') {
-            d++;
-        }
-        if (d == colon + 1 || *d != ':') {
-            continue;
-        }
-        size_t name = (size_t)(colon - in->raw);
-        for (int i = 0; i < pkg->count; i++) {
-            if (strlen(pkg->files[i].path) == name && memcmp(pkg->files[i].path, in->raw, name) == 0) {
-                src = (const char *)pkg->files[i].data;
-                len = pkg->files[i].len;
-            }
-        }
-        break;
-    }
-    apps_vm_excerpt(in->raw, src, len, in->msg + at, sizeof in->msg - at);  /* raw is its own buffer: never in place */
-}
-
 /*
  * A run that failed: a crash ("<prefix>crashed in start(): <error>\n<traceback>\nlog:\n<the last 10 lines>", or
  * crashed while loading <main>, or crashed in the settle), or anything else ("<prefix>it didn't run: <why>"; a launch,
@@ -797,7 +770,7 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
     }
     in->raw[0] = '\0';
     if (!ops->compile(pkg, in->raw, sizeof in->raw)) {
-        compile_message(in, pkg);
+        apps_pkg_compile_message(pkg, in->raw, in->msg, sizeof in->msg);  /* raw is its own buffer: never in place */
         return failure(APPS_ERR_COMPILE_FAILED, in->msg);
     }
     bool unchanged = false;

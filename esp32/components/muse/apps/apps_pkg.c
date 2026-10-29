@@ -48,6 +48,7 @@
 
 #include "apps_json.h"
 #include "apps_suggest.h"
+#include "apps_vm.h"
 
 /* The functions that hold a buffer or a reader stay out of one another's frames: they run one after the
  * other, so the deepest the stack goes is the biggest of them, not the sum. */
@@ -706,6 +707,37 @@ void apps_pkg_free(apps_pkg_t *pkg, void (*free_fn)(void *)) {
     }
     apps_manifest_clear(&pkg->manifest, free_fn);
     memset(pkg, 0, sizeof *pkg);
+}
+
+/* ==== Compile messages ==== */
+
+void apps_pkg_compile_message(const apps_pkg_t *pkg, const char *raw, char *out, size_t cap) {
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    int n = snprintf(out, cap, "compile failed: ");
+    size_t at = n > 0 && (size_t)n < cap ? (size_t)n : cap - 1;
+    const char *src = NULL;
+    size_t len = 0;
+    /* "<file>:<line>: ...": the file is what comes before the first ":<digits>:". */
+    for (const char *colon = strchr(raw, ':'); colon != NULL && src == NULL; colon = strchr(colon + 1, ':')) {
+        const char *d = colon + 1;
+        while (*d >= '0' && *d <= '9') {
+            d++;
+        }
+        if (d == colon + 1 || *d != ':') {
+            continue;
+        }
+        size_t name = (size_t)(colon - raw);
+        for (int i = 0; i < pkg->count && i < APPS_MAX_FILES; i++) {
+            if (strlen(pkg->files[i].path) == name && memcmp(pkg->files[i].path, raw, name) == 0) {
+                src = (const char *)pkg->files[i].data;
+                len = pkg->files[i].len;
+            }
+        }
+        break;
+    }
+    apps_vm_excerpt(raw, src, len, out + at, cap - at);
 }
 
 /* ==== Images ==== */

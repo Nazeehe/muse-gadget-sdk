@@ -604,7 +604,8 @@ class UiTest(UiTestCase):
                 "    w:set{src = 'art/icon.bin'}\n"
                 "    print(w:get('src'))\n"
                 "end\nreturn app\n")
-        run = self.host(self.make_app("scratch", main, files=files))
+        # fake.lua isn't Lua, so the install's compile would refuse the package: this is the runtime's own rule.
+        run = self.host(self.make_app("scratch", main, files=files), compile=False)
         message = "ui.image: src '%s' is not one of this app's images (manifest.json \"files\")"
         self.assertEqual(run.logs(), [
             "art/icon.bin\t150\timage#0",

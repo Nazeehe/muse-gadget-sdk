@@ -1010,6 +1010,12 @@ class MuseAppsPkgTest(unittest.TestCase):
     def test_pkg_free_frees_every_blob_and_the_messages(self):
         self.run_case("pkg_free")
 
+    def test_the_compile_message_names_the_file_and_shows_its_lines(self):
+        # "compile failed: ", Lua's message and the lines around the one it names, for the install pipeline and
+        # apphost's check alike: a file of the package is matched by its whole path at the first ":<digits>:", and
+        # anything else (no such file, no line, a line the file lacks) is shown as it is; cut at cap on a character.
+        self.run_case("compile_message")
+
     def test_every_prefix_of_a_manifest_is_refused(self):
         # A text is its first len bytes: cut anywhere, each is an error and nothing is read past the end.
         self.run_case("truncations")

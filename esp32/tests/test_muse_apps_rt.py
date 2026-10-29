@@ -74,6 +74,12 @@ def not_a_file(name, files):
     return f"require: '{name}' is not one of this app's files (manifest.json \"files\": {listed})"
 
 
+def compile_failed(message, *lines):
+    """What the install says of a package whose Lua doesn't compile (apps_pkg_compile_message), and apphost with it:
+    Lua's message, and the lines of the file around the one it names, the line itself marked with '>'."""
+    return "\n".join(["compile failed: " + message, *lines])
+
+
 def ring_suffix(lines, cap=RING_BYTES):
     """The lines the ring holds after these were printed: the longest end of them that fits."""
     kept, used = [], 0
@@ -144,9 +150,11 @@ class AppHostTestCase(unittest.TestCase):
             target.write_bytes(content if isinstance(content, bytes) else content.encode())
         return folder
 
-    def host(self, app, *, script=None, mem_kb=None, cycles=None, rc=0, timeout=60):
-        """Runs apphost on app with the script lines on stdin; expects exit status rc and an empty stderr."""
-        args = []
+    def host(self, app, *, script=None, mem_kb=None, cycles=None, rc=0, timeout=60, compile=True):
+        """Runs apphost on app with the script lines on stdin; expects exit status rc and an empty stderr. Unless
+        compile is false (--no-compile: the tests of what the runtime does with a module that doesn't compile, which
+        the install never lets in), the package is compiled as the install compiles it before anything runs."""
+        args = [] if compile else ["--no-compile"]
         if mem_kb is not None:
             args += ["--mem-kb", mem_kb]
         if cycles is not None:
@@ -410,25 +418,42 @@ class RuntimeTest(AppHostTestCase):
         self.assertRegex(run.events[1]["message"],
                          r"^main\.lua:3: attempt to index a nil value \(local 't'\)\nstack traceback:\n\t")
 
-    def test_syntax_error_in_main_is_lua_s_own_message(self):
+    def test_syntax_error_in_main_is_refused_in_the_installs_words(self):
+        # The compile the install does comes first and says what it says: "compile failed: ", Lua's message and the
+        # lines around the one it names. Nothing ran, and that one event is all there is.
         run = self.run_app("local x = 1\nx = = 2\n", rc=1)
-        self.assertEqual(run.events, [{"event": "crash", "message": "main.lua:2: unexpected symbol near '='"}])
+        self.assertEqual(run.events, [{"event": "crash", "message": compile_failed(
+            "main.lua:2: unexpected symbol near '='", " 1| local x = 1", ">2| x = = 2")}])
         run = self.run_app("local x <close> = nil\nreturn {}", rc=1)
+        self.assertEqual(run.messages("crash"), [compile_failed(
+            "main.lua:1: '<close>' variables are not available in Muse apps", ">1| local x <close> = nil",
+            " 2| return {}")])
+
+    def test_syntax_error_in_main_without_the_compile_step_is_lua_s_own_message(self):
+        # --no-compile: the runtime makes the app itself, and the crash event is what Lua said.
+        run = self.run_app("local x = 1\nx = = 2\n", rc=1, compile=False)
+        self.assertEqual(run.events, [{"event": "crash", "message": "main.lua:2: unexpected symbol near '='"}])
+        run = self.run_app("local x <close> = nil\nreturn {}", rc=1, compile=False)
         self.assertEqual(run.messages("crash"), ["main.lua:1: '<close>' variables are not available in Muse apps"])
 
     def test_a_compile_error_shows_the_token_as_clean_text(self):
-        # Lua's message for an unfinished string quotes the token, raw bytes and all: it is cleaned like any text
-        # this module hands out. (A module's error is cleaned the same way, and is one line.)
+        # Lua's message for an unfinished string quotes the token, raw bytes and all. The runtime cleans it like any
+        # text this module hands out (--no-compile, below, and a module's error the same way, in one line). The
+        # install's message is Lua's as it comes, with the source line under it: the bytes as JSON carries them, a
+        # control byte escaped and one that isn't UTF-8 as U+FFFD.
         run = self.run_app(b"x = '\x01\x1b[2J\xff\n", rc=1)
+        self.assertEqual(run.messages("crash"), [compile_failed(
+            "main.lua:1: unfinished string near ''\x01\x1b[2J\ufffd'", ">1| x = '\x01\x1b[2J\ufffd")])
+        run = self.run_app(b"x = '\x01\x1b[2J\xff\n", rc=1, compile=False)
         self.assertEqual(run.messages("crash"), ["main.lua:1: unfinished string near ''??[2J?'"])
         app = self.make_app("scratch", "return {message = function() return require('m') end}",
                             files={"m.lua": b"x = '\x01\x1b[2J\xff\n"})
-        run = self.host(app, script=["message x"])
+        run = self.host(app, script=["message x"], compile=False)
         self.assertEqual(run.messages("error"), ["main.lua:1: require: m.lua:1: unfinished string near ''??[2J?'"])
         # One line: a token can hold a newline ('\x and the end of the line is "hexadecimal digit expected").
         app = self.make_app("scratch", "return {message = function() return {pcall(require, 'm')} end}",
                             files={"m.lua": b"x = '\\x\n"})
-        run = self.host(app, script=["message x"])
+        run = self.host(app, script=["message x"], compile=False)
         self.assertEqual(run.of("reply")[0]["data"],
                          [False, "require: m.lua:1: hexadecimal digit expected near ''\\x?'"])
 
@@ -702,7 +727,7 @@ class RuntimeTest(AppHostTestCase):
             'message x {"name": "once"}', 'message x {"name": "once"}', 'message x {"name": "once.lua"}',
             'message x {"name": "noret"}', 'message x {"name": "noret"}',
             'message x {"name": "lib/bad"}', 'message x {"name": "lib/bad"}',
-            'message x {"name": "lib/syntax"}', 'message x {"name": "lib/a"}', "state"])
+            'message x {"name": "lib/syntax"}', 'message x {"name": "lib/a"}', "state"], compile=False)
         self.assertEqual(run.logs(), ["loading once", "loading noret", "loading bad", "loading bad"])
         replies = [e["data"] for e in run.of("reply")]
         self.assertEqual(replies[:3], [{"ok": True, "v": "table"}] * 3)
@@ -727,9 +752,12 @@ class RuntimeTest(AppHostTestCase):
     def test_require_of_a_file_with_a_close_variable_is_refused(self):
         app = self.make_app("scratch", "return {message = function() return require('c') end}",
                             files={"c.lua": "local x <close> = nil"})
-        run = self.host(app, script=["message x"])
+        run = self.host(app, script=["message x"], compile=False)
         self.assertRegex(run.messages("error")[0],
                          r"^main\.lua:1: require: c\.lua:1: '<close>' variables are not available in Muse apps$")
+        run = self.host(app, script=["message x"], rc=1)  # the install refuses such a package, so check does
+        self.assertEqual(run.events, [{"event": "crash", "message": compile_failed(
+            "c.lua:1: '<close>' variables are not available in Muse apps", ">1| local x <close> = nil")}])
 
     def test_require_runs_in_a_coroutine(self):
         app = self.make_app("scratch", "return {message = function()\n"
@@ -767,23 +795,25 @@ class RuntimeTest(AppHostTestCase):
         # handler's error is.
         nested = "return " + "(" * 60 + "1" + ")" * 60
         run = self.run_app(nested, rc=1)  # main.lua itself: nothing of it ran
+        self.assertEqual(run.events, [{"event": "crash", "message": "compile failed: C stack overflow"}])
+        run = self.run_app(nested, rc=1, compile=False)  # the runtime's own, without the install's words
         self.assertEqual(run.events, [{"event": "crash", "message": "C stack overflow"}])
         modules = {"deep.lua": nested}
         # require outside a pcall: an error with the require's position, from a handler ...
         app = self.make_app("scratch", "return {message = function() return require('deep') end}", files=modules)
-        run = self.host(app, script=["message x", "message x", "state"])
+        run = self.host(app, script=["message x", "message x", "state"], compile=False)
         self.assertEqual(run.messages("error"), ["main.lua:1: require: C stack overflow"] * 2)  # not cached
         self.assertEqual(run.events[-1], {"event": "state", "state": "running"})
         # ... and from main.lua's top level, a crash with the traceback of the require.
         app = self.make_app("scratch", "require('deep') return {}", files=modules)
-        run = self.host(app, rc=1)
+        run = self.host(app, rc=1, compile=False)
         record = run.messages("crash")[0]
         self.assertRegex(record, r"^main\.lua:1: require: C stack overflow\nstack traceback:\n\t")
         self.assertNotIn("?stack traceback", record)
         # Under a pcall there is no traceback to cut: the one line.
         app = self.make_app("scratch", "return {message = function() return select(2, pcall(require, 'deep')) end}",
                             files=modules)
-        run = self.host(app, script=["message x"])
+        run = self.host(app, script=["message x"], compile=False)
         self.assertEqual(run.of("reply")[0]["data"], "require: C stack overflow")
 
     # ---- Launch, stop, free ----
@@ -851,10 +881,18 @@ class RuntimeTest(AppHostTestCase):
             two,       # `log 1`
         ])
 
-    def test_commands_after_a_main_that_does_not_compile(self):
-        # Nothing of it ran, so there is no runtime and nothing to log: the commands answer with the reason.
-        syntax = "main.lua:2: unexpected symbol near '='"
+    def test_a_main_that_does_not_compile_is_refused_and_the_script_does_not_run(self):
+        # The install's compile comes first: its refusal is the one event, with no `state` or error after it.
         run = self.run_app("print('never')\nx = = 1", script=["state", "message x", "start", "show", "stop", "log"], rc=1)
+        self.assertEqual(run.events, [{"event": "crash", "message": compile_failed(
+            "main.lua:2: unexpected symbol near '='", " 1| print('never')", ">2| x = = 1")}])
+
+    def test_commands_after_a_main_that_does_not_compile_without_the_compile_step(self):
+        # --no-compile: nothing of main ran, so there is no runtime and nothing to log: the commands answer with the
+        # reason.
+        syntax = "main.lua:2: unexpected symbol near '='"
+        run = self.run_app("print('never')\nx = = 1", script=["state", "message x", "start", "show", "stop", "log"], rc=1,
+                           compile=False)
         self.assertEqual(run.events, [
             {"event": "crash", "message": syntax},
             {"event": "state", "state": "crashed"},
@@ -901,9 +939,12 @@ class RuntimeTest(AppHostTestCase):
         self.assertEqual(run.kinds(), ["started"])
 
     def test_a_heap_too_small_to_start_is_a_crash(self):
-        run = self.run_app("return {}", mem_kb=2, rc=1)
+        run = self.run_app("return {}", mem_kb=2, rc=1, compile=False)
         self.assertEqual(run.kinds(), ["crash"])
         self.assertIn("out of memory", run.events[0]["message"])
+        run = self.run_app("return {}", mem_kb=2, rc=1)  # the install's compile has no room for it either, and says so
+        self.assertEqual(run.events, [{"event": "crash", "message":
+                                       "compile failed: out of memory: can't make the app's heap of 2 KB"}])
 
     def test_manifest_warnings_are_events(self):
         app = self.make_app("scratch", "return {}", manifest={"permission": ["sound"], "colour": 1})
@@ -943,7 +984,7 @@ class RuntimeTest(AppHostTestCase):
         app = str(FIXTURES / "handlers")
         for args in ([], ["--mem-kb"], ["--mem-kb", "x", app], ["--mem-kb", "0", app], ["--cycles", "0", app],
                      ["--cycles", "-1", app], ["--bogus", app], [app, app], ["--cycles", "2", "--script", "-", app],
-                     ["--sha256"], ["--sha256", "a", "b"]):
+                     ["--no-compile"], ["--sha256"], ["--sha256", "a", "b"]):
             with self.subTest(args):
                 done = apps_host.run(self.apphost, *args, text=False)
                 self.assertEqual(done.returncode, 2)
@@ -1113,6 +1154,120 @@ class RuntimeTest(AppHostTestCase):
         cmake = (ROOT / "components/muse/CMakeLists.txt").read_text()
         block = re.search(r"if\(CONFIG_MUSE_APPS\)(.*?)endif\(\)", cmake, re.S).group(1)
         self.assertIn('"apps/apps_rt.c"', block)
+
+
+class CompileStepTest(AppHostTestCase):
+    """apphost compiles a package as the install does before it makes the runtime (apps_task.c's compile): every .lua
+    file, main first and the others in the package's order, in a scratch VM with the manifest's memory limit. A package
+    it refuses is one crash event, in the install's words, and nothing else: that is what `app.py check` is for."""
+
+    BAD = "local a = 1\nlocal b = = 2\nreturn {}\n"
+
+    def refused(self, app, message, **kw):
+        """app is refused with this message as the one event, and exit status 1."""
+        run = self.host(app, rc=1, **kw)
+        self.assertEqual(run.events, [{"event": "crash", "message": message}])
+
+    def test_a_module_nothing_requires_is_compiled_all_the_same(self):
+        # main.lua prints when it loads and would print again in start(): neither happens, and no command answers.
+        app = self.make_app("scratch", "print('main ran')\nreturn {start = function() print('start ran') end}",
+                            files={"util.lua": self.BAD})
+        self.refused(app, compile_failed("util.lua:2: unexpected symbol near '='", " 1| local a = 1",
+                                         ">2| local b = = 2", " 3| return {}"), script=["state", "message x", "log"])
+
+    def test_a_file_in_a_folder_is_named_by_its_path(self):
+        app = self.make_app("scratch", "return {}", files={"lib/util.lua": "return {\n  x = 1,\n  y = ,\n}\n"})
+        self.refused(app, compile_failed("lib/util.lua:3: unexpected symbol near ','", " 2|   x = 1,", ">3|   y = ,",
+                                         " 4| }"))
+
+    def test_main_is_compiled_first_then_the_files_in_the_packages_order(self):
+        def broken(name):
+            return f"-- {name}\nx = = 1\n"
+
+        files = {"b.lua": broken("b"), "a.lua": broken("a"), "c.lua": "return 1"}
+        for main, listed, first in ((broken("main"), files, "main.lua"), ("return {}", files, "b.lua"),
+                                    ("return {}", {"a.lua": files["a.lua"], "b.lua": files["b.lua"]}, "a.lua"),
+                                    ("return {}", {"c.lua": files["c.lua"], "a.lua": files["a.lua"]}, "a.lua")):
+            with self.subTest(first=first, listed=list(listed)):
+                run = self.host(self.make_app("scratch", main, files=listed), rc=1)
+                self.assertEqual(run.kinds(), ["crash"])
+                self.assertTrue(run.messages("crash")[0].startswith(f"compile failed: {first}:2: unexpected symbol"),
+                                run.messages("crash"))
+
+    def test_a_json_file_is_not_compiled(self):
+        # Only .lua is Lua: this .json would be a syntax error as Lua, and is data.
+        app = self.make_app("scratch", "return {}", files={"data.json": '{"a": [1, 2]}'})
+        self.assertEqual(self.host(app).kinds(), ["started"])
+
+    def test_nesting_37_deep_compiles_and_38_is_a_c_stack_overflow(self):
+        # The install compiles each file as a top-level chunk, the main thread's whole C stack for it: the parser takes
+        # one of LUAI_MAXCCALLS (40) levels for the statement, one for the returned expression and one for each
+        # parenthesis, so a file nested 37 deep compiles and one nested 38 is refused.
+        for depth, accepted in ((36, True), (37, True), (38, False), (39, False), (60, False)):
+            with self.subTest(depth=depth):
+                app = self.make_app("scratch", "return {}",
+                                    files={"deep.lua": "return " + "(" * depth + "1" + ")" * depth + "\n"})
+                if accepted:
+                    self.assertEqual(self.host(app).kinds(), ["started"])
+                else:
+                    self.refused(app, "compile failed: C stack overflow")
+
+    def test_the_scratch_vm_has_the_manifests_memory_limit(self):
+        # A table of 10000 numbers needs more than 64 KB to compile and less than 128: the default of 256 KB takes it, a
+        # manifest of 64 doesn't, and --mem-kb (which the runtime's heap follows too) says the same.
+        big = "return {" + ",".join(["1"] * 10000) + "}\n"
+        app = self.make_app("scratch", "return {}", files={"big.lua": big})
+        self.assertEqual(self.host(app).kinds(), ["started"])
+        self.assertEqual(self.host(app, mem_kb=128).kinds(), ["started"])
+        self.refused(app, "compile failed: not enough memory", mem_kb=64)
+        small = self.make_app("scratch", "return {}", files={"big.lua": big}, manifest={"memory_kb": 64})
+        self.refused(small, "compile failed: not enough memory")
+        self.assertEqual(self.host(small, mem_kb=128).kinds(), ["started"])
+
+    def test_lua_s_message_is_cut_where_the_install_cuts_it(self):
+        # The app task gives Lua's message 512 bytes in its compile (511 and the NUL), and so does check; the line
+        # under it is cut at 80.
+        app = self.make_app("scratch", "return {}", files={"long.lua": "x = '" + "a" * 600 + "\n"})
+        (message,) = self.host(app, rc=1).messages("crash")
+        head, _, rest = message.partition("\n")
+        self.assertTrue(head.startswith("compile failed: long.lua:1: unfinished string near ''aaaa"), head)
+        self.assertEqual(len(head), len("compile failed: ") + 511)
+        self.assertEqual(rest, ">1| x = '" + "a" * 75)
+
+    def test_a_heap_too_small_to_make_is_the_installs_message(self):
+        self.refused(self.make_app("scratch", "return {}"), "compile failed: out of memory: can't make the app's heap of 2 KB",
+                     mem_kb=2)
+
+    def test_the_compile_leaves_the_runtime_with_a_heap_of_its_own(self):
+        # The scratch VM is gone when the app starts: a package that compiles in all of its memory still has all of it.
+        big = "return {" + ",".join(["1"] * 5000) + "}\n"
+        app = self.make_app("scratch", "return {start = function() local t = {} for i = 1, 1000 do t[i] = i end end}",
+                            files={"big.lua": big}, manifest={"memory_kb": 128})
+        self.assertEqual(self.host(app).kinds(), ["started"])
+
+    def test_no_compile_leaves_the_compile_out(self):
+        # What check never says: with the flag, a module that doesn't compile is the app's own business when it is
+        # required, and the package starts.
+        app = self.make_app("scratch", "return {message = function(e) return require('util') end}",
+                            files={"util.lua": self.BAD})
+        run = self.host(app, script=["message x"], compile=False)
+        self.assertEqual(run.kinds(), ["started", "error"])
+        self.assertEqual(run.messages("error"), ["main.lua:1: require: util.lua:2: unexpected symbol near '='"])
+        self.assertEqual(self.host(app, rc=1).kinds(), ["crash"])
+
+    def test_warnings_wait_for_a_package_that_compiles(self):
+        # A refused package is one event: the manifest's warnings are part of launching one that isn't.
+        app = self.make_app("scratch", self.BAD, manifest={"colour": 1})
+        self.refused(app, compile_failed("main.lua:2: unexpected symbol near '='", " 1| local a = 1",
+                                         ">2| local b = = 2", " 3| return {}"))
+        app = self.make_app("scratch", "return {}", manifest={"colour": 1})
+        self.assertEqual(self.host(app).kinds(), ["warning", "started"])
+
+    def test_cycles_make_the_app_without_compiling_it_first(self):
+        # --cycles measures make, start, stop and free: it has no compile step of the install's to repeat.
+        app = self.make_app("scratch", "return {}", files={"util.lua": self.BAD})
+        run = self.host(app, cycles=3)
+        self.assertEqual(run.events, [{"event": "leak_check", "bytes": 0}])
 
 
 class HarnessTest(unittest.TestCase):

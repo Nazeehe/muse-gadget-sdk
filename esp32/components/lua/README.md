@@ -49,20 +49,28 @@ header to it. Set build options in `CMakeLists.txt` instead.
 ## Build settings
 
 - `LUAI_MAXCCALLS=40` (Lua's default is 200) is how deep C calls and parser
-  levels may nest before Lua raises "C stack overflow". It's sized to the Lua
-  task's 32 KB stack:
+  levels may nest before Lua raises "C stack overflow". The app task runs on a
+  56 KB stack in PSRAM (57,344 bytes):
   - While Lua handles that error it lets the count go on to 1.1 times the
-    limit, 44 C levels. At roughly 500 bytes a level on the ESP32-S3 (the
-    compiler's stack-usage estimate, not yet a measurement on the device)
-    that's about 22 KB. The task's own frames, a binding's buffers and log
-    formatting add about 6 KB: some 28 KB of the 32.
+    limit, 44 C levels.
+  - Measured on the ESP32-S3 with `tests/muse_apps_fixtures/torture`, which
+    `tools/muse/app.py` pushes: the four chains (`pcall`, `coroutine.resume`,
+    `__index` through `table.concat`, `__tostring` through `string.format`) run
+    to the limit with a 16-deep `json.encode` and `json.decode`, each ending in
+    a float, at the bottom of each. The worst of them used 42,076 bytes of the
+    stack and left 15,268 free.
+  - A chunk compiled on its own (the install compiles every `.lua` file of a
+    package so) takes a parenthesis nested 37 deep and refuses 38 with "C stack
+    overflow": the parser spends a level on the statement, one on the expression
+    and one on each parenthesis. A `require` has a few levels less to spend, and
+    takes 34.
   - Only nesting across the C boundary counts (`pcall`, metamethods,
     `coroutine.resume`, `table.sort` comparators), and the parser's own
     levels. A Lua function calling a Lua function doesn't use the C stack in
     Lua 5.4. Nesting past the limit ends in a Lua error, not a crash.
 - `-O2 -w`: upstream's code, warnings and all. Unoptimized, the frames are
   several times larger (40 nested `pcall`s take about 170 KB with the host's
-  compiler), far more than that 32 KB.
+  compiler), far more than that 56 KB.
 - `LUA_COMPAT_5_3` isn't defined, though upstream's own Makefile defines it, so
   `math.atan2`, `cosh`, `sinh`, `tanh`, `pow`, `frexp`, `ldexp` and `log10` are
   absent.

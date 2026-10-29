@@ -30,7 +30,10 @@ check builds apphost (tools/muse/apphost) from this checkout the first time, and
 changes (tools/muse/apphost_build.py), and runs the folder on it. It prints apphost's events, one JSON object a line (a
 `started` for an app that loads, a `log` for each line it prints, a `crash` for one that fails), and exits 1 on an
 `error` or a `crash` event. --script FILE is apphost's script of commands (message, tap, dump, ...), which
-tools/muse/apphost/apphost.c lists. It needs no gadget and no pyserial.
+tools/muse/apphost/apphost.c lists. It needs no gadget and no pyserial. Before it runs anything it compiles every .lua
+file as the install does, so a package it passes is one the install doesn't refuse for its Lua: one that doesn't compile
+is the one `crash` event the install would answer, "compile failed: util.lua:7: ..." and the lines around line 7, and
+nothing runs.
 
 push sends manifest.json, then main, then the manifest's "files" in order, as `>app.put` lines of at most 768 base64
 characters each (a console line is at most 1,023 bytes after the '>'), one at a time, each after the `@app.ack` for

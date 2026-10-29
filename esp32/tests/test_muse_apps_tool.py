@@ -1388,10 +1388,10 @@ class CheckTest(unittest.TestCase):
             code = self.app.main(["check", str(folder), *args])
         return code, out.getvalue(), err.getvalue()
 
-    def make(self, main, script=None, manifest=None):
+    def make(self, main, script=None, manifest=None, files=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        folder = make_package(tmp.name, app_id="scratch", main=main, manifest=manifest)
+        folder = make_package(tmp.name, app_id="scratch", main=main, manifest=manifest, files=files)
         path = folder.parent / "script.txt"
         if script is not None:
             path.write_text(script)
@@ -1422,6 +1422,41 @@ class CheckTest(unittest.TestCase):
         code, out, _ = self.check(folder)
         self.assertEqual(code, 1)
         self.assertIn("crash", self.kinds(out))
+
+    def refusal(self, folder, *args):
+        """check exits 1 on a package whose Lua doesn't compile, with that one crash event and nothing run. -> its
+        message."""
+        code, out, err = self.check(folder, *args)
+        self.assertEqual((code, err, self.kinds(out)), (1, "", ["crash"]))
+        return json.loads(out)["message"]
+
+    def test_a_module_nobody_requires_is_compiled_as_the_install_compiles_it(self):
+        # The install compiles every .lua file: a syntax error in util.lua, which main.lua never requires, is refused
+        # there, so check refuses it, in the install's words. main.lua printed when it loaded: nothing ran.
+        folder, script = self.make("print('main ran')\nreturn {start = function() print('started') end}",
+                                   script="state\nmessage x\n",
+                                   files={"util.lua": "local a = 1\nlocal b = = 2\nreturn {}\n"})
+        self.assertEqual(self.refusal(folder, "--script", str(script)),
+                         "compile failed: util.lua:2: unexpected symbol near '='\n 1| local a = 1\n>2| local b = = 2\n"
+                         " 3| return {}")
+
+    def test_a_module_nested_38_deep_is_refused_as_the_install_refuses_it_and_37_is_not(self):
+        # Each file is compiled as a top-level chunk (LUAI_MAXCCALLS is 40: a level for the statement, one for the
+        # expression, one a parenthesis): 37 deep compiles and 38 is "C stack overflow".
+        for depth, accepted in ((37, True), (38, False)):
+            with self.subTest(depth=depth):
+                nest = "return " + "(" * depth + "1" + ")" * depth + "\n"
+                folder, _ = self.make("return {}", files={"deep.lua": nest})
+                if accepted:
+                    code, out, err = self.check(folder)
+                    self.assertEqual((code, err, self.kinds(out)), (0, "", ["started"]))
+                else:
+                    self.assertEqual(self.refusal(folder), "compile failed: C stack overflow")
+
+    def test_a_syntax_error_in_main_lua_is_refused_in_the_installs_words(self):
+        folder, _ = self.make("local x = 1\nx = = 2\n")
+        self.assertEqual(self.refusal(folder),
+                         "compile failed: main.lua:2: unexpected symbol near '='\n 1| local x = 1\n>2| x = = 2")
 
     def test_a_crash_with_unicode_line_separators_in_it_is_still_a_crash(self):
         # The event is one line of JSON with U+2028 in it as it is. Split with str.splitlines() it is two lines that
@@ -1553,8 +1588,8 @@ class TortureTest(AppsTestCase):
     def test_the_fixture_is_what_the_rulings_say(self):
         manifest = json.loads((TORTURE / "manifest.json").read_text())
         self.assertEqual((manifest["id"], manifest["api"]), ("torture", 1))
-        # C24: a file of each depth. The install compiles every file as a top-level chunk, which takes 36 levels and not
-        # 37 (LUAI_MAXCCALLS is 40), so 36 is the deepest a package can hold.
+        # C24: a file of each depth, 26 to 36 (a require takes 34 at most; the install compiles every file as a
+        # top-level chunk, which takes 37 levels and not 38: LUAI_MAXCCALLS is 40).
         self.assertEqual(sorted(manifest["files"]), sorted([*(f"deep{n}.lua" for n in range(26, 37)), "tile.bin"]))
         self.assertEqual(sorted(p.name for p in TORTURE.glob("deep*.lua")),
                          sorted(f"deep{n}.lua" for n in range(26, 37)))
@@ -1575,7 +1610,7 @@ class TortureTest(AppsTestCase):
         self.assertTrue(index[2].endswith("C stack overflow"), index)
         (deepest,) = [row for row in logs if row[0] == "deepest nesting that loads"]
         # 40 is LUAI_MAXCCALLS: the parser takes a C level for each parenthesis, and the require, the pcall and the
-        # handler hold a few: the first that loads is a little under the 36 of a top-level chunk.
+        # handler hold a few: the first that loads is a little under the 37 of a top-level chunk.
         self.assertTrue(30 <= int(deepest[1]) <= 35, deepest)
         chains = {row[1]: (int(row[2]), row[3]) for row in logs if row[0] == "chain"}
         self.assertEqual(sorted(chains), sorted(self.NAMES))

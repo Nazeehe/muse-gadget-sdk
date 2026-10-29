@@ -38,6 +38,7 @@
  * 4. ops->compile. Lua's own message ("main.lua:2: unexpected symbol near 'x'") becomes "compile failed: " and
  *    apps_vm_excerpt's text of it for the file it names (the line before, the line and the line after, ">2|" on the
  *    line itself); a message that names none of the package's files is shown as it is, after "compile failed: ".
+ *    apps_pkg_compile_message makes that text, and apphost's check calls it too.
  * 5. ops->commit: the store keeps a copy of its own.
  * 6. With run, ops->run, with APPS_SETTLE_MS: it takes the package. A crash is
  *      installed but crashed in start(): <error>\n<traceback>\nlog:\n<the last 10 lines of the log>

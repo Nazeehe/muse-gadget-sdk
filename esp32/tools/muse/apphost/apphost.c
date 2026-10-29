@@ -19,14 +19,18 @@
  * does here is what it does there: the same Lua, the same sandbox, budgets, messages and crash rules. It is
  * the development loop's runner and the tests' (tests/test_muse_apps_rt.py).
  *
- *   apphost [--mem-kb N] [--script FILE|-] APP_DIR
+ *   apphost [--no-compile] [--mem-kb N] [--script FILE|-] APP_DIR
  *   apphost [--mem-kb N] --cycles N APP_DIR
  *   apphost --sha256 TEXT|-
  *
  * APP_DIR holds manifest.json and the files it lists (the folder's name is the app's id). The package is read
  * the way the install pipeline reads one (apps_pkg: the manifest, the size limits, .json files that must
- * parse, .bin files that must be LVGL images), the runtime is made and start() is called. Then the script's
- * lines run, if there is one. --mem-kb N sets the heap in KB, whatever the manifest says (1 to 65535).
+ * parse, .bin files that must be LVGL images) and compiled the way it compiles one (apps_task.c's compile: every
+ * .lua file, main first and the others in the package's order, each loaded and not run, in a scratch VM with the
+ * manifest's memory limit), so that a package this runs is a package the install accepts. Then the runtime is
+ * made and start() is called, and the script's lines run, if there is one. --mem-kb N sets the heap in KB,
+ * whatever the manifest says (1 to 65535). --no-compile leaves the compile out: it is for the runtime's own
+ * tests of a module that doesn't compile when it is required, which the install never lets in.
  *
  * Output is one JSON object a line on stdout, flushed as it is written, whatever the app printed or raised:
  * every string is escaped, and bytes that aren't valid UTF-8 come out as U+FFFD.
@@ -37,7 +41,10 @@
  *   {"event":"error","message":"…"}        a command that failed and left the app as it was; a package that
  *                                          can't be loaded
  *   {"event":"crash","message":"…"}        the app crashed, as it happens (once: a crash is final): the crash
- *                                          record, the error with its traceback or the kill's reason
+ *                                          record, the error with its traceback or the kill's reason; or a
+ *                                          package whose Lua doesn't compile, refused before anything runs
+ *                                          with the install's words: "compile failed: util.lua:7: …" and the
+ *                                          lines of the file around line 7 (apps_pkg_compile_message)
  *   {"event":"state","state":"running"}    the `state` command: stopped, running or crashed
  *   {"event":"dump","widgets":[...]}       the `dump` command: one object an alive widget (apps_ui.h), with
  *                                          "dropped":N after them when N didn't fit the size asked for
@@ -67,7 +74,10 @@
  * held, or left held by a command ends the run, and so does a command that changes the screen without taking it.
  * An app whose load failed (a crash event at launch) is a crashed app: `state` says crashed, `message` and
  * `start` answer with its crash record, `log` shows what main.lua printed before it failed, and the rest do
- * nothing. A main.lua that doesn't compile never ran: the crash event is Lua's message, and there is no log.
+ * nothing. A package whose Lua doesn't compile is no app: nothing ran or runs, the one crash event is all that is
+ * printed (not the warnings, not the script's answers), and the status is 1. With --no-compile a main.lua that
+ * doesn't compile never ran either, and the crash event is Lua's message with no log; the script's commands
+ * answer as above.
  *
  * --cycles N makes, starts, stops and frees the app N times, and prints the heap's balance. Nothing else is
  * printed but the first failure, as a crash event: the app's log and warnings are dropped.
@@ -99,6 +109,7 @@
 #include "apps_port.h"
 #include "apps_rt.h"
 #include "apps_ui.h"
+#include "apps_vm.h"
 
 /* The device's CONFIG_MUSE_APPS_HEAP_MAX_KB is set by its build; here the manifest's own ceiling holds. */
 #define HEAP_MAX_KB 1024
@@ -109,7 +120,7 @@
 #define DUMP_MAX_BYTES 4000000
 
 #define USAGE                                                                           \
-    "usage: apphost [--mem-kb N] [--script FILE|-] APP_DIR\n"                           \
+    "usage: apphost [--no-compile] [--mem-kb N] [--script FILE|-] APP_DIR\n"            \
     "       apphost [--mem-kb N] --cycles N APP_DIR\n"                                  \
     "       apphost --sha256 TEXT|-\n"
 
@@ -311,6 +322,44 @@ static bool load_package(const char *folder, const char *id, apps_pkg_t *pkg, ch
 fail:
     apps_pkg_free(pkg, NULL);
     return false;
+}
+
+/* ---- The compile ---- */
+
+/*
+ * What the install's compile step does (apps_task.c's compile()): every .lua file of the package, main first and the
+ * others in the package's order, loaded and not run, in a scratch VM with the manifest's memory limit. False, with
+ * what Lua said of the first that failed in raw, which apps_pkg_compile_message words. Each file is compiled as a
+ * top-level chunk, as the install compiles it, and not as a require does, with a few C levels less to spend: with
+ * LUAI_MAXCCALLS 40 a file nested 37 deep passes here and 38 is "C stack overflow", and a require takes 34.
+ */
+static bool compile_package(const apps_pkg_t *pkg, char *raw, size_t raw_len) {
+    apps_vm_config_t cfg = {
+        .mem_limit = (size_t)pkg->manifest.memory_kb * 1024u,
+        .realloc_fn = apps_port_realloc,
+        .free_fn = apps_port_free,
+        .now_ms = apps_port_mono_ms,
+    };
+    apps_vm_t *vm = apps_vm_new(&cfg);
+    if (vm == NULL) {
+        snprintf(raw, raw_len, "out of memory: can't make the app's heap of %u KB", (unsigned)pkg->manifest.memory_kb);
+        return false;
+    }
+    bool ok = true;
+    for (int pass = 0; pass < 2; pass++) {  /* pass 0: main; pass 1: the rest */
+        for (int i = 0; i < pkg->count && ok; i++) {
+            const apps_blob_t *b = &pkg->files[i];
+            if ((strcmp(b->path, pkg->manifest.main) == 0) != (pass == 0) || apps_file_kind(b->path) != APPS_FILE_LUA) {
+                continue;
+            }
+            ok = apps_vm_load(vm, b->path, (const char *)b->data, b->len, raw, raw_len);
+            if (ok) {
+                lua_pop(apps_vm_lua(vm), 1);
+            }
+        }
+    }
+    apps_vm_free(vm);
+    return ok;
 }
 
 /* ---- The app, and the commands that drive it ---- */
@@ -687,9 +736,17 @@ static bool run_script(app_t *app, FILE *in) {
 
 /* ---- Launch ---- */
 
-/* The app's launch, as events, then the script; the exit status. A script that can't be read is the status
- * 2, after what it did run. */
-static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name) {
+/* The app's launch, as events, then the script; the exit status. A package that doesn't compile (unless compile is
+ * false) is refused first, with one crash event and the status 1, and nothing else happens. A script that can't be read
+ * is the status 2, after what it did run. */
+static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name, bool compile) {
+    char raw[512];  /* what the app task gives Lua's message in its compile: the install's words are made from the same */
+    if (compile && !compile_package(pkg, raw, sizeof raw)) {
+        char message[APPS_ERROR_MAX];
+        apps_pkg_compile_message(pkg, raw, message, sizeof message);
+        emit_text("crash", message);
+        return 1;
+    }
     app_t app = {.pkg = pkg};
     apphost_set_log(emit_log);
     emit_warnings(pkg->manifest.warnings);
@@ -752,6 +809,7 @@ static int run_cycles(const apps_pkg_t *pkg, int cycles) {
 typedef struct {
     const char *folder, *script, *sha256;
     long mem_kb, cycles;
+    bool no_compile;
 } options_t;
 
 static bool usage(const char *why, const char *arg) {
@@ -772,7 +830,9 @@ static bool parse_args(int argc, char **argv, options_t *o) {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *value = i + 1 < argc ? argv[i + 1] : NULL;
-        if (strcmp(a, "--mem-kb") == 0 || strcmp(a, "--cycles") == 0 || strcmp(a, "--script") == 0) {
+        if (strcmp(a, "--no-compile") == 0) {
+            o->no_compile = true;
+        } else if (strcmp(a, "--mem-kb") == 0 || strcmp(a, "--cycles") == 0 || strcmp(a, "--script") == 0) {
             if (value == NULL) {
                 return usage("needs a value:", a);
             }
@@ -884,7 +944,7 @@ int main(int argc, char **argv) {
         if (o.mem_kb > 0) {
             pkg->manifest.memory_kb = (uint16_t)o.mem_kb;
         }
-        status = o.cycles > 0 ? run_cycles(pkg, (int)o.cycles) : run_app(pkg, script, o.script);
+        status = o.cycles > 0 ? run_cycles(pkg, (int)o.cycles) : run_app(pkg, script, o.script, !o.no_compile);
         apps_pkg_free(pkg, NULL);
     } else {
         emit_text("error", err);

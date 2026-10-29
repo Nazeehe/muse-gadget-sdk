@@ -648,6 +648,88 @@ static void memory(void) {
     free(m);
 }
 
+/* apps_pkg_compile_message: "compile failed: ", Lua's message, and the lines of the file it names around its line. The
+ * install pipeline and apphost's check both word a refusal with it. */
+static void compile_message(void) {
+    static const char main_src[] = "local a = 1\nlocal b = = 2\nreturn {}\n";
+    static const char util_src[] = "return {\n  x = 1,\n  y = ,\n}\n";
+    apps_pkg_t *pkg = calloc(1, sizeof *pkg);
+    static const struct {
+        const char *path;
+        const char *src;  /* NULL: an empty file with no block */
+        size_t len;
+    } files[] = {
+        {"main.lua", main_src, sizeof main_src - 1},
+        {"lib/util.lua", util_src, sizeof util_src - 1},
+        {"empty.lua", NULL, 0},
+    };
+    for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
+        apps_blob_t *b = &pkg->files[pkg->count++];
+        snprintf(b->path, sizeof b->path, "%s", files[i].path);
+        b->data = files[i].src != NULL ? (uint8_t *)exact_copy(files[i].src, files[i].len) : NULL;
+        b->len = files[i].len;
+    }
+
+    static const struct {
+        const char *raw, *want;
+    } rows[] = {
+        /* The file is what is before the first ":<digits>:", and the lines around that line show, the line marked. */
+        {"main.lua:2: unexpected symbol near '='",
+         "compile failed: main.lua:2: unexpected symbol near '='\n 1| local a = 1\n>2| local b = = 2\n 3| return {}"},
+        {"lib/util.lua:3: unexpected symbol near ','",
+         "compile failed: lib/util.lua:3: unexpected symbol near ','\n 2|   x = 1,\n>3|   y = ,\n 4| }"},
+        {"main.lua:1: boom", "compile failed: main.lua:1: boom\n>1| local a = 1\n 2| local b = = 2"},
+        {"main.lua:3: at the end", "compile failed: main.lua:3: at the end\n 2| local b = = 2\n>3| return {}"},
+        /* Whatever isn't a file of the package, or has no line, or a line the file lacks, is shown as it is. */
+        {"other.lua:2: boom", "compile failed: other.lua:2: boom"},
+        {"xmain.lua:2: boom", "compile failed: xmain.lua:2: boom"},
+        {"main.lu:2: boom", "compile failed: main.lu:2: boom"},
+        {"main.lua.bak:2: boom", "compile failed: main.lua.bak:2: boom"},
+        {"util.lua:3: boom", "compile failed: util.lua:3: boom"},
+        {"C stack overflow", "compile failed: C stack overflow"},
+        {"out of memory: this app may use 64 KB (memory_kb in manifest.json)",
+         "compile failed: out of memory: this app may use 64 KB (memory_kb in manifest.json)"},
+        {"main.lua:99: past the end", "compile failed: main.lua:99: past the end"},
+        {"main.lua:0: no line", "compile failed: main.lua:0: no line"},
+        {"empty.lua:1: unexpected symbol near <eof>", "compile failed: empty.lua:1: unexpected symbol near <eof>"},
+        {"", "compile failed: "},
+        /* Only the first ":<digits>:" can name the file: a later one in the message doesn't. */
+        {"x 1: main.lua:2: y", "compile failed: x 1: main.lua:2: y"},
+        {"near 3:4: main.lua:2: y", "compile failed: near 3:4: main.lua:2: y"},
+        /* A colon that isn't followed by digits and a colon ends no file name, though a later line number shows. */
+        {"main.lua: x:2: boom", "compile failed: main.lua: x:2: boom"},
+        {"main.lua:: x:2: boom", "compile failed: main.lua:: x:2: boom"},
+    };
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        char out[512];
+        memset(out, 'x', sizeof out);
+        apps_pkg_compile_message(pkg, exact_copy(rows[i].raw, strlen(rows[i].raw) + 1), out, sizeof out);
+        CHECK(strcmp(out, rows[i].want) == 0, "row %zu '%s':\n  got  '%s'\n  want '%s'", i, rows[i].raw, out, rows[i].want);
+    }
+
+    /* The result is cut at cap - 1 bytes and terminated, whatever cap is; nothing is written past it (the buffer is an
+     * exact block), and a cut keeps a character whole. */
+    static const char raw[] = "lib/util.lua:3: caf\xc3\xa9 near ','";
+    static const char head[] = "compile failed: lib/util.lua:3: caf\xc3\xa9";
+    char full[512];
+    apps_pkg_compile_message(pkg, exact_copy(raw, sizeof raw), full, sizeof full);
+    CHECK(strncmp(full, head, sizeof head - 1) == 0 && strstr(full, "\n>3|   y = ,") != NULL, "full: '%s'", full);
+    for (size_t cap = 1; cap <= strlen(full) + 2; cap++) {
+        char *out = exact_copy(NULL, cap);
+        apps_pkg_compile_message(pkg, exact_copy(raw, sizeof raw), out, cap);
+        size_t want = cap - 1 < strlen(full) ? cap - 1 : strlen(full);
+        while (want > 0 && want < strlen(full) && ((unsigned char)full[want] & 0xC0) == 0x80) {
+            want--;  /* a cut inside a character goes back to where it starts */
+        }
+        CHECK(strlen(out) == want && memcmp(out, full, want) == 0, "cap %zu: '%s', wanted %zu bytes", cap, out, want);
+    }
+    apps_pkg_compile_message(pkg, raw, NULL, 10);  /* nowhere to write, or no room: no write */
+    char guard[4] = "abc";
+    apps_pkg_compile_message(pkg, raw, guard, 0);
+    CHECK(strcmp(guard, "abc") == 0, "cap 0 wrote '%s'", guard);
+    free(pkg);
+}
+
 /* apps_pkg_free frees every blob and the manifest's messages, and leaves a zero package. */
 static void pkg_free(void) {
     apps_pkg_t *pkg = calloc(1, sizeof *pkg);
@@ -1060,6 +1142,7 @@ int main(int argc, char **argv) {
         {"contracts", contracts},
         {"memory", memory},
         {"pkg_free", pkg_free},
+        {"compile_message", compile_message},
         {"truncations", truncations},
         {"combos", combos},
         {"fuzz", fuzz},

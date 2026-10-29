@@ -193,6 +193,17 @@ void apps_manifest_clear(apps_manifest_t *m, void (*free_fn)(void *));
 void apps_pkg_free(apps_pkg_t *pkg, void (*free_fn)(void *));
 
 /*
+ * The message for a package whose Lua didn't compile, from raw, what apps_vm_load said of one of its files
+ * ("util.lua:7: unexpected symbol near '='"): "compile failed: ", raw, and the lines of the file it names around the
+ * line it gives (apps_vm_excerpt's text: " 6| ...\n>7| ...\n 8| ..."). A raw that names no file of the package, or
+ * names no line, is shown as it is. The file is what comes before raw's first ":<digits>:", matched against the
+ * paths of pkg's files whole. out is always terminated when cap is above 0, and cut at cap - 1 bytes on a character
+ * boundary; raw must not be inside out. One wording for two callers: the install pipeline's refusal (apps_install.c,
+ * step 4) and apphost's, whose check compiles what the install compiles.
+ */
+void apps_pkg_compile_message(const apps_pkg_t *pkg, const char *raw, char *out, size_t cap);
+
+/*
  * Whether data[0, len) is an LVGL v9 .bin image the gadget can draw: magic 0x19; colour format RGB565 (0x12),
  * RGB565A8 (0x14) or A8 (0x0E); not compressed (flag 0x0008) and with no flag but premultiplied alpha (0x0001,
  * which LVGLImage.py sets for a premultiplied image; the others, allocated and modifiable, say what an image's

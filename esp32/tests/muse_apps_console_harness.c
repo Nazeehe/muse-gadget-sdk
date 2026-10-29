@@ -224,6 +224,38 @@ bool apps_port_dark(void) {
     return false;
 }
 
+/* The system's alarms and sound (apps_port.h): none here, as no case runs an app's alarm. */
+bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    (void)app;
+    (void)name;
+    (void)ms;
+    (void)sound;
+    (void)wake;
+    return false;
+}
+
+void apps_port_alarm_cancel(const char *app, const char *name) {
+    (void)app;
+    (void)name;
+}
+
+int64_t apps_port_alarm_remaining(const char *app, const char *name) {
+    (void)app;
+    (void)name;
+    return -1;
+}
+
+int apps_port_alarm_list(const char *app, char names[4][24], int64_t remaining[4]) {
+    (void)app;
+    (void)names;
+    (void)remaining;
+    return 0;
+}
+
+void apps_port_sound_chirp(void) {}
+
+void apps_port_sound_stop(void) {}
+
 /* The store's room: plenty (tests/test_muse_apps_install.py has the budget). */
 size_t apps_port_psram_free(void) {
     return (size_t)64 << 20;
@@ -412,6 +444,15 @@ bool apps_task_stop(char *err, size_t err_len) {
     stops++;
     snprintf(err, err_len, "%s", stop_ok ? "" : stop_err);
     return stop_ok;
+}
+
+/* The job tells apps_task when the store has no such app, so that the alarms waiting for its launch are given up: who it told. */
+static int missing_calls;
+static char missing_id[APPS_ID_MAX + 1];
+
+void apps_task_launch_missing(const char *id) {
+    missing_calls++;
+    snprintf(missing_id, sizeof missing_id, "%s", id);
 }
 
 static apps_status_t status_record; /* what apps_task_status copies */
@@ -956,12 +997,16 @@ static void launch_by_id_prints_nothing(void) {
     CHECK(runs == before + 2, "nothing ran");
     CHECK(logs == logged + 1 && strcmp(last_log, "W muse_apps: launch nosuch: no such app on the gadget") == 0,
           "one log line: '%s'", last_log);
+    /* The store has no such app: the alarms that wait for it are given up. */
+    CHECK(missing_calls == 1 && strcmp(missing_id, "nosuch") == 0, "apps_task_launch_missing: %d calls, '%s'", missing_calls,
+          missing_id);
     run_ok = false;
     snprintf(run_err, sizeof run_err, "crashed in start(): main.lua:2: boom");
     CHECK(muse_apps_launch("hello", true), "queued");
     run_jobs();
     EXPECT("");
     CHECK(strcmp(last_log, "W muse_apps: launch hello: crashed in start(): main.lua:2: boom") == 0, "'%s'", last_log);
+    CHECK(missing_calls == 1, "an app the store has isn't missing: %d calls", missing_calls);
     run_ok = true;
     logged = logs;
     submit_refuses = true;

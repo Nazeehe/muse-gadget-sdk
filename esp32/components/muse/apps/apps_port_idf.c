@@ -17,7 +17,8 @@
 /*
  * apps_port.h on the gadget. The heap is PSRAM; the clock is esp_timer's; an app's log line goes to the console as
  * "@app.log <id> <line>", at most 1,024 bytes of them a second, queued in the call and printed after it; the UI lock is
- * a static FreeRTOS mutex that muse_apps_start() makes (apps_port_init).
+ * a static FreeRTOS mutex that muse_apps_start() makes (apps_port_init); the system's alarms are apps_alarm.c's, and a chirp
+ * is the voice task's.
  *
  * The UI lock keeps the host runner's contract (tools/muse/apphost/apphost_port.c): it is never taken twice by one
  * task, given back only by its holder, and nothing uses the heap while it is held. The host aborts on a breach; here a
@@ -42,11 +43,13 @@
 #include "freertos/task.h"
 #include "psa/crypto.h"
 
+#include "apps_alarm.h"
 #include "apps_echo.h"
 #include "apps_pkg.h"
 #include "muse_mem.h"
 #include "muse_sntp.h"
 #include "muse_ui.h"
+#include "muse_voice.h"
 
 static const char *TAG = "muse_apps";
 
@@ -233,6 +236,33 @@ void apps_port_ui_unlock(void) {
     }
     s_ui_holder = NULL;
     xSemaphoreGive(s_ui_lock);
+}
+
+/* The alarms and the sound: apps_alarm.c keeps the first (its table, its timers and its ring), the voice task plays the second. */
+
+bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    return apps_alarm_arm(app, name, ms, sound, wake);
+}
+
+void apps_port_alarm_cancel(const char *app, const char *name) {
+    apps_alarm_cancel(app, name);
+}
+
+int64_t apps_port_alarm_remaining(const char *app, const char *name) {
+    return apps_alarm_remaining(app, name);
+}
+
+int apps_port_alarm_list(const char *app, char names[4][24], int64_t remaining[4]) {
+    return apps_alarm_list(app, names, remaining);
+}
+
+/* A flag and a bit of an event group, whichever task asks: the voice task chirps when it is idle, at the volume that is set. */
+void apps_port_sound_chirp(void) {
+    muse_voice_request_chirp();
+}
+
+void apps_port_sound_stop(void) {
+    apps_alarm_ring_stop();
 }
 
 /* PSA's SHA-256 (C21): IDF v6's mbedTLS is PSA, as main/link_pairing.c uses it. psa_crypto_init is cheap once it has

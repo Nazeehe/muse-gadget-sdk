@@ -87,3 +87,31 @@ void apps_port_ui_unlock(void);
 
 /* The SHA-256 (FIPS 180-4) of data[0, len) into out. data may be NULL when len is 0. Any task. */
 void apps_port_sha256(const void *data, size_t len, uint8_t out[32]);
+
+/*
+ * The system's alarms, which belong to no app: they run on the monotonic clock, outlive the app that armed them, and, when
+ * one fires, the system starts that app again if it isn't running and tells it (alarm(name)). The device keeps them in
+ * apps_alarm.c (apps_alarm.h says all of it), apphost on its fake clock. An app is named by its id, an alarm by a name of 1
+ * to 23 characters of a-z, 0-9 and _; the arrays of names hold 24 bytes with the NUL. Any task.
+ */
+
+/* Arms `name` of `app` to fire ms from now, 1 to 604800000 (a week), replacing the one of that name. With sound the ring
+ * goes when it fires, and with wake the screen wakes. False, with nothing changed, when the app has 4 of other names or the
+ * gadget has 8 in all, or an argument isn't valid. */
+bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake);
+
+/* Disarms it. Nothing for a name that isn't armed. */
+void apps_port_alarm_cancel(const char *app, const char *name);
+
+/* Milliseconds until it fires, rounded up (0 when it is due and its app hasn't been told), or -1 if there is no such alarm. */
+int64_t apps_port_alarm_remaining(const char *app, const char *name);
+
+/* The names of app's alarms, earliest first, with the time left of each; returns how many (at most 4). */
+int apps_port_alarm_list(const char *app, char names[4][24], int64_t remaining[4]);
+
+/* One chirp, at the volume the gadget has set; it returns at once (the device asks the voice task, which plays it when it
+ * is idle, and keeps one request). */
+void apps_port_sound_chirp(void);
+
+/* Ends the ring of an alarm that is going. Nothing when none is. */
+void apps_port_sound_stop(void);

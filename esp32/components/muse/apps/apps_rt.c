@@ -697,7 +697,7 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     lua_State *L = apps_vm_lua(rt->vm);
     apps_json_open(L);  /* safe outside a call: if the heap refuses, the call below ends out of memory */
     apps_ui_open(L, rt->ui);
-    apps_svc_open(L, rt);  /* time, os and timer: before main.lua, so its top level can arm a timer */
+    apps_svc_open(L, rt);  /* time, os, timer, alarm and sound: before main.lua, so its top level can arm a timer */
     rt->duty_second = apps_port_mono_ms() / DUTY_WINDOW_MS;  /* main.lua's top level is in the first window */
 
     boot_t boot = {.rt = rt, .main = main, .outcome = BOOT_OK};
@@ -1185,6 +1185,14 @@ const char *apps_rt_last_error(const apps_rt_t *rt) {
 
 const char *apps_rt_warnings(const apps_rt_t *rt) {
     return rt != NULL ? rt->warnings : "";
+}
+
+const char *apps_rt_id(const apps_rt_t *rt) {
+    return rt->pkg->manifest.id;
+}
+
+bool apps_rt_permits(const apps_rt_t *rt, unsigned perm) {
+    return (rt->pkg->manifest.perms & perm) != 0;
 }
 
 apps_vm_t *apps_rt_vm(apps_rt_t *rt) {

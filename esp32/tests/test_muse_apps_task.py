@@ -39,8 +39,9 @@ MUSE = ROOT / "components/muse"
 APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_task_harness.c"
-SOURCES = [HARNESS, APPS / "apps_task.c", APPS / "apps_io.c", APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c",
-           APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_svc.c"]
+SOURCES = [HARNESS, TESTS / "muse_apps_fake_esp_timer.c", APPS / "apps_task.c", APPS / "apps_io.c", APPS / "apps_alarm.c",
+           APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c", APPS / "apps_pkg.c",
+           APPS / "apps_suggest.c", APPS / "apps_svc.c"]
 CONSOLE_SOURCES = [APPS / "apps_console.c", APPS / "apps_install.c"]
 
 # What apps_task.c and muse_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one is a line that includes the fakes.
@@ -271,6 +272,32 @@ class AppTaskTest(HarnessCase):
     def test_cpu_pct_and_the_duty_cycle_count_the_same_time(self):  # B: one booking, read twice
         self.run_case("cpu_pct_and_the_duty_cycle_agree")
 
+    # ---- Task 17: the system's alarms, told by the loop ----
+
+    def test_an_alarm_of_the_running_app_fronts_it_and_calls_alarm(self):  # the esp_timer task marks, rings, wakes and posts
+        self.run_case("an_alarm_of_the_running_app_fronts_it_and_calls_it")
+
+    def test_an_alarms_delivery_does_not_depend_on_the_post(self):  # C22: the loop's own round finds it within a second
+        self.run_case("a_delivery_does_not_depend_on_the_post")
+
+    def test_an_alarm_posted_to_a_full_queue_is_told(self):  # C22: the post is dropped and nothing is lost
+        self.run_case("an_alarm_posted_to_a_full_queue_is_told")
+
+    def test_alarms_are_told_in_the_order_they_fired(self):
+        self.run_case("alarms_are_told_in_the_order_they_fired")
+
+    def test_an_alarm_during_a_voice_turn_fronts_the_app_after_it(self):  # C11
+        self.run_case("an_alarm_during_a_voice_turn_fronts_the_app_after_it")
+
+    def test_an_alarm_is_told_while_the_screen_sleeps(self):
+        self.run_case("an_alarm_is_told_while_the_screen_sleeps")
+
+    def test_a_crash_in_alarm_ends_the_ring(self):
+        self.run_case("a_crash_in_alarm_ends_the_ring")
+
+    def test_an_alarm_cancelled_between_the_copy_and_the_take_is_not_told(self):  # the same alarm is never told twice
+        self.run_case("an_alarm_cancelled_before_it_is_taken_is_not_told")
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))
@@ -323,6 +350,26 @@ class AppTaskStoreTest(HarnessCase):
 
     def test_two_launches_of_one_id_run_it_once(self):  # F10: the second fronts it
         self.run_case("two_launches_of_one_id_run_it_once")
+
+    # ---- Task 17: an alarm for an app that doesn't run ----
+
+    def test_an_alarm_starts_a_stopped_app_and_calls_it_after_start(self):  # X11: the worker loads it; start() may arm the name again
+        self.run_case("an_alarm_starts_a_stopped_app_and_calls_it_after_start")
+
+    def test_an_alarm_replaces_the_app_that_runs_with_its_own(self):
+        self.run_case("an_alarm_replaces_the_app_that_runs_with_its_own")
+
+    def test_an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends(self):  # "alarm <name> for missing app <id>"
+        self.run_case("an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends")
+
+    def test_an_alarm_whose_app_does_not_start_is_dropped_after_ten_seconds(self):  # every wait bounded
+        self.run_case("a_launch_that_does_not_come_gives_up")
+
+    def test_a_refused_alarm_launch_is_asked_for_again_a_second_later(self):  # not at every round
+        self.run_case("a_refused_alarm_launch_is_asked_for_again")
+
+    def test_alarms_of_two_stopped_apps_are_told_one_after_the_other(self):
+        self.run_case("alarms_of_two_stopped_apps_are_told_one_after_the_other")
 
 
 if __name__ == "__main__":

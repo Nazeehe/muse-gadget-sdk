@@ -37,11 +37,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "apps_alarm.h"
 #include "apps_echo.h"
 #include "apps_port.h"
 #include "muse_apps_task_fakes.h"
 #include "muse_sntp.h"
 #include "muse_ui.h"
+#include "muse_voice.h"
 #include "psa/crypto.h"
 
 static int failures;
@@ -217,6 +219,57 @@ bool muse_ui_dark(void) {
 
 bool muse_time_valid(void) {
     return clock_is_set;
+}
+
+/* ---- What the port asks of the alarms (apps_alarm.c's own cases are tests/muse_apps_alarm_harness.c) and of the voice task ---- */
+
+static struct {
+    char app[32], name[32];
+    int64_t ms;
+    bool sound, wake;
+    int arms, cancels, asks, lists, stops, chirps;
+    bool answer;
+} alarm_calls;
+
+bool apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    snprintf(alarm_calls.app, sizeof alarm_calls.app, "%s", app);
+    snprintf(alarm_calls.name, sizeof alarm_calls.name, "%s", name);
+    alarm_calls.ms = ms;
+    alarm_calls.sound = sound;
+    alarm_calls.wake = wake;
+    alarm_calls.arms++;
+    return alarm_calls.answer;
+}
+
+void apps_alarm_cancel(const char *app, const char *name) {
+    snprintf(alarm_calls.app, sizeof alarm_calls.app, "%s", app);
+    snprintf(alarm_calls.name, sizeof alarm_calls.name, "%s", name);
+    alarm_calls.cancels++;
+}
+
+int64_t apps_alarm_remaining(const char *app, const char *name) {
+    snprintf(alarm_calls.app, sizeof alarm_calls.app, "%s", app);
+    snprintf(alarm_calls.name, sizeof alarm_calls.name, "%s", name);
+    alarm_calls.asks++;
+    return 4321;
+}
+
+int apps_alarm_list(const char *app, char names[4][24], int64_t remaining[4]) {
+    snprintf(alarm_calls.app, sizeof alarm_calls.app, "%s", app);
+    snprintf(names[0], 24, "first");
+    snprintf(names[1], 24, "second");
+    remaining[0] = 10;
+    remaining[1] = 20;
+    alarm_calls.lists++;
+    return 2;
+}
+
+void apps_alarm_ring_stop(void) {
+    alarm_calls.stops++;
+}
+
+void muse_voice_request_chirp(void) {
+    alarm_calls.chirps++;
 }
 
 /* ---- The console: stdout, into a file ---- */
@@ -601,6 +654,33 @@ static void the_wall_clock_counts_when_the_helper_says(void) {
           (long long)high);
 }
 
+/* The alarms and the sound are other modules' (apps_alarm.c, the voice task): the port passes what it is given on, and what it is
+ * told back, and a chirp is the voice task's request and a stop is the ring's. */
+static void alarms_and_sound_go_to_their_owners(void) {
+    alarm_calls.answer = true;
+    CHECK(apps_port_alarm_arm("clock", "wake_up", 90000, true, false) && alarm_calls.arms == 1, "arm");
+    CHECK(strcmp(alarm_calls.app, "clock") == 0 && strcmp(alarm_calls.name, "wake_up") == 0 && alarm_calls.ms == 90000 &&
+              alarm_calls.sound && !alarm_calls.wake,
+          "arm passed %s/%s %lld %d %d", alarm_calls.app, alarm_calls.name, (long long)alarm_calls.ms, alarm_calls.sound,
+          alarm_calls.wake);
+    alarm_calls.answer = false;
+    CHECK(!apps_port_alarm_arm("clock", "x", 1, false, true) && alarm_calls.arms == 2 && !alarm_calls.sound && alarm_calls.wake,
+          "a refusal is told");
+    apps_port_alarm_cancel("clock", "wake_up");
+    CHECK(alarm_calls.cancels == 1 && strcmp(alarm_calls.name, "wake_up") == 0, "cancel");
+    CHECK(apps_port_alarm_remaining("clock", "t") == 4321 && alarm_calls.asks == 1 && strcmp(alarm_calls.name, "t") == 0, "remaining");
+    char names[4][24] = {{0}};
+    int64_t left[4] = {0};
+    CHECK(apps_port_alarm_list("clock", names, left) == 2 && strcmp(names[1], "second") == 0 && left[0] == 10 && left[1] == 20 &&
+              strcmp(alarm_calls.app, "clock") == 0,
+          "list");
+    CHECK(alarm_calls.chirps == 0 && alarm_calls.stops == 0, "nothing sounded yet");
+    apps_port_sound_chirp();
+    CHECK(alarm_calls.chirps == 1 && alarm_calls.stops == 0, "one chirp is one request to the voice task");
+    apps_port_sound_stop();
+    CHECK(alarm_calls.stops == 1 && alarm_calls.chirps == 1, "stop is the ring's");
+}
+
 static const struct {
     const char *name;
     void (*run)(void);
@@ -613,6 +693,7 @@ static const struct {
     {"breach_kinds", breach_kinds},
     {"dark_follows_the_ui", dark_follows_the_ui},
     {"the_wall_clock_counts_when_the_helper_says", the_wall_clock_counts_when_the_helper_says},
+    {"alarms_and_sound_go_to_their_owners", alarms_and_sound_go_to_their_owners},
 };
 
 int main(int argc, char **argv) {

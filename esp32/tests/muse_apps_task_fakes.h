@@ -38,6 +38,39 @@ typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_FAIL -1
 #define ESP_ERR_NO_MEM 0x101
+#define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_INVALID_STATE 0x103
+
+/* ---- esp_timer.h: what apps_alarm.c calls (esp_timer_get_time is muse_apps_lv_fakes.h's, each harness's own clock) ---- */
+
+typedef struct fake_esp_timer *esp_timer_handle_t;
+typedef void (*esp_timer_cb_t)(void *arg);
+typedef enum { ESP_TIMER_TASK, ESP_TIMER_MAX } esp_timer_dispatch_t;
+typedef struct {
+    esp_timer_cb_t callback;
+    void *arg;
+    esp_timer_dispatch_t dispatch_method;
+    const char *name;
+    bool skip_unhandled_events;
+} esp_timer_create_args_t;
+
+esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *out);
+esp_err_t esp_timer_start_once(esp_timer_handle_t timer, uint64_t timeout_us);
+esp_err_t esp_timer_start_periodic(esp_timer_handle_t timer, uint64_t period_us);
+esp_err_t esp_timer_stop(esp_timer_handle_t timer);
+
+/* tests/muse_apps_fake_esp_timer.c makes these real: one thread runs every callback, one at a time and in the order they are
+ * due, as the esp_timer task does, polling esp_timer_get_time for the clock a harness gives. What a harness asks of it: */
+bool fake_esp_timer_on_task(void);  /* the caller is that thread */
+void fake_esp_timer_sync(void);     /* returns once every timer due now has run its callback, and the thread is idle */
+int64_t fake_esp_timer_next_due_us(void);  /* when the earliest armed timer is due, or INT64_MAX when none is armed */
+/* Runs the callback of the timer made with this name and arg (the arg as a number) once, on that thread, whether or not it is
+ * armed: a call that was on its way when the timer was stopped or restarted, which a real esp_timer task can still make.
+ * Returns when it has run. */
+void fake_esp_timer_call(const char *name, uintptr_t arg);
+/* The next esp_timer_stop of a timer that is armed is followed at once by a start of it (10 ms on), as if another task's start
+ * came between that stop and the caller's next call: the caller's own start then finds it armed (ESP_ERR_INVALID_STATE). */
+void fake_esp_timer_start_behind_next_stop(void);
 
 /* ---- esp_heap_caps.h: what muse_apps_lv_fakes.h doesn't declare ---- */
 

@@ -29,7 +29,8 @@
  *
  * What the app's code is given besides the sandbox's libraries (apps_vm.h), `json` (apps_json.h), `ui`
  * (apps_ui.h; main.lua's top level can already draw, so ui.image finds the package's images from the start) and
- * `time`, `os` and `timer` (apps_svc.h; main.lua's top level can already arm a timer, which runs once start() has):
+ * `time`, `os`, `timer`, `alarm` and `sound` (apps_svc.h; main.lua's top level can already arm a timer, which runs once
+ * start() has):
  * - print(...): the tostring of each argument, joined with tabs, as the lines of the app's log. The text
  *   is split at each "\n". In each line, a byte under 0x20 but tab, 0x7F, a C1 control character
  *   (U+0080 to U+009F) and anything that isn't valid UTF-8 (RFC 3629) become '?', one for each byte, or
@@ -329,6 +330,11 @@ bool apps_rt_timer_take(apps_rt_t *rt, int slot, uint32_t gen, int *fn_ref);
 
 /* How many timers are armed. */
 int apps_rt_timer_count(const apps_rt_t *rt);
+
+/* The app's id, and whether its manifest has a permission (APPS_PERM_*, apps_pkg.h): what the services (apps_svc.c) ask. The id
+ * is valid as long as the runtime is (it is the package's, which the runtime's caller keeps). */
+const char *apps_rt_id(const apps_rt_t *rt);
+bool apps_rt_permits(const apps_rt_t *rt, unsigned perm);
 
 /* The VM, for what the runtime doesn't wrap: apps_vm_kill, apps_vm_in_call, apps_vm_call_started_ms and the
  * memory counters (apps_vm.h). What is installed into its globals through it is there for the handlers, not for

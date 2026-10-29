@@ -52,6 +52,12 @@ TABLE_ARGUMENT = "the argument must be a table like {year = 2026, month = 1, day
 YEARS = "(the years 0 to 9999)"
 DAYS_RULE = "os.time: day, hour, min and sec add up to more than 3000000 days"
 NOT_REPRESENTED = f"os.time: the time can't be represented {YEARS}"
+# The alarm and sound modules' (the brief's, and the controller's ruling on a full table).
+ALARM_PERMISSION = 'alarm: add "alarm" to "permissions" in manifest.json'
+SOUND_PERMISSION = 'sound: add "sound" to "permissions" in manifest.json'
+ALARM_NAME_RULE = "alarm: name must be 1-23 characters of a-z, 0-9 and _"
+ALARM_MS_RULE = "alarm.after: ms must be a whole number from 1 to 604800000"
+TOO_MANY_ALARMS = "alarm: no more than 4 alarms per app"
 
 
 def timer_ms_rule(name):
@@ -448,6 +454,319 @@ class TimerTest(SvcTestCase):
                            script=["dark on", "advance 500", "dark off", "state", "advance 0"])
         before, after = chunks(run)[:2]
         self.assertEqual((logs(before), logs(after)), ([], ["late"]))
+
+
+class AlarmTest(SvcTestCase):
+    """The `alarm` and `sound` modules (apps_svc.c) on apphost's fake clock: an alarm is the system's, so it outlives the app's
+    stop and calls the app again, and it runs on the monotonic clock like a timer."""
+
+    def alarm_app(self, handlers, script, permissions=("alarm", "sound"), **kw):
+        """An app with the handlers of `handlers` (Lua statements that fill `app`; `bare` and `says` at hand), the manifest
+        permissions given, then the script."""
+        main = BARE + "local app = {}\n" + handlers + "\nreturn app\n"
+        app = self.make_app("scratch", main, manifest={"permissions": list(permissions)})
+        return self.host(app, script=script, **kw)
+
+    def alarm_lines(self, source, permissions=("alarm", "sound"), script=None, **kw):
+        """A one-file app whose start() runs `source` (Lua statements, `bare` and `says` at hand), with the permissions
+        given: the run, whose logs are what start() printed."""
+        main = BARE + "local app = {}\nfunction app.start()\n" + source + "\nend\nreturn app\n"
+        app = self.make_app("scratch", main, manifest={"permissions": list(permissions)})
+        return self.host(app, script=script, **kw)
+
+    # ---- The brief's tests ----
+
+    def test_alarm_fires_and_calls_handler(self):
+        run = self.host(FIXTURES / "alarm5", script=["advance 4999", "state", "advance 1", "state", "dump"])
+        before, at = chunks(run)[:2]
+        self.assertEqual(before, [{"event": "started", "id": "alarm5", "name": "Alarm 5"}])  # 4999 ms: nothing has fired
+        self.assertEqual(at, [
+            {"event": "alarm", "name": "t", "sound": True, "wake": True},      # at 5000 ms, as the system fires it
+            {"event": "ring", "on": True},                                      # with sound, the ring begins
+            {"event": "log", "app": "alarm5", "line": "rang t"},                # then the app is told: alarm("t")
+        ])
+        self.assertEqual(run.of("dump")[0]["widgets"][0]["text"], "rang t")
+
+    def test_alarm_remaining_counts_down(self):
+        run = self.alarm_app("""
+            function app.start() alarm.after("t", 5000) end
+            function app.message()
+                return {t = alarm.remaining("t") or false, other = alarm.remaining("other") or false,
+                        kind = math.type(alarm.remaining("t")) or false}
+            end
+        """, script=["message a", "advance 1500", "message b", "advance 3499", "message c", "advance 1", "message d"])
+        a, b, c, d = replies(run)
+        self.assertEqual(a, {"t": 5000, "other": False, "kind": "integer"})
+        self.assertEqual(b, {"t": 3500, "other": False, "kind": "integer"})  # 5000, and `advance 1500`, give 3500
+        self.assertEqual(c["t"], 1)
+        self.assertEqual(d, {"t": False, "other": False, "kind": False})     # a one-shot that has fired is gone
+
+    def test_alarm_limit_and_name_rules(self):
+        wrong_names = ['""', '"A"', '"a b"', '"a-b"', '"a.b"', '"' + "x" * 24 + '"', '"\u00e9"', "5", "nil", "{}", "true"]
+        right_names = ['"a"', '"a_1"', '"0"', '"_"', '"' + "x" * 23 + '"']
+        wrong_ms = ["0", "-1", "604800001", "1.5", '"1000"', "true", "nil", "{}", "1e100", "0/0", "math.huge", "-math.huge"]
+        name_calls = "".join(f"says(alarm.after, {n}, 1000) says(alarm.cancel, {n}) says(alarm.remaining, {n})\n"
+                             for n in wrong_names)
+        ms_calls = "".join(f'says(alarm.after, "t", {ms})\n' for ms in wrong_ms)
+        run = self.alarm_lines(name_calls + ms_calls + """
+            says(alarm.after, "t") says(alarm.after)
+            says(alarm.after, "t", 1) says(alarm.after, "t", 604800000) says(alarm.after, "t", 5000.0) says(alarm.after, "t", 1e3)
+            alarm.cancel("t")
+            for _, name in ipairs({""" + ", ".join(right_names) + """}) do says(alarm.after, name, 1000) alarm.cancel(name) end
+            for i = 1, 4 do alarm.after("n" .. i, 1000 * i) end
+            says(alarm.after, "n5", 1000) says(alarm.after, "n3", 9000) says(alarm.after, "n5", 1000)
+            alarm.cancel("n1")
+            says(alarm.after, "n5", 1000) says(alarm.after, "n6", 1000)
+            print(#alarm.list())
+        """, permissions=("alarm",))
+        self.assertEqual(run.messages("crash"), [])
+        self.assertEqual(run.logs(), [
+            *[ALARM_NAME_RULE] * (3 * len(wrong_names)),   # after, cancel and remaining all say it
+            *[ALARM_MS_RULE] * len(wrong_ms),
+            ALARM_MS_RULE, ALARM_NAME_RULE,                 # no ms; no name at all
+            "ok", "ok", "ok", "ok",                         # 1 ms, a week, 5000.0 and 1e3: whole numbers
+            *["ok"] * len(right_names),
+            TOO_MANY_ALARMS, "ok", TOO_MANY_ALARMS,         # four are armed: a fifth is refused, a name armed is replaced
+            "ok", TOO_MANY_ALARMS,                          # one cancelled makes room for one
+            "4",
+        ])
+
+    def test_permission_messages(self):
+        calls = """
+            says(alarm.after, "t", 1000) says(alarm.cancel, "t") says(alarm.remaining, "t") says(alarm.list)
+            says(sound.chirp) says(sound.stop)
+        """
+        none = self.alarm_lines('says(alarm.after, "BAD", 0)' + calls, permissions=())
+        # The permission is the first thing checked: before the name and the ms.
+        self.assertEqual(none.logs(), [ALARM_PERMISSION] * 5 + [SOUND_PERMISSION, "ok"])  # sound.stop needs none
+        only_alarm = self.alarm_lines(calls, permissions=("alarm",))
+        self.assertEqual(only_alarm.logs(), ["ok", "ok", "ok", "ok", SOUND_PERMISSION, "ok"])
+        self.assertEqual(only_alarm.of("chirp"), [])
+        only_sound = self.alarm_lines(calls, permissions=("sound",))
+        self.assertEqual(only_sound.logs(), [ALARM_PERMISSION] * 4 + ["ok", "ok"])
+        self.assertEqual(only_sound.of("chirp"), [{"event": "chirp"}])
+
+    def test_alarm_launches_stopped_app(self):
+        run = self.alarm_app("""
+            function app.start() print("start") end
+            function app.alarm(name) print("alarm " .. name) end
+            function app.message() alarm.after("t", 2000) return true end
+        """, script=["message arm", "stop", "state", "advance 1999", "state", "advance 1", "state"])
+        # Stopped, the app has nothing armed (its timers go with it), but an alarm is the system's: at 2000 ms it starts the app
+        # again, and alarm("t") follows start().
+        quiet, at = chunks(run)[1:3]
+        self.assertEqual(quiet, [])
+        self.assertEqual(at, [
+            {"event": "alarm", "name": "t", "sound": True, "wake": True},
+            {"event": "ring", "on": True},
+            {"event": "log", "app": "scratch", "line": "start"},
+            {"event": "started", "id": "scratch", "name": "scratch"},
+            {"event": "log", "app": "scratch", "line": "alarm t"},
+        ])
+        self.assertEqual([e["state"] for e in run.of("state")], ["stopped", "stopped", "running"])
+
+    def test_the_launch_by_an_alarm_is_a_new_run_of_the_package(self):  # as on the gadget, where a stop frees the runtime
+        run = self.alarm_app("""
+            local launches = 0
+            print("top")
+            function app.start() launches = launches + 1 print("start", launches) end
+            function app.alarm(name) print("alarm", name, launches) end
+            function app.message() alarm.after("t", 2000) return true end
+        """, script=["message arm", "stop", "advance 2000"])
+        # main.lua runs from the top again and its locals are new: `launches` is 1 again, not 2.
+        self.assertEqual(run.logs(), ["top", "start\t1", "top", "start\t1", "alarm\tt\t1"])
+
+    def test_sound_stop_silences_ring(self):
+        run = self.alarm_app("""
+            function app.start() alarm.after("t", 1000) end
+            function app.message(event) if event == "stop" then sound.stop() end return true end
+        """, script=["advance 1000", "message stop", "message stop", "advance 100000"])
+        # sound.stop ends the ring, once: the second, with nothing ringing, prints nothing, and nothing ends it later.
+        self.assertEqual(run.kinds(), ["started", "alarm", "ring", "ring", "reply", "reply"])
+        self.assertEqual(run.of("ring"), [{"event": "ring", "on": True}, {"event": "ring", "on": False}])
+
+    def test_alarm_unaffected_by_clock_jump(self):
+        run = self.alarm_app("""
+            function app.start() alarm.after("t", 5000) end
+            function app.alarm(name) print("rang", name, time.mono()) end
+        """, script=["advance 1000", f"sync {SYNCED}", "advance 3999", "state", "advance 1", "state"])
+        before, at = chunks(run)[:2]
+        self.assertEqual(logs(before), [])  # the wall clock jumped from nowhere to 2026 at 1000 ms, and nothing noticed
+        self.assertEqual(logs(at), ["rang\tt\t6000"])  # 5000 ms after start() on the monotonic clock, which began at 1000
+
+
+    # ---- What the brief's don't cover ----
+
+    def test_the_options_decide_the_ring_and_the_screen(self):
+        run = self.alarm_app("""
+            function app.start()
+                alarm.after("loud", 100)
+                alarm.after("quiet", 200, {sound = false})
+                alarm.after("dim", 300, {wake = false})
+                alarm.after("none", 400, {sound = false, wake = false})
+            end
+        """, script=["advance 100", "state", "advance 100", "state", "advance 100", "state", "advance 100"])
+        started, quiet, dim, none = chunks(run)[:4]
+        loud = started[1:]  # after the launch's `started`
+        self.assertEqual(loud, [{"event": "alarm", "name": "loud", "sound": True, "wake": True}, {"event": "ring", "on": True}])
+        # No sound: no chirp and no change of the ring that goes; the alarm's event says what it asked for.
+        self.assertEqual(quiet, [{"event": "alarm", "name": "quiet", "sound": False, "wake": True}])
+        self.assertEqual(dim, [{"event": "alarm", "name": "dim", "sound": True, "wake": False}])
+        self.assertEqual(none, [{"event": "alarm", "name": "none", "sound": False, "wake": False}])
+
+    def test_an_alarm_with_wake_lights_a_dark_screen_and_one_without_leaves_it(self):
+        main = """
+            function app.start()
+                timer.after(50, function() print("timer") end)
+                alarm.after("t", 100, {wake = %s, sound = false})
+            end
+        """
+        # Dark, no timer runs. The alarm at 100 ms lights the screen (wake): the timer, overdue since 50, runs in that step.
+        woken = self.alarm_app(main % "true", script=["dark on", "advance 99", "state", "advance 1", "state"])
+        before, at = chunks(woken)[:2]
+        self.assertEqual(logs(before), [])
+        self.assertEqual([e["event"] for e in at], ["alarm", "log"])  # the alarm first, then the timer it woke the screen for
+        # Without wake the screen stays dark however long: the timer waits for the screen to be lit.
+        dark = self.alarm_app(main % "false", script=["dark on", "advance 200", "state", "dark off", "advance 0"])
+        before, after = chunks(dark)[:2]
+        self.assertEqual([e["event"] for e in before], ["started", "alarm"])
+        self.assertEqual([e["event"] for e in after], ["log"])
+        self.assertEqual(logs(after), ["timer"])
+
+    def test_alarms_are_replaced_cancelled_and_listed_earliest_first(self):
+        run = self.alarm_app("""
+            function app.start()
+                alarm.after("b", 2000)
+                alarm.after("a", 1000)
+                alarm.after("c", 3000, {sound = false})
+            end
+            function app.message(event, data)
+                if event == "list" then return alarm.list() end
+                if event == "replace" then alarm.after("a", 5000) return true end
+                if event == "cancel" then alarm.cancel("b") alarm.cancel("never") return true end
+                if event == "kinds" then
+                    local list = alarm.list()
+                    return {math.type(list[1].remaining), math.type(alarm.remaining("a")), type(list[1].name), #list}
+                end
+            end
+        """, script=["message list", "advance 400", "message list", "message replace", "message list", "message cancel", "message list",
+                     "message kinds"])
+        first, later, _, replaced, _, cancelled, kinds = replies(run)
+        self.assertEqual(first, [{"name": "a", "remaining": 1000}, {"name": "b", "remaining": 2000}, {"name": "c", "remaining": 3000}])
+        self.assertEqual(later, [{"name": "a", "remaining": 600}, {"name": "b", "remaining": 1600}, {"name": "c", "remaining": 2600}])
+        self.assertEqual(replaced, [{"name": "b", "remaining": 1600}, {"name": "c", "remaining": 2600}, {"name": "a", "remaining": 5000}])
+        self.assertEqual(cancelled, [{"name": "c", "remaining": 2600}, {"name": "a", "remaining": 5000}])
+        self.assertEqual(kinds, ["integer", "integer", "string", 2])
+        self.assertEqual(run.of("alarm"), [])  # nothing came due: a replaced and a cancelled alarm never fire
+
+    def test_alarm_and_sound_return_no_handle_and_list_gives_plain_tables(self):  # X17: nothing for getmetatable to open
+        run = self.alarm_app("""
+            function app.message()
+                local counts = {select("#", alarm.after("t", 1000)), select("#", alarm.cancel("t")), select("#", sound.chirp()),
+                                select("#", sound.stop())}
+                alarm.after("t", 1000)
+                local item = alarm.list()[1]
+                return {counts = counts, item = type(getmetatable(item)), list = type(getmetatable(alarm.list()))}
+            end
+        """, script=["message go"])
+        self.assertEqual(replies(run), [{"counts": [0, 0, 0, 0], "item": "nil", "list": "nil"}])
+
+    def test_a_fired_alarm_is_gone_when_alarm_is_called_and_the_handler_may_arm_it_again(self):
+        run = self.alarm_app("""
+            local n = 0
+            function app.start() alarm.after("t", 1000) end
+            function app.alarm(name)
+                n = n + 1
+                print("rang " .. name .. " " .. tostring(alarm.remaining(name)) .. " " .. #alarm.list())
+                if n < 3 then alarm.after(name, 1000) end
+            end
+        """, script=["advance 3500"])
+        self.assertEqual(logs(run.events), ["rang t nil 0", "rang t nil 0", "rang t nil 0"])
+        self.assertEqual(len(run.of("alarm")), 3)
+
+    def test_start_may_arm_the_name_that_started_the_app(self):
+        # An alarm clock sets its next alarm in start(): the alarm that launched it is still told, and the new one is armed.
+        run = self.alarm_app("""
+            function app.start() alarm.after("t", 1000) end
+            function app.alarm(name) print("rang " .. name .. " " .. tostring(alarm.remaining(name))) end
+        """, script=["stop", "advance 1000", "state", "advance 1000", "state"])
+        first, second = chunks(run)[0][1:], chunks(run)[1]
+        # Started, then told, with start()'s new alarm 1000 ms away; and that one, 1000 ms on, finds nothing left to arm.
+        self.assertEqual([e["event"] for e in first], ["alarm", "ring", "started", "log"])
+        self.assertEqual(logs(first), ["rang t 1000"])
+        self.assertEqual([e["event"] for e in second], ["alarm", "log"])
+        self.assertEqual(logs(second), ["rang t nil"])
+
+    def test_the_ring_goes_on_a_minute_from_the_last_alarm_with_sound(self):
+        run = self.alarm_app("""
+            function app.start() alarm.after("one", 1000) alarm.after("two", 30000) end
+        """, script=["advance 29999", "state", "advance 1", "state", "advance 59999", "state", "advance 1", "state"])
+        first, second, still, over = chunks(run)[:4]
+        self.assertEqual([e["event"] for e in first], ["started", "alarm", "ring"])  # the ring began at 1000 ms
+        self.assertEqual([e["event"] for e in second], ["alarm"])  # at 30000, the second makes it a minute longer: to 90000
+        self.assertEqual(still, [])                                 # past the first minute, 61000: still going
+        self.assertEqual(over, [{"event": "ring", "on": False}])
+        self.assertEqual(run.of("ring"), [{"event": "ring", "on": True}, {"event": "ring", "on": False}])
+
+    def test_a_chirp_is_an_event_in_order_with_the_apps_own_logs(self):
+        run = self.alarm_app("""
+            function app.message() print("a") sound.chirp() print("b") sound.chirp() return true end
+        """, script=["message go"])
+        self.assertEqual([(e["event"], e.get("line")) for e in run.events[1:-1]],
+                         [("log", "a"), ("chirp", None), ("log", "b"), ("chirp", None)])
+
+    def test_an_app_that_crashed_is_started_again_by_its_alarm(self):
+        # A crash ends the app, and its alarm, which is the system's, starts it from the package again (a new runtime: its timer,
+        # the one that crashed it, was armed by start() as well, and is armed again).
+        run = self.alarm_app("""
+            function app.start()
+                print("start")
+                alarm.after("t", 1500)
+                timer.after(500, function() error("boom") end)
+            end
+            function app.alarm(name) print("rang " .. name) end
+        """, script=["advance 500", "state", "advance 1000", "state"])
+        crashed, relaunched = chunks(run)[:2]
+        self.assertEqual(crashed[-1]["event"], "crash")
+        self.assertEqual([e["event"] for e in relaunched], ["alarm", "ring", "log", "started", "log"])
+        self.assertEqual(logs(relaunched), ["start", "rang t"])
+        self.assertEqual([e["state"] for e in run.of("state")], ["crashed", "running"])
+
+    def test_an_error_in_alarm_crashes_the_app_and_ends_the_ring(self):
+        run = self.alarm_app("""
+            function app.start() alarm.after("t", 1000) end
+            function app.alarm(name) error("alarm boom") end
+        """, script=["advance 1000", "state", "advance 100000"], rc=1)
+        at = chunks(run)[0][1:]  # after the launch's `started`
+        self.assertEqual([e["event"] for e in at], ["alarm", "ring", "crash", "ring"])  # once: the advance doesn't say it again
+        self.assertTrue(at[2]["message"].startswith("main.lua:"), at[2])
+        self.assertEqual(at[3], {"event": "ring", "on": False})  # no one is left to stop it
+        self.assertEqual(len(run.of("ring")), 2)
+        self.assertEqual(chunks(run)[1], [])  # and no later ring
+
+    def test_alarms_that_come_due_together_fire_in_the_order_they_were_armed(self):
+        run = self.alarm_app("""
+            function app.start() alarm.after("late", 30, {sound = false}) alarm.after("x", 10, {sound = false}) alarm.after("y", 10, {sound = false}) end
+            function app.alarm(name) print(name) end
+        """, script=["advance 100"])
+        self.assertEqual([e["name"] for e in run.of("alarm")], ["x", "y", "late"])
+        self.assertEqual(logs(run.events), ["x", "y", "late"])
+
+    def test_the_options_are_checked(self):
+        run = self.alarm_lines("""
+            says(alarm.after, "t", 1000, 5) says(alarm.after, "t", 1000, "loud") says(alarm.after, "t", 1000, {sound = 1})
+            says(alarm.after, "t", 1000, {wake = "yes"}) says(alarm.after, "t", 1000, {loud = true}) says(alarm.after, "t", 1000, {true})
+            says(alarm.after, "t", 1000, {}) says(alarm.after, "t", 1000, nil) says(alarm.after, "t", 1000, {sound = false, wake = false})
+        """, permissions=("alarm",))
+        self.assertEqual(run.logs(), [
+            "alarm.after: options must be a table like {sound = true, wake = true}, got number",
+            "alarm.after: options must be a table like {sound = true, wake = true}, got string",
+            "alarm.after: sound must be true or false, got number",
+            "alarm.after: wake must be true or false, got string",
+            "alarm.after: unknown option 'loud' (valid: sound, wake)",
+            "alarm.after: unknown option '<number>' (valid: sound, wake)",
+            "ok", "ok", "ok",
+        ])
 
 
 class TimeTest(SvcTestCase):
@@ -1013,7 +1332,9 @@ class SvcStaticTest(unittest.TestCase):
         names = {"apps_time_funcs": ["now", "mono", "synced", "date", "format"],
                  "apps_os_funcs": ["time", "date", "clock", "difftime"],
                  "apps_timer_funcs": ["after", "every", "cancel"],
-                 "apps_timer_methods": ["cancel"]}
+                 "apps_timer_methods": ["cancel"],
+                 "apps_alarm_funcs": ["after", "cancel", "remaining", "list"],
+                 "apps_sound_funcs": ["chirp", "stop"]}
         for table, functions in names.items():
             with self.subTest(table):
                 body = re.search(rf"static const luaL_Reg {table}\[\] = \{{(.*?)\n\}};", source, re.S)
@@ -1025,6 +1346,16 @@ class SvcStaticTest(unittest.TestCase):
         match = re.search(r"luaL_newmetatable\(L, (\w+)\);(.*?)lua_setfield\(L, -2, \"__metatable\"\)", source, re.S)
         self.assertIsNotNone(match, "the timer handle's metatable has no __metatable")
         self.assertLess(match.group(2).count("\n"), 6)
+
+    def test_alarm_and_sound_hand_out_no_handle(self):  # X17
+        # The timer's handle is the one userdata with a metatable (protected, above); an alarm is the system's, named by a string,
+        # and alarm.list() gives plain tables. A later handle needs its own __metatable, and this test to be told of it.
+        source = (APPS / "apps_svc.c").read_text()
+        self.assertEqual(source.count("luaL_newmetatable"), 1)
+        for name in ("alarm_after", "alarm_cancel", "alarm_remaining", "alarm_list", "sound_chirp", "sound_stop"):
+            body = re.search(rf"^static int {name}\(lua_State \*L\) \{{\n(.*?)^\}}", source, re.S | re.M).group(1)
+            self.assertNotIn("lua_newuserdata", body, name)
+            self.assertNotIn("lua_setmetatable", body, name)
 
     def test_arm_gives_the_reference_back_when_the_runtime_has_no_slot(self):
         # Unreachable today (the count is checked just before and no app code runs between), so no script gets there: the
@@ -1076,6 +1407,10 @@ class SvcHarnessTest(unittest.TestCase):
     def test_of_two_timers_due_together_the_one_armed_first_runs_first(self):
         # Not the one in the lower slot: a timer armed after a cancel takes the slot of the first.
         self.run_case("timer_tie")
+
+    def test_a_full_gadget_says_so_and_a_name_that_is_armed_needs_no_slot(self):  # C31
+        # The app's limit (4) and the gadget's (8) are different messages; the other apps' alarms fill the table.
+        self.run_case("alarm_table_full")
 
     def test_os_time_charges_the_days_it_walks(self):
         # 100 days to an instruction and one more, for each of day, hour, min and sec; a plain table costs one; a year and month

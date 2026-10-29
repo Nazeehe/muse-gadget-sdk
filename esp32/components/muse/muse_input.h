@@ -86,5 +86,14 @@ void muse_input_add_console_hook(bool (*hook)(const char *line));
 /* LVGL microphone press/release edges; handled by the existing input task. */
 void muse_input_touch_talk(bool pressed);
 
+/*
+ * Wakes the screen as a press does, from any task: an alarm that fires calls it from the esp_timer task, which must not
+ * block, so this records why and notifies the input task and returns. The input task wakes the screen on its next pass (at
+ * once, if it waits for a button) and pokes the idle timer, so the screen stays on a while: the log says "waking (<why>)"
+ * when it was asleep. It is read later, by that task: why is a string that stays (a literal), NULL for "wake". Asked twice
+ * before the input task looks, one wake is made with the last why.
+ */
+void muse_input_wake(const char *why);
+
 /* Plays the goodbye animation and powers off (from the input task). */
 void muse_input_request_power_off(void);

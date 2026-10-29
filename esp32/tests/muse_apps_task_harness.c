@@ -54,6 +54,7 @@
 #ifdef HARNESS_CONSOLE
 #include "apps_install.h"
 #endif
+#include "apps_alarm.h"
 #include "apps_io.h"
 #include "apps_lv.h"
 #include "apps_pkg.h"
@@ -64,6 +65,7 @@
 #include "muse_apps.h"
 #include "muse_apps_task_fakes.h"
 #include "muse_input.h"
+#include "muse_voice.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 #define HUNG_MESSAGE "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"
@@ -674,6 +676,42 @@ bool muse_apps_launch(const char *id, bool front) {
 }
 #endif
 
+/* What an alarm does besides telling the app (apps_alarm.c): the screen wakes, and a chirp is asked of the voice task. Both come
+ * from the esp_timer task, and neither may wait. */
+void muse_input_wake(const char *why) {
+    event("wake %s", why != NULL ? why : "(null)");
+}
+
+void muse_voice_request_chirp(void) {
+    event("chirp");
+}
+
+/* The alarms are apps_alarm.c's, the real one, on the fake esp_timer (tests/muse_apps_fake_esp_timer.c), whose clock is this
+ * harness's: a case that moves it makes the timers come due. */
+bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    return apps_alarm_arm(app, name, ms, sound, wake);
+}
+
+void apps_port_alarm_cancel(const char *app, const char *name) {
+    apps_alarm_cancel(app, name);
+}
+
+int64_t apps_port_alarm_remaining(const char *app, const char *name) {
+    return apps_alarm_remaining(app, name);
+}
+
+int apps_port_alarm_list(const char *app, char names[4][24], int64_t remaining[4]) {
+    return apps_alarm_list(app, names, remaining);
+}
+
+void apps_port_sound_chirp(void) {
+    muse_voice_request_chirp();
+}
+
+void apps_port_sound_stop(void) {
+    apps_alarm_ring_stop();
+}
+
 /* Free PSRAM, for the RAM store's room (the store class): plenty. */
 size_t apps_port_psram_free(void) {
     return (size_t)64 << 20;
@@ -847,13 +885,16 @@ static bool has_item(const struct fake_queue *q) {
 
 /* What a post asked of the queue: the LVGL task and apps_task_launch never wait (C5, the rulings), whatever the
  * queue holds, so what they pass is recorded, not timed. */
-static _Atomic(TickType_t) lvgl_longest_send, launch_longest_send;
+static _Atomic(TickType_t) lvgl_longest_send, launch_longest_send, timer_longest_send;
 static _Thread_local bool in_launch;  /* this thread is inside apps_task_launch (the case marks it) */
 static const char *const EVENT_NAMES[] = {"?", "TOUCH", "RUN", "STOP", "COMPILE", "MESSAGE", "SHOW", "HIDE", "ALARM", "EXIT",
                                           "WAKE"};
 
 static void note_send(const void *item, size_t item_size, TickType_t wait) {
-    _Atomic(TickType_t) *longest = on_lvgl_task() ? &lvgl_longest_send : in_launch ? &launch_longest_send : NULL;
+    _Atomic(TickType_t) *longest = on_lvgl_task()            ? &lvgl_longest_send
+                                   : in_launch               ? &launch_longest_send
+                                   : fake_esp_timer_on_task() ? &timer_longest_send
+                                                              : NULL;
     if (longest != NULL && wait > atomic_load(longest)) {
         atomic_store(longest, wait);
     }
@@ -990,7 +1031,15 @@ static void gate_check(const struct fake_mutex *m) {
     pthread_mutex_unlock(&gate.mu);
 }
 
+/* The longest wait the esp_timer task asked of a lock: the alarms' callbacks take the table with a short try (they serve every timer
+ * of the gadget), never with a wait that has no end. */
+static _Atomic(TickType_t) timer_longest_take;
+static atomic_int alarm_mutex;  /* the alarm table's lock, once a case says which it is: each take of it by the app task is an event */
+
 BaseType_t xSemaphoreTake(SemaphoreHandle_t m, TickType_t wait) {
+    if (fake_esp_timer_on_task() && wait > atomic_load(&timer_longest_take)) {
+        atomic_store(&timer_longest_take, wait);
+    }
     gate_check(m);
     struct timespec deadline = deadline_in(ticks_to_ms(wait));
     pthread_mutex_lock(&m->mu);
@@ -1014,6 +1063,9 @@ BaseType_t xSemaphoreTake(SemaphoreHandle_t m, TickType_t wait) {
     m->held = true;
     m->holder = pthread_self();
     pthread_mutex_unlock(&m->mu);
+    if (m->number == atomic_load(&alarm_mutex) && current_task != NULL && strcmp(current_task->name, "muse_apps") == 0) {
+        event("alarm take");
+    }
     return pdTRUE;
 }
 
@@ -1467,6 +1519,12 @@ static void free_pkg(apps_pkg_t *p) {
     apps_port_free(p);
 }
 
+/* The manifest's "permissions" (apps_pkg.h's APPS_PERM_*) of a package a case made. */
+static apps_pkg_t *with_perms(apps_pkg_t *p, uint8_t perms) {
+    p->manifest.perms = perms;
+    return p;
+}
+
 static apps_status_t *new_status(void) {
     apps_status_t *st = heap_caps_calloc(1, sizeof *st, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     CHECK(st != NULL, "no memory for a status");
@@ -1573,6 +1631,10 @@ static void finish(void) {
           (unsigned)atomic_load(&lvgl_longest_send));
     CHECK(atomic_load(&launch_longest_send) == 0, "apps_task_launch waited %u ticks to post: it never waits (C5)",
           (unsigned)atomic_load(&launch_longest_send));
+    CHECK(atomic_load(&timer_longest_send) == 0, "the esp_timer task waited %u ticks to post: an alarm's callback never waits (C22)",
+          (unsigned)atomic_load(&timer_longest_send));
+    CHECK(atomic_load(&timer_longest_take) <= pdMS_TO_TICKS(20), "the esp_timer task waited %u ticks for a lock: a short try, 20 ms at most",
+          (unsigned)atomic_load(&timer_longest_take));
     atomic_store(&lvgl_quit, true);
 }
 
@@ -3347,6 +3409,239 @@ static void cpu_pct_and_the_duty_cycle_agree(void) {
     heap_caps_free(st);
 }
 
+/* ---- Task 17: the system's alarms, told by the app task's loop ---- */
+
+/* The app of the alarm cases: a button (whose tap prints 'busy', which a case can make block), the alarm "t" that start() arms
+ * 5000 ms ahead, and a message handler that does what a case asks of the alarm and sound modules. A fired alarm prints "rang <name>". */
+static const char APP_ALARMY[] =
+    "local app = {}\n"
+    "function app.start()\n"
+    "  print('start')\n"
+    "  ui.button{text = 'Busy'}:on('tap', function() print('busy') end)\n"
+    "  alarm.after('t', 5000)\n"
+    "end\n"
+    "function app.show() print('show') end\n"
+    "function app.alarm(name)\n"
+    "  print('rang ' .. name)\n"
+    "  if name == 'crash' then error('alarm boom') end\n"
+    "end\n"
+    "function app.message(event, data)\n"
+    "  if event == 'stop' then sound.stop() return {} end\n"
+    "  if event == 'arm' then alarm.after(data.name, data.ms, data.options) return {} end\n"
+    "  return nil\n"
+    "end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+static const file_t ALARMY[] = {LUA("main.lua", APP_ALARMY)};
+
+/* The package, with the "alarm" permission, under the id of the case (the same app twice is two ids). */
+static apps_pkg_t *alarmy_as(const char *id) {
+    return with_perms(make_pkg(id, "Alarmy", ALARMY, 1), APPS_PERM_ALARM);
+}
+
+static apps_pkg_t *alarmy(void) {
+    return alarmy_as("alarmy");
+}
+
+/* The app is told a message (its handler arms or silences). */
+static void tell_alarmy(const char *what, const char *json) {
+    char err[300];
+    char *reply = apps_task_message("alarmy", what, json, false, 0, err, sizeof err);
+    CHECK(reply != NULL, "message %s: %s", what, err);
+    apps_port_free(reply);
+}
+
+/* An alarm of the app that runs: the esp_timer task marks it, rings, wakes the screen and posts, in that order and none of it
+ * waiting (finish() checks the waits), and the app task fronts the layer and calls alarm(name), after which the alarm is gone from
+ * its slot. The ring goes on every 1.5 s until the app says sound.stop(). */
+static void an_alarm_of_the_running_app_fronts_it_and_calls_it(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    CHECK(apps_task_run(alarmy(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print alarmy start");
+    FIFO_SYNC();
+    CHECK(apps_alarm_remaining("alarmy", "t") == 5000, "armed for 5000 ms: %lld", (long long)apps_alarm_remaining("alarmy", "t"));
+    clock_jump(4999);
+    fake_esp_timer_sync();
+    FIFO_SYNC();
+    ABSENT(from, "wake");
+    ABSENT(from, "chirp");
+    ABSENT(from, "front 1");
+    int fired = mark();
+    clock_jump(1);
+    fake_esp_timer_sync();  /* the callback has run */
+    ORDERED(fired, "chirp", "wake alarm");
+    ORDERED(fired, "wake alarm", "queue ALARM wait 0");
+    ORDERED(fired, "queue ALARM wait 0", "log I alarm alarmy/t fired (sound 1, wake 1)");
+    ORDERED(fired, "log I alarm alarmy/t fired (sound 1, wake 1)", "log I ring alarmy/t chirp 1");
+    WAIT(fired, "print alarmy rang t");
+    WAIT(fired, "front 1");
+    CHECK(apps_alarm_remaining("alarmy", "t") == -1 && !apps_alarm_pending(), "the alarm has been told, and left its slot");
+    CHECK(count_from(fired, "print alarmy rang") == 1, "told once");
+    /* The ring goes on until the app stops it. */
+    clock_jump(1500);
+    fake_esp_timer_sync();
+    CHECK(at_from(fired, "log I ring alarmy/t chirp 2") >= 0, "the ring chirps every 1.5 s");
+    int stopped = mark();
+    tell_alarmy("stop", "{}");
+    CHECK(at_from(stopped, "log I ring stopped (sound.stop)") >= 0, "sound.stop() ended it");
+    clock_jump(10000);
+    fake_esp_timer_sync();
+    CHECK(count_from(fired, "chirp") == 2, "no chirp after it: %d", count_from(fired, "chirp"));
+    clock_go();
+}
+
+/* The esp_timer task's post is only a nudge: with none made (the callback unset, as if the post had been missed), the loop's own
+ * round, which comes at least once a second (C22), finds the fired alarm in its slot. */
+static void a_delivery_does_not_depend_on_the_post(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    CHECK(apps_task_run(alarmy(), true, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print alarmy start");
+    FIFO_SYNC();
+    apps_alarm_set_fired_cb(NULL);
+    int fired = mark();
+    int64_t began = real_ms();
+    clock_jump(5000);
+    fake_esp_timer_sync();
+    ABSENT(fired, "queue ALARM");
+    WAIT(fired, "print alarmy rang t");
+    CHECK(real_ms() - began < 2500, "told %lld ms after it fired: the loop comes round within a second", (long long)(real_ms() - began));
+    clock_go();
+}
+
+/* A queue that is full loses nothing either: the post is dropped (it never waits: finish() checks), and the alarm, which keeps its
+ * slot, is told when the loop is round again. The app task is stuck in a call for as long as it takes the real clock to bring
+ * the alarm (the case's own, armed for 30 ms) due: the clock isn't moved, as a call that took seconds is the duty cycle's. */
+static void an_alarm_posted_to_a_full_queue_is_told(void) {
+    char err[200];
+    CHECK(apps_task_run(alarmy(), true, 0, NULL, err, sizeof err), "run: %s", err);
+    block_print("busy");
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    for (int i = 0; i < 16; i++) {
+        launch("alarmy", false);  /* the queue is full */
+    }
+    int fired = mark();
+    CHECK(apps_alarm_arm("alarmy", "q", 30, true, true), "arm");
+    WAIT(fired, "log I ring alarmy/q chirp 1");
+    CHECK(count_from(fired, "queue ALARM wait 0") == 1, "the esp_timer task posted, without waiting");
+    ABSENT(fired, "print alarmy rang");  /* the app task is stuck in its print */
+    CHECK(apps_alarm_pending(), "and the alarm waits in its slot");
+    release_print();
+    WAIT(fired, "print alarmy rang q");
+    CHECK(!apps_alarm_pending(), "told");
+}
+
+/* Alarms that come due together are told in the order they fired, whatever the order they were armed in. */
+static void alarms_are_told_in_the_order_they_fired(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    CHECK(apps_task_run(alarmy(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print alarmy start");
+    tell_alarmy("arm", "{\"name\":\"b\",\"ms\":300}");
+    tell_alarmy("arm", "{\"name\":\"a\",\"ms\":100,\"options\":{\"sound\":false}}");
+    int fired = mark();
+    clock_jump(5000);  /* all three of them are due */
+    fake_esp_timer_sync();
+    WAIT(fired, "print alarmy rang t");
+    ORDERED(fired, "print alarmy rang a", "print alarmy rang b");
+    ORDERED(fired, "print alarmy rang b", "print alarmy rang t");
+    CHECK(count_from(fired, "print alarmy rang") == 3, "three, once each");
+    CHECK(count_from(fired, "chirp") == 2, "the one without sound didn't chirp: %d chirps", count_from(fired, "chirp"));
+    clock_go();
+}
+
+/* An alarm that fires during a voice turn is told at once (the app has its call), and the layer comes to the front when the turn is
+ * over, as any request for the front does (C11). */
+static void an_alarm_during_a_voice_turn_fronts_the_app_after_it(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_task_run(alarmy(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    TURN(true);
+    int from = mark();
+    clock_jump(5000);
+    fake_esp_timer_sync();
+    WAIT(from, "print alarmy rang t");
+    WAIT_FRAMES(5);
+    ABSENT(from, "front 1");
+    TURN(false);
+    WAIT(from, "front 1");
+    WAIT(from, "print alarmy show");
+    clock_go();
+}
+
+/* An alarm that fires while the screen sleeps (LVGL paused, dark) is told at once, as the board needs it: the app task runs
+ * whatever the screen does. The layer comes to the front when the screen is back. */
+static void an_alarm_is_told_while_the_screen_sleeps(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_task_run(alarmy(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    FIFO_SYNC();
+    pause_lvgl();
+    atomic_store(&lvgl_asleep, true);
+    int from = mark();
+    clock_jump(5000);
+    fake_esp_timer_sync();
+    WAIT(from, "wake alarm");
+    WAIT(from, "print alarmy rang t");
+    ABSENT(from, "front 1");  /* the LVGL task sleeps */
+    atomic_store(&lvgl_paused, false);
+    atomic_store(&lvgl_asleep, false);
+    WAIT(from, "front 1");
+    clock_go();
+}
+
+/* An alarm that another task cancels between the app task's copy of what has fired and its take of this one is not told: the take
+ * says it is gone, and no one is told of what was cancelled (a ring it started ended with it). The app task's second take of the
+ * table's lock, the one that takes the alarm, is held until the case has cancelled it. */
+static void an_alarm_cancelled_before_it_is_taken_is_not_told(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_task_run(alarmy(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print alarmy start");
+    FIFO_SYNC();
+    int table_lock = atomic_load(&n_mutexes);  /* the last lock made: the table's, which start()'s first alarm made */
+    atomic_store(&alarm_mutex, table_lock);
+    int from = mark();
+    gate_arm(table_lock, "muse_apps", from, "alarm take");
+    clock_jump(5000);
+    fake_esp_timer_sync();
+    char gate_text[16];
+    snprintf(gate_text, sizeof gate_text, "gate %d", table_lock);
+    WAIT(from, gate_text);  /* the copy was made (the first take), and the take of the alarm waits */
+    ORDERED(from, "alarm take", gate_text);
+    apps_alarm_cancel("alarmy", "t");
+    gate_open();
+    FIFO_SYNC();
+    ABSENT(from, "print alarmy rang");
+    CHECK(!apps_alarm_pending() && apps_alarm_remaining("alarmy", "t") == -1, "the alarm is gone");
+    CHECK(at_from(from, "log I ring stopped (alarm cancelled)") >= 0, "and the ring it started with it");
+    clock_go();
+}
+
+/* The app crashes in alarm(): its card comes as for any crash, and the ring ends, as no one is left to stop it. The error line is
+ * main.lua's. */
+static void a_crash_in_alarm_ends_the_ring(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_task_run(alarmy(), true, 0, NULL, err, sizeof err), "run: %s", err);
+    tell_alarmy("arm", "{\"name\":\"crash\",\"ms\":100}");
+    int from = mark();
+    clock_jump(100);
+    fake_esp_timer_sync();
+    WAIT(from, "crash Alarmy | main.lua:10: alarm boom");
+    WAIT(from, "log I ring stopped (alarm() crashed)");
+    int chirps = count_from(from, "chirp");
+    clock_jump(4000);  /* two ticks of the ring, were it going; the app's own alarm, at 5000, is not due yet */
+    fake_esp_timer_sync();
+    CHECK(count_from(from, "chirp") == chirps && chirps == 1, "the ring ended with the app: %d chirps", count_from(from, "chirp"));
+    clock_go();
+}
+
 /* The I/O worker's jobs: "hold" waits while io_hold is set, "chain" submits "chained". */
 static atomic_bool io_hold, io_held;
 
@@ -3669,6 +3964,179 @@ static void two_launches_of_one_id_run_it_once(void) {
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
     on_worker(empty_store_job, NULL);
 }
+
+/* ---- Task 17: an alarm for an app that doesn't run (the store, and the worker's launch) ---- */
+
+/* An alarm outlives its app's stop, and when it fires the app is started from the store, in front, and alarm(name) comes after
+ * start(): start() of this app arms its alarm "t" again (as an alarm clock sets its next), which must not cost the one that
+ * fired: it is told, and the new one is armed beside it. */
+static void an_alarm_starts_a_stopped_app_and_calls_it_after_start(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    store(alarmy());
+    CHECK(apps_task_run(alarmy(), true, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print alarmy start");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    WAIT(0, "print alarmy stop");
+    CHECK(apps_alarm_remaining("alarmy", "t") == 5000, "the alarm outlives its app: %lld", (long long)apps_alarm_remaining("alarmy", "t"));
+    int from = mark();
+    clock_jump(5000);
+    fake_esp_timer_sync();
+    WAIT(from, "log I launch alarmy (256 KB)");
+    int started = WAIT(from, "print alarmy start");
+    int rang = WAIT(from, "print alarmy rang t");
+    CHECK(started < rang, "alarm(name) comes after start() (%d, %d)", started, rang);
+    WAIT(from, "front 1");
+    CHECK(!apps_alarm_pending(), "told");
+    CHECK(apps_alarm_remaining("alarmy", "t") == 5000, "start()'s new alarm is armed: %lld", (long long)apps_alarm_remaining("alarmy", "t"));
+    CHECK(count_from(from, "print alarmy rang") == 1, "told once");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    clock_go();
+    on_worker(empty_store_job, NULL);
+}
+
+/* The alarm of an app that isn't the one that runs replaces the one that runs: one app at a time, and an alarm is the user's. */
+static void an_alarm_replaces_the_app_that_runs_with_its_own(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    store(alarmy());
+    store(make_pkg("busy", "Busy", BUSY, 1));
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 0, NULL, err, sizeof err), "run: %s", err);
+    CHECK(apps_alarm_arm("alarmy", "t", 1000, true, true), "arm");
+    int from = mark();
+    clock_jump(1000);
+    fake_esp_timer_sync();
+    WAIT(from, "log I stop busy: replaced");
+    WAIT(from, "log I launch alarmy (256 KB)");
+    int rang = WAIT(from, "print alarmy rang t");
+    ORDERED(from, "log I stop busy: replaced", "log I launch alarmy (256 KB)");
+    CHECK(at_from(from, "print alarmy start") < rang, "start(), then alarm(name)");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    clock_go();
+    on_worker(empty_store_job, NULL);
+}
+
+/* An alarm of an app the store doesn't have is dropped with one line, after the launch's own, and the ring it started ends:
+ * nothing will start the app, and with no app there is no one to stop the ring. */
+static void an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends(void) {
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_alarm_arm("ghost", "t", 1000, true, true), "arm");
+    int from = mark();
+    clock_jump(1000);
+    fake_esp_timer_sync();
+    WAIT(from, "log W alarm t for missing app ghost");
+    ORDERED(from, "log W launch ghost: no such app on the gadget", "log W alarm t for missing app ghost");
+    WAIT(from, "log I ring stopped (alarm dropped)");
+    CHECK(!apps_alarm_pending() && apps_alarm_remaining("ghost", "t") == -1, "dropped, and out of the table");
+    int chirps = count_from(from, "chirp");
+    clock_jump(10000);
+    fake_esp_timer_sync();
+    FIFO_SYNC();
+    CHECK(count_from(from, "chirp") == chirps && chirps == 1, "no chirp after the drop: %d", count_from(from, "chirp"));
+    CHECK(count_from(from, "log W alarm t for missing app ghost") == 1, "said once");
+    clock_go();
+}
+
+/* An app that doesn't start in time (the worker is busy and the launch waits behind its job) has its alarm dropped after
+ * APPS_TASK_ALARM_LAUNCH_MS, with a line that says why, and the ring it started ends. The launch itself, when the worker comes to
+ * it, is a launch like the launcher's: the app starts, with no alarm to be told. */
+static void a_launch_that_does_not_come_gives_up(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    store(alarmy());
+    atomic_store(&io_held, false);
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    CHECK(apps_alarm_arm("alarmy", "t", 1000, true, true), "arm");
+    int from = mark();
+    clock_jump(1000);
+    fake_esp_timer_sync();
+    WAIT(from, "log I ring alarmy/t chirp 1");
+    FIFO_SYNC();  /* the loop has asked for the launch, which waits behind the worker's job */
+    ABSENT(from, "log W alarm t: ");
+    /* The queue is full now (the launch and the fillers), so a second ask would be refused and logged. The loop doesn't make one: the
+     * launch it asked for is queued, and only a launch the worker refused is asked for again. */
+    for (int i = 1; i < APPS_IO_JOBS; i++) {
+        CHECK(apps_io_submit(io_job, "filler"), "submit a filler");
+    }
+    for (int i = 0; i < 9; i++) {
+        clock_jump(1000);  /* every ALARM_RETRY_MS of the 10 s */
+        FIFO_SYNC();
+    }
+    ABSENT(from, "log W io:");
+    clock_jump(APPS_TASK_ALARM_LAUNCH_MS - 9000 - 1);
+    FIFO_SYNC();
+    ABSENT(from, "log W alarm t: ");
+    clock_jump(2);
+    FIFO_SYNC();
+    WAIT(from, "log W alarm t: alarmy did not start within 10000 ms: dropped");
+    WAIT(from, "log I ring stopped (alarm dropped)");
+    CHECK(!apps_alarm_pending(), "dropped");
+    atomic_store(&io_hold, false);
+    WAIT(from, "log I launch alarmy (256 KB)");
+    WAIT(from, "print alarmy start");
+    FIFO_SYNC();
+    ABSENT(from, "print alarmy rang");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    clock_go();
+    on_worker(empty_store_job, NULL);
+}
+
+/* A launch the I/O worker refuses (not enough internal RAM) is one line in the log and is asked for again a second later, not at
+ * every round of the loop (which is what a retry with no period would be): once the memory is back, the app starts and is told. */
+static void a_refused_alarm_launch_is_asked_for_again(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    store(alarmy());
+    CHECK(apps_alarm_arm("alarmy", "t", 1000, true, true), "arm");
+    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    int from = mark();
+    clock_jump(1000);
+    fake_esp_timer_sync();
+    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
+    for (int i = 0; i < 5; i++) {
+        FIFO_SYNC();  /* rounds of the loop, with the alarm waiting: it doesn't ask again at each one */
+    }
+    CHECK(count_from(from, "log W io:") == 1, "asked %d times in a second of the clock that didn't move", count_from(from, "log W io:"));
+    ABSENT(from, "log I launch alarmy");
+    atomic_store(&internal_free, 200u * 1024);
+    clock_jump(1000);  /* ALARM_RETRY_MS: the time to ask again */
+    FIFO_SYNC();
+    WAIT(from, "log I launch alarmy (256 KB)");
+    WAIT(from, "print alarmy rang t");
+    CHECK(count_from(from, "log W") == 1, "the refusal was the only warning");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    clock_go();
+    on_worker(empty_store_job, NULL);
+}
+
+/* Alarms of two apps that aren't running, due together: the first to fire starts its app and is told, and the other app's launch
+ * comes on a later round of the loop and replaces it (one app at a time), then that one is told: neither alarm is lost. */
+static void alarms_of_two_stopped_apps_are_told_one_after_the_other(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    store(alarmy_as("alarmy"));
+    store(alarmy_as("second"));
+    CHECK(apps_alarm_arm("alarmy", "t", 1000, true, true) && apps_alarm_arm("second", "t", 2000, true, true), "arm two");
+    int from = mark();
+    clock_jump(5000);
+    fake_esp_timer_sync();
+    WAIT(from, "print alarmy rang t");
+    WAIT(from, "print second rang t");
+    ORDERED(from, "print alarmy start", "print alarmy rang t");
+    ORDERED(from, "print alarmy rang t", "log I stop alarmy: replaced");
+    ORDERED(from, "log I stop alarmy: replaced", "print second start");
+    ORDERED(from, "print second start", "print second rang t");
+    CHECK(count_from(from, "print alarmy rang") == 1 && count_from(from, "print second rang") == 1, "once each");
+    CHECK(!apps_alarm_pending(), "both told");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    clock_go();
+    on_worker(empty_store_job, NULL);
+}
 #endif
 
 int main(int argc, char **argv) {
@@ -3730,12 +4198,26 @@ int main(int argc, char **argv) {
         {"the_duty_cycle_warns_the_status_then_kills", the_duty_cycle_warns_the_status_then_kills},
         {"a_throttle_warning_from_a_pass_joins_the_launch_warnings", a_throttle_warning_from_a_pass_joins_the_launch_warnings},
         {"cpu_pct_and_the_duty_cycle_agree", cpu_pct_and_the_duty_cycle_agree},
+        {"an_alarm_of_the_running_app_fronts_it_and_calls_it", an_alarm_of_the_running_app_fronts_it_and_calls_it},
+        {"a_delivery_does_not_depend_on_the_post", a_delivery_does_not_depend_on_the_post},
+        {"an_alarm_posted_to_a_full_queue_is_told", an_alarm_posted_to_a_full_queue_is_told},
+        {"alarms_are_told_in_the_order_they_fired", alarms_are_told_in_the_order_they_fired},
+        {"an_alarm_during_a_voice_turn_fronts_the_app_after_it", an_alarm_during_a_voice_turn_fronts_the_app_after_it},
+        {"an_alarm_is_told_while_the_screen_sleeps", an_alarm_is_told_while_the_screen_sleeps},
+        {"a_crash_in_alarm_ends_the_ring", a_crash_in_alarm_ends_the_ring},
+        {"an_alarm_cancelled_before_it_is_taken_is_not_told", an_alarm_cancelled_before_it_is_taken_is_not_told},
 #ifdef HARNESS_CONSOLE
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},
         {"the_launcher_lists_the_store", the_launcher_lists_the_store},
         {"the_launcher_keeps_apps_that_ended", the_launcher_keeps_apps_that_ended},
         {"two_launches_of_one_id_run_it_once", two_launches_of_one_id_run_it_once},
+        {"an_alarm_starts_a_stopped_app_and_calls_it_after_start", an_alarm_starts_a_stopped_app_and_calls_it_after_start},
+        {"an_alarm_replaces_the_app_that_runs_with_its_own", an_alarm_replaces_the_app_that_runs_with_its_own},
+        {"an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends", an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends},
+        {"a_launch_that_does_not_come_gives_up", a_launch_that_does_not_come_gives_up},
+        {"a_refused_alarm_launch_is_asked_for_again", a_refused_alarm_launch_is_asked_for_again},
+        {"alarms_of_two_stopped_apps_are_told_one_after_the_other", alarms_of_two_stopped_apps_are_told_one_after_the_other},
 #endif
     };
     if (argc != 2) {

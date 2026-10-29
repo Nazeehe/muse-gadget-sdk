@@ -175,6 +175,27 @@ static void set_asleep(bool asleep, const char *why)
     }
 }
 
+/* muse_input_wake's request: why, until the input task takes it at the top of its loop. */
+static _Atomic(const char *) s_wake_why;
+
+void muse_input_wake(const char *why)
+{
+    atomic_store(&s_wake_why, why ? why : "wake");
+    if (s_input) {
+        xTaskNotifyGive(s_input);   /* out of wait_buttons() */
+    }
+}
+
+/* The input task: a wake that was asked for from another task is a press's wake. */
+static void apply_wake(void)
+{
+    const char *why = atomic_exchange(&s_wake_why, NULL);
+    if (why) {
+        set_asleep(false, why);
+        muse_state_poke();
+    }
+}
+
 static void toggle_phone_setup(void)
 {
     bool on = !muse_settings_ble_on();
@@ -589,6 +610,7 @@ static void input_task(void *arg)
     TickType_t powered = xTaskGetTickCount() - pdMS_TO_TICKS(POWER_MS);
 
     for (;;) {
+        apply_wake();
         unsigned ev = muse_board->poll_buttons() | atomic_exchange(&s_touch_talk_events, 0);
 #if CONFIG_MUSE_VIDEO
         /* Any press leaves the video view (its release then does nothing). */

@@ -38,6 +38,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "apps_alarm.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_rt.h"
@@ -126,6 +127,94 @@ bool apps_port_epoch_ms(int64_t *out) {
 
 bool apps_port_dark(void) {
     return port_dark;
+}
+
+/* The system's alarms and sound (apps_port.h): a fake the case controls. The contract's table in a few lines, 4 to an app and
+ * APPS_ALARMS_MAX in all, with the other apps' alarms a case can put there (fake_alarms_of); no time passes in it, an alarm
+ * has the ms it was armed with. What the sound is asked for is counted. */
+typedef struct {
+    bool used, sound, wake;
+    char app[APPS_ID_MAX + 1], name[APPS_ALARM_NAME_MAX + 1];
+    int64_t ms;
+} fake_alarm_t;
+
+static fake_alarm_t fake_alarms[APPS_ALARMS_MAX];
+static int fake_chirps, fake_stops;
+
+static fake_alarm_t *fake_find(const char *app, const char *name) {
+    for (int i = 0; i < APPS_ALARMS_MAX; i++) {
+        if (fake_alarms[i].used && strcmp(fake_alarms[i].app, app) == 0 && strcmp(fake_alarms[i].name, name) == 0) {
+            return &fake_alarms[i];
+        }
+    }
+    return NULL;
+}
+
+static int fake_alarms_of(const char *app) {
+    int n = 0;
+    for (int i = 0; i < APPS_ALARMS_MAX; i++) {
+        n += fake_alarms[i].used && strcmp(fake_alarms[i].app, app) == 0 ? 1 : 0;
+    }
+    return n;
+}
+
+bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    fake_alarm_t *a = fake_find(app, name);
+    for (int i = 0; a == NULL && i < APPS_ALARMS_MAX; i++) {
+        a = !fake_alarms[i].used ? &fake_alarms[i] : NULL;
+    }
+    if (a == NULL || (!a->used && fake_alarms_of(app) >= APPS_ALARMS_PER_APP)) {
+        return false;
+    }
+    *a = (fake_alarm_t){.used = true, .sound = sound, .wake = wake, .ms = ms};
+    snprintf(a->app, sizeof a->app, "%s", app);
+    snprintf(a->name, sizeof a->name, "%s", name);
+    return true;
+}
+
+void apps_port_alarm_cancel(const char *app, const char *name) {
+    fake_alarm_t *a = fake_find(app, name);
+    if (a != NULL) {
+        a->used = false;
+    }
+}
+
+int64_t apps_port_alarm_remaining(const char *app, const char *name) {
+    const fake_alarm_t *a = fake_find(app, name);
+    return a != NULL ? a->ms : -1;
+}
+
+int apps_port_alarm_list(const char *app, char names[4][24], int64_t remaining[4]) {
+    int n = 0;
+    for (int i = 0; i < APPS_ALARMS_MAX && n < 4; i++) {
+        if (fake_alarms[i].used && strcmp(fake_alarms[i].app, app) == 0) {
+            snprintf(names[n], 24, "%s", fake_alarms[i].name);
+            remaining[n++] = fake_alarms[i].ms;
+        }
+    }
+    return n;
+}
+
+void apps_port_sound_chirp(void) {
+    fake_chirps++;
+}
+
+void apps_port_sound_stop(void) {
+    fake_stops++;
+}
+
+/* The apps of the other kind: count alarms of the app `owner` ("other1", ...) in the table, as if it had armed them. */
+static void fake_fill(const char *owner, int count) {
+    for (int k = 0; k < count; k++) {
+        char name[APPS_ALARM_NAME_MAX + 1];
+        snprintf(name, sizeof name, "x%d", k);
+        CHECK(apps_port_alarm_arm(owner, name, 1000, true, true), "filling for %s: %d", owner, k);
+    }
+}
+
+static void fake_clear(void) {
+    memset(fake_alarms, 0, sizeof fake_alarms);
+    fake_chirps = fake_stops = 0;
 }
 
 void apps_port_ui_lock(void) {}
@@ -242,6 +331,13 @@ static apps_pkg_t *make_pkg_kb(unsigned memory_kb, const file_t *files, int n) {
 static apps_pkg_t *make_pkg(const char *main_src) {
     const file_t files[] = {{"main.lua", main_src}};
     return make_pkg_kb(256, files, 1);
+}
+
+/* The same, with the permissions of the manifest (APPS_PERM_*). */
+static apps_pkg_t *make_pkg_perms(const char *main_src, unsigned perms) {
+    apps_pkg_t *pkg = make_pkg(main_src);
+    pkg->manifest.perms = (uint8_t)perms;
+    return pkg;
 }
 
 static void free_pkg(apps_pkg_t *pkg) {
@@ -1552,7 +1648,13 @@ static const char *const SERVICES_APP =
     "  local s = os.time{year = 2026, month = 1, day = 1, hour = 0}\n"
     "  timer.after(100, f)\n"
     "  timer.every(100, f):cancel()\n"
-    "  return {d.year, text, t.year, s > 0}\n"
+    "  alarm.after('t', 1000, {sound = false, wake = false})\n"
+    "  alarm.after('u', 2000)\n"
+    "  local listed = alarm.list()\n"
+    "  local left = alarm.remaining('t')\n"
+    "  alarm.cancel('t') alarm.cancel('u')\n"
+    "  sound.chirp() sound.stop()\n"
+    "  return {d.year, text, t.year, s > 0, #listed, listed[1].name, listed[1].remaining, left}\n"
     "end}\n";
 
 static void services_refused(void) {
@@ -1562,7 +1664,8 @@ static void services_refused(void) {
     long reached = 0;
     for (long k = 1; k < 100000; k++) {
         char err[256] = "";
-        apps_pkg_t *pkg = make_pkg(SERVICES_APP);
+        fake_clear();
+        apps_pkg_t *pkg = make_pkg_perms(SERVICES_APP, APPS_PERM_ALARM | APPS_PERM_SOUND);
         apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
         CHECK(rt != NULL && apps_rt_start(rt), "%s", err);
         if (rt == NULL) {
@@ -1586,8 +1689,11 @@ static void services_refused(void) {
                       "k=%ld: '%s', state %d", k, err, apps_rt_state(rt));
             }
         } else {
-            CHECK(reply != NULL && strcmp(reply, "[1970,\"Fri Jan  2 00:00:00 1970\",1970,true]") == 0 && err[0] == '\0',
+            CHECK(reply != NULL && strcmp(reply, "[1970,\"Fri Jan  2 00:00:00 1970\",1970,true,2,\"t\",1000,1000]") == 0 &&
+                      err[0] == '\0',
                   "k=%ld: '%s' '%s'", k, reply != NULL ? reply : "(none)", err);
+            CHECK(fake_chirps == 1 && fake_stops == 1 && fake_alarms_of("app") == 0, "chirps %d, stops %d, alarms %d",
+                  fake_chirps, fake_stops, fake_alarms_of("app"));
             reached = growths - before;
         }
         apps_port_free(reply);
@@ -1599,6 +1705,52 @@ static void services_refused(void) {
     CHECK(reached > 10, "only %ld growth requests in the message", reached);
     CHECK(saw_crash, "no refusal ever crashed the app");
     CHECK(saw_soft_failure, "the reply's block was never the one refused");
+}
+
+/* C31: the app's own limit is 4 and the gadget's is 8, and each has its message. The other apps' alarms fill the table, which one
+ * app (or apphost, with one app) can't do. A name that is armed is replaced whatever the table holds, so it needs no free slot. */
+static const char *const FULL_APP =
+    "local function says(f, ...) local ok, m = pcall(f, ...) print(ok and 'ok' or m) end\n"
+    "return {message = function(event, data)\n"
+    "  says(alarm.after, data, 1000)\n"
+    "  return alarm.remaining(data)\n"
+    "end}\n";
+
+static void alarm_table_full(void) {
+    fake_clear();
+    fake_fill("other1", 4);  /* the first of the others has its four, the second three: seven of the eight are taken */
+    fake_fill("other2", 3);
+    apps_pkg_t *pkg = make_pkg_perms(FULL_APP, APPS_PERM_ALARM);
+    char err[256] = "";
+    apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt != NULL && apps_rt_start(rt), "%s", err);
+    if (rt == NULL) {
+        free_pkg(pkg);
+        return;
+    }
+    const char *const NO_SLOTS = "alarm: the gadget has no free alarm slots (8 in all); cancel one";
+    char *reply = apps_rt_message(rt, "arm", "\"a\"", 3, err, sizeof err);  /* the eighth: all that is left */
+    CHECK(reply != NULL && strcmp(reply, "1000") == 0, "the last slot: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    reply = apps_rt_message(rt, "arm", "\"b\"", 3, err, sizeof err);  /* the table is full */
+    CHECK(reply != NULL && strcmp(reply, "null") == 0, "a ninth: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    const char *const want[] = {"ok", NO_SLOTS};
+    expect_logged_at(__LINE__, want, 2);
+    forget_logged();
+    reply = apps_rt_message(rt, "rearm", "\"a\"", 3, err, sizeof err);  /* replaced: needs no slot */
+    CHECK(reply != NULL && strcmp(reply, "1000") == 0, "a name that is armed: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    expect_logged("ok");
+    CHECK(fake_alarms_of("app") == 1 && fake_alarms_of("other1") == 4 && fake_alarms_of("other2") == 3, "the table changed");
+    apps_port_alarm_cancel("other2", "x0");  /* one of the others is cancelled: a slot is free */
+    forget_logged();
+    reply = apps_rt_message(rt, "arm", "\"b\"", 3, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "1000") == 0, "after a cancel: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    expect_logged("ok");
+    finish(rt, pkg);
+    fake_clear();
 }
 
 /* The timers' contract at the runtime's own API, which the app task and apphost build on, where a script only sees events:
@@ -2699,6 +2851,7 @@ int main(int argc, char **argv) {
         {"require_refused", require_refused},
         {"time_zone", time_zone},
         {"services_refused", services_refused},
+        {"alarm_table_full", alarm_table_full},
         {"timer_api", timer_api},
         {"timer_tie", timer_tie},
         {"os_time_charge", os_time_charge},

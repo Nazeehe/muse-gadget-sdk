@@ -129,6 +129,38 @@ bool apps_port_dark(void) {
     return false;
 }
 
+/* The system's alarms and sound (apps_port.h): none here, as no case runs an app's alarm. */
+bool apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    (void)app;
+    (void)name;
+    (void)ms;
+    (void)sound;
+    (void)wake;
+    return false;
+}
+
+void apps_port_alarm_cancel(const char *app, const char *name) {
+    (void)app;
+    (void)name;
+}
+
+int64_t apps_port_alarm_remaining(const char *app, const char *name) {
+    (void)app;
+    (void)name;
+    return -1;
+}
+
+int apps_port_alarm_list(const char *app, char names[4][24], int64_t remaining[4]) {
+    (void)app;
+    (void)names;
+    (void)remaining;
+    return 0;
+}
+
+void apps_port_sound_chirp(void) {}
+
+void apps_port_sound_stop(void) {}
+
 void apps_port_log(const char *app_id, const char *line) {
     (void)app_id;
     (void)line;

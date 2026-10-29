@@ -576,6 +576,9 @@ static void launch_job(void *arg) {
         } else {
             ESP_LOGW(TAG, "launch %s: %s", job->id, job->why);
         }
+        if (!apps_ram_has(job->id)) {
+            apps_task_launch_missing(job->id);  /* the alarms that fired for it and wait for this launch are given up */
+        }
     }
     apps_port_free(job);
 }

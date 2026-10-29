@@ -53,6 +53,18 @@
  * handler does. The runtime's warnings that come after the run's start (the duty cycle's) are added to the record's as they
  * come, and its kill is a crash like any.
  *
+ * Alarms. The system's alarms (apps_alarm.h) are delivered by this task, on every round of the loop, whatever woke it, and so at
+ * least once a second: the esp_timer task that fires one only marks it (it keeps its slot until its app has been told), rings,
+ * wakes the screen and posts APPS_EV_ALARM with no wait and no payload. The one for the app that runs fronts it (request_front,
+ * deferred past a voice turn like every front) and calls alarm(name) (apps_rt_alarm: a call of the app like any other, so the
+ * duty cycle counts it and the supervisor watches it). One for an app that doesn't run starts it: the same launch as the
+ * launcher's pick (muse_apps_launch: the I/O worker loads the last package installed with that id, from RAM now and from the
+ * store later, and runs it in front), and alarm(name) follows start(). The alarm waits in its slot for that, at most
+ * APPS_TASK_ALARM_LAUNCH_MS; the app task never waits for the worker. An app the store doesn't have is
+ * "alarm <name> for missing app <id>" in the log, and an app that doesn't come up in time "alarm <name>: <id> did not start within
+ * <N> ms: dropped"; either way the alarm is dropped, and a ring it started ends. Launches go one app at a time, in the order
+ * the alarms fired.
+ *
  * An app's end (stop, a new run, sys.exit, a crash, a hang) is one order, the rulings': the pending request is
  * answered; the table is unpublished (apps_lv_set_ui(NULL) under the UI lock); the record takes the crash record,
  * the log and the widget dump; the runtime is freed; the LVGL task is asked to reset the layer (apps_lv_reset) and
@@ -79,6 +91,7 @@
 #define APPS_TASK_HUNG_MS 3000       /* a call that has run longer is hung (strictly longer) */
 #define APPS_TASK_RESET_MS 500       /* the app task's wait for the LVGL task's reset */
 #define APPS_TASK_LAYOUT_MS 500      /* a run's wait for a pass of the apply step that has laid its widgets out */
+#define APPS_TASK_ALARM_LAUNCH_MS 10000  /* a fired alarm waits this long for its app to start (the launch's run waits 7 s) */
 
 /*
  * What the app task knows of the current app (or the last one: the record keeps it until the next run). It is
@@ -122,7 +135,7 @@ typedef enum {
     APPS_EV_MESSAGE,    /* apps_task_message */
     APPS_EV_SHOW,       /* the layer came to the front: show() */
     APPS_EV_HIDE,       /* it went behind: hide() */
-    APPS_EV_ALARM,      /* Task 17 */
+    APPS_EV_ALARM,      /* an alarm fired (apps_alarm.h): brings the loop round, which delivers; no payload */
     APPS_EV_EXIT,       /* sys.exit() (Task 18): the app ends once the current callback returns */
     APPS_EV_WAKE,       /* the LVGL task ran a reset the app task waits for, or the screen was lit: the round's housekeeping */
 } apps_event_type_t;
@@ -174,6 +187,14 @@ bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status
  * (apps_task_set_list); Task 17's alarms and Task 20's flash store build on this.
  */
 void apps_task_launch(const char *id, bool front);
+
+/*
+ * The I/O worker's launch job (apps_console.c) found that the store has no app id. The alarms that fired for it and wait for
+ * its launch are dropped, each with "alarm <name> for missing app <id>" in the log, and a ring they started ends: nothing
+ * will start the app, and with no app there is no one to stop the ring. Any task; it waits only for the alarm table's lock,
+ * which is held for copies.
+ */
+void apps_task_launch_missing(const char *id);
 
 /*
  * Stops the current app (its stop() runs) and puts the layer behind. Waits at most APPS_TASK_WAIT_MS. True once the

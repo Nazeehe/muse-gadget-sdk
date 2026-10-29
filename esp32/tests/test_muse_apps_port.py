@@ -34,8 +34,8 @@ APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_port_harness.c"
 
-FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/semphr.h", "freertos/task.h", "esp_err.h", "esp_heap_caps.h", "esp_log.h",
-                "esp_timer.h"]
+FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/queue.h", "freertos/semphr.h", "freertos/task.h", "esp_err.h", "esp_heap_caps.h",
+                "esp_log.h", "esp_timer.h"]
 PSA = """#pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -101,6 +101,9 @@ class AppPortTest(unittest.TestCase):
 
     def test_the_wall_clock_counts_when_the_sntp_helper_says_so(self):  # Task 16: muse_time_valid(), not a year of its own
         self.run_case("the_wall_clock_counts_when_the_helper_says")
+
+    def test_alarms_and_sound_go_to_their_owners(self):  # Task 17: apps_alarm.c's table and ring, the voice task's chirp
+        self.run_case("alarms_and_sound_go_to_their_owners")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

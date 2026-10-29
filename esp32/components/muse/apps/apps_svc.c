@@ -27,17 +27,20 @@
 #include <string.h>
 #include <time.h>
 
+#include "apps_alarm.h"
+#include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_vm.h"
 #include "lauxlib.h"
 #include "lua.h"
 
 /*
- * The `time`, `os` and `timer` modules (apps_svc.h says what they do). Every binding calls apps_vm_check first and runs
+ * The `time`, `os`, `timer`, `alarm` and `sound` modules (apps_svc.h says what they do). Every binding calls apps_vm_check first and runs
  * inside a call of the app, so what allocates in the app's heap (a table, a string, a handle, a registry reference) may be
  * refused and ends the app out of memory, as everywhere else. The clocks are the port's (apps_port.h): the wall clock is the
  * port's epoch, and the zone is the C library's (TZ), which the watch sets on the gadget (muse_clock_build) and apphost sets
- * to UTC. What a timer is lives in the runtime; the handle here is a slot and a gen.
+ * to UTC. What a timer is lives in the runtime; the handle here is a slot and a gen. An alarm is the system's (apps_alarm.h):
+ * the port keeps it, named by the app's id and a name of the app's, and there is no handle.
  *
  * Stack, under app code: the formatter's output buffer (136 bytes) and a struct tm are the largest frames, in the bindings
  * of time.format and os.date.
@@ -526,6 +529,151 @@ static int timer_tostring(lua_State *L) {
     return 1;
 }
 
+/* ---- alarm ---- */
+
+/* Raises the module's message unless the manifest gives the app its permission (the module and its permission are named
+ * alike: "alarm", "sound"). Upvalue 1 is the runtime. */
+static void need(lua_State *L, unsigned perm, const char *module) {
+    apps_rt_t *rt = lua_touserdata(L, lua_upvalueindex(1));
+    if (!apps_rt_permits(rt, perm)) {
+        luaL_error(L, "%s: add \"%s\" to \"permissions\" in manifest.json", module, module);
+    }
+}
+
+#define ALARM_MS_RULE "ms must be a whole number from 1 to " STR(APPS_ALARM_MAX_MS)
+
+/* The name at idx: a string of 1 to 23 characters of a-z, 0-9 and _. A number isn't taken for text. */
+static const char *alarm_name(lua_State *L, int idx) {
+    size_t len = 0;
+    const char *name = lua_type(L, idx) == LUA_TSTRING ? lua_tolstring(L, idx, &len) : NULL;
+    bool ok = name != NULL && len >= 1 && len <= APPS_ALARM_NAME_MAX;
+    for (size_t i = 0; ok && i < len; i++) {
+        ok = (name[i] >= 'a' && name[i] <= 'z') || (name[i] >= '0' && name[i] <= '9') || name[i] == '_';
+    }
+    if (!ok) {
+        luaL_error(L, "alarm: name must be 1-" STR(APPS_ALARM_NAME_MAX) " characters of a-z, 0-9 and _");
+    }
+    return name;
+}
+
+/* alarm.after's options, the table at idx: sound and wake, each true or false, both true unless it says so. A key that is
+ * neither is an error, as in the ui module. The table is read raw (no metamethod, so no app code runs here) and walked with
+ * lua_next, which no count hook sees: charged by the slots it visits. */
+static void alarm_options(lua_State *L, int idx, bool *sound, bool *wake) {
+    if (lua_type(L, idx) != LUA_TTABLE) {
+        luaL_error(L, "alarm.after: options must be a table like {sound = true, wake = true}, got %s", luaL_typename(L, idx));
+    }
+    apps_vm_charge(L, apps_vm_table_slots(L, idx) + 1);
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        size_t len = 0;
+        const char *key = lua_type(L, -2) == LUA_TSTRING ? lua_tolstring(L, -2, &len) : NULL;
+        bool *option = key == NULL ? NULL : (len == 5 && memcmp(key, "sound", 5) == 0) ? sound :
+                       (len == 4 && memcmp(key, "wake", 4) == 0) ? wake : NULL;
+        if (option == NULL) {
+            char shown[24 + 4];
+            if (key != NULL) {
+                apps_text_shown(key, len, 24, shown);
+            } else {
+                snprintf(shown, sizeof shown, "<%s>", luaL_typename(L, -2));
+            }
+            luaL_error(L, "alarm.after: unknown option '%s' (valid: sound, wake)", shown);
+        }
+        if (lua_type(L, -1) != LUA_TBOOLEAN) {
+            luaL_error(L, "alarm.after: %s must be true or false, got %s", option == sound ? "sound" : "wake",
+                       luaL_typename(L, -1));
+        }
+        *option = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);  /* the value; the key stays for the next step */
+    }
+}
+
+/* alarm.after(name, ms, {sound, wake}), upvalue 1 the runtime. The limits are the app's (4) and the gadget's (8): the port
+ * enforces both, and this says which, as the first is checked here (a name already armed is replaced, so it is no new one). */
+static int alarm_after(lua_State *L) {
+    apps_vm_check(L);
+    need(L, APPS_PERM_ALARM, "alarm");
+    const char *name = alarm_name(L, 1);
+    lua_Integer ms = 0;
+    if (!whole(L, 2, &ms) || ms < 1 || ms > APPS_ALARM_MAX_MS) {
+        return luaL_error(L, "alarm.after: " ALARM_MS_RULE);
+    }
+    bool sound = true, wake = true;
+    if (!lua_isnoneornil(L, 3)) {
+        alarm_options(L, 3, &sound, &wake);
+    }
+    const char *app = apps_rt_id(lua_touserdata(L, lua_upvalueindex(1)));
+    char names[APPS_ALARMS_PER_APP][APPS_ALARM_NAME_MAX + 1];
+    int64_t left[APPS_ALARMS_PER_APP];
+    if (apps_port_alarm_remaining(app, name) < 0 && apps_port_alarm_list(app, names, left) >= APPS_ALARMS_PER_APP) {
+        return luaL_error(L, "alarm: no more than " STR(APPS_ALARMS_PER_APP) " alarms per app");
+    }
+    if (!apps_port_alarm_arm(app, name, ms, sound, wake)) {
+        return luaL_error(L, "alarm: the gadget has no free alarm slots (" STR(APPS_ALARMS_MAX) " in all); cancel one");
+    }
+    return 0;
+}
+
+/* alarm.cancel(name): nothing to do for one that isn't armed (or has gone). */
+static int alarm_cancel(lua_State *L) {
+    apps_vm_check(L);
+    need(L, APPS_PERM_ALARM, "alarm");
+    const char *name = alarm_name(L, 1);
+    apps_port_alarm_cancel(apps_rt_id(lua_touserdata(L, lua_upvalueindex(1))), name);
+    return 0;
+}
+
+/* alarm.remaining(name): the milliseconds left as an integer, or nil. */
+static int alarm_remaining(lua_State *L) {
+    apps_vm_check(L);
+    need(L, APPS_PERM_ALARM, "alarm");
+    const char *name = alarm_name(L, 1);
+    int64_t left = apps_port_alarm_remaining(apps_rt_id(lua_touserdata(L, lua_upvalueindex(1))), name);
+    if (left < 0) {
+        lua_pushnil(L);
+    } else {
+        lua_pushinteger(L, left);
+    }
+    return 1;
+}
+
+/* alarm.list(): {{name = ..., remaining = ...}, ...}, the earliest first. */
+static int alarm_list(lua_State *L) {
+    apps_vm_check(L);
+    need(L, APPS_PERM_ALARM, "alarm");
+    char names[APPS_ALARMS_PER_APP][APPS_ALARM_NAME_MAX + 1];
+    int64_t left[APPS_ALARMS_PER_APP];
+    int n = apps_port_alarm_list(apps_rt_id(lua_touserdata(L, lua_upvalueindex(1))), names, left);
+    lua_createtable(L, n, 0);
+    for (int i = 0; i < n; i++) {
+        lua_createtable(L, 0, 2);
+        lua_pushstring(L, names[i]);
+        lua_setfield(L, -2, "name");
+        lua_pushinteger(L, left[i]);
+        lua_setfield(L, -2, "remaining");
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+/* ---- sound ---- */
+
+/* sound.chirp(): one chirp, with the "sound" permission. */
+static int sound_chirp(lua_State *L) {
+    apps_vm_check(L);
+    need(L, APPS_PERM_SOUND, "sound");
+    apps_port_sound_chirp();
+    return 0;
+}
+
+/* sound.stop(): ends the ring of an alarm that is going, whichever app's it is: no permission (an app that can't make a
+ * noise can still be asked to stop one), and nothing happens when none is going. */
+static int sound_stop(lua_State *L) {
+    apps_vm_check(L);
+    apps_port_sound_stop();
+    return 0;
+}
+
 /* ---- The modules ---- */
 
 static const luaL_Reg apps_time_funcs[] = {
@@ -557,12 +705,26 @@ static const luaL_Reg apps_timer_methods[] = {
     {NULL, NULL},
 };
 
+static const luaL_Reg apps_alarm_funcs[] = {
+    {"after", alarm_after},
+    {"cancel", alarm_cancel},
+    {"remaining", alarm_remaining},
+    {"list", alarm_list},
+    {NULL, NULL},
+};
+
+static const luaL_Reg apps_sound_funcs[] = {
+    {"chirp", sound_chirp},
+    {"stop", sound_stop},
+    {NULL, NULL},
+};
+
 static const luaL_Reg apps_timer_meta[] = {
     {"__tostring", timer_tostring},
     {NULL, NULL},
 };
 
-/* Runs under lua_pcall: the three globals and the timer handle's metatable. */
+/* Runs under lua_pcall: the five globals and the timer handle's metatable. */
 static int open_svc(lua_State *L) {
     apps_rt_t *rt = lua_touserdata(L, 1);
     lua_settop(L, 0);
@@ -590,6 +752,18 @@ static int open_svc(lua_State *L) {
     lua_pushlightuserdata(L, rt);
     luaL_setfuncs(L, apps_timer_funcs, 1);
     lua_setglobal(L, "timer");
+
+    /* alarm and sound make no handle: nothing to protect, but the runtime, which every one of them asks for the app's id and
+     * what its manifest permits. */
+    lua_createtable(L, 0, 4);
+    lua_pushlightuserdata(L, rt);
+    luaL_setfuncs(L, apps_alarm_funcs, 1);
+    lua_setglobal(L, "alarm");
+
+    lua_createtable(L, 0, 2);
+    lua_pushlightuserdata(L, rt);
+    luaL_setfuncs(L, apps_sound_funcs, 1);
+    lua_setglobal(L, "sound");
     return 0;
 }
 

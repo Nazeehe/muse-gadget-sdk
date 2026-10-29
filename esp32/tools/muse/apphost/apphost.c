@@ -49,6 +49,12 @@
  *                                          lines of the file around line 7 (apps_pkg_compile_message)
  *   {"event":"state","state":"running"}    the `state` command: stopped, running or crashed
  *   {"event":"timers","count":2}           the `timers` command: how many timers the app has armed
+ *   {"event":"alarm","name":"t","sound":true,"wake":true}
+ *                                          an alarm of the app came due, as the system fires it: before the ring, the screen
+ *                                          and the app's own alarm(name), which follow
+ *   {"event":"ring","on":true}             the ring began (an alarm with sound fired and none was ringing), or ended:
+ *                                          sound.stop, a minute after the last alarm with sound, or never if nothing rang
+ *   {"event":"chirp"}                      sound.chirp()
  *   {"event":"dump","widgets":[...]}       the `dump` command: one object an alive widget (apps_ui.h), with
  *                                          "dropped":N after them when N didn't fit the size asked for
  *   {"event":"leak_check","bytes":0}       --cycles: what the apps' heap still holds
@@ -73,8 +79,12 @@
  *   advance MS             time passes: the monotonic clock moves MS ms (0 to 86400000) in steps of 10 ms, and after each
  *                          step the timers that are due run, as the app task's loop runs them, and the screen is applied,
  *                          as a frame follows. Always at least one pass, so `advance 0` runs the timers that came due
- *                          while the screen was dark. A crash in a timer prints a crash event, as it happens.
- *   dark on | dark off     the screen goes dark (no timer runs) or wakes; nothing runs at once
+ *                          while the screen was dark. A crash in a timer prints a crash event, as it happens. After each
+ *                          step the alarms that are due fire first (below), and a ring whose minute is over ends. An alarm
+ *                          is the system's (apps_alarm.h): the app's stop doesn't disarm it, and when one fires, an app that
+ *                          doesn't run is launched again (a new runtime, as on the gadget: main.lua's top level runs, then
+ *                          start() and its `started` event), then alarm(name) is called.
+ *   dark on | dark off     the screen goes dark (no timer runs) or wakes; nothing runs at once. An alarm with wake wakes it
  *   sync EPOCH_MS          the wall clock is set (to 2025 or later, in ms since 1970, as SNTP sets the gadget's), and moves
  *                          with the monotonic clock from then on. Unset, time.now() is nil. The time zone is UTC0.
  *   timers                 -> timers: how many timers the app has armed
@@ -217,6 +227,20 @@ static void emit_warnings(const char *joined) {
         p += n + (sep != NULL ? 2 : 0);
     }
 }
+
+/* The sound module's events (apphost_port.h), printed as they happen. */
+static void emit_chirp(void) {
+    begin("chirp");
+    end_event();
+}
+
+static void emit_ring(bool on) {
+    begin("ring");
+    printf(",\"on\":%s", on ? "true" : "false");
+    end_event();
+}
+
+static const apphost_sound_t SOUND_EVENTS = {.chirp = emit_chirp, .ring = emit_ring};
 
 /* ---- The package ---- */
 
@@ -609,6 +633,50 @@ static void cmd_handler(app_t *app, const char *name) {
     report_crash(app, was_crashed);
 }
 
+static void make_and_start(app_t *app);
+
+/* An alarm has fired: the app is told, alarm(name), after it is launched again if it doesn't run. A stopped or a crashed app's
+ * runtime is freed and a new one made from the package, as a launch of the stored package does on the gadget (a stop or a
+ * crash ends the app there, and its alarm launches it): main.lua's top level runs again, then start(). */
+static void tell_app(app_t *app, const char *name) {
+    if (app->rt != NULL && apps_rt_state(app->rt) != APPS_STATE_RUNNING) {
+        apps_rt_free(app->rt);
+        app->rt = NULL;
+        app->warned = 0;
+        make_and_start(app);
+    }
+    if (app->rt == NULL || apps_rt_state(app->rt) != APPS_STATE_RUNNING) {
+        return;
+    }
+    bool was_crashed = crashed(app);
+    (void)apps_rt_alarm(app->rt, name);
+    flush_warnings(app);
+    report_crash(app, was_crashed);
+    if (!was_crashed && crashed(app)) {
+        apps_port_sound_stop();  /* no one is left to stop a ring: the app task ends it when the app crashes in alarm() */
+    }
+}
+
+/* What the gadget does by itself as the clock moves: a ring whose minute is over ends, and each alarm that is due fires, in the
+ * order the system does it in (apps_alarm.h): the alarm, the ring, the screen, then the app. */
+static void fire_alarms(app_t *app) {
+    apphost_ring_tick();
+    apphost_alarm_t a;
+    while (apphost_alarm_next_due(&a)) {
+        begin("alarm");
+        field("name", a.name, strlen(a.name));
+        printf(",\"sound\":%s,\"wake\":%s", a.sound ? "true" : "false", a.wake ? "true" : "false");
+        end_event();
+        if (a.sound) {
+            apphost_ring();
+        }
+        if (a.wake) {
+            apphost_set_dark(false);
+        }
+        tell_app(app, a.name);
+    }
+}
+
 /* The most `advance` moves the clock in one command: a day. */
 #define ADVANCE_MAX_MS 86400000
 /* How far the app task's loop is from the clock: the pass of the timers after each step. */
@@ -628,6 +696,7 @@ static void cmd_advance(app_t *app, long ms) {
         done += step;
         if (app->rt != NULL) {
             begin_command();
+            fire_alarms(app);  /* an app that crashed in alarm() was reported there */
             bool was_crashed = crashed(app);
             apps_rt_run_timers(app->rt, apps_port_mono_ms());
             flush_warnings(app);
@@ -840,6 +909,20 @@ static bool run_script(app_t *app, FILE *in) {
 
 /* ---- Launch ---- */
 
+/* The runtime of app->pkg is made and the app started, as events: the launch of a run, and of an alarm for an app that crashed. */
+static void make_and_start(app_t *app) {
+    app->rt = apps_rt_new(app->pkg, app->crash_text, sizeof app->crash_text);
+    if (app->rt == NULL) {  /* nothing could be made (main.lua doesn't compile, ...): the reason */
+        emit_text("crash", app->crash_text);
+    } else if (apps_rt_state(app->rt) == APPS_STATE_CRASHED) {  /* main.lua ran and failed: its record */
+        emit_text("crash", apps_rt_last_error(app->rt));
+    } else {
+        emit_warnings(apps_rt_warnings(app->rt));
+        app->warned = strlen(apps_rt_warnings(app->rt));
+        cmd_start(app);
+    }
+}
+
 /* The app's launch, as events, then the script; the exit status. A package that doesn't compile (unless compile is
  * false) is refused first, with one crash event and the status 1, and nothing else happens. A script that can't be read
  * is the status 2, after what it did run. */
@@ -853,18 +936,10 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name,
     }
     app_t app = {.pkg = pkg};
     apphost_set_log(emit_log);
+    apphost_set_sound(&SOUND_EVENTS);
     emit_warnings(pkg->manifest.warnings);
     begin_command();
-    app.rt = apps_rt_new(pkg, app.crash_text, sizeof app.crash_text);
-    if (app.rt == NULL) {  /* nothing could be made (main.lua doesn't compile, ...): the reason */
-        emit_text("crash", app.crash_text);
-    } else if (apps_rt_state(app.rt) == APPS_STATE_CRASHED) {  /* main.lua ran and failed: its record */
-        emit_text("crash", apps_rt_last_error(app.rt));
-    } else {
-        emit_warnings(apps_rt_warnings(app.rt));
-        app.warned = strlen(apps_rt_warnings(app.rt));
-        cmd_start(&app);
-    }
+    make_and_start(&app);
     end_of_command(&app);
     int status = 0;
     if (script != NULL && !run_script(&app, script)) {

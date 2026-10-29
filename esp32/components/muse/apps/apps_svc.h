@@ -17,7 +17,7 @@
 #pragma once
 
 /*
- * The services of the device a Muse app can call: the Lua modules `time`, `os` and `timer` (later tasks add `alarm`, `sound`,
+ * The services of the device a Muse app can call: the Lua modules `time`, `os`, `timer`, `alarm` and `sound` (later tasks add
  * `store`, `sys` and `log` here). Portable C: the clocks and the screen's sleep come through apps_port.h, and what a timer
  * is lives in the runtime (apps_rt.h, which also says when the timers run). Every binding calls apps_vm_check first, and
  * everything that allocates in the app's heap runs inside a call of the app, so a heap that refuses is the app running
@@ -58,13 +58,44 @@
  *   Each returns a handle: h:cancel(), and timer.cancel(h) does the same; either may be called again, and from the timer's
  *   own callback. ms is a whole number from 40 to 86400000. No more than 16 timers at once. The handle is protected (X17).
  *   tostring(h) is "timer#<slot>".
+ *
+ * alarm (the system's: they belong to the gadget, not to the app, so they run on the monotonic clock, fire while the gadget
+ * sleeps, and outlive the app's stop and its crash; apps_alarm.h says how, apphost mimics it on its fake clock). The "alarm"
+ * permission of the manifest is needed for all of them: without it each raises
+ * `alarm: add "alarm" to "permissions" in manifest.json`, before anything else is looked at.
+ *   alarm.after(name, ms, {sound = true, wake = true})
+ *                         fires ms from now (a whole number from 1 to 604800000, a week). name is 1 to 23 characters of
+ *                         a-z, 0-9 and _ and names the alarm among this app's: arming a name that is armed replaces it.
+ *                         sound rings (a chirp now and every 1.5 s, for a minute at most, until sound.stop()), wake lights
+ *                         the screen as a press does; both default to true, a key that is neither is an error, and no
+ *                         "sound" permission is needed for the ring. When it fires the app is brought to the front, started
+ *                         first if it isn't running (from the last package installed with its id), and its handler
+ *                         alarm(name) is called, once start() has returned. At most 4 alarms an app and 8 on the gadget:
+ *                         `alarm: no more than 4 alarms per app`, `alarm: the gadget has no free alarm slots (8 in all); cancel
+ *                         one`. The one-shot is gone from alarm.list() once alarm(name) is called (and inside it), so the
+ *                         handler may arm the same name again; so may start(), when it is the alarm that started the app: the
+ *                         alarm that fired is still called, and the new one is armed beside it. It returns nothing: there is
+ *                         no handle.
+ *   alarm.cancel(name)    disarms it; nothing for one that isn't armed. Cancelled after it fired and before alarm(name) was
+ *                         called, it is never delivered, and the ring it started ends.
+ *   alarm.remaining(name) the milliseconds left, an integer rounded up (0 for one that has fired and isn't delivered yet), or
+ *                         nil when there is no such alarm
+ *   alarm.list()          {{name = "t", remaining = 4200}, ...}, the earliest first
+ *   A wrong name is `alarm: name must be 1-23 characters of a-z, 0-9 and _` (in all four), a wrong ms
+ *   `alarm.after: ms must be a whole number from 1 to 604800000`.
+ *
+ * sound:
+ *   sound.chirp()         one chirp at the gadget's volume (it plays when the voice task is idle); needs the "sound"
+ *                         permission: `sound: add "sound" to "permissions" in manifest.json`
+ *   sound.stop()          ends the ring of an alarm that is going, whichever app's it is; no permission, and nothing happens
+ *                         when none is going
  */
 
 #include "apps_rt.h"
 
 typedef struct lua_State lua_State;
 
-/* Installs `time`, `os` and `timer` into L's globals, for the app of rt, which must outlive L. It runs under lua_pcall, so a
+/* Installs `time`, `os`, `timer`, `alarm` and `sound` into L's globals, for the app of rt, which must outlive L. It runs under lua_pcall, so a
  * heap that refuses ends the app out of memory at its next call rather than aborting. Called by apps_rt_new, before
  * main.lua's top level runs. */
 void apps_svc_open(lua_State *L, apps_rt_t *rt);

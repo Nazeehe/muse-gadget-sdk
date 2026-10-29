@@ -457,15 +457,29 @@ class TimerTest(AppHostTestCase):
         self.assertEqual(run.of("ring"), [RING_ON, RING_OFF, RING_ON])
         self.assertEqual(run.of("alarm"), [ALARM_FIRED, ALARM_FIRED])
 
-    def test_pause_then_resume_after_the_systems_budget_took_the_alarm_away_does_not_crash(self):
-        # More than 6 alarms in a minute cancel an app's alarms (apps_alarm.h). The app is behind, so nothing redraws it: it still says
-        # running when Pause is tapped, with no alarm, so 0 is stored. Resume arms 1 ms, which the budget drops again (the same minute).
-        # The next time the app reads the time left it finds no alarm: done.
-        run = self.go("hide", *['message start {"seconds":1}', "advance 1000"] * 7, 'tap "Pause"', 'tap "Resume"', "advance 10",
-                      "message status")
+    def test_a_paused_timer_with_nothing_left_can_be_resumed_and_finishes(self):
+        # What the race above stores, brought back by a restart (a record with 0 left is one the app reads): Resume arms 1 ms, as the
+        # alarm refuses 0, and that alarm finishes the countdown. Without it the refusal is the hint and the timer stays paused.
+        run = self.seeded('{state = "paused", total = 60000, left = 0}', "dump", 'tap "Resume"', "dump", "advance 1", "dump")
         self.assertEqual(run.of("crash"), [])
-        self.assertEqual(len(run.messages("warning")), 2, "the seventh firing and the eighth were cut")
-        self.assertEqual(run.of("reply")[-1], reply("done", 0))
+        self.assertEqual(self.screens(run), [paused("0:00"), running("0:01"), done()])
+        self.assertEqual(self.kinds(run), ["started", "dump", "dump", "alarm", "ring", "dump"])
+        self.assertEqual(run.of("alarm"), [ALARM_FIRED])
+
+    def test_a_pause_after_the_systems_budget_took_the_alarm_away_makes_it_done(self):
+        # More than 6 alarms in a minute cancel an app's alarms (apps_alarm.h). The app is behind, so nothing redraws it: it still says
+        # running, with Pause on it, and its alarm is gone. A countdown with no alarm will never ring, so there is nothing to pause: the
+        # timer is done, on the screen, in the reply and in the store (it used to keep 0 left and show Paused 0:00). Nothing is armed
+        # after the cut, so the budget only speaks once.
+        for how in ('tap "Pause"', "message pause"):
+            with self.subTest(how):
+                run = self.go("hide", *['message start {"seconds":1}', "advance 1000"] * 7, how, "dump", "message resume",
+                              "message status", "restart", "dump")
+                self.assertEqual(run.of("crash"), [])
+                self.assertEqual(len(run.messages("warning")), 1, "the seventh firing was cut")
+                self.assertEqual(self.screens(run), [done(), done()], "after the pause, and after a restart")
+                replies = [reply("done", 0)] * (2 if how.startswith("tap") else 3)   # the pause's own (a message), resume's, status's
+                self.assertEqual(run.of("reply")[7:], replies, "the seven starts' replies come first")
 
     # ---- A new countdown, and the ring ----
 

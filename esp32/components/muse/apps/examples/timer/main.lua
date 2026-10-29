@@ -98,7 +98,9 @@ end
 
 local function pause()
   if s.state ~= "running" then return end
-  s.left = alarm.remaining(ALARM) or 0
+  local left = remaining()
+  if s.state ~= "running" then return end  -- its alarm was gone: the read found it done, and there is nothing to pause
+  s.left = left
   alarm.cancel(ALARM)
   s.state = "paused"
   changed()

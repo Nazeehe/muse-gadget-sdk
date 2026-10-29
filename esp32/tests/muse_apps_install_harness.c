@@ -641,6 +641,31 @@ static void compile_error_has_excerpt(void) {
     CHECK(strcmp(compiled_paths, "main.lua lib/util.lua ") == 0, "compile was given %s", compiled_paths);
 }
 
+/* Fix round 1, A: the message carries nothing a terminal could take for more than text, whether it comes from Lua's token
+ * or from the lines of the file that follow it: a control byte, a C1 character (U+009B is CSI) and a byte that isn't
+ * UTF-8 are each a '?', and the newlines the excerpt puts between its lines stay. */
+static void compile_message_is_clean(void) {
+    static const char util[] = "-- \x1b]0;owned\x07 \xc2\x9b" "2J\nlocal b = = 2\nreturn {}\n";
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"util.lua\"]}");
+    serve_text("main.lua", MAIN);
+    serve("util.lua", util, sizeof util - 1);
+    compile_raw = "util.lua:2: unfinished string near ''\x01\x1b[2J\xff'";
+    EXPECT_FAILURE(install("hello", true), APPS_ERR_COMPILE_FAILED,
+                   "compile failed: util.lua:2: unfinished string near ''??[2J?'\n 1| -- ?]0;owned? ?2J\n>2| local b = = 2\n 3| "
+                   "return {}");
+    /* A file nobody requires, with the bytes in a comment next to the syntax error. */
+    compile_raw = "util.lua:2: unexpected symbol near '='";
+    EXPECT_FAILURE(install("hello", false), APPS_ERR_COMPILE_FAILED,
+                   "compile failed: util.lua:2: unexpected symbol near '='\n 1| -- ?]0;owned? ?2J\n>2| local b = = 2\n 3| "
+                   "return {}");
+    /* Lua's message is one line, though a token can hold a newline. */
+    compile_raw = "util.lua:2: hexadecimal digit expected near ''\\x\n'";
+    char *m = message_of(install("hello", false));
+    CHECK(strncmp(m, "compile failed: util.lua:2: hexadecimal digit expected near ''\\x?'\n 1| ", 68) == 0, "%s", m);
+    free(m);
+    CHECK(commits == 0 && runs == 0, "nothing kept or run");
+}
+
 static void crash_in_start_message(void) {
     serve_hello();
     run_ok = false;
@@ -1281,6 +1306,7 @@ int main(int argc, char **argv) {
         {"compiled_chunk_refused", compiled_chunk_refused},
         {"oversize_and_totals", oversize_and_totals},
         {"compile_error_has_excerpt", compile_error_has_excerpt},
+        {"compile_message_is_clean", compile_message_is_clean},
         {"crash_in_start_message", crash_in_start_message},
         {"crash_in_top_level_message", crash_in_top_level_message},
         {"result_fits_6144_bytes", result_fits_6144_bytes},

@@ -438,12 +438,18 @@ class RuntimeTest(AppHostTestCase):
 
     def test_a_compile_error_shows_the_token_as_clean_text(self):
         # Lua's message for an unfinished string quotes the token, raw bytes and all. The runtime cleans it like any
-        # text this module hands out (--no-compile, below, and a module's error the same way, in one line). The
-        # install's message is Lua's as it comes, with the source line under it: the bytes as JSON carries them, a
-        # control byte escaped and one that isn't UTF-8 as U+FFFD.
+        # text this module hands out (--no-compile, below, and a module's error the same way, in one line), and so
+        # does the install's message, the token and the source line under it: apps_pkg_compile_message makes both from
+        # the same rule, so the board's reply and check's crash event are one text, a '?' for each control byte,
+        # each C1 character and each byte that isn't UTF-8 (fix round 1, A).
         run = self.run_app(b"x = '\x01\x1b[2J\xff\n", rc=1)
         self.assertEqual(run.messages("crash"), [compile_failed(
-            "main.lua:1: unfinished string near ''\x01\x1b[2J\ufffd'", ">1| x = '\x01\x1b[2J\ufffd")])
+            "main.lua:1: unfinished string near ''??[2J?'", ">1| x = '??[2J?")])
+        # A C1 character (U+009B is CSI) next to the error, in a comment: the lines show it as '?', and so does
+        # whatever the terminal gets.
+        run = self.run_app("-- \x1b]0;owned\x07 \u009b2J\nlocal b = = 2\nreturn {}\n", rc=1)
+        self.assertEqual(run.messages("crash"), [compile_failed(
+            "main.lua:2: unexpected symbol near '='", " 1| -- ?]0;owned? ?2J", ">2| local b = = 2", " 3| return {}")])
         run = self.run_app(b"x = '\x01\x1b[2J\xff\n", rc=1, compile=False)
         self.assertEqual(run.messages("crash"), ["main.lua:1: unfinished string near ''??[2J?'"])
         app = self.make_app("scratch", "return {message = function() return require('m') end}",
@@ -1028,6 +1034,27 @@ class RuntimeTest(AppHostTestCase):
         app = self.make_app("scratch", "return {}", files={"big.json": " " * (32 * 1024 + 1)})
         self.assertEqual(run_dir(app).messages("error"), ["big.json is larger than 32 KB"])
 
+    def test_a_compiled_chunk_is_refused_in_the_installs_words(self):
+        # Fix round 1, F: the install refuses a .lua that starts with Lua's signature before it compiles anything, with
+        # the manifest's own index of the file (main is files[0]); apphost reads the package the same way, through the
+        # same check, so check says what the install says (and not "binary chunks are not allowed", the compile's).
+        for compiled in (b"\x1bLua", b"\x1bLuaT\x00\x19\x93\r\n\x1a\n", b"\x1bLua" + bytes(100)):
+            with self.subTest(compiled=compiled[:12]):
+                app = self.make_app("scratch", compiled)
+                self.assertEqual(self.host(app, rc=1).events, [{
+                    "event": "error", "message": "files[0] main.lua is a compiled chunk: install Lua source text"}])
+        app = self.make_app("scratch", "return {}", files={"d.json": "{}", "lib/lib.lua": b"\x1bLua"})
+        self.assertEqual(self.host(app, rc=1).events, [{
+            "event": "error", "message": "files[2] lib/lib.lua is a compiled chunk: install Lua source text"}])
+        # Only a .lua file's start is the signature: a .json file that starts that way is refused as JSON, and three bytes
+        # of it are not the signature, so the install's step 3 lets them by and the compile says what it says of any
+        # source that starts with ESC (as it does here, and in the install: one text).
+        app = self.make_app("scratch", "return {}", files={"d.json": b"\x1bLua"})
+        self.assertEqual(self.host(app, rc=1).messages("error"), ["d.json: unexpected byte 0x1B at byte 1"])
+        app = self.make_app("scratch", b"\x1bLu")
+        self.assertEqual(self.host(app, rc=1).events, [{
+            "event": "crash", "message": compile_failed("binary chunks are not allowed: install Lua source text")}])
+
     def test_the_totals_of_a_package_are_limited(self):
         # 8 files of 250 KB make 2000 KB, a 9th goes past the app's 2 MB (no one file is over its own limit).
         files = {f"m{i}.lua": "x" * (250 * 1024) for i in range(1, 10)}
@@ -1285,6 +1312,13 @@ class HarnessTest(unittest.TestCase):
             self.fail(f"{case} took more than {timeout} s")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         return done
+
+    def test_the_compile_step_loads_in_order_and_leaves_nothing(self):
+        # Fix round 1, E: apps_rt_compile, which the app task's compile and apphost's check share.
+        self.run_case("compile_all")
+
+    def test_the_compile_step_survives_a_heap_that_refuses_at_every_step(self):
+        self.run_case("compile_refused")
 
     def test_new_survives_a_heap_that_refuses_at_every_step(self):
         self.run_case("new_refused")

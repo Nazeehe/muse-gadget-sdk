@@ -1016,6 +1016,19 @@ class MuseAppsPkgTest(unittest.TestCase):
         # anything else (no such file, no line, a line the file lacks) is shown as it is; cut at cap on a character.
         self.run_case("compile_message")
 
+    def test_the_compile_order_is_main_first_then_the_other_lua_files(self):
+        # Fix round 1, E: apps_pkg_compile_order, the one order of the install's compile and apphost's check.
+        self.run_case("compile_order")
+
+    def test_the_compiled_chunk_check_is_the_installs_wording(self):
+        # Fix round 1, F: apps_pkg_check_source, which the install pipeline's step 3 and apphost's loading share.
+        self.run_case("check_source")
+
+    def test_text_that_leaves_the_runtime_is_cleaned_by_one_rule(self):
+        # Fix round 1, A: apps_text_clean (the runtime's messages and the compile message share it): each control byte
+        # but tab and a kept newline, DEL, each C1 character and each byte of broken UTF-8 is one '?'; U+00A0 is text.
+        self.run_case("text_clean")
+
     def test_every_prefix_of_a_manifest_is_refused(self):
         # A text is its first len bytes: cut anywhere, each is an error and nothing is read past the end.
         self.run_case("truncations")

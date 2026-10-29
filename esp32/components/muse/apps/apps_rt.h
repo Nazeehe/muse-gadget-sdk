@@ -154,6 +154,24 @@ typedef struct apps_rt apps_rt_t;
  */
 apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len);
 
+/* One Lua file to compile: its path, which names the chunk in Lua's messages ("util.lua:7: ..."), and its source. */
+typedef struct {
+    const char *path;
+    const char *src;
+    size_t len;
+} apps_code_t;
+
+/*
+ * The install's compile step, in one place for the app task (the install's, on the gadget) and for apphost (check, on a
+ * laptop): code[0, n) each loaded, as a top-level chunk and not run, in a scratch VM of the app's own kind (memory_kb of
+ * heap, the sandbox) that is gone before this returns. The caller picks the order (apps_pkg_compile_order); the first
+ * file that fails ends it. True when every file compiles. Otherwise err (cut to err_len on a character boundary; err may be
+ * NULL) has Lua's raw message for that file ("util.lua:7: unexpected symbol near '='"; apps_pkg_compile_message words it),
+ * or, when the VM can't be made, "out of memory: can't make the app's heap of %u KB": the same words apps_rt_new says of a
+ * heap it can't make.
+ */
+bool apps_rt_compile(const apps_code_t *code, int n, unsigned memory_kb, char *err, size_t err_len);
+
 /*
  * start(), with APPS_BUDGET_START. True when the app is RUNNING after it: start() returned, or the app has no
  * start, or it was RUNNING already (then nothing runs). False, with nothing run, when the runtime is CRASHED;

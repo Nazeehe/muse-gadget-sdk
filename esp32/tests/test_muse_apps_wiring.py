@@ -106,6 +106,11 @@ def c_function(source: str, signature: str) -> str:
     return source[start:pos]
 
 
+def strip_c_comments(source: str) -> str:
+    """The code of a C file: its comments gone, and its string literals as they are."""
+    return re.sub(r'("(?:\\.|[^"\\\n])*")|/\*.*?\*/|//[^\n]*', lambda m: m.group(1) or "", source, flags=re.S)
+
+
 def open_conditions(source: str, index: int) -> list:
     """The preprocessor branches open at source[index], outermost first: "if CONFIG_X", or "else" once #else is met."""
     stack = []
@@ -610,7 +615,8 @@ class MuseAppsWiringTest(unittest.TestCase):
 
     def test_one_compile_message(self):  # the pre-review round: check words a refusal as the install does
         # apps_pkg.c makes the message, "compile failed: ", Lua's own and the excerpt of the file it names; the install
-        # pipeline and apphost both call it, so neither keeps a lookup or a wording of its own.
+        # pipeline and apphost both call it, so neither keeps a lookup or a wording of its own. (Fix round 1, E and F: the
+        # step that compiles, its order, the heap's message and the compiled-chunk refusal are shared the same way.)
         pkg = (MUSE / "apps/apps_pkg.c").read_text()
         self.assertEqual(pkg.count('"compile failed: "'), 1)
         self.assertEqual(pkg.count("apps_vm_excerpt("), 1)
@@ -620,6 +626,54 @@ class MuseAppsWiringTest(unittest.TestCase):
                 self.assertEqual(text.count("apps_pkg_compile_message("), 1)
                 self.assertNotIn('"compile failed: "', text)
                 self.assertNotIn("apps_vm_excerpt(", text)
+        self.one_compile_step_and_one_compiled_chunk_check()
+
+    def one_compile_step_and_one_compiled_chunk_check(self):  # fix round 1, E and F
+        # What the install compiles, apphost's check compiles with the same code: apps_rt.c makes the scratch VM and
+        # loops over the files (and says what a heap too small to make says, as it does for the app's own), apps_pkg.c
+        # puts main first and refuses a compiled chunk. The app task's compile and apphost call these, and neither has a
+        # VM, a loop, an order or a wording of its own. Every C file of the build is searched, so a copy anywhere else
+        # fails here too.
+        sources = {path.name: strip_c_comments(path.read_text()) for folder in (MUSE / "apps", ROOT / "tools/muse/apphost")
+                   for path in [*folder.glob("*.c"), *folder.glob("*.h")]}
+        for name in ("apps_task.c", "apphost.c", "apps_rt.c", "apps_pkg.c", "apps_install.c"):
+            self.assertIn(name, sources)
+
+        def holders(text):
+            return sorted(name for name, source in sources.items() if text in source)
+
+        # One wording of a heap that can't be made, and of a compiled chunk.
+        self.assertEqual(holders("can't make the app's heap"), ["apps_rt.c"])
+        self.assertEqual(sources["apps_rt.c"].count("can't make the app's heap"), 1)
+        self.assertEqual(holders("is a compiled chunk"), ["apps_pkg.c"])
+        self.assertEqual(sources["apps_pkg.c"].count("is a compiled chunk"), 1)
+        self.assertEqual(holders("binary chunks are not allowed"), ["apps_vm.c"])
+        # The compile's steps are in the runtime: the VM is made by one function (the app's and the compile's), and each
+        # file loaded into it and the VM freed by one function more.
+        rt = sources["apps_rt.c"]
+        self.assertEqual(rt.count("apps_vm_new("), 1)
+        self.assertEqual(c_function(rt, "static apps_vm_t *make_vm(").count("apps_vm_new("), 1)
+        compile_all = c_function(rt, "bool apps_rt_compile(")
+        self.assertEqual(compile_all.count("make_vm("), 1)
+        self.assertEqual(compile_all.count("apps_vm_load("), 1)
+        self.assertEqual(compile_all.count("apps_vm_free("), 1)
+        for name in ("apps_task.c", "apphost.c", "apps_install.c"):
+            for call in ("apps_vm_new(", "apps_vm_load(", "apps_vm_load_on(", "apps_vm_free(", "apps_vm_config_t"):
+                with self.subTest(name, call=call):
+                    self.assertNotIn(call, sources[name])
+        # The callers: each calls the shared pieces once and makes no loop or order of its own.
+        for name, calls in (("apps_task.c", ("apps_rt_compile(", "apps_pkg_compile_order(")),
+                            ("apphost.c", ("apps_rt_compile(", "apps_pkg_compile_order(", "apps_pkg_check_source("))):
+            for call in calls:
+                with self.subTest(name, call=call):
+                    self.assertEqual(sources[name].count(call), 1)
+        self.assertEqual(sources["apps_install.c"].count("apps_pkg_check_source("), 1)
+        # The order, main first, is apps_pkg.c's alone: nothing else compares a path with the manifest's main to sort
+        # the compile (the app task's message for a main it can't compile is its own business, after the order).
+        order = c_function(sources["apps_pkg.c"], "int apps_pkg_compile_order(")
+        self.assertIn("manifest.main", order)
+        self.assertNotIn("manifest.main", c_function(sources["apphost.c"], "static bool compile_package("))
+        self.assertEqual(c_function(sources["apps_task.c"], "bool apps_task_compile(").count("apps_pkg_compile_order("), 1)
 
     def test_the_io_worker_is_on_core_0(self):  # Task 13's F4: never in front of the app task or LVGL on core 1
         io = (MUSE / "apps/apps_io.c").read_text()

@@ -116,12 +116,6 @@ _Static_assert(ARRAY_LEN(KINDS) == APPS_W_IMAGE + 1, "a name for each kind of wi
 
 typedef enum { REQ_RUN, REQ_LAUNCH, REQ_STOP, REQ_COMPILE, REQ_MESSAGE } req_op_t;
 
-typedef struct {
-    const char *path;
-    const char *src;
-    size_t len;
-} code_t;
-
 /* A caller's request (run, stop, compile, message), which it waits for, or a launch, which nobody waits for. One PSRAM
  * block; a compile's copy of the package's code follows it, or a message's event and data. */
 typedef struct {
@@ -132,7 +126,7 @@ typedef struct {
     char id[APPS_ID_MAX + 1];   /* a launch's and a message's */
     uint16_t memory_kb;         /* a compile's, and its copy of the .lua files, main first */
     int n_code;
-    code_t code[APPS_MAX_FILES];
+    apps_code_t code[APPS_MAX_FILES];
     const char *event, *data;   /* a message's, in the block: NUL-terminated, data data_len bytes */
     size_t data_len;
     bool by_id;                 /* a run's: a launch by id, which fronts an app of pkg's id that runs (F10) */
@@ -966,32 +960,9 @@ static void on_run(req_t *r) {
     run_locked(pkg, r->front, r, r->settle_ms);
 }
 
-static bool compile(const req_t *r, char *err, size_t err_len) {
-    apps_vm_config_t cfg = {
-        .mem_limit = (size_t)r->memory_kb * 1024u,
-        .realloc_fn = apps_port_realloc,
-        .free_fn = apps_port_free,
-        .now_ms = apps_port_mono_ms,
-    };
-    apps_vm_t *vm = apps_vm_new(&cfg);
-    if (vm == NULL) {
-        snprintf(err, err_len, "out of memory: can't make the app's heap of %u KB", (unsigned)r->memory_kb);
-        return false;
-    }
-    bool ok = true;
-    for (int i = 0; i < r->n_code && ok; i++) {
-        ok = apps_vm_load(vm, r->code[i].path, r->code[i].src, r->code[i].len, err, err_len);
-        if (ok) {
-            lua_pop(apps_vm_lua(vm), 1);
-        }
-    }
-    apps_vm_free(vm);
-    return ok;
-}
-
 static void on_compile(req_t *r) {
     char err[512] = "";
-    bool ok = wanted(r) && compile(r, err, sizeof err);
+    bool ok = wanted(r) && apps_rt_compile(r->code, r->n_code, r->memory_kb, err, sizeof err);
     complete(r, ok, ok ? NULL : err);
 }
 
@@ -1483,7 +1454,7 @@ bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status
 }
 
 static void add_code(req_t *r, char **at, const apps_blob_t *b) {
-    code_t *c = &r->code[r->n_code++];
+    apps_code_t *c = &r->code[r->n_code++];
     size_t n = strlen(b->path) + 1;
     memcpy(*at, b->path, n);
     c->path = *at;
@@ -1502,19 +1473,17 @@ bool apps_task_compile(const apps_pkg_t *pkg, char *err, size_t err_len) {
         put_text(err, err_len, "no package to compile");
         return false;
     }
-    const apps_blob_t *main = NULL;
-    bool listed = false;
+    const apps_blob_t *order[APPS_MAX_FILES];
+    int n = apps_pkg_compile_order(pkg, order);
     size_t bytes = 0;
-    for (int i = 0; i < pkg->count && i < APPS_MAX_FILES; i++) {
-        const apps_blob_t *b = &pkg->files[i];
-        bool is_main = strcmp(b->path, pkg->manifest.main) == 0;
-        listed = listed || is_main;
-        if (apps_file_kind(b->path) == APPS_FILE_LUA) {
-            bytes += strlen(b->path) + 1 + b->len;
-            main = is_main ? b : main;
-        }
+    for (int i = 0; i < n; i++) {
+        bytes += strlen(order[i]->path) + 1 + order[i]->len;
     }
-    if (main == NULL) {
+    if (n == 0 || strcmp(order[0]->path, pkg->manifest.main) != 0) {  /* main is first when the package has it as Lua */
+        bool listed = false;
+        for (int i = 0; i < pkg->count && i < APPS_MAX_FILES; i++) {
+            listed = listed || strcmp(pkg->files[i].path, pkg->manifest.main) == 0;
+        }
         char text[APPS_PATH_MAX + 40];
         snprintf(text, sizeof text, listed ? "%s is not a .lua file" : "%s is missing from the package",
                  pkg->manifest.main);
@@ -1532,12 +1501,8 @@ bool apps_task_compile(const apps_pkg_t *pkg, char *err, size_t err_len) {
     }
     r->memory_kb = pkg->manifest.memory_kb;
     char *at = (char *)(r + 1);
-    add_code(r, &at, main);
-    for (int i = 0; i < pkg->count && i < APPS_MAX_FILES; i++) {
-        const apps_blob_t *b = &pkg->files[i];
-        if (b != main && apps_file_kind(b->path) == APPS_FILE_LUA) {
-            add_code(r, &at, b);
-        }
+    for (int i = 0; i < n; i++) {
+        add_code(r, &at, order[i]);
     }
     r->err = err;
     r->err_len = err_len;

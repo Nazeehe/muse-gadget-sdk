@@ -107,6 +107,14 @@ class Install(unittest.TestCase):
     def test_compile_error_has_excerpt(self):  # C17: the raw message, the excerpt from the package's file
         self.run_case("compile_error_has_excerpt")
 
+    def test_a_compile_message_is_clean_text(self):  # fix round 1, A: the token and the lines, a '?' for each byte
+        results, _ = self.run_case("compile_message_is_clean")
+        self.assertEqual(len(results), 3)
+        for result in results:
+            message = result["error"]["message"]
+            self.assertNotRegex(message, "[\x00-\x08\x0b-\x1f\x7f-\x9f]", message)  # newline and tab are text
+            self.assertEqual(message.count("\n"), 3, message)
+
     def test_crash_in_start_message(self):
         results, _ = self.run_case("crash_in_start_message")
         message = results[0]["error"]["message"]

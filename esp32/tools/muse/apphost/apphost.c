@@ -24,13 +24,14 @@
  *   apphost --sha256 TEXT|-
  *
  * APP_DIR holds manifest.json and the files it lists (the folder's name is the app's id). The package is read
- * the way the install pipeline reads one (apps_pkg: the manifest, the size limits, .json files that must
- * parse, .bin files that must be LVGL images) and compiled the way it compiles one (apps_task.c's compile: every
- * .lua file, main first and the others in the package's order, each loaded and not run, in a scratch VM with the
- * manifest's memory limit), so that a package this runs is a package the install accepts. Then the runtime is
- * made and start() is called, and the script's lines run, if there is one. --mem-kb N sets the heap in KB,
- * whatever the manifest says (1 to 65535). --no-compile leaves the compile out: it is for the runtime's own
- * tests of a module that doesn't compile when it is required, which the install never lets in.
+ * the way the install pipeline reads one (apps_pkg: the manifest, the size limits, .lua files that aren't compiled
+ * chunks, .json files that must parse, .bin files that must be LVGL images) and compiled the way it compiles one
+ * (apps_rt_compile, which the app task's compile calls too: every .lua file, main first and the others in the
+ * package's order, each loaded and not run, in a scratch VM with the manifest's memory limit), so that a package this
+ * runs is a package the install accepts. Then the runtime is made and start() is called, and the script's lines run, if
+ * there is one. --mem-kb N sets the heap in KB, whatever the manifest says (1 to 65535). --no-compile leaves the
+ * compile out: it is for the runtime's own tests of a module that doesn't compile when it is required, which the
+ * install never lets in.
  *
  * Output is one JSON object a line on stdout, flushed as it is written, whatever the app printed or raised:
  * every string is escaped, and bytes that aren't valid UTF-8 come out as U+FFFD.
@@ -109,7 +110,6 @@
 #include "apps_port.h"
 #include "apps_rt.h"
 #include "apps_ui.h"
-#include "apps_vm.h"
 
 /* The device's CONFIG_MUSE_APPS_HEAP_MAX_KB is set by its build; here the manifest's own ceiling holds. */
 #define HEAP_MAX_KB 1024
@@ -261,6 +261,7 @@ static size_t kind_max(apps_file_kind_t kind) {
  *   reading util.lua: No such file or directory
  *   main.lua is larger than 256 KB        (and 32 KB for .json, 512 KB for images)
  *   the app is larger than 2 MB           (manifest and files)
+ *   files[1] x.lua is a compiled chunk: install Lua source text
  *   images add up to more than 1.5 MB
  *   data.json: unexpected '}' at byte 6   (a .json file that doesn't parse)
  *   logo.bin: image: not an LVGL v9 image file (use LVGLImage.py --ofmt BIN)
@@ -301,6 +302,9 @@ static bool load_package(const char *folder, const char *id, apps_pkg_t *pkg, ch
             snprintf(err, err_len, "the app is larger than 2 MB");
             goto fail;
         }
+        if (!apps_pkg_check_source(i, rel, data, len, err, err_len)) {
+            goto fail;
+        }
         char why[160] = "";
         if (kind == APPS_FILE_JSON && !apps_json_validate((const char *)data, len, why, sizeof why)) {
             snprintf(err, err_len, "%s: %s", rel, why);
@@ -327,39 +331,21 @@ fail:
 /* ---- The compile ---- */
 
 /*
- * What the install's compile step does (apps_task.c's compile()): every .lua file of the package, main first and the
- * others in the package's order, loaded and not run, in a scratch VM with the manifest's memory limit. False, with
- * what Lua said of the first that failed in raw, which apps_pkg_compile_message words. Each file is compiled as a
- * top-level chunk, as the install compiles it, and not as a require does, with a few C levels less to spend: with
- * LUAI_MAXCCALLS 40 a file nested 37 deep passes here and 38 is "C stack overflow", and a require takes 34.
+ * What the install's compile step does, by the same code (apps_rt_compile, in the order apps_pkg_compile_order gives):
+ * every .lua file of the package, main first and the others in the package's order, loaded and not run, in a scratch VM
+ * with the manifest's memory limit. False, with what Lua said of the first that failed in raw, which
+ * apps_pkg_compile_message words. Each file is compiled as a top-level chunk, as the install compiles it, and not as a
+ * require does, with a few C levels less to spend: with LUAI_MAXCCALLS 40 a file nested 37 deep passes here and 38 is "C
+ * stack overflow", and a require takes 34.
  */
 static bool compile_package(const apps_pkg_t *pkg, char *raw, size_t raw_len) {
-    apps_vm_config_t cfg = {
-        .mem_limit = (size_t)pkg->manifest.memory_kb * 1024u,
-        .realloc_fn = apps_port_realloc,
-        .free_fn = apps_port_free,
-        .now_ms = apps_port_mono_ms,
-    };
-    apps_vm_t *vm = apps_vm_new(&cfg);
-    if (vm == NULL) {
-        snprintf(raw, raw_len, "out of memory: can't make the app's heap of %u KB", (unsigned)pkg->manifest.memory_kb);
-        return false;
+    const apps_blob_t *order[APPS_MAX_FILES];
+    apps_code_t code[APPS_MAX_FILES];
+    int n = apps_pkg_compile_order(pkg, order);
+    for (int i = 0; i < n; i++) {
+        code[i] = (apps_code_t){.path = order[i]->path, .src = (const char *)order[i]->data, .len = order[i]->len};
     }
-    bool ok = true;
-    for (int pass = 0; pass < 2; pass++) {  /* pass 0: main; pass 1: the rest */
-        for (int i = 0; i < pkg->count && ok; i++) {
-            const apps_blob_t *b = &pkg->files[i];
-            if ((strcmp(b->path, pkg->manifest.main) == 0) != (pass == 0) || apps_file_kind(b->path) != APPS_FILE_LUA) {
-                continue;
-            }
-            ok = apps_vm_load(vm, b->path, (const char *)b->data, b->len, raw, raw_len);
-            if (ok) {
-                lua_pop(apps_vm_lua(vm), 1);
-            }
-        }
-    }
-    apps_vm_free(vm);
-    return ok;
+    return apps_rt_compile(code, n, pkg->manifest.memory_kb, raw, raw_len);
 }
 
 /* ---- The app, and the commands that drive it ---- */

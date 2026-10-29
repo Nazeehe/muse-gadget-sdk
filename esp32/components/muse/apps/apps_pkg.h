@@ -167,6 +167,22 @@ size_t apps_file_max(apps_file_kind_t kind);
 char *apps_text_shown(const char *s, size_t n, size_t max, char *out);
 
 /*
+ * Text that leaves the runtime, and the compile message the install and apphost share: what an app prints or raises, and
+ * what a package's source says, are bytes from outside, and they reach the serial console, Muse and a developer's terminal
+ * inside JSON. So text handed out is valid UTF-8 (RFC 3629) with no control byte but, where a caller says so, "\n" and
+ * tab; anything else is one '?': each byte of a C0 control (under 0x20), of DEL (0x7F) and of broken UTF-8, and, for a C1
+ * control character (U+0080 to U+009F, which a terminal can take for an escape sequence: U+009B is CSI), the character.
+ * The mapping never lengthens a text.
+ *
+ * apps_text_next reads the character at p (end is the end of the text) and gives the bytes it takes, at least one;
+ * *keep says whether it passes as it is, or becomes one '?'. apps_text_clean makes s[0, n) clean in place, and returns
+ * its new length. A NUL ends a text that shrank (s[new length]), and s[n] is never written: s[0, n) may hold NULs, each
+ * of which is one more byte to map.
+ */
+size_t apps_text_next(const unsigned char *p, const unsigned char *end, bool keep_newline, bool *keep);
+size_t apps_text_clean(char *s, size_t n, bool keep_newline);
+
+/*
  * Reads json[0, len), a manifest.json (json may be NULL when len is 0), into m (never NULL), which this
  * overwrites (it doesn't free what m held): on success m is the manifest and err is "", and on failure m is
  * all zero and err has the message (Messages, above). err may be NULL, and nothing is written when err_len
@@ -193,6 +209,15 @@ void apps_manifest_clear(apps_manifest_t *m, void (*free_fn)(void *));
 void apps_pkg_free(apps_pkg_t *pkg, void (*free_fn)(void *));
 
 /*
+ * The .lua files of pkg in the order the install compiles them (apps_rt_compile): main first, then the others in the
+ * package's order. order has room for APPS_MAX_FILES pointers into pkg; it returns how many it set. main is order[0]
+ * when it is one of pkg's .lua files, which a package that passed the manifest's parse and was read always has; with
+ * no such file the others come alone. One order for two callers, the app task's compile and apphost's check: where the
+ * first error is found depends on it.
+ */
+int apps_pkg_compile_order(const apps_pkg_t *pkg, const apps_blob_t *order[APPS_MAX_FILES]);
+
+/*
  * The message for a package whose Lua didn't compile, from raw, what apps_vm_load said of one of its files
  * ("util.lua:7: unexpected symbol near '='"): "compile failed: ", raw, and the lines of the file it names around the
  * line it gives (apps_vm_excerpt's text: " 6| ...\n>7| ...\n 8| ..."). A raw that names no file of the package, or
@@ -200,8 +225,20 @@ void apps_pkg_free(apps_pkg_t *pkg, void (*free_fn)(void *));
  * paths of pkg's files whole. out is always terminated when cap is above 0, and cut at cap - 1 bytes on a character
  * boundary; raw must not be inside out. One wording for two callers: the install pipeline's refusal (apps_install.c,
  * step 4) and apphost's, whose check compiles what the install compiles.
+ * The text is clean (apps_text_clean): Lua's message quotes the token it stopped at and the lines are the package's own
+ * bytes, so a '?' stands for each control byte, C1 character and byte that isn't UTF-8, in a message of one line (a token
+ * can hold a newline) and in the lines (the excerpt's own newlines stay, and tab).
  */
 void apps_pkg_compile_message(const apps_pkg_t *pkg, const char *raw, char *out, size_t cap);
+
+/*
+ * Whether `path`, the manifest's entry number `index` (counting main as 0), whose bytes are data[0, len), is source the
+ * install takes. A .lua file that starts with Lua's signature, "\x1bLua", is a compiled chunk, and no package may hold
+ * one: err has "files[%d] %s is a compiled chunk: install Lua source text", and it returns false. Any other file, of any
+ * kind, passes. (apps_vm_load refuses a chunk too, but later and in its own words.) One wording for two callers, the
+ * install pipeline's step 3 and apphost's reading of a package, so check says what the install says.
+ */
+bool apps_pkg_check_source(int index, const char *path, const uint8_t *data, size_t len, char *err, size_t err_len);
 
 /*
  * Whether data[0, len) is an LVGL v9 .bin image the gadget can draw: magic 0x19; colour format RGB565 (0x12),

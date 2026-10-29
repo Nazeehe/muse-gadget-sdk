@@ -1157,6 +1157,121 @@ static void new_refused(void) {
     free_pkg(pkg);
 }
 
+/* ---- The compile step ---- */
+
+/* The install's compile (apps_rt_compile) for the files, each an exact-size heap copy, made one VM of memory_kb. */
+static bool compile_files(const file_t *files, int n, unsigned memory_kb, char *err, size_t err_len) {
+    apps_code_t code[8];
+    for (int i = 0; i < n; i++) {
+        code[i] = (apps_code_t){.path = files[i].path, .src = exact_copy(files[i].src, strlen(files[i].src)),
+                                .len = strlen(files[i].src)};
+    }
+    bool ok = apps_rt_compile(code, n, memory_kb, err, err_len);
+    for (int i = 0; i < n; i++) {
+        free((void *)code[i].src);
+    }
+    return ok;
+}
+
+/* apps_rt_compile: every file is loaded and none runs; the first that fails ends it and is the message; the VM is
+ * gone after (nothing held), and err is cut where every message is. */
+static void compile_all(void) {
+    char err[APPS_ERROR_MAX];
+    /* No file, nothing to refuse; err is "" for every success. */
+    snprintf(err, sizeof err, "stale");
+    CHECK(apps_rt_compile(NULL, 0, 256, err, sizeof err) && err[0] == '\0', "no files: '%s'", err);
+    const file_t good[] = {{"main.lua", "print('main ran')\nreturn {}"},
+                           {"lib/util.lua", "print('util ran')\nreturn 1"},
+                           {"b.lua", ""}};
+    snprintf(err, sizeof err, "stale");
+    CHECK(compile_files(good, 3, 256, err, sizeof err) && err[0] == '\0', "good files: '%s'", err);
+    expect_no_logs();  /* loaded, never run */
+    CHECK(held == 0, "%zu bytes held after a compile", held);
+
+    /* The first file that fails is the message, in the order given, and the files after it aren't compiled. */
+    const file_t bad_main_first[] = {{"main.lua", "x = = 1"}, {"c.lua", "y = = 2"}};
+    CHECK(!compile_files(bad_main_first, 2, 256, err, sizeof err) && strcmp(err, "main.lua:1: unexpected symbol near '='") == 0,
+          "main first: '%s'", err);
+    const file_t bad_c_first[] = {{"c.lua", "y = = 2"}, {"main.lua", "x = = 1"}};
+    CHECK(!compile_files(bad_c_first, 2, 256, err, sizeof err) && strcmp(err, "c.lua:1: unexpected symbol near '='") == 0,
+          "c first: '%s'", err);
+    const file_t second_bad[] = {{"main.lua", "return {}"}, {"lib/b.lua", "return {\n"}};
+    CHECK(!compile_files(second_bad, 2, 256, err, sizeof err) && strcmp(err, "lib/b.lua:2: unexpected symbol near <eof>") == 0,
+          "second: '%s'", err);
+    const file_t closing[] = {{"main.lua", "local x <close> = nil"}};
+    CHECK(!compile_files(closing, 1, 256, err, sizeof err) &&
+              strcmp(err, "main.lua:1: '<close>' variables are not available in Muse apps") == 0,
+          "<close>: '%s'", err);
+    const file_t compiled[] = {{"main.lua", "\x1b" "Lua"}};
+    CHECK(!compile_files(compiled, 1, 256, err, sizeof err) &&
+              strcmp(err, "binary chunks are not allowed: install Lua source text") == 0,
+          "a compiled chunk: '%s'", err);
+    CHECK(held == 0, "%zu bytes held after refusals", held);
+
+    /* The VM has the app's memory_kb: a heap too small to make is the one message of apps_rt_new's, and a source that
+     * doesn't fit its heap is Lua's. */
+    CHECK(!compile_files(good, 1, 2, err, sizeof err) && strcmp(err, "out of memory: can't make the app's heap of 2 KB") == 0,
+          "2 KB: '%s'", err);
+    CHECK(!compile_files(good, 1, 0, err, sizeof err) && strcmp(err, "out of memory: can't make the app's heap of 0 KB") == 0,
+          "0 KB: '%s'", err);
+    static char big[10000 * 2 + 16];
+    int at = snprintf(big, sizeof big, "return {");
+    for (int i = 0; i < 10000; i++) {
+        big[at++] = '1';
+        big[at++] = ',';
+    }
+    snprintf(big + at, sizeof big - (size_t)at, "}");
+    const file_t large[] = {{"big.lua", big}};
+    CHECK(compile_files(large, 1, 256, err, sizeof err) && compile_files(large, 1, 128, err, sizeof err),
+          "10000 numbers: '%s'", err);
+    CHECK(!compile_files(large, 1, 64, err, sizeof err) && strcmp(err, "not enough memory") == 0, "in 64 KB: '%s'", err);
+    CHECK(held == 0, "%zu bytes held after the heap refusals", held);
+
+    /* err is cut like the others (on a character boundary, a block of exactly err_len bytes), and may be NULL. */
+    const file_t accent[] = {{"caf\xc3\xa9.lua", "x = = 1"}};
+    static const char whole[] = "caf\xc3\xa9.lua:1: unexpected symbol near '='";
+    for (size_t cap = 1; cap <= sizeof whole + 1; cap++) {
+        char *out = malloc(cap);  /* a block of exactly cap bytes */
+        CHECK(out != NULL, "no memory");
+        bool ok = compile_files(accent, 1, 256, out, cap);
+        size_t want = cap - 1 < sizeof whole - 1 ? cap - 1 : sizeof whole - 1;
+        while (want < sizeof whole - 1 && want > 0 && ((unsigned char)whole[want] & 0xC0) == 0x80) {
+            want--;
+        }
+        CHECK(!ok && strlen(out) == want && memcmp(out, whole, want) == 0, "cap %zu: '%s'", cap, out);
+        free(out);
+    }
+    CHECK(!compile_files(accent, 1, 256, NULL, 0) && !compile_files(accent, 1, 256, NULL, 5), "a NULL err");
+    CHECK(compile_files(good, 3, 256, NULL, 0), "a NULL err, a package that compiles");
+    CHECK(held == 0, "%zu bytes held at the end", held);
+}
+
+/* A heap that refuses from the Nth growth request on, for each N: a compile either finishes (and no request was
+ * refused) or says so, the VM never leaks, and nothing aborts. */
+static void compile_refused(void) {
+    static const char main_src[] = "local t = {}\nfor i = 1, 3 do t[i] = 'x' .. i end\nreturn {start = function() return t end}\n";
+    const file_t files[] = {{"main.lua", main_src}, {"lib/util.lua", "local a = {1, 2, 3}\nreturn a\n"}};
+    long total = 0;
+    for (long k = 1; k < 100000; k++) {
+        char err[256] = "";
+        growths = 0;
+        refuse_from = k;
+        bool ok = compile_files(files, 2, 256, err, sizeof err);
+        bool refused = growths >= k;
+        refuse_from = -1;
+        CHECK(ok == !refused && (ok ? err[0] == '\0' : err[0] != '\0'), "k=%ld: refused %d, compile %d '%s'", k, refused, ok, err);
+        if (k == 1) {  /* the VM's own first request: no heap to compile in */
+            CHECK(!ok && strcmp(err, "out of memory: can't make the app's heap of 256 KB") == 0, "k=1: '%s'", err);
+        }
+        CHECK(held == 0, "k=%ld: %zu bytes held", k, held);
+        if (!refused) {
+            total = k;
+            break;
+        }
+    }
+    CHECK(total > 50, "only %ld growth requests in a compile", total);
+}
+
 /* The source the sweeps run: it allocates (strings, tables), so every step has something to refuse. Each
  * handler makes strings of its own (the tag): a short string that is still alive from an earlier call is
  * found, not allocated, and a sweep of the second handler would have little to refuse. */
@@ -1558,6 +1673,8 @@ int main(int argc, char **argv) {
         {"ring", ring},
         {"tail_cuts", tail_cuts},
         {"port_log", port_log},
+        {"compile_all", compile_all},
+        {"compile_refused", compile_refused},
         {"new_refused", new_refused},
         {"handlers_refused", handlers_refused},
         {"message_refused", message_refused},

@@ -750,9 +750,8 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
         if (app_bytes > APPS_APP_MAX) {
             return failure(APPS_ERR_INVALID_PACKAGE, "the app is larger than 2 MB");
         }
-        if (kind == APPS_FILE_LUA && len >= 4 && memcmp(data, "\x1bLua", 4) == 0) {
-            return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE,
-                            "files[%d] %s is a compiled chunk: install Lua source text", i, rel);
+        if (!apps_pkg_check_source(i, rel, data, len, in->raw, sizeof in->raw)) {
+            return failure(APPS_ERR_INVALID_PACKAGE, in->raw);
         }
         if (kind == APPS_FILE_JSON && !apps_json_validate((const char *)data, len, in->raw, sizeof in->raw)) {
             return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE, "%s: %s", rel, in->raw);

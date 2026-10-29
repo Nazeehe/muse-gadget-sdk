@@ -251,6 +251,42 @@ char *apps_text_shown(const char *s, size_t n, size_t max, char *out) {
     return out;
 }
 
+size_t apps_text_next(const unsigned char *p, const unsigned char *end, bool keep_newline, bool *keep) {
+    unsigned char c = *p;
+    if (c < 0x80) {
+        *keep = (c >= 0x20 && c != 0x7F) || c == '\t' || (keep_newline && c == '\n');
+        return 1;
+    }
+    int n = apps_json_utf8_len(p, end);
+    if (n <= 0) {  /* not UTF-8, or cut short by the end: this byte alone */
+        *keep = false;
+        return 1;
+    }
+    *keep = !(n == 2 && p[0] == 0xC2 && p[1] <= 0x9F);
+    return (size_t)n;
+}
+
+size_t apps_text_clean(char *s, size_t n, bool keep_newline) {
+    unsigned char *r = (unsigned char *)s, *w = r;
+    const unsigned char *end = r + n;
+    while (r < end) {
+        bool keep;
+        size_t k = apps_text_next(r, end, keep_newline, &keep);
+        if (keep) {
+            memmove(w, r, k);
+            w += k;
+        } else {
+            *w++ = '?';
+        }
+        r += k;
+    }
+    size_t len = (size_t)(w - (unsigned char *)s);
+    if (len < n) {
+        s[len] = '\0';
+    }
+    return len;
+}
+
 /* ==== The manifest ==== */
 
 /* The keys the manifest reads, in the order apps_pkg.h checks them (and the candidates of "did you mean"). */
@@ -711,6 +747,19 @@ void apps_pkg_free(apps_pkg_t *pkg, void (*free_fn)(void *)) {
 
 /* ==== Compile messages ==== */
 
+int apps_pkg_compile_order(const apps_pkg_t *pkg, const apps_blob_t *order[APPS_MAX_FILES]) {
+    int n = 0;
+    for (int pass = 0; pass < 2; pass++) {  /* pass 0 is main alone, pass 1 the rest */
+        for (int i = 0; i < pkg->count && i < APPS_MAX_FILES; i++) {
+            const apps_blob_t *b = &pkg->files[i];
+            if ((strcmp(b->path, pkg->manifest.main) == 0) == (pass == 0) && apps_file_kind(b->path) == APPS_FILE_LUA) {
+                order[n++] = b;
+            }
+        }
+    }
+    return n;
+}
+
 void apps_pkg_compile_message(const apps_pkg_t *pkg, const char *raw, char *out, size_t cap) {
     if (out == NULL || cap == 0) {
         return;
@@ -737,7 +786,26 @@ void apps_pkg_compile_message(const apps_pkg_t *pkg, const char *raw, char *out,
         }
         break;
     }
-    apps_vm_excerpt(raw, src, len, out + at, cap - at);
+    size_t used = apps_vm_excerpt(raw, src, len, out + at, cap - at);
+    /* Lua's message and the lines are bytes from outside (apps_text_clean). The message is one line, though a token can
+     * hold a newline: it is what the excerpt wrote first, and the newlines after it are the excerpt's own. */
+    size_t head = strlen(raw) < used ? strlen(raw) : used;
+    for (size_t i = 0; i < head; i++) {
+        if (out[at + i] == '\n') {
+            out[at + i] = '?';
+        }
+    }
+    apps_text_clean(out + at, used, true);
+}
+
+bool apps_pkg_check_source(int index, const char *path, const uint8_t *data, size_t len, char *err, size_t err_len) {
+    if (err != NULL && err_len > 0) {
+        err[0] = '\0';
+    }
+    if (apps_file_kind(path) == APPS_FILE_LUA && len >= 4 && memcmp(data, "\x1bLua", 4) == 0) {
+        return failf(err, err_len, "files[%d] %s is a compiled chunk: install Lua source text", index, path);
+    }
+    return true;
 }
 
 /* ==== Images ==== */

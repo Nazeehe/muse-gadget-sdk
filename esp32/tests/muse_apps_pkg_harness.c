@@ -648,11 +648,43 @@ static void memory(void) {
     free(m);
 }
 
+/* The lines of ctl.lua around line 2, as the message shows them. */
+#define CTL_LINES "\n 1| -- ?]0;owned? ?2J \xc2\xa0\xc3\xa9\n>2| local b = = 2\n 3| \treturn ?{}?"
+
+/* Whether s[0, n) is text for a terminal and for JSON: valid UTF-8, with no C0 byte but "\n" and tab, no DEL and no C1
+ * character (U+0080 to U+009F). */
+static bool is_clean_n(const char *s, size_t n) {
+    const unsigned char *p = (const unsigned char *)s, *end = p + n;
+    while (p < end) {
+        if (*p < 0x80) {
+            if ((*p < 0x20 && *p != '\n' && *p != '\t') || *p == 0x7F) {
+                return false;
+            }
+            p++;
+            continue;
+        }
+        int k = apps_json_utf8_len(p, end);
+        if (k <= 0 || (k == 2 && p[0] == 0xC2 && p[1] <= 0x9F)) {
+            return false;
+        }
+        p += k;
+    }
+    return true;
+}
+
+static bool is_clean(const char *s) {
+    return is_clean_n(s, strlen(s));
+}
+
 /* apps_pkg_compile_message: "compile failed: ", Lua's message, and the lines of the file it names around its line. The
  * install pipeline and apphost's check both word a refusal with it. */
 static void compile_message(void) {
     static const char main_src[] = "local a = 1\nlocal b = = 2\nreturn {}\n";
     static const char util_src[] = "return {\n  x = 1,\n  y = ,\n}\n";
+    /* Bytes a terminal takes for more than text: ESC and BEL, a C1 character (U+009B, CSI), DEL, broken UTF-8 and a tab
+     * in the lines; U+00A0 and an accented letter are text. (The literal is split where a hex escape would eat a digit.) */
+    static const char ctl_src[] = "-- \x1b]0;owned\x07 \xc2\x9b" "2J \xc2\xa0\xc3\xa9\nlocal b = = 2\n\treturn \x7f{}\xff\n";
+    static const char nul_src[] = "x = 1 \0 y\nz = = 2\n";
     apps_pkg_t *pkg = calloc(1, sizeof *pkg);
     static const struct {
         const char *path;
@@ -661,6 +693,8 @@ static void compile_message(void) {
     } files[] = {
         {"main.lua", main_src, sizeof main_src - 1},
         {"lib/util.lua", util_src, sizeof util_src - 1},
+        {"ctl.lua", ctl_src, sizeof ctl_src - 1},
+        {"nul.lua", nul_src, sizeof nul_src - 1},
         {"empty.lua", NULL, 0},
     };
     for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
@@ -699,6 +733,22 @@ static void compile_message(void) {
         /* A colon that isn't followed by digits and a colon ends no file name, though a later line number shows. */
         {"main.lua: x:2: boom", "compile failed: main.lua: x:2: boom"},
         {"main.lua:: x:2: boom", "compile failed: main.lua:: x:2: boom"},
+        /* What a terminal could take for more than text becomes '?' in Lua's message and in the lines of the file: each
+         * C0 byte but the excerpt's own newlines and tab, DEL, each C1 character and each byte of broken UTF-8 (a
+         * message is one line, though a token can hold a newline). Valid UTF-8 stays, U+00A0 and an accented letter. */
+        {"ctl.lua:2: unexpected symbol near '='", "compile failed: ctl.lua:2: unexpected symbol near '='" CTL_LINES},
+        {"ctl.lua:2: unfinished string near ''\x01\x1b[2J\xff'",
+         "compile failed: ctl.lua:2: unfinished string near ''??[2J?'" CTL_LINES},
+        {"ctl.lua:2: bad \xc2\x9b token\xc2\x85 \xc2\xa0 \xc3\xa9\x7f\xe2\x82",
+         "compile failed: ctl.lua:2: bad ? token? \xc2\xa0 \xc3\xa9???" CTL_LINES},
+        {"ctl.lua:2: hexadecimal digit expected near ''\\x\n'",
+         "compile failed: ctl.lua:2: hexadecimal digit expected near ''\\x?'" CTL_LINES},
+        {"ctl.lua:2: a\rb\tc\x7f" "d", "compile failed: ctl.lua:2: a?b\tc?d" CTL_LINES},
+        {"\x1b[2J C stack overflow\xff", "compile failed: ?[2J C stack overflow?"},
+        {"other.lua:2: \x1b]0;x\x07", "compile failed: other.lua:2: ?]0;x?"},
+        /* A NUL in a line is a byte like the others: the lines after it show. */
+        {"nul.lua:2: unexpected symbol near '='",
+         "compile failed: nul.lua:2: unexpected symbol near '='\n 1| x = 1 ? y\n>2| z = = 2"},
     };
     for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
         char out[512];
@@ -723,11 +773,208 @@ static void compile_message(void) {
         }
         CHECK(strlen(out) == want && memcmp(out, full, want) == 0, "cap %zu: '%s', wanted %zu bytes", cap, out, want);
     }
+    /* Bytes to clean don't change that: whatever the cap, the result is text, ends at cap - 1 bytes at most, and is
+     * the start of the whole one. A C1 character takes two bytes of the message and one '?' of the result. */
+    static const char *const dirty[] = {
+        "ctl.lua:2: unfinished string near ''\x01\x1b[2J\xff'",
+        "ctl.lua:2: bad \xc2\x9b\xc2\x9b token \xe2\x82",
+        "\xc2\x9b\x1b[2J ctl.lua:2: x\n",
+    };
+    for (size_t d = 0; d < sizeof dirty / sizeof dirty[0]; d++) {
+        char whole[512];
+        apps_pkg_compile_message(pkg, exact_copy(dirty[d], strlen(dirty[d]) + 1), whole, sizeof whole);
+        CHECK(is_clean(whole) && strlen(whole) > 20, "dirty %zu: '%s'", d, whole);
+        for (size_t cap = 1; cap <= strlen(whole) + 8; cap++) {
+            char *out = exact_copy(NULL, cap);
+            apps_pkg_compile_message(pkg, exact_copy(dirty[d], strlen(dirty[d]) + 1), out, cap);
+            CHECK(strlen(out) < cap && is_clean(out) && strncmp(out, whole, strlen(out)) == 0,
+                  "dirty %zu, cap %zu: '%s' (whole '%s')", d, cap, out, whole);
+        }
+    }
     apps_pkg_compile_message(pkg, raw, NULL, 10);  /* nowhere to write, or no room: no write */
     char guard[4] = "abc";
     apps_pkg_compile_message(pkg, raw, guard, 0);
     CHECK(strcmp(guard, "abc") == 0, "cap 0 wrote '%s'", guard);
     free(pkg);
+}
+
+/* apps_pkg_compile_order: main first, then the package's other .lua files as it has them, and nothing that isn't Lua; the one
+ * order the app task's compile and apphost's check use (fix round 1, E). */
+static void compile_order(void) {
+    static const struct {
+        const char *main;
+        const char *paths[8];  /* NULL ends the list */
+        const char *want;      /* the order, the paths joined with a space */
+    } rows[] = {
+        {"main.lua", {"main.lua", "a.lua", "b.lua"}, "main.lua a.lua b.lua"},
+        {"main.lua", {"a.lua", "b.lua", "main.lua"}, "main.lua a.lua b.lua"},
+        {"main.lua", {"a.lua", "main.lua", "b.lua"}, "main.lua a.lua b.lua"},
+        {"main.lua", {"b.lua", "a.lua", "main.lua"}, "main.lua b.lua a.lua"},
+        {"main.lua", {"d.json", "a.lua", "i.bin", "main.lua", "lib/x.lua"}, "main.lua a.lua lib/x.lua"},
+        {"app.lua", {"main.lua", "app.lua"}, "app.lua main.lua"},
+        /* A file is main by its whole path. */
+        {"main.lua", {"xmain.lua", "main.lua.bak", "lib/main.lua", "main.lua"}, "main.lua xmain.lua lib/main.lua"},
+        /* No main among the .lua files: the others alone, in the package's order. */
+        {"main.lua", {"b.lua", "a.lua"}, "b.lua a.lua"},
+        {"main.json", {"a.lua", "main.json"}, "a.lua"},
+        {"main.lua", {"d.json", "i.bin"}, ""},
+        {"main.lua", {NULL}, ""},
+    };
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++) {
+        apps_pkg_t *pkg = calloc(1, sizeof *pkg);
+        snprintf(pkg->manifest.main, sizeof pkg->manifest.main, "%s", rows[r].main);
+        for (int i = 0; i < 8 && rows[r].paths[i] != NULL; i++) {
+            snprintf(pkg->files[pkg->count++].path, sizeof pkg->files[0].path, "%s", rows[r].paths[i]);
+        }
+        const apps_blob_t **order = (const apps_blob_t **)exact_copy(NULL, APPS_MAX_FILES * sizeof *order);
+        int n = apps_pkg_compile_order(pkg, order);
+        char got[256] = "";
+        for (int i = 0; i < n; i++) {
+            snprintf(got + strlen(got), sizeof got - strlen(got), "%s%s", i > 0 ? " " : "", order[i]->path);
+        }
+        CHECK(strcmp(got, rows[r].want) == 0, "row %zu: '%s' instead of '%s'", r, got, rows[r].want);
+        free(pkg);
+    }
+    /* 32 files, main the last: all of them, main first, and not a pointer past the room for 32. */
+    apps_pkg_t *pkg = calloc(1, sizeof *pkg);
+    snprintf(pkg->manifest.main, sizeof pkg->manifest.main, "main.lua");
+    for (int i = 0; i < APPS_MAX_FILES - 1; i++) {
+        snprintf(pkg->files[pkg->count++].path, sizeof pkg->files[0].path, "m%02d.lua", i);
+    }
+    snprintf(pkg->files[pkg->count++].path, sizeof pkg->files[0].path, "main.lua");
+    const apps_blob_t **order = (const apps_blob_t **)exact_copy(NULL, APPS_MAX_FILES * sizeof *order);
+    int n = apps_pkg_compile_order(pkg, order);
+    CHECK(n == APPS_MAX_FILES && strcmp(order[0]->path, "main.lua") == 0 && strcmp(order[1]->path, "m00.lua") == 0 &&
+              strcmp(order[APPS_MAX_FILES - 1]->path, "m30.lua") == 0,
+          "32 files: %d, first '%s', last '%s'", n, order[0]->path, order[n > 0 ? n - 1 : 0]->path);
+    /* The pointers are into the package: the same blobs, not copies. */
+    CHECK(order[0] == &pkg->files[APPS_MAX_FILES - 1] && order[1] == &pkg->files[0], "the blobs of the package");
+    free(pkg);
+}
+
+/* apps_pkg_check_source: a .lua file that starts with Lua's signature is a compiled chunk, in the install's words; nothing
+ * else is refused, and what is read is read in len bytes (fix round 1, F). */
+static void check_source(void) {
+    static const struct {
+        int index;
+        const char *path;
+        const char *data;
+        size_t len;
+        const char *want;  /* NULL: accepted */
+    } rows[] = {
+        {0, "main.lua", LIT("\x1b" "LuaT\x00\x19\x93"), "files[0] main.lua is a compiled chunk: install Lua source text"},
+        {3, "lib/util.lua", LIT("\x1b" "Lua"), "files[3] lib/util.lua is a compiled chunk: install Lua source text"},
+        {31, "z.lua", LIT("\x1b" "Lua" "x"), "files[31] z.lua is a compiled chunk: install Lua source text"},
+        /* Three bytes of the signature, or another signature, or a later one: not a chunk (the compile has its own say). */
+        {0, "main.lua", LIT("\x1b" "Lu"), NULL},
+        {0, "main.lua", LIT("\x1b" "LuA"), NULL},
+        {0, "main.lua", LIT(" \x1b" "Lua"), NULL},
+        {0, "main.lua", LIT("return {}"), NULL},
+        {0, "main.lua", "", 0, NULL},
+        /* Only a .lua file is a chunk. */
+        {1, "d.json", LIT("\x1b" "Lua"), NULL},
+        {1, "i.bin", LIT("\x1b" "Lua"), NULL},
+        {1, "lua", LIT("\x1b" "Lua"), NULL},
+        {1, "x.LUA", LIT("\x1b" "Lua"), NULL},
+    };
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        char err[160];
+        snprintf(err, sizeof err, "stale");
+        const uint8_t *data = (const uint8_t *)exact_copy(rows[i].data, rows[i].len);
+        bool ok = apps_pkg_check_source(rows[i].index, rows[i].path, data, rows[i].len, err, sizeof err);
+        CHECK(ok == (rows[i].want == NULL) && strcmp(err, rows[i].want != NULL ? rows[i].want : "") == 0, "row %zu: %d '%s'", i,
+              ok, err);
+    }
+    /* The message is cut where every one is (a block of exactly err_len bytes), and err may be NULL. */
+    static const char want[] = "files[2] main.lua is a compiled chunk: install Lua source text";
+    for (size_t cap = 1; cap <= sizeof want + 1; cap++) {
+        char *out = exact_copy(NULL, cap);
+        CHECK(!apps_pkg_check_source(2, "main.lua", (const uint8_t *)exact_copy("\x1b" "Lua", 4), 4, out, cap),
+              "cap %zu: accepted", cap);
+        size_t n = cap - 1 < sizeof want - 1 ? cap - 1 : sizeof want - 1;
+        CHECK(strlen(out) == n && memcmp(out, want, n) == 0, "cap %zu: '%s'", cap, out);
+    }
+    CHECK(!apps_pkg_check_source(2, "main.lua", (const uint8_t *)exact_copy("\x1b" "Lua", 4), 4, NULL, 0), "NULL err");
+    CHECK(apps_pkg_check_source(2, "main.lua", NULL, 0, NULL, 0), "no data, no err");
+}
+
+/* apps_text_clean and apps_text_next: the one rule for text that leaves the runtime and for the compile message (fix round
+ * 1, A). */
+static void text_clean(void) {
+    static const struct {
+        const char *in;
+        size_t len;
+        bool newline;
+        const char *want;
+        size_t want_len;
+    } rows[] = {
+        {LIT("plain text, caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80"), false, "plain text, caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80", 0},
+        /* C0: every byte but tab, and "\n" when it is kept; DEL */
+        {LIT("a\x01\x1b[2J\x07z\x7f"), false, "a??[2J?z?", 0},
+        {LIT("a\tb\nc\rd"), false, "a\tb?c?d", 0},
+        {LIT("a\tb\nc\rd"), true, "a\tb\nc?d", 0},
+        /* C1: the character, one '?' for its two bytes; U+00A0 and U+00A1 are text */
+        {LIT("x\xc2\x80y\xc2\x9bz\xc2\x9f"), true, "x?y?z?", 0},
+        {LIT("\xc2\xa0\xc2\xa1\xc2\xbf\xc3\x80"), true, "\xc2\xa0\xc2\xa1\xc2\xbf\xc3\x80", 0},
+        /* broken UTF-8: each byte; a character cut short by the end too */
+        {LIT("a\xff\xfe\x80" "b"), true, "a???b", 0},
+        {LIT("a\xc3(b"), true, "a?(b", 0},
+        {LIT("a\xe2\x82"), true, "a??", 0},
+        {LIT("a\xc2"), true, "a?", 0},
+        {LIT("\xed\xa0\x80\xc0\x80\xf4\x90\x80\x80"), true, "?????????", 0},  /* a surrogate, an overlong NUL, past U+10FFFF */
+        /* a NUL inside the range is a byte like the others */
+        {"a\0b\0", 4, true, "a?b?", 0},
+        {"", 0, true, "", 0},
+    };
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        size_t want_len = strlen(rows[i].want);
+        char *text = exact_copy(rows[i].in, rows[i].len);
+        size_t got = apps_text_clean(text, rows[i].len, rows[i].newline);
+        CHECK(got == want_len && memcmp(text, rows[i].want, want_len) == 0, "row %zu: %zu bytes '%.*s', wanted %zu '%s'", i, got,
+              (int)got, text, want_len, rows[i].want);
+        CHECK(got <= rows[i].len, "row %zu: %zu bytes from %zu", i, got, rows[i].len);
+        /* A text that shrank ends with a NUL (and one that didn't has none written: the block is exactly len bytes). */
+        if (got < rows[i].len) {
+            CHECK(text[got] == '\0', "row %zu: no NUL at %zu", i, got);
+        }
+        CHECK(is_clean_n(text, got), "row %zu: still not text", i);
+    }
+    /* Every byte, alone and between two letters: the result is text, and never longer. */
+    for (int b = 0; b < 256; b++) {
+        for (int newline = 0; newline < 2; newline++) {
+            const char in[3] = {'a', (char)b, 'z'};
+            char *text = exact_copy(in, 3);
+            size_t got = apps_text_clean(text, 3, newline != 0);
+            CHECK(got == 3 && text[0] == 'a' && text[2] == 'z', "byte %d: %zu bytes", b, got);
+            bool kept = (b >= 0x20 && b < 0x7F) || b == '\t' || (b == '\n' && newline);
+            CHECK(text[1] == (kept ? (char)b : '?'), "byte %d (newline %d) became %d", b, newline, text[1]);
+        }
+    }
+    /* Every two-byte character: C1 is the one that goes, whatever follows. */
+    for (int lead = 0xC2; lead < 0xE0; lead++) {
+        for (int cont = 0x80; cont < 0xC0; cont++) {
+            char in[4] = {'a', (char)lead, (char)cont, 'z'};
+            char *text = exact_copy(in, 4);
+            size_t got = apps_text_clean(text, 4, true);
+            bool c1 = lead == 0xC2 && cont <= 0x9F;
+            CHECK(got == (c1 ? 3u : 4u) && text[0] == 'a' && text[got - 1] == 'z', "U+%04x: %zu bytes", (lead & 0x1F) << 6 | (cont & 0x3F), got);
+            CHECK(c1 ? text[1] == '?' : (text[1] == (char)lead && text[2] == (char)cont), "U+%04x: kept wrongly", (lead & 0x1F) << 6 | (cont & 0x3F));
+        }
+    }
+    /* apps_text_next: the bytes a character takes, and whether it stays. */
+    static const unsigned char sample[] = "\xc2\x9b\xc2\xa0\xe2\x82\xac\xff\x01\n";
+    static const struct { size_t take; bool keep_plain, keep_newline; } steps[] = {
+        {2, false, false}, {2, true, true}, {3, true, true}, {1, false, false}, {1, false, false}, {1, false, true},
+    };
+    const unsigned char *at = sample, *end = sample + sizeof sample - 1;
+    for (size_t i = 0; i < sizeof steps / sizeof steps[0]; i++) {
+        bool plain, newline;
+        size_t a = apps_text_next(at, end, false, &plain), b = apps_text_next(at, end, true, &newline);
+        CHECK(a == steps[i].take && b == steps[i].take && plain == steps[i].keep_plain && newline == steps[i].keep_newline,
+              "step %zu: %zu/%zu bytes, keep %d/%d", i, a, b, plain, newline);
+        at += a;
+    }
+    CHECK(at == end, "the steps end at the end");
 }
 
 /* apps_pkg_free frees every blob and the manifest's messages, and leaves a zero package. */
@@ -1143,6 +1390,9 @@ int main(int argc, char **argv) {
         {"memory", memory},
         {"pkg_free", pkg_free},
         {"compile_message", compile_message},
+        {"text_clean", text_clean},
+        {"compile_order", compile_order},
+        {"check_source", check_source},
         {"truncations", truncations},
         {"combos", combos},
         {"fuzz", fuzz},

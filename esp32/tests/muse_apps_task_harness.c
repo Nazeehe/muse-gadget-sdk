@@ -2114,6 +2114,22 @@ static void compile_checks_every_file(void) {
     p = make_pkg("comp", "Comp", no_main, 1);
     CHECK(!apps_task_compile(p, err, sizeof err) && strcmp(err, "main.lua is missing from the package") == 0, "no main: '%s'", err);
     free_pkg(p);
+    /* Main is compiled first, whatever the order the package holds its files in (the one order apphost's check uses too),
+     * and the others as the package has them. */
+    const file_t both_bad[] = {LUA("lib/util.lua", "return {\n"), LUA("main.lua", "x = = 1\n"), LUA("lib/b.lua", "y = = 2\n")};
+    p = make_pkg("comp", "Comp", both_bad, 3);
+    CHECK(!apps_task_compile(p, err, sizeof err) && strncmp(err, "main.lua:1:", 11) == 0, "main first: '%s'", err);
+    free_pkg(p);
+    const file_t modules_bad[] = {LUA("lib/util.lua", "return {\n"), LUA("main.lua", APP_HELLO), LUA("lib/b.lua", "y = = 2\n")};
+    p = make_pkg("comp", "Comp", modules_bad, 3);
+    CHECK(!apps_task_compile(p, err, sizeof err) && strncmp(err, "lib/util.lua:", 13) == 0, "then in the package's order: '%s'", err);
+    free_pkg(p);
+    /* A heap too small to make is the one message (apps_rt_compile's), with the manifest's memory_kb in it. */
+    p = make_pkg("comp", "Comp", good, 2);
+    p->manifest.memory_kb = 2;
+    CHECK(!apps_task_compile(p, err, sizeof err) && strcmp(err, "out of memory: can't make the app's heap of 2 KB") == 0,
+          "a heap of 2 KB: '%s'", err);
+    free_pkg(p);
     ABSENT(0, "print comp");  /* nothing ran */
     /* A compile leaves a running app as it was. */
     CHECK(apps_task_run(make_pkg("hello", "Hello", HELLO, 1), true, 50, NULL, err, sizeof err), "run: %s", err);

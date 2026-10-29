@@ -85,44 +85,8 @@ struct apps_rt {
 /* ---- Text that leaves the runtime ----
  *
  * What an app prints and raises is the app's own bytes, and it reaches the serial console and Muse inside
- * JSON. So a text this module hands out is valid UTF-8 (RFC 3629) with no control byte but, where a caller
- * says so, "\n" and tab: anything else is one '?', for each byte or, for a C1 control character
- * (U+0080 to U+009F, which a terminal can take for an escape sequence: U+009B is CSI), for the character. */
-
-/* The character at p (end is the end of the text): the bytes it takes, at least one. *keep is whether it
- * passes as it is, or becomes one '?'. */
-static size_t next_char(const unsigned char *p, const unsigned char *end, bool keep_newline, bool *keep) {
-    unsigned char c = *p;
-    if (c < 0x80) {
-        *keep = (c >= 0x20 && c != 0x7F) || c == '\t' || (keep_newline && c == '\n');
-        return 1;
-    }
-    int n = apps_json_utf8_len(p, end);
-    if (n <= 0) {  /* not UTF-8, or cut short by the end: this byte alone */
-        *keep = false;
-        return 1;
-    }
-    *keep = !(n == 2 && p[0] == 0xC2 && p[1] <= 0x9F);
-    return (size_t)n;
-}
-
-/* s, a C string, made clean in place (the text only shrinks or stays the same size). */
-static void clean_text(char *s, bool keep_newline) {
-    unsigned char *r = (unsigned char *)s, *w = r;
-    const unsigned char *end = r + strlen(s);
-    while (r < end) {
-        bool keep;
-        size_t n = next_char(r, end, keep_newline, &keep);
-        if (keep) {
-            memmove(w, r, n);
-            w += n;
-        } else {
-            *w++ = '?';
-        }
-        r += n;
-    }
-    *w = '\0';
-}
+ * JSON. So a text this module hands out is clean (apps_text_clean, apps_pkg.h, which the install's compile
+ * message uses too): valid UTF-8 (RFC 3629) with no control byte but, where a caller says so, "\n" and tab. */
 
 /* text with its traceback dropped: what follows the first "\nstack traceback:" (the message alone, as a
  * handler's error() text is given). */
@@ -156,7 +120,7 @@ static void echo(char *out, const char *s, size_t len, size_t max) {
     size_t used = 0;
     while (p < end) {
         bool keep;
-        size_t n = next_char(p, end, false, &keep);
+        size_t n = apps_text_next(p, end, false, &keep);
         size_t take = keep ? n : 1;
         if (used + take > max) {
             memcpy(out + used, "...", 3);
@@ -289,7 +253,7 @@ static void line_add(line_t *ln, const char *s, size_t n) {
     const unsigned char *p = (const unsigned char *)s, *end = p + n;
     while (p < end && !ln->full) {
         bool keep;
-        size_t k = next_char(p, end, false, &keep);
+        size_t k = apps_text_next(p, end, false, &keep);
         size_t take = keep ? k : 1;
         if (ln->len + take > APPS_LOG_LINE_MAX) {
             ln->full = true;
@@ -428,7 +392,7 @@ static int rt_require(lua_State *L) {
     char message[COMPILE_MESSAGE_MAX];
     if (!apps_vm_load_on(L, file->path, (const char *)file->data, file->len, message, sizeof message)) {
         cut_traceback(message);  /* the parser's own runtime error ("C stack overflow") arrives with the call's */
-        clean_text(message, false);
+        apps_text_clean(message, strlen(message), false);
         return luaL_error(L, "require: %s", message);
     }
     lua_pushvalue(L, 1);
@@ -461,7 +425,7 @@ static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t b
 
 /* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. */
 static void crash(apps_rt_t *rt) {
-    clean_text(rt->err, true);
+    apps_text_clean(rt->err, strlen(rt->err), true);
     rt->state = APPS_STATE_CRASHED;
 }
 
@@ -608,6 +572,40 @@ static int build_assets(const apps_pkg_t *pkg, apps_asset_t *assets) {
     return n;
 }
 
+/* A VM for an app: memory_kb of heap from the port. NULL, with err saying so, when it can't be made. */
+static apps_vm_t *make_vm(unsigned memory_kb, char *err, size_t err_len) {
+    apps_vm_config_t cfg = {
+        .mem_limit = (size_t)memory_kb * 1024u,
+        .realloc_fn = apps_port_realloc,
+        .free_fn = apps_port_free,
+        .now_ms = apps_port_mono_ms,
+    };
+    apps_vm_t *vm = apps_vm_new(&cfg);
+    if (vm == NULL) {
+        char text[64];
+        snprintf(text, sizeof text, "out of memory: can't make the app's heap of %u KB", memory_kb);
+        put_text(err, err_len, text);
+    }
+    return vm;
+}
+
+bool apps_rt_compile(const apps_code_t *code, int n, unsigned memory_kb, char *err, size_t err_len) {
+    put_text(err, err_len, "");
+    apps_vm_t *vm = make_vm(memory_kb, err, err_len);
+    if (vm == NULL) {
+        return false;
+    }
+    bool ok = true;
+    for (int i = 0; i < n && ok; i++) {
+        ok = apps_vm_load(vm, code[i].path, code[i].src, code[i].len, err, err_len);
+        if (ok) {
+            lua_pop(apps_vm_lua(vm), 1);
+        }
+    }
+    apps_vm_free(vm);
+    return ok;
+}
+
 apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     put_text(err, err_len, "");
     if (pkg == NULL) {
@@ -642,17 +640,8 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     apps_asset_t assets[APPS_UI_ASSETS_MAX];
     /* Before main.lua runs, so that a ui.image at its top level finds them. */
     apps_ui_set_assets(rt->ui, assets, build_assets(pkg, assets));
-    apps_vm_config_t cfg = {
-        .mem_limit = (size_t)pkg->manifest.memory_kb * 1024u,
-        .realloc_fn = apps_port_realloc,
-        .free_fn = apps_port_free,
-        .now_ms = apps_port_mono_ms,
-    };
-    rt->vm = apps_vm_new(&cfg);
+    rt->vm = make_vm(pkg->manifest.memory_kb, err, err_len);
     if (rt->vm == NULL) {
-        snprintf(text, sizeof text, "out of memory: can't make the app's heap of %u KB",
-                 (unsigned)pkg->manifest.memory_kb);
-        put_text(err, err_len, text);
         apps_ui_free(rt->ui);
         apps_port_free(rt);
         return NULL;
@@ -667,7 +656,7 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
         /* Nothing of main.lua ran, so there is no app to keep: Lua's message, which may be the parser's own
          * runtime error and have the call's traceback, as in require. */
         cut_traceback(boot.fail);
-        clean_text(boot.fail, true);
+        apps_text_clean(boot.fail, strlen(boot.fail), true);
         put_text(err, err_len, boot.fail);
         apps_rt_free(rt);
         return NULL;
@@ -848,7 +837,7 @@ char *apps_rt_message(apps_rt_t *rt, const char *event, const char *data_json, s
         case APPS_CALL_ERROR: {  /* the handler's error() or a runtime error: the message alone fails */
             apps_port_free(m.reply);
             cut_traceback(rt->err);
-            clean_text(rt->err, true);
+            apps_text_clean(rt->err, strlen(rt->err), true);
             put_text(err, err_len, rt->err);
             return NULL;
         }

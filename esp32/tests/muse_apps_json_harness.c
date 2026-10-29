@@ -1138,13 +1138,16 @@ static void encode_values(void) {
            "eq(json.encode(0), '0'); eq(json.encode(-5), '-5')\n"
            "eq(json.encode(math.maxinteger), '9223372036854775807')\n"
            "eq(json.encode(math.mininteger), '-9223372036854775808')\n"
-           "-- floats: %.17g, plus '.0' where that reads as an integer, so they decode as floats again\n"
-           "eq(json.encode(1.5), '1.5'); eq(json.encode(0.5), '0.5'); eq(json.encode(0.1), '0.10000000000000001')\n"
+           "-- floats: the fewest of 15, 16 and 17 digits that read back, plus '.0' where that reads as an integer,\n"
+           "-- so they decode as floats again (encode_floats checks the rule over many more)\n"
+           "eq(json.encode(1.5), '1.5'); eq(json.encode(0.5), '0.5'); eq(json.encode(0.1), '0.1')\n"
            "eq(json.encode(3.0), '3.0'); eq(json.encode(-0.0), '-0.0'); eq(json.encode(0.0), '0.0')\n"
-           "eq(json.encode(1e15), '1000000000000000.0'); eq(json.encode(2^53), '9007199254740992.0')\n"
-           "eq(json.encode(1e100), '1e+100'); eq(json.encode(-1e-7), '-9.9999999999999995e-08')\n"
-           "eq(json.encode(math.pi), '3.1415926535897931')\n"
-           "eq(json.encode(5e-324), '4.9406564584124654e-324')\n"
+           "eq(json.encode(1e15), '1e+15'); eq(json.encode(2^53), '9007199254740992.0')\n"
+           "eq(json.encode(1e100), '1e+100'); eq(json.encode(-1e-7), '-1e-07')\n"
+           "eq(json.encode(math.pi), '3.141592653589793')\n"
+           "-- a host libc prints a subnormal's exact digits and picolibc its shortest (5e-324): the text may differ\n"
+           "-- by libc, and both decode to the same double\n"
+           "eq(json.encode(5e-324), '4.94065645841247e-324')\n"
            "eq(math.type(json.decode(json.encode(3.0))), 'float'); eq(math.type(json.decode(json.encode(3))), 'integer')\n"
            "-- arrays and objects\n"
            "eq(json.encode({1, 2, 3}), '[1,2,3]'); eq(json.encode({{}}), '[{}]'); eq(json.encode({{1}, {2}}), '[[1],[2]]')\n"
@@ -1161,6 +1164,63 @@ static void encode_values(void) {
            "eq(same(json.decode(json.encode({[0] = 'z', 'a', 'b'})), {['0'] = 'z', ['1'] = 'a', ['2'] = 'b'}), true, 'a zero key')\n"
            "eq(same(json.decode(json.encode({1, 2, x = 3})), {['1'] = 1, ['2'] = 2, x = 3}), true, 'mixed')\n"
            "eq(same(json.decode(json.encode({[1.0] = 'a', [2] = 'b'})), json.decode('[\"a\",\"b\"]')), true, 'float key 1.0')\n");
+    apps_vm_free(vm);
+}
+
+/* ---- encode_floats ---- */
+
+/* Each line of stdin is a double: the 16 hex digits of its IEEE-754 bits, a tab, and the text json.encode must give
+ * it (tests/test_muse_apps_json.py works that out with Python's printf). Each is encoded and compared with its text,
+ * and what was encoded is decoded: the double that comes back has the same bits, the sign of a zero included, and is
+ * a float (a text of "3" would come back an integer). */
+static int t_encode_floats(lua_State *L) {
+    char line[160];
+    int rows = 0;
+    while (failures < 20 && fgets(line, sizeof line, stdin) != NULL) {  /* 20 failures say enough */
+        char *tab = strchr(line, '\t'), *nl = strchr(line, '\n');
+        if (tab == NULL || nl == NULL || tab - line != 16 || nl < tab + 2) {
+            CHECK(false, "stdin line %d is not 'bits<TAB>text': '%s'", rows + 1, line);
+            continue;
+        }
+        *tab = '\0';
+        *nl = '\0';
+        const char *want = tab + 1;
+        uint64_t bits = strtoull(line, NULL, 16);
+        double d, back = 0;
+        memcpy(&d, &bits, sizeof d);
+
+        char err[96] = "";
+        size_t len = 0;
+        lua_pushnumber(L, (lua_Number)d);
+        char *out = apps_json_encode_value(L, -1, count_realloc, &len, err, sizeof err);
+        CHECK(out != NULL && len == strlen(want) && memcmp(out, want, len) == 0, "%s: got '%.*s', want '%s' (%s)", line,
+              (int)len, out != NULL ? out : "", want, err);
+        if (out != NULL) {
+            bool pushed = apps_json_push(L, out, len, err, sizeof err);
+            CHECK(pushed, "%s: '%.*s' doesn't decode: %s", line, (int)len, out, err);
+            if (pushed) {
+                bool is_float = lua_type(L, -1) == LUA_TNUMBER && !lua_isinteger(L, -1);
+                if (is_float) {
+                    back = (double)lua_tonumber(L, -1);
+                }
+                CHECK(is_float && memcmp(&back, &d, sizeof d) == 0, "%s: '%.*s' decodes to %s%.17g, not the same double", line,
+                      (int)len, out, is_float ? "" : "a non-float ", back);
+                lua_pop(L, 1);
+            }
+        }
+        count_free(out);
+        lua_pop(L, 1);
+        exact_release();
+        rows++;
+    }
+    CHECK(rows > 0, "no doubles on stdin");
+    printf("encode_floats: %d doubles\n", rows);
+    return 0;
+}
+
+static void encode_floats(void) {
+    apps_vm_t *vm = new_json_vm(1 * MB);
+    run_c(vm, t_encode_floats);
     apps_vm_free(vm);
 }
 
@@ -2696,6 +2756,7 @@ int main(int argc, char **argv) {
         {"decode_limits", decode_limits},
         {"encode_roundtrip", encode_roundtrip},
         {"encode_values", encode_values},
+        {"encode_floats", encode_floats},
         {"encode_strings", encode_strings},
         {"encode_errors", encode_errors},
         {"encode_limits", encode_limits},

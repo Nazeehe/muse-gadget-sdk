@@ -62,7 +62,8 @@
 #define ENCODE_SLOTS 3
 
 /* Decoding and encoding call apps_vm_charge(L, 0) after every 256 values they build or write: it reads the
- * clock, which kills a call past APPS_WALL_MS and raises an external kill, inside one big table. */
+ * clock, which kills a call past APPS_WALL_MS and raises an external kill, inside one big table. A float costs the S3
+ * 7 to 11 us to decode and, at the most, 109 us to encode (put_float's three tries), so 256 of them are under 30 ms. */
 #define CLOCK_EVERY_MASK 0xFFu
 
 /* json.null is this address. */
@@ -1027,16 +1028,32 @@ static NOINLINE void put_integer(enc_t *e, lua_Integer v) {
     out_put(e, p, (size_t)(end - p));
 }
 
-/* "%.17g" round-trips a double. One that prints with no '.', 'e' or 'E' (3, -0, 1e15) gets ".0", so it
- * decodes as a float again. */
+/* The shortest of "%.15g", "%.16g" and "%.17g" that strtod reads back as the same double, so 0.1 is "0.1" and not the
+ * "0.10000000000000001" that "%.17g" gives on a host. 17 digits always read back, so that is the last resort and isn't
+ * checked. A text with no '.', 'e' or 'E' (3, -0, 2^53) gets ".0", so it decodes as a float again.
+ *
+ * Why not "%.17g" alone: a host's printf prints a double's exact digits and picolibc's its shortest ones, padded or cut
+ * to the precision, so one double came out as two texts (0.1 on the board). Under this rule they agree for every
+ * double but the subnormals, where 15 exact digits already read back: 5e-324 is 4.94065645841247e-324 on a host and
+ * 5e-324 on the board. The two texts decode to the same double.
+ *
+ * Cost, on the S3: 32 us for a float that reads back at 15 digits (one printf, one strtod), 109 us for one that needs
+ * all 17 (three printf, two strtod), whatever its exponent (Task 15's torture). The buffer is this leaf's. */
 static NOINLINE bool put_float(enc_t *e, lua_Number n) {
     if (!isfinite(n)) {
         return enc_fail(e, "can't encode NaN or infinity");
     }
+    const double d = (double)n;
     char buf[32];  /* the longest, -1.2345678901234567e-308, has 24 characters, and ".0" adds 2 */
-    int len = snprintf(buf, sizeof buf - 2, "%.17g", (double)n);
-    if (len < 0 || (size_t)len >= sizeof buf - 2) {
-        return enc_fail(e, "can't encode a number");  /* not reachable: %.17g of a double fits */
+    int len = 0;
+    for (int digits = 15; digits <= 17; digits++) {
+        len = snprintf(buf, sizeof buf - 2, "%.*g", digits, d);
+        if (len < 0 || (size_t)len >= sizeof buf - 2) {
+            return enc_fail(e, "can't encode a number");  /* not reachable: %.17g of a double fits */
+        }
+        if (digits < 17 && strtod(buf, NULL) == d) {
+            break;
+        }
     }
     if (strpbrk(buf, ".eE") == NULL) {
         memcpy(buf + len, ".0", 3);
@@ -1128,7 +1145,7 @@ static bool encode_table(enc_t *e, int idx, int level) {
 static bool encode_at(enc_t *e, int idx, int depth) {
     lua_State *L = e->L;
     if ((++e->values & CLOCK_EVERY_MASK) == 0) {
-        apps_vm_charge(L, 0);  /* a %.17g costs tens of microseconds on the S3: the clock, inside one big table */
+        apps_vm_charge(L, 0);  /* a float costs up to 109 us on the S3: the clock, inside one big table */
     }
     switch (lua_type(L, idx)) {
         case LUA_TNIL:

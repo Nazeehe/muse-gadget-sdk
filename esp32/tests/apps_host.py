@@ -237,6 +237,20 @@ def build_apphost(tmp: str | Path, *, sanitize: bool = True) -> Path:
                  include_dirs=[LUA_SRC, APPS, APPHOST], sanitize=sanitize)
 
 
+def json_float_text(x: float) -> str:
+    """What json.encode prints for the finite float x: the shortest of "%.15g", "%.16g" and "%.17g" that reads back as
+    x (17 always does), plus ".0" where that has no '.', 'e' or 'E' and would decode as an integer. This is the rule of
+    apps_json.c's put_float. A libc that prints a double's exact digits (a host's, and Python's) and one that prints
+    its shortest (the board's picolibc) agree on every double but the subnormals: 5e-324 is 4.94065645841247e-324
+    here and 5e-324 there, and both decode to the same double.
+    """
+    for digits in (15, 16, 17):
+        text = "%.*g" % (digits, x)
+        if digits == 17 or float(text) == x:
+            break
+    return text if any(c in text for c in ".eE") else text + ".0"
+
+
 def run(binary: str | Path, *args: object, input: str | bytes | None = None, timeout: float = 60,
         text: bool = True) -> subprocess.CompletedProcess:
     """Runs a harness built by build() and returns the CompletedProcess.

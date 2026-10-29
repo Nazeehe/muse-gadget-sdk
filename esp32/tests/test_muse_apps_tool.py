@@ -1592,29 +1592,43 @@ class TortureTest(AppsTestCase):
                 self.assertIn("C stack overflow", plain[name]["err"])
                 self.assertNotIn("json", plain[name])
                 self.assertEqual(with_json[name]["depth"], plain[name]["depth"], "the same depth, with work there")
-                self.assertEqual(with_json[name]["json"]["decoded_levels"], 16)
-                self.assertGreater(with_json[name]["json"]["encoded"], 100)
+                leaf = with_json[name]["json"]
+                self.assertEqual(leaf["decoded_levels"], 16)
+                self.assertGreater(leaf["encoded"], 100)
+                self.assertEqual(leaf["tail"], 0.1 + 0.2, "the 17-digit float at the deepest point reads back")
 
-    def test_floats_round_trip_as_the_hosts_printf_has_them(self):
+    def test_floats_print_in_the_fewest_digits_that_read_back_and_round_trip(self):
         events = self.run_app(TORTURE, ["message floats"])
         result = self.of(events, "reply")[0]["data"]
         self.assertTrue(result["ok"] and result["integer_ok"] and result["round_trip"])
-        want = ["%.17g" % v for v in (0.1, 5e-324, 1e100, -9.9999999999999995e-08)]
-        self.assertEqual(want, ["0.10000000000000001", "4.9406564584124654e-324", "1e+100", "-9.9999999999999995e-08"])
+        values = (0.1, 5e-324, 1e100, -1e-07)
+        want = [apps_host.json_float_text(v) for v in values]
+        self.assertEqual(want, ["0.1", "4.94065645841247e-324", "1e+100", "-1e-07"])
         self.assertEqual([c["expected"] for c in result["cases"]], want)
-        self.assertEqual([c["encoded"] for c in result["cases"]], want, "this host's printf; a board's may differ")
+        self.assertEqual([c["encoded"] for c in result["cases"]], want, "a host's printf: the board's has 5e-324")
+        # The board's text for the subnormal is the other one; both decode to the double.
+        self.assertEqual([c.get("other") for c in result["cases"]], [None, "5e-324", None, None])
         self.assertTrue(all(c["encode_ok"] and c["decode_ok"] and c["round_trip_ok"] for c in result["cases"]))
 
     def test_a_thousand_floats_come_back_as_themselves(self):
         events = self.run_app(TORTURE, ["message floats_exact"])
         self.assertEqual(self.of(events, "reply")[0]["data"], {"count": 1000, "same": 1000})
 
-    def test_the_thousand_floats_are_there_to_time(self):
-        events = self.run_app(TORTURE, ['message floats_time {"n": 2}', 'message floats_time {"n": 1, "decode": true}'])
-        encode, decode = [e["data"] for e in self.of(events, "reply")]
+    def test_the_thousand_floats_are_there_to_time_in_two_sets(self):
+        events = self.run_app(TORTURE, ['message floats_time {"n": 2}', 'message floats_time {"n": 1, "decode": true}',
+                                        'message floats_time {"n": 1, "digits": 15}',
+                                        'message floats_time {"n": 1, "digits": 15, "decode": true}',
+                                        'message floats_time {"n": 1, "scale": 1e300}',
+                                        'message floats_time {"n": 1, "scale": 1e-300, "decode": true}'])
+        encode, decode, short_encode, short_decode, big, tiny = [e["data"] for e in self.of(events, "reply")]
+        self.assertGreater(big["bytes"], 22 * 1000, "17 digits and an exponent of e+300 each")
+        self.assertEqual((tiny["count"], tiny["decode"]), (1000, True))
         self.assertEqual((encode["n"], encode["decode"], decode["n"], decode["decode"]), (2, False, 1, True))
-        self.assertEqual(decode["count"], 1000)
-        self.assertGreater(encode["bytes"], 17 * 1000)
+        self.assertEqual((decode["count"], short_decode["count"]), (1000, 1000))
+        self.assertGreater(encode["bytes"], 19 * 1000, "the default set takes 17 digits, a point and a comma each")
+        self.assertLess(short_encode["bytes"], 7 * 1000, "i / 10 takes at most 6 bytes with its comma")
+        self.assertEqual(decode["bytes"], encode["bytes"])
+        self.assertEqual(short_decode["bytes"], short_encode["bytes"])
 
     def test_the_screen_is_128_widgets_of_every_kind_and_the_deep_tap_reaches_the_app(self):
         events = self.run_app(TORTURE, ["message widgets", "dump", 'tap "deepest"', "message hits"])

@@ -21,6 +21,9 @@ inside a protected call. Every case also ends with the harness's counting alloca
 test runs every case again against a Lua built with its own API checks on (stack slots).
 """
 
+import math
+import random
+import struct
 import subprocess
 import sys
 import tempfile
@@ -35,6 +38,48 @@ SOURCES = [ROOT / "tests/muse_apps_json_harness.c", APPS / "apps_json.c", APPS /
            APPS / "apps_suggest.c"]
 INCLUDES = [ROOT / "components/lua/src", APPS]
 
+# The text json.encode gives a float is apps_host.json_float_text's: the fewest of 15, 16 and 17 digits that read back,
+# and ".0" where that would decode as an integer. These are the doubles whose text the tests pin as literals, the rule's
+# corners; the reference is checked against each.
+FLOAT_TEXTS = [
+    (0.1, "0.1"),  # %.17g gives 0.10000000000000001; 15 digits read back
+    (0.1 + 0.2, "0.30000000000000004"),  # needs all 17
+    (1 / 3, "0.3333333333333333"),  # 16: 15 don't read back
+    (math.pi, "3.141592653589793"),
+    (2.0 ** 53, "9007199254740992.0"),  # 16 digits, and no '.'
+    (2.0 ** 53 + 2, "9007199254740994.0"),
+    (1e15, "1e+15"),  # %.15g switches to an exponent at 10^15
+    (1e16, "1e+16"),
+    (1e23, "1e+23"),  # the double next to 10^23, which 15 digits read back
+    (sys.float_info.max, "1.7976931348623157e+308"),  # 15 and 16 digits round up past DBL_MAX: infinity
+    (sys.float_info.min, "2.2250738585072014e-308"),
+    (5e-324, "4.94065645841247e-324"),  # a host libc's exact digits; picolibc prints 5e-324 (Task 15's board run)
+    (-0.0, "-0.0"),
+    (3.0, "3.0"),
+]
+
+
+def float_rows(values) -> str:
+    """The stdin of the harness's encode_floats case: a line a double, its IEEE-754 bits, a tab and its text."""
+    return "".join(f"{struct.pack('>d', x).hex()}\t{apps_host.json_float_text(x)}\n" for x in values)
+
+
+def many_floats() -> list[float]:
+    """Some thousands of doubles, the same every run: every exponent, the ones a person writes (thirds, tenths,
+    rounded to k places), the powers of ten and of two, and the subnormals."""
+    rng = random.Random(20261028)
+    values = []
+    while len(values) < 1500:
+        x = struct.unpack(">d", rng.getrandbits(64).to_bytes(8, "big"))[0]
+        if math.isfinite(x):
+            values.append(x)
+    values += [struct.unpack(">d", rng.getrandbits(52).to_bytes(8, "big"))[0] for _ in range(100)]  # subnormals
+    values += [rng.uniform(-1e6, 1e6) for _ in range(500)]
+    values += [round(rng.uniform(-1000, 1000), rng.randint(0, 12)) + 0.0 for _ in range(500)]
+    values += [i / 10 for i in range(-300, 300)] + [i / 7 + 0.1 for i in range(1000)]
+    values += [10.0 ** k for k in range(-30, 31)] + [2.0 ** k for k in range(-1074, 1024, 7)]
+    return values
+
 
 class MuseAppsJsonTest(unittest.TestCase):
     @classmethod
@@ -45,9 +90,10 @@ class MuseAppsJsonTest(unittest.TestCase):
         cls.harness = apps_host.build("muse_apps_json_harness", [*SOURCES, *apps_host.lua_sources()], tmp.name,
                                       include_dirs=INCLUDES)
 
-    def run_case(self, case: str, timeout: float = 60, harness=None) -> subprocess.CompletedProcess:
+    def run_case(self, case: str, timeout: float = 60, harness=None, input: str = "") -> subprocess.CompletedProcess:
+        """Runs one harness case; its stdin is input (empty for the cases that read none: never the test's own)."""
         try:
-            done = apps_host.run(harness or self.harness, case, timeout=timeout)
+            done = apps_host.run(harness or self.harness, case, input=input, timeout=timeout)
         except subprocess.TimeoutExpired:
             done = None
         if done is None:
@@ -93,6 +139,22 @@ class MuseAppsJsonTest(unittest.TestCase):
 
     def test_encode_values(self):
         self.run_case("encode_values")
+
+    def test_encode_floats_in_the_fewest_digits_that_read_back(self):
+        # The rule's corners with their texts as literals (and the Python reference agrees with each): what is
+        # encoded decodes to the same bits, a zero's sign too, and as a float.
+        for x, text in FLOAT_TEXTS:
+            self.assertEqual(apps_host.json_float_text(x), text, x.hex())
+        done = self.run_case("encode_floats", input=float_rows(x for x, _ in FLOAT_TEXTS))
+        self.assertIn(f"encode_floats: {len(FLOAT_TEXTS)} doubles", done.stdout)
+
+    def test_encode_floats_match_a_reference_over_thousands(self):
+        # The text is what Python's printf gives by the same rule, for doubles of every exponent, the ones people
+        # write, powers of ten and two, and subnormals (a host libc and Python both print exact digits); each
+        # decodes to the same bits.
+        values = many_floats()
+        done = self.run_case("encode_floats", input=float_rows(values), timeout=60)
+        self.assertIn(f"encode_floats: {len(values)} doubles", done.stdout)
 
     def test_encode_strings(self):
         self.run_case("encode_strings")
@@ -200,9 +262,10 @@ class MuseAppsJsonTest(unittest.TestCase):
         self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
         cases = [name for name in listed.stdout.split() if name not in ("overrun", "stack")]
         self.assertIn("stack_discipline", cases)
+        stdin = {"encode_floats": float_rows(x for x, _ in FLOAT_TEXTS)}
         for case in cases:
             with self.subTest(case=case):
-                self.run_case(case, timeout=90, harness=harness)
+                self.run_case(case, timeout=90, harness=harness, input=stdin.get(case, ""))
 
 
 if __name__ == "__main__":

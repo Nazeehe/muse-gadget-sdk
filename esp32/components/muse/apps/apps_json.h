@@ -36,8 +36,11 @@
  * Encoding: a table with the keys 1..n (n >= 1) and no others is an array; any other table is an
  * object, so {} is {}, and an integer key becomes its decimal text. An object's keys come in
  * lua_next's order, not the order they were set in. Integers print in decimal;
- * floats with "%.17g", which round-trips, and ".0" is added to one that prints without a '.', 'e'
- * or 'E' (3.0, -0.0), so it decodes as a float again. A string is escaped as RFC 8259 asks:
+ * floats in the fewest of 15, 16 and 17 significant digits that strtod reads back as the same
+ * double (0.1 is 0.1, not 0.10000000000000001), and ".0" is added to one that prints without a '.',
+ * 'e' or 'E' (3.0, -0.0), so it decodes as a float again. A host's libc and picolibc's give the
+ * same text for every double but the subnormals: 5e-324 is 4.94065645841247e-324 on a host and
+ * 5e-324 on the board, and both decode to the same double. A string is escaped as RFC 8259 asks:
  * '"', '\' and every byte under 0x20 (\n \r \t \b \f, the rest as \u00xx); every other byte,
  * '/' included, passes through. nil and json.null are null. Encoding reads tables raw (lua_next,
  * lua_rawgeti) and never calls a metamethod, so no app code runs inside it. It refuses: a

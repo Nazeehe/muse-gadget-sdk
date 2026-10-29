@@ -19,10 +19,10 @@
   ],
   "messages": {
     "chains": "run the four C-call chains (pcall, resume, __index through table.concat, __tostring through string.format) to the limit",
-    "json": "the same chains, with json.encode of a 16-deep table and json.decode of a 16-deep array at the bottom of each",
-    "floats": "json round trips of 0.1, 5e-324, 1e+100, -9.9999999999999995e-08 and 9007199254740993: the host's text, and whether the text reads back",
+    "json": "the same chains, with json.encode of a 16-deep table and json.decode of a 16-deep array at the bottom of each, both ending in a 17-digit float",
+    "floats": "json round trips of 0.1, 5e-324, 1e+100, -1e-07 and 9007199254740993: the text printed (a subnormal's differs by libc) and whether it reads back",
     "floats_exact": "1000 floats of 17 digits through encode and decode: how many come back as the same double",
-    "floats_time": "{n, decode}: n encodes (or decodes) of an array of 1000 floats",
+    "floats_time": "{n, decode, digits, scale}: n encodes (or decodes) of 1000 floats: of 17 digits (digits 17, the default) or at most 15 (digits 15), times scale",
     "widgets": "128 widgets of every kind, boxes 4 deep, handlers, a 256-byte text; returns where to tap the deepest",
     "hits": "the events the handlers have seen"
   }

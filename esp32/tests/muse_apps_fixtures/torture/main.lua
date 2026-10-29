@@ -89,45 +89,54 @@ local CHAIN_NAMES = {"pcall", "resume", "index", "tostring"}
 local JSON_DEPTH = 16
 
 -- json.encode of a table nested 16 deep and json.decode of an array nested 16 deep: the most C recursion
--- the json module allows itself.
+-- the json module allows itself. Each ends in a float of 17 digits (0.1 + 0.2), the encoder's three printf and two
+-- strtod and the decoder's strtod, at the deepest point.
 local function json_leaf()
-    local nested = {}
+    local nested = {tail = 0.1 + 0.2}
     for _ = 2, JSON_DEPTH do
         nested = {next = nested}
     end
     local text = json.encode(nested)
-    local array = json.decode(string.rep("[", JSON_DEPTH) .. string.rep("]", JSON_DEPTH))
+    local array = json.decode(string.rep("[", JSON_DEPTH) .. "0.30000000000000004" .. string.rep("]", JSON_DEPTH))
     local levels = 0
-    while type(array) == "table" and array[1] ~= nil do
-        array = array[1]
+    while type(array) == "table" do
         levels = levels + 1
+        array = array[1]
     end
-    return {encoded = #text, decoded_levels = levels + 1}
+    return {encoded = #text, decoded_levels = levels, tail = array}
 end
 
 -- ---- Floats ----
 
--- What the host's printf("%.17g") gives each double, and the integer that doesn't fit a double. Another libc may
--- print another text for the same double (the shortest that reads back as it): `encode_ok` says whether the text is
--- the host's, `round_trip_ok` whether what the encoder printed reads back as the double it came from.
+-- The text json.encode gives each double: the shortest of 15, 16 and 17 digits that reads back as it (apps_json.c's
+-- put_float), the same on a host and on the board but for a subnormal. A host's printf prints a subnormal's exact
+-- digits and the board's its shortest, so 5e-324 is the second text on a host and the third on the board. Each
+-- row is the double and the text, or the two. `encode_ok` says the encoder's text is one of them, `decode_ok` that
+-- each decodes to the double as a float, `round_trip_ok` that what the encoder printed reads back as the double
+-- it came from. Last, the integer that doesn't fit a double.
 local FLOATS = {
-    {0.1, "0.10000000000000001"},
-    {5e-324, "4.9406564584124654e-324"},
+    {0.1, "0.1"},
+    {5e-324, "4.94065645841247e-324", "5e-324"},
     {1e100, "1e+100"},
-    {-9.9999999999999995e-08, "-9.9999999999999995e-08"},
+    {-1e-07, "-1e-07"},
 }
 
 local function floats()
     local cases, ok, round_trip = {}, true, true
     for i, case in ipairs(FLOATS) do
-        local value, expected = case[1], case[2]
+        local value = case[1]
         local text = json.encode(value)
-        local back = json.decode(expected)
+        local decode_ok = true
+        for j = 2, #case do
+            local back = json.decode(case[j])
+            decode_ok = decode_ok and back == value and math.type(back) == "float"
+        end
         local row = {
-            expected = expected,
+            expected = case[2],
+            other = case[3],
             encoded = text,
-            encode_ok = text == expected,
-            decode_ok = back == value and math.type(back) == "float",
+            encode_ok = text == case[2] or text == case[3],
+            decode_ok = decode_ok,
             round_trip_ok = json.decode(text) == value,
         }
         ok = ok and row.encode_ok and row.decode_ok
@@ -139,12 +148,33 @@ local function floats()
     return {ok = ok and integer_ok, round_trip = round_trip and integer_ok, cases = cases, integer_ok = integer_ok}
 end
 
+-- 1000 floats of one of two kinds. At most 15 digits: i / 10, which the encoder prints at its first try. 17 digits:
+-- the first 1000 of 1 / (i + 0.3) times `scale` (1 if left out) that "%.16g" doesn't read back, which take all three
+-- tries (two printf and strtod that fail, then the third printf) and so cost the most. A scale of 1e300 or 1e-300
+-- gives the exponents that strtod has the most to do for. Multiplication, division and addition are correctly
+-- rounded, so a host and the board make the same floats.
+local function float_set(digits, scale)
+    local array = {}
+    if digits == 15 then
+        for i = 1, 1000 do
+            array[i] = i / 10
+        end
+        return array
+    end
+    local i = 0
+    while #array < 1000 do
+        i = i + 1
+        local x = 1 / (i + 0.3) * (scale or 1)
+        if tonumber(string.format("%.16g", x)) ~= x then
+            array[#array + 1] = x
+        end
+    end
+    return array
+end
+
 -- 1000 floats of 17 digits, encoded and decoded back: how many come back as the same double.
 local function floats_exact()
-    local array = {}
-    for i = 1, 1000 do
-        array[i] = i / 7 + 0.1
-    end
+    local array = float_set(17)
     local back = json.decode(json.encode(array))
     local same = 0
     for i = 1, 1000 do
@@ -155,13 +185,10 @@ local function floats_exact()
     return {count = #back, same = same}
 end
 
--- n encodes (or decodes) of an array of 1000 floats with 17 digits each: the call's own time is what
--- >app.status calls worst_dispatch_ms.
-local function floats_time(n, decode)
-    local array = {}
-    for i = 1, 1000 do
-        array[i] = i / 7 + 0.1
-    end
+-- n encodes (or decodes) of an array of 1000 floats, of 17 digits (times `scale`) or of at most 15: the call's own
+-- time is what >app.status calls worst_dispatch_ms.
+local function floats_time(n, decode, digits, scale)
+    local array = float_set(digits, scale)
     local text = json.encode(array)
     local count = 0
     for _ = 1, n do
@@ -305,7 +332,7 @@ function app.message(event, data)
     elseif event == "floats_exact" then
         return floats_exact()
     elseif event == "floats_time" then
-        return floats_time(data and data.n or 1, data and data.decode)
+        return floats_time(data and data.n or 1, data and data.decode, data and data.digits, data and data.scale)
     elseif event == "widgets" then
         return widgets()
     elseif event == "hits" then

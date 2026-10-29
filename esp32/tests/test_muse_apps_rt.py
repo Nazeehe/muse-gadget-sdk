@@ -68,7 +68,7 @@ NOT_RUNNING = "the app is not running"
 BUDGET_CALL = "stopped: ran more than 2000000 VM instructions in one callback (use timer.every for long work)"
 BUDGET_START = "stopped: ran more than 5000000 VM instructions in one callback (use timer.every for long work)"
 # The commands apphost lists when it doesn't know one.
-COMMANDS = "(commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, sync, timers)"
+COMMANDS = "(commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, sync, timers, restart)"
 # The ring: a line takes its length plus one of 8192 bytes; print cuts a line at 200 bytes.
 RING_BYTES = 8192
 LINE_MAX = 200

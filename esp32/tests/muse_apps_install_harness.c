@@ -161,6 +161,39 @@ void apps_port_sound_chirp(void) {}
 
 void apps_port_sound_stop(void) {}
 
+/* The store, the battery, the Wi-Fi and the front (apps_port.h): none here, as no case runs an app that uses them. */
+char *apps_port_store_load(const char *app, size_t *len) {
+    (void)app;
+    *len = 0;
+    return NULL;
+}
+
+bool apps_port_store_save(const char *app, const char *json, size_t len) {
+    (void)app;
+    (void)json;
+    (void)len;
+    return false;
+}
+
+apps_battery_t apps_port_battery(void) {
+    return (apps_battery_t){.pct = -1, .charging = false, .usb = false};
+}
+
+bool apps_port_wifi(char *ssid, size_t cap) {
+    if (cap > 0) {
+        ssid[0] = '\0';
+    }
+    return false;
+}
+
+void apps_port_show(void) {}
+
+void apps_port_keep_awake(bool on) {
+    (void)on;
+}
+
+void apps_port_exit(void) {}
+
 void apps_port_log(const char *app_id, const char *line) {
     (void)app_id;
     (void)line;

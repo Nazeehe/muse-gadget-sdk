@@ -67,6 +67,11 @@ static const char *const handler_names[H_COUNT] = {"start", "stop", "show", "hid
 
 #define NOT_RUNNING "the app is not running"
 
+/* What the store says to the log, and to apps_rt_new's caller when the store can't be had. */
+#define STORE_UNREADABLE "store: the saved values couldn't be read; starting with none"
+#define STORE_LOST "store: the last changes couldn't be saved"
+#define STORE_LOAD_FAILED "can't read the app's saved values (the gadget is short of memory or busy); try again in a few seconds"
+
 /* The duty cycle (apps_rt.h): a window is a whole second of the monotonic clock, hot over APPS_DUTY_BUSY_PCT of it spent in
  * calls; a throttled app's timers are this much later. */
 #define DUTY_WINDOW_MS 1000
@@ -85,6 +90,15 @@ typedef struct {
     int64_t period;  /* ms between runs of an every timer; 0 for a one-shot */
     uint32_t gen;    /* its life: a handle names (slot, gen); never 0 while armed */
 } armed_t;
+
+/* A key of the store and the text of its value (JSON, as json.encode writes it), in one block of the port's heap: outside the Lua heap,
+ * so the 16 KB the store may hold never counts against memory_kb. */
+typedef struct {
+    uint32_t text_len;
+    uint16_t key_len;  /* bytes */
+    uint16_t esc_len;  /* the key's bytes in the saved object, escaped as JSON escapes a string (the quotes not counted) */
+    char data[];       /* the key, then the text: neither ends in a NUL */
+} store_entry_t;
 
 struct apps_rt {
     const apps_pkg_t *pkg;
@@ -105,6 +119,16 @@ struct apps_rt {
     int duty_hot;
     uint8_t cpu_pct;
     bool throttled, throttle_warned;
+    /* The store (apps_rt.h): a block for each key, how many bytes of the saved object they take between them (each key's escape,
+     * its quotes and colon, its text), whether a change waits to be saved and when the save is due. */
+    store_entry_t **store;
+    unsigned store_n, store_cap;
+    size_t store_sum;
+    bool store_dirty;
+    int64_t store_due;
+    /* sys.show (apps_rt_show_allowed): message() or alarm() is running, or a touch came at touch_ms. */
+    bool show_ok, touched;
+    int64_t touch_ms;
     /* apps_vm_call writes its error here. It is the crash record while the state is CRASHED (and nothing runs
      * after that), and the scratch of a call that fails the message alone otherwise. */
     char err[APPS_ERROR_MAX];
@@ -318,8 +342,9 @@ static void line_put(line_t *ln, const char *s, size_t n) {
 }
 
 /* print(...): the tostrings of the arguments, joined with tabs, as lines of the app's log. A piece is read in
- * place, never joined into a string of the Lua heap: a print of a big string costs the heap nothing. */
-static int rt_print(lua_State *L) {
+ * place, never joined into a string of the Lua heap: a print of a big string costs the heap nothing. sys.log is this too
+ * (apps_rt.h): the runtime is the first upvalue of both. */
+int apps_rt_print(lua_State *L) {
     apps_vm_check(L);
     line_t ln = {.rt = lua_touserdata(L, lua_upvalueindex(1)), .L = L};
     int n = lua_gettop(L);
@@ -445,6 +470,7 @@ static int rt_require(lua_State *L) {
 static void duty_roll(apps_rt_t *rt, int64_t now_ms);
 static void duty_book(apps_rt_t *rt, int64_t began, int64_t ended, uint64_t instr);
 static void timers_disarm(apps_rt_t *rt);
+static void store_flush_final(apps_rt_t *rt);
 
 /* Runs fn(arg) as one apps_vm_call with the budget: fn is a C function that gets arg as a light userdata and
  * does everything that touches the app's heap, so that a refusal there is an error inside the call. The
@@ -467,11 +493,303 @@ static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t b
     return result;
 }
 
-/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. Its timers go. */
+/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. Its timers go, and what it had
+ * written to its store is saved. */
 static void crash(apps_rt_t *rt) {
     apps_text_clean(rt->err, strlen(rt->err), true);
     rt->state = APPS_STATE_CRASHED;
     timers_disarm(rt);
+    store_flush_final(rt);
+}
+
+/* ---- The store ---- */
+
+/* One line into the log, as print's go: the ring, and the port's echo. line is at most APPS_LOG_LINE_MAX bytes of clean text. */
+static void log_note(apps_rt_t *rt, const char *line) {
+    ring_push(rt, line, strlen(line));
+    apps_port_log(rt->pkg->manifest.id, line);
+}
+
+/* key[0, n) escaped as the encoder escapes a string (apps_json.c's put_string): '"' and '\\', and \b \f \n \r \t, take two bytes, any other
+ * byte under 0x20 six (\u00xx), every other byte one. It is written to out, which has room for that many (NULL: only counted). */
+static size_t escape_key(char *out, const char *s, size_t n) {
+    static const char hex[] = "0123456789abcdef";
+    size_t used = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        char esc = c == '"' ? '"' : c == '\\' ? '\\' : c == '\b' ? 'b' : c == '\f' ? 'f' : c == '\n' ? 'n' : c == '\r' ? 'r' : c == '\t' ? 't' : 0;
+        if (esc != 0) {
+            if (out != NULL) {
+                out[used] = '\\';
+                out[used + 1] = esc;
+            }
+            used += 2;
+        } else if (c < 0x20) {
+            if (out != NULL) {
+                memcpy(out + used, "\\u00", 4);
+                out[used + 4] = hex[c >> 4];
+                out[used + 5] = hex[c & 15];
+            }
+            used += 6;
+        } else {
+            if (out != NULL) {
+                out[used] = (char)c;
+            }
+            used++;
+        }
+    }
+    return used;
+}
+
+bool apps_rt_store_key_valid(const char *key, size_t len) {
+    const unsigned char *p = (const unsigned char *)key, *end = p + len;
+    size_t chars = 0;
+    while (p < end) {
+        if (*p == '\0') {
+            return false;  /* the key is a C string wherever it is read back */
+        }
+        if (*p >= 0x80) {
+            int n = apps_json_utf8_len(p, end);
+            if (n <= 0) {
+                return false;  /* not valid UTF-8: the saved object couldn't be read back as JSON */
+            }
+            p += n;
+        } else {
+            p++;
+        }
+        if (++chars > APPS_STORE_KEY_MAX) {
+            return false;
+        }
+    }
+    return chars >= 1;
+}
+
+/* What an entry takes in the saved object: its key as escaped, the quotes round it and the colon, and its text. */
+static size_t entry_cost(const store_entry_t *e) {
+    return (size_t)e->esc_len + 3 + e->text_len;
+}
+
+/* The saved object's bytes: its braces, the entries (sum), and a comma between each two. */
+static size_t doc_bytes(size_t sum, unsigned n) {
+    return 2 + sum + (n > 0 ? n - 1 : 0);
+}
+
+static int store_find(const apps_rt_t *rt, const char *key, size_t key_len) {
+    for (unsigned i = 0; i < rt->store_n; i++) {
+        const store_entry_t *e = rt->store[i];
+        if (e->key_len == key_len && memcmp(e->data, key, key_len) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* The save is due APPS_STORE_FLUSH_MS from now, whatever was due before: a change inside the wait starts it again. */
+static void store_changed(apps_rt_t *rt) {
+    rt->store_dirty = true;
+    rt->store_due = apps_port_mono_ms() + APPS_STORE_FLUSH_MS;
+}
+
+/* Stores the text under the key, as apps_rt_store_set does; changed says whether it counts as a change to save (what is loaded
+ * doesn't). */
+static apps_store_result_t store_put(apps_rt_t *rt, const char *key, size_t key_len, const char *text, size_t len, bool changed) {
+    if (!apps_rt_store_key_valid(key, key_len)) {
+        return APPS_STORE_BAD_KEY;
+    }
+    int at = store_find(rt, key, key_len);
+    if (at >= 0) {
+        const store_entry_t *old = rt->store[at];
+        if (old->text_len == len && memcmp(old->data + old->key_len, text, len) == 0) {
+            return APPS_STORE_OK;  /* what is there already: no change, and no new save */
+        }
+    }
+    size_t esc = escape_key(NULL, key, key_len);
+    size_t sum = rt->store_sum + esc + 3 + len;
+    if (at >= 0) {
+        sum -= entry_cost(rt->store[at]);  /* the bytes it had count for nothing */
+    }
+    unsigned n = rt->store_n + (at >= 0 ? 0u : 1u);
+    if (doc_bytes(sum, n) > APPS_STORE_MAX_BYTES) {
+        return APPS_STORE_FULL;
+    }
+    store_entry_t *e = apps_port_realloc(NULL, sizeof *e + key_len + len);
+    if (e == NULL) {
+        return APPS_STORE_NO_MEMORY;
+    }
+    e->text_len = (uint32_t)len;
+    e->key_len = (uint16_t)key_len;
+    e->esc_len = (uint16_t)esc;
+    memcpy(e->data, key, key_len);
+    memcpy(e->data + key_len, text, len);
+    if (at >= 0) {
+        apps_port_free(rt->store[at]);
+        rt->store[at] = e;
+    } else {
+        if (rt->store_n == rt->store_cap) {
+            unsigned cap = rt->store_cap != 0 ? rt->store_cap * 2 : 8;
+            store_entry_t **grown = apps_port_realloc(rt->store, (size_t)cap * sizeof *grown);
+            if (grown == NULL) {
+                apps_port_free(e);
+                return APPS_STORE_NO_MEMORY;
+            }
+            rt->store = grown;
+            rt->store_cap = cap;
+        }
+        rt->store[rt->store_n++] = e;
+    }
+    rt->store_sum = sum;
+    if (changed) {
+        store_changed(rt);
+    }
+    return APPS_STORE_OK;
+}
+
+apps_store_result_t apps_rt_store_set(apps_rt_t *rt, const char *key, size_t key_len, const char *text, size_t len) {
+    return store_put(rt, key, key_len, text, len, true);
+}
+
+const char *apps_rt_store_get(const apps_rt_t *rt, const char *key, size_t key_len, size_t *len) {
+    int at = apps_rt_store_key_valid(key, key_len) ? store_find(rt, key, key_len) : -1;
+    if (at < 0) {
+        *len = 0;
+        return NULL;
+    }
+    *len = rt->store[at]->text_len;
+    return rt->store[at]->data + rt->store[at]->key_len;
+}
+
+void apps_rt_store_remove(apps_rt_t *rt, const char *key, size_t key_len) {
+    int at = apps_rt_store_key_valid(key, key_len) ? store_find(rt, key, key_len) : -1;
+    if (at < 0) {
+        return;
+    }
+    rt->store_sum -= entry_cost(rt->store[at]);
+    apps_port_free(rt->store[at]);
+    memmove(&rt->store[at], &rt->store[at + 1], (size_t)(rt->store_n - (unsigned)at - 1) * sizeof rt->store[0]);
+    rt->store_n--;
+    store_changed(rt);
+}
+
+unsigned apps_rt_store_count(const apps_rt_t *rt) {
+    return rt->store_n;
+}
+
+static void store_clear(apps_rt_t *rt) {
+    for (unsigned i = 0; i < rt->store_n; i++) {
+        apps_port_free(rt->store[i]);
+    }
+    rt->store_n = 0;
+    rt->store_sum = 0;
+}
+
+/* The object that is saved: the entries, each as `"key":text`, in braces. Given to the port, which copies it. False when the port
+ * doesn't take it, or the heap has no room for the text. */
+static bool store_save(apps_rt_t *rt) {
+    size_t total = doc_bytes(rt->store_sum, rt->store_n);
+    char *doc = apps_port_realloc(NULL, total + 1);
+    if (doc == NULL) {
+        return false;
+    }
+    char *at = doc;
+    *at++ = '{';
+    for (unsigned i = 0; i < rt->store_n; i++) {
+        const store_entry_t *e = rt->store[i];
+        if (i > 0) {
+            *at++ = ',';
+        }
+        *at++ = '"';
+        at += escape_key(at, e->data, e->key_len);
+        *at++ = '"';
+        *at++ = ':';
+        memcpy(at, e->data + e->key_len, e->text_len);
+        at += e->text_len;
+    }
+    *at++ = '}';
+    *at = '\0';
+    bool ok = (size_t)(at - doc) == total && apps_port_store_save(rt->pkg->manifest.id, doc, total);
+    apps_port_free(doc);
+    return ok;
+}
+
+void apps_rt_store_tick(apps_rt_t *rt, int64_t now_ms) {
+    if (rt == NULL || !rt->store_dirty || now_ms < rt->store_due) {
+        return;
+    }
+    if (store_save(rt)) {
+        rt->store_dirty = false;
+    } else {
+        rt->store_due = now_ms + APPS_STORE_FLUSH_MS;  /* the port was full, or short of memory: asked again then */
+    }
+}
+
+/* The last save, when the app ends: asked once. A port that refuses it loses what the app wrote since the last, and the log says so. */
+static void store_flush_final(apps_rt_t *rt) {
+    if (!rt->store_dirty) {
+        return;
+    }
+    rt->store_dirty = false;
+    if (!store_save(rt)) {
+        log_note(rt, STORE_LOST);
+    }
+}
+
+typedef enum { PARSED, UNREADABLE, NO_MEMORY } parse_t;
+
+/* The object the port gave, into the cache: what the store writes (an object whose values are JSON, in at most 16 KB). A key twice is
+ * its last; a key the store never writes (empty, over 32 characters) is dropped. NO_MEMORY when the cache couldn't grow: that
+ * is no reason to think the object is bad. */
+static parse_t store_parse(apps_rt_t *rt, const char *json, size_t len) {
+    apps_jr_t r;
+    char key[APPS_STORE_KEY_MAX * 4 + 1];  /* the longest key in bytes, and its NUL */
+    apps_jr_init(&r, json, len);
+    if (len > APPS_STORE_MAX_BYTES || !apps_jr_object(&r)) {
+        return UNREADABLE;
+    }
+    for (;;) {
+        int k = apps_jr_key(&r, key, sizeof key);
+        if (k < 0) {
+            return UNREADABLE;
+        }
+        if (k == 0) {
+            break;
+        }
+        size_t value_len;
+        const char *value = apps_jr_raw_value(&r, &value_len);
+        if (value == NULL) {
+            return UNREADABLE;
+        }
+        size_t key_len = strlen(key);
+        if (!apps_rt_store_key_valid(key, key_len)) {
+            continue;
+        }
+        apps_store_result_t put = store_put(rt, key, key_len, value, value_len, false);
+        if (put == APPS_STORE_NO_MEMORY) {
+            return NO_MEMORY;
+        }
+        if (put != APPS_STORE_OK) {
+            return UNREADABLE;  /* more than the store holds */
+        }
+    }
+    return apps_jr_end(&r) ? PARSED : UNREADABLE;
+}
+
+/* The app's store from the port, before main.lua runs. False when the port couldn't give it (or the cache couldn't be made): the app
+ * is not made, and never starts with an empty store in the real one's place. */
+static bool store_load(apps_rt_t *rt) {
+    size_t len = 0;
+    char *json = apps_port_store_load(rt->pkg->manifest.id, &len);
+    if (json == NULL) {
+        return false;
+    }
+    parse_t parsed = store_parse(rt, json, len);
+    apps_port_free(json);
+    if (parsed != PARSED) {
+        store_clear(rt);
+    }
+    if (parsed == UNREADABLE) {
+        log_note(rt, STORE_UNREADABLE);
+    }
+    return parsed != NO_MEMORY;
 }
 
 /* ---- Loading main.lua ---- */
@@ -570,7 +888,7 @@ static int boot_trampoline(lua_State *L) {
     lua_settop(L, 0);
 
     lua_pushlightuserdata(L, rt);
-    lua_pushcclosure(L, rt_print, 1);
+    lua_pushcclosure(L, apps_rt_print, 1);
     lua_setglobal(L, "print");
     lua_pushlightuserdata(L, rt);
     lua_newtable(L);
@@ -697,7 +1015,12 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     lua_State *L = apps_vm_lua(rt->vm);
     apps_json_open(L);  /* safe outside a call: if the heap refuses, the call below ends out of memory */
     apps_ui_open(L, rt->ui);
-    apps_svc_open(L, rt);  /* time, os, timer, alarm and sound: before main.lua, so its top level can arm a timer */
+    apps_svc_open(L, rt);  /* time, os, timer, alarm, sound, store and sys: before main.lua, so its top level can arm a timer */
+    if (apps_rt_permits(rt, APPS_PERM_STORE) && !store_load(rt)) {
+        put_text(err, err_len, STORE_LOAD_FAILED);
+        apps_rt_free(rt);
+        return NULL;
+    }
     rt->duty_second = apps_port_mono_ms() / DUTY_WINDOW_MS;  /* main.lua's top level is in the first window */
 
     boot_t boot = {.rt = rt, .main = main, .outcome = BOOT_OK};
@@ -786,6 +1109,7 @@ void apps_rt_stop(apps_rt_t *rt) {
     if (rt->handler[H_STOP] == LUA_NOREF || call_handler(rt, H_STOP, NULL, APPS_BUDGET_CALL)) {
         rt->state = APPS_STATE_STOPPED;
         timers_disarm(rt);
+        store_flush_final(rt);  /* what stop() wrote too */
     }
 }
 
@@ -793,8 +1117,13 @@ bool apps_rt_alarm(apps_rt_t *rt, const char *name) {
     if (rt == NULL || rt->state != APPS_STATE_RUNNING) {
         return false;
     }
-    return rt->handler[H_ALARM] == LUA_NOREF ||
-           call_handler(rt, H_ALARM, name != NULL ? name : "", APPS_BUDGET_CALL);
+    if (rt->handler[H_ALARM] == LUA_NOREF) {
+        return true;
+    }
+    rt->show_ok = true;  /* sys.show() may be called in alarm() */
+    bool ok = call_handler(rt, H_ALARM, name != NULL ? name : "", APPS_BUDGET_CALL);
+    rt->show_ok = false;
+    return ok;
 }
 
 /* ---- Touch ---- */
@@ -819,6 +1148,8 @@ void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event) {
     if (rt == NULL || rt->state != APPS_STATE_RUNNING) {
         return;
     }
+    rt->touched = true;  /* sys.show() may be called for the next APPS_SHOW_TAP_MS, whatever the touch found */
+    rt->touch_ms = apps_port_mono_ms();
     touch_call_t t = {rt, slot, gen, event};
     if (vm_run(rt, touch_trampoline, &t, APPS_BUDGET_CALL) != APPS_CALL_OK) {
         crash(rt);
@@ -882,15 +1213,25 @@ static bool runs_first(const armed_t *a, const armed_t *b) {
     return a->due < b->due || (a->due == b->due && a->gen < b->gen);
 }
 
-int64_t apps_rt_next_deadline(const apps_rt_t *rt) {
+/* The earliest due time of the armed timers; INT64_MAX when there are none. */
+static int64_t earliest_timer(const apps_rt_t *rt) {
     int64_t next = INT64_MAX;
-    if (rt == NULL || rt->state != APPS_STATE_RUNNING || apps_port_dark()) {
-        return next;
-    }
     for (int i = 0; i < APPS_TIMERS_MAX; i++) {
         if (rt->timers[i].gen != 0 && rt->timers[i].due < next) {
             next = rt->timers[i].due;
         }
+    }
+    return next;
+}
+
+int64_t apps_rt_next_deadline(const apps_rt_t *rt) {
+    if (rt == NULL || rt->state != APPS_STATE_RUNNING) {
+        return INT64_MAX;
+    }
+    int64_t next = rt->store_dirty ? rt->store_due : INT64_MAX;  /* a save is due dark or lit */
+    if (!apps_port_dark()) {
+        int64_t timer = earliest_timer(rt);
+        next = timer < next ? timer : next;
     }
     return next;
 }
@@ -922,7 +1263,7 @@ bool apps_rt_has_work(apps_rt_t *rt, int64_t now_ms) {
         return false;
     }
     duty_roll(rt, now_ms);
-    return apps_vm_dying(rt->vm) || apps_rt_next_deadline(rt) <= now_ms;
+    return apps_vm_dying(rt->vm) || (!apps_port_dark() && earliest_timer(rt) <= now_ms);  /* the store's save isn't a call */
 }
 
 static int nop_trampoline(lua_State *L) {
@@ -1132,7 +1473,10 @@ char *apps_rt_message(apps_rt_t *rt, const char *event, const char *data_json, s
         return NULL;
     }
     message_t m = {.rt = rt, .event = event != NULL ? event : "", .data = data_json, .data_len = data_len};
-    switch (vm_run(rt, message_trampoline, &m, APPS_BUDGET_CALL)) {
+    rt->show_ok = true;  /* sys.show() may be called in message() */
+    apps_call_t result = vm_run(rt, message_trampoline, &m, APPS_BUDGET_CALL);
+    rt->show_ok = false;
+    switch (result) {
         case APPS_CALL_OK:
             if (m.reply != NULL) {
                 return m.reply;
@@ -1158,6 +1502,9 @@ char *apps_rt_message(apps_rt_t *rt, const char *event, const char *data_json, s
 
 void apps_rt_free(apps_rt_t *rt) {
     if (rt != NULL) {
+        store_flush_final(rt);  /* a change that is left is saved (the app's end has done it already, as a rule) */
+        store_clear(rt);
+        apps_port_free(rt->store);
         /* The VM goes first: no app code runs after it, so no handle to the table is left to use. */
         apps_vm_free(rt->vm);
         apps_ui_free(rt->ui);
@@ -1193,6 +1540,14 @@ const char *apps_rt_id(const apps_rt_t *rt) {
 
 bool apps_rt_permits(const apps_rt_t *rt, unsigned perm) {
     return (rt->pkg->manifest.perms & perm) != 0;
+}
+
+unsigned apps_rt_memory_kb(const apps_rt_t *rt) {
+    return rt->pkg->manifest.memory_kb;
+}
+
+bool apps_rt_show_allowed(const apps_rt_t *rt) {
+    return rt->show_ok || (rt->touched && apps_port_mono_ms() - rt->touch_ms <= APPS_SHOW_TAP_MS);
 }
 
 apps_vm_t *apps_rt_vm(apps_rt_t *rt) {

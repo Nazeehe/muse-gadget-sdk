@@ -65,6 +65,7 @@
 #include "muse_apps.h"
 #include "muse_apps_task_fakes.h"
 #include "muse_input.h"
+#include "muse_state.h"
 #include "muse_voice.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
@@ -840,6 +841,217 @@ void vTaskDelay(const TickType_t ticks) {
     sleep_ms((int)ticks_to_ms(ticks));
 }
 
+/* ---- The store (apps_port.h), made as the device's port makes it: the app task's calls are ops of the I/O worker (apps_io_submit_op),
+ * which alone touches the map, and a load waits for its op at most APPS_STORE_WAIT_MS (the request is abandoned past that, and the op frees
+ * it). A case can slow a save (a slow flash: a load that jumped the queue would read what was there before it) and can make the worker
+ * refuse saves. The events say what was queued and what was done, in the order each thread did it. ---- */
+
+#define STORE_APPS_MAX 8
+static pthread_mutex_t store_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    char app[APPS_ID_MAX + 1];
+    char *json;
+    size_t len;
+} store_map[STORE_APPS_MAX];
+static atomic_int store_save_delay_ms;
+static atomic_bool store_refuse_saves;
+static atomic_int store_ops_queued, store_ops_done;  /* what the worker was given, and what it has done */
+
+typedef struct {
+    char app[APPS_ID_MAX + 1];
+    size_t len;
+    char json[];
+} store_save_t;
+
+enum { LOAD_WAITING, LOAD_DONE, LOAD_ABANDONED };
+
+typedef struct {
+    atomic_int state;
+    char app[APPS_ID_MAX + 1];
+    char *json;
+    size_t len;
+} store_load_t;
+
+/* X11: every access of the store is the I/O worker's. */
+static void store_on_worker(const char *what) {
+    if (strcmp(self_task()->name, "muse_apps_io") != 0) {
+        error("a store %s on '%s': the I/O worker's (X11)", what, self_task()->name);
+    }
+}
+
+static void store_put_op(void *arg) {
+    store_save_t *save = arg;
+    store_on_worker("save");
+    int delay = atomic_load(&store_save_delay_ms);
+    if (delay > 0) {
+        sleep_ms(delay);
+    }
+    pthread_mutex_lock(&store_mu);
+    int at = -1, free_at = -1;
+    for (int i = 0; i < STORE_APPS_MAX; i++) {
+        if (store_map[i].json != NULL && strcmp(store_map[i].app, save->app) == 0) {
+            at = i;
+        }
+        if (store_map[i].json == NULL && free_at < 0) {
+            free_at = i;
+        }
+    }
+    at = at >= 0 ? at : free_at;
+    char *copy = at >= 0 ? apps_port_realloc(NULL, save->len + 1) : NULL;
+    if (copy != NULL) {
+        memcpy(copy, save->json, save->len + 1);
+        apps_port_free(store_map[at].json);
+        snprintf(store_map[at].app, sizeof store_map[at].app, "%s", save->app);
+        store_map[at].json = copy;
+        store_map[at].len = save->len;
+    }
+    pthread_mutex_unlock(&store_mu);
+    event(copy != NULL ? "store saved %s %s" : "store NOT saved %s %s", save->app, save->json);
+    apps_port_free(save);
+    atomic_fetch_add(&store_ops_done, 1);
+}
+
+static void store_get_op(void *arg) {
+    store_load_t *r = arg;
+    store_on_worker("load");
+    pthread_mutex_lock(&store_mu);
+    const char *json = "{}";
+    size_t len = 2;
+    for (int i = 0; i < STORE_APPS_MAX; i++) {
+        if (store_map[i].json != NULL && strcmp(store_map[i].app, r->app) == 0) {
+            json = store_map[i].json;
+            len = store_map[i].len;
+        }
+    }
+    char *copy = apps_port_realloc(NULL, len + 1);
+    if (copy != NULL) {
+        memcpy(copy, json, len);
+        copy[len] = '\0';
+    }
+    pthread_mutex_unlock(&store_mu);
+    event("store load %s", r->app);
+    r->json = copy;
+    r->len = copy != NULL ? len : 0;
+    int waiting = LOAD_WAITING;
+    if (!atomic_compare_exchange_strong(&r->state, &waiting, LOAD_DONE)) {
+        event("store load abandoned %s", r->app);
+        apps_port_free(copy);
+        apps_port_free(r);
+    }
+    atomic_fetch_add(&store_ops_done, 1);
+}
+
+char *apps_port_store_load(const char *app, size_t *len) {
+    *len = 0;
+    store_load_t *r = apps_port_realloc(NULL, sizeof *r);
+    CHECK(r != NULL, "no memory for a load");
+    atomic_init(&r->state, LOAD_WAITING);
+    snprintf(r->app, sizeof r->app, "%s", app);
+    r->json = NULL;
+    r->len = 0;
+    atomic_fetch_add(&store_ops_queued, 1);
+    if (!apps_io_submit_op(store_get_op, r)) {
+        atomic_fetch_sub(&store_ops_queued, 1);
+        apps_port_free(r);
+        event("store load refused %s", app);
+        return NULL;
+    }
+    int64_t until = apps_port_mono_ms() + APPS_STORE_WAIT_MS;
+    while (atomic_load(&r->state) != LOAD_DONE) {
+        if (apps_port_mono_ms() >= until) {
+            int waiting = LOAD_WAITING;
+            if (atomic_compare_exchange_strong(&r->state, &waiting, LOAD_ABANDONED)) {
+                event("store load gave up %s", app);
+                return NULL;
+            }
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    char *json = r->json;
+    *len = r->len;
+    apps_port_free(r);
+    return json;
+}
+
+bool apps_port_store_save(const char *app, const char *json, size_t len) {
+    if (atomic_load(&store_refuse_saves)) {
+        event("store save refused %s", app);
+        return false;
+    }
+    store_save_t *save = apps_port_realloc(NULL, sizeof *save + len + 1);
+    CHECK(save != NULL, "no memory for a save");
+    snprintf(save->app, sizeof save->app, "%s", app);
+    save->len = len;
+    memcpy(save->json, json, len);
+    save->json[len] = '\0';
+    atomic_fetch_add(&store_ops_queued, 1);
+    if (!apps_io_submit_op(store_put_op, save)) {
+        atomic_fetch_sub(&store_ops_queued, 1);
+        apps_port_free(save);
+        event("store save refused %s", app);
+        return false;
+    }
+    event("store save queued %s %s", app, json);
+    return true;
+}
+
+/* What the store holds for app, as a copy the case frees; NULL for none. */
+static char *store_peek(const char *app) {
+    char *copy = NULL;
+    pthread_mutex_lock(&store_mu);
+    for (int i = 0; i < STORE_APPS_MAX; i++) {
+        if (store_map[i].json != NULL && strcmp(store_map[i].app, app) == 0) {
+            copy = strdup(store_map[i].json);
+        }
+    }
+    pthread_mutex_unlock(&store_mu);
+    return copy;
+}
+
+/* The end of a case: once the worker has done what it was given, the map's blocks go back (finish() checks that nothing of the apps'
+ * heap is held). */
+static void store_forget_all(void) {
+    for (int64_t until = real_ms() + 5000; atomic_load(&store_ops_done) < atomic_load(&store_ops_queued) && real_ms() < until;) {
+        sleep_ms(2);
+    }
+    pthread_mutex_lock(&store_mu);
+    for (int i = 0; i < STORE_APPS_MAX; i++) {
+        apps_port_free(store_map[i].json);
+        store_map[i].json = NULL;
+    }
+    pthread_mutex_unlock(&store_mu);
+}
+
+/* ---- sys: the battery and the network are fixed, and show, keep_awake and exit are the real app task's (apps_port_idf.c forwards
+ * them as these do); the idle timer's pokes are events with the time they came ---- */
+
+apps_battery_t apps_port_battery(void) {
+    return (apps_battery_t){.pct = 64, .charging = false, .usb = true};
+}
+
+bool apps_port_wifi(char *ssid, size_t cap) {
+    snprintf(ssid, cap, "harness-net");
+    return true;
+}
+
+void apps_port_show(void) {
+    apps_task_show();
+}
+
+void apps_port_keep_awake(bool on) {
+    event("sys keep_awake %d", on ? 1 : 0);
+    apps_task_keep_awake(on);
+}
+
+void apps_port_exit(void) {
+    apps_task_exit();
+}
+
+void muse_state_poke(void) {
+    event("poke at %lld", (long long)apps_port_mono_ms());
+}
+
 struct fake_queue {
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -896,8 +1108,8 @@ static bool has_item(const struct fake_queue *q) {
  * queue holds, so what they pass is recorded, not timed. */
 static _Atomic(TickType_t) lvgl_longest_send, launch_longest_send, timer_longest_send;
 static _Thread_local bool in_launch;  /* this thread is inside apps_task_launch (the case marks it) */
-static const char *const EVENT_NAMES[] = {"?", "TOUCH", "RUN", "STOP", "COMPILE", "MESSAGE", "SHOW", "HIDE", "ALARM", "EXIT",
-                                          "WAKE", "ALARM_LAUNCH"};
+static const char *const EVENT_NAMES[] = {"?", "TOUCH", "RUN", "STOP", "COMPILE", "MESSAGE", "SHOW", "HIDE", "ALARM", "WAKE",
+                                          "ALARM_LAUNCH"};
 
 static void note_send(const void *item, size_t item_size, TickType_t wait) {
     _Atomic(TickType_t) *longest = on_lvgl_task()            ? &lvgl_longest_send
@@ -1564,6 +1776,12 @@ static void fifo_sync_at(int line) {
     }
 }
 #define FIFO_SYNC() fifo_sync_at(__LINE__)
+/* The queue's two syncs: the round of the second began after the first's ended, its timers (and the store's tick) included. */
+#define ROUNDS()      \
+    do {              \
+        FIFO_SYNC();  \
+        FIFO_SYNC();  \
+    } while (0)
 
 /* apps_task_launch, with what it passes the queue recorded (it must never wait). */
 static void launch(const char *id, bool front) {
@@ -1635,6 +1853,7 @@ static void finish(void) {
     release_print();
     clock_go();
     (void)stop_app(NULL, 0);
+    store_forget_all();
     int64_t until = real_ms() + 5000;
     while ((held_now(&port_held) != 0 || held_now(&caps_held) != caps_after_start) && real_ms() < until) {
         sleep_ms(5);
@@ -1840,6 +2059,7 @@ static void a_crash_in_start_is_contained(void) {
     int card = WAIT(later, "crash Crashy | main.lua:4: boom");
     int reset = WAIT(later, "reset");
     CHECK(reset < card, "the card after the reset it waits for: %d %d", reset, card);
+    WAIT(later, "free pkg pic");  /* the app task's, on its round after the reset: a thread of its own, not ordered with the card */
     ORDERED(later, "reset", "free pkg pic");
     heap_caps_free(st);
 }
@@ -3893,6 +4113,554 @@ static void io_refuses_when_fragmented(void) {
     atomic_store(&internal_largest, 200u * 1024);
 }
 
+/* ---- Task 18: sys and the store, on the app task ---- */
+
+/* The app's own message, said and answered (the reply is dropped). */
+static void say(const char *id, const char *event, const char *json) {
+    char err[300];
+    char *reply = apps_task_message(id, event, json, false, 5000, err, sizeof err);
+    CHECK(reply != NULL, "message %s to %s: %s", event, id, err);
+    apps_port_free(reply);
+}
+
+/* sys.exit() (C10): the callback that called it runs to its end and its reply is given; then stop(), and nothing else of the app. */
+static const char APP_EXITY[] =
+    "local app = {}\n"
+    "function app.start() print('start') end\n"
+    "function app.message(event, data)\n"
+    "  if event == 'quit' then\n"
+    "    print('quit begins')\n"
+    "    sys.exit()\n"
+    "    print('quit ends')\n"
+    "    return {bye = true}\n"
+    "  end\n"
+    "  if event == 'timers' then\n"
+    "    timer.after(50, function() print('timer one') sys.exit() print('timer one ends') end)\n"
+    "    timer.after(50, function() print('timer two') end)\n"
+    "    return {}\n"
+    "  end\n"
+    "  return nil\n"
+    "end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+static const file_t EXITY[] = {LUA("main.lua", APP_EXITY)};
+
+static void sys_exit_ends_the_app_after_the_callback(void) {
+    char err[300];
+    CHECK(apps_task_run(make_pkg("exity", "Exity", EXITY, 1), true, 0, NULL, err, sizeof err), "run: %s", err);
+    int from = mark();
+    char *reply = apps_task_message("exity", "quit", NULL, false, 5000, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "{\"bye\":true}") == 0, "the callback runs to its end and its reply is given: %s",
+          reply != NULL ? reply : err);
+    apps_port_free(reply);
+    WAIT(from, "log I stop exity: exited");
+    ORDERED(from, "print exity quit begins", "print exity quit ends");
+    ORDERED(from, "print exity quit ends", "print exity stop");
+    ORDERED(from, "print exity stop", "log I stop exity: exited");
+    WAIT(from, "front 0");  /* the layer goes behind, as with any end */
+    char id[APPS_ID_MAX + 1];
+    CHECK(!apps_task_running(id, sizeof id), "nothing runs now: '%s'", id);
+    CHECK(apps_task_message("exity", "quit", NULL, false, 0, err, sizeof err) == NULL && strcmp(err, "exity isn't running") == 0,
+          "no app to tell: '%s'", err);
+    CHECK(count_from(from, "print exity quit begins") == 1 && count_from(from, "print exity stop") == 1, "nothing ran twice");
+}
+
+/* Two timers are due together and the first exits: the second never runs (one timer a round, and the app is gone after the first). */
+static void sys_exit_in_a_timer_runs_no_other_callback(void) {
+    char err[300];
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_task_run(make_pkg("exity", "Exity", EXITY, 1), true, 0, NULL, err, sizeof err), "run: %s", err);
+    say("exity", "timers", NULL);
+    int from = mark();
+    clock_jump(50);
+    WAIT(from, "print exity timer one ends");
+    WAIT(from, "log I stop exity: exited");
+    ORDERED(from, "print exity timer one ends", "print exity stop");
+    FIFO_SYNC();
+    clock_jump(1000);
+    FIFO_SYNC();
+    ABSENT(from, "print exity timer two");
+    clock_go();
+}
+
+/* sys.exit() before the run has settled, at main.lua's top level or in start(): the run fails with a message that says so (not "ok" with
+ * a layout warning about a sleeping screen), the app is never started at the top level, and stop() runs after a start() that returned. */
+static const char APP_EXIT_START[] =
+    "local app = {}\n"
+    "function app.start() print('start') sys.exit() print('start ends') end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+static const char APP_EXIT_TOP[] =
+    "print('top')\n"
+    "sys.exit()\n"
+    "print('top ends')\n"
+    "local app = {}\n"
+    "function app.start() print('start') end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+
+static void sys_exit_before_the_run_settles_fails_the_run(void) {
+    char err[300];
+    apps_status_t *st = new_status();
+    const file_t in_start[] = {LUA("main.lua", APP_EXIT_START)};
+    int from = mark();
+    CHECK(!apps_task_run(make_pkg("quits", "Quits", in_start, 1), true, 150, st, err, sizeof err), "a run whose app exited didn't succeed");
+    CHECK(strcmp(err, "the app exited (sys.exit)") == 0, "it says why: '%s'", err);
+    CHECK(strstr(st->warnings, "layout not checked") == NULL, "no layout warning about a screen that wasn't asleep: '%s'", st->warnings);
+    ORDERED(from, "print quits start", "print quits start ends");
+    ORDERED(from, "print quits start ends", "print quits stop");
+    WAIT(from, "log I stop quits: exited");
+    const file_t at_top[] = {LUA("main.lua", APP_EXIT_TOP)};
+    from = mark();
+    CHECK(!apps_task_run(make_pkg("quitstop", "Quitstop", at_top, 1), true, 150, st, err, sizeof err), "a run whose main.lua exited didn't succeed");
+    CHECK(strcmp(err, "the app exited (sys.exit)") == 0, "it says why: '%s'", err);
+    WAIT(from, "print quitstop top ends");
+    WAIT(from, "log I stop quitstop: exited");
+    ABSENT(from, "print quitstop start");
+    ABSENT(from, "print quitstop stop");  /* never started: nothing to stop */
+    char id[APPS_ID_MAX + 1];
+    CHECK(!apps_task_running(id, sizeof id), "nothing runs: '%s'", id);
+    heap_caps_free(st);
+}
+
+/* sys.keep_awake and sys.show. */
+static const char APP_AWAKE[] =
+    "local app = {}\n"
+    "function app.start() ui.label{text = 'Awake'} end\n"
+    "function app.message(event, data)\n"
+    "  if event == 'keep' then sys.keep_awake(data.on) return {} end\n"
+    "  if event == 'show' then sys.show() return {} end\n"
+    "  return nil\n"
+    "end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+static const file_t AWAKE[] = {LUA("main.lua", APP_AWAKE)};
+
+/* While the app keeps the screen awake and its layer is in front, the loop pokes the idle timer, and no oftener than once a second: from the
+ * first round at once, then each second of the clock. Not while the layer is behind (a voice turn), not once the app says false, and not
+ * after the app ends, which clears it. */
+static void keep_awake_pokes_the_idle_timer_while_in_front(void) {
+    char err[300];
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    CHECK(apps_task_run(with_perms(make_pkg("awake", "Awake", AWAKE, 1), APPS_PERM_KEEP_AWAKE), true, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "front 1");
+    FIFO_SYNC();
+    CHECK(count_from(from, "poke at") == 0, "no poke before the app asks");
+    say("awake", "keep", "{\"on\":true}");
+    FIFO_SYNC();
+    WAIT(from, "poke at");
+    ORDERED(from, "sys keep_awake 1", "poke at");
+    CHECK(count_from(from, "poke at") == 1, "one poke, at the first round");
+    for (int i = 0; i < 3; i++) {
+        FIFO_SYNC();
+    }
+    CHECK(count_from(from, "poke at") == 1, "no more with the clock where it was: %d", count_from(from, "poke at"));
+    clock_jump(999);
+    FIFO_SYNC();
+    CHECK(count_from(from, "poke at") == 1, "none before a second: %d", count_from(from, "poke at"));
+    clock_jump(1);
+    FIFO_SYNC();
+    CHECK(count_from(from, "poke at") == 2, "the second poke, a second after the first: %d", count_from(from, "poke at"));
+    int turn = mark();
+    TURN(true);
+    WAIT(turn, "front 0");
+    clock_jump(5000);
+    FIFO_SYNC();
+    CHECK(count_from(from, "poke at") == 2, "no poke while the layer is behind: %d", count_from(from, "poke at"));
+    TURN(false);
+    WAIT(turn, "front 1");
+    FIFO_SYNC();
+    CHECK(count_from(from, "poke at") == 3, "the poke that was due, once the layer is back: %d", count_from(from, "poke at"));
+    say("awake", "keep", "{\"on\":false}");
+    clock_jump(5000);
+    FIFO_SYNC();
+    CHECK(count_from(from, "poke at") == 3, "keep_awake(false) ends them: %d", count_from(from, "poke at"));
+    say("awake", "keep", "{\"on\":true}");
+    FIFO_SYNC();
+    CHECK(count_from(from, "poke at") == 4, "and true starts them again: %d", count_from(from, "poke at"));
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    clock_jump(5000);
+    FIFO_SYNC();
+    FIFO_SYNC();
+    CHECK(count_from(from, "poke at") == 4, "an app's end clears it: %d", count_from(from, "poke at"));
+    CHECK(apps_task_run(make_pkg("awake", "Awake", AWAKE, 1), true, 0, NULL, err, sizeof err), "run again: %s", err);
+    clock_jump(5000);
+    FIFO_SYNC();
+    CHECK(count_from(from, "poke at") == 4, "the next run doesn't inherit it: %d", count_from(from, "poke at"));
+    clock_go();
+}
+
+/* sys.show() in a message asks for the front through the one door of every front (C11): the layer that was behind comes up. */
+static void sys_show_asks_for_the_front(void) {
+    char err[300];
+    CHECK(apps_task_run(make_pkg("awake", "Awake", AWAKE, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    FIFO_SYNC();
+    WAIT_FRAMES(3);
+    CHECK(!apps_lv_front(), "the layer starts behind");
+    int from = mark();
+    say("awake", "show", NULL);
+    WAIT(from, "front 1");
+    CHECK(apps_lv_front(), "and comes up");
+}
+
+/* The app of the store's cases: start() counts its runs, and a message sets, reads or exits. */
+static const char APP_STORED[] =
+    "local app = {}\n"
+    "function app.start()\n"
+    "  print('runs ' .. tostring(store.get('runs')))\n"
+    "  store.set('runs', (store.get('runs') or 0) + 1)\n"
+    "end\n"
+    "function app.message(event, data)\n"
+    "  if event == 'set' then store.set(data.k, data.v) return {} end\n"
+    "  if event == 'get' then return {v = store.get(data.k)} end\n"
+    "  if event == 'exit' then sys.exit() return {} end\n"
+    "  return nil\n"
+    "end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+static const file_t STORED[] = {LUA("main.lua", APP_STORED)};
+
+static apps_pkg_t *stored_pkg(void) {
+    return with_perms(make_pkg("stored", "Stored", STORED, 1), APPS_PERM_STORE);
+}
+
+/* What the worker holds for "stored" has this key with this value. */
+static void expect_stored_at(int line, const char *needle) {
+    char *held = store_peek("stored");
+    if (held == NULL || strstr(held, needle) == NULL) {
+        fail_at(line, "the store holds '%s', not something with %s", held != NULL ? held : "(nothing)", needle);
+    }
+    free(held);
+}
+#define EXPECT_STORED(needle) expect_stored_at(__LINE__, (needle))
+
+/* The app's values are saved by the loop, through the worker (X11), 2 s after the last change and not before: another change in the
+ * second before pushes it back. The saves are the I/O worker's ops (the harness checks the thread). */
+static void the_store_is_saved_through_the_worker_two_seconds_after_the_last_change(void) {
+    char err[300];
+    const int64_t t0 = apps_port_mono_ms();
+    clock_stop_at(t0);
+    int from = mark();
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print stored runs nil");
+    ORDERED(from, "store load stored", "print stored runs nil");  /* the values are read before start() runs */
+    clock_jump(1999);
+    ROUNDS();
+    ABSENT(from, "store save queued");
+    say("stored", "set", "{\"k\":\"a\",\"v\":1}");  /* at t0 + 1999: the 2 s begin again */
+    clock_jump(1);
+    ROUNDS();
+    ABSENT(from, "store save queued");
+    clock_jump(1998);  /* t0 + 3998 */
+    ROUNDS();
+    ABSENT(from, "store save queued");
+    clock_jump(1);
+    ROUNDS();
+    WAIT(from, "store saved stored {");
+    CHECK(count_from(from, "store save queued stored") == 1, "one save for the two changes: %d", count_from(from, "store save queued stored"));
+    EXPECT_STORED("\"a\":1");
+    EXPECT_STORED("\"runs\":1");
+    ROUNDS();
+    clock_jump(10000);
+    ROUNDS();
+    CHECK(count_from(from, "store save queued stored") == 1, "nothing changed since: no more saves");
+    clock_go();
+}
+
+/* With nothing else to wake it, the loop wakes for the save: its wait ends when the store is due (apps_rt_next_deadline), not at its next
+ * round of up to a second later. The last write is at t, another round comes at t + 500 ms (which puts the rounds off the save's time), and
+ * the save is queued about 2 s after t, not 2.5 s. */
+static void the_loop_wakes_for_the_store_save(void) {
+    char err[300];
+    int from = mark();
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print stored runs nil");
+    FIFO_SYNC();  /* start()'s change is saved 2 s after the run: let it be, so that the case's own is the last */
+    WAIT(from, "store saved stored {");
+    from = mark();
+    say("stored", "set", "{\"k\":\"late\",\"v\":true}");
+    int64_t wrote = real_ms();
+    sleep_ms(500);
+    FIFO_SYNC();
+    wait_event_at(__LINE__, from, "store saved stored {", 3000);
+    int64_t took = real_ms() - wrote;
+    CHECK(took >= 1950 && took <= 2400, "the save came %lld ms after the change: 2 s, not the second round's 2.5 s", (long long)took);
+    EXPECT_STORED("\"late\":true");
+}
+
+/* The next run reads what the last one left, even though the worker is slow over the save: the stop's save and the new run's load are ops
+ * in one order. Without that order the load would read what was saved before (nothing). */
+static void a_stop_saves_and_the_next_run_reads_it_after_a_slow_save(void) {
+    char err[300];
+    atomic_store(&store_save_delay_ms, 300);
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    say("stored", "set", "{\"k\":\"n\",\"v\":5}");
+    int from = mark();
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run again: %s", err);
+    WAIT(from, "print stored runs 1");  /* the second run read the first's: runs was 1 when it stopped */
+    ORDERED(from, "store save queued stored", "store load stored");
+    ORDERED(from, "store saved stored {", "store load stored");
+    char *reply = apps_task_message("stored", "get", "{\"k\":\"n\"}", false, 5000, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "{\"v\":5}") == 0, "the value came back: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    clock_go();
+}
+
+/* sys.exit() saves what is left as a stop does: the app task's end_app runs stop() (which saves) before the runtime goes. */
+static void sys_exit_saves_the_store(void) {
+    char err[300];
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    say("stored", "set", "{\"k\":\"bye\",\"v\":\"yes\"}");
+    int from = mark();
+    say("stored", "exit", NULL);
+    WAIT(from, "log I stop stored: exited");
+    WAIT(from, "store saved stored {");
+    FIFO_SYNC();
+    EXPECT_STORED("\"bye\":\"yes\"");
+    clock_go();
+}
+
+/* A save the worker refuses is asked for again at the next 2 s tick, no oftener (a retry with no period would spin the loop), and goes
+ * through once it takes it. */
+static void a_refused_save_is_asked_for_again_at_the_next_tick(void) {
+    char err[300];
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    atomic_store(&store_refuse_saves, true);
+    int from = mark();
+    clock_jump(2000);
+    ROUNDS();
+    CHECK(count_from(from, "store save refused stored") == 1, "asked at the tick: %d", count_from(from, "store save refused stored"));
+    for (int i = 0; i < 5; i++) {
+        FIFO_SYNC();
+    }
+    CHECK(count_from(from, "store save refused stored") == 1, "not again before the next tick: %d", count_from(from, "store save refused stored"));
+    clock_jump(1999);
+    ROUNDS();
+    CHECK(count_from(from, "store save refused stored") == 1, "not 1999 ms on: %d", count_from(from, "store save refused stored"));
+    clock_jump(1);
+    ROUNDS();
+    CHECK(count_from(from, "store save refused stored") == 2, "again 2 s after the refusal: %d", count_from(from, "store save refused stored"));
+    atomic_store(&store_refuse_saves, false);
+    clock_jump(2000);
+    ROUNDS();
+    WAIT(from, "store saved stored {");
+    EXPECT_STORED("\"runs\":1");
+    clock_go();
+}
+
+/* The save at the app's end, which the worker refuses: it is tried once, said in the app's log in one line, and the changes since the last
+ * save are lost (the runtime has no more ticks to ask again with). The next run reads the last save. */
+static void a_final_save_that_cannot_be_queued_is_logged_and_lost(void) {
+    char err[300];
+    clock_stop_at(apps_port_mono_ms());
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    atomic_store(&store_refuse_saves, true);
+    int from = mark();
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    WAIT(from, "print stored store: the last changes couldn't be saved");
+    CHECK(count_from(from, "store save refused stored") == 1, "tried once at the end: %d", count_from(from, "store save refused stored"));
+    CHECK(count_from(from, "print stored store: the last changes couldn't be saved") == 1, "one log line");
+    atomic_store(&store_refuse_saves, false);
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run again: %s", err);
+    WAIT(from, "print stored runs nil");  /* nothing was saved: the first run's count is lost with the rest */
+    clock_go();
+}
+
+/* The worker's ops (apps_io.h): in the order queued; a worker that isn't there is made for the first; and while a job holds the worker they
+ * wait for its end, then run before the next job. */
+static void io_op(void *arg) {
+    event("op %s on %s", (const char *)arg, self_task()->name);
+}
+
+static void io_ops_run_in_order_between_jobs(void) {
+    int from = mark();
+    CHECK(apps_io_submit_op(io_op, "a") && apps_io_submit_op(io_op, "b"), "two ops, with no worker");
+    WAIT(from, "op b on muse_apps_io");
+    ORDERED(from, "op a on muse_apps_io", "op b on muse_apps_io");
+    CHECK(count_from(from, "task muse_apps_io stack") == 1, "one worker was made for them");
+    atomic_store(&io_held, false);
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    int held = mark();
+    CHECK(apps_io_submit_op(io_op, "c") && apps_io_submit_op(io_op, "d") && apps_io_submit(io_job, "after"), "two ops and a job behind the held one");
+    sleep_ms(100);
+    ABSENT(held, "op c");  /* the job holds the worker, and doesn't look */
+    atomic_store(&io_hold, false);
+    WAIT(held, "job after on muse_apps_io");
+    ORDERED(held, "op c on muse_apps_io", "op d on muse_apps_io");
+    ORDERED(held, "op d on muse_apps_io", "job after on muse_apps_io");
+}
+
+/* A job that waits (a launch waiting for the app task) runs the ops that wait as it looks (apps_io_assist): while it still holds the worker.
+ * Another task's assist runs nothing. */
+static void assisting_job(void *arg) {
+    (void)arg;
+    atomic_store(&io_held, true);
+    while (atomic_load(&io_hold)) {
+        apps_io_assist();
+        sleep_ms(1);
+    }
+    event("job assisting ends");
+}
+
+static void io_ops_run_while_a_job_that_waits_assists(void) {
+    atomic_store(&io_held, false);
+    atomic_store(&io_hold, true);
+    int from = mark();
+    CHECK(apps_io_submit(assisting_job, NULL), "submit the job that waits");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    CHECK(apps_io_submit_op(io_op, "x") && apps_io_submit_op(io_op, "y"), "two ops");
+    WAIT(from, "op y on muse_apps_io");
+    ORDERED(from, "op x on muse_apps_io", "op y on muse_apps_io");
+    ABSENT(from, "job assisting ends");  /* while the job still holds the worker */
+    atomic_store(&io_hold, false);
+    WAIT(from, "job assisting ends");
+    /* A caller that isn't the worker, asking to assist, runs nothing: the ops are the worker's. */
+    atomic_store(&io_held, false);
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    int others = mark();
+    CHECK(apps_io_submit_op(io_op, "z"), "an op behind the held job");
+    apps_io_assist();
+    sleep_ms(50);
+    ABSENT(others, "op z");
+    atomic_store(&io_hold, false);
+    WAIT(others, "op z on muse_apps_io");
+}
+
+/* APPS_IO_OPS ops can wait; one more is refused with one log line, and never runs. */
+static void io_ops_are_bounded(void) {
+    atomic_store(&io_held, false);
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    static const char *const LABELS[] = {"o1", "o2", "o3", "o4", "o5", "o6", "o7", "o8"};
+    _Static_assert(ARRAY_LEN(LABELS) == APPS_IO_OPS, "a label for each op the worker holds");
+    int from = mark();
+    for (size_t i = 0; i < ARRAY_LEN(LABELS); i++) {
+        CHECK(apps_io_submit_op(io_op, (void *)LABELS[i]), "op %zu of %d", i + 1, APPS_IO_OPS);
+    }
+    CHECK(!apps_io_submit_op(io_op, "over"), "one more is refused");
+    WAIT(from, "log W io: 8 ops wait already: op refused");
+    atomic_store(&io_hold, false);
+    WAIT(from, "op o8 on muse_apps_io");
+    for (size_t i = 1; i < ARRAY_LEN(LABELS); i++) {
+        char first[24], then[24];
+        snprintf(first, sizeof first, "op %s on", LABELS[i - 1]);
+        snprintf(then, sizeof then, "op %s on", LABELS[i]);
+        ORDERED(from, first, then);
+    }
+    ABSENT(from, "op over");
+}
+
+/* With no worker and none that can be made, an op is refused (nothing could ever run it): the nudge's own refusal says why, and the op is
+ * taken back, so it doesn't run when memory comes back. */
+static void io_op_with_no_worker_and_no_room_is_refused(void) {
+    int from = mark();
+    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    CHECK(!apps_io_submit_op(io_op, "short"), "refused when no worker can be made");
+    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
+    atomic_store(&internal_free, 200u * 1024);
+    CHECK(apps_io_submit_op(io_op, "enough"), "taken with the room");
+    WAIT(from, "op enough on muse_apps_io");
+    ABSENT(from, "op short");
+}
+
+/* With a worker that runs, an op is queued even when the nudge that would wake it is refused: the worker looks at the ops when its job ends. */
+static void io_op_for_a_worker_that_runs_waits_for_its_job(void) {
+    atomic_store(&io_held, false);
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    int from = mark();
+    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    CHECK(apps_io_submit_op(io_op, "late"), "taken: the worker is there and will look");
+    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
+    atomic_store(&internal_free, 200u * 1024);
+    atomic_store(&io_hold, false);
+    int64_t released = real_ms();
+    WAIT(from, "op late on muse_apps_io");
+    CHECK(real_ms() - released < 500, "the op ran %lld ms after the job ended: as it ended, not at the worker's idle look 2 s on",
+          (long long)(real_ms() - released));
+}
+
+/* An idle worker, whose nudge was refused, looks at the ops when its wait for a job runs out, and doesn't go before it has run them. */
+static void io_op_for_an_idle_worker_runs_at_the_end_of_its_wait(void) {
+    int from = mark();
+    CHECK(apps_io_submit(io_job, "one"), "a worker, made by a job");
+    WAIT(from, "job one on muse_apps_io");
+    sleep_ms(100);  /* the job is over and the worker waits */
+    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    CHECK(apps_io_submit_op(io_op, "idle"), "taken: the worker is there");
+    atomic_store(&internal_free, 200u * 1024);
+    WAIT(from, "op idle on muse_apps_io");
+    WAIT(from, "log I io: idle");
+    ORDERED(from, "op idle on muse_apps_io", "log I io: idle");
+    CHECK(count_from(from, "task muse_apps_io stack") == 1, "the worker that was there ran it: %d made", count_from(from, "task muse_apps_io stack"));
+}
+
+/* A store that can't be read refuses the launch (an app never starts with an empty store: a later save would replace the real one): with
+ * no worker, and none that can be made, the load is refused at once and the run fails with a message that says why. */
+static void a_store_that_cannot_be_read_refuses_the_launch(void) {
+    char err[300];
+    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    int from = mark();
+    CHECK(!apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "no app without its values");
+    CHECK(strstr(err, "can't read the app's saved values") != NULL, "it says why: '%s'", err);
+    ABSENT(from, "print stored runs");
+    ABSENT(from, "store load stored");
+    atomic_store(&internal_free, 200u * 1024);
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run once the memory is back: %s", err);
+    WAIT(from, "print stored runs nil");
+}
+
+/* A worker that is held by a job that doesn't look at the ops: the load waits APPS_STORE_WAIT_MS and the launch is refused, inside the
+ * supervisor's 3 s. The request it leaves is the worker's: it frees it when it gets to the op (finish() checks that nothing is held). */
+static void a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second(void) {
+    char err[300];
+    atomic_store(&io_held, false);
+    atomic_store(&io_hold, true);
+    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
+    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
+        CHECK(real_ms() < until, "the job never ran");
+        sleep_ms(1);
+    }
+    int from = mark();
+    int64_t began = real_ms();
+    CHECK(!apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "no app without its values");
+    int64_t took = real_ms() - began;
+    CHECK(took >= APPS_STORE_WAIT_MS && took < APPS_TASK_HUNG_MS, "the launch was refused after %lld ms: the load's bound is %d", (long long)took,
+          APPS_STORE_WAIT_MS);
+    CHECK(strstr(err, "can't read the app's saved values") != NULL, "it says why: '%s'", err);
+    WAIT(from, "store load gave up stored");
+    ABSENT(from, "print stored runs");
+    atomic_store(&io_hold, false);
+    WAIT(from, "store load abandoned stored");  /* the worker gets to the op, finds nobody waiting, and frees the request */
+    CHECK(count_from(from, "log W launch stored: no app: ") == 1, "one log line for the refused launch: %d", count_from(from, "log W launch stored: no app: "));
+}
+
 #ifdef HARNESS_CONSOLE
 /* ---- The cases that need the console's launch job and the RAM store (HARNESS_CONSOLE) ---- */
 
@@ -4676,6 +5444,52 @@ static void a_launch_whose_alarm_went_does_not_hold_back_the_next_apps(void) {
     clock_go();
     on_worker(empty_store_job, NULL);
 }
+/* ---- Task 18: the store and a launch that is a job of the worker ---- */
+
+/* A launch is a job of the I/O worker, which waits for the app task; the app task, making the app, asks the worker for the app's values
+ * (an op). The job's waits run the ops that wait (apps_io_assist), so the load is served as the job looks and the app starts inside the load's
+ * bound; without that the load would wait for the job and the job for the load, until the load's bound refused the launch. */
+static void a_launch_of_a_store_app_does_not_wait_for_its_own_load(void) {
+    char err[200];
+    store(stored_pkg());
+    int from = mark();
+    int64_t began = real_ms();
+    launch("stored", true);
+    WAIT(from, "print stored runs nil");
+    int64_t took = real_ms() - began;
+    CHECK(took < APPS_STORE_WAIT_MS / 2, "the app started after %lld ms: its load was served as the launch job looked, not at the load's bound", (long long)took);
+    ABSENT(from, "store load gave up");
+    CHECK(count_from(from, "store load stored") == 1, "one load: %d", count_from(from, "store load stored"));
+    ORDERED(from, "log I launch stored", "store load stored");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    on_worker(empty_store_job, NULL);
+}
+
+/* An app that its alarm launched and that calls sys.exit() in start(), before the alarm that launched it was told: the run fails ("the app
+ * exited"), the worker says the launch failed, and the alarm is dropped with the line every launch that didn't run gets. Nothing launches it
+ * again and again for the alarm that waits (the same rule as a crash in start()). */
+static void an_alarm_launch_of_an_app_that_exits_in_start_is_given_up(void) {
+    clock_stop_at(apps_port_mono_ms());
+    const file_t in_start[] = {LUA("main.lua", APP_EXIT_START)};
+    store(with_perms(make_pkg("quitter", "Quitter", in_start, 1), APPS_PERM_ALARM));
+    CHECK(apps_alarm_arm("quitter", "t", 1000, false, false) == APPS_ALARM_ARMED, "arm");
+    int from = mark();
+    clock_jump(1000);
+    fake_esp_timer_sync();
+    WAIT(from, "log W alarm t: quitter did not start: dropped");
+    WAIT(from, "log W launch quitter: the app exited (sys.exit)");
+    for (int i = 0; i < 5; i++) {
+        FIFO_SYNC();
+        clock_jump(1000);
+    }
+    FIFO_SYNC();
+    CHECK(count_from(from, "log I launch quitter") == 1 && count_from(from, "print quitter start ends") == 1, "launched once, not again and again: %d launches, %d starts",
+          count_from(from, "log I launch quitter"), count_from(from, "print quitter start ends"));
+    CHECK(!apps_alarm_pending(), "nothing waits");
+    clock_go();
+    on_worker(empty_store_job, NULL);
+}
+
 #endif
 
 int main(int argc, char **argv) {
@@ -4748,6 +5562,25 @@ int main(int argc, char **argv) {
         {"a_crash_in_alarm_ends_the_ring", a_crash_in_alarm_ends_the_ring},
         {"a_run_for_alarms_that_are_gone_replaces_nothing", a_run_for_alarms_that_are_gone_replaces_nothing},
         {"an_alarm_cancelled_before_it_is_taken_is_not_told", an_alarm_cancelled_before_it_is_taken_is_not_told},
+        {"sys_exit_ends_the_app_after_the_callback", sys_exit_ends_the_app_after_the_callback},
+        {"sys_exit_in_a_timer_runs_no_other_callback", sys_exit_in_a_timer_runs_no_other_callback},
+        {"sys_exit_before_the_run_settles_fails_the_run", sys_exit_before_the_run_settles_fails_the_run},
+        {"keep_awake_pokes_the_idle_timer_while_in_front", keep_awake_pokes_the_idle_timer_while_in_front},
+        {"sys_show_asks_for_the_front", sys_show_asks_for_the_front},
+        {"the_store_is_saved_through_the_worker_two_seconds_after_the_last_change", the_store_is_saved_through_the_worker_two_seconds_after_the_last_change},
+        {"the_loop_wakes_for_the_store_save", the_loop_wakes_for_the_store_save},
+        {"a_stop_saves_and_the_next_run_reads_it_after_a_slow_save", a_stop_saves_and_the_next_run_reads_it_after_a_slow_save},
+        {"sys_exit_saves_the_store", sys_exit_saves_the_store},
+        {"a_refused_save_is_asked_for_again_at_the_next_tick", a_refused_save_is_asked_for_again_at_the_next_tick},
+        {"a_final_save_that_cannot_be_queued_is_logged_and_lost", a_final_save_that_cannot_be_queued_is_logged_and_lost},
+        {"a_store_that_cannot_be_read_refuses_the_launch", a_store_that_cannot_be_read_refuses_the_launch},
+        {"a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second", a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second},
+        {"io_ops_run_in_order_between_jobs", io_ops_run_in_order_between_jobs},
+        {"io_ops_run_while_a_job_that_waits_assists", io_ops_run_while_a_job_that_waits_assists},
+        {"io_ops_are_bounded", io_ops_are_bounded},
+        {"io_op_with_no_worker_and_no_room_is_refused", io_op_with_no_worker_and_no_room_is_refused},
+        {"io_op_for_a_worker_that_runs_waits_for_its_job", io_op_for_a_worker_that_runs_waits_for_its_job},
+        {"io_op_for_an_idle_worker_runs_at_the_end_of_its_wait", io_op_for_an_idle_worker_runs_at_the_end_of_its_wait},
 #ifdef HARNESS_CONSOLE
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},
@@ -4773,6 +5606,8 @@ int main(int argc, char **argv) {
         {"a_crash_in_alarm_makes_the_loop_look_again_for_the_next_app", a_crash_in_alarm_makes_the_loop_look_again_for_the_next_app},
         {"a_launch_given_up_lets_the_next_apps_be_asked_for_in_the_same_round", a_launch_given_up_lets_the_next_apps_be_asked_for_in_the_same_round},
         {"a_launch_given_up_at_the_backstop_lets_the_next_apps_be_asked_for_in_the_same_round", a_launch_given_up_at_the_backstop_lets_the_next_apps_be_asked_for_in_the_same_round},
+        {"a_launch_of_a_store_app_does_not_wait_for_its_own_load", a_launch_of_a_store_app_does_not_wait_for_its_own_load},
+        {"an_alarm_launch_of_an_app_that_exits_in_start_is_given_up", an_alarm_launch_of_an_app_that_exits_in_start_is_given_up},
 #endif
     };
     if (argc != 2) {

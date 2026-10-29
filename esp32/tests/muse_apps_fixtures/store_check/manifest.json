@@ -1,0 +1,1 @@
+{"id": "store_check", "name": "Store check", "api": 1, "permissions": ["store"], "messages": {"report": "replies {runs, battery, connected, ssid_len}: what the store and the device say, never the SSID itself"}}

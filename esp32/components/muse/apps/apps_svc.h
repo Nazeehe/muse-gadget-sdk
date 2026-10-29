@@ -17,9 +17,10 @@
 #pragma once
 
 /*
- * The services of the device a Muse app can call: the Lua modules `time`, `os`, `timer`, `alarm` and `sound` (later tasks add
- * `store`, `sys` and `log` here). Portable C: the clocks and the screen's sleep come through apps_port.h, and what a timer
- * is lives in the runtime (apps_rt.h, which also says when the timers run). Every binding calls apps_vm_check first, and
+ * The services of the device a Muse app can call: the Lua modules `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys`
+ * (logging is `print` and `sys.log`: there is no `log` module). Portable C: the clocks, the screen's sleep, the battery, the front
+ * and the rest come through apps_port.h, and what a timer is, and the store's cache, live in the runtime (apps_rt.h, which also
+ * says when the timers run and when the store is saved). Every binding calls apps_vm_check first, and
  * everything that allocates in the app's heap runs inside a call of the app, so a heap that refuses is the app running
  * out of memory and never an abort.
  *
@@ -89,13 +90,42 @@
  *                         permission: `sound: add "sound" to "permissions" in manifest.json`
  *   sound.stop()          ends the ring of an alarm that is going, whichever app's it is; no permission, and nothing happens
  *                         when none is going
+ *
+ * store (the app's own keys and values, kept across restarts; the "store" permission of the manifest is needed for all of them:
+ * without it each raises `store: add "store" to "permissions" in manifest.json`, before anything else is looked at). A key is a
+ * string of 1 to 32 characters (valid UTF-8, no NUL; another is `store: key must be a string of 1 to 32 characters`), a value
+ * anything json.encode takes, at most 15 containers deep. The saved object, counted after encoding as it is saved, may be 16 KB:
+ * more is `store: more than 16 KB stored; remove keys you don't need`, and nothing is changed.
+ *   store.get(key, default)   the value, a copy (decoded afresh from what is kept: change it and the store doesn't change); the
+ *                         default, as it is (nil if none is given), when there is no such key. A json.null stored is json.null
+ *   store.set(key, value) keeps value (a copy: what the app does to its table afterwards isn't seen). Raises
+ *                         `store.set: ` and json.encode's message ("store.set: can't encode a function"), with "nested deeper
+ *                         than 15" for one level more than fits. nil removes the key, as store.remove does; a write of what is
+ *                         there is no change. Returns nothing
+ *   store.remove(key)     removes it; nothing for a key that isn't there
+ *   The values are cached and saved 2 s after the last change and when the app ends (apps_rt.h says how, and what a refused
+ *   save does), loaded before main.lua runs, whose top level may use them. The flush isn't a timer: it isn't one of the 16.
+ *
+ * sys (the device, and the app's own life):
+ *   sys.battery()         {pct = 0 to 100, charging = bool, usb = bool}; no pct when the gadget can't tell
+ *   sys.wifi()            {connected = bool, ssid = "..."}: the network's name, "" when it isn't connected
+ *   sys.show()            asks for the front. Allowed in message() and alarm(), and in any callback within 10 s of a tap (the 10th
+ *                         second included); otherwise `sys.show: allowed only in message() or alarm(), or within 10 s of a tap`
+ *   sys.keep_awake(on)    true keeps the screen lit while the app is in front, false lets it sleep again. Needs the "keep_awake"
+ *                         permission: `sys: add "keep_awake" to "permissions" in manifest.json`; on must be true or false
+ *   sys.has(name)         whether the gadget has that module: true for ui time timer alarm store sound json sys, false for any
+ *                         other name (net, secrets and muse aren't there yet; nor is log). name must be a string
+ *   sys.api               1, the api of manifest.json it speaks
+ *   sys.mem()             {used_kb, peak_kb, limit_kb} of the Lua heap (rounded up, as the status has them), limit_kb the manifest's
+ *   sys.exit()            the app ends once this callback has returned: it runs to its end, stop() runs, the store is saved
+ *   sys.log(...)          print: the same lines in the same log
  */
 
 #include "apps_rt.h"
 
 typedef struct lua_State lua_State;
 
-/* Installs `time`, `os`, `timer`, `alarm` and `sound` into L's globals, for the app of rt, which must outlive L. It runs under lua_pcall, so a
+/* Installs `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` into L's globals, for the app of rt, which must outlive L. It runs under lua_pcall, so a
  * heap that refuses ends the app out of memory at its next call rather than aborting. Called by apps_rt_new, before
  * main.lua's top level runs. */
 void apps_svc_open(lua_State *L, apps_rt_t *rt);

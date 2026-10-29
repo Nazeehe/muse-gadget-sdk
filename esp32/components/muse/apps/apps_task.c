@@ -38,6 +38,7 @@
 #include "apps_vm.h"
 #include "muse_apps.h"
 #include "muse_input.h"
+#include "muse_state.h"
 
 /*
  * The app task, and the glue muse_ui calls on the LVGL task (muse_apps.h). apps_task.h has the contract; this is how
@@ -112,6 +113,7 @@ static const char *TAG = "muse_apps";
 #define REFRESH_MS 1000      /* while an app runs, the record's log and dump are at most this old */
 #define SETTLE_MAX_MS 60000
 #define ALARM_RETRY_MS 1000  /* a launch the I/O worker refused is asked for again this much later */
+#define KEEP_AWAKE_POKE_MS 1000  /* while an app keeps the screen awake and is in front, the idle timer is poked this often */
 #define ALARM_PASSES 3       /* looks at the table in one round: another comes when telling an app ended it, or a launch was given up */
 #define FIRST_LINE_MAX 160   /* a crash card's line, and a failed run's */
 #define SHOWN_MAX 40         /* text an app supplied, as a message shows it (apps_ui.h) */
@@ -124,6 +126,7 @@ static const char *TAG = "muse_apps";
 #define MSG_DOWN "Muse apps aren't running"
 #define MSG_SELF "the app task can't wait for itself"
 #define MSG_ASLEEP "layout not checked: the screen was asleep"
+#define MSG_EXITED "the app exited (sys.exit)"
 
 static const char *const KINDS[] = {"label", "button", "box", "arc", "bar", "image"};
 _Static_assert(ARRAY_LEN(KINDS) == APPS_W_IMAGE + 1, "a name for each kind of widget");
@@ -233,6 +236,9 @@ static struct {
     int64_t alarm_since, alarm_retry, alarm_queued_at;
     bool alarm_queued;
     bool run_alarm;           /* the app that runs was launched for its alarms, and no delivery round has come since it began (P1) */
+    bool exit_asked;          /* sys.exit() was called in the call that runs: the app ends when it returns (call_end) */
+    bool keep_awake;          /* sys.keep_awake(true): while the layer is in front, the idle timer is poked each second */
+    int64_t poke_at;          /* the earliest the next poke may be (apps_port_mono_ms) */
 } T;
 
 /* ---- The LVGL task's own ---- */
@@ -703,7 +709,7 @@ static void end_app(end_t how) {
         }
         return;
     }
-    if (how != END_CRASHED && how != END_HUNG && T.pending != NULL) {
+    if (how != END_CRASHED && how != END_HUNG && how != END_EXITED && T.pending != NULL) {
         finish_run();  /* the run settles before its app ends */
     }
     if (how <= END_EXITED && T.rt != NULL && !T.abandoned && apps_rt_state(T.rt) == APPS_STATE_RUNNING) {
@@ -722,7 +728,9 @@ static void end_app(end_t how) {
     if (T.pending != NULL) {
         char err[WHAT_MAX + FIRST_LINE_MAX + 2];
         snprintf(err, sizeof err, "%s: %s", T.what, line);
-        complete(T.pending, false, how == END_HUNG ? MSG_HUNG : err);
+        /* An app that called sys.exit() before its run settled (at main.lua's top level, in start(), or in the settle's first
+         * moments) didn't give a running app: the run says so, and an alarm's launch of it is given up on like any that didn't run. */
+        complete(T.pending, false, how == END_HUNG ? MSG_HUNG : how == END_EXITED ? MSG_EXITED : err);
         T.pending = NULL;
     }
     unpublish();
@@ -735,8 +743,9 @@ static void end_app(end_t how) {
              (unsigned)s_rec->st.stack_free);
     end_alarms(how);
     set_running(false);  /* the launcher lists it still while the store has it */
-    apps_rt_free(T.rt);
+    apps_rt_free(T.rt);  /* saves the store if a change is left in it (stop() has saved it when the app stopped) */
     T.rt = NULL;
+    T.exit_asked = T.keep_awake = false;
     uint32_t reset;
     if (T.was_published) {
         reset = ask_reset();
@@ -793,6 +802,10 @@ static bool call_end(void) {
         end_app(END_CRASHED);
         return false;
     }
+    if (T.exit_asked && T.rt != NULL) {
+        end_app(END_EXITED);  /* sys.exit(): the callback has run to its end, and nothing else of the app runs after it */
+        return false;
+    }
     return true;
 }
 
@@ -806,6 +819,8 @@ static void begin_app(apps_pkg_t *pkg) {
     T.warned = NO_WARNED;
     T.worst_ms = 0;
     T.cpu_pct = 0;
+    T.exit_asked = T.keep_awake = false;
+    T.poke_at = 0;
     T.gen++;
     atomic_store(&s_rec->app_gen, T.gen);
     if (rec_take(LOCK_MS)) {
@@ -1093,11 +1108,6 @@ static void handle(const apps_event_t *ev) {
     case APPS_EV_MESSAGE:
         on_message(ev->req);
         break;
-    case APPS_EV_EXIT:
-        if (T.rt != NULL && ev->app_gen == T.gen) {
-            end_app(END_EXITED);
-        }
-        break;
     case APPS_EV_ALARM_LAUNCH:
         on_alarm_launch(ev->code, ev->app_gen);
         break;
@@ -1287,6 +1297,10 @@ static void housekeeping(void) {
     if (T.rt != NULL && T.dirty && apps_port_mono_ms() >= T.refresh_at) {
         refresh_record();
     }
+    if (T.keep_awake && T.rt != NULL && !T.abandoned && apps_port_mono_ms() >= T.poke_at && apps_lv_front()) {
+        muse_state_poke();  /* sys.keep_awake(true): the screen isn't let go dark for idling while the app is in front */
+        T.poke_at = apps_port_mono_ms() + KEEP_AWAKE_POKE_MS;
+    }
     drain_logs();
 }
 
@@ -1328,6 +1342,7 @@ static void run_timers(void) {
         return;
     }
     int64_t now = apps_port_mono_ms();
+    apps_rt_store_tick(T.rt, now);  /* a save of the store that is due: no call of the app, so no bracket (the port only queues it) */
     if (apps_rt_has_work(T.rt, now)) {
         call_begin();
         (void)apps_rt_run_one_timer(T.rt, now);
@@ -1693,6 +1708,7 @@ static bool await(req_t *r, int64_t until, int ms, char *err, size_t err_len) {
             put_text(err, err_len, text);
             return false;
         }
+        apps_io_assist();  /* a job of the I/O worker that waits here runs the ops the app task may be waiting for (the app's store) */
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
 }
@@ -1985,6 +2001,19 @@ void apps_task_status(apps_status_t *st) {
     if (atomic_load(&s_rec->hung)) {
         st->state = APPS_STATE_HUNG;
     }
+}
+
+void apps_task_show(void) {
+    request_front(true);  /* the one door of every front: the LVGL task holds it back during a voice turn (C11) */
+}
+
+void apps_task_keep_awake(bool on) {
+    T.keep_awake = on;
+    T.poke_at = 0;  /* the first poke at once, at the next round */
+}
+
+void apps_task_exit(void) {
+    T.exit_asked = true;
 }
 
 esp_err_t muse_apps_start(void) {

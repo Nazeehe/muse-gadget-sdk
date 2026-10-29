@@ -26,6 +26,10 @@
  *
  * The heap is malloc with a header that records each block's size, so that apphost can say how many bytes the
  * apps' heap holds (apphost_heap_held): a leak check that needs no LeakSanitizer, which macOS doesn't have.
+ *
+ * The store's objects are kept in the process, one for each app (a plain malloc: not the apps' heap, which a leak check counts),
+ * and given back by apphost_store_clear; a load returns a copy from the apps' heap, which the runtime frees. The battery and the
+ * Wi-Fi are fixed, so that a run is the same everywhere; show is told to the sink; the exit is a flag apphost.c takes.
  */
 
 #include <stdint.h>
@@ -36,6 +40,7 @@
 #include "apphost_esp.h"
 #include "apphost_port.h"
 #include "apps_alarm.h"
+#include "apps_pkg.h"
 #include "apps_port.h"
 
 /* Not 0: a clock at 0 reads as "unset" in places. */
@@ -149,6 +154,112 @@ static unsigned long ui_takes;
 static void lock_violation(const char *what) {
     fprintf(stderr, "apphost: %s\n", what);
     abort();
+}
+
+/* ---- The store, and what sys asks of the gadget ---- */
+
+typedef struct saved {
+    struct saved *next;
+    char app[APPS_ID_MAX + 1];
+    char *json;
+    size_t len;
+} saved_t;
+
+static saved_t *saved_head;
+static const apphost_system_t *system_sink;
+static bool exit_asked;
+
+void apphost_set_system(const apphost_system_t *sink) {
+    system_sink = sink;
+}
+
+char *apps_port_store_load(const char *app, size_t *len) {
+    const char *json = "{}";
+    size_t n = 2;
+    for (const saved_t *s = saved_head; s != NULL; s = s->next) {
+        if (strcmp(s->app, app) == 0) {
+            json = s->json;
+            n = s->len;
+            break;
+        }
+    }
+    char *copy = apps_port_realloc(NULL, n + 1);
+    if (copy == NULL) {
+        *len = 0;
+        return NULL;
+    }
+    memcpy(copy, json, n);
+    copy[n] = '\0';
+    *len = n;
+    return copy;
+}
+
+bool apps_port_store_save(const char *app, const char *json, size_t len) {
+    char *copy = malloc(len + 1);
+    if (copy == NULL) {
+        return false;
+    }
+    memcpy(copy, json, len);
+    copy[len] = '\0';
+    saved_t *s = saved_head;
+    while (s != NULL && strcmp(s->app, app) != 0) {
+        s = s->next;
+    }
+    if (s == NULL) {
+        s = calloc(1, sizeof *s);
+        if (s == NULL) {
+            free(copy);
+            return false;
+        }
+        snprintf(s->app, sizeof s->app, "%s", app);
+        s->next = saved_head;
+        saved_head = s;
+    }
+    free(s->json);
+    s->json = copy;
+    s->len = len;
+    if (system_sink != NULL && system_sink->store_saved != NULL) {
+        system_sink->store_saved(len);
+    }
+    return true;
+}
+
+void apphost_store_clear(void) {
+    while (saved_head != NULL) {
+        saved_t *s = saved_head;
+        saved_head = s->next;
+        free(s->json);
+        free(s);
+    }
+}
+
+apps_battery_t apps_port_battery(void) {
+    return (apps_battery_t){.pct = 76, .charging = true, .usb = true};
+}
+
+bool apps_port_wifi(char *ssid, size_t cap) {
+    snprintf(ssid, cap, "muse-lab");
+    return true;
+}
+
+void apps_port_show(void) {
+    if (system_sink != NULL && system_sink->show != NULL) {
+        system_sink->show();
+    }
+}
+
+void apps_port_keep_awake(bool on) {
+    (void)on;  /* nothing on a laptop goes to sleep */
+}
+
+void apps_port_exit(void) {
+    exit_asked = true;
+}
+
+bool apphost_take_exit(void) {
+    bool asked = exit_asked;
+    exit_asked = false;
+    return asked;
 }
 
 void *apps_port_realloc(void *ptr, size_t n) {

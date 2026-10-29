@@ -39,6 +39,7 @@
 #include <unistd.h>
 
 #include "apps_alarm.h"
+#include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_rt.h"
@@ -220,6 +221,146 @@ static void fake_fill(const char *owner, int count) {
 static void fake_clear(void) {
     memset(fake_alarms, 0, sizeof fake_alarms);
     fake_chirps = fake_stops = 0;
+}
+
+/* A NUL-terminated exact-size copy of json[0, len) in plain malloc (a read past it is an AddressSanitizer report). */
+static char *exact_copy_for_store(const char *json, size_t len) {
+    char *copy = malloc(len + 1);
+    if (copy == NULL) {
+        fputs("out of memory in the harness\n", stderr);
+        exit(2);
+    }
+    memcpy(copy, json, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+/* The store (apps_port.h), the battery and the Wi-Fi, and what sys asks of the screen: a fake the case controls. What is saved is kept
+ * for each app id, in plain malloc blocks (the harness's count of the apps' heap is the runtime's, and every case ends it at 0 bytes);
+ * a case can make the port refuse every save or fail every load, and reads what was saved and how often it was asked. */
+typedef struct {
+    char app[APPS_ID_MAX + 1];
+    char *json;
+    size_t len;
+} fake_saved_t;
+
+static struct {
+    fake_saved_t saved[4];
+    int loads, attempts, saves;  /* loads asked, saves asked (the refused ones too), saves taken */
+    bool refuse_saves, fail_loads;
+    char load_app[APPS_ID_MAX + 1], save_app[APPS_ID_MAX + 1];
+    int64_t saved_at;            /* the port's clock at the last save taken */
+} fake_store;
+
+static apps_battery_t fake_battery;
+static bool fake_wifi_connected;
+static char fake_wifi_ssid[64];
+static int fake_shows, fake_keep_awake_calls, fake_exits;
+static bool fake_keep_awake_on;
+
+static fake_saved_t *fake_saved_for(const char *app, bool make) {
+    for (size_t i = 0; i < ARRAY_LEN(fake_store.saved); i++) {
+        if (fake_store.saved[i].json != NULL && strcmp(fake_store.saved[i].app, app) == 0) {
+            return &fake_store.saved[i];
+        }
+    }
+    for (size_t i = 0; make && i < ARRAY_LEN(fake_store.saved); i++) {
+        if (fake_store.saved[i].json == NULL) {
+            snprintf(fake_store.saved[i].app, sizeof fake_store.saved[i].app, "%s", app);
+            return &fake_store.saved[i];
+        }
+    }
+    return NULL;
+}
+
+/* What the port holds for app: a NUL-terminated copy the case reads, or NULL when nothing was saved. */
+static const char *fake_saved_json(const char *app) {
+    const fake_saved_t *s = fake_saved_for(app, false);
+    return s != NULL ? s->json : NULL;
+}
+
+/* A document the port holds for app, as a save leaves it: what the next load reads. */
+static void fake_preload(const char *app, const char *json) {
+    fake_saved_t *s = fake_saved_for(app, true);
+    CHECK(s != NULL, "no room in the fake store");
+    if (s != NULL) {
+        free(s->json);
+        s->len = strlen(json);
+        s->json = strdup(json);
+    }
+}
+
+static void fake_store_reset(void) {
+    for (size_t i = 0; i < ARRAY_LEN(fake_store.saved); i++) {
+        free(fake_store.saved[i].json);
+    }
+    memset(&fake_store, 0, sizeof fake_store);
+    fake_battery = (apps_battery_t){.pct = 50, .charging = false, .usb = false};
+    fake_wifi_connected = false;
+    fake_wifi_ssid[0] = '\0';
+    fake_shows = fake_keep_awake_calls = fake_exits = 0;
+    fake_keep_awake_on = false;
+}
+
+char *apps_port_store_load(const char *app, size_t *len) {
+    fake_store.loads++;
+    snprintf(fake_store.load_app, sizeof fake_store.load_app, "%s", app);
+    *len = 0;
+    if (fake_store.fail_loads) {
+        return NULL;
+    }
+    const fake_saved_t *s = fake_saved_for(app, false);
+    const char *json = s != NULL ? s->json : "{}";
+    size_t n = s != NULL ? s->len : 2;
+    char *copy = apps_port_realloc(NULL, n + 1);  /* the apps' heap, as the contract says: the runtime frees it with apps_port_free */
+    if (copy == NULL) {
+        return NULL;
+    }
+    memcpy(copy, json, n);
+    copy[n] = '\0';
+    *len = n;
+    return copy;
+}
+
+bool apps_port_store_save(const char *app, const char *json, size_t len) {
+    fake_store.attempts++;
+    snprintf(fake_store.save_app, sizeof fake_store.save_app, "%s", app);
+    if (fake_store.refuse_saves) {
+        return false;
+    }
+    fake_saved_t *s = fake_saved_for(app, true);
+    if (s == NULL) {
+        return false;
+    }
+    char *copy = exact_copy_for_store(json, len);
+    free(s->json);
+    s->json = copy;
+    s->len = len;
+    fake_store.saves++;
+    fake_store.saved_at = port_mono_ms;
+    return true;
+}
+
+apps_battery_t apps_port_battery(void) {
+    return fake_battery;
+}
+
+bool apps_port_wifi(char *ssid, size_t cap) {
+    snprintf(ssid, cap, "%s", fake_wifi_connected ? fake_wifi_ssid : "");
+    return fake_wifi_connected;
+}
+
+void apps_port_show(void) {
+    fake_shows++;
+}
+
+void apps_port_keep_awake(bool on) {
+    fake_keep_awake_calls++;
+    fake_keep_awake_on = on;
+}
+
+void apps_port_exit(void) {
+    fake_exits++;
 }
 
 void apps_port_ui_lock(void) {}
@@ -1792,6 +1933,651 @@ static void alarm_table_full(void) {
     fake_clear();
 }
 
+/* ---- The store, sys and the front (Task 18) ---- */
+
+static const char *const STORE_UNREADABLE_LINE = "store: the saved values couldn't be read; starting with none";
+static const char *const STORE_LOST_LINE = "store: the last changes couldn't be saved";
+static const char *const STORE_LOAD_FAILED_TEXT =
+    "can't read the app's saved values (the gadget is short of memory or busy); try again in a few seconds";
+
+/* A runtime for main_src with the permissions given (APPS_PERM_*), made and started. NULL if it couldn't be made. */
+static apps_rt_t *launch_perms(apps_pkg_t **pkg_out, const char *main_src, unsigned perms) {
+    *pkg_out = make_pkg_perms(main_src, perms);
+    char err[256] = "";
+    apps_rt_t *rt = apps_rt_new(*pkg_out, err, sizeof err);
+    CHECK(rt != NULL, "apps_rt_new failed: %s", err);
+    if (rt != NULL) {
+        CHECK(apps_rt_start(rt), "start failed: %s", apps_rt_last_error(rt));
+    }
+    return rt;
+}
+
+/* The text of the value under key, copied: "(none)" when there is no such key. */
+static void store_value(const apps_rt_t *rt, const char *key, char *out, size_t cap) {
+    size_t len;
+    const char *text = apps_rt_store_get(rt, key, strlen(key), &len);
+    if (text == NULL) {
+        snprintf(out, cap, "(none)");
+    } else {
+        snprintf(out, cap, "%.*s", (int)len, text);
+    }
+}
+
+#define STORE_SET(rt, key, text) apps_rt_store_set((rt), (key), strlen(key), (text), strlen(text))
+
+/* The cache at the runtime's own API: set, get and remove, the key rules (characters, valid UTF-8, no NUL), the 16 KB counted as the
+ * object that is saved (to the byte, on both sides of it, and the same bytes in what is saved), and the object's text, key escapes and
+ * order included. */
+static void store_api(void) {
+    fake_store_reset();
+    port_mono_ms = 5000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_perms(&pkg, "return {}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    char got[64];
+    size_t len = 77;
+    CHECK(apps_rt_store_count(rt) == 0 && apps_rt_store_get(rt, "a", 1, &len) == NULL && len == 0, "a new store has a key");
+    CHECK(STORE_SET(rt, "a", "1") == APPS_STORE_OK && STORE_SET(rt, "b", "\"x\"") == APPS_STORE_OK, "set");
+    store_value(rt, "a", got, sizeof got);
+    CHECK(strcmp(got, "1") == 0 && apps_rt_store_count(rt) == 2, "a is '%s', %u keys", got, apps_rt_store_count(rt));
+    CHECK(STORE_SET(rt, "a", "[1,2]") == APPS_STORE_OK, "replace");
+    store_value(rt, "a", got, sizeof got);
+    CHECK(strcmp(got, "[1,2]") == 0 && apps_rt_store_count(rt) == 2, "a is '%s' after a replace, %u keys", got,
+          apps_rt_store_count(rt));
+    apps_rt_store_remove(rt, "b", 1);
+    apps_rt_store_remove(rt, "never", 5);
+    store_value(rt, "b", got, sizeof got);
+    CHECK(strcmp(got, "(none)") == 0 && apps_rt_store_count(rt) == 1, "b is '%s' after a remove", got);
+
+    /* The key rules: 1 to 32 characters of valid UTF-8 with no NUL. */
+    static const struct {
+        const char *key;
+        size_t len;
+        bool valid;
+    } keys[] = {
+        {"", 0, false},
+        {"k", 1, true},
+        {"abcdefghijklmnopqrstuvwxyz012345", 32, true},
+        {"abcdefghijklmnopqrstuvwxyz0123456", 33, false},
+        {"a\0b", 3, false},
+        {"\0", 1, false},
+        {"\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9"
+         "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9",
+         64, true},  /* 32 two-byte characters */
+        {"\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9"
+         "\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9"
+         "\xC3\xA9",
+         66, false},  /* 33 */
+        {"\xF0\x9F\x98\x80", 4, true},
+        {"\xFF", 1, false},                      /* never valid */
+        {"\x80", 1, false},                      /* a stray continuation byte */
+        {"\xC0\xAF", 2, false},                  /* overlong */
+        {"\xED\xA0\x80", 3, false},              /* a surrogate */
+        {"\xF4\x90\x80\x80", 4, false},          /* past U+10FFFF */
+        {"\xC3", 1, false},                      /* cut short */
+        {"a\xE2\x82", 3, false},                 /* cut short, after a character */
+        {"tab\there", 8, true},                  /* a control character is a character (it is escaped when saved) */
+    };
+    for (size_t i = 0; i < ARRAY_LEN(keys); i++) {
+        CHECK(apps_rt_store_key_valid(keys[i].key, keys[i].len) == keys[i].valid, "key %zu: valid is %d, want %d", i,
+              apps_rt_store_key_valid(keys[i].key, keys[i].len), keys[i].valid);
+        if (!keys[i].valid) {
+            unsigned before = apps_rt_store_count(rt);
+            CHECK(apps_rt_store_set(rt, keys[i].key, keys[i].len, "1", 1) == APPS_STORE_BAD_KEY &&
+                      apps_rt_store_count(rt) == before,
+                  "key %zu: a bad key was taken", i);
+            CHECK(apps_rt_store_get(rt, keys[i].key, keys[i].len, &len) == NULL, "key %zu: a bad key found a value", i);
+            apps_rt_store_remove(rt, keys[i].key, keys[i].len);  /* nothing, and no crash */
+        }
+    }
+    apps_rt_store_remove(rt, "a", 1);
+
+    /* The 16 KB is the object: {"k":<text>} is 2 + 1 + 3 + text bytes, so a text of 16378 bytes is the last that fits. */
+    static char big[APPS_STORE_MAX_BYTES + 8];
+    memset(big, 'x', sizeof big);
+    big[0] = '"';
+    char *text = big;
+    size_t fits = APPS_STORE_MAX_BYTES - 6;
+    text[fits - 1] = '"';
+    CHECK(apps_rt_store_set(rt, "k", 1, text, fits) == APPS_STORE_OK, "a text that fits was refused");
+    text[fits - 1] = 'x';
+    text[fits] = '"';
+    CHECK(apps_rt_store_set(rt, "k", 1, text, fits + 1) == APPS_STORE_FULL, "one more byte was taken");
+    store_value(rt, "k", got, sizeof got);
+    CHECK(strncmp(got, "\"xxxx", 5) == 0, "a refused set changed the value");
+    CHECK(STORE_SET(rt, "k", "1") == APPS_STORE_OK, "a smaller value in place of the big one");
+    apps_rt_store_remove(rt, "k", 1);
+
+    /* Two keys: the second adds its key, its quotes and colon (4 bytes here) and a comma. */
+    char one[104];
+    memset(one, 'x', sizeof one);
+    one[0] = one[101] = '"';
+    CHECK(apps_rt_store_set(rt, "a", 1, one, 102) == APPS_STORE_OK, "a, 102 bytes");
+    text[0] = '"';
+    memset(text + 1, 'y', 16269);
+    text[16270] = '"';  /* 16271 bytes: {"a":<102>,"b":<16271>} = 2 + 106 + 1 + 4 + 16271 = 16384 */
+    CHECK(apps_rt_store_set(rt, "b", 1, text, 16271) == APPS_STORE_OK, "b, the last that fits beside a");
+    memset(text + 1, 'y', 16270);
+    text[16271] = '"';
+    apps_rt_store_remove(rt, "b", 1);
+    CHECK(apps_rt_store_set(rt, "b", 1, text, 16272) == APPS_STORE_FULL, "b, one more");
+    apps_rt_store_remove(rt, "a", 1);
+    CHECK(apps_rt_store_count(rt) == 0, "not empty");
+
+    /* What is saved: the keys escaped as JSON escapes them, in the order they were first set, replaced in place, removed gone. */
+    CHECK(apps_rt_store_set(rt, "plain", 5, "1", 1) == APPS_STORE_OK, "plain");
+    static const char escaped_key[] = "q\"b\\c\nd\x01" "e\x7f";  /* ten bytes */
+    CHECK(apps_rt_store_set(rt, escaped_key, strlen(escaped_key), "{\"x\":[true,null]}", 17) == APPS_STORE_OK, "escaped key");
+    CHECK(apps_rt_store_set(rt, "\xC3\xA9\xF0\x9F\x98\x80", 6, "\"\\u00e9\"", 8) == APPS_STORE_OK, "utf-8 key");
+    CHECK(STORE_SET(rt, "gone", "0") == APPS_STORE_OK, "gone");
+    CHECK(STORE_SET(rt, "plain", "2") == APPS_STORE_OK, "plain again");
+    apps_rt_store_remove(rt, "gone", 4);
+    port_mono_ms = 7000;
+    apps_rt_store_tick(rt, 7000);
+    const char *saved = fake_saved_json("app");
+    const char *want = "{\"plain\":2,\"q\\\"b\\\\c\\nd\\u0001e\x7f\":{\"x\":[true,null]},\"\xC3\xA9\xF0\x9F\x98\x80\":\"\\u00e9\"}";
+    CHECK(saved != NULL && strcmp(saved, want) == 0, "saved '%s', want '%s'", saved != NULL ? saved : "(none)", want);
+    CHECK(saved != NULL && fake_saved_for("app", false)->len == strlen(want), "the length given to the port was %zu, want %zu",
+          saved != NULL ? fake_saved_for("app", false)->len : 0, strlen(want));
+    finish(rt, pkg);
+    fake_store_reset();
+}
+
+/* When the store is saved: 2 s after the last change (a change inside the wait starts it again, and a write that changes nothing
+ * is none), dark or lit, never as a call; a save the port refuses again 2 s later; the last one when the app ends (stop, a crash, a
+ * crash in main.lua's top level, the runtime freed), asked once. */
+static void store_flush(void) {
+    fake_store_reset();
+    port_mono_ms = 5000;
+    port_dark = false;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_perms(&pkg, "return {}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    CHECK(apps_rt_next_deadline(rt) == INT64_MAX, "a clean store has a deadline");
+    CHECK(STORE_SET(rt, "a", "1") == APPS_STORE_OK, "set");
+    CHECK(apps_rt_next_deadline(rt) == 7000, "the save is due at %lld", (long long)apps_rt_next_deadline(rt));
+    CHECK(!apps_rt_has_work(rt, 7000) && !apps_rt_run_one_timer(rt, 7000), "a save is no call");
+    apps_rt_store_tick(rt, 6999);
+    CHECK(fake_store.attempts == 0, "saved early");
+    apps_rt_store_tick(rt, 7000);
+    CHECK(fake_store.saves == 1 && strcmp(fake_saved_json("app"), "{\"a\":1}") == 0, "%d saves: '%s'", fake_store.saves,
+          fake_saved_json("app") != NULL ? fake_saved_json("app") : "(none)");
+    CHECK(apps_rt_next_deadline(rt) == INT64_MAX, "saved, and still due");
+    apps_rt_store_tick(rt, 99999);
+    CHECK(fake_store.attempts == 1, "saved again with nothing changed");
+
+    /* A change inside the wait starts it again; one that changes nothing doesn't. */
+    port_mono_ms = 8000;
+    CHECK(STORE_SET(rt, "a", "22") == APPS_STORE_OK, "a = 22");
+    port_mono_ms = 9500;
+    CHECK(STORE_SET(rt, "a", "333") == APPS_STORE_OK, "a = 333");
+    CHECK(apps_rt_next_deadline(rt) == 11500, "due at %lld", (long long)apps_rt_next_deadline(rt));
+    port_mono_ms = 10500;
+    CHECK(STORE_SET(rt, "a", "333") == APPS_STORE_OK && apps_rt_next_deadline(rt) == 11500, "a write of what is there moved it");
+    apps_rt_store_remove(rt, "never", 5);
+    CHECK(apps_rt_next_deadline(rt) == 11500, "a remove of a key that isn't there moved it");
+    apps_rt_store_tick(rt, 11499);
+    CHECK(fake_store.attempts == 1, "saved early");
+    apps_rt_store_tick(rt, 11500);
+    CHECK(fake_store.saves == 2 && strcmp(fake_saved_json("app"), "{\"a\":333}") == 0, "second save: '%s'", fake_saved_json("app"));
+
+    /* Dark, a save is due all the same: the deadline says so and the tick saves. */
+    port_dark = true;
+    port_mono_ms = 13000;
+    CHECK(STORE_SET(rt, "b", "true") == APPS_STORE_OK, "b");
+    CHECK(apps_rt_next_deadline(rt) == 15000, "dark, due at %lld", (long long)apps_rt_next_deadline(rt));
+    apps_rt_store_tick(rt, 15000);
+    CHECK(fake_store.saves == 3, "no save while dark");
+    port_dark = false;
+
+    /* A refused save is asked again 2 s later, and the same object is saved. */
+    port_mono_ms = 20000;
+    CHECK(STORE_SET(rt, "c", "null") == APPS_STORE_OK, "c");
+    fake_store.refuse_saves = true;
+    apps_rt_store_tick(rt, 22000);
+    CHECK(fake_store.attempts == 4 && fake_store.saves == 3, "the refused save: %d asked, %d taken", fake_store.attempts,
+          fake_store.saves);
+    CHECK(apps_rt_next_deadline(rt) == 24000, "asked again at %lld", (long long)apps_rt_next_deadline(rt));
+    apps_rt_store_tick(rt, 23999);
+    CHECK(fake_store.attempts == 4, "asked again early");
+    fake_store.refuse_saves = false;
+    apps_rt_store_tick(rt, 24000);
+    CHECK(fake_store.saves == 4 && strcmp(fake_saved_json("app"), "{\"a\":333,\"b\":true,\"c\":null}") == 0, "saved '%s'",
+          fake_saved_json("app"));
+    expect_no_logs();
+
+    /* The last save is at stop(), whenever it is due, and what stop() wrote is in it. */
+    CHECK(STORE_SET(rt, "d", "1") == APPS_STORE_OK, "d");
+    apps_rt_stop(rt);
+    CHECK(fake_store.saves == 5 && strstr(fake_saved_json("app"), "\"d\":1") != NULL, "no save at stop: %d", fake_store.saves);
+    apps_rt_store_tick(rt, 99999);
+    CHECK(fake_store.attempts == 6, "saved again after the stop's: %d asked", fake_store.attempts);
+    /* A runtime that is freed with a change in it saves it (the owner that forgot to). */
+    CHECK(STORE_SET(rt, "e", "2") == APPS_STORE_OK, "e");
+    finish(rt, pkg);
+    CHECK(fake_store.saves == 6 && strstr(fake_saved_json("app"), "\"e\":2") != NULL, "no save at free: %d", fake_store.saves);
+
+    /* The last save is asked once: a port that refuses it loses the changes, and the log says so. */
+    fake_store_reset();
+    rt = launch_perms(&pkg, "return {}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    CHECK(STORE_SET(rt, "a", "1") == APPS_STORE_OK, "a");
+    fake_store.refuse_saves = true;
+    forget_logged();
+    apps_rt_stop(rt);
+    CHECK(fake_store.attempts == 1 && fake_store.saves == 0, "the last save: %d asked, %d taken", fake_store.attempts,
+          fake_store.saves);
+    expect_logged(STORE_LOST_LINE);
+    fake_store.refuse_saves = false;
+    apps_rt_store_tick(rt, 99999);
+    finish(rt, pkg);
+    CHECK(fake_store.attempts == 1, "the lost changes were saved later: %d", fake_store.attempts);
+
+    /* A crash saves what was written: a kill from outside, found by the next call. */
+    fake_store_reset();
+    rt = launch_perms(&pkg, "return {message = function() return 1 end}", APPS_PERM_STORE);
+    if (rt == NULL) {
+        return;
+    }
+    CHECK(STORE_SET(rt, "a", "7") == APPS_STORE_OK, "a");
+    apps_vm_kill(apps_rt_vm(rt), KILL_REASON);
+    char err[256];
+    CHECK(send(rt, "go", err, sizeof err) == NULL && apps_rt_state(rt) == APPS_STATE_CRASHED, "no crash: '%s'", err);
+    CHECK(fake_store.saves == 1 && strcmp(fake_saved_json("app"), "{\"a\":7}") == 0, "a crash saved %d times: '%s'",
+          fake_store.saves, fake_saved_json("app") != NULL ? fake_saved_json("app") : "(none)");
+    apps_rt_store_tick(rt, 99999);
+    finish(rt, pkg);
+    CHECK(fake_store.attempts == 1, "saved again after the crash's: %d", fake_store.attempts);
+
+    /* A crash in main.lua's top level, after it wrote, saves too: the runtime that comes back is crashed, with its record. */
+    fake_store_reset();
+    pkg = make_pkg_perms("store.set('boot', 1) error('boom', 0)", APPS_PERM_STORE);
+    rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt != NULL && apps_rt_state(rt) == APPS_STATE_CRASHED, "no crashed runtime");
+    CHECK(fake_store.saves == 1 && strcmp(fake_saved_json("app"), "{\"boot\":1}") == 0, "a boot crash saved %d times", fake_store.saves);
+    finish(rt, pkg);
+    fake_store_reset();
+}
+
+/* What a load makes of what the port gives: the keys, the last of a key that is there twice, none of a key the store doesn't write,
+ * an empty store and a line in the log for an object it didn't write, no start at all when the port can't give it, and no
+ * question for an app without the permission. */
+static void store_load(void) {
+    fake_store_reset();
+    port_mono_ms = 5000;
+    static const char *const READER =
+        "local function show(k) local v = store.get(k) print(k, v == nil and 'none' or type(v) == 'table' and #v or v) end\n"
+        "show('a') show('b') show('c')\n"
+        "return {message = function() return {store.get('a'), store.get('b'), store.get('c', 'none')} end}\n";
+    char err[256];
+    /* What is saved is read back, before main.lua runs. */
+    fake_preload("app", "{\"a\":[1,2,3],\"b\":\"text\"}");
+    apps_pkg_t *pkg = make_pkg_perms(READER, APPS_PERM_STORE);
+    apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt != NULL && apps_rt_state(rt) == APPS_STATE_STOPPED, "new: %s", err);
+    expect_logged("a\t3", "b\ttext", "c\tnone");
+    CHECK(fake_store.loads == 1 && strcmp(fake_store.load_app, "app") == 0, "%d loads, for '%s'", fake_store.loads, fake_store.load_app);
+    CHECK(apps_rt_next_deadline(rt) == INT64_MAX && apps_rt_store_count(rt) == 2, "a loaded store has a save due, or %u keys",
+          apps_rt_store_count(rt));
+    finish(rt, pkg);
+    CHECK(fake_store.attempts == 0, "a store that nothing changed was saved");
+
+    /* Without the permission the port isn't asked, whatever it holds. */
+    fake_store.loads = 0;
+    pkg = make_pkg_perms("return {}", APPS_PERM_ALARM);
+    rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt != NULL && fake_store.loads == 0, "an app without the permission loaded its store");
+    finish(rt, pkg);
+
+    /* Each app has its own. */
+    fake_store_reset();
+    fake_preload("app", "{\"a\":1}");
+    fake_preload("other", "{\"b\":2}");
+    pkg = make_pkg_perms("return {}", APPS_PERM_STORE);
+    snprintf(pkg->manifest.id, sizeof pkg->manifest.id, "other");
+    rt = apps_rt_new(pkg, err, sizeof err);
+    char got[32];
+    CHECK(rt != NULL && apps_rt_store_count(rt) == 1, "other's store");
+    if (rt != NULL) {
+        store_value(rt, "b", got, sizeof got);
+        CHECK(strcmp(got, "2") == 0 && strcmp(fake_store.load_app, "other") == 0, "other read '%s' (asked for '%s')", got,
+              fake_store.load_app);
+        store_value(rt, "a", got, sizeof got);
+        CHECK(strcmp(got, "(none)") == 0, "other read app's key");
+        CHECK(STORE_SET(rt, "c", "3") == APPS_STORE_OK, "set");
+    }
+    finish(rt, pkg);  /* frees the runtime, which saves what it changed */
+    CHECK(strcmp(fake_saved_json("app"), "{\"a\":1}") == 0 && strcmp(fake_saved_json("other"), "{\"b\":2,\"c\":3}") == 0,
+          "'%s' and '%s'", fake_saved_json("app"), fake_saved_json("other"));
+
+    /* A key twice is its last; an empty key and one of 33 characters are not the store's: dropped; the rest is read. */
+    fake_store_reset();
+    fake_preload("app", "{\"a\":1,\"a\":2,\"\":3,\"abcdefghijklmnopqrstuvwxyz0123456\":4,\"b\":5}");
+    pkg = make_pkg_perms("return {}", APPS_PERM_STORE);
+    rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt != NULL, "new: %s", err);
+    if (rt != NULL) {
+        char a[32], b[32];
+        store_value(rt, "a", a, sizeof a);
+        store_value(rt, "b", b, sizeof b);
+        CHECK(apps_rt_store_count(rt) == 2 && strcmp(a, "2") == 0 && strcmp(b, "5") == 0, "%u keys, a '%s', b '%s'",
+              apps_rt_store_count(rt), a, b);
+    }
+    expect_no_logs();
+    finish(rt, pkg);
+
+    /* An object the store didn't write: an empty store, one line in the log, and the app is made all the same. */
+    static char huge[APPS_STORE_MAX_BYTES + 100], deep[256], longkey[400];
+    snprintf(huge, sizeof huge, "{\"a\":\"");
+    memset(huge + 6, 'x', APPS_STORE_MAX_BYTES - 6 + 10);
+    strcpy(huge + 6 + APPS_STORE_MAX_BYTES - 6 + 10, "\"}");
+    {
+        size_t n = 0;
+        n += (size_t)snprintf(deep + n, sizeof deep - n, "{\"k\":");
+        for (int i = 0; i < 16; i++) {
+            deep[n++] = '[';
+        }
+        deep[n++] = '1';
+        for (int i = 0; i < 16; i++) {
+            deep[n++] = ']';
+        }
+        deep[n++] = '}';
+        deep[n] = '\0';
+    }
+    {
+        size_t n = (size_t)snprintf(longkey, sizeof longkey, "{\"");
+        memset(longkey + n, 'k', 200);
+        strcpy(longkey + n + 200, "\":1}");
+    }
+    static const char *const unreadable[] = {"[]", "null", "5", "\"text\"", "{", "{\"a\":}", "{\"a\":1,}", "{\"a\" 1}", "{\"a\":1} x",
+                                             "", "{\"a\":\"\xFF\"}", huge, deep, longkey, "{\"a\":NaN}"};
+    for (size_t i = 0; i < ARRAY_LEN(unreadable); i++) {
+        fake_store_reset();
+        forget_logged();
+        fake_preload("app", unreadable[i]);
+        pkg = make_pkg_perms("return {}", APPS_PERM_STORE);
+        rt = apps_rt_new(pkg, err, sizeof err);
+        CHECK(rt != NULL && apps_rt_store_count(rt) == 0 && apps_rt_state(rt) == APPS_STATE_STOPPED,
+              "case %zu: an object the store didn't write: %p, %u keys", i, (void *)rt, rt != NULL ? apps_rt_store_count(rt) : 99);
+        expect_logged(STORE_UNREADABLE_LINE);
+        CHECK(rt == NULL || apps_rt_next_deadline(rt) == INT64_MAX, "case %zu: a save is due for a store that is only empty", i);
+        finish(rt, pkg);
+        CHECK(fake_store.attempts == 0, "case %zu: an empty store that nothing changed was saved", i);
+    }
+    /* The object that is exactly 16 KB is the store's; one byte more isn't (above). */
+    {
+        fake_store_reset();
+        char *edge = malloc(APPS_STORE_MAX_BYTES + 1);
+        snprintf(edge, APPS_STORE_MAX_BYTES + 1, "{\"k\":\"");
+        memset(edge + 6, 'x', APPS_STORE_MAX_BYTES - 8);
+        strcpy(edge + 6 + APPS_STORE_MAX_BYTES - 8, "\"}");
+        CHECK(strlen(edge) == APPS_STORE_MAX_BYTES, "the edge is %zu bytes", strlen(edge));
+        fake_preload("app", edge);
+        free(edge);
+        pkg = make_pkg_perms("return {}", APPS_PERM_STORE);
+        forget_logged();
+        rt = apps_rt_new(pkg, err, sizeof err);
+        CHECK(rt != NULL && apps_rt_store_count(rt) == 1, "an object of exactly 16 KB wasn't read");
+        expect_no_logs();
+        finish(rt, pkg);
+    }
+
+    /* A port that can't give the store: no app is made, and the message says to try again. Nothing is held, and nothing is saved over the
+     * real store (there is none here to say so, but nothing was asked of the port either). */
+    fake_store_reset();
+    fake_store.fail_loads = true;
+    fake_preload("app", "{\"a\":1}");
+    pkg = make_pkg_perms("print('main ran') return {}", APPS_PERM_STORE);
+    forget_logged();
+    rt = apps_rt_new(pkg, err, sizeof err);
+    CHECK(rt == NULL && strcmp(err, STORE_LOAD_FAILED_TEXT) == 0, "a failed load: %p '%s'", (void *)rt, err);
+    expect_no_logs();  /* main.lua never ran */
+    CHECK(fake_store.attempts == 0 && strcmp(fake_saved_json("app"), "{\"a\":1}") == 0, "the real store was touched");
+    free_pkg(pkg);
+    forget_logged();
+    CHECK(held == 0, "%zu bytes held", held);
+    fake_store_reset();
+}
+
+/* A heap that refuses at every step with the store in use: a refusal in the load is no app (and never an empty store in the real one's
+ * place); in the app it is the app out of memory, or a message that failed alone; and every document that is saved, at any point, is the
+ * real one with the app's changes, never a part of it. Every case ends at 0 bytes. */
+static const char *const STORE_APP =
+    "return {\n"
+    "  start = function() store.set('s', 1) end,\n"
+    "  stop = function() store.set('t', {1, {2}}) end,\n"
+    "  message = function(event, data)\n"
+    "    store.set('a', {1, 2, {x = 'y'}})\n"
+    "    store.set('b', 'text')\n"
+    "    store.set('a', {3})\n"
+    "    store.remove('b')\n"
+    "    local v = store.get('a')\n"
+    "    store.set('c', v[1])\n"
+    "    return {#v, store.get('c'), store.get('p'), #store.get('q')}\n"
+    "  end}\n";
+
+static void store_refused(void) {
+    long reached = 0;
+    bool saw_load_refused = false, saw_crash = false, saw_soft_failure = false;
+    for (long k = 1; k < 100000; k++) {
+        fake_store_reset();
+        port_mono_ms = 5000;
+        fake_preload("app", "{\"p\":1,\"q\":[1,2,3]}");
+        apps_pkg_t *pkg = make_pkg_perms(STORE_APP, APPS_PERM_STORE);
+        char err[256] = "";
+        long before = growths;
+        refuse_from = growths + k;
+        apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+        bool soft = false;
+        if (rt != NULL && apps_rt_state(rt) == APPS_STATE_STOPPED && apps_rt_start(rt)) {
+            char *reply = send(rt, "go", err, sizeof err);
+            soft = reply == NULL && apps_rt_state(rt) == APPS_STATE_RUNNING;
+            apps_port_free(reply);
+            apps_rt_store_tick(rt, 99999);
+            apps_rt_stop(rt);
+        }
+        bool refused = growths >= refuse_from;
+        refuse_from = -1;
+        if (rt == NULL) {
+            /* No app: for want of memory for the VM, or the store's load. The reason is the message (nothing ran). */
+            CHECK(err[0] != '\0', "k=%ld: no runtime and no reason", k);
+            saw_load_refused = saw_load_refused || strcmp(err, STORE_LOAD_FAILED_TEXT) == 0;
+            CHECK(fake_store.attempts == 0, "k=%ld: an app that wasn't made saved its store", k);
+        } else if (apps_rt_state(rt) == APPS_STATE_CRASHED) {
+            saw_crash = true;
+        }
+        saw_soft_failure = saw_soft_failure || soft;
+        /* Whatever was saved is the real object with the changes: it parses, and the keys that were there are there. */
+        const char *json = fake_saved_json("app");
+        if (json != NULL) {
+            char why[96];
+            CHECK(apps_json_validate(json, strlen(json), why, sizeof why), "k=%ld: saved '%s': %s", k, json, why);
+            CHECK(strstr(json, "\"p\":1") != NULL && strstr(json, "\"q\":[1,2,3]") != NULL,
+                  "k=%ld: saved '%s' without the real keys", k, json);
+        }
+        apps_rt_free(rt);
+        free_pkg(pkg);
+        forget_logged();
+        CHECK(held == 0, "k=%ld: %zu bytes held", k, held);
+        if (!refused) {
+            reached = growths - before;
+            break;
+        }
+    }
+    CHECK(reached > 40, "only %ld growth requests in the whole run", reached);
+    CHECK(saw_load_refused, "no refusal ever failed the load");
+    CHECK(saw_crash, "no refusal ever crashed the app");
+    CHECK(saw_soft_failure, "no refusal ever failed a call alone");
+    fake_store_reset();
+}
+
+/* sys at the runtime: the battery and the Wi-Fi as the port gives them (a missing percentage is no field, a long one is cut at 100, a
+ * name is clean text and "" when there is no network), the calls that go to the port (show, keep_awake, exit) and the memory. */
+static const char *const SYS_APP =
+    "return {message = function(event)\n"
+    "  if event == 'battery' then local b = sys.battery() return {b.pct or 'none', b.charging, b.usb} end\n"
+    "  if event == 'wifi' then local w = sys.wifi() return {w.connected, w.ssid} end\n"
+    "  if event == 'keep' then sys.keep_awake(true) sys.keep_awake(false) sys.keep_awake(true) return true end\n"
+    "  if event == 'show' then sys.show() return true end\n"
+    "  if event == 'exit' then sys.exit() print('after') return 'bye' end\n"
+    "  if event == 'mem' then local m = sys.mem() return {m.used_kb > 0, m.peak_kb >= m.used_kb, m.limit_kb} end\n"
+    "end}\n";
+
+static void expect_reply_at(int line, apps_rt_t *rt, const char *event, const char *want) {
+    char err[256] = "";
+    char *reply = send(rt, event, err, sizeof err);
+    CHECK_AT(line, reply != NULL && strcmp(reply, want) == 0, "%s: '%s' (%s), want '%s'", event, reply != NULL ? reply : "(none)", err,
+             want);
+    apps_port_free(reply);
+}
+#define expect_reply(rt, event, want) expect_reply_at(__LINE__, (rt), (event), (want))
+
+static void sys_services(void) {
+    fake_store_reset();
+    port_mono_ms = 5000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_perms(&pkg, SYS_APP, APPS_PERM_KEEP_AWAKE);
+    if (rt == NULL) {
+        return;
+    }
+    fake_battery = (apps_battery_t){.pct = 76, .charging = true, .usb = false};
+    expect_reply(rt, "battery", "[76,true,false]");
+    fake_battery = (apps_battery_t){.pct = 0, .charging = false, .usb = true};
+    expect_reply(rt, "battery", "[0,false,true]");
+    fake_battery = (apps_battery_t){.pct = -1, .charging = false, .usb = false};
+    expect_reply(rt, "battery", "[\"none\",false,false]");
+    fake_battery = (apps_battery_t){.pct = 250, .charging = true, .usb = true};
+    expect_reply(rt, "battery", "[100,true,true]");
+
+    expect_reply(rt, "wifi", "[false,\"\"]");
+    snprintf(fake_wifi_ssid, sizeof fake_wifi_ssid, "home net");
+    expect_reply(rt, "wifi", "[false,\"\"]");  /* not connected: no name, whatever the port holds */
+    fake_wifi_connected = true;
+    expect_reply(rt, "wifi", "[true,\"home net\"]");
+    snprintf(fake_wifi_ssid, sizeof fake_wifi_ssid, "\x01net\xFF" "work\x7f\n");
+    expect_reply(rt, "wifi", "[true,\"?net?work??\"]");  /* bytes from the air are cleaned as any text is */
+    snprintf(fake_wifi_ssid, sizeof fake_wifi_ssid, "%s", "\xC3\xA9tage \xE2\x82\xAC");
+    expect_reply(rt, "wifi", "[true,\"\xC3\xA9tage \xE2\x82\xAC\"]");  /* valid UTF-8 as it is */
+    snprintf(fake_wifi_ssid, sizeof fake_wifi_ssid, "%s", "abcdefghijklmnopqrstuvwxyz012345");
+    expect_reply(rt, "wifi", "[true,\"abcdefghijklmnopqrstuvwxyz012345\"]");
+    snprintf(fake_wifi_ssid, sizeof fake_wifi_ssid, "%s", "abcdefghijklmnopqrstuvwxyz0123456789");  /* the port gave more than 32 */
+    expect_reply(rt, "wifi", "[true,\"abcdefghijklmnopqrstuvwxyz012345\"]");
+
+    expect_reply(rt, "keep", "true");
+    CHECK(fake_keep_awake_calls == 3 && fake_keep_awake_on, "%d calls, on %d", fake_keep_awake_calls, fake_keep_awake_on);
+    expect_reply(rt, "show", "true");
+    CHECK(fake_shows == 1, "%d shows", fake_shows);
+    forget_logged();
+    expect_reply(rt, "exit", "\"bye\"");  /* the callback runs to its end */
+    expect_logged("after");
+    CHECK(fake_exits == 1 && apps_rt_state(rt) == APPS_STATE_RUNNING, "%d exits; the runtime's owner ends the app, not the runtime",
+          fake_exits);
+    expect_reply(rt, "mem", "[true,true,256]");
+    finish(rt, pkg);
+    fake_store_reset();
+}
+
+/* sys.show's rule at the runtime's own clock: allowed in message() and alarm(), and in a callback within 10 s of a touch, the 10 s
+ * included; a touch is the time of the last, whatever it found; not in start(), nor before any touch (the clock a long way from 0). */
+static const char *const SHOW_APP =
+    "local function try(label) local ok = pcall(sys.show) print(label, ok) end\n"
+    "return {\n"
+    "  start = function()\n"
+    "    try('start')\n"
+    "    for i = 1, 5 do timer.after(100, function() try('timer ' .. i) end) end\n"
+    "  end,\n"
+    "  message = function(event)\n"
+    "    if event == 'fail' then try('message') error('boom', 0) end\n"
+    "    try('message')\n"
+    "    local co = coroutine.wrap(function() try('coroutine') end)\n"
+    "    co()\n"
+    "    return true\n"
+    "  end,\n"
+    "  alarm = function(name) try('alarm ' .. name) if name == 'bad' then error('boom', 0) end end}\n";
+
+static void show_window(void) {
+    fake_store_reset();
+    port_mono_ms = 1000;
+    port_dark = false;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_perms(&pkg, SHOW_APP, 0);
+    if (rt == NULL) {
+        return;
+    }
+    CHECK(!apps_rt_show_allowed(rt), "allowed at the start");
+    expect_logged("start\tfalse");
+    forget_logged();
+    char err[256];
+    char *reply = send(rt, "go", err, sizeof err);  /* message(): allowed, in a coroutine of it too */
+    apps_port_free(reply);
+    expect_logged("message\ttrue", "coroutine\ttrue");
+    forget_logged();
+    CHECK(fake_shows == 2 && !apps_rt_show_allowed(rt), "%d shows, allowed after the message: %d", fake_shows,
+          apps_rt_show_allowed(rt));
+    CHECK(send(rt, "fail", err, sizeof err) == NULL, "a failing message answered");
+    expect_logged("message\ttrue");
+    forget_logged();
+    CHECK(!apps_rt_show_allowed(rt), "allowed after a message that failed");
+
+    /* A timer, no touch yet: at 1100, 1100 ms from the clock's start, which is no tap. */
+    port_mono_ms = 1100;
+    CHECK(apps_rt_run_one_timer(rt, 1100), "no timer");
+    expect_logged("timer 1\tfalse");
+    forget_logged();
+    /* A touch at 2000 (the widget it names isn't there: it is still a touch), and the window is 10 s from it. */
+    port_mono_ms = 2000;
+    apps_rt_touch(rt, 3, 1, APPS_UI_TAP);
+    CHECK(apps_rt_show_allowed(rt), "not allowed at the touch");
+    port_mono_ms = 11999;
+    CHECK(apps_rt_run_one_timer(rt, 11999), "no timer");
+    port_mono_ms = 12000;
+    CHECK(apps_rt_run_one_timer(rt, 12000), "no timer");
+    port_mono_ms = 12001;
+    CHECK(apps_rt_run_one_timer(rt, 12001), "no timer");
+    expect_logged("timer 2\ttrue", "timer 3\ttrue", "timer 4\tfalse");
+    forget_logged();
+    CHECK(!apps_rt_show_allowed(rt), "allowed a millisecond past the window");
+    port_mono_ms = 12000;
+    CHECK(apps_rt_show_allowed(rt), "not allowed at the window's end");
+    port_mono_ms = 12001;
+    /* A later touch moves the window. */
+    apps_rt_touch(rt, 3, 1, APPS_UI_TAP);
+    CHECK(apps_rt_run_one_timer(rt, 12001), "no timer");
+    expect_logged("timer 5\ttrue");
+    forget_logged();
+    /* alarm(): allowed, and not after it, nor when it fails. */
+    port_mono_ms = 40000;
+    CHECK(!apps_rt_show_allowed(rt), "allowed long after the touch");
+    CHECK(apps_rt_alarm(rt, "ok"), "alarm");
+    expect_logged("alarm ok\ttrue");
+    forget_logged();
+    CHECK(!apps_rt_show_allowed(rt), "allowed after alarm()");
+    CHECK(!apps_rt_alarm(rt, "bad") && apps_rt_state(rt) == APPS_STATE_CRASHED, "an alarm that fails");
+    expect_logged("alarm bad\ttrue");
+    CHECK(!apps_rt_show_allowed(rt), "allowed after an alarm that crashed");
+    forget_logged();
+    finish(rt, pkg);
+    /* A touch of a runtime that doesn't run is none (the app task drops it); one of a running app counts. */
+    rt = launch_perms(&pkg, "return {}", 0);
+    if (rt != NULL) {
+        apps_rt_stop(rt);
+        port_mono_ms = 50000;
+        apps_rt_touch(rt, 0, 1, APPS_UI_TAP);
+        CHECK(!apps_rt_show_allowed(rt), "a touch of a stopped app was counted");
+        CHECK(apps_rt_start(rt), "start again");
+        apps_rt_touch(rt, 0, 1, APPS_UI_TAP);
+        CHECK(apps_rt_show_allowed(rt), "a touch of a running app wasn't counted");
+        finish(rt, pkg);
+    }
+    fake_store_reset();
+}
+
 /* The timers' contract at the runtime's own API, which the app task and apphost build on, where a script only sees events:
  * when the next one is due, what one step of a pass does (which timer, in what order, from what time it reschedules), what the
  * dark screen, a stop, a crash and a kill from outside leave. The clocks are the case's. */
@@ -2892,6 +3678,12 @@ int main(int argc, char **argv) {
         {"services_refused", services_refused},
         {"alarm_table_full", alarm_table_full},
         {"alarm_no_memory", alarm_no_memory},
+        {"store_api", store_api},
+        {"store_flush", store_flush},
+        {"store_load", store_load},
+        {"store_refused", store_refused},
+        {"sys_services", sys_services},
+        {"show_window", show_window},
         {"timer_api", timer_api},
         {"timer_tie", timer_tie},
         {"os_time_charge", os_time_charge},
@@ -2916,6 +3708,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
         if (strcmp(argv[1], cases[i].name) == 0) {
             cases[i].run();
+            fake_store_reset();
             forget_logged();
             free(logged);
             CHECK(held == 0, "%s ended with %zu bytes held", argv[1], held);

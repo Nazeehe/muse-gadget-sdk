@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""apps_port_idf.c, the device's port of Muse apps: the console echo's cap and queue, and the UI lock's breach log.
+"""apps_port_idf.c, the device's port of Muse apps: the console echo's cap and queue, the UI lock's breach log, the store's map
+behind the I/O worker's ops, and sys's battery and Wi-Fi.
 
 tests/muse_apps_port_harness.c runs the real apps_port_idf.c on the host over fakes: its ESP-IDF and FreeRTOS headers
 are staged as one line each that includes tests/muse_apps_task_fakes.h (the harness defines what the port calls), and
@@ -104,6 +105,32 @@ class AppPortTest(unittest.TestCase):
 
     def test_alarms_and_sound_go_to_their_owners(self):  # Task 17: apps_alarm.c's table and ring, the voice task's chirp
         self.run_case("alarms_and_sound_go_to_their_owners")
+
+    # ---- Task 18: the store, sys's battery and Wi-Fi, and what goes to the app task ----
+
+    def test_the_store_round_trips_through_the_worker(self):  # X11: saves and loads are the I/O worker's ops
+        self.run_case("store_round_trip_through_the_worker")
+
+    def test_the_store_serves_in_the_order_of_the_calls(self):  # a restart's load comes after the stop's save
+        self.run_case("store_ops_run_in_the_order_of_the_calls")
+
+    def test_a_load_the_worker_never_answers_gives_up_and_leaks_nothing(self):  # the load's bound, the abandoned request
+        self.run_case("store_load_gives_up_when_the_worker_is_silent")
+
+    def test_an_answer_that_lands_at_the_deadline_is_kept(self):  # whichever mark of the request came first decides
+        self.run_case("store_load_answered_at_the_deadline")
+
+    def test_a_refused_store_call_leaves_nothing_held(self):  # no op, no memory, an id or an object the runtime never makes
+        self.run_case("store_refusals")
+
+    def test_the_store_keeps_16_apps_and_drops_the_oldest_saved(self):
+        self.run_case("store_keeps_16_apps_and_drops_the_oldest_saved")
+
+    def test_battery_and_wifi_are_the_systems(self):  # C33's device half: muse_state's power, muse_wifi's status, no log
+        self.run_case("battery_and_wifi_are_the_systems")
+
+    def test_show_keep_awake_and_exit_are_the_app_tasks(self):  # C10, C11
+        self.run_case("show_keep_awake_and_exit_go_to_the_app_task")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

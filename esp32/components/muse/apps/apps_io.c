@@ -31,6 +31,12 @@
  * worker while it decides to go: so a job is either queued while the worker is there (and the worker sees it before it
  * goes, as it looks at the queue under the lock), or it finds no worker and makes one. The worker never holds the lock
  * across a job, and a submit never waits for anything but the lock.
+ *
+ * The ops are a ring of APPS_IO_OPS under the same lock. One submitter (the app task) pushes; the worker's thread alone pops and runs
+ * them, outside the lock: after each job, before it decides to go (it doesn't go with one waiting), and in apps_io_assist. A worker that
+ * waits for a job would not see a new op, so a push queues a job to wake it (drain_job), one at a time: s_ops_nudged says one is on its
+ * way, and the job clears it before it looks, so an op that comes after the look queues the next. When that job can't be queued and
+ * no worker is there, nothing could ever run the op, and it is taken back; with a worker there it stays, for the end of its job.
  */
 
 static const char *TAG = "muse_apps";
@@ -48,6 +54,38 @@ static StaticSemaphore_t s_lock_buf;
 static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_jobs;   /* APPS_IO_JOBS of job_t, in PSRAM */
 static TaskHandle_t s_worker;  /* under s_lock: the worker, or NULL when there is none */
+static job_t s_ops[APPS_IO_OPS];  /* under s_lock: the ops waiting, a ring from s_ops_head */
+static unsigned s_ops_head, s_ops_n;
+static bool s_ops_nudged;         /* under s_lock: a drain job is queued, and has not looked yet */
+
+/* Runs the ops that are waiting, in order. The worker's thread alone calls it, and no lock is held while an op runs. */
+static void drain_ops(void) {
+    for (;;) {
+        job_t op = {NULL, NULL};
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        bool have = s_ops_n > 0;
+        if (have) {
+            op = s_ops[s_ops_head];
+            s_ops_head = (s_ops_head + 1) % APPS_IO_OPS;
+            s_ops_n--;
+        }
+        xSemaphoreGive(s_lock);
+        if (!have) {
+            return;
+        }
+        op.fn(op.arg);
+    }
+}
+
+/* What an op's submit queues to bring a waiting worker to it: the flag goes before the look, so that an op pushed after the look
+ * queues the next one. */
+static void drain_job(void *arg) {
+    (void)arg;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_ops_nudged = false;
+    xSemaphoreGive(s_lock);
+    drain_ops();
+}
 
 static void worker(void *arg) {
     (void)arg;
@@ -55,11 +93,13 @@ static void worker(void *arg) {
         job_t job;
         if (xQueueReceive(s_jobs, &job, pdMS_TO_TICKS(APPS_IO_IDLE_MS)) == pdTRUE) {
             job.fn(job.arg);
+            drain_ops();  /* the ops that came while it ran */
             continue;
         }
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        if (uxQueueMessagesWaiting(s_jobs) > 0) {
+        if (uxQueueMessagesWaiting(s_jobs) > 0 || s_ops_n > 0) {
             xSemaphoreGive(s_lock);  /* one came in as the wait ran out */
+            drain_ops();
             continue;
         }
         s_worker = NULL;
@@ -119,5 +159,50 @@ bool apps_io_submit(void (*fn)(void *arg), void *arg) {
     default:
         ESP_LOGW(TAG, "io: no memory for the worker: job refused");
         return false;
+    }
+}
+
+bool apps_io_submit_op(void (*op)(void *arg), void *arg) {
+    if (s_lock == NULL || s_jobs == NULL || op == NULL) {
+        ESP_LOGW(TAG, "io: not started: op refused");
+        return false;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_ops_n >= APPS_IO_OPS) {
+        xSemaphoreGive(s_lock);
+        ESP_LOGW(TAG, "io: %d ops wait already: op refused", APPS_IO_OPS);
+        return false;
+    }
+    s_ops[(s_ops_head + s_ops_n) % APPS_IO_OPS] = (job_t){op, arg};
+    s_ops_n++;
+    bool nudge = !s_ops_nudged;
+    s_ops_nudged = true;
+    xSemaphoreGive(s_lock);
+    if (!nudge || apps_io_submit(drain_job, NULL)) {
+        return true;
+    }
+    /* No job could be queued to bring the worker (apps_io_submit said why). With a worker there the op waits for the end of its job,
+     * or its idle look; with none, nothing would ever run it, and it is taken back: it is the last in the ring, and nothing pops
+     * but the worker's thread. */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_ops_nudged = false;
+    bool taken_back = s_worker == NULL && s_ops_n > 0;
+    if (taken_back) {
+        s_ops_n--;
+    }
+    xSemaphoreGive(s_lock);
+    return !taken_back;
+}
+
+void apps_io_assist(void) {
+    if (s_lock == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool mine = s_worker != NULL && xTaskGetCurrentTaskHandle() == s_worker;
+    bool waiting = s_ops_n > 0;
+    xSemaphoreGive(s_lock);
+    if (mine && waiting) {
+        drain_ops();
     }
 }

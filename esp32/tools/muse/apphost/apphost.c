@@ -61,6 +61,11 @@
  *                                          nothing is left that could stop it (the app that was told the ring was stopped or
  *                                          crashed, and no alarm with sound waits to be told); never if nothing rang
  *   {"event":"chirp"}                      sound.chirp()
+ *   {"event":"store_save","bytes":N}       the app's store was saved (apps_port_store_save): the object's bytes, the 16 KB's measure. The
+ *                                          device writes it later, on the I/O worker; here it is kept in the process, so a `restart` reads it
+ *                                          back. The runtime saves 2 s after the last change, when the app ends (stop, exit, a crash,
+ *                                          a restart) and when it is freed with a change in it, after the script's last command
+ *   {"event":"show"}                       sys.show(): the app asks for the front
  *   {"event":"dump","widgets":[...]}       the `dump` command: one object an alive widget (apps_ui.h), with
  *                                          "dropped":N after them when N didn't fit the size asked for
  *   {"event":"leak_check","bytes":0}       --cycles: what the apps' heap still holds
@@ -96,6 +101,14 @@
  *   sync EPOCH_MS          the wall clock is set (to 2025 or later, in ms since 1970, as SNTP sets the gadget's), and moves
  *                          with the monotonic clock from then on. Unset, time.now() is nil. The time zone is UTC0.
  *   timers                 -> timers: how many timers the app has armed
+ *   restart                the app is stopped if it runs (stop() runs, its store is saved, its alarms are told, as the stop command does),
+ *                          its runtime freed and a new one made and started, as a launch is (main.lua's top level runs again, then
+ *                          start()): the values it saved are read back. It works on an app that crashed, too
+ * sys.exit() ends the app once the callback it was called in has returned, as the app task does: the callback runs to its end (its
+ * reply is given), then stop() runs, the store is saved and the alarms are told ("app exited"), and no other callback runs, a
+ * timer that was due in the same pass included. It is no event of its own. Called in start(), the app has started and then ends;
+ * called at main.lua's top level, it is never started. What sys asks of the gadget has a fixed answer (apphost_port.h): the battery is
+ * 76% on a charger and USB, the Wi-Fi is "muse-lab".
  * The LVGL task's apply step has no counterpart here but a stand-in that runs after each command: it takes every
  * request as applied, so a deleted widget's slot is free for the next command, as it is on the gadget after
  * a frame. Nothing is laid out, so a dump shows the declared geometry.
@@ -251,6 +264,20 @@ static void emit_ring(bool on) {
 }
 
 static const apphost_sound_t SOUND_EVENTS = {.chirp = emit_chirp, .ring = emit_ring};
+
+/* The store's saves and sys.show, which the port tells as they happen (apphost_port.h). */
+static void emit_store_saved(size_t bytes) {
+    begin("store_save");
+    printf(",\"bytes\":%zu", bytes);
+    end_event();
+}
+
+static void emit_show(void) {
+    begin("show");
+    end_event();
+}
+
+static const apphost_system_t SYSTEM_EVENTS = {.store_saved = emit_store_saved, .show = emit_show};
 
 /* What the alarm table logs (apps_alarm.c, through apphost_esp.h's log): the warnings and errors are events, since they are what
  * the gadget's console shows someone who watches it; the rest of its lines (a firing, a chirp, the ring's end) are events of their own
@@ -673,6 +700,39 @@ static void cmd_handler(app_t *app, const char *name) {
 
 static void make_and_start(app_t *app);
 
+/* sys.exit() asked for the app to end, and the callback it was called in has returned (apphost_take_exit): the app ends as the app task
+ * ends it (end_app, END_EXITED): stop() runs, which saves the store, and the alarms are told. An app that doesn't run (it is
+ * stopped, crashed, or never started: main.lua's top level called it) has nothing to end. */
+static void end_if_exited(app_t *app) {
+    if (!apphost_take_exit() || app->rt == NULL || apps_rt_state(app->rt) != APPS_STATE_RUNNING) {
+        return;
+    }
+    apps_rt_stop(app->rt);
+    flush_warnings(app);
+    report_crash(app, false);
+    if (!crashed(app)) {
+        end_alarms(app, false, "app exited");
+    }
+}
+
+/* restart: the app is stopped if it runs (as the stop command stops it), its runtime is freed and a new one is made and started. */
+static void cmd_restart(app_t *app) {
+    if (app->rt != NULL && apps_rt_state(app->rt) == APPS_STATE_RUNNING) {
+        apps_rt_stop(app->rt);
+        flush_warnings(app);
+        report_crash(app, false);
+        if (!crashed(app)) {
+            end_alarms(app, false, "app stopped");
+        }
+    }
+    (void)apphost_take_exit();  /* asked while it stopped: it has ended */
+    apps_rt_free(app->rt);
+    app->rt = NULL;
+    app->warned = 0;
+    app->alarm_window = false;
+    make_and_start(app);
+}
+
 /* What the app task's round does with the alarms (apps_task.c's deliver_alarms), after the esp_timer task has run: the table's timers that came
  * due in the step fire (the gadget's own code: its budget, its ring, its journal of lines, which print as warnings), and what fired is
  * announced, in the order it fired, with the ring's start, then told to the app, each, earliest first. An app that doesn't run, stopped
@@ -719,6 +779,7 @@ static void deliver_alarms(app_t *app) {
         (void)apps_rt_alarm(app->rt, due[i].name);
         flush_warnings(app);
         report_crash(app, was_crashed);
+        end_if_exited(app);
     }
     app->alarm_window = false;
 }
@@ -743,10 +804,19 @@ static void cmd_advance(app_t *app, long ms) {
         if (app->rt != NULL) {
             begin_command();
             deliver_alarms(app);  /* an app that crashed in alarm() was reported there */
-            bool was_crashed = crashed(app);
-            apps_rt_run_timers(app->rt, apps_port_mono_ms());
-            flush_warnings(app);
-            report_crash(app, was_crashed);
+            int64_t now = apps_port_mono_ms();
+            apps_rt_store_tick(app->rt, now);  /* a save that is due, before the timers: the app task's round does the same */
+            /* The timers one step at a time (apps_rt_run_timers is these), so that an app that exits in one runs no other. */
+            for (int pass = 0; pass < APPS_TIMERS_MAX; pass++) {
+                bool was_crashed = crashed(app);
+                bool ran = apps_rt_run_one_timer(app->rt, now);
+                flush_warnings(app);
+                report_crash(app, was_crashed);
+                end_if_exited(app);
+                if (!ran) {
+                    break;
+                }
+            }
             end_of_command(app);
         }
     } while (done < ms);
@@ -886,7 +956,8 @@ static void run_line(app_t *app, char *line) {
             apphost_sync(epoch_ms);
         }
     } else if (strcmp(cmd, "start") == 0 || strcmp(cmd, "stop") == 0 || strcmp(cmd, "show") == 0 ||
-               strcmp(cmd, "hide") == 0 || strcmp(cmd, "state") == 0 || strcmp(cmd, "timers") == 0) {
+               strcmp(cmd, "hide") == 0 || strcmp(cmd, "state") == 0 || strcmp(cmd, "timers") == 0 ||
+               strcmp(cmd, "restart") == 0) {
         if (*args != '\0') {
             snprintf(text, sizeof text, "%s takes no arguments", cmd);
             emit_text("error", text);
@@ -896,16 +967,19 @@ static void run_line(app_t *app, char *line) {
             cmd_state(app);
         } else if (strcmp(cmd, "timers") == 0) {
             cmd_timers(app);
+        } else if (strcmp(cmd, "restart") == 0) {
+            cmd_restart(app);
         } else {
             cmd_handler(app, cmd);
         }
     } else {
         snprintf(text, sizeof text,
                  "unknown command '%.60s' (commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, "
-                 "sync, timers)",
+                 "sync, timers, restart)",
                  cmd);
         emit_text("error", text);
     }
+    end_if_exited(app);  /* a callback of the command may have asked: it ends the app, after the callback's own output */
 }
 
 /* What the UI lock's count was when the command began. */
@@ -967,7 +1041,10 @@ static void make_and_start(app_t *app) {
     } else {
         emit_warnings(apps_rt_warnings(app->rt));
         app->warned = strlen(apps_rt_warnings(app->rt));
-        cmd_start(app);
+        if (!apphost_take_exit()) {  /* main.lua's top level that called sys.exit() never starts the app */
+            cmd_start(app);
+            end_if_exited(app);
+        }
     }
 }
 
@@ -986,6 +1063,7 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name,
     apphost_set_log(emit_log);
     apphost_esp_set_log(emit_esp_log);
     apphost_set_sound(&SOUND_EVENTS);
+    apphost_set_system(&SYSTEM_EVENTS);
     emit_warnings(pkg->manifest.warnings);
     begin_command();
     make_and_start(&app);
@@ -998,7 +1076,8 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name,
     if (status == 0) {
         status = crashed(&app) ? 1 : 0;
     }
-    apps_rt_free(app.rt);
+    apps_rt_free(app.rt);  /* a store with a change in it is saved: the run's last event, if there is one */
+    apphost_store_clear();
     return status;
 }
 
@@ -1030,6 +1109,7 @@ static int run_cycles(const apps_pkg_t *pkg, int cycles) {
     }
     printf("{\"event\":\"leak_check\",\"bytes\":%zu}\n", apphost_heap_held());
     fflush(stdout);
+    apphost_store_clear();
     return failed ? 1 : 0;
 }
 

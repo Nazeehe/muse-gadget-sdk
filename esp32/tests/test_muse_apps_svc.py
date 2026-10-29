@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The `time`, `os` and `timer` modules of Muse apps (apps_svc.c), the timers and the CPU duty cycle of the runtime
-(apps_rt.c), and the commands of apphost that move time (advance, dark, sync, timers).
+"""The `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` modules of Muse apps (apps_svc.c), the timers, the CPU duty cycle
+and the store's cache of the runtime (apps_rt.c), and the commands of apphost that move time (advance, dark, sync, timers) or restart
+the app.
 
 Most tests run apphost on an app folder, a fixture (tests/muse_apps_fixtures/timers, time_label) or one made on the
 spot, with a script on stdin, and read the one-JSON-object-a-line events it prints. Time is fake there and moves only
@@ -24,6 +25,7 @@ that refuses at every step, and the duty cycle's windows, which a clock that jum
 show and apphost's 10 ms steps can't (each window is closed as it ends there).
 """
 
+import json
 import random
 import re
 import subprocess
@@ -58,6 +60,16 @@ SOUND_PERMISSION = 'sound: add "sound" to "permissions" in manifest.json'
 ALARM_NAME_RULE = "alarm: name must be 1-23 characters of a-z, 0-9 and _"
 ALARM_MS_RULE = "alarm.after: ms must be a whole number from 1 to 604800000"
 TOO_MANY_ALARMS = "alarm: no more than 4 alarms per app"
+# The store and sys modules' (the brief's, exactly).
+STORE_KEY_RULE = "store: key must be a string of 1 to 32 characters"
+STORE_FULL = "store: more than 16 KB stored; remove keys you don't need"
+STORE_PERMISSION = 'store: add "store" to "permissions" in manifest.json'
+KEEP_AWAKE_PERMISSION = 'sys: add "keep_awake" to "permissions" in manifest.json'
+SHOW_RULE = "sys.show: allowed only in message() or alarm(), or within 10 s of a tap"
+STORE_BYTES = 16 * 1024
+# What apphost's port says of the gadget (apphost_port.c): the same in every run.
+HOST_BATTERY = {"pct": 76, "charging": True, "usb": True}
+HOST_WIFI = {"connected": True, "ssid": "muse-lab"}
 
 
 def timer_ms_rule(name):
@@ -1481,6 +1493,569 @@ class DutyCycleTest(SvcTestCase):
         self.assertEqual(run.of("state"), [{"event": "state", "state": "running"}] * 2)
 
 
+
+# ---- The store and sys modules ----
+
+# The handlers most store tests share: put and remove a key, get one, by message.
+PUT_HANDLERS = """
+    function app.message(event, data)
+        if event == "put" then store.set(data.key, data.value) return true end
+        if event == "remove" then store.remove(data) return true end
+        if event == "get" then return store.get(data.key, data.default) end
+    end
+"""
+
+
+def put(key, value):
+    return "message put " + json.dumps({"key": key, "value": value})
+
+
+def saved(run):
+    """The sizes of the saves a run printed (apphost's `store_save` events: the bytes of the object that was saved)."""
+    return [e["bytes"] for e in run.of("store_save")]
+
+
+def serialized(values):
+    """What a store holding these values saves: one compact JSON object, whose bytes are what the 16 KB counts."""
+    return len(json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode())
+
+
+def line(text):
+    return {"event": "log", "app": "scratch", "line": text}
+
+
+class DeviceTestCase(SvcTestCase):
+    """The store and sys modules, on apphost's port: its saves and its show are events, its battery and Wi-Fi are fixed
+    (HOST_BATTERY, HOST_WIFI), and the clock is the script's. apphost's port saves at once and keeps what it saved in the
+    process, so a `restart` reads it back; the device's goes through the I/O worker (the C cases of the task and port
+    harnesses show that)."""
+
+    def device_app(self, handlers, script=None, permissions=(), manifest=None, **kw):
+        """An app with the handlers of `handlers` (Lua statements that fill `app`; `bare` and `says` at hand) and the
+        permissions given, then the script."""
+        main = BARE + "local app = {}\n" + handlers + "\nreturn app\n"
+        doc = {"permissions": list(permissions), **(manifest or {})}
+        return self.host(self.make_app("scratch", main, manifest=doc), script=script, **kw)
+
+    def device_lines(self, source, permissions=(), script=None, **kw):
+        """What start() printed when it ran `source` (Lua statements, `bare` and `says` at hand), with no warning, error or
+        crash among the events."""
+        main = BARE + "local app = {}\nfunction app.start()\n" + source + "\nend\nreturn app\n"
+        app = self.make_app("scratch", main, manifest={"permissions": list(permissions)})
+        run = self.host(app, script=script, **kw)
+        self.assertEqual([k for k in run.kinds() if k in ("warning", "error", "crash")], [], run.events)
+        return run.logs()
+
+
+class StoreTest(DeviceTestCase):
+    """The `store` module (apps_svc.c, over the runtime's cache in apps_rt.c): what an app keeps across a restart, the 16 KB,
+    the key rules, and when the values are saved."""
+
+    # ---- The brief's tests ----
+
+    def test_store_roundtrip_across_restart(self):
+        mix = {"i": 7, "f": 0.5, "whole": 3.0, "s": "héllo \"q\" \\ \n\ttab", "b": False,
+               "list": [1, "two", None, {"x": 1}], "null": None, "nested": {"a": {"b": {"c": [True]}}}}
+        run = self.device_app("""
+            function app.start() print("start", store.get("runs", 0)) end
+            function app.stop() print("stop") end
+            function app.message(event, data)
+                if event == "put" then store.set(data.key, data.value) return true end
+                if event == "get" then return store.get(data.key, data.default) end
+                if event == "types" then
+                    local v = store.get("mix")
+                    return {math.type(v.i), math.type(v.f), math.type(v.whole), type(v.s), type(v.b), type(v.list),
+                            v.null == json.null, v.list[3] == json.null}
+                end
+                if event == "runs" then store.set("runs", store.get("runs", 0) + 1) return store.get("runs") end
+            end
+        """, permissions=["store"], script=[
+            put("mix", mix), "message runs", "message runs", 'message get {"key":"mix"}', "message types",
+            "state", "restart", "state",
+            'message get {"key":"mix"}', "message types", "message runs", "state",
+            "restart", "state", "restart", "state", 'message get {"key":"runs"}'])
+        types = ["integer", "float", "float", "string", "boolean", "table", True, True]
+        self.assertEqual(replies(run), [True, 1, 2, mix, types, mix, types, 3, 3])
+        launch, first, _, second, third, last = chunks(run)
+        self.assertEqual([e["event"] for e in launch], ["log", "started", *["reply"] * 5])
+        self.assertEqual(logs(launch), ["start\t0"])
+        # A restart stops the app (stop() prints), saves what it holds (the object whose bytes the 16 KB counts), and starts the
+        # app again from the top: the values it saved are read back, whatever types they had.
+        self.assertEqual([e["event"] for e in first], ["log", "store_save", "log", "started"])
+        self.assertEqual(first[1], {"event": "store_save", "bytes": serialized({"mix": mix, "runs": 2})})
+        self.assertEqual(logs(first), ["stop", "start\t2"])
+        self.assertEqual([e["event"] for e in second], ["log", "store_save", "log", "started"])
+        self.assertEqual(second[1], {"event": "store_save", "bytes": serialized({"mix": mix, "runs": 3})})
+        self.assertEqual(logs(second), ["stop", "start\t3"])
+        self.assertEqual([e["event"] for e in third], ["log", "log", "started"])  # nothing changed: nothing to save
+        self.assertEqual([e["event"] for e in last], ["reply"])
+        self.assertEqual(saved(run), [first[1]["bytes"], second[1]["bytes"]])
+
+    def test_store_limit(self):
+        # The 16 KB is the object that is saved, counted after encoding: {"k":"..."} is the value's n bytes and 8 more.
+        lines = self.device_lines(r"""
+            local function fill(n) return ("x"):rep(n) end
+            says(store.set, "k", fill(16376))              -- {"k":"..."} is 16384 bytes
+            says(store.set, "k", fill(16377))              -- one more is refused
+            print(#store.get("k"))                         -- and the value it had is still there
+            says(store.set, "k", "y")                      -- a smaller one replaces it: the bytes it had count for nothing
+            says(store.set, "k", fill(16376))
+            store.remove("k")
+            says(store.set, "a", fill(100))                -- {"a":"...","b":"..."}: the second key's 7 bytes and its comma
+            says(store.set, "b", fill(16269))
+            says(store.set, "b", fill(16270))
+            store.remove("a") store.remove("b")
+            says(store.set, "q", ('"'):rep(8188))          -- a quote is 2 bytes once encoded: 8188 of them are 16384
+            says(store.set, "q", ('"'):rep(8189))
+            store.remove("q")
+            says(store.set, "c", ("\1"):rep(2729))         -- a control character is 6: \u0001
+            says(store.set, "c", ("\1"):rep(2730))
+        """, permissions=["store"])
+        self.assertEqual(lines, ["ok", STORE_FULL, "16376", "ok", "ok",
+                                 "ok", "ok", STORE_FULL,
+                                 "ok", STORE_FULL,
+                                 "ok", STORE_FULL])
+        # And the largest store that is taken is the largest that is saved: the bytes counted are the bytes of the object.
+        run = self.device_app("function app.start() store.set('k', ('x'):rep(16376)) end", permissions=["store"],
+                              script=["advance 2000"])
+        self.assertEqual(saved(run), [STORE_BYTES])
+
+    def test_store_saves_two_seconds_after_last_write_and_on_stop(self):
+        run = self.device_app(PUT_HANDLERS, permissions=["store"], script=[
+            put("a", 1),                                    # the first write, at 1000 on apphost's clock
+            "advance 1999", "state",                        # not yet: 2999
+            "advance 1", "state",                           # 2000 ms after the write: saved
+            "advance 60000", "state",                       # and not again: nothing has changed
+            put("a", 22), "advance 1500", put("a", 333),    # a write inside the 2 s starts them again
+            "advance 1999", "state", "advance 1", "state",
+            put("a", 4444), "stop", "state",                # a write in the last 2 s before the stop is saved by it
+            "advance 60000", "state"])
+        kinds = [[e["event"] for e in c] for c in chunks(run)]
+        self.assertEqual(kinds, [["started", "reply"], ["store_save"], [], ["reply", "reply"], ["store_save"],
+                                 ["reply", "store_save"], [], []])
+        # Each save is of what the app wrote last by then (the sizes tell the values apart).
+        self.assertEqual(saved(run), [serialized({"a": 1}), serialized({"a": 333}), serialized({"a": 4444})])
+        # What is saved is what the app wrote last: a restart reads it back.
+        again = self.device_app(PUT_HANDLERS, permissions=["store"],
+                                script=[put("a", 5), "stop", "restart", 'message get {"key":"a"}'])
+        self.assertEqual(replies(again), [True, 5])
+
+    # ---- What the brief's don't cover: saving ----
+
+    def test_a_crash_saves_what_was_written(self):
+        run = self.device_app("""
+            function app.message(event)
+                store.set("a", 1)
+                timer.after(100, function() error("boom") end)
+                return true
+            end
+        """, permissions=["store"], script=["message go", "advance 99", "advance 1", "state"], rc=1)
+        # The runtime saves as it ends the app, and apphost reports the crash once the call has returned.
+        self.assertEqual(run.kinds(), ["started", "reply", "store_save", "crash", "state"])
+        self.assertEqual(saved(run), [serialized({"a": 1})])
+
+    def test_a_store_that_did_not_change_saves_nothing(self):
+        run = self.device_app(PUT_HANDLERS, permissions=["store"], script=[
+            put("a", 1), "advance 2000", put("a", 1), "advance 2000", 'message remove "never"', "advance 2000", "stop",
+            "advance 2000"])
+        self.assertEqual(saved(run), [serialized({"a": 1})])
+        # A write of what is there is no change: it doesn't move the save either.
+        run = self.device_app(PUT_HANDLERS, permissions=["store"],
+                              script=[put("a", 1), "advance 1500", put("a", 1), "advance 500"])
+        self.assertEqual(saved(run), [serialized({"a": 1})])
+
+    def test_the_end_of_the_run_saves_what_is_left(self):
+        # The runtime that is freed saves a store that still has a change in it (an owner may have forgotten to): the last event.
+        run = self.device_app(PUT_HANDLERS, permissions=["store"], script=[put("a", 1)])
+        self.assertEqual(run.kinds(), ["started", "reply", "store_save"])
+
+    def test_the_stores_bytes_are_what_is_saved(self):
+        # The 16 KB counts what is saved, whatever the keys and values: escapes and all, after replacing and removing.
+        values = {"plain": 1, "q\"uote": "a \"b\" \\ c", "tab\there": [1.5, True, None], "café": {"k": "€\U0001f600"},
+                  "\x01": "\x1f\x7f", "k" * 32: "z" * 40, "é" * 32: 0}
+        script = [put(k, v) for k, v in values.items()]
+        script += [put("plain", "replaced and longer"), "message remove " + json.dumps("café"), "advance 2000"]
+        run = self.device_app(PUT_HANDLERS, permissions=["store"], script=script)
+        want = {k: v for k, v in values.items() if k != "café"}
+        want["plain"] = "replaced and longer"
+        self.assertEqual(saved(run), [serialized(want)])
+
+    def test_the_store_may_be_used_at_the_top_level_of_main_lua(self):  # the module is there before main.lua runs
+        main = "store.set('top', 1)\nreturn {start = function() print('top', store.get('top')) end}"
+        run = self.host(self.make_app("scratch", main, manifest={"permissions": ["store"]}), script=["restart"])
+        self.assertEqual(run.logs(), ["top\t1", "top\t1"])  # and the second launch read it back
+        self.assertEqual(saved(run), [serialized({"top": 1})])
+
+    def test_many_small_keys_are_counted_as_they_are_saved(self):
+        pairs = {f"key{i}": i for i in range(1000)}
+        run = self.device_app("""
+            function app.start() for i = 1, 1000 do store.set("key" .. (i - 1), i - 1) end end
+            function app.message(event, data) return {store.get("key999"), store.get("key0"), store.get("key500")} end
+        """, permissions=["store"], script=["advance 2000", "message get"])
+        self.assertEqual(saved(run), [serialized(pairs)])
+        self.assertEqual(replies(run), [[999, 0, 500]])
+
+    def test_launch_stop_cycles_of_a_store_app_leak_nothing(self):
+        # Each cycle loads the values the one before saved and saves them again at its end: the cache, the block the port
+        # gave and the copies a get returned are all freed by the end of the cycles (apphost counts them, to the byte).
+        run = self.host(FIXTURES / "store_check", cycles=25)
+        self.assertEqual(run.events, [{"event": "leak_check", "bytes": 0}])
+        # The cycles do load what the one before saved: the eleventh launch reads ten, and says so by crashing (which saves too).
+        run = self.device_app("""
+            function app.start()
+                local n = (store.get("n") or 0) + 1
+                store.set("n", n)
+                if n == 11 then error("the eleventh launch read ten") end
+            end
+        """, permissions=["store"], cycles=25, rc=1)
+        self.assertIn("the eleventh launch read ten", run.events[0]["message"])
+        self.assertEqual(run.events[-1], {"event": "leak_check", "bytes": 0})
+
+    def test_cycles_of_an_app_with_many_keys_and_an_unsaved_change_leak_nothing(self):
+        # Many keys, a key removed, a value replaced by a longer one, and the change the app ends with: saved by free().
+        run = self.device_app("""
+            function app.start()
+                for i = 1, 200 do store.set("key" .. i, ("v"):rep(i % 40 + 1)) end
+                store.remove("key7")
+                store.set("key8", {nested = {1, 2, 3}, text = "longer than before"})
+            end
+        """, permissions=["store"], cycles=25)
+        self.assertEqual(run.events[-1], {"event": "leak_check", "bytes": 0})
+
+    # ---- The key rules, and what a value may be ----
+
+    def test_store_keys_are_strings_of_1_to_32_characters(self):
+        lines = self.device_lines(r"""
+            local long33, key32 = ("k"):rep(33), ("k"):rep(32)
+            says(store.set, "", 1) says(store.get, "") says(store.remove, "")
+            says(store.set, long33, 1) says(store.get, long33) says(store.remove, long33)
+            says(store.set, 5, 1) says(store.get, 5) says(store.remove, 5)
+            says(store.set, nil, 1) says(store.get) says(store.remove, {})
+            says(store.set, key32, 1) print(store.get(key32))
+            says(store.set, ("\u{e9}"):rep(32), 1)          -- 32 characters, 64 bytes
+            says(store.set, ("\u{1F600}"):rep(32), 1)       -- 32 characters, 128 bytes
+            says(store.set, ("\u{e9}"):rep(33), 1)          -- 33 characters
+            says(store.set, "\255", 1) says(store.get, "\255") says(store.set, "a\0b", 1) says(store.remove, "a\0b")
+        """, permissions=["store"])
+        self.assertEqual(lines, [STORE_KEY_RULE] * 12 + ["ok", "1", "ok", "ok"] + [STORE_KEY_RULE] * 5)
+
+    def test_store_set_says_what_cannot_be_encoded(self):
+        run = self.device_app(r"""
+            function app.start()
+                says(store.set, "f", function() end)
+                says(store.set, "t", {f = print})
+                says(store.set, "n", 0/0) says(store.set, "i", math.huge)
+                says(store.set, "s", "\255")
+                says(store.set, "k", {[{}] = 1}) says(store.set, "co", coroutine.create(print))
+                local deep = "x" for i = 1, 15 do deep = {deep} end says(store.set, "d15", deep)
+                says(store.set, "d16", {deep})
+                print(store.get("f", "none"), store.get("d15") ~= nil, store.get("d16", "none"))
+            end
+            function app.message()
+                local v, n = store.get("d15"), 0
+                while type(v) == "table" do n = n + 1 v = v[1] end
+                return n
+            end
+        """, permissions=["store"], script=["restart", "message depth"])
+        # The json.encode message after "store.set: " (the bare text, as ruled). A value sits inside the store's object, so what
+        # json.encode takes 16 deep the store takes 15, and says so.
+        want = ["store.set: can't encode a function",
+                "store.set: can't encode a function",
+                "store.set: can't encode NaN or infinity", "store.set: can't encode NaN or infinity",
+                "store.set: can't encode a string that isn't valid UTF-8",
+                "store.set: can't encode a table key", "store.set: can't encode a thread",
+                "ok", "store.set: nested deeper than 15",
+                "none\ttrue\tnone"]
+        self.assertEqual(run.logs(), want * 2)  # and the restart's start() reads the same of what was saved
+        self.assertEqual(replies(run), [15])    # the value 15 deep is read back from the saved object, which is 16 deep
+
+    def test_get_returns_a_copy_and_the_default_as_it_is(self):
+        run = self.device_app("""
+            function app.start()
+                local t = {x = 1, list = {1, 2}}
+                store.set("t", t)
+                t.x = 5 t.list[1] = 5          -- the app's own table, changed after the set: the store kept what it was given
+            end
+            function app.message(event)
+                if event == "mutate" then
+                    local t = store.get("t")
+                    t.x = 99 t.list[1] = 99 t.list[#t.list + 1] = 5 t.extra = true
+                    return {store.get("t"), t}
+                end
+                if event == "identity" then
+                    local d = {}
+                    return {store.get("t") ~= store.get("t"), store.get("nope", d) == d, store.get("nope") == nil,
+                            store.get("nope", false) == false}
+                end
+            end
+        """, permissions=["store"], script=["message mutate", "message identity"])
+        (stored, mutated), identity = replies(run)
+        self.assertEqual(stored, {"x": 1, "list": [1, 2]})
+        self.assertEqual(mutated, {"x": 99, "list": [99, 2, 5], "extra": True})
+        self.assertEqual(identity, [True, True, True, True])
+
+    def test_remove_and_set_nil_delete_and_a_missing_key_is_no_error(self):
+        lines = self.device_lines("""
+            store.set("a", 1) store.set("b", 2)
+            print(store.get("a"), store.get("b"))
+            store.remove("a")
+            print(store.get("a", "gone"), store.get("b"))
+            store.remove("a") store.remove("never")                       -- nothing to remove: not an error
+            store.set("b", nil)                                           -- the Lua way to delete
+            print(store.get("b", "gone"), select("#", store.remove("b")), select("#", store.set("c", 1)))
+            store.set("c", json.null)                                     -- a null, on purpose: it is there
+            print(store.get("c") == json.null, store.get("c", "default") == json.null)
+        """, permissions=["store"])
+        self.assertEqual(lines, ["1\t2", "gone\t2", "gone\t0\t0", "true\ttrue"])
+
+    def test_the_store_is_a_plain_value_store(self):  # X17: nothing for getmetatable to open
+        lines = self.device_lines("""
+            store.set("t", {1, 2})
+            print(type(getmetatable(store.get("t"))), type(getmetatable(store)))
+        """, permissions=["store"])
+        self.assertEqual(lines, ["nil\tnil"])
+
+
+class SysTest(DeviceTestCase):
+    """The `sys` module (apps_svc.c) on apphost's port, and the commands that make it testable (`restart`, a `show` event)."""
+
+    def test_sys_show_rules(self):
+        main = BARE + """
+            local app = {}
+            local function try(label)
+                local ok, message = pcall(sys.show)
+                print(label, ok and "ok" or bare(message))
+            end
+            function app.start()
+                try("start")
+                local go = ui.button{text = "Go"}
+                go:on("tap", function() print("tapped") end)
+            end
+            function app.message(event, data)
+                if event == "show" then sys.show() print("message") return true end
+                if event == "arm" then
+                    for _, ms in ipairs(data) do timer.after(ms, function() try("after " .. ms) end) end
+                    return true
+                end
+                if event == "alarm" then alarm.after("t", 500, {sound = false}) return true end
+            end
+            function app.alarm(name) sys.show() print("alarm " .. name) end
+            return app
+        """
+        app = self.make_app("scratch", main, manifest={"permissions": ["alarm"]})
+        run = self.host(app, script=[
+            "message show",                                         # message(): allowed
+            "message arm [100]", "advance 100",                     # a timer, and no tap yet: refused (the clock is at 1100)
+            "message alarm", "advance 500",                         # alarm(): allowed
+            'tap "Go"', "message arm [9990, 10000, 10001, 10040]",  # a tap opens a window of 10 s, to the millisecond included
+            "advance 10100",
+            'tap "Go"', "message arm [9000]", "advance 9000"])      # and a tap later opens it again
+        show = {"event": "show"}
+        reply = {"event": "reply", "data": True}
+        self.assertEqual(run.events, [
+            line(f"start\t{SHOW_RULE}"), {"event": "started", "id": "scratch", "name": "scratch"},   # start() is no place for it
+            show, line("message"), reply,
+            reply, line(f"after 100\t{SHOW_RULE}"),
+            reply, {"event": "alarm", "name": "t", "sound": False, "wake": True}, show, line("alarm t"),
+            line("tapped"), reply,
+            show, line("after 9990\tok"), show, line("after 10000\tok"),
+            line(f"after 10001\t{SHOW_RULE}"), line(f"after 10040\t{SHOW_RULE}"),  # 10001 ms on: the next step of 10 ms is past it
+            line("tapped"), reply, show, line("after 9000\tok"),
+        ])
+
+    def test_sys_has_api_mem(self):
+        names = ["ui", "time", "timer", "alarm", "store", "sound", "json", "sys", "net", "secrets", "muse", "log", "os", "string",
+                 "math", "bogus", ""]
+        run = self.device_app("""
+            function app.message(event, data)
+                local out = {}
+                for i, name in ipairs(data) do out[i] = sys.has(name) end
+                local before = sys.mem()
+                local big = ("x"):rep(50 * 1024)
+                local after = sys.mem()
+                big = nil
+                local later = sys.mem()
+                return {has = out, api = sys.api, api_type = math.type(sys.api), before = before, after = after, later = later}
+            end
+        """, manifest={"memory_kb": 256}, script=["message names " + json.dumps(names)])
+        reply = replies(run)[0]
+        self.assertEqual(reply["has"], [True] * 8 + [False] * 9)  # ui time timer alarm store sound json sys, and nothing else
+        self.assertEqual((reply["api"], reply["api_type"]), (1, "integer"))
+        before, after, later = reply["before"], reply["after"], reply["later"]
+        for mem in (before, after, later):
+            self.assertEqual(sorted(mem), ["limit_kb", "peak_kb", "used_kb"])
+            self.assertEqual(mem["limit_kb"], 256)  # the manifest's memory_kb
+            self.assertTrue(1 <= mem["used_kb"] <= mem["peak_kb"] <= 256, mem)
+        self.assertGreaterEqual(after["used_kb"], before["used_kb"] + 40)  # a string of 50 KB (less what a collection took back)
+        self.assertGreaterEqual(later["peak_kb"], after["peak_kb"])        # the peak never goes down
+        lines = self.device_lines("""
+            says(sys.has) says(sys.has, nil) says(sys.has, 5) says(sys.has, {}) says(sys.has, true)
+        """)
+        self.assertEqual(lines, [f"sys.has: name must be a string, got {kind}" for kind in
+                                 ("no value", "nil", "number", "table", "boolean")])
+
+    def test_sys_exit_stops_after_callback(self):
+        run = self.device_app("""
+            function app.start() print("start") end
+            function app.stop() print("stop") end
+            function app.message(event)
+                if event == "exit" then
+                    print("before")
+                    store.set("k", 1)
+                    sys.exit()
+                    print("after")        -- the callback runs to its end
+                    return "bye"          -- and its reply is given
+                end
+                return "alive"
+            end
+        """, permissions=["store"], script=["message exit", "state", "message again", "start", "state"])
+        started = {"event": "started", "id": "scratch", "name": "scratch"}
+        self.assertEqual(run.events, [
+            line("start"), started,
+            line("before"), line("after"), {"event": "reply", "data": "bye"},
+            line("stop"), {"event": "store_save", "bytes": serialized({"k": 1})},   # then the app ends: stop(), and the store
+            {"event": "state", "state": "stopped"},
+            {"event": "error", "message": "the app is not running"},
+            line("start"), started, {"event": "state", "state": "running"},
+        ])
+
+    def test_sys_exit_in_start_and_in_a_timer(self):
+        run = self.device_app("""
+            function app.start() print("start") sys.exit() print("start ends") end
+            function app.stop() print("stop") end
+        """, script=["state", "timers"])
+        # start() runs to its end and has started the app: then the app ends, stop() included.
+        self.assertEqual(run.events, [line("start"), line("start ends"), {"event": "started", "id": "scratch", "name": "scratch"},
+                                      line("stop"), {"event": "state", "state": "stopped"}, {"event": "timers", "count": 0}])
+        run = self.device_app("""
+            function app.start()
+                timer.after(100, function() print("first") sys.exit() print("first ends") end)
+                timer.after(100, function() print("second") end)     -- due with the first: it never runs
+                timer.every(50, function() print("every") end)
+            end
+            function app.stop() print("stop") end
+        """, script=["advance 500", "state", "timers"])
+        self.assertEqual(run.logs(), ["every", "first", "first ends", "stop"])  # every at 50, then the two that are due at 100
+        self.assertEqual(run.of("state"), [{"event": "state", "state": "stopped"}])
+        self.assertEqual(run.of("timers"), [{"event": "timers", "count": 0}])
+
+    def test_sys_exit_at_the_top_level_of_main_lua_means_the_app_is_not_started(self):
+        main = "print('top') sys.exit() print('top ends') return {start = function() print('start') end}"
+        run = self.host(self.make_app("scratch", main), script=["state"])
+        self.assertEqual(run.logs(), ["top", "top ends"])
+        self.assertEqual(run.kinds(), ["log", "log", "state"])
+        self.assertEqual(run.of("state"), [{"event": "state", "state": "stopped"}])
+
+    def test_permissions(self):
+        lines = self.device_lines("""
+            says(store.get, 5) says(store.set, 5, 1) says(store.remove, 5)
+            says(store.get, "k") says(store.set, "k", function() end) says(store.remove, "k")
+        """, permissions=[])
+        # The permission is the first thing checked: before the key and before the value.
+        self.assertEqual(lines, [STORE_PERMISSION] * 6)
+        calls = """
+            says(sys.keep_awake, true) says(sys.keep_awake, false) says(sys.keep_awake, "x") says(sys.keep_awake)
+        """
+        self.assertEqual(self.device_lines(calls, permissions=["store", "alarm", "sound"]), [KEEP_AWAKE_PERMISSION] * 4)
+        self.assertEqual(self.device_lines(calls, permissions=["keep_awake"]), [
+            "ok", "ok", "sys.keep_awake: on must be true or false, got string",
+            "sys.keep_awake: on must be true or false, got no value"])
+        # The rest of sys needs none.
+        lines = self.device_lines("""
+            says(sys.battery) says(sys.wifi) says(sys.has, "net") says(sys.mem) says(sys.log, "x")
+        """, permissions=[])
+        self.assertEqual(lines, ["ok", "ok", "ok", "ok", "x", "ok"])  # sys.log prints "x" itself, then says prints its "ok"
+
+    def test_sys_battery_wifi_log(self):  # C33
+        run = self.device_app("""
+            function app.start()
+                sys.log("a", 1)
+                print("p", 2)
+                sys.log()
+                sys.log("x\\ny", nil, true, {} == {})
+            end
+            function app.message()
+                local a, b, w = sys.battery(), sys.battery(), sys.wifi()
+                return {battery = a, wifi = w, fresh = a ~= b, plain = getmetatable(a) == nil and getmetatable(w) == nil,
+                        pct_type = math.type(a.pct)}
+            end
+        """, script=["message report", "log"])
+        # sys.log is print: the same lines, in the same ring, in order with print's.
+        lines = ["a\t1", "p\t2", "", "x", "y\tnil\ttrue\tfalse"]
+        self.assertEqual(run.logs(), lines + lines)  # as printed, and as the log command shows the ring
+        self.assertEqual(replies(run), [{"battery": HOST_BATTERY, "wifi": HOST_WIFI, "fresh": True, "plain": True,
+                                         "pct_type": "integer"}])
+
+    def test_sys_log_and_print_make_the_same_lines(self):
+        lines = self.device_lines(r"""
+            local words = {"plain", "tab\there", "bell\7bell", "nl\nnl", "\255bad", ("w"):rep(250), "\u{85}c1", ""}
+            for _, w in ipairs(words) do print("p", w) end
+            print(1, 2.5, true, nil, {} ~= nil)
+            print("--")
+            for _, w in ipairs(words) do sys.log("p", w) end
+            sys.log(1, 2.5, true, nil, {} ~= nil)
+        """)
+        cut = lines.index("--")
+        self.assertGreater(cut, 8)
+        self.assertEqual(lines[:cut], lines[cut + 1:])
+
+    def test_there_is_no_log_global(self):  # the rulings: logging is print and sys.log
+        lines = self.device_lines("""
+            local ok, message = pcall(function() return log end)
+            print(ok, bare(message):find("unknown global 'log'", 1, true) ~= nil)
+            print(sys.has("log"), type(sys.log), type(print))
+        """)
+        self.assertEqual(lines, ["false\ttrue", "false\tfunction\tfunction"])
+
+    def test_keep_awake_with_its_permission_is_accepted(self):
+        # apphost's port only records it (nothing on a laptop sleeps); the C cases of the runtime harness count the calls.
+        lines = self.device_lines("sys.keep_awake(true) sys.keep_awake(false) print('fine')", permissions=["keep_awake"])
+        self.assertEqual(lines, ["fine"])
+
+    def test_restart_stops_frees_and_starts_a_new_runtime(self):
+        run = self.handler_app("""
+            local runs = 0
+            print("top")
+            function app.start() runs = runs + 1 print("start", runs) end
+            function app.stop() print("stop") end
+        """, script=["restart", "state", "restart", "stop", "restart", "state", "restart extra"])
+        # Each restart is stop() (if the app was running), a new runtime (main.lua's top level runs again, its locals are new),
+        # then start(): `runs` is 1 every time. After a stop() there is nothing to stop.
+        self.assertEqual(run.logs(), ["top", "start\t1",
+                                      "stop", "top", "start\t1",        # restart
+                                      "stop", "top", "start\t1",        # restart
+                                      "stop",                           # stop
+                                      "top", "start\t1"])               # restart of a stopped app
+        self.assertEqual(run.kinds().count("started"), 4)
+        self.assertEqual(run.messages("error"), ["restart takes no arguments"])
+        self.assertEqual([e["state"] for e in run.of("state")], ["running", "running"])
+
+    def test_restart_after_a_crash_makes_a_fresh_app(self):
+        run = self.handler_app("""
+            function app.start() print("start") end
+            function app.message(event)
+                if event == "boom" then timer.after(50, function() error("boom") end) return true end
+                return "fine"
+            end
+        """, script=["message boom", "advance 50", "state", "restart", "state", "message ok"])
+        self.assertEqual(run.of("state"), [{"event": "state", "state": "crashed"}, {"event": "state", "state": "running"}])
+        self.assertEqual(run.logs(), ["start", "start"])
+        self.assertEqual(replies(run), [True, "fine"])
+        self.assertEqual(len(run.of("crash")), 1)
+
+    def test_restart_tells_the_alarms_of_an_app_that_stopped(self):
+        # As the stop command does: a ring only this app could stop ends with it, there and then, and not at its minute's end.
+        main = BARE + """
+            local app = {}
+            function app.start() if time.mono() < 1500 then alarm.after("t", 1000) end end
+            return app
+        """
+        run = self.host(self.make_app("scratch", main, manifest={"permissions": ["alarm"]}),
+                        script=["advance 1000", "restart", "advance 100000"])
+        self.assertEqual(run.kinds(), ["started", "alarm", "ring", "ring", "started"])
+        self.assertEqual(run.of("ring"), [{"event": "ring", "on": True}, {"event": "ring", "on": False}])
+
+
 class SvcStaticTest(unittest.TestCase):
     def test_the_binding_tables_are_named_as_the_guide_test_reads_them(self):  # X8
         source = (APPS / "apps_svc.c").read_text()
@@ -1489,12 +2064,20 @@ class SvcStaticTest(unittest.TestCase):
                  "apps_timer_funcs": ["after", "every", "cancel"],
                  "apps_timer_methods": ["cancel"],
                  "apps_alarm_funcs": ["after", "cancel", "remaining", "list"],
-                 "apps_sound_funcs": ["chirp", "stop"]}
+                 "apps_sound_funcs": ["chirp", "stop"],
+                 "apps_store_funcs": ["get", "set", "remove"],
+                 "apps_sys_funcs": ["battery", "wifi", "show", "keep_awake", "has", "mem", "exit", "log"]}
         for table, functions in names.items():
             with self.subTest(table):
                 body = re.search(rf"static const luaL_Reg {table}\[\] = \{{(.*?)\n\}};", source, re.S)
                 self.assertIsNotNone(body, f"no `static const luaL_Reg {table}[]`")
                 self.assertEqual(re.findall(r'\{"(\w+)",', body.group(1)), functions)
+
+    def test_there_is_no_log_module(self):  # the rulings: logging is print and sys.log, so no apps_log_funcs and no `log` global
+        source = (APPS / "apps_svc.c").read_text()
+        self.assertNotIn("apps_log_funcs", source)
+        self.assertNotRegex(source, r'lua_setglobal\(L, "log"\)')
+        self.assertRegex(source, r'\{"log", sys_log\}')
 
     def test_the_handle_metatable_is_protected(self):  # X17
         source = (APPS / "apps_svc.c").read_text()
@@ -1547,7 +2130,7 @@ class SvcStaticTest(unittest.TestCase):
         source = (APPS / "apps_svc.c").read_text()
         functions = re.findall(r"^static int (\w+)\(lua_State \*L\) \{\n(.*?)^\}", source, re.S | re.M)
         bindings = [(name, body) for name, body in functions if re.search(rf'\{{"\w+", {name}\}}', source)]
-        self.assertGreaterEqual(len(bindings), 12)
+        self.assertGreaterEqual(len(bindings), 25)
         for name, body in bindings:
             with self.subTest(name):
                 self.assertTrue(body.lstrip().startswith("apps_vm_check(L);"), f"{name} doesn't start with apps_vm_check(L)")
@@ -1596,6 +2179,38 @@ class SvcHarnessTest(unittest.TestCase):
         # that cannot land in the calendar are refused before anything is charged (the host's C library would refuse them too, so
         # that only shows in what is counted).
         self.run_case("os_time_charge")
+
+    # The store and sys (Task 18), where a script can't reach: the runtime's own API, an exact clock, a heap that refuses, the port's answers.
+
+    def test_the_store_at_the_runtimes_own_api(self):
+        # Set, get and remove; the key rules (characters of valid UTF-8, no NUL); the 16 KB to the byte on both sides of it; the object
+        # that is saved, key escapes, order and length as the port is given them.
+        self.run_case("store_api")
+
+    def test_when_the_store_is_saved(self):
+        # 2 s after the last change (a change inside the wait starts it again; one that changes nothing doesn't), dark or lit, never as a
+        # call; 2 s after a save the port refused; and when the app ends (stop, a crash, a crash in main.lua, free), asked once.
+        self.run_case("store_flush")
+
+    def test_what_a_load_makes_of_what_the_port_gives(self):
+        # The keys, the last of a key that is there twice, none of one the store doesn't write; an empty store and a line in the log for
+        # an object it didn't write; no app at all when the port can't give it; no question for an app without the permission.
+        self.run_case("store_load")
+
+    def test_the_store_survives_a_heap_that_refuses_at_every_step(self):
+        # No app, never an empty store in the real one's place, for a refusal in the load; the app out of memory or a call that failed
+        # alone for one in the app; and every object that is saved is the real one with the changes. Nothing held at the end of each.
+        self.run_case("store_refused")
+
+    def test_sys_at_the_runtime_with_the_ports_answers(self):
+        # A battery with no percentage is no field and one past 100 is 100; a Wi-Fi name is clean text, "" with no network, 32 bytes at
+        # most; keep_awake, show and exit go to the port; the exit lets the callback run to its end; mem.
+        self.run_case("sys_services")
+
+    def test_sys_show_at_the_runtimes_clock(self):
+        # Allowed in message() (a coroutine of it too) and alarm(), refused in start(); a touch opens 10 s, the 10th second included
+        # and not a millisecond past it, whatever the touch found; never before a touch, the clock a long way from 0.
+        self.run_case("show_window")
 
     # The duty cycle's windows, which apphost's 10 ms steps close one at a time and so can't show: here the clock jumps, the
     # calls come when the case says, and they take the time the case says (apphost's clock stands still inside a call).

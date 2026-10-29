@@ -307,6 +307,65 @@ class AppTaskTest(HarnessCase):
     def test_a_run_for_alarms_that_are_gone_replaces_nothing(self):  # D: the app task asks too, before it replaces the app that runs
         self.run_case("a_run_for_alarms_that_are_gone_replaces_nothing")
 
+    # ---- Task 18: sys and the store on the app task, and the worker's ops ----
+
+    def test_sys_exit_ends_the_app_after_the_callback(self):  # C10: the callback runs to its end, its reply is given, stop() runs
+        self.run_case("sys_exit_ends_the_app_after_the_callback")
+
+    def test_sys_exit_in_a_timer_runs_no_other_callback(self):  # one timer a round, and the app is gone after the first
+        self.run_case("sys_exit_in_a_timer_runs_no_other_callback")
+
+    def test_sys_exit_before_the_run_settles_fails_the_run(self):  # top level (never started) and start() (stop() follows)
+        self.run_case("sys_exit_before_the_run_settles_fails_the_run")
+
+    def test_keep_awake_pokes_the_idle_timer_while_the_app_is_in_front(self):  # at most once a second; not behind; off at the end
+        self.run_case("keep_awake_pokes_the_idle_timer_while_in_front")
+
+    def test_sys_show_asks_for_the_front(self):  # C11
+        self.run_case("sys_show_asks_for_the_front")
+
+    def test_the_store_is_saved_through_the_worker_two_seconds_after_the_last_change(self):  # X11, the strict debounce
+        self.run_case("the_store_is_saved_through_the_worker_two_seconds_after_the_last_change")
+
+    def test_the_loop_wakes_for_the_store_save(self):  # the loop's wait ends at the save's time, not a round later
+        self.run_case("the_loop_wakes_for_the_store_save")
+
+    def test_a_stop_saves_and_the_next_run_reads_it_even_when_the_save_is_slow(self):  # the ops' order: load after save
+        self.run_case("a_stop_saves_and_the_next_run_reads_it_after_a_slow_save")
+
+    def test_sys_exit_saves_the_store(self):
+        self.run_case("sys_exit_saves_the_store")
+
+    def test_a_save_the_worker_refuses_is_asked_for_again_at_the_next_tick(self):  # X11: a refused flush retries
+        self.run_case("a_refused_save_is_asked_for_again_at_the_next_tick")
+
+    def test_a_final_save_that_cannot_be_queued_is_logged_and_lost(self):  # X11: what happens when it can't be submitted at stop
+        self.run_case("a_final_save_that_cannot_be_queued_is_logged_and_lost")
+
+    def test_a_store_that_cannot_be_read_refuses_the_launch(self):  # never an app with an empty store over the real one
+        self.run_case("a_store_that_cannot_be_read_refuses_the_launch")
+
+    def test_a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second(self):  # every wait bounded; the request is the worker's
+        self.run_case("a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second")
+
+    def test_the_io_worker_runs_ops_in_order_between_jobs(self):
+        self.run_case("io_ops_run_in_order_between_jobs")
+
+    def test_a_job_of_the_worker_that_waits_runs_the_ops_as_it_looks(self):  # a launch's load of the store would deadlock without it
+        self.run_case("io_ops_run_while_a_job_that_waits_assists")
+
+    def test_the_io_workers_ops_are_bounded(self):
+        self.run_case("io_ops_are_bounded")
+
+    def test_an_op_with_no_worker_and_no_room_for_one_is_refused(self):  # nothing could ever run it
+        self.run_case("io_op_with_no_worker_and_no_room_is_refused")
+
+    def test_an_op_for_a_worker_that_runs_waits_for_its_job_when_the_nudge_is_refused(self):
+        self.run_case("io_op_for_a_worker_that_runs_waits_for_its_job")
+
+    def test_an_op_for_an_idle_worker_runs_when_its_wait_ends_and_the_worker_stays_for_it(self):
+        self.run_case("io_op_for_an_idle_worker_runs_at_the_end_of_its_wait")
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))
@@ -418,6 +477,14 @@ class AppTaskStoreTest(HarnessCase):
 
     def test_a_launch_given_up_at_the_backstop_lets_the_next_apps_be_asked_for_in_the_same_round(self):  # and so is the backstop's
         self.run_case("a_launch_given_up_at_the_backstop_lets_the_next_apps_be_asked_for_in_the_same_round")
+
+    # ---- Task 18: the store and a launch that is a job of the worker ----
+
+    def test_a_launch_of_a_store_app_does_not_wait_for_its_own_load(self):  # the launch job assists: the load is an op of the same worker
+        self.run_case("a_launch_of_a_store_app_does_not_wait_for_its_own_load")
+
+    def test_an_alarm_launch_of_an_app_that_exits_in_start_is_given_up(self):  # no relaunch for ever, as for a crash in start()
+        self.run_case("an_alarm_launch_of_an_app_that_exits_in_start_is_given_up")
 
 
 if __name__ == "__main__":

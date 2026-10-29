@@ -75,6 +75,14 @@
  * (apps_alarm_app_ended), whose ring ends with the app that was told it unless a firing with sound still waits. What the esp_timer
  * task and these calls record to log is printed here, in housekeeping and after each call (apps_alarm_log_drain).
  *
+ * The store. An app's values are the runtime's cache (apps_rt.h), loaded when the runtime is made and saved through the port
+ * (apps_port.h), whose work is the I/O worker's (X11). The loop saves what is due each round (apps_rt_store_tick), and its wait is
+ * shortened to the time a save is due (apps_rt_next_deadline), dark or lit. The load, inside apps_rt_new, waits for the worker at most
+ * APPS_STORE_WAIT_MS, inside the supervisor's 3 s. A launch is itself a job of the worker, which waits for this task, so that load can't
+ * wait behind it: it is an op, which the worker runs between jobs and a job that waits here runs as it looks (apps_io_assist, called by
+ * the waits of the callers). An app's end saves the rest (apps_rt_stop after stop(), the crash, apps_rt_free), the order of the ops
+ * keeping the next launch's load after that save.
+ *
  * An app's end (stop, a new run, sys.exit, a crash, a hang) is one order, the rulings': the pending request is
  * answered; the table is unpublished (apps_lv_set_ui(NULL) under the UI lock); the record takes the crash record,
  * the log and the widget dump; the runtime is freed; the LVGL task is asked to reset the layer (apps_lv_reset) and
@@ -149,7 +157,6 @@ typedef enum {
     APPS_EV_SHOW,       /* the layer came to the front: show() */
     APPS_EV_HIDE,       /* it went behind: hide() */
     APPS_EV_ALARM,      /* an alarm fired (apps_alarm.h): brings the loop round, which delivers; no payload */
-    APPS_EV_EXIT,       /* sys.exit() (Task 18): the app ends once the current callback returns */
     APPS_EV_WAKE,       /* the LVGL task ran a reset the app task waits for, or the screen was lit: the round's housekeeping */
     APPS_EV_ALARM_LAUNCH,  /* the I/O worker's launch for an app's alarms is over: code the outcome (apps_alarm_launch_t), app_gen its identity */
 } apps_event_type_t;
@@ -279,3 +286,20 @@ bool apps_task_running(char *id, size_t cap);
  */
 char *apps_task_message(const char *id, const char *event, const char *data_json, bool show, int timeout_ms, char *err,
                         size_t err_len);
+
+/*
+ * What sys asks of the app task, from inside a call of the app (apps_port.h's apps_port_show, apps_port_keep_awake and apps_port_exit
+ * are these). Only the app task calls them: they touch the app task's own state.
+ * - apps_task_show: the layer is asked to the front, through the door of every front (request_front: held back during a voice turn).
+ * - apps_task_keep_awake: while on, and the layer is in front, the loop's housekeeping pokes the idle timer (muse_state_poke) about once a
+ *   second (never oftener, and the loop comes round at least each second, so never more than 2 s apart), so the screen isn't let go dark
+ *   for being idle. It is off again when the app ends.
+ * - apps_task_exit: the app ends, as END_EXITED, once the call it was asked in has returned (call_end): that callback runs to its end,
+ *   its reply is given, stop() runs, the store is saved, and no other callback of the app runs after it, a timer due in the same round
+ *   included. At main.lua's top level it means the app is never started; in start(), that it ends after it. A run that hasn't settled
+ *   by then (those two, or a callback in the first moments of its settle) is answered as failed, "the app exited (sys.exit)", so that
+ *   the developer's run says what happened and an alarm's launch of the app is given up on as for any app that didn't run.
+ */
+void apps_task_show(void);
+void apps_task_keep_awake(bool on);
+void apps_task_exit(void);

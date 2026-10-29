@@ -28,6 +28,7 @@
 #include <time.h>
 
 #include "apps_alarm.h"
+#include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_vm.h"
@@ -35,12 +36,15 @@
 #include "lua.h"
 
 /*
- * The `time`, `os`, `timer`, `alarm` and `sound` modules (apps_svc.h says what they do). Every binding calls apps_vm_check first and runs
+ * The `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` modules (apps_svc.h says what they do). Every binding calls apps_vm_check first and runs
  * inside a call of the app, so what allocates in the app's heap (a table, a string, a handle, a registry reference) may be
  * refused and ends the app out of memory, as everywhere else. The clocks are the port's (apps_port.h): the wall clock is the
  * port's epoch, and the zone is the C library's (TZ), which the watch sets on the gadget (muse_clock_build) and apphost sets
  * to UTC. What a timer is lives in the runtime; the handle here is a slot and a gen. An alarm is the system's (apps_alarm.h):
- * the port keeps it, named by the app's id and a name of the app's, and there is no handle.
+ * the port keeps it, named by the app's id and a name of the app's, and there is no handle. The store's values are the runtime's
+ * (apps_rt.h: a cache of each value's JSON, saved through the port), and so are sys.show's rule and sys.log, which is print; the
+ * battery, the Wi-Fi, the front, the screen's keep-awake and the exit are the port's (apps_port.h). None of them makes a handle:
+ * what store.get, sys.battery and sys.wifi return is plain tables, afresh each time.
  *
  * Stack, under app code: the formatter's output buffer (136 bytes) and a struct tm are the largest frames, in the bindings
  * of time.format and os.date.
@@ -50,6 +54,18 @@
 #define STR(x) STR_(x)
 
 #define TIMER_MT "muse.timer"
+
+/* The store: a lookup walks this many keys for an instruction of the call's budget (no count hook fires inside it), a value may be
+ * this many containers deep (the saved object is the first level), and the limit as the message says it. */
+#define STORE_KEYS_PER_INSTR 32
+#define STORE_VALUE_DEPTH 15
+#define STORE_KB 16
+_Static_assert(STORE_VALUE_DEPTH == APPS_JSON_MAX_DEPTH - 1, "a stored value sits one level down, inside the saved object");
+_Static_assert(STORE_KB * 1024 == APPS_STORE_MAX_BYTES, "the message says the limit in whole KB");
+
+/* A network name is at most this long (MUSE_SSID_MAX), and the API's number is sys.api. */
+#define SSID_MAX 32
+#define SYS_API 1
 
 /* The longest result of time.format and os.date, in bytes. A longer one is an error, never cut. */
 #define FORMAT_MAX 128
@@ -531,13 +547,17 @@ static int timer_tostring(lua_State *L) {
 
 /* ---- alarm ---- */
 
-/* Raises the module's message unless the manifest gives the app its permission (the module and its permission are named
- * alike: "alarm", "sound"). Upvalue 1 is the runtime. */
-static void need(lua_State *L, unsigned perm, const char *module) {
+/* Raises the module's message unless the manifest gives the app its permission. Upvalue 1 is the runtime. The module and its
+ * permission are named alike ("alarm", "sound", "store"), except for sys's one (need_as). */
+static void need_as(lua_State *L, unsigned perm, const char *module, const char *permission) {
     apps_rt_t *rt = lua_touserdata(L, lua_upvalueindex(1));
     if (!apps_rt_permits(rt, perm)) {
-        luaL_error(L, "%s: add \"%s\" to \"permissions\" in manifest.json", module, module);
+        luaL_error(L, "%s: add \"%s\" to \"permissions\" in manifest.json", module, permission);
     }
+}
+
+static void need(lua_State *L, unsigned perm, const char *module) {
+    need_as(L, perm, module, module);
 }
 
 #define ALARM_MS_RULE "ms must be a whole number from 1 to " STR(APPS_ALARM_MAX_MS)
@@ -675,6 +695,199 @@ static int sound_stop(lua_State *L) {
     return 0;
 }
 
+/* ---- store ---- */
+
+/* The key at idx: a string of 1 to 32 characters (apps_rt_store_key_valid). A number isn't taken for text. */
+static const char *store_key(lua_State *L, int idx, size_t *len) {
+    const char *key = lua_type(L, idx) == LUA_TSTRING ? lua_tolstring(L, idx, len) : NULL;
+    if (key == NULL || !apps_rt_store_key_valid(key, *len)) {
+        luaL_error(L, "store: key must be a string of 1 to " STR(APPS_STORE_KEY_MAX) " characters");
+    }
+    return key;
+}
+
+/* store.get(key, default), upvalue 1 the runtime: the value, decoded afresh from its text (so it is a copy, and what the app does to
+ * it changes nothing the store holds); the default, as it is, for a key that isn't there. */
+static int store_get(lua_State *L) {
+    apps_vm_check(L);
+    need(L, APPS_PERM_STORE, "store");
+    apps_rt_t *rt = lua_touserdata(L, lua_upvalueindex(1));
+    size_t key_len = 0;
+    const char *key = store_key(L, 1, &key_len);
+    apps_vm_charge(L, apps_rt_store_count(rt) / STORE_KEYS_PER_INSTR);  /* the walk over the keys, which no count hook sees */
+    size_t len;
+    const char *text = apps_rt_store_get(rt, key, key_len, &len);
+    if (text == NULL) {
+        lua_settop(L, 2);  /* the default, nil if there is none */
+        return 1;
+    }
+    char bare[96];
+    if (!apps_json_push(L, text, len, bare, sizeof bare)) {
+        return luaL_error(L, "store: a saved value can't be read: %s", bare);  /* not reachable: the text is the encoder's, or was checked */
+    }
+    return 1;
+}
+
+/* store.set(key, value), upvalue 1 the runtime: the value is encoded (the same JSON as json.encode, and its errors, without its
+ * prefix) and kept; nil removes the key. The saved object holds it one level down, so the value is encoded inside a one-element
+ * array, which takes one of the encoder's 16 levels: a value may be 15 deep, and the error says 15. */
+static int store_set(lua_State *L) {
+    apps_vm_check(L);
+    need(L, APPS_PERM_STORE, "store");
+    apps_rt_t *rt = lua_touserdata(L, lua_upvalueindex(1));
+    size_t key_len = 0;
+    const char *key = store_key(L, 1, &key_len);
+    apps_vm_charge(L, apps_rt_store_count(rt) / STORE_KEYS_PER_INSTR);
+    if (lua_isnoneornil(L, 2)) {
+        apps_rt_store_remove(rt, key, key_len);
+        return 0;
+    }
+    lua_settop(L, 2);
+    lua_createtable(L, 1, 0);
+    lua_pushvalue(L, 2);
+    lua_rawseti(L, -2, 1);
+    char bare[96];
+    size_t len = 0;
+    char *text = apps_json_encode_value(L, -1, apps_port_realloc, &len, bare, sizeof bare);
+    if (text == NULL) {
+        if (strcmp(bare, "out of memory") == 0) {  /* the port's heap, not Lua's (that raises): the same try-again as the alarms' */
+            return luaL_error(L, "store.set: the gadget is short of memory; try again");
+        }
+        if (strcmp(bare, "nested deeper than " STR(APPS_JSON_MAX_DEPTH)) == 0) {
+            return luaL_error(L, "store.set: nested deeper than " STR(STORE_VALUE_DEPTH));
+        }
+        return luaL_error(L, "store.set: %s", bare);
+    }
+    apps_store_result_t result = apps_rt_store_set(rt, key, key_len, text + 1, len - 2);  /* without the array's brackets */
+    apps_port_free(text);
+    if (result == APPS_STORE_FULL) {
+        return luaL_error(L, "store: more than " STR(STORE_KB) " KB stored; remove keys you don't need");
+    }
+    if (result != APPS_STORE_OK) {  /* APPS_STORE_NO_MEMORY: the key was checked above */
+        return luaL_error(L, "store.set: the gadget is short of memory; try again");
+    }
+    return 0;
+}
+
+/* store.remove(key), upvalue 1 the runtime: nothing for a key that isn't there. */
+static int store_remove(lua_State *L) {
+    apps_vm_check(L);
+    need(L, APPS_PERM_STORE, "store");
+    apps_rt_t *rt = lua_touserdata(L, lua_upvalueindex(1));
+    size_t key_len = 0;
+    const char *key = store_key(L, 1, &key_len);
+    apps_vm_charge(L, apps_rt_store_count(rt) / STORE_KEYS_PER_INSTR);
+    apps_rt_store_remove(rt, key, key_len);
+    return 0;
+}
+
+/* ---- sys ---- */
+
+/* sys.battery(): {pct, charging, usb}; no pct when the gadget can't tell. */
+static int sys_battery(lua_State *L) {
+    apps_vm_check(L);
+    apps_battery_t battery = apps_port_battery();
+    lua_createtable(L, 0, 3);
+    if (battery.pct >= 0) {
+        lua_pushinteger(L, battery.pct > 100 ? 100 : battery.pct);
+        lua_setfield(L, -2, "pct");
+    }
+    lua_pushboolean(L, battery.charging);
+    lua_setfield(L, -2, "charging");
+    lua_pushboolean(L, battery.usb);
+    lua_setfield(L, -2, "usb");
+    return 1;
+}
+
+/* sys.wifi(): {connected, ssid}, the ssid "" when it isn't connected. A network's name is bytes from the air, so it is cleaned as any
+ * text from outside is (apps_text_clean). */
+static int sys_wifi(lua_State *L) {
+    apps_vm_check(L);
+    char ssid[SSID_MAX + 1] = "";
+    bool connected = apps_port_wifi(ssid, sizeof ssid);
+    ssid[SSID_MAX] = '\0';
+    size_t len = connected ? apps_text_clean(ssid, strlen(ssid), false) : 0;
+    lua_createtable(L, 0, 2);
+    lua_pushboolean(L, connected);
+    lua_setfield(L, -2, "connected");
+    lua_pushlstring(L, ssid, len);
+    lua_setfield(L, -2, "ssid");
+    return 1;
+}
+
+/* sys.show(), upvalue 1 the runtime: ask for the front, in message() and alarm() and for 10 s after a tap (apps_rt_show_allowed). */
+static int sys_show(lua_State *L) {
+    apps_vm_check(L);
+    if (!apps_rt_show_allowed(lua_touserdata(L, lua_upvalueindex(1)))) {
+        return luaL_error(L, "sys.show: allowed only in message() or alarm(), or within 10 s of a tap");
+    }
+    apps_port_show();
+    return 0;
+}
+
+/* sys.keep_awake(on), upvalue 1 the runtime: needs the "keep_awake" permission, which the message names under sys. */
+static int sys_keep_awake(lua_State *L) {
+    apps_vm_check(L);
+    need_as(L, APPS_PERM_KEEP_AWAKE, "sys", "keep_awake");
+    if (lua_type(L, 1) != LUA_TBOOLEAN) {
+        return luaL_error(L, "sys.keep_awake: on must be true or false, got %s", luaL_typename(L, 1));
+    }
+    apps_port_keep_awake(lua_toboolean(L, 1) != 0);
+    return 0;
+}
+
+/* The gadget's own modules, what sys.has says yes to: not Lua's libraries, and none of the ones that aren't there yet. */
+static const char *const HAS[] = {"ui", "time", "timer", "alarm", "store", "sound", "json", "sys"};
+
+/* sys.has(name): whether the gadget has the module of that name. */
+static int sys_has(lua_State *L) {
+    apps_vm_check(L);
+    if (lua_type(L, 1) != LUA_TSTRING) {
+        return luaL_error(L, "sys.has: name must be a string, got %s", luaL_typename(L, 1));
+    }
+    size_t len;
+    const char *name = lua_tolstring(L, 1, &len);
+    bool has = false;
+    for (size_t i = 0; i < sizeof HAS / sizeof HAS[0]; i++) {
+        has = has || (strlen(HAS[i]) == len && memcmp(HAS[i], name, len) == 0);
+    }
+    lua_pushboolean(L, has);
+    return 1;
+}
+
+static lua_Integer kb(size_t bytes) {
+    return (lua_Integer)((bytes + 1023) / 1024);
+}
+
+/* sys.mem(): {used_kb, peak_kb, limit_kb} of the Lua heap, as the status reports it (rounded up). */
+static int sys_mem(lua_State *L) {
+    apps_vm_check(L);
+    apps_rt_t *rt = lua_touserdata(L, lua_upvalueindex(1));
+    const apps_vm_t *vm = apps_rt_vm(rt);
+    lua_Integer used = kb(apps_vm_mem_used(vm)), peak = kb(apps_vm_mem_peak(vm));
+    lua_createtable(L, 0, 3);
+    lua_pushinteger(L, used);
+    lua_setfield(L, -2, "used_kb");
+    lua_pushinteger(L, peak);
+    lua_setfield(L, -2, "peak_kb");
+    lua_pushinteger(L, (lua_Integer)apps_rt_memory_kb(rt));
+    lua_setfield(L, -2, "limit_kb");
+    return 1;
+}
+
+/* sys.exit(): the app ends once this callback has returned (apps_port_exit). */
+static int sys_exit(lua_State *L) {
+    apps_vm_check(L);
+    apps_port_exit();
+    return 0;
+}
+
+/* sys.log(...): print. */
+static int sys_log(lua_State *L) {
+    apps_vm_check(L);
+    return apps_rt_print(L);
+}
+
 /* ---- The modules ---- */
 
 static const luaL_Reg apps_time_funcs[] = {
@@ -720,12 +933,31 @@ static const luaL_Reg apps_sound_funcs[] = {
     {NULL, NULL},
 };
 
+static const luaL_Reg apps_store_funcs[] = {
+    {"get", store_get},
+    {"set", store_set},
+    {"remove", store_remove},
+    {NULL, NULL},
+};
+
+static const luaL_Reg apps_sys_funcs[] = {
+    {"battery", sys_battery},
+    {"wifi", sys_wifi},
+    {"show", sys_show},
+    {"keep_awake", sys_keep_awake},
+    {"has", sys_has},
+    {"mem", sys_mem},
+    {"exit", sys_exit},
+    {"log", sys_log},
+    {NULL, NULL},
+};
+
 static const luaL_Reg apps_timer_meta[] = {
     {"__tostring", timer_tostring},
     {NULL, NULL},
 };
 
-/* Runs under lua_pcall: the five globals and the timer handle's metatable. */
+/* Runs under lua_pcall: the seven globals and the timer handle's metatable. */
 static int open_svc(lua_State *L) {
     apps_rt_t *rt = lua_touserdata(L, 1);
     lua_settop(L, 0);
@@ -765,6 +997,20 @@ static int open_svc(lua_State *L) {
     lua_pushlightuserdata(L, rt);
     luaL_setfuncs(L, apps_sound_funcs, 1);
     lua_setglobal(L, "sound");
+
+    /* store and sys make no handle either: plain tables of functions, which take the runtime for the app's id, permissions and
+     * cache. There is no `log` global: logging is print and sys.log. */
+    lua_createtable(L, 0, 3);
+    lua_pushlightuserdata(L, rt);
+    luaL_setfuncs(L, apps_store_funcs, 1);
+    lua_setglobal(L, "store");
+
+    lua_createtable(L, 0, 9);
+    lua_pushlightuserdata(L, rt);
+    luaL_setfuncs(L, apps_sys_funcs, 1);
+    lua_pushinteger(L, SYS_API);
+    lua_setfield(L, -2, "api");
+    lua_setglobal(L, "sys");
     return 0;
 }
 

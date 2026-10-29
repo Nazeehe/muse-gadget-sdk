@@ -122,3 +122,50 @@ void apps_port_sound_chirp(void);
 
 /* Ends the ring of an alarm that is going. Nothing when none is. */
 void apps_port_sound_stop(void);
+
+/*
+ * The store of an app (the `store` module), which the runtime caches and saves (apps_rt.h): one JSON object an app, of at most 16 KB,
+ * written by the runtime and read back by it, whole. The device keeps the objects behind the I/O worker (X11: no flash or NVS from
+ * a task with a PSRAM stack, reads included), in a map in PSRAM until Task 20 gives them flash (they survive an app's restart, not
+ * the gadget's); apphost keeps them in the process.
+ */
+
+/* How long a load waits for the worker at most. The app task's call is watched for APPS_TASK_HUNG_MS (3 s), and the load is made
+ * inside the launch's. */
+#define APPS_STORE_WAIT_MS 1000
+
+/* The object saved for `app`, as a block of apps_port_realloc with a NUL after its *len bytes, which the caller frees with
+ * apps_port_free; "{}" when nothing is saved. NULL, with *len 0, when it can't be had: no memory, or the worker didn't answer within
+ * APPS_STORE_WAIT_MS (a launch is then refused, and never starts with an empty store, which a later save would put in place of the
+ * real one). Whatever was saved before this call is read, in the order the calls were made (a restart's load comes after the
+ * stop's save). The app task, outside any call of the app. */
+char *apps_port_store_load(const char *app, size_t *len);
+
+/* Saves json[0, len), one JSON object, as `app`'s store, in place of what was there. The bytes are copied before this returns and
+ * written on the worker, in the order of the calls. True when that is queued, false when it isn't (the worker's queue is full, or no
+ * memory, or the object is more than APPS_STORE_MAX_BYTES, which the runtime never makes): the caller tries again later (a periodic save)
+ * or gives up (the last one, when the app ends). The app task. */
+bool apps_port_store_save(const char *app, const char *json, size_t len);
+
+/* The battery, as muse_state_power() has it: pct in 0 to 100, or -1 when there is none or it can't be told. */
+typedef struct {
+    int pct;
+    bool charging, usb;
+} apps_battery_t;
+apps_battery_t apps_port_battery(void);
+
+/* Whether the gadget is on a Wi-Fi network, and then the network's name in ssid (cap bytes with the NUL, cut if it is longer);
+ * "" when it isn't. The name is bytes from the air: the caller cleans it as text. */
+bool apps_port_wifi(char *ssid, size_t cap);
+
+/* The app asks to be in front (sys.show: message() and alarm() may, and any callback within 10 s of a tap). The device goes through
+ * the same door as every front (a request the LVGL task carries out, held back during a voice turn); apphost prints it. */
+void apps_port_show(void);
+
+/* sys.keep_awake(on): while on, the screen isn't let go dark for being idle as long as the app is in front. The app task's
+ * housekeeping pokes the idle timer about once a second for it. Off by itself when the app ends. */
+void apps_port_keep_awake(bool on);
+
+/* sys.exit(): the app ends once the callback that called it has returned (stop() runs, its store is saved, the layer goes behind).
+ * The callback itself runs to its end. */
+void apps_port_exit(void);

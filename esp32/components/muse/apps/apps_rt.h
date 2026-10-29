@@ -29,8 +29,8 @@
  *
  * What the app's code is given besides the sandbox's libraries (apps_vm.h), `json` (apps_json.h), `ui`
  * (apps_ui.h; main.lua's top level can already draw, so ui.image finds the package's images from the start) and
- * `time`, `os`, `timer`, `alarm` and `sound` (apps_svc.h; main.lua's top level can already arm a timer, which runs once
- * start() has):
+ * `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` (apps_svc.h; main.lua's top level can already arm a timer, which
+ * runs once start() has, and use the store, which is loaded before it runs):
  * - print(...): the tostring of each argument, joined with tabs, as the lines of the app's log. The text
  *   is split at each "\n". In each line, a byte under 0x20 but tab, 0x7F, a C1 control character
  *   (U+0080 to U+009F) and anything that isn't valid UTF-8 (RFC 3629) become '?', one for each byte, or
@@ -127,6 +127,27 @@
  *   a pass, which makes one to say so. An app that the throttle brings under the limit (its callbacks fit in what is left of the
  *   period) isn't killed: its windows turn cool, the throttle ends, and the app speeds up again.
  *
+ * The store. An app with the "store" permission has a store of keys and values, which the runtime keeps in its own cache, outside the
+ * Lua heap (so the 16 KB it may hold never counts against memory_kb): per key, the text of its value, JSON as json.encode writes
+ * it, which store.get decodes afresh each time (so what it returns is a copy, and what the app does to it changes nothing here).
+ * - Loaded in apps_rt_new, before main.lua runs, from the port (apps_port_store_load: the object the last save left, or "{}"). An
+ *   object that isn't what the store writes (it doesn't parse, a key it never makes, more than 16 KB) is an empty store, and the log
+ *   says so: the next save replaces it. A port that can't give it (no memory, no answer in time) makes apps_rt_new fail, with
+ *   an error that says to try again: an app never starts with an empty store in place of the real one, which a later save
+ *   would overwrite. Only an app with the permission is loaded.
+ * - The 16 KB is the object that is saved, counted after encoding (apps_rt_store_set): its braces, each key escaped as JSON
+ *   escapes it and its two quotes and colon, each value's text, the commas. A key is 1 to 32 characters (code points of valid
+ *   UTF-8, no NUL), a value at most 15 containers deep (it sits inside the object, which is the first).
+ * - A write that changes something marks the store changed, and the save is due APPS_STORE_FLUSH_MS after the last change (a change
+ *   inside the wait starts it again; one that changes nothing doesn't). The loop that serves the app asks apps_rt_next_deadline for
+ *   it, dark or lit, and calls apps_rt_store_tick, which saves when it is due: the object whole, through apps_port_store_save. A
+ *   save the port refuses is asked again APPS_STORE_FLUSH_MS later. The last save is made when the app ends, whichever way: in
+ *   apps_rt_stop once stop() has returned, when it crashes, and in apps_rt_free for a runtime that is freed with a change in it. That
+ *   one is asked once: a port that refuses it loses the changes, and the log has a line that says so.
+ *
+ * Show, tap and exit. sys.show() is allowed inside message() and alarm(), and inside any callback within APPS_SHOW_TAP_MS (10 s) of a
+ * touch the runtime was given (apps_rt_touch), the 10 s included. The runtime knows nothing of the front: it asks the port.
+ *
  * Messages (the runtime's own; <main> is the manifest's main file, "main.lua" unless it says otherwise):
  *   <main> must return a table of handlers: local app = {} … return app
  *   <main> returned '%s' as a %s; handlers must be functions         a handler key holding a non-function
@@ -142,8 +163,8 @@
  * table.
  *
  * Memory: a runtime is one block from apps_port_realloc (itself, with its log and crash record), the VM's
- * heap, capped at the manifest's memory_kb, and the widget table (apps_ui.h) with its text. apps_rt_free gives
- * all of it back, and runs no app code.
+ * heap, capped at the manifest's memory_kb, the widget table (apps_ui.h) with its text, and the store's cache (a block for each
+ * key, and a table of them). apps_rt_free gives all of it back, saves a store that has a change in it, and runs no app code.
  */
 
 #include <stdbool.h>
@@ -156,6 +177,7 @@
  * headers. */
 typedef struct apps_vm apps_vm_t;
 typedef struct apps_ui apps_ui_t;
+typedef struct lua_State lua_State;  /* lua.h's too */
 
 typedef enum { APPS_STATE_STOPPED, APPS_STATE_RUNNING, APPS_STATE_CRASHED, APPS_STATE_HUNG } apps_state_t;
 
@@ -288,9 +310,9 @@ void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event);
 #define APPS_DUTY_THROTTLE_WINDOWS 3
 #define APPS_DUTY_KILL_WINDOWS 5
 
-/* The monotonic time the earliest timer is due at, for the wait of the loop that serves the app: INT64_MAX when there is no
- * timer, the app isn't RUNNING, or the screen is dark (the loop looks again within its second). Any time at or before now is
- * due. */
+/* The monotonic time the loop that serves the app should come back at: the earliest timer's due time (none runs while the screen is
+ * dark), or the time a save of the store is due, if that is sooner (dark or lit). INT64_MAX when the app isn't RUNNING, or there
+ * is neither (the loop looks again within its second). Any time at or before now is due. */
 int64_t apps_rt_next_deadline(const apps_rt_t *rt);
 
 /* Whether apps_rt_run_one_timer(rt, now_ms) would make a call: a timer is due, or the app was killed and no call has found
@@ -340,3 +362,50 @@ bool apps_rt_permits(const apps_rt_t *rt, unsigned perm);
  * memory counters (apps_vm.h). What is installed into its globals through it is there for the handlers, not for
  * main.lua's top level, which has run by the time the runtime exists. */
 apps_vm_t *apps_rt_vm(apps_rt_t *rt);
+
+/* ---- The store, show and exit (above; the `store` and `sys` modules of apps_svc.c are built on these) ---- */
+
+#define APPS_STORE_MAX_BYTES 16384  /* the saved object, counted after encoding */
+#define APPS_STORE_KEY_MAX 32       /* characters in a key */
+#define APPS_STORE_FLUSH_MS 2000    /* a save is due this long after the last change, and again this long after one the port refused */
+#define APPS_SHOW_TAP_MS 10000      /* sys.show() is allowed this long after a touch, the end of it included */
+
+typedef enum {
+    APPS_STORE_OK = 0,
+    APPS_STORE_BAD_KEY,    /* not 1 to 32 characters of valid UTF-8 with no NUL */
+    APPS_STORE_FULL,       /* the saved object would be more than APPS_STORE_MAX_BYTES */
+    APPS_STORE_NO_MEMORY,  /* the port's heap refused: nothing was changed, and a try later may work */
+} apps_store_result_t;
+
+/* Whether key[0, len) is a store key: 1 to APPS_STORE_KEY_MAX characters (code points) of valid UTF-8 (apps_json.h) with no NUL. */
+bool apps_rt_store_key_valid(const char *key, size_t len);
+
+/* The text of the value stored under key (JSON, as apps_json_encode_value writes it; not terminated), with its length in *len; NULL
+ * when there is none, or the key isn't one. Valid until the next apps_rt_store_set, apps_rt_store_remove or apps_rt_free. */
+const char *apps_rt_store_get(const apps_rt_t *rt, const char *key, size_t key_len, size_t *len);
+
+/* Stores text[0, len), one JSON value (a copy is kept), under key, in place of what it had. Nothing is saved yet: the change is
+ * marked, and the save is due APPS_STORE_FLUSH_MS from now (apps_port_mono_ms); a text that is the one stored is no change.
+ * APPS_STORE_FULL leaves the store as it was. */
+apps_store_result_t apps_rt_store_set(apps_rt_t *rt, const char *key, size_t key_len, const char *text, size_t len);
+
+/* Removes key: nothing for one that isn't there (and no change). */
+void apps_rt_store_remove(apps_rt_t *rt, const char *key, size_t key_len);
+
+/* How many keys the store has: what a lookup walks, which the module charges to the call. */
+unsigned apps_rt_store_count(const apps_rt_t *rt);
+
+/* Saves the store if a change is waiting and its save is due at now_ms: the object whole, through apps_port_store_save. A save the
+ * port refuses is due again APPS_STORE_FLUSH_MS later. The loop that serves the app calls it every round; it runs no app code, so it
+ * needs no call to be bracketed. NULL is ignored. */
+void apps_rt_store_tick(apps_rt_t *rt, int64_t now_ms);
+
+/* Whether sys.show() may be called now: inside message() or alarm(), or within APPS_SHOW_TAP_MS of the last touch (apps_rt_touch). */
+bool apps_rt_show_allowed(const apps_rt_t *rt);
+
+/* The manifest's memory_kb, the limit sys.mem() reports. */
+unsigned apps_rt_memory_kb(const apps_rt_t *rt);
+
+/* print, for sys.log (apps_svc.c): the same function print is, whose first upvalue is the runtime. It starts with apps_vm_check
+ * like every binding. */
+int apps_rt_print(lua_State *L);

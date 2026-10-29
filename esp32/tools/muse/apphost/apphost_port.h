@@ -19,7 +19,7 @@
 /*
  * What apphost's port (apphost_port.c, which implements apps_port.h on the host) gives apphost.c besides
  * the port itself: where the app's log lines go, what the apps' heap holds, whether the UI lock is held, the clocks and
- * the screen a script moves, and the system's alarms and the ring.
+ * the screen a script moves, the system's alarms and the ring, and the store, the front and the exit of an app.
  */
 
 #include <stdbool.h>
@@ -75,3 +75,25 @@ void apphost_set_sound(const apphost_sound_t *sink);
  * ring's minute, a firing, a cancel and the end of an app each may change. The port calls it after the calls of the app that can, and
  * apphost.c after each step of the clock and each end of the app. */
 void apphost_ring_sync(void);
+
+/*
+ * The store, the front and the exit. apphost keeps the objects the runtime saves (apps_port_store_save) in the process, a copy for each app,
+ * so that a `restart` reads them back (apps_port_store_load); a save is told to the sink at once (the device writes it later, on the I/O
+ * worker). What sys asks of the gadget has a fixed answer here: the battery is 76% on a charger and USB (apps_port_battery) and the Wi-Fi
+ * is the network "muse-lab", so a run is the same on every machine. sys.show() is told to the sink, as it happens, inside the call that
+ * made it, so that it prints in order with what the app printed. sys.keep_awake has nothing to keep awake on a laptop. sys.exit() only sets
+ * a flag, which apphost.c takes after each call (apphost_take_exit) to end the app as the app task does when a callback returns.
+ */
+typedef struct {
+    void (*store_saved)(size_t bytes);  /* the app's store was saved: the object's bytes */
+    void (*show)(void);                 /* sys.show() */
+} apphost_system_t;
+
+/* Where saves and shows go: NULL (the start, and --cycles) is nowhere. sink must outlive the run. */
+void apphost_set_system(const apphost_system_t *sink);
+
+/* Whether sys.exit() was called since the last call of this, which clears it. */
+bool apphost_take_exit(void);
+
+/* Frees the objects the port kept. */
+void apphost_store_clear(void);

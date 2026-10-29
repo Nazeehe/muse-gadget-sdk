@@ -24,7 +24,7 @@
     "floats": "json round trips of 0.1, 5e-324, 1e+100, -1e-07 and 9007199254740993: the text printed (a subnormal's differs by libc) and whether it reads back",
     "floats_exact": "1000 floats of 17 digits through encode and decode: how many come back as the same double",
     "floats_time": "{n, decode, digits, scale}: n encodes (or decodes) of 1000 floats: of 17 digits (digits 17, the default) or at most 15 (digits 15), times scale",
-    "widgets": "128 widgets of every kind, boxes 4 deep (a box in the fifth is refused: nest), handlers, a 256-byte text; returns where to tap the deepest",
+    "widgets": "128 widgets of every kind, boxes 4 deep (a fifth box is refused: nest), handlers, a 256-byte text; returns where to tap the deepest",
     "hits": "the events the handlers have seen"
   }
 }

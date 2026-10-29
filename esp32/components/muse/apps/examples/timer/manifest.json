@@ -1,0 +1,17 @@
+{
+  "id": "timer",
+  "name": "Timer",
+  "version": "1.0.0",
+  "api": 1,
+  "main": "main.lua",
+  "files": [],
+  "permissions": ["sound", "alarm", "store"],
+  "memory_kb": 128,
+  "messages": {
+    "start":  "Start a countdown. data: {seconds: whole number 1..5999}. Replies {state, remaining} in seconds.",
+    "pause":  "Pause a running countdown. Replies {state, remaining} in seconds.",
+    "resume": "Resume a paused countdown. Replies {state, remaining} in seconds.",
+    "reset":  "Stop and clear the countdown (also silences the alarm). Replies {state, remaining} in seconds.",
+    "status": "Change nothing. Replies {state, remaining} in seconds; state is idle, running, paused or done."
+  }
+}

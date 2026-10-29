@@ -1731,8 +1731,14 @@ POKE(parent_dead, {
     W(e, 1)->alive = false;
     W(e, 1)->dirty = 0;
 })
-POKE(parent_five_boxes_up, w->parent = 4)            /* box 4 has four boxes above it: five in all */
-POKE(parent_four_boxes_up, w->parent = 3)            /* four: the most there may be */
+/* The binding makes no box with four boxes above it (boxes nest at most four deep), so these two build the table as only a
+ * corrupted one could be: box 4, made on its own, is moved into box 3, so the label (slot 5, made in box 4) has five boxes
+ * above it; and with the label moved out of box 4 into box 3 it has four, the most there may be. */
+POKE(parent_five_boxes_up, W(e, 4)->parent = 3)
+POKE(parent_four_boxes_up, {
+    W(e, 4)->parent = 3;
+    w->parent = 3;
+})
 POKE(parent_loop, W(e, 0)->parent = 1)               /* 0 inside 1 inside 0 */
 POKE(parent_kind_changed, W(e, 0)->kind = APPS_W_LABEL)
 
@@ -1787,7 +1793,7 @@ static const bad_t BAD[] = {
     {"a parent of -2", "w = ui.label{}", 0, parent_minus_2, 0, 1},
     {"a parent that is not alive", "l = ui.label{} b = ui.box{} w = ui.label{parent = b}", 2, parent_dead, 1, 1},
     {"five boxes above it", "b0 = ui.box{} b1 = ui.box{parent = b0} b2 = ui.box{parent = b1} b3 = ui.box{parent = b2} "
-                            "b4 = ui.box{parent = b3} w = ui.label{}", 5, parent_five_boxes_up, 5, 1},
+                            "b4 = ui.box{} w = ui.label{parent = b4}", 5, parent_five_boxes_up, 5, 1},
     {"a parent chain that loops", "b0 = ui.box{} b1 = ui.box{parent = b0}", 1, parent_loop, 0, 2},
     {"a box that became a label under a child", "b = ui.box{} w = ui.label{parent = b}", 1, parent_kind_changed, 1, 1},
     /* A box in a higher slot than its pending child is made for the child, so it is checked first: bad, it is not made,
@@ -1827,7 +1833,7 @@ static void parent_chain_of_four_is_drawn(void) {
     env_t e;
     scene(&e);
     RUN(&e, "b0 = ui.box{} b1 = ui.box{parent = b0} b2 = ui.box{parent = b1} b3 = ui.box{parent = b2} "
-            "b4 = ui.box{parent = b3} w = ui.label{}");
+            "b4 = ui.box{} w = ui.label{parent = b4}");
     parent_four_boxes_up(&e, W(&e, 5));
     CHECK(APPLY(&e), "the pass ran");
     CHECK(log_count("create ") == 6 && stats_since().rejects == 0, "six objects, no reject\n%s", log_peek());

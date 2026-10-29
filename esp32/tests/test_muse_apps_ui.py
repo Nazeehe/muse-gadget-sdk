@@ -142,7 +142,6 @@ class UiTest(UiTestCase):
             ("get_unknown_property", unknown_property("label", "bg")),
             ("parent_set_later", "ui.label: parent can only be set when the widget is created"),
             ("parent_deleted", "ui.label: parent was deleted"),
-            ("nesting", "ui.label: boxes nest at most 4 deep"),
             ("nesting_box", "ui.box: boxes nest at most 4 deep"),
             ("unknown_method", "ui.label: unknown method 'frobnicate' (valid: set, get, on, delete)"),
             # What the brief leaves to the implementation.
@@ -836,7 +835,7 @@ class UiTest(UiTestCase):
         not_box = "ui.label: parent must be a ui.box"
         self.assertEqual(lines, ["false\t" + once, "false\t" + once, "true\ttrue"] + ["false\t" + not_box] * 6)
 
-    def test_boxes_nest_at_most_four_deep(self):  # R9.5
+    def test_boxes_nest_at_most_four_deep(self):  # R9.5, and the controller's ruling of 2026-10-29: the message is the rule
         lines = self.lua_lines("""
             local boxes = {}
             local parent
@@ -846,18 +845,24 @@ class UiTest(UiTestCase):
                 if ok then parent = box boxes[i] = box end
             end
             print((pcall(ui.label, {parent = boxes[4]})))
-            print(pcall(ui.label, {parent = boxes[5]}))
+            print((pcall(ui.arc, {parent = boxes[4]})))
+            print(pcall(ui.box, {parent = boxes[4]}))
             local lone = ui.box{}
-            print((pcall(ui.button, {parent = lone})))
+            print((pcall(ui.box, {parent = lone})), (pcall(ui.button, {parent = lone})))
             boxes[1]:delete()
             local fresh = ui.box{}
-            print((pcall(ui.arc, {parent = fresh})), (pcall(ui.label, {parent = boxes[5]})))
+            print((pcall(ui.box, {parent = fresh})), (pcall(ui.label, {parent = boxes[4]})))
+            print(pcall(ui.box, {parent = boxes[4]}))
         """)
-        deep = "ui.label: boxes nest at most 4 deep"
+        deep = "ui.box: boxes nest at most 4 deep"
         self.assertEqual(lines, [
-            "1\ttrue\tbox#0", "2\ttrue\tbox#1", "3\ttrue\tbox#2", "4\ttrue\tbox#3", "5\ttrue\tbox#4",
-            "6\tfalse\tui.box: boxes nest at most 4 deep",  # the fifth box has four box ancestors, and holds nothing
-            "true", "false\t" + deep, "true", "true\tfalse",  # a deleted box takes its depth with it: boxes[5] is gone
+            "1\ttrue\tbox#0", "2\ttrue\tbox#1", "3\ttrue\tbox#2", "4\ttrue\tbox#3",
+            "5\tfalse\t" + deep, "6\tfalse\t" + deep,   # the fifth box is nested deeper than four: refused
+            "true", "true",                               # a widget that isn't a box goes in the fourth: four box ancestors
+            "false\t" + deep,                             # a box doesn't
+            "true\ttrue",                                 # a lone box takes a box and a button
+            "true\tfalse",                                # boxes[1]'s delete took the chain with it: boxes[4] is gone
+            "false\tui.box: parent was deleted",
         ])
 
     def test_handles_have_methods_not_fields(self):  # R9.6

@@ -243,6 +243,8 @@ static void check_invariants(int line, env_t *e) {
             depth++;
         }
         CHECK_AT(line, depth <= APPS_UI_BOX_DEPTH_MAX, "slot %d: %d box ancestors", i, depth);
+        CHECK_AT(line, w->kind != APPS_W_BOX || depth < APPS_UI_BOX_DEPTH_MAX,
+                 "slot %d: a box with %d box ancestors is the fifth box in a chain", i, depth);
         CHECK_AT(line, in_range(w->x, -466, 466) && in_range(w->y, -466, 466), "slot %d: x %d y %d", i, w->x, w->y);
         CHECK_AT(line, (w->w == -1 || in_range(w->w, 1, 466)) && (w->h == -1 || in_range(w->h, 1, 466)),
                  "slot %d: w %d h %d", i, w->w, w->h);

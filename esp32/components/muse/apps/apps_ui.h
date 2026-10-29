@@ -48,8 +48,8 @@
  *   with no NUL byte; "" is no text. font is one of sans14 sans16 sans20 sans28 mono8 mono16 digits48 digits96
  *   (the digit fonts hold "0-9:.-+% "), text_align one of left center right. Colours are "#rgb", "#rrggbb" or
  *   0xRRGGBB, and bg also takes "none". src is the path of an image of the app's package (manifest.json "files").
- *   parent is a box, and can be given only when the widget is made. A widget may have at most
- *   APPS_UI_BOX_DEPTH_MAX box ancestors.
+ *   parent is a box, and can be given only when the widget is made. Boxes nest at most APPS_UI_BOX_DEPTH_MAX deep: a
+ *   box may have at most APPS_UI_BOX_DEPTH_MAX - 1 box ancestors, and any other widget at most APPS_UI_BOX_DEPTH_MAX.
  * - Defaults. Every widget: align center, x y 0, w h to content, visible, opacity 100, border_color white. label:
  *   font sans20, text_align center, color white. button: bg "#262626", radius 16, font sans20, color white.
  *   box: bg none, radius 0. arc: min 0, max 100, value 0, start_angle 0, end_angle 360, thickness 12, color
@@ -74,7 +74,8 @@
  *   ui.<kind>: radius '<s>' is not a number or "circle"
  *   ui.<kind>: text is longer than 256 bytes | text is not valid UTF-8 | text can't contain a NUL byte
  *   ui.<kind>: min must be less than max
- *   ui.<kind>: parent must be a ui.box | parent was deleted | boxes nest at most 4 deep
+ *   ui.<kind>: parent must be a ui.box | parent was deleted
+ *   ui.box: boxes nest at most 4 deep
  *   ui.<kind>: parent can only be set when the widget is created
  *   ui.image: src is required (a .bin image of this app's manifest.json "files") | src '<s>' is not one of this
  *             app's images (manifest.json "files")
@@ -97,8 +98,8 @@
  * box deletes everything inside it. The handles the app holds are remembered in a weak registry table, a place for
  * each slot (push_widget), which is what makes a widget one object. The invariants, which hold whenever the lock
  * is free:
- * - an alive widget's parent is alive and a box, and has at most APPS_UI_BOX_DEPTH_MAX box ancestors, so the
- *   parent chain ends and the apply step may walk it;
+ * - an alive widget's parent is alive and a box, and the boxes above a widget are at most APPS_UI_BOX_DEPTH_MAX (a
+ *   box has at most APPS_UI_BOX_DEPTH_MAX - 1 above it), so the parent chain ends and the apply step may walk it;
  * - an arc or bar has min < max and min <= value <= max, and all of them are within +-APPS_UI_VALUE_MAX;
  * - every number and enum is in its range, text is NULL (for "") or a valid, NUL-terminated block of at most
  *   APPS_UI_TEXT_MAX bytes, and a widget of kind image has an image in the asset table;

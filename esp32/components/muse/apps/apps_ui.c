@@ -692,7 +692,9 @@ static void read_parent(const ctx_t *x, prop_t p, int idx, change_t *c) {
     if (parent == NULL) {
         fail_kind(L, x->kind, "parent was deleted");
     }
-    if (ancestors_of(x->ui, h->slot) > APPS_UI_BOX_DEPTH_MAX) {
+    /* Boxes nest at most APPS_UI_BOX_DEPTH_MAX deep (R9.5, and the message says it): a box counts itself, so it may have three
+     * box ancestors and a fifth one is refused; a widget that isn't a box may sit in the fourth, with four above it. */
+    if (ancestors_of(x->ui, h->slot) + (x->kind == APPS_W_BOX) > APPS_UI_BOX_DEPTH_MAX) {
         fail_kind(L, x->kind, "boxes nest at most %d deep", APPS_UI_BOX_DEPTH_MAX);
     }
     c->v[p] = h->slot;

@@ -995,6 +995,26 @@ class MuseAppsPkgTest(unittest.TestCase):
         self.assertEqual(self.image(data), {"ok": True, "w": 260, "h": 1})
         self.assertTrue(self.image(lvgl_image(reserved=0xFFFF))["ok"])
 
+    def test_real_lvglimage_outputs_pass(self):
+        # Not this file's own headers: what LVGL 9.5.0's scripts/LVGLImage.py writes when it is run as the guide tells Muse to
+        # (--ofmt BIN --compress NONE, once for each of --cf RGB565, RGB565A8 and A8) on three PNGs of 5x3, 4x4 and 7x2
+        # pixels (the controller's ruling from Task 7's review). Flags 0, and the size and stride the check wants.
+        images = ROOT / "tests/muse_apps_fixtures/lvgl_images"
+        formats = {"RGB565": 0x12, "RGB565A8": 0x14, "A8": 0x0E}
+        sizes = {"a5x3": (5, 3), "b4x4": (4, 4), "c7x2": (7, 2)}
+        self.assertEqual(sorted(p.relative_to(images).as_posix() for p in images.rglob("*")),
+                         sorted([*formats, *(f"{cf}/{name}.bin" for cf in formats for name in sizes)]))
+        for cf, code in formats.items():
+            for name, (w, h) in sizes.items():
+                with self.subTest(cf=cf, image=name):
+                    data = (images / cf / f"{name}.bin").read_bytes()
+                    magic, got_cf, flags, got_w, got_h = struct.unpack_from("<BBHHH", data)
+                    self.assertEqual((magic, got_cf, flags, got_w, got_h), (0x19, code, 0, w, h))
+                    self.assertEqual(self.image(data), {"ok": True, "w": w, "h": h})
+                    # The same bytes cut short or with one more are not an image: it is the size that passed them.
+                    self.refused_image(data[:-1], image_size_msg(len(data) - 1, len(data)))
+                    self.refused_image(data + b"\0", image_size_msg(len(data) + 1, len(data)))
+
     # ---- The C cases ----
 
     def test_c_contracts(self):

@@ -2089,6 +2089,17 @@ class SysTest(DeviceTestCase):
         lines = self.device_lines("sys.keep_awake(true) sys.keep_awake(false) print('fine')", permissions=["keep_awake"])
         self.assertEqual(lines, ["fine"])
 
+    def test_the_keep_awake_board_fixture_asks_to_stay_lit_and_takes_the_request_back(self):
+        # tests/muse_apps_fixtures/keep_awake is Task 19's board check: in front, with the permission, it asks for the screen to
+        # stay lit, and the message "off" takes that back, so the same app is its own control. apphost only records the calls.
+        run = self.host(FIXTURES / "keep_awake", script=["message off", "message on", "message nope"])
+        self.assertEqual(run.logs(), ["keep_awake on", "keep_awake off", "keep_awake on"])
+        self.assertEqual(replies(run), [{"keep_awake": False}, {"keep_awake": True}])
+        (error,) = run.messages("error")
+        self.assertIn("use on or off", error)
+        self.assertEqual(run.of("started"), [{"event": "started", "id": "keep_awake", "name": "Keep awake"}])
+        self.assertEqual(run.of("warning"), [])
+
     def test_restart_stops_frees_and_starts_a_new_runtime(self):
         run = self.handler_app("""
             local runs = 0

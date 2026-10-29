@@ -54,7 +54,6 @@ case("text_align_a_boolean", function() ui.label{text_align = true} end)
 case("get_unknown_property", function() w.label:get("bg") end)
 case("parent_set_later", function() w.label:set{parent = w.box} end)
 case("parent_deleted", function() ui.label{parent = w.gone_box} end)
-case("nesting", function() ui.label{parent = w.deep} end)
 case("nesting_box", function() ui.box{parent = w.deep} end)
 case("unknown_method", function() w.label:frobnicate() end)
 
@@ -93,9 +92,9 @@ function app.start()
     w.gone_label:delete()
     w.gone_box = ui.box{}
     w.gone_box:delete()
-    -- Five boxes, one inside the other: the fifth has four box ancestors, and nothing may go inside it.
+    -- Four boxes, one inside the other: no box may go inside the fourth (a widget that isn't a box may).
     local parent
-    for _ = 1, 5 do
+    for _ = 1, 4 do
         w.deep = ui.box{parent = parent}
         parent = w.deep
     end

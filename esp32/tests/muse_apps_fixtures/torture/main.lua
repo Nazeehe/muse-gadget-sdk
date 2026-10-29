@@ -244,10 +244,10 @@ local function on_event(w, name)
 end
 
 -- 128 widgets: the box chain of the depth the screen allows, a button at the bottom of it, a field of every
--- kind, and a label with the longest text there is, each with a handler or two. A widget may have four box ancestors
--- (apps_ui.h): the button has four, and so has a fifth box beside it; a box inside that one is one too many, and the
--- runtime says so ("nest" in the result: the dump has no parent field, so this refusal is how the chain is known to
--- be four boxes deep).
+-- kind, and a label with the longest text there is, each with a handler or two. Boxes nest at most four deep
+-- (apps_ui.h): the button has four box ancestors, and a fifth box in the fourth is one too many, and the runtime says
+-- so ("nest" in the result: the dump has no parent field, so this refusal is how the chain is known to be four boxes
+-- deep).
 local function widgets()
     ui.clear()
     ui.bg("#000000")
@@ -266,9 +266,7 @@ local function widgets()
     local deepest = ui.button{parent = parent, text = "deepest", align = "center", w = 120, h = 44}
     deepest:on("tap", on_event):on("press", on_event):on("release", on_event):on("long_press", on_event)
     made = made + 1
-    local fifth = ui.box{parent = parent, align = "center", x = 0, y = 40, w = 40, h = 20, bg = "#203040"}
-    made = made + 1
-    local ok, why = pcall(ui.box, {parent = fifth, w = 10, h = 10})
+    local ok, why = pcall(ui.box, {parent = parent, align = "center", x = 0, y = 40, w = 40, h = 20, bg = "#203040"})
 
     local words = string.rep("0123456789abcdef", 16)   -- 256 bytes: as long as text gets
     local i = 0

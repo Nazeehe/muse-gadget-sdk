@@ -2439,11 +2439,11 @@ class TortureTest(AppsTestCase):
         widgets = self.of(events, "dump")[0]["widgets"]
         self.assertEqual(len(widgets), 128)
         self.assertEqual({w["kind"] for w in widgets}, {"label", "button", "box", "arc", "bar", "image"})
-        self.assertEqual([w["kind"] for w in widgets[:6]], ["box", "box", "box", "box", "button", "box"])
+        self.assertEqual([w["kind"] for w in widgets[:6]], ["box", "box", "box", "box", "button", "label"])
         self.assertEqual(built["deepest"], widgets[4]["id"])
-        # The dump has no parent field. The boxes nest as deep as a widget may (four box ancestors: the button, and the
-        # fifth box beside it), which is known from the runtime's refusal of a box in that fifth one; a widget that was
-        # made without its parent would take it.
+        # The dump has no parent field. The boxes nest as deep as they may (four, one inside the other, and the button in
+        # the fourth has four box ancestors), which is known from the runtime's refusal of a fifth box in the fourth; a
+        # box that was made without its parent would shorten the chain and let that fifth one in.
         self.assertEqual(c_define("apps_ui.h", "APPS_UI_BOX_DEPTH_MAX"), 4)
         self.assertEqual(built["nest"], {"ok": False, "err": "ui.box: boxes nest at most 4 deep"})
         text_max = c_define("apps_ui.h", "APPS_UI_TEXT_MAX")

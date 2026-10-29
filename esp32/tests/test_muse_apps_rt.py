@@ -24,10 +24,12 @@ err and of the log tail, the return value of every entry point. Its counting all
 at 0 bytes, and apphost's --cycles does the same for whole launches.
 """
 
+import atexit
 import hashlib
 import json
 import random
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -44,6 +46,20 @@ HARNESS_SOURCES = [ROOT / "tests/muse_apps_rt_harness.c", APPS / "apps_rt.c", AP
                    APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_ui.c",
                    APPS / "apps_svc.c"]
 INCLUDES = [ROOT / "components/lua/src", APPS]
+
+_rt_harness = None
+
+
+def rt_harness():
+    """tests/muse_apps_rt_harness.c, built once for the process (with the sanitizers, as every harness is): HarnessTest here and
+    SvcHarnessTest (test_muse_apps_svc.py) run its cases, and two builds of the same sources and flags could not differ."""
+    global _rt_harness
+    if _rt_harness is None:
+        tmp = tempfile.mkdtemp(prefix="muse-apps-rt-harness-")
+        atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+        _rt_harness = apps_host.build("muse_apps_rt_harness", [*HARNESS_SOURCES, *apps_host.lua_sources()], tmp,
+                                      include_dirs=INCLUDES)
+    return _rt_harness
 
 # The messages, exactly (apps_rt.h lists them, and apps_vm.h the kills').
 NOT_A_TABLE = "main.lua must return a table of handlers: local app = {} … return app"
@@ -128,6 +144,9 @@ class Run:
 
 
 class AppHostTestCase(unittest.TestCase):
+    # Added to the environment of every apphost run of the class: what a test that must hold on any machine sets (TZ).
+    host_env = None
+
     @classmethod
     def setUpClass(cls):
         tmp = tempfile.TemporaryDirectory()
@@ -166,7 +185,7 @@ class AppHostTestCase(unittest.TestCase):
             args += ["--script", "-"]
         text = "".join(f"{line}\n" for line in script) if isinstance(script, (list, tuple)) else script
         done = apps_host.run(self.apphost, *args, app, input=text.encode() if text else None, text=False,
-                             timeout=timeout)
+                             timeout=timeout, env=self.host_env)
         self.assertEqual(done.returncode, rc,
                          f"{done.stdout.decode(errors='replace')}\n{done.stderr.decode(errors='replace')}")
         self.assertEqual(done.stderr, b"")
@@ -1303,10 +1322,7 @@ class CompileStepTest(AppHostTestCase):
 class HarnessTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        tmp = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(tmp.cleanup)
-        cls.harness = apps_host.build("muse_apps_rt_harness", [*HARNESS_SOURCES, *apps_host.lua_sources()],
-                                      tmp.name, include_dirs=INCLUDES)
+        cls.harness = rt_harness()
 
     def run_case(self, case, timeout=120, harness=None):
         try:

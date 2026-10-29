@@ -58,16 +58,18 @@ def stage_fakes(directory):
     return directory
 
 
-def build_harness(cls, name, console):
+def build_harness(cls, name, console, defines=()):
     tmp = tempfile.TemporaryDirectory()
     cls.addClassCleanup(tmp.cleanup)
     stage = stage_fakes(Path(tmp.name) / "fake_headers")
     includes = [apps_host.LUA_SRC, APPS, MUSE, stage, TESTS]
     if not console:
-        return apps_host.build(name, [*SOURCES, *apps_host.lua_sources()], tmp.name, include_dirs=includes)
+        return apps_host.build(name, [*SOURCES, *apps_host.lua_sources()], tmp.name, include_dirs=includes,
+                               defines=list(defines))
     cjson = apps_host.cjson_object()  # skips the class, alone, when the cJSON sources aren't here
     return apps_host.build(name, [*SOURCES, *CONSOLE_SOURCES, *apps_host.lua_sources()], tmp.name,
-                           include_dirs=[*includes, apps_host.CJSON_DIR], defines=["HARNESS_CONSOLE"], objects=[cjson])
+                           include_dirs=[*includes, apps_host.CJSON_DIR], defines=["HARNESS_CONSOLE", *defines],
+                           objects=[cjson])
 
 
 class HarnessCase(unittest.TestCase):
@@ -249,12 +251,50 @@ class AppTaskTest(HarnessCase):
     def test_the_duty_cycle_warns_the_status_then_kills(self):
         self.run_case("the_duty_cycle_warns_the_status_then_kills")
 
+    # ---- Task 16, fix round 1 ----
+
+    def test_a_lone_timer_far_away_does_not_make_the_loop_wait_longer_than_a_second(self):  # H, C22
+        self.run_case("a_lone_far_timer_never_makes_the_loop_wait_long")
+
+    def test_a_far_timer_does_not_delay_the_answer_of_a_run_that_settles(self):  # H
+        self.run_case("a_far_timer_does_not_delay_a_settle")
+
+    def test_a_timer_due_within_a_tick_is_waited_for_and_not_spun_on(self):  # G
+        self.run_case("a_timer_due_within_a_tick_is_waited_for_not_spun_on")
+
+    def test_the_wake_runs_the_overdue_timers_at_once(self):  # R: the supervisor posts a no-op event at the dark-to-lit edge
+        self.run_case("the_wake_runs_the_overdue_timers_at_once")
+
+    def test_a_throttle_warning_raised_by_a_pass_joins_the_launch_warnings(self):  # K, and the pass that makes no call
+        self.run_case("a_throttle_warning_from_a_pass_joins_the_launch_warnings")
+
+    def test_cpu_pct_and_the_duty_cycle_count_the_same_time(self):  # B: one booking, read twice
+        self.run_case("cpu_pct_and_the_duty_cycle_agree")
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))
         self.assertTrue(cases, "no cases found in the harness")
         self.assertEqual(sorted(cases - tested), [], "harness cases no test runs")
         self.assertEqual(sorted(tested - cases), [], "tests that run a case the harness doesn't have")
+
+
+class AppTaskTickTest(HarnessCase):
+    """The loop's waits on a build whose tick is 10 ms (CONFIG_FREERTOS_HZ=100, ESP-IDF's default: the board's is 1000), where a
+    wait of 1 to 9 ms is no tick at all (pdMS_TO_TICKS rounds down) and the loop must still wait."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.harness = build_harness(cls, "muse_apps_task_harness_100hz", console=False, defines=["MUSE_FAKE_TICK_HZ=100"])
+
+    def test_timers_that_are_due_never_make_the_loop_spin_at_100_hz(self):
+        self.run_case("due_timers_never_make_the_loop_spin")
+
+    def test_a_timer_due_within_a_tick_is_waited_for_at_100_hz(self):
+        self.run_case("a_timer_due_within_a_tick_is_waited_for_not_spun_on")
+
+    def test_timers_run_on_the_app_task_at_100_hz(self):
+        self.run_case("timers_run_on_the_app_task")
 
 
 class AppTaskStoreTest(HarnessCase):

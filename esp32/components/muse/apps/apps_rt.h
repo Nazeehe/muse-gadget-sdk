@@ -103,17 +103,28 @@
  *   of any handler nobody waits for is (a widget's, show, hide, alarm): last_error is the record. Only message() fails alone,
  *   as it has a caller to tell.
  *
- * The duty cycle. The VM's instructions are counted in windows of one second of the monotonic clock, over every call into the
- * app (a callback, a handler, a message, main.lua's top level). A window of more than APPS_DUTY_INSTR_PER_S is hot, any other
- * is cool, and a second in which the app ran nothing is cool. Windows are closed when a call begins and by every pass of the
- * timers (apps_rt_has_work, apps_rt_run_one_timer), which the loop that serves the app makes at least once a second, so a
- * warning and a kill come when the second ends, with or without a call to carry them.
+ * The duty cycle. What the app uses of the CPU is measured in windows, the whole seconds of the monotonic clock
+ * (apps_port_mono_ms), over every call into the app (a callback, a handler, a message, main.lua's top level): the VM's
+ * instructions, and the time the calls took. Each call, when it ends, books both to the windows it ran in, in proportion to
+ * the time it spent in each: a call that took 760 ms from 1250 to 2010 is 750 ms and 750/760 of its instructions in the
+ * window of 1000 to 2000, and the rest in the next. A window is hot when what was booked to it is over
+ * APPS_DUTY_INSTR_PER_S instructions or over APPS_DUTY_BUSY_PCT percent of the second (400 ms) in calls: instructions are the
+ * measure of Lua, and time that of the C work no count hook sees (a string function over a long string, os.time). A window
+ * with nothing booked is cool. Windows are closed in the order of the clock, one at a time, when a call begins, when one ends
+ * past the end of a window, and by every pass of the timers (apps_rt_has_work, apps_rt_run_one_timer), which the loop that
+ * serves the app makes at least once a second, so a warning and a kill come when the second ends, with or without a call to
+ * carry them. A window that is closed late (the loop slept across it) counts as it would have on time. apphost's clock
+ * stands still inside a call, so there the time is 0 and the instructions alone decide. The status's cpu_pct is the share
+ * of the last window to close that the calls took (apps_rt_cpu_pct).
  * - After APPS_DUTY_THROTTLE_WINDOWS hot windows in a row the app is throttled: every timer's next run moves 100 ms later, so
- *   does each one armed or rescheduled while it lasts, and the warning "throttled: using more than 40% of the CPU" is added to
- *   apps_rt_warnings and to the log, once for the runtime. A cool window ends the throttle and the count.
+ *   does each one armed while it lasts, and an every timer is due, after each run, a period and 100 ms after its callback
+ *   ENDED (apps_rt_run_one_timer), so that the delay is time the core is idle. The warning "throttled: using more than 40%
+ *   of the CPU" is added to apps_rt_warnings and to the log, once for the runtime. A cool window ends the throttle and the
+ *   count.
  * - After APPS_DUTY_KILL_WINDOWS hot windows in a row the VM is killed (apps_vm_kill) and the app has crashed, with the
  *   reason "stopped: used more than 40% of the CPU for 5 s" as its record: at the next call into it, or at the next step of
- *   a pass, which makes one to say so.
+ *   a pass, which makes one to say so. An app that the throttle brings under the limit (its callbacks fit in what is left of the
+ *   period) isn't killed: its windows turn cool, the throttle ends, and the app speeds up again.
  *
  * Messages (the runtime's own; <main> is the manifest's main file, "main.lua" unless it says otherwise):
  *   <main> must return a table of handlers: local app = {} … return app
@@ -267,11 +278,12 @@ void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event);
 #define APPS_TIMER_MIN_MS 40
 #define APPS_TIMER_MAX_MS 86400000  /* a day */
 
-/* The most instructions a window of one second may hold and not be hot: the plan's number, about 40% of 10 M a second, and
- * Task 27 sets it from its own measurement. The 1.75C's VM runs 2.5 M a second of the cheapest instruction (a loop that only
- * counts; Task 16 measured it on the board, with the count hook on), so until Task 27 lowers this no window on that board is
- * hot, and the throttle and the kill don't come: 40% of 2.5 M is about 1 M. */
-#define APPS_DUTY_INSTR_PER_S 4000000u
+/* The most VM instructions a window of one second may hold and not be hot. The 1.75C's VM runs 2.5 M a second of the cheapest
+ * instruction (a loop that only counts; Task 16 measured it on the board, with the count hook on), and a window may use about
+ * 40% of the second: 1 M. Task 27 tunes it from its own measurements. */
+#define APPS_DUTY_INSTR_PER_S 1000000u
+/* And the most of the second the calls may take (milliseconds in calls, over this percent of 1000, are hot too). */
+#define APPS_DUTY_BUSY_PCT 40
 #define APPS_DUTY_THROTTLE_WINDOWS 3
 #define APPS_DUTY_KILL_WINDOWS 5
 
@@ -286,12 +298,19 @@ int64_t apps_rt_next_deadline(const apps_rt_t *rt);
 bool apps_rt_has_work(apps_rt_t *rt, int64_t now_ms);
 
 /* One step of a pass at now_ms (it closes the duty windows first, as above). The earliest timer due at now_ms runs, as one
- * call of APPS_BUDGET_CALL, and true comes back. An every timer's next run is now_ms + its period (a throttled app's: 100 ms
- * more), so no timer is due twice in a pass, and what a callback arms is a period away. A killed app (the duty cycle's kill,
- * or another task's) that no call has found out is the step's call: a call that does nothing and records the crash. False,
- * with nothing run, when no timer is due, the app isn't RUNNING, or the screen is dark. A callback that fails has crashed the
- * app: the caller checks apps_rt_state, as after any call, before the next step. */
+ * call of APPS_BUDGET_CALL, and true comes back. An every timer's next run is now_ms + its period (the time the pass is at, not
+ * the one its callback ends at), so no timer is due twice in a pass and what a callback arms is a period away; while the app is
+ * throttled, after the callback has returned, it is a period and 100 ms after the callback's end (apps_port_mono_ms then).
+ * A killed app (the duty cycle's kill, or another task's) that no call has found out is the step's call: a call that does
+ * nothing and records the crash. False, with nothing run, when no timer is due, the app isn't RUNNING, or the screen is
+ * dark. A callback that fails has crashed the app: the caller checks apps_rt_state, as after any call, before the next step. */
 bool apps_rt_run_one_timer(apps_rt_t *rt, int64_t now_ms);
+
+/* How much of the last whole window the calls took, in percent (0 to 100): the window that closed last, which this closes the
+ * ones that have ended by now_ms to find (as apps_rt_has_work does, for a RUNNING app: a runtime that isn't keeps the value it
+ * had). 0 for an app that has been idle for a second, and for NULL. The app task reads it once a round for the status's cpu_pct,
+ * so that the status and the duty cycle count the same time. */
+uint8_t apps_rt_cpu_pct(apps_rt_t *rt, int64_t now_ms);
 
 /* A whole pass: each timer due at now_ms once, earliest first (apps_rt_run_one_timer until it says false, or the app crashes). */
 void apps_rt_run_timers(apps_rt_t *rt, int64_t now_ms);

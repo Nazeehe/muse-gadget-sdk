@@ -65,8 +65,15 @@
 /* How far from its year and month an os.time table may put the date, in days: day, hour, min and sec added up (each by its
  * size). picolibc's mktime goes through the days it is given a month at a time, about a microsecond a month, so 2^31 days
  * would hold the app for six seconds, with the app task's watchdog and the supervisor's three seconds both passed. This is
- * about 8200 years and costs 10 ms at most. */
+ * about 8200 years and costs 10 ms at most. Month and year offsets walk nothing: the library takes the months out in a division,
+ * and the years it counts are those between 1970 and the date, which the calendar bounds (below). */
 #define OS_TIME_MAX_DAYS 3000000
+/* The days of that walk a VM instruction pays for. The board's mktime takes about 3.2 ns a day (10 ms for 3.16 M days, measured),
+ * and an instruction of the VM about 0.4 us (2.5 M a second): about 120, rounded down to 100, so that a table at the bound costs
+ * 30,001 instructions of the call's 2 M, and a callback can make about 66 of them. */
+#define OS_TIME_DAYS_PER_INSTR 100
+#define CALENDAR_MIN_YEAR 0
+#define CALENDAR_MAX_YEAR 9999
 
 static const char *const DAYS[7] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 static const char *const MONTHS[12] = {"January", "February", "March",     "April",   "May",      "June",
@@ -157,13 +164,13 @@ static void set_int(lua_State *L, const char *key, lua_Integer v) {
 /* tm's fields into the table on top of the stack: time.date's, and os.date's isdst, which time.date doesn't have. */
 static void fill_fields(lua_State *L, const struct tm *tm, bool with_isdst) {
     set_int(L, "year", (lua_Integer)tm->tm_year + 1900);
-    set_int(L, "month", tm->tm_mon + 1);
+    set_int(L, "month", (lua_Integer)tm->tm_mon + 1);
     set_int(L, "day", tm->tm_mday);
     set_int(L, "hour", tm->tm_hour);
     set_int(L, "min", tm->tm_min);
     set_int(L, "sec", tm->tm_sec);
-    set_int(L, "wday", tm->tm_wday + 1);
-    set_int(L, "yday", tm->tm_yday + 1);
+    set_int(L, "wday", (lua_Integer)tm->tm_wday + 1);
+    set_int(L, "yday", (lua_Integer)tm->tm_yday + 1);
     if (with_isdst && tm->tm_isdst >= 0) {
         lua_pushboolean(L, tm->tm_isdst);
         lua_setfield(L, -2, "isdst");
@@ -347,6 +354,10 @@ static int64_t magnitude(int v) {
     return v < 0 ? -(int64_t)v : v;
 }
 
+static int os_time_unrepresentable(lua_State *L) {
+    return luaL_error(L, "os.time: the time can't be represented " CALENDAR_YEARS);
+}
+
 static int os_time_isdst(lua_State *L) {
     int res = lua_getfield(L, -1, "isdst") == LUA_TNIL ? -1 : lua_toboolean(L, -1);
     lua_pop(L, 1);
@@ -378,10 +389,23 @@ static int os_time(lua_State *L) {
     if (days > OS_TIME_MAX_DAYS) {
         return luaL_error(L, "os.time: day, hour, min and sec add up to more than " STR(OS_TIME_MAX_DAYS) " days");
     }
+    /* The year the month and year fields name (a month past 11 or before 0 moves it), in 64 bits: the C library takes ints, and
+     * a year it can't hold or a month of 2^31 is for it to wrap on. The days move it by at most days / 365 years (and two more
+     * for the carries): a date that cannot be in the calendar even so is refused here, as it is below when mktime has put
+     * it outside. */
+    int64_t months = ts.tm_mon;
+    int64_t year = (int64_t)ts.tm_year + 1900 + months / 12 - (months % 12 < 0 ? 1 : 0);
+    int64_t reach = days / 365 + 2;
+    if (year - reach > CALENDAR_MAX_YEAR || year + reach < CALENDAR_MIN_YEAR) {
+        return os_time_unrepresentable(L);
+    }
+    /* mktime walks the days in C, where no count hook sees it: they are charged to the call before it does (a call over its
+     * budget, or killed, stops here), so that an app that does it over and over is stopped, and counts in the duty cycle. */
+    apps_vm_charge(L, (unsigned)(days / OS_TIME_DAYS_PER_INSTR) + 1);
     time_t t = mktime(&ts);  /* local time; it normalizes ts, which goes back into the table, as Lua's does */
     fill_fields(L, &ts, true);
     if (t == (time_t)-1 || t < CALENDAR_MIN_S || t > CALENDAR_MAX_S) {
-        return luaL_error(L, "os.time: the time can't be represented " CALENDAR_YEARS);
+        return os_time_unrepresentable(L);
     }
     lua_pushinteger(L, (lua_Integer)t);
     return 1;
@@ -457,6 +481,10 @@ static int arm(lua_State *L, bool every) {
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
     uint32_t gen;
     int slot = apps_rt_timer_add(rt, ref, ms, every, &gen);
+    if (slot < 0) {  /* the count was checked above and no app code runs between (no finalizers): but never a handle to nothing */
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        return luaL_error(L, "timer: no more than " STR(APPS_TIMERS_MAX) " timers per app");
+    }
     h->gen = gen;
     h->slot = (uint16_t)slot;
     return 1;

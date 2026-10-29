@@ -33,7 +33,7 @@
  *   insert, remove and sort refuse to walk more elements than the heap could hold
  *   (mem_limit / 16: a range or a __len with nothing behind it). A C function that
  *   walks without allocating anyway charges the walk to the call's budget with
- *   apps_vm_charge (json.encode: the slots lua_next visits, empty ones too).
+ *   apps_vm_charge (json.encode: the slots lua_next visits, empty ones too; os.time: the days mktime walks).
  * Globals are strict: reading an undefined one raises "unknown global 'x'", with a
  * "did you mean" when a name is near, or advice for a library left out (io, debug,
  * load...); assigning one defines it. Strictness lives in the table's __index, so C

@@ -71,7 +71,12 @@ typedef struct {
 #define pdTRUE 1
 #define pdFAIL 0
 #define pdPASS 1
-#define configTICK_RATE_HZ 1000
+/* The board builds at 1000 Hz (CONFIG_FREERTOS_HZ, sdkconfig.defaults), ESP-IDF's own default is 100: a harness built with
+ * -DMUSE_FAKE_TICK_HZ=100 shows what the app task does when a tick is 10 ms (a wait of 1 to 9 ms is no tick at all). */
+#ifndef MUSE_FAKE_TICK_HZ
+#define MUSE_FAKE_TICK_HZ 1000
+#endif
+#define configTICK_RATE_HZ MUSE_FAKE_TICK_HZ
 #define portMAX_DELAY ((TickType_t)0xffffffffu)
 #define pdMS_TO_TICKS(ms) ((TickType_t)(((uint64_t)(ms) * configTICK_RATE_HZ) / 1000u))
 #define tskNO_AFFINITY ((BaseType_t)0x7FFFFFFF)

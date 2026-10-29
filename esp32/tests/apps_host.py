@@ -252,18 +252,20 @@ def json_float_text(x: float) -> str:
 
 
 def run(binary: str | Path, *args: object, input: str | bytes | None = None, timeout: float = 60,
-        text: bool = True) -> subprocess.CompletedProcess:
+        text: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Runs a harness built by build() and returns the CompletedProcess.
 
     By default its output is text: bytes that aren't UTF-8 become U+FFFD, and input is a str. With
     text=False both are bytes, for a test that has to see exactly what the binary wrote. A sanitized
-    binary aborts on its first report, and checks for leaks only where LeakSanitizer works.
+    binary aborts on its first report, and checks for leaks only where LeakSanitizer works. env is
+    added to the environment the binary gets (this process's, otherwise as it is): a test that must
+    hold on any machine sets what the machine could have set differently, TZ for one.
     """
     sanitized, leaks = _built.get(Path(binary).resolve(), (False, False))
-    env = os.environ.copy()
+    environment = {**os.environ, **(env or {})}
     if sanitized:
-        env["ASAN_OPTIONS"] = f"detect_leaks={int(leaks)}:abort_on_error=1"
-        env["UBSAN_OPTIONS"] = "print_stacktrace=1"
+        environment["ASAN_OPTIONS"] = f"detect_leaks={int(leaks)}:abort_on_error=1"
+        environment["UBSAN_OPTIONS"] = "print_stacktrace=1"
     options = {"text": True, "errors": "replace"} if text else {}
     return subprocess.run([str(binary), *map(str, args)], cwd=ROOT, input=input,
-                          capture_output=True, timeout=timeout, env=env, **options)
+                          capture_output=True, timeout=timeout, env=environment, **options)

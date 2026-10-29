@@ -202,9 +202,7 @@ static struct {
     int64_t settle_until;
     char what[WHAT_MAX];     /* what a crash now is, to the pending run */
     int64_t call_began;
-    int64_t window;          /* the second the busy time is counted in */
-    int64_t window_busy;
-    uint8_t cpu_pct;
+    uint8_t cpu_pct;         /* what the runtime last said of the share of a window its calls took (apps_rt_cpu_pct) */
     uint32_t worst_ms;
     bool dirty;              /* the app ran since the record was refreshed */
     int64_t refresh_at;
@@ -217,6 +215,7 @@ static struct {
 
 static struct {
     bool in_turn;
+    bool dark;               /* the screen was dark at the last frame (apps_port_dark) */
     bool turn_ended;         /* the next supervise decides the layer's place */
     uint32_t gen;            /* the app (app_gen) the two below are about */
     bool front_before_turn;  /* it was in front when the voice turn began */
@@ -594,51 +593,37 @@ static const char *const END_NAMES[] = {"stopped", "replaced", "exited", "crashe
 
 static void finish_run(void);
 
-/* Calls' time is counted in whole seconds of apps_port_mono_ms (windows): cpu_pct is the share of the last whole one.
- * This brings the count to `second`. */
-static void roll_to(int64_t second) {
-    if (second == T.window) {
+/* The time of the app's calls is counted by its runtime, in the windows of the duty cycle (whole seconds of apps_port_mono_ms:
+ * apps_rt.h), where the same booking decides what is hot: cpu_pct is the share of the last whole window that its calls took. The
+ * loop asks every round, at least once a second (C22), so an idle app's cpu_pct falls to 0 (and the windows that have ended are
+ * closed, so the duty cycle's warning and kill come on time); the record takes a change at once. */
+static void roll_window(void) {
+    if (T.rt == NULL || T.abandoned) {
         return;
     }
-    T.cpu_pct = second == T.window + 1 ? (uint8_t)(T.window_busy >= 1000 ? 100 : T.window_busy / 10) : 0;
-    T.window = second;
-    T.window_busy = 0;
-}
-
-/* The loop calls it every round, at least once a second (C22), so an idle app's cpu_pct falls to 0; the record takes a
- * change at once. */
-static void roll_window(void) {
-    uint8_t was = T.cpu_pct;
-    roll_to(apps_port_mono_ms() / 1000);
-    if (T.cpu_pct != was && T.rt != NULL && rec_take(LOCK_MS)) {
-        s_rec->st.cpu_pct = T.cpu_pct;
-        rec_give();
+    uint8_t pct = apps_rt_cpu_pct(T.rt, apps_port_mono_ms());
+    if (pct != T.cpu_pct) {
+        T.cpu_pct = pct;
+        if (rec_take(LOCK_MS)) {
+            s_rec->st.cpu_pct = pct;
+            rec_give();
+        }
     }
 }
 
 static void call_begin(void) {
     T.call_began = apps_port_mono_ms();
-    roll_to(T.call_began / 1000);
     atomic_store(&s_rec->call_started, (uint32_t)T.call_began);
     atomic_store(&s_rec->in_call, 1);
 }
 
-/* The call is over: the counters. Its time goes to the windows it spans. */
+/* The call is over: the counters (its time is the runtime's to book). */
 static void call_finish(void) {
     atomic_store(&s_rec->in_call, 0);
-    int64_t now = apps_port_mono_ms();
-    int64_t took = now - T.call_began;
+    int64_t took = apps_port_mono_ms() - T.call_began;
     if (took > (int64_t)T.worst_ms) {
         T.worst_ms = took > UINT32_MAX ? UINT32_MAX : (uint32_t)took;
     }
-    for (int64_t at = T.call_began; at < now;) {
-        roll_to(at / 1000);
-        int64_t upto = (at / 1000 + 1) * 1000;
-        upto = upto < now ? upto : now;
-        T.window_busy += upto - at;
-        at = upto;
-    }
-    roll_to(now / 1000);
     T.dirty = true;
     apps_port_log_drain();  /* the call's echo, now that its wall clock has stopped */
 }
@@ -772,8 +757,6 @@ static void begin_app(apps_pkg_t *pkg) {
     T.warned = NO_WARNED;
     T.worst_ms = 0;
     T.cpu_pct = 0;
-    T.window = apps_port_mono_ms() / 1000;
-    T.window_busy = 0;
     T.gen++;
     atomic_store(&s_rec->app_gen, T.gen);
     if (rec_take(LOCK_MS)) {
@@ -1073,7 +1056,8 @@ static void housekeeping(void) {
 
 /* How long the loop waits for an event: until the pending run settles or the app's earliest timer is due, and never more
  * than RECEIVE_MS (C22), which is also how long it waits while the screen is dark and no timer can run. A timer that is due
- * already still waits a tick: a task that came straight back would never let the idle task run. */
+ * already still waits a millisecond, which wait_ticks makes a tick: a task that came straight back would never let the idle task
+ * run. 0 only for a run whose settle is over. */
 static int receive_ms(void) {
     int64_t now = apps_port_mono_ms();
     int64_t wait = RECEIVE_MS;
@@ -1089,6 +1073,14 @@ static int receive_ms(void) {
         }
     }
     return (int)wait;
+}
+
+/* ms in ticks, rounded up, and at least one for a wait above 0. pdMS_TO_TICKS rounds down, so where a tick is longer than a
+ * millisecond (ESP-IDF's default is 100 Hz: 10 ms; the board's is 1000) a wait of 1 to 9 ms would be no wait at all, and the loop
+ * would go straight round for those milliseconds, a task at priority 2 that never lets the idle task run. 0 is a settle that
+ * is over. */
+static TickType_t wait_ticks(int ms) {
+    return ms <= 0 ? 0 : (TickType_t)(((uint64_t)ms * configTICK_RATE_HZ + 999u) / 1000u);
 }
 
 /* The timer that is due runs, as a call of the app like any other: bracketed for the supervisor and the status, and an
@@ -1112,10 +1104,9 @@ static void run_timers(void) {
 static void apps_task(void *arg) {
     (void)arg;
     ESP_LOGI(TAG, "up: stack %u in PSRAM", (unsigned)APPS_TASK_STACK);
-    T.window = apps_port_mono_ms() / 1000;
     for (;;) {
         apps_event_t ev;
-        bool got = xQueueReceive(s_queue, &ev, pdMS_TO_TICKS(receive_ms())) == pdTRUE;
+        bool got = xQueueReceive(s_queue, &ev, wait_ticks(receive_ms())) == pdTRUE;
         housekeeping();
         if (got) {
             handle(&ev);
@@ -1178,6 +1169,21 @@ static void front_now(void) {
         apps_lv_set_front(true);
     }
     post_from_lvgl(APPS_EV_SHOW, L.gen);
+}
+
+/* The screen was dark and is lit: the timers that came due while it slept are overdue, and the app task's loop, which waits a
+ * second for an event while the screen is dark (no timer can run, so no deadline shortens its wait), is told at once, with a
+ * no-op event. Without it the loop notices the wake at its next round, up to that second, and an app in front shows its
+ * frame from before the sleep (a clock, its old minute) all that time. Posted with no wait, as everything the LVGL task
+ * posts: with the queue full the app task is awake anyway. Seen at a frame, whichever way the screen is: update_sleep clears
+ * the flag later in the frame than the supervisor runs, so it is the next frame's that sees the edge. */
+static void note_wake(void) {
+    bool dark = apps_port_dark();
+    if (L.dark && !dark) {
+        apps_event_t ev = {.type = APPS_EV_WAKE};
+        (void)xQueueSend(s_queue, &ev, 0);
+    }
+    L.dark = dark;
 }
 
 /* The supervisor: a call that has run for more than APPS_TASK_HUNG_MS is hung. */
@@ -1341,6 +1347,7 @@ void muse_apps_ui_supervise(void) {
         carry_out_front();
         show_cards();
     }
+    note_wake();
     update_covering();
 }
 

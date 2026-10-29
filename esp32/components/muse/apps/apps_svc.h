@@ -42,7 +42,10 @@
  *                         {year, month, day, hour = 12, min = 0, sec = 0, isdst}: mktime in the local time zone, which also
  *                         writes the normalized fields back into the table, as Lua's does (so a month of 13 is January).
  *                         day, hour, min and sec may add up to at most 3000000 days (the C library works through the days
- *                         a month at a time, and 2^31 of them would hold the app for seconds)
+ *                         a month at a time, and 2^31 of them would hold the app for seconds), and the walk is charged to the
+ *                         call like Lua's own instructions, 100 days to an instruction and one more (so a callback that makes
+ *                         them by the hundred is over its budget, and counts in the duty cycle: apps_rt.h). A year and month
+ *                         that no days within that bound could bring into the calendar are refused before the C library sees them
  *   os.date(fmt?, s?)     Lua's: fmt (default "%a %b %e %H:%M:%S %Y", what C's %c is) with time.format's specifiers, for the
  *                         epoch seconds s (default os.time(): before the clock is set it is 1970, and never an error); a
  *                         "!" in front of fmt is UTC; "*t" (or "!*t") is the table of time.date's fields and isdst

@@ -82,6 +82,12 @@ static int64_t real_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* How long a number of ticks is, at the tick rate the fakes were built for (MUSE_FAKE_TICK_HZ: 1000, or 100 for the cases that
+ * show what a coarse tick does). */
+static int64_t ticks_to_ms(TickType_t ticks) {
+    return (int64_t)ticks * 1000 / configTICK_RATE_HZ;
+}
+
 /* An absolute CLOCK_REALTIME time ms from now, for pthread_cond_timedwait. */
 static struct timespec deadline_in(int64_t ms) {
     struct timespec ts;
@@ -784,7 +790,7 @@ UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task) {
 }
 
 void vTaskDelay(const TickType_t ticks) {
-    sleep_ms((int)ticks);
+    sleep_ms((int)ticks_to_ms(ticks));
 }
 
 struct fake_queue {
@@ -817,7 +823,7 @@ void vQueueDeleteWithCaps(QueueHandle_t q) {
 
 /* Waits on q's condition until ready() or the wait runs out; q->mu is held. */
 static bool queue_wait(struct fake_queue *q, TickType_t wait, bool (*ready)(const struct fake_queue *)) {
-    struct timespec deadline = deadline_in((int64_t)wait);
+    struct timespec deadline = deadline_in(ticks_to_ms(wait));
     while (!ready(q)) {
         if (wait == 0) {
             return false;
@@ -986,7 +992,7 @@ static void gate_check(const struct fake_mutex *m) {
 
 BaseType_t xSemaphoreTake(SemaphoreHandle_t m, TickType_t wait) {
     gate_check(m);
-    struct timespec deadline = deadline_in((int64_t)wait);
+    struct timespec deadline = deadline_in(ticks_to_ms(wait));
     pthread_mutex_lock(&m->mu);
     if (m->held && pthread_equal(m->holder, pthread_self())) {
         pthread_mutex_unlock(&m->mu);
@@ -1561,8 +1567,8 @@ static void finish(void) {
           held_now(&caps_held), caps_after_start);
     CHECK(errors == 0, "%d errors, the first: %s", errors, error_note);
     CHECK(!atomic_load(&events_full), "the event log filled up (%d events): the case's checks can't be trusted", EVENTS_MAX);
-    CHECK(atomic_load(&longest_receive) <= 1000, "the app task waited %u ticks for an event: at most 1000 (C22)",
-          (unsigned)atomic_load(&longest_receive));
+    CHECK(atomic_load(&longest_receive) <= pdMS_TO_TICKS(1000), "the app task waited %u ticks for an event: at most a second, %u (C22)",
+          (unsigned)atomic_load(&longest_receive), (unsigned)pdMS_TO_TICKS(1000));
     CHECK(atomic_load(&lvgl_longest_send) == 0, "the LVGL task waited %u ticks to post: it never waits",
           (unsigned)atomic_load(&lvgl_longest_send));
     CHECK(atomic_load(&launch_longest_send) == 0, "apps_task_launch waited %u ticks to post: it never waits (C5)",
@@ -2950,6 +2956,9 @@ static void an_echo_waits_outside_the_call(void) {
 
 /* ---- Timers (Task 16) ---- */
 
+#define THROTTLED_TEXT "throttled: using more than 40% of the CPU"
+#define KILLED_TEXT "stopped: used more than 40% of the CPU for 5 s"
+
 /* A timer's callback is a call into the app like any other: it runs on the app task's loop (which wakes for the timer, not
  * at its next round a second away), is bracketed for the supervisor and the status, and its app ends as any app ends. */
 static const char APP_TIMERS[] =
@@ -2978,13 +2987,19 @@ static void timers_run_on_the_app_task(void) {
     ORDERED(from, "print timers after", "print timers tick 1");
     ORDERED(from, "print timers tick 1", "print timers tick 2");
     ABSENT(from, "print timers tomorrow");
-    /* Each callback is a call, which the status counts; and the loop never waits longer than its second for a day-long
-     * timer (finish() checks the longest wait). */
-    apps_task_status(st);
-    CHECK(st->state == APPS_STATE_RUNNING && st->instructions > 0, "the status: %s %llu", apps_state_name(st->state),
-          (unsigned long long)st->instructions);
+    /* Each callback is a call, which the status counts: the lines they printed (nothing else here prints) are in its log within
+     * a second (the record is refreshed at most that often while the app runs), where start() and main.lua didn't put any. */
+    for (int64_t until = real_ms() + 3000; real_ms() < until;) {
+        apps_task_status(st);
+        if (strstr(st->log_tail, "tick 3") != NULL) {
+            break;
+        }
+        sleep_ms(20);
+    }
+    CHECK(st->state == APPS_STATE_RUNNING && strstr(st->log_tail, "after") != NULL && strstr(st->log_tail, "tick 3") != NULL,
+          "the status: %s '%s'", apps_state_name(st->state), st->log_tail);
     FIFO_SYNC();
-    CHECK(atomic_load(&longest_receive) > 0 && atomic_load(&longest_receive) <= 1000, "the longest wait: %u ticks",
+    CHECK(atomic_load(&longest_receive) > 0 && atomic_load(&longest_receive) <= pdMS_TO_TICKS(1000), "the longest wait: %u ticks",
           (unsigned)atomic_load(&longest_receive));
     /* Stopping the app takes its timers with it: nothing ticks after stop(). */
     CHECK(stop_app(err, sizeof err), "stop: '%s'", err);
@@ -3022,7 +3037,11 @@ static void a_hung_timer_callback_is_abandoned(void) {
     WAIT(back, "priority muse_apps 2");
     ORDERED(back, "set_ui NULL", "reset");
     CHECK(at_from(back, "log I stop hangt: hung, peak ") >= 0, "the stop line");
-    CHECK(card >= 0 && at_from(back, "print hangt") < 0, "nothing of the app runs again");
+    /* The callback was stuck for three seconds of the clock: its call, when it returns, is booked as three windows of 100% of
+     * the CPU, and the runtime says what it counted (the throttle's warning, once: its own line, not the app's). Nothing of the
+     * app's own runs. */
+    CHECK(card >= 0 && count_from(back, "print hangt") == count_from(back, "print hangt " THROTTLED_TEXT),
+          "nothing of the app runs again");
     heap_caps_free(st);
 }
 
@@ -3052,6 +3071,61 @@ static void due_timers_never_make_the_loop_spin(void) {
     FIFO_SYNC();
     CHECK(atomic_load(&zero_receives) == zeros, "the loop asked for a wait of 0 %u times with a timer due",
           atomic_load(&zero_receives) - zeros);
+    clock_go();
+}
+
+/* The loop never waits longer than a second, whatever its earliest timer: an app whose only timer is 5 s away (a day-long
+ * one is the same) has the loop come round once a second, as the record's refresh, the parked package and the log's drain
+ * need it to (C22; finish() checks the longest wait of every case, and this one says so too). */
+static const char APP_FAR[] =
+    "local app = {}\n"
+    "function app.start() timer.after(5000, function() print('far') end) end\n"
+    "return app\n";
+
+static void a_lone_far_timer_never_makes_the_loop_wait_long(void) {
+    const file_t files[] = {LUA("main.lua", APP_FAR)};
+    char err[200];
+    CHECK(apps_task_run(make_pkg("far", "Far", files, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    FIFO_SYNC();  /* the loop has been round, and waits for the timer */
+    sleep_ms(50);
+    CHECK(atomic_load(&longest_receive) > 0 && atomic_load(&longest_receive) <= pdMS_TO_TICKS(1000), "the longest wait: %u ticks, not a second's %u",
+          (unsigned)atomic_load(&longest_receive), (unsigned)pdMS_TO_TICKS(1000));
+}
+
+/* A run that waits for its settle gets its answer then, not when the timer of the app (5 s away) is due: the loop wakes at the
+ * earlier of the two. */
+static void a_far_timer_does_not_delay_a_settle(void) {
+    const file_t files[] = {LUA("main.lua", APP_FAR)};
+    apps_status_t *st = new_status();
+    char err[200];
+    int64_t began = real_ms();
+    CHECK(apps_task_run(make_pkg("far", "Far", files, 1), false, 300, st, err, sizeof err), "run: %s", err);
+    int64_t took = real_ms() - began;
+    CHECK(took >= 300 && took < 2000, "a run with a settle of 300 ms answered after %lld ms", (long long)took);
+    CHECK(st->state == APPS_STATE_RUNNING, "the status: %s", apps_state_name(st->state));
+    heap_caps_free(st);
+}
+
+/* A timer that is due within a tick is waited for, never spun on: a wait of 5 ms is a tick (1 at 1000 Hz, which is 5 of them;
+ * 10 ms at 100 Hz, where pdMS_TO_TICKS(5) is 0 and the loop used to go straight round for those 5 ms: the idle task starves).
+ * The clock stands still, and the timer is 5 ms away. */
+static void a_timer_due_within_a_tick_is_waited_for_not_spun_on(void) {
+    const file_t files[] = {LUA("main.lua", APP_TWINS)};
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());  /* before the run: the timers are armed at this time, and are due exactly 1000 ms on */
+    CHECK(apps_task_run(make_pkg("twins", "Twins", files, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    FIFO_SYNC();
+    unsigned zeros = atomic_load(&zero_receives);
+    int from = mark();
+    clock_jump(995);  /* both are due in 5 ms */
+    FIFO_SYNC();
+    sleep_ms(300);  /* real time: the loop goes round every tick it waits */
+    ABSENT(from, "print twins");
+    CHECK(atomic_load(&zero_receives) == zeros, "the loop asked for a wait of 0 %u times with a timer 5 ms away",
+          atomic_load(&zero_receives) - zeros);
+    clock_jump(5);
+    WAIT(from, "print twins one");
+    WAIT(from, "print twins two");
     clock_go();
 }
 
@@ -3095,6 +3169,42 @@ static void dark_pauses_the_timers_and_the_wake_runs_each_once(void) {
     clock_go();
 }
 
+/* The screen wakes and the timers that came due while it was dark run at once, not when the loop next comes round (up to a
+ * second, which on the watch is the old minute on screen for that long): the LVGL task's supervisor sees the screen go from
+ * dark to lit and posts a no-op event, which wakes the loop. The loop was sent into a fresh wait of a second just before the
+ * wake. */
+static void the_wake_runs_the_overdue_timers_at_once(void) {
+    const file_t files[] = {LUA("main.lua", APP_TICKER)};
+    char err[200];
+    CHECK(apps_task_run(make_pkg("ticker", "Ticker", files, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    clock_jump(1000);
+    FIFO_SYNC();
+    WAIT(from, "print ticker tick 1");
+    WAIT_FRAMES(5);
+    ABSENT(from, "queue WAKE");        /* frames of a screen that is lit post nothing */
+    atomic_store(&lvgl_asleep, true);  /* the screen goes dark */
+    WAIT_FRAMES(3);                    /* and the supervisor has seen it */
+    ABSENT(from, "queue WAKE");        /* nor does the edge into the dark */
+    clock_jump(10000);                 /* the timer is overdue ten times over */
+    FIFO_SYNC();
+    FIFO_SYNC();  /* the loop has been round, and now waits a second for an event: a dark screen has no timer to wait for */
+    int dark = mark();
+    ABSENT(dark, "queue WAKE");
+    ABSENT(dark, "print ticker");
+    int64_t woke = real_ms();
+    atomic_store(&lvgl_asleep, false);
+    WAIT(dark, "queue WAKE wait 0");  /* the supervisor's no-op event, posted with no wait */
+    WAIT(dark, "print ticker tick 2");
+    int64_t took = real_ms() - woke;
+    CHECK(took < 400, "the overdue timer ran %lld ms after the wake: the loop waited out its second", (long long)took);
+    FIFO_SYNC();
+    FIFO_SYNC();
+    CHECK(count_from(dark, "print ticker tick") == 1, "%d ticks at the wake, one is due", count_from(dark, "print ticker tick"));
+    clock_go();
+}
+
 /* An error in a timer's callback crashes the app as one in a widget's handler does: the table comes down, the card is
  * shown after the reset, and the record has the error and its traceback. */
 static const char APP_TIMER_BOOM[] =
@@ -3133,9 +3243,6 @@ static const char APP_BURNER[] =
     "function app.message(event, data) for i = 1, data do end return true end\n"
     "return app\n";
 
-#define THROTTLED_TEXT "throttled: using more than 40% of the CPU"
-#define KILLED_TEXT "stopped: used more than 40% of the CPU for 5 s"
-
 static void the_duty_cycle_warns_the_status_then_kills(void) {
     const file_t files[] = {LUA("main.lua", APP_BURNER)};
     apps_status_t *st = new_status();
@@ -3162,13 +3269,80 @@ static void the_duty_cycle_warns_the_status_then_kills(void) {
     apps_task_status(st);
     CHECK(strcmp(st->warnings, THROTTLED_TEXT) == 0, "the status warns once: '%s'", st->warnings);
     ABSENT(from, "crash ");
-    /* The sixth window's first call closes the fifth: the app is killed. */
+    /* The sixth window's first call closes the fifth: the app is killed. The loop's own pass may have closed it first (it reads
+     * the clock after the fifth call's reply, and the clock was jumped by then: nothing orders the two), and the app has crashed:
+     * the call then finds it gone. Either way the card comes, and the record has the reason. */
     char *reply = apps_task_message("burner", "burn", data, false, 0, err, sizeof err);
-    CHECK(reply == NULL && strcmp(err, KILLED_TEXT) == 0, "the kill: '%s'", err);
+    CHECK(reply == NULL && (strcmp(err, KILLED_TEXT) == 0 || strstr(err, "isn't running") != NULL), "the kill: '%s'", err);
     WAIT(from, "crash Burner | " KILLED_TEXT);
     apps_task_status(st);
     CHECK(st->state == APPS_STATE_CRASHED && strcmp(st->last_error, KILLED_TEXT) == 0, "the record: %s '%s'",
           apps_state_name(st->state), st->last_error);
+    clock_go();
+    heap_caps_free(st);
+}
+
+/* A warning that the duty cycle raises later joins the ones the launch gave, with one "; " between (the runtime's own text starts
+ * with "; " when it follows another, which the status strips before it adds its own). Here it is the loop's pass that raises
+ * it, the second after the third hot window has ended with no call since (no timer is due, so the pass makes no call: the
+ * status takes the warning from a pass that made none). */
+static const char APP_BURNER_WARNED[] =
+    "local app = {bogus = function() end}\n"
+    "function app.start() ui.label{text = 'Busy'} end\n"
+    "function app.message(event, data) for i = 1, data do end return true end\n"
+    "return app\n";
+
+#define LAUNCH_WARNING "main.lua returned unknown handler 'bogus'"
+
+static void a_throttle_warning_from_a_pass_joins_the_launch_warnings(void) {
+    const file_t files[] = {LUA("main.lua", APP_BURNER_WARNED)};
+    apps_status_t *st = new_status();
+    char err[300], data[32];
+    CHECK(apps_task_run(make_pkg("burner", "Burner", files, 1), true, 0, st, err, sizeof err), "run: %s", err);
+    CHECK(strcmp(st->warnings, LAUNCH_WARNING) == 0, "the launch's warning: '%s'", st->warnings);
+    clock_stop_at(apps_port_mono_ms());
+    snprintf(data, sizeof data, "%u", APPS_DUTY_INSTR_PER_S / 3 + 5000);  /* three of them are over the rate */
+    for (int window = 1; window <= 3; window++) {
+        for (int call = 0; call < 3; call++) {
+            char *reply = apps_task_message("burner", "burn", data, false, 0, err, sizeof err);
+            CHECK(reply != NULL, "window %d, call %d: %s", window, call + 1, err);
+            apps_port_free(reply);
+        }
+        clock_jump(1000);
+    }
+    FIFO_SYNC();
+    FIFO_SYNC();  /* the pass of the first has finished: nothing but it has closed the third window */
+    apps_task_status(st);
+    CHECK(strcmp(st->warnings, LAUNCH_WARNING "; " THROTTLED_TEXT) == 0, "the status: '%s'", st->warnings);
+    clock_go();
+    heap_caps_free(st);
+}
+
+/* The status's cpu_pct and the duty cycle count the same time: a call that takes 450 ms of each of three seconds (a print that
+ * blocks, on the stoppable clock) is 45% of the last, and is hot, by time alone (it runs a few hundred instructions): the third
+ * hot second makes a warning. */
+static void cpu_pct_and_the_duty_cycle_agree(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    const int64_t t0 = (apps_port_mono_ms() / 1000 + 3) * 1000;  /* a whole second, ahead */
+    apps_status_t *st = new_status();
+    for (int second = 0; second < 3; second++) {
+        clock_stop_at(t0 + 1000 * second);
+        block_print("busy");
+        TAP(0);
+        WAIT_PRINT_BLOCKED();
+        clock_stop_at(t0 + 1000 * second + 450);
+        release_print();
+        FIFO_SYNC();
+        apps_task_status(st);
+        CHECK(strstr(st->warnings, THROTTLED_TEXT) == NULL, "second %d: warned '%s'", second, st->warnings);
+    }
+    clock_stop_at(t0 + 3001);  /* the third second has closed */
+    FIFO_SYNC();
+    FIFO_SYNC();
+    apps_task_status(st);
+    CHECK(st->cpu_pct == 45, "cpu %u%%", st->cpu_pct);
+    CHECK(strcmp(st->warnings, THROTTLED_TEXT) == 0, "three seconds of 45%%: the status warns once: '%s'", st->warnings);
     clock_go();
     heap_caps_free(st);
 }
@@ -3545,11 +3719,17 @@ int main(int argc, char **argv) {
         {"io_takes_a_job_that_came_as_it_timed_out", io_takes_a_job_that_came_as_it_timed_out},
         {"an_echo_waits_outside_the_call", an_echo_waits_outside_the_call},
         {"timers_run_on_the_app_task", timers_run_on_the_app_task},
+        {"a_lone_far_timer_never_makes_the_loop_wait_long", a_lone_far_timer_never_makes_the_loop_wait_long},
+        {"a_far_timer_does_not_delay_a_settle", a_far_timer_does_not_delay_a_settle},
+        {"a_timer_due_within_a_tick_is_waited_for_not_spun_on", a_timer_due_within_a_tick_is_waited_for_not_spun_on},
+        {"the_wake_runs_the_overdue_timers_at_once", the_wake_runs_the_overdue_timers_at_once},
         {"a_hung_timer_callback_is_abandoned", a_hung_timer_callback_is_abandoned},
         {"due_timers_never_make_the_loop_spin", due_timers_never_make_the_loop_spin},
         {"dark_pauses_the_timers_and_the_wake_runs_each_once", dark_pauses_the_timers_and_the_wake_runs_each_once},
         {"a_timer_error_crashes_the_app_and_shows_the_card", a_timer_error_crashes_the_app_and_shows_the_card},
         {"the_duty_cycle_warns_the_status_then_kills", the_duty_cycle_warns_the_status_then_kills},
+        {"a_throttle_warning_from_a_pass_joins_the_launch_warnings", a_throttle_warning_from_a_pass_joins_the_launch_warnings},
+        {"cpu_pct_and_the_duty_cycle_agree", cpu_pct_and_the_duty_cycle_agree},
 #ifdef HARNESS_CONSOLE
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},

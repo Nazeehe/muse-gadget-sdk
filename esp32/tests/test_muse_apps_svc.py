@@ -27,13 +27,12 @@ show and apphost's 10 ms steps can't (each window is closed as it ends there).
 import random
 import re
 import subprocess
-import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
 import apps_host
-from test_muse_apps_rt import BUDGET_CALL, HARNESS_SOURCES, INCLUDES, AppHostTestCase
+from test_muse_apps_rt import BUDGET_CALL, AppHostTestCase, rt_harness, unknown_handler
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
@@ -43,6 +42,7 @@ SYNCED = 1767225600000  # 2026-01-01T00:00:00Z, a Thursday: what `sync` is given
 
 # The messages, exactly (the brief's, the controller's ruling on the 128 bytes, and the ones the modules add).
 CLOCK_NOT_SET = "time.date: the clock isn't set yet"
+FORMAT_CLOCK_NOT_SET = "time.format: the clock isn't set yet"
 TOO_MANY_TIMERS = "timer: no more than 16 timers per app"
 THROTTLED = "throttled: using more than 40% of the CPU"
 KILLED = "stopped: used more than 40% of the CPU for 5 s"
@@ -67,7 +67,7 @@ def too_long(function):
 
 
 def header_number(header, name):
-    """What `#define NAME 4000000u` is in a header of components/muse/apps."""
+    """What `#define NAME 1000000u` is in a header of components/muse/apps."""
     match = re.search(rf"^#define\s+{name}\s+(\d+)u?\b", (APPS / header).read_text(), re.M)
     assert match, f"no #define {name} in {header}"
     return int(match.group(1))
@@ -111,6 +111,10 @@ end
 
 
 class SvcTestCase(AppHostTestCase):
+    # The runs of apphost here are made in a zone that isn't UTC (the board's): apphost sets its own, UTC0, whatever the machine
+    # says, and a test that only ran on a machine in another zone than UTC (a Linux CI runner is in UTC) would not see that go.
+    host_env = {"TZ": "PST8PDT,M3.2.0,M11.1.0"}
+
     def lua_app(self, source, script=None, **kw):
         """A one-file app whose start() runs `source` (Lua statements, with `bare` and `says` at hand), then the script."""
         main = BARE + "local app = {}\nfunction app.start()\n" + source + "\nend\nreturn app\n"
@@ -337,6 +341,41 @@ class TimerTest(SvcTestCase):
         self.assertEqual(replies(run), [20000])
         self.assertEqual(run.events[-1], {"event": "timers", "count": 0})
 
+    def test_a_timer_may_be_armed_and_cancelled_from_a_coroutine(self):
+        # A coroutine runs on a stack of its own, and the registry reference of a cancelled timer is given back through the
+        # thread that cancels it, not through the main thread, which is in the middle of a call.
+        run = self.handler_app("""
+            local co, outer
+            function app.start()
+                outer = timer.every(100, function() print("outer") end)
+                co = coroutine.wrap(function()
+                    local a = timer.after(100, function() print("a") end)
+                    local b = timer.every(100, function() print("b") end)
+                    a:cancel()
+                    coroutine.yield()
+                    outer:cancel()      -- armed outside, cancelled inside
+                    timer.cancel(b)     -- armed inside, cancelled after the yield
+                end)
+                co()
+            end
+            function app.message() co() return true end
+        """, script=["timers", "advance 250", "message finish", "timers", "advance 1000", "state"])
+        self.assertEqual(run.logs(), ["outer", "b", "outer", "b"])
+        self.assertEqual([e["count"] for e in run.of("timers")], [2, 0])
+
+    def test_timers_cancelled_in_coroutines_give_their_registry_references_back(self):
+        # 3000 coroutines (each is 1000 instructions of the budget) each arm a timer and cancel it: in a heap of 64 KB, 3000
+        # references that were never given back (16 bytes of registry each, in an array that doubles) end the app.
+        main = """
+            local function f() end
+            return {start = function()
+                for i = 1, 3000 do coroutine.wrap(function() timer.after(100, f):cancel() end)() end
+            end}
+        """
+        run = self.run_app(main, mem_kb=64, script=["timers", "state"])
+        self.assertEqual(run.messages("crash"), [])
+        self.assertEqual(run.events[-2:], [{"event": "timers", "count": 0}, {"event": "state", "state": "running"}])
+
     def test_stop_disarms_the_timers_and_start_arms_new_ones(self):
         run = self.handler_app("""
             function app.start() timer.every(100, function() print("tick") end) end
@@ -419,14 +458,17 @@ class TimeTest(SvcTestCase):
             function app.message(event)
                 if event == "before" then
                     local ok, message = pcall(time.date)
-                    return {now_is_nil = time.now() == nil, synced = time.synced(), ok = ok, message = bare(message)}
+                    local format_ok, format_message = pcall(time.format, "%Y")
+                    return {now_is_nil = time.now() == nil, synced = time.synced(), ok = ok, message = bare(message),
+                            format_ok = format_ok, format_message = bare(format_message)}
                 end
                 return {year = time.date().year, text = time.format("%Y-%m-%d %H:%M"), now = time.now(),
                         synced = time.synced(), os_time = os.time()}
             end
         """, script=["message before", f"sync {SYNCED}", "message after", "advance 1500", "message after"])
         before, after, later = replies(run)
-        self.assertEqual(before, {"now_is_nil": True, "synced": False, "ok": False, "message": CLOCK_NOT_SET})
+        self.assertEqual(before, {"now_is_nil": True, "synced": False, "ok": False, "message": CLOCK_NOT_SET,
+                                  "format_ok": False, "format_message": FORMAT_CLOCK_NOT_SET})
         self.assertEqual(after, {"year": 2026, "text": "2026-01-01 00:00", "now": SYNCED, "synced": True,
                                  "os_time": SYNCED // 1000})
         # The clock moves with the monotonic clock from then on.
@@ -449,6 +491,18 @@ class TimeTest(SvcTestCase):
         # Before the first sync os.time() is seconds since boot and os.date never raises: it is 1970 (the rulings).
         self.assertEqual((first["boot"], second["boot"], first["year"], second["year"]), (True, True, "1970", "1970"))
         self.assertEqual((third["boot"], third["year"]), (False, "2026"))
+
+    def test_a_run_is_in_utc_whatever_the_zone_of_the_machine_is(self):
+        # These tests run apphost in the board's zone (SvcTestCase.host_env), as a machine in any zone could: the run is UTC0
+        # (apphost.c sets it), so that a script gives the same events everywhere, and `app.py check` with it.
+        run = self.handler_app("""
+            function app.message()
+                local t = os.date("*t", 3600 * 20)
+                return {os.date("%H:%M", 0), time.format("%H:%M", 0), t.hour, t.isdst, os.time{year = 1970, month = 1, day = 2, hour = 0},
+                        os.date("%H", 3600 * 20)}
+            end
+        """, script=["message zone"])
+        self.assertEqual(replies(run), [["00:00", "00:00", 20, False, 86400, "20"]])
 
     def test_the_label_of_the_time_fixture_follows_the_clock(self):
         run = self.host(FIXTURES / "time_label",
@@ -618,6 +672,15 @@ class TimeTest(SvcTestCase):
                  too_long("os.date"), too_long("os.date"), "128\t24"]
         self.assertEqual(lines, want)
 
+    def test_a_specifier_that_is_not_printable_is_shown_as_a_question_mark(self):
+        # The one place these modules echo a byte of the app's own format: the error leaves as text, where "\n" would be a line
+        # of its own, so the byte is a '?' (printable ASCII is shown as it is).
+        lines = self.lua_lines(r"""
+            says(time.format, "%\n", 0) says(time.format, "%\1", 0) says(time.format, "%\127", 0) says(time.format, "%\255", 0)
+            says(os.date, "%\n", 0) says(os.date, "!%\1", 0) says(os.date, "%\127", 0) says(os.date, "!%\255", 0)
+        """)
+        self.assertEqual(lines, [unsupported("time.format", "%?")] * 4 + [unsupported("os.date", "%?")] * 4)
+
     # ---- os.date and os.time ----
 
     def test_os_date(self):
@@ -738,6 +801,45 @@ class TimeTest(SvcTestCase):
                                  DAYS_RULE, DAYS_RULE, "ok", "ok", "ok", "ok", NOT_REPRESENTED, NOT_REPRESENTED, NOT_REPRESENTED, NOT_REPRESENTED,
                                  NOT_REPRESENTED])
 
+    def test_os_time_refuses_a_year_and_month_that_cannot_land_in_the_calendar(self):
+        # month = 2^31 puts tm_mon at INT_MAX: the `+ 1` that writes the field back overflowed an int (UBSan aborts on it), and
+        # a C library was given years of its own to walk. Such a pair is refused before mktime, however far the days could pull
+        # it back (3 M of them are 8200 years): the calendar's message. A far year that the days do bring back is taken.
+        lines = self.lua_lines("""
+            says(os.time, {year = 2026, month = 2^31, day = 1})
+            says(os.time, {year = 2026, month = -(2^31) + 1, day = 1})
+            says(os.time, {year = 2^31 - 1900, month = 2^31, day = 1})
+            says(os.time, {year = -(2^31) + 1900, month = -(2^31) + 1, day = 1})
+            says(os.time, {year = 2^31 - 1900, month = 1, day = 1})
+            says(os.time, {year = 1000000, month = 1, day = 1})
+            says(os.time, {year = 9999, month = 12, day = -2500000})
+        """)
+        self.assertEqual(lines, [NOT_REPRESENTED] * 6 + ["ok"])
+
+    def test_a_callback_of_big_os_time_calls_is_killed_by_the_budget(self):
+        # mktime goes through 2.5 M days in C for each of these calls, 10 ms on the board, and os.time charges the walk: 25,001
+        # instructions each (about 100 days to an instruction), so a hundred of them are over a callback's 2 M.
+        run = self.handler_app("""
+            function app.message()
+                for i = 1, 100 do os.time{year = 9999, month = 12, day = -2500000} end
+                return true
+            end
+        """, script=["message walk"], rc=1)
+        self.assertEqual(run.messages("crash"), [BUDGET_CALL])
+
+    def test_a_sort_with_os_time_as_the_comparator_is_killed_by_the_budget(self):
+        # The same through table.sort(list, os.time): each table is walked once (os.time writes the normal form back), a hundred
+        # of them are over the budget, and the sort would otherwise run for a second before it gave up on the order function.
+        run = self.handler_app("""
+            function app.message()
+                local list = {}
+                for i = 1, 100 do list[i] = {year = 9999, month = 12, day = -2500000 - i} end
+                table.sort(list, os.time)
+                return true
+            end
+        """, script=["message sort"], rc=1)
+        self.assertEqual(run.messages("crash"), [BUDGET_CALL])
+
     def test_os_difftime_and_clock(self):
         lines = self.lua_lines("""
             print(os.difftime(5, 3), os.difftime(3, 5), os.difftime(2.5, 1), math.type(os.difftime(7, 7)))
@@ -752,9 +854,11 @@ class TimeTest(SvcTestCase):
 
 
 class DutyCycleTest(SvcTestCase):
-    """The duty cycle (the brief's rule): the instructions spent in calls are summed per 1 s window of the monotonic clock;
-    a window over APPS_DUTY_INSTR_PER_S is hot; after 3 hot windows in a row every timer's next due time moves 100 ms later
-    and a warning is logged once; after 5 the app is killed; a cool window resets the count."""
+    """The duty cycle (the brief's rule): the VM's instructions, and the time spent in calls, are summed per 1 s window of the
+    monotonic clock; a window over APPS_DUTY_INSTR_PER_S instructions or over 40% of the second in calls is hot; after 3 hot
+    windows in a row every timer's next due time moves 100 ms later and a warning is logged once; after 5 the app is killed; a
+    cool window resets the count. apphost's clock stands still inside a call, so here the instructions are the measure (the C
+    cases of tests/muse_apps_rt_harness.c have calls that take time); what C does without a count hook is charged to them."""
 
     HOT_TIMER = """
         local app = {}
@@ -850,6 +954,32 @@ class DutyCycleTest(SvcTestCase):
         self.assertEqual(warnings(-12000), [])
         self.assertEqual(warnings(12000), [THROTTLED])
 
+    def test_os_time_calls_make_a_window_hot(self):
+        # What C walks is charged as instructions: os.time of 2.5 M days is 25,001, so a callback of a few of them is as heavy as the
+        # loop of HOT_TIMER, every 100 ms (the callback of the loop is 0.3 of the rate).
+        calls = self.work // 25001 + 1
+        main = f"""
+            local app = {{}}
+            function app.start()
+                timer.every(100, function() for i = 1, {calls} do os.time{{year = 9999, month = 12, day = -2500000}} end end)
+            end
+            return app
+        """
+        run = self.host(self.make_app("scratch", main), script=["advance 3000", "state", "advance 2000", "state"], rc=1)
+        self.assertEqual(run.messages("warning"), [THROTTLED])
+        self.assertEqual(run.messages("crash"), [KILLED])
+
+    def test_a_late_throttle_warning_follows_the_launch_warnings(self):
+        # The runtime's warnings are one text joined with "; ": the one that comes after the launch's is "; throttled: ...",
+        # and each is an event of its own, with no empty one between.
+        main = f"""
+            local app = {{bogus = function() end}}
+            function app.start() timer.every(100, function() for i = 1, {self.work} do end end) end
+            return app
+        """
+        run = self.host(self.make_app("scratch", main), script=["advance 3000"])
+        self.assertEqual(run.messages("warning"), [unknown_handler("bogus"), THROTTLED])
+
     def test_every_call_counts_not_only_the_timers(self):
         # Five hot windows made of message handlers alone kill the app, at the end of the fifth.
         run = self.host(self.make_app("scratch", self.BURNER % self.third), script=[*self.HOT] * 6, rc=1)
@@ -857,12 +987,24 @@ class DutyCycleTest(SvcTestCase):
         self.assertEqual(run.messages("crash"), [KILLED])
 
     def test_the_throttle_is_warned_once_for_the_life_of_the_app(self):
+        # The app can arm a timer of 100 ms, to see whether it is throttled: a throttled app's timers are 100 ms later.
+        main = (self.BURNER % self.third).replace(
+            "function app.message(event, data)",
+            'function app.message(event, data)\n'
+            '            if event == "arm" then timer.after(100, function() print("fired") end) return true end')
         cool = ["message cool 0", "advance 1000", f"message hot {self.third}"]
-        script = [*self.HOT, *self.HOT, *self.HOT, *cool, *self.HOT, *self.HOT, *self.HOT, "state"]
-        run = self.host(self.make_app("scratch", self.BURNER % self.third), script=script)
+        script = [*self.HOT, *self.HOT, *self.HOT, *cool, *self.HOT, *self.HOT, *self.HOT,
+                  "message arm", "advance 100", "state", "advance 100", "state", "log"]
+        run = self.host(self.make_app("scratch", main), script=script)
         self.assertEqual(run.messages("warning"), [THROTTLED])  # the second time round, it is not said again
-        self.assertEqual(run.logs().count(THROTTLED), 1)
-        self.assertEqual(run.of("state"), [{"event": "state", "state": "running"}])
+        before, at, ring = chunks(run)[:3]
+        # The second throttle did happen: the timer armed after it is not due 100 ms on but 200.
+        self.assertNotIn("fired", logs(before))
+        self.assertEqual(logs(at), ["fired"])
+        # The warning is in the app's log too, once (the ring, which `log` shows), and the echo said it once as it happened.
+        self.assertEqual(logs(ring), [THROTTLED, "fired"])
+        self.assertEqual(logs(before).count(THROTTLED), 1)
+        self.assertEqual(run.of("state"), [{"event": "state", "state": "running"}] * 2)
 
 
 class SvcStaticTest(unittest.TestCase):
@@ -884,6 +1026,16 @@ class SvcStaticTest(unittest.TestCase):
         self.assertIsNotNone(match, "the timer handle's metatable has no __metatable")
         self.assertLess(match.group(2).count("\n"), 6)
 
+    def test_arm_gives_the_reference_back_when_the_runtime_has_no_slot(self):
+        # Unreachable today (the count is checked just before and no app code runs between), so no script gets there: the
+        # source is read. An unchecked -1 would be a handle to slot 65535, a leaked reference and a timer that never was.
+        source = (APPS / "apps_svc.c").read_text()
+        body = re.search(r"^static int arm\(lua_State \*L, bool every\) \{\n(.*?)^\}", source, re.S | re.M).group(1)
+        added = body.index("apps_rt_timer_add(")
+        check = re.search(r"if \(slot < 0\) \{[^}]*luaL_unref\(L, LUA_REGISTRYINDEX, ref\);[^}]*luaL_error[^}]*\}", body[added:], re.S)
+        self.assertIsNotNone(check, "arm doesn't check the slot apps_rt_timer_add gave, and give the reference back")
+        self.assertLess(added + check.start(), body.index("h->slot ="), "the handle is written before the check")
+
     def test_every_binding_calls_apps_vm_check_first(self):
         source = (APPS / "apps_svc.c").read_text()
         functions = re.findall(r"^static int (\w+)\(lua_State \*L\) \{\n(.*?)^\}", source, re.S | re.M)
@@ -895,14 +1047,11 @@ class SvcStaticTest(unittest.TestCase):
 
 
 class SvcHarnessTest(unittest.TestCase):
-    """The C cases of tests/muse_apps_rt_harness.c for these modules."""
+    """The C cases of tests/muse_apps_rt_harness.c for these modules (its one build is shared with HarnessTest)."""
 
     @classmethod
     def setUpClass(cls):
-        tmp = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(tmp.cleanup)
-        cls.harness = apps_host.build("muse_apps_svc_cases", [*HARNESS_SOURCES, *apps_host.lua_sources()], tmp.name,
-                                      include_dirs=INCLUDES)
+        cls.harness = rt_harness()
 
     def run_case(self, case, timeout=120):
         try:
@@ -913,7 +1062,8 @@ class SvcHarnessTest(unittest.TestCase):
         return done
 
     def test_conversions_in_the_boards_time_zone(self):
-        # PST8PDT on both sides of each change of the clock, `!` for UTC, mktime in the zone, and the normalized fields.
+        # PST8PDT on both sides of each change of the clock, `!` for UTC, mktime in the zone, the hour that happens twice with
+        # isdst true and false, and the normalized fields.
         self.run_case("time_zone")
 
     def test_the_services_survive_a_heap_that_refuses_at_every_step(self):
@@ -923,11 +1073,24 @@ class SvcHarnessTest(unittest.TestCase):
         # Which timer a step runs and when it is due again, what a dark screen, a stop, a crash and a kill from outside leave.
         self.run_case("timer_api")
 
-    # The duty cycle's windows, which apphost's 10 ms steps close one at a time and so can't show: here the clock jumps and the
-    # calls come when the case says (the task asleep in its queue across a boundary, and awake for an event).
+    def test_of_two_timers_due_together_the_one_armed_first_runs_first(self):
+        # Not the one in the lower slot: a timer armed after a cancel takes the slot of the first.
+        self.run_case("timer_tie")
 
-    def test_a_hot_window_closed_together_with_a_silent_one_starts_the_count_again(self):
+    def test_os_time_charges_the_days_it_walks(self):
+        # 100 days to an instruction and one more, for each of day, hour, min and sec; a plain table costs one; a year and month
+        # that cannot land in the calendar are refused before anything is charged (the host's C library would refuse them too, so
+        # that only shows in what is counted).
+        self.run_case("os_time_charge")
+
+    # The duty cycle's windows, which apphost's 10 ms steps close one at a time and so can't show: here the clock jumps, the
+    # calls come when the case says, and they take the time the case says (apphost's clock stands still inside a call).
+
+    def test_a_hot_window_closed_together_with_a_silent_one_still_counts(self):
         self.run_case("duty_jump")
+
+    def test_a_hot_window_closed_with_a_silent_one_after_it_is_the_kill_when_it_is_the_fifth(self):
+        self.run_case("duty_late_kill")
 
     def test_the_loops_pass_closes_a_window_with_no_call_or_timer_in_it(self):
         self.run_case("duty_pass")
@@ -937,6 +1100,33 @@ class SvcHarnessTest(unittest.TestCase):
 
     def test_a_throttled_app_arms_its_timers_late_and_a_cool_window_ends_the_throttle(self):
         self.run_case("duty_throttle")
+
+    def test_a_call_that_runs_into_the_next_window_is_booked_to_both(self):
+        # The review's trace: 0.76 s calls every 1.25 s were never killed, for the windows no call began in read as cool.
+        self.run_case("duty_trace")
+
+    def test_a_calls_instructions_are_split_over_the_windows_it_spanned_by_time(self):
+        self.run_case("duty_split")
+
+    def test_c_work_that_costs_no_instructions_is_hot_by_the_time_it_takes(self):
+        # 400 ms of each second is the limit (cool), 401 is over it; a light app is never hot.
+        self.run_case("duty_busy")
+
+    def test_the_status_share_is_what_the_calls_took_of_the_last_window(self):
+        # The same booking as the duty cycle's: a call that runs into the next window is in both, an idle window is 0.
+        self.run_case("duty_cpu_pct")
+
+    def test_a_throttled_timer_waits_from_the_end_of_its_callback(self):
+        # The throttle's 100 ms are idle time, also for a callback that outlasts its period and 100 ms; unthrottled it is a period.
+        self.run_case("duty_pace")
+
+    def test_a_throttled_callback_that_swaps_its_timer_for_another_moves_nothing_of_the_new_one(self):
+        # The end of a call moves the timer that ran, if it is still there: not the one that took its slot.
+        self.run_case("duty_swap")
+
+    def test_a_window_of_exactly_the_rate_is_cool_and_one_instruction_more_is_hot(self):
+        # Four windows at the rate are no throttle, three over it are: the rate is not "over the rate".
+        self.run_case("duty_rate")
 
 
 if __name__ == "__main__":

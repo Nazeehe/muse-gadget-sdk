@@ -24,7 +24,6 @@ watch shows the time).
 
 import re
 import shutil
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,7 +78,7 @@ class SntpTest(unittest.TestCase):
                                       include_dirs=[stage])
 
     def run_case(self, case, timeout=30):
-        done = subprocess.run([str(self.harness), case], capture_output=True, text=True, timeout=timeout)
+        done = apps_host.run(self.harness, case, timeout=timeout)  # with the sanitizer options its probe chose
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     def test_sntp_starts_once_when_wifi_is_up(self):

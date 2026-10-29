@@ -45,10 +45,13 @@
  *
  * Timers. The loop waits for an event until the app's earliest timer is due (apps_rt_next_deadline), and never more than a
  * second, which is also how long it waits while the screen is dark, when no timer runs (apps_port_dark): the first round after
- * the wake runs the timers that came due, each once. Each round, after the event it got, runs the timer that is due, one a
- * round: a call of the app like any other, bracketed for the supervisor and counted in the status, and an error in it ends the
- * app as an error in a handler does. The runtime's warnings that come after the run's start (the duty cycle's) are added to
- * the record's as they come, and its kill is a crash like any.
+ * the wake runs the timers that came due, each once. That round comes at once: the supervisor, on the LVGL task, posts a no-op
+ * event (APPS_EV_WAKE) when it sees the screen go from dark to lit, so that an app in front doesn't show its old frame for up to
+ * a second. A wait is rounded up to whole ticks and is at least one for any wait above 0 (a build whose tick is 10 ms would
+ * otherwise spin for the last 9 ms). Each round, after the event it got, runs the timer that is due, one a round: a call of the
+ * app like any other, bracketed for the supervisor and counted in the status, and an error in it ends the app as an error in a
+ * handler does. The runtime's warnings that come after the run's start (the duty cycle's) are added to the record's as they
+ * come, and its kill is a crash like any.
  *
  * An app's end (stop, a new run, sys.exit, a crash, a hang) is one order, the rulings': the pending request is
  * answered; the table is unpublished (apps_lv_set_ui(NULL) under the UI lock); the record takes the crash record,
@@ -89,7 +92,8 @@
  *   ui_truncated how many widgets it dropped for want of room (a result says "ui_truncated":N when it isn't 0).
  * - instructions: the VM's count (apps_vm_instructions); mem_kb, peak_kb: the Lua heap now and at most; limit_kb:
  *   the manifest's memory_kb; worst_dispatch_ms: the longest call into the app; cpu_pct: the share of the last
- *   whole second spent in calls; dropped_events: touches the queue had no room for; stack_free: the app task's
+ *   whole second (a window of the runtime's duty cycle, which counts the calls' time for both: apps_rt.h) that its calls
+ *   took; dropped_events: touches the queue had no room for; stack_free: the app task's
  *   stack high-water mark, in bytes; widgets: alive widgets; front: the layer is in front.
  * The log tail, the dump and the counters are refreshed after a run settles, when an app ends, and otherwise at
  * most once a second while the app runs; front and dropped_events are read when the status is.
@@ -120,7 +124,7 @@ typedef enum {
     APPS_EV_HIDE,       /* it went behind: hide() */
     APPS_EV_ALARM,      /* Task 17 */
     APPS_EV_EXIT,       /* sys.exit() (Task 18): the app ends once the current callback returns */
-    APPS_EV_WAKE,       /* the LVGL task ran a reset the app task waits for */
+    APPS_EV_WAKE,       /* the LVGL task ran a reset the app task waits for, or the screen was lit: the round's housekeeping */
 } apps_event_type_t;
 
 typedef struct {

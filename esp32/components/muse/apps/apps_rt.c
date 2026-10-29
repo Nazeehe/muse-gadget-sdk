@@ -67,8 +67,10 @@ static const char *const handler_names[H_COUNT] = {"start", "stop", "show", "hid
 
 #define NOT_RUNNING "the app is not running"
 
-/* The duty cycle (apps_rt.h): a window is a second of the monotonic clock; a throttled app's timers are this much later. */
+/* The duty cycle (apps_rt.h): a window is a whole second of the monotonic clock, hot over APPS_DUTY_BUSY_PCT of it spent in
+ * calls; a throttled app's timers are this much later. */
 #define DUTY_WINDOW_MS 1000
+#define DUTY_BUSY_MS (DUTY_WINDOW_MS * APPS_DUTY_BUSY_PCT / 100)
 #define THROTTLE_DELAY_MS 100
 #define STR_(x) #x
 #define STR(x) STR_(x)
@@ -92,11 +94,16 @@ struct apps_rt {
     int handler[H_COUNT];  /* registry references; LUA_NOREF for a handler the app hasn't */
     armed_t timers[APPS_TIMERS_MAX];
     uint32_t timer_gen;  /* the last gen given */
-    /* The duty cycle: the window that began at duty_start, the VM's instruction count then, how many hot windows in a row
-     * have closed, and whether the app is throttled and has been told so. */
-    int64_t duty_start;
-    uint64_t duty_base;
+    /* The duty cycle's books. The window open now is the whole second duty_second of apps_port_mono_ms, and these are what the
+     * calls that ran in it have used so far: VM instructions, and milliseconds spent in calls (every call's time and its
+     * instructions are booked to the windows it ran in when it ends: duty_book). Then how many hot windows in a row have
+     * closed, the share of the last window to close that was spent in calls (the status's cpu_pct), and whether the app is
+     * throttled and has been told so. */
+    int64_t duty_second;
+    uint64_t duty_instr;
+    int64_t duty_busy_ms;
     int duty_hot;
+    uint8_t cpu_pct;
     bool throttled, throttle_warned;
     /* apps_vm_call writes its error here. It is the crash record while the state is CRASHED (and nothing runs
      * after that), and the scratch of a call that fails the message alone otherwise. */
@@ -436,14 +443,17 @@ static int rt_require(lua_State *L) {
 /* ---- Calling into the app ---- */
 
 static void duty_roll(apps_rt_t *rt, int64_t now_ms);
+static void duty_book(apps_rt_t *rt, int64_t began, int64_t ended, uint64_t instr);
 static void timers_disarm(apps_rt_t *rt);
 
 /* Runs fn(arg) as one apps_vm_call with the budget: fn is a C function that gets arg as a light userdata and
  * does everything that touches the app's heap, so that a refusal there is an error inside the call. The
  * result is apps_vm_call's; a call that can't start for want of stack room is an error too. Every way into the app
- * comes through here, so this is where the duty cycle's windows are closed: a kill it decides on is the call's result. */
+ * comes through here, so this is where the duty cycle is kept: the windows that have ended are closed before the call, and a
+ * kill it decides on is the call's result; the call's time and instructions are booked to the windows it ran in after it. */
 static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t budget) {
-    duty_roll(rt, apps_port_mono_ms());
+    int64_t began = apps_port_mono_ms();
+    duty_roll(rt, began);
     lua_State *L = apps_vm_lua(rt->vm);
     if (!lua_checkstack(L, 2)) {
         snprintf(rt->err, sizeof rt->err, "out of memory: no room on the Lua stack");
@@ -451,7 +461,10 @@ static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t b
     }
     lua_pushcfunction(L, fn);
     lua_pushlightuserdata(L, arg);
-    return apps_vm_call(rt->vm, 1, 0, budget, rt->err, sizeof rt->err);
+    uint64_t before = apps_vm_instructions(rt->vm);
+    apps_call_t result = apps_vm_call(rt->vm, 1, 0, budget, rt->err, sizeof rt->err);
+    duty_book(rt, began, apps_port_mono_ms(), apps_vm_instructions(rt->vm) - before);
+    return result;
 }
 
 /* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. Its timers go. */
@@ -685,8 +698,7 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     apps_json_open(L);  /* safe outside a call: if the heap refuses, the call below ends out of memory */
     apps_ui_open(L, rt->ui);
     apps_svc_open(L, rt);  /* time, os and timer: before main.lua, so its top level can arm a timer */
-    rt->duty_start = apps_port_mono_ms();  /* main.lua's top level is the first window's */
-    rt->duty_base = apps_vm_instructions(rt->vm);
+    rt->duty_second = apps_port_mono_ms() / DUTY_WINDOW_MS;  /* main.lua's top level is in the first window */
 
     boot_t boot = {.rt = rt, .main = main, .outcome = BOOT_OK};
     apps_call_t result = vm_run(rt, boot_trampoline, &boot, APPS_BUDGET_START);
@@ -946,10 +958,20 @@ bool apps_rt_run_one_timer(apps_rt_t *rt, int64_t now_ms) {
     }
     timer_call_t call = {.rt = rt, .slot = (int)(pick - rt->timers), .gen = pick->gen};
     if (pick->period > 0) {  /* before the call, so a callback that cancels itself finds it armed */
-        pick->due = now_ms + pick->period + (rt->throttled ? THROTTLE_DELAY_MS : 0);
+        pick->due = now_ms + pick->period;
     }
     if (vm_run(rt, timer_trampoline, &call, APPS_BUDGET_CALL) != APPS_CALL_OK) {
         crash(rt);
+    } else if (rt->throttled) {
+        /* A throttled every timer is due a period and the throttle's 100 ms after its callback ENDED, so that the delay is time
+         * the core is idle: counted from when the callback began, a callback that outlasts its period and 100 ms is due again
+         * before it has returned, and the throttle changes nothing. (The call may have ended the throttle: then the due time
+         * above stands, a period after it began, as the brief says.) A timer the callback cancelled, or one that took its slot,
+         * isn't this one. */
+        armed_t *t = &rt->timers[call.slot];
+        if (t->gen == call.gen && t->period > 0) {
+            t->due = apps_port_mono_ms() + t->period + THROTTLE_DELAY_MS;
+        }
     }
     return true;
 }
@@ -979,23 +1001,17 @@ static void throttle_begin(apps_rt_t *rt) {
     }
 }
 
-/* Closes the windows that have ended by now_ms: the first holds what the VM ran since the last one was closed (every call is
- * run through vm_run, which comes here first, and a pass of the timers comes here too, so a second with no call in it is closed
- * all the same), any others nothing. The throttle and the kill follow the count of hot windows in a row. */
-static void duty_roll(apps_rt_t *rt, int64_t now_ms) {
-    int64_t ended = (now_ms - rt->duty_start) / DUTY_WINDOW_MS;
-    if (ended <= 0) {
-        return;
-    }
-    uint64_t total = apps_vm_instructions(rt->vm);
-    bool hot = total - rt->duty_base > APPS_DUTY_INSTR_PER_S;
-    rt->duty_base = total;
-    rt->duty_start += ended * DUTY_WINDOW_MS;
-    if (ended > 1) {
-        rt->duty_hot = 0;  /* a cool window came after the first */
-    } else {
-        rt->duty_hot = hot ? rt->duty_hot + 1 : 0;
-    }
+/* Closes the window that is open, and opens the next: it is hot when what was booked to it is over the rate in instructions or
+ * over APPS_DUTY_BUSY_PCT of it in time (a window with nothing booked is cool), and its share of time in calls is the last
+ * the status reports. The count of hot windows in a row, the throttle and the kill follow, so windows are closed one at a
+ * time and in the order of the clock, however late. */
+static void duty_close(apps_rt_t *rt) {
+    bool hot = rt->duty_instr > APPS_DUTY_INSTR_PER_S || rt->duty_busy_ms > DUTY_BUSY_MS;
+    rt->cpu_pct = rt->duty_busy_ms >= DUTY_WINDOW_MS ? 100 : (uint8_t)(rt->duty_busy_ms * 100 / DUTY_WINDOW_MS);
+    rt->duty_second++;
+    rt->duty_instr = 0;
+    rt->duty_busy_ms = 0;
+    rt->duty_hot = hot ? rt->duty_hot + 1 : 0;
     if (rt->duty_hot >= APPS_DUTY_KILL_WINDOWS) {
         apps_vm_kill(rt->vm, DUTY_KILL_REASON);
     } else if (rt->duty_hot >= APPS_DUTY_THROTTLE_WINDOWS) {
@@ -1005,6 +1021,62 @@ static void duty_roll(apps_rt_t *rt, int64_t now_ms) {
     } else {
         rt->throttled = false;
     }
+}
+
+/* Closes the windows that have ended by now_ms: the one that is open, with what has been booked to it (every call books when it
+ * ends, so a call that is still running isn't in it), and any others, which held nothing: a second with no call in it is cool. A
+ * long silence is no longer than two windows to close: a second one that is empty is every one after it. */
+static void duty_roll(apps_rt_t *rt, int64_t now_ms) {
+    int64_t second = now_ms / DUTY_WINDOW_MS;
+    for (int closed = 0; closed < 2 && rt->duty_second < second; closed++) {
+        duty_close(rt);
+    }
+    if (rt->duty_second < second) {
+        rt->duty_second = second;
+    }
+}
+
+/* Books a call that began at `began` and ended at `ended` (apps_port_mono_ms before and after it) and ran `instr` VM
+ * instructions to the windows it ran in, in proportion to the time it spent in each: a call that begins at 1250 and ends at 2010
+ * puts 750 of its 760 ms and 750/760 of its instructions in the window of 1000 to 2000, and the rest in the next. A window the
+ * call runs past the end of is closed as its share lands, and the windows are closed in order. The window the call ended in
+ * stays open. A call that took no time (the clock stood still, as apphost's does inside a call) is all in the window it is in. */
+static void duty_book(apps_rt_t *rt, int64_t began, int64_t ended, uint64_t instr) {
+    int64_t open_from = rt->duty_second * DUTY_WINDOW_MS;
+    if (began < open_from) {  /* the clock is monotonic: a case's that goes back is read as the open window's start */
+        began = open_from;
+    }
+    if (ended < began) {
+        ended = began;
+    }
+    const uint64_t span = (uint64_t)(ended - began);
+    uint64_t given = 0;
+    int64_t at = began;
+    for (;;) {
+        const bool last = ended / DUTY_WINDOW_MS <= rt->duty_second;
+        const int64_t upto = last ? ended : (rt->duty_second + 1) * DUTY_WINDOW_MS;
+        /* The instructions up to `upto`, in all: what is added to the window is the part since the last, so the shares add up
+         * to `instr` exactly. */
+        const uint64_t share = span > 0 ? instr * (uint64_t)(upto - began) / span : instr;
+        rt->duty_instr += share - given;
+        given = share;
+        rt->duty_busy_ms += upto - at;
+        at = upto;
+        if (last) {
+            break;
+        }
+        duty_close(rt);
+    }
+}
+
+uint8_t apps_rt_cpu_pct(apps_rt_t *rt, int64_t now_ms) {
+    if (rt == NULL) {
+        return 0;
+    }
+    if (rt->state == APPS_STATE_RUNNING) {
+        duty_roll(rt, now_ms);
+    }
+    return rt->cpu_pct;
 }
 
 /* ---- Messages ---- */

@@ -82,6 +82,9 @@
 #if CONFIG_MUSE_ENABLED
 #include "muse_glue.h"
 #include "muse_input.h"
+#if CONFIG_MUSE_APPS
+#include "muse_apps.h"
+#endif
 // Muse joins Wi-Fi from its own settings, before or without pairing.
 #define WIFI_WITHOUT_PAIRING 1
 #else
@@ -2944,10 +2947,20 @@ void app_run(void) {
         size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
         size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
         size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        // Muse apps: the resident app ("-" for none), its state and its Lua heap.
+        char apps[64] = "";
+#if CONFIG_MUSE_APPS
+        char resident[32];
+        const char *apps_state = "stopped";
+        unsigned lua_kb = 0;
+        muse_apps_brief(resident, sizeof(resident), &apps_state, &lua_kb);
+        snprintf(apps, sizeof(apps), " apps=%s/%s lua=%uK",
+                 resident[0] ? resident : "-", apps_state, lua_kb);
+#endif
         tunnel_stats_t tun;
         tunnel_netif_get_stats(&tun);
         ESP_LOGI(HEARTBEAT_TAG, "hb t=%llds setup=%s wifi=%s ws=%s raw=%s ble=%s "
-                       "int=%uK/%uK min=%uK%s dma=%uK/%uK psram=%uK "
+                       "int=%uK/%uK min=%uK%s dma=%uK/%uK psram=%uK%s "
                        "tun rx+%lu/%luB tx+%lu/%luB drop+%lu",
                  esp_timer_get_time() / 1000000,
                  s_setup_stage,
@@ -2962,6 +2975,7 @@ void app_run(void) {
                  (unsigned)(free_dma / 1024),
                  (unsigned)(largest_dma / 1024),
                  (unsigned)(free_psram / 1024),
+                 apps,
                  (unsigned long)(tun.rx_pkts - prev_tun.rx_pkts),
                  (unsigned long)(tun.rx_bytes - prev_tun.rx_bytes),
                  (unsigned long)(tun.tx_pkts - prev_tun.tx_pkts),

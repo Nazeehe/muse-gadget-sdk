@@ -36,6 +36,7 @@
 #include "apps_port.h"
 #include "apps_store.h"
 #include "apps_ui.h"
+#include "apps_values.h"
 #include "apps_vm.h"
 #include "muse_apps.h"
 #include "muse_input.h"
@@ -91,6 +92,13 @@
  * took is waited for until APPS_TASK_ALARM_BACKSTOP_MS, and a launch whose alarms are gone runs nothing. Every app's end tells the
  * alarms (end_alarms): the ring ends with the app that was told it, and an app that its alarm launched and that crashed loses its
  * alarms. What they record to log, the app task prints (drain_logs: in housekeeping and after each call, never inside one).
+ *
+ * The store (apps_store.h). The task submits the mount job as it starts, and housekeeping asks again every APPS_STORE_RETRY_MS while
+ * the worker refuses it (the worker's first step mounts too: apps_io_set_first). Housekeeping also offers the values' saves that wait
+ * and brings the alarms' records in line (apps_values_tick): an arming or a cancel marks its app in the port, a firing that is told or
+ * given up on here, and a cancel of all of an app's alarms (the budget's, a crash's) through apps_alarm_take_cancelled. A failure of the
+ * values' backend is said once per streak, in the app's log if it runs. The quarantine's marker (apps_store_marker) is marked at every
+ * launch (begin_app) and cleared at every end that isn't a reset (end_app, no_app).
  */
 
 static const char *TAG = "muse_apps";
@@ -201,6 +209,7 @@ static StaticSemaphore_t s_rec_lock_buf, s_req_lock_buf, s_names_lock_buf;
 static SemaphoreHandle_t s_rec_lock, s_req_lock, s_names_lock;
 static atomic_bool s_launcher_wanted;  /* any task asks; the LVGL task shows it */
 static atomic_bool s_alarm_posted;     /* the esp_timer task posted APPS_EV_ALARM and the loop hasn't looked at the table since */
+static atomic_bool s_list_changed;     /* the store gave a new list: the LVGL task shows the launcher again if it is up */
 
 /* ---- The app task's own ---- */
 
@@ -743,6 +752,7 @@ static void end_app(end_t how) {
     ESP_LOGI(TAG, "stop %s: %s, peak %u KB, stack %u free", s_rec->st.id, END_NAMES[how], (unsigned)s_rec->st.peak_kb,
              (unsigned)s_rec->st.stack_free);
     end_alarms(how);
+    apps_marker_clean_stop(apps_store_marker());  /* it ended without a reset */
     set_running(false);  /* the launcher lists it still while the store has it */
     apps_rt_free(T.rt);  /* saves the store if a change is left in it (stop() has saved it when the app stopped) */
     T.rt = NULL;
@@ -843,6 +853,7 @@ static void begin_app(apps_pkg_t *pkg) {
         put_text(s_rec->names.name, sizeof s_rec->names.name, m->name[0] != '\0' ? m->name : m->id);
         names_give();
     }
+    apps_marker_launch(apps_store_marker(), m->id);  /* a reset from here to its end counts toward its quarantine, if it is a crash */
     ESP_LOGI(TAG, "launch %s (%u KB)", m->id, (unsigned)m->memory_kb);
 }
 
@@ -856,6 +867,7 @@ static void no_app(const char *err) {
         rec_give();
     }
     ESP_LOGW(TAG, "launch %s: no app: %s", T.pkg->manifest.id, err);
+    apps_marker_clean_stop(apps_store_marker());
     free_pkg(T.pkg);
     T.pkg = NULL;
     set_running(false);  /* the store keeps it: another launch may find the room */
@@ -1126,6 +1138,7 @@ static void tell_alarm(const apps_alarm_fired_t *f) {
     if (!apps_alarm_take(f, true)) {
         return;  /* cancelled, replaced or given up on since it was copied: nothing to tell */
     }
+    apps_values_alarms_changed(f->app);  /* its record follows: dropped, unless the name is armed again */
     request_front(true);
     call_begin();
     (void)apps_rt_alarm(T.rt, f->name);
@@ -1154,6 +1167,7 @@ static void drop_alarms(const char *app, uint32_t upto, drop_t why) {
         if (strcmp(due[i].app, app) != 0 || gen_after(due[i].gen, upto) || !apps_alarm_take(&due[i], false)) {
             continue;
         }
+        apps_values_alarms_changed(app);
         switch (why) {
         case DROP_MISSING:
             ESP_LOGW(TAG, "alarm %s for missing app %s", due[i].name, app);
@@ -1302,7 +1316,22 @@ static void housekeeping(void) {
         muse_state_poke();  /* sys.keep_awake(true): the screen isn't let go dark for idling while the app is in front */
         T.poke_at = apps_port_mono_ms() + KEEP_AWAKE_POKE_MS;
     }
-    apps_store_tick(apps_port_mono_ms());  /* the saves the worker hasn't taken yet, with or without an app (apps_store.h) */
+    char ids[APPS_ALARMS_MAX][APPS_ID_MAX + 1];
+    int cancelled = apps_alarm_take_cancelled(ids, APPS_ALARMS_MAX);
+    for (int i = 0; i < cancelled; i++) {
+        apps_values_alarms_changed(ids[i]);  /* the budget's or a crash's cancel of all its alarms: their records go */
+    }
+    int64_t now = apps_port_mono_ms();
+    apps_values_tick(now);  /* the saves the worker hasn't taken yet, with or without an app, and the alarms' records (apps_values.h) */
+    apps_store_tick(now);   /* the mount, until the worker has taken it; the records' re-arm, once the clock is valid */
+    muse_apps_console_tick(now);  /* a stage the console was sent and that waits for no commit any more goes */
+    char failed[APPS_ID_MAX + 1];
+    if (apps_values_take_failure(failed, sizeof failed)) {
+        ESP_LOGW(TAG, "%s: %s", failed, APPS_VALUES_FULL);
+        if (T.rt != NULL && !T.abandoned && strcmp(s_rec->st.id, failed) == 0) {
+            apps_rt_note(T.rt, APPS_VALUES_FULL);  /* in its log too, once a streak */
+        }
+    }
     drain_logs();
 }
 
@@ -1357,6 +1386,7 @@ static void run_timers(void) {
 static void apps_task(void *arg) {
     (void)arg;
     apps_io_register_op_task();  /* the store's loads and saves are ops of the I/O worker, and only this task submits them (apps_io.h) */
+    apps_store_tick(apps_port_mono_ms());  /* the boot's mount job (asked again by housekeeping while the worker refuses it) */
     ESP_LOGI(TAG, "up: stack %u in PSRAM", (unsigned)APPS_TASK_STACK);
     for (;;) {
         apps_event_t ev;
@@ -1555,7 +1585,8 @@ static void show_cards(void) {
             apps_lv_show_crash(L.hung_name, NULL);
         }
     }
-    bool launcher = atomic_load(&s_launcher_wanted);
+    /* The store's list changed while the launcher shows (the mount's end, an install): it is shown again, with the new rows. */
+    bool launcher = atomic_load(&s_launcher_wanted) || (atomic_exchange(&s_list_changed, false) && apps_lv_launcher_shown());
     bool card = false;
     int rows = 0;
     char name[25] = "", line[FIRST_LINE_MAX] = "";
@@ -1569,7 +1600,7 @@ static void show_cards(void) {
         put_text(line, sizeof line, s_rec->names.card_line);
     }
     if (launcher) {
-        rows = launcher_rows();
+        rows = apps_store_mode() == APPS_STORAGE_NONE ? APPS_LV_LOADING : launcher_rows();
     }
     names_give();
     if (card) {
@@ -1856,8 +1887,8 @@ bool apps_task_compile(const apps_pkg_t *pkg, char *err, size_t err_len) {
 }
 
 void apps_task_set_list(const apps_listed_t *apps, int n) {
-    if (!atomic_load(&s_up)) {
-        return;
+    if (s_rec == NULL || s_names_lock == NULL) {
+        return;  /* the mount's list can come as the task starts, before s_up: the record is there by then */
     }
     n = apps == NULL || n < 0 ? 0 : n > APPS_TASK_LIST_MAX ? APPS_TASK_LIST_MAX : n;
     if (!names_take(LOCK_MS)) {
@@ -1870,6 +1901,7 @@ void apps_task_set_list(const apps_listed_t *apps, int n) {
     }
     s_rec->names.list_n = n;
     names_give();
+    atomic_store(&s_list_changed, true);
 }
 
 bool apps_task_running(char *id, size_t cap) {
@@ -2006,6 +2038,33 @@ void apps_task_status(apps_status_t *st) {
     }
 }
 
+void apps_task_brief(char *id, size_t cap, apps_state_t *state, uint32_t *mem_kb, uint32_t *peak_kb) {
+    put_text(id, cap, "");
+    *state = APPS_STATE_STOPPED;
+    *mem_kb = *peak_kb = 0;
+    if (!atomic_load(&s_up) || !rec_take(STATUS_LOCK_MS)) {
+        return;
+    }
+    if (s_rec->loaded) {
+        put_text(id, cap, s_rec->st.id);
+        *mem_kb = s_rec->st.mem_kb;  /* an app that has ended has freed its heap */
+    }
+    *state = s_rec->st.state;
+    *peak_kb = s_rec->st.peak_kb;
+    rec_give();
+    if (atomic_load(&s_rec->hung)) {
+        *state = APPS_STATE_HUNG;
+    }
+}
+
+void muse_apps_brief(char *resident, size_t cap, const char **state, unsigned *lua_kb) {
+    apps_state_t st;
+    uint32_t mem_kb, peak_kb;
+    apps_task_brief(resident, cap, &st, &mem_kb, &peak_kb);
+    *state = apps_state_name(st);
+    *lua_kb = (unsigned)mem_kb;
+}
+
 void apps_task_show(void) {
     request_front(true);  /* the one door of every front: the LVGL task holds it back during a voice turn (C11) */
 }
@@ -2038,6 +2097,7 @@ esp_err_t muse_apps_start(void) {
     s_req_lock = xSemaphoreCreateMutexStatic(&s_req_lock_buf);
     s_names_lock = xSemaphoreCreateMutexStatic(&s_names_lock_buf);
     apps_io_init();
+    apps_io_set_first(apps_store_mount_once);  /* the worker mounts the store before its first job or op (apps_store.h) */
     if (!console_added) {
         /* Even if the task can't be made below: the console then says that Muse apps aren't running. */
         muse_input_add_console_hook(muse_apps_console);

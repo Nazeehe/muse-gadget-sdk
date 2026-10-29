@@ -176,3 +176,20 @@ bool apps_alarm_take(const apps_alarm_fired_t *f, bool delivered);
  * for those firings is still wanted. The I/O worker asks before it loads and runs the app, and the app task before it replaces the
  * app that runs, so a launch whose alarms were given up on, or told in the meantime, runs nothing. */
 bool apps_alarm_wanted(const char *app, uint32_t upto);
+
+/* ---- What the alarms' records need (apps_values.h, apps_store.h) ---- */
+
+/* One of an app's alarms: its name, the time left (as apps_alarm_remaining: 0 for a firing that only waits to be told), and what it
+ * asks for (the arming's, or the waiting firing's when it isn't armed again). */
+typedef struct {
+    char name[APPS_ALARM_NAME_MAX + 1];
+    int64_t remaining_ms;
+    bool sound, wake;
+} apps_alarm_info_t;
+
+/* app's alarms, earliest first, as apps_alarm_list orders them; returns how many (at most APPS_ALARMS_PER_APP). */
+int apps_alarm_list_info(const char *app, apps_alarm_info_t out[APPS_ALARMS_PER_APP]);
+
+/* The apps whose alarms apps_alarm_cancel_app or the budget cancelled since the last call, each once, at most max of them (the
+ * first APPS_ALARMS_MAX noted are kept): the app task's round takes them, so that their records follow. */
+int apps_alarm_take_cancelled(char ids[][APPS_ID_MAX + 1], int max);

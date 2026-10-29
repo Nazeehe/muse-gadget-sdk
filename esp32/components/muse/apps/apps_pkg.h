@@ -136,11 +136,16 @@ typedef struct {
     uint8_t sha256[32];
 } apps_blob_t;
 
-/* A package: the manifest, and the bytes of the files it lists. Start it zeroed. */
+/* A package: the manifest, and the bytes of the files it lists. Start it zeroed. manifest_json is the manifest.json the
+ * package was read from, manifest_len bytes, kept by the install pipeline and the flash store's load so that the store
+ * writes the manifest as it came (and sees a reinstall that changed only it): a block like the files', which
+ * apps_pkg_free frees, or NULL (the RAM store's copies don't keep it). */
 typedef struct {
     apps_manifest_t manifest;
     apps_blob_t files[APPS_MAX_FILES];
     int count;
+    char *manifest_json;
+    size_t manifest_len;
 } apps_pkg_t;
 
 /* Whether id is ^[a-z][a-z0-9_]{1,23}$. NULL is not. */
@@ -203,9 +208,9 @@ bool apps_manifest_parse(const char *json, size_t len, const char *expected_id, 
 /* Frees messages_json with free_fn (NULL: free) and zeroes m. NULL is ignored. Safe after any parse. */
 void apps_manifest_clear(apps_manifest_t *m, void (*free_fn)(void *));
 
-/* Frees every blob's data and the manifest's messages_json with free_fn (NULL: free), and zeroes pkg. It looks
- * at every file slot, not just the first count, so a blob that was read but never counted is freed too. NULL
- * is ignored. */
+/* Frees every blob's data, manifest_json and the manifest's messages_json with free_fn (NULL: free), and zeroes pkg.
+ * It looks at every file slot, not just the first count, so a blob that was read but never counted is freed too.
+ * NULL is ignored. */
 void apps_pkg_free(apps_pkg_t *pkg, void (*free_fn)(void *));
 
 /*

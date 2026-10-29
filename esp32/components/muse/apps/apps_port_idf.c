@@ -18,8 +18,9 @@
  * apps_port.h on the gadget. The heap is PSRAM; the clock is esp_timer's; an app's log line goes to the console as
  * "@app.log <id> <line>", at most 1,024 bytes of them a second, queued in the call and printed after it; the UI lock is
  * a static FreeRTOS mutex that muse_apps_start() makes (apps_port_init); the system's alarms are apps_alarm.c's, and a chirp
- * is the voice task's. An app's store is apps_store_ram.c's (apps_store.h): a map in PSRAM that the I/O worker keeps; sys's battery and
- * Wi-Fi are muse_state's and muse_wifi's, and its show, keep_awake and exit are the app task's (apps_task.h).
+ * is the voice task's. An app's store is apps_values.c's (apps_values.h): apps_nvs on a gadget with the apps partition, a map in PSRAM
+ * otherwise, behind the I/O worker; an alarm that is armed or cancelled marks its app for its records (apps_values_alarms_changed); sys's
+ * battery and Wi-Fi are muse_state's and muse_wifi's, and its show, keep_awake and exit are the app task's (apps_task.h).
  *
  * The UI lock keeps the host runner's contract (tools/muse/apphost/apphost_port.c): it is never taken twice by one
  * task, given back only by its holder, and nothing uses the heap while it is held. The host aborts on a breach; here a
@@ -47,8 +48,8 @@
 #include "apps_alarm.h"
 #include "apps_echo.h"
 #include "apps_pkg.h"
-#include "apps_store.h"
 #include "apps_task.h"
+#include "apps_values.h"
 #include "muse_mem.h"
 #include "muse_sntp.h"
 #include "muse_state.h"
@@ -243,14 +244,18 @@ void apps_port_ui_unlock(void) {
     xSemaphoreGive(s_ui_lock);
 }
 
-/* The alarms and the sound: apps_alarm.c keeps the first (its table, its timers and its ring), the voice task plays the second. */
+/* The alarms and the sound: apps_alarm.c keeps the first (its table, its timers and its ring), the voice task plays the second. An arming
+ * or a cancel marks the app, and its records follow at a tick of the app task after the call (apps_values.h): nothing here waits. */
 
 apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
-    return apps_alarm_arm(app, name, ms, sound, wake);
+    apps_alarm_result_t got = apps_alarm_arm(app, name, ms, sound, wake);
+    apps_values_alarms_changed(app);  /* a refusal can have dropped a replaced arming too (apps_alarm.h) */
+    return got;
 }
 
 void apps_port_alarm_cancel(const char *app, const char *name) {
     apps_alarm_cancel(app, name);
+    apps_values_alarms_changed(app);
 }
 
 int64_t apps_port_alarm_remaining(const char *app, const char *name) {
@@ -270,16 +275,16 @@ void apps_port_sound_stop(void) {
     apps_alarm_ring_stop();
 }
 
-/* The store of an app: apps_store_ram.c keeps the objects (apps_store.h), behind the I/O worker. */
+/* The store of an app: apps_values.c keeps the objects (apps_values.h), behind the I/O worker. */
 
 char *apps_port_store_load(const char *app, size_t *len) {
-    char *json = apps_store_load(app, len);
+    char *json = apps_values_load(app, len);
     apps_task_call_restart();  /* what the load waited for is the gadget's: the call that makes the app is counted from here (apps_port.h) */
     return json;
 }
 
 bool apps_port_store_save(const char *app, const char *json, size_t len) {
-    return apps_store_save(app, json, len);
+    return apps_values_save(app, json, len);
 }
 
 /* sys.battery(): muse_state's, as the status bar reads it; a percentage outside 0 to 100 is clamped, none is -1. */

@@ -400,8 +400,12 @@ static bool fake_run(apps_pkg_t *pkg, int settle_ms, apps_status_t *st, char *er
     return run_ok;
 }
 
+/* Where the fake store keeps apps: "ram" (no apps partition: results add the hint), or "flash". */
+static const char *storage_name = "ram";
+#define HINT ",\"hint\":\"" APPS_RAM_HINT "\""
+
 static const char *fake_storage(void) {
-    return "ram";
+    return storage_name;
 }
 
 static const apps_install_ops_t OPS = {fake_compile, fake_commit, fake_run, fake_storage};
@@ -809,7 +813,7 @@ static void result_fits_6144_bytes(void) {
     /* With room, nothing is trimmed and nothing is said. */
     reset_ops();
     install("hello", true);
-    CHECK(strstr(last, "\"log\":[\"started\"],\"ui\":[],\"mem_kb\":20,\"peak_kb\":24}}") != NULL, "%s", last);
+    CHECK(strstr(last, "\"log\":[\"started\"],\"ui\":[],\"mem_kb\":20,\"peak_kb\":24" HINT "}}") != NULL, "%s", last);
     /* The dump's own drops count too. */
     run_record.ui_truncated = 3;
     install("hello", true);
@@ -853,7 +857,7 @@ static void success_payload(void) {
              "\"files\":[{\"path\":\"main.lua\",\"bytes\":%zu,\"sha256\":\"", strlen(MAIN));
     CHECK(strncmp(got, want, strlen(want)) == 0, "%s", got);
     CHECK(strstr(got, "\"state\":\"installed\",\"warnings\":[\"unknown key 'colour' ignored\"],\"log\":[],\"ui\":[],"
-                      "\"mem_kb\":0,\"peak_kb\":0}}") != NULL,
+                      "\"mem_kb\":0,\"peak_kb\":0" HINT "}}") != NULL,
           "%s", got);
     CHECK(compiles == 1 && commits == 1 && runs == 0, "compiled and kept, not run");
     CHECK(strcmp(reads, "manifest.json main.lua data.json logo.bin ") == 0, "read in order: %s", reads);
@@ -868,13 +872,20 @@ static void success_payload(void) {
     CHECK(strstr(got, "\"state\":\"running\",\"warnings\":[\"unknown key 'colour' ignored\",\"label#0 'Hi' extends 3 px "
                       "past the round edge\"],\"log\":[\"one\",\"\\ttwo \\\"2\\\"\"],\"ui\":[{\"id\":\"label#0\",\"kind\":"
                       "\"label\",\"text\":\"Hi\",\"x\":1,\"y\":2,\"w\":3,\"h\":4,\"hidden\":false,\"overflow\":3}],"
-                      "\"mem_kb\":20,\"peak_kb\":24}}") != NULL,
+                      "\"mem_kb\":20,\"peak_kb\":24" HINT "}}") != NULL,
           "%s", got);
     CHECK(runs == 1 && run_settle == APPS_SETTLE_MS, "run with the settle");
     /* The store's word. */
     commit_unchanged = true;
     got = install("hello", false);
-    CHECK(strstr(got, "\"peak_kb\":0,\"unchanged\":true}}") != NULL, "%s", got);
+    CHECK(strstr(got, "\"peak_kb\":0,\"unchanged\":true" HINT "}}") != NULL, "%s", got);
+    /* On the apps partition: "flash", and no hint. */
+    storage_name = "flash";
+    got = install("hello", false);
+    CHECK(strstr(got, "\"storage\":\"flash\"") != NULL && strstr(got, "\"peak_kb\":0,\"unchanged\":true}}") != NULL &&
+              strstr(got, "hint") == NULL,
+          "%s", got);
+    storage_name = "ram";
 }
 
 static void read_and_commit_failures(void) {

@@ -54,13 +54,15 @@
  *      {"ok":true,"payload":{"id","version","storage","files":[{"path","bytes","sha256"}],"state","warnings":[...],
  *       "log":[...],"ui":[...],"mem_kb","peak_kb"}}
  *    with "ui_truncated":N when N widgets aren't in "ui" (apps_ui_dump's and the trim's), "files_truncated":N when
- *    files had to go, and "unchanged":true when the store found the package it already had. Without run, "state" is
+ *    files had to go, "unchanged":true when the store found the package it already had, and "hint":APPS_RAM_HINT when
+ *    the storage is "ram" (the gadget has no apps partition: apps_store.h). Without run, "state" is
  *    "installed", "warnings" the manifest's, and "log" and "ui" are empty. "ui" is the widget dump (apps_ui.h) as
  *    raw JSON (a cJSON_Raw item). On failure:
  *      {"ok":false,"error":{"code":<one of the codes below>,"message":<the message above>}}
  *
  * The package is the pipeline's from step 2 to step 6: its blocks are apps_port_realloc's, so that apps_task_run can
- * free it, and it is freed on every way out that doesn't give it to ops->run.
+ * free it, and it is freed on every way out that doesn't give it to ops->run. It keeps manifest.json's bytes
+ * (manifest_json), which the store writes as they came.
  *
  * The deadline. apps_install_run computes one absolute deadline, APPS_INSTALL_DEADLINE_MS from its start, in
  * microseconds of apps_port_mono_ms's clock, and passes it to every read.
@@ -91,6 +93,9 @@
 
 /* What a caller answers when apps_install_try_begin says no. */
 #define APPS_INSTALL_BUSY "busy: another install is running"
+
+/* What a result adds when the apps are kept in RAM (no apps partition: apps_store.h). */
+#define APPS_RAM_HINT "reflash over USB once to keep apps"
 
 /*
  * Where the files come from. read reads the app's file rel (a path apps_path_valid passed, or "manifest.json") into
@@ -152,8 +157,9 @@ cJSON *apps_install_status(const apps_status_t *st);
 #define APPS_SHOWN_MAX 64
 
 /*
- * The RAM store (C4): until Task 20's flash store, a committed package stays in PSRAM, one for each id, at most
- * APPS_RAM_APPS of them, until the gadget restarts or the store drops it. The store is the I/O worker's: every call
+ * The RAM store (C4): on a gadget without the apps partition (apps_store.h's RAM mode), a committed package stays in
+ * PSRAM, one for each id, at most APPS_RAM_APPS of them, until the gadget restarts or the store drops it. Its copies don't
+ * keep manifest.json's bytes (manifest_json is NULL in them): nothing reads them back from RAM. The store is the I/O worker's: every call
  * below is made from a job (apps_io_submit), never from another task, so it takes no lock. Each run gets a fresh copy
  * (apps_ram_load), which the app task frees when that app ends: an app that runs is in PSRAM twice (C4, E26).
  *
@@ -194,3 +200,8 @@ int apps_ram_list(apps_ram_entry_t *out, int max);
  * the most recent. *unchanged is always false. Fails with the store's refusal for room above, or with "out of memory: no
  * room to keep the app in RAM"; either way the store's copy of that id, if any, stays. */
 bool apps_ram_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t err_len);
+
+/* A copy of id's manifest into m (overwritten), its messages_json a block of apps_port_realloc (apps_manifest_clear(m,
+ * apps_port_free)): apps_store_manifest in RAM mode. False, with m zeroed, when there is none or no memory. Recency is
+ * unchanged. */
+bool apps_ram_manifest(const char *id, apps_manifest_t *m);

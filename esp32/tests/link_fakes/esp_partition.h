@@ -30,12 +30,15 @@ typedef enum {
     ESP_PARTITION_SUBTYPE_APP_OTA_1 = ESP_PARTITION_SUBTYPE_APP_OTA_MIN + 1,
     ESP_PARTITION_SUBTYPE_APP_OTA_MAX = ESP_PARTITION_SUBTYPE_APP_OTA_MIN + 16,
     ESP_PARTITION_SUBTYPE_DATA_NVS = 0x02,
+    ESP_PARTITION_SUBTYPE_DATA_FAT = 0x81,
+    ESP_PARTITION_SUBTYPE_ANY = 0xff,
 } esp_partition_subtype_t;
 
 typedef struct {
     esp_partition_type_t type;
     esp_partition_subtype_t subtype;
     uint32_t address;
+    uint32_t size;
     char label[17];
 } esp_partition_t;
 

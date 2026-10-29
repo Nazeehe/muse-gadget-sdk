@@ -1159,7 +1159,7 @@ void apps_lv_show_launcher(const char *const *ids, const char *const *names, int
         if (empty != NULL) {
             lv_label_set_long_mode(empty, LV_LABEL_LONG_MODE_WRAP);
             lv_obj_set_size(empty, ROW_W, LV_SIZE_CONTENT);
-            lv_label_set_text(empty, "No apps yet. Ask Muse to make one.");
+            lv_label_set_text(empty, n == APPS_LV_LOADING ? "Loading apps..." : "No apps yet. Ask Muse to make one.");
             lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
         }
     }
@@ -1226,4 +1226,8 @@ void apps_lv_hide_cards(void) {
 
 bool apps_lv_cards_shown(void) {
     return s_launcher_shown || s_crash_shown;
+}
+
+bool apps_lv_launcher_shown(void) {
+    return s_launcher_shown;
 }

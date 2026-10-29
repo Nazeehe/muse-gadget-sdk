@@ -60,8 +60,10 @@
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_rt.h"
+#include "apps_store.h"
 #include "apps_task.h"
 #include "apps_ui.h"
+#include "apps_values.h"
 #include "muse_apps.h"
 #include "muse_apps_task_fakes.h"
 #include "muse_input.h"
@@ -705,11 +707,14 @@ void muse_voice_request_chirp(void) {
 /* The alarms are apps_alarm.c's, the real one, on the fake esp_timer (tests/muse_apps_fake_esp_timer.c), whose clock is this
  * harness's: a case that moves it makes the timers come due. */
 apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
-    return apps_alarm_arm(app, name, ms, sound, wake);
+    apps_alarm_result_t got = apps_alarm_arm(app, name, ms, sound, wake);
+    apps_values_alarms_changed(app);  /* as apps_port_idf.c: the app's records follow (apps_values.h) */
+    return got;
 }
 
 void apps_port_alarm_cancel(const char *app, const char *name) {
     apps_alarm_cancel(app, name);
+    apps_values_alarms_changed(app);
 }
 
 int64_t apps_port_alarm_remaining(const char *app, const char *name) {
@@ -852,27 +857,127 @@ void vTaskDelay(const TickType_t ticks) {
     sleep_ms((int)ticks_to_ms(ticks));
 }
 
-/* ---- The store (apps_port.h): the real one. apps_store_ram.c is compiled into this file (included, not linked, so that a case can read
+/* ---- The store of packages (apps_store.h): a fake. Its mode picks the values' backend (RAM unless a case says otherwise); with the
+ * console's cases its packages are the real RAM store's (apps_install.c), as the gadget's are without an apps partition. What the app
+ * task asks of it, the tick and the quarantine's marker, is counted, and a flash backend's values and alarms' records are recorded. ---- */
+
+static atomic_int store_mode = APPS_STORAGE_RAM;
+static atomic_int store_ticks, store_mounts, marker_launches, marker_stops;
+static char marker_id[APPS_ID_MAX + 1];  /* the app task's: the last launch's id */
+static atomic_bool flash_refuses;        /* apps_nvs is full: the flash backend fails every save */
+static apps_marker_t fake_marker;
+
+apps_storage_t apps_store_mode(void) {
+    return (apps_storage_t)atomic_load(&store_mode);
+}
+
+const char *apps_storage_name(apps_storage_t mode) {
+    return mode == APPS_STORAGE_FLASH ? "flash" : mode == APPS_STORAGE_RAM ? "ram" : "none";
+}
+
+void apps_store_tick(int64_t now_ms) {
+    (void)now_ms;
+    atomic_fetch_add(&store_ticks, 1);
+}
+
+/* The worker's first step (apps_io_set_first): counted, not an event, so that the cases that read the events of a worker's start see
+ * them as they were. */
+void apps_store_mount_once(void) {
+    atomic_fetch_add(&store_mounts, 1);
+}
+
+apps_marker_t *apps_store_marker(void) {
+    return &fake_marker;
+}
+
+void apps_marker_launch(apps_marker_t *m, const char *id) {
+    CHECK(m == &fake_marker, "the store's marker");
+    snprintf(marker_id, sizeof marker_id, "%s", id);
+    atomic_fetch_add(&marker_launches, 1);
+}
+
+void apps_marker_clean_stop(apps_marker_t *m) {
+    CHECK(m == &fake_marker, "the store's marker");
+    atomic_fetch_add(&marker_stops, 1);
+}
+
+bool apps_store_save_values(const char *id, const char *json, size_t len) {
+    event("flash save %s %.*s", id, (int)len, json);
+    return !atomic_load(&flash_refuses);
+}
+
+char *apps_store_load_values(const char *id, size_t *len) {
+    (void)id;
+    char *json = apps_port_realloc(NULL, 3);
+    if (json != NULL) {
+        memcpy(json, "{}", 3);
+    }
+    *len = json != NULL ? 2 : 0;
+    return json;
+}
+
+void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n, bool epochs) {
+    event("records %s %d%s%s", id, n, n > 0 ? " " : "", n > 0 ? alarms[0].name : "");
+    (void)epochs;
+}
+
+#ifdef HARNESS_CONSOLE
+bool apps_store_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t n) {
+    return apps_ram_commit(pkg, unchanged, err, n);
+}
+
+bool apps_store_load(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
+    return apps_ram_load(id, pkg, err, n);
+}
+
+bool apps_store_has(const char *id) {
+    return apps_ram_has(id);
+}
+
+int apps_store_list(char ids[][APPS_ID_MAX + 1], char names[][25], int max) {
+    apps_ram_entry_t e[APPS_RAM_APPS];
+    int n = apps_ram_list(e, max < APPS_RAM_APPS ? max : APPS_RAM_APPS);
+    for (int i = 0; i < n; i++) {
+        snprintf(ids[i], APPS_ID_MAX + 1, "%s", e[i].id);
+        snprintf(names[i], 25, "%s", e[i].name);
+    }
+    return n;
+}
+
+bool apps_store_manifest(const char *id, apps_manifest_t *m) {
+    return apps_ram_manifest(id, m);
+}
+
+uint32_t apps_store_free_kb(void) {
+    return 0;
+}
+#else
+void muse_apps_console_tick(int64_t now_ms) {
+    (void)now_ms;  /* no console, no stage */
+}
+#endif
+
+/* ---- The values (apps_port.h): the real ones. apps_values.c is compiled into this file (included, not linked, so that a case can read
  * what the worker keeps: store_peek), and runs over the real I/O worker (apps_io.c): the app task's saves and loads are ops of the worker,
  * which alone touches the map. What a case can't read off the store itself it reads off the events: what the runtime asked of the port, in the
  * order the app task asked it, and the log lines the store and the worker write. apps_port_idf.c forwards the two calls as these do. ---- */
 
-#include "apps_store_ram.c"
+#include "apps_values.c"
 
 char *apps_port_store_load(const char *app, size_t *len) {
-    char *json = apps_store_load(app, len);
+    char *json = apps_values_load(app, len);
     apps_task_call_restart();  /* as apps_port_idf.c does: what the load waited for is the gadget's, not the app's */
     event(json != NULL ? "store load %s" : "store load failed %s", app);
     return json;
 }
 
 bool apps_port_store_save(const char *app, const char *json, size_t len) {
-    bool taken = apps_store_save(app, json, len);
+    bool taken = apps_values_save(app, json, len);
     event(taken ? "store save queued %s %s" : "store save refused %s %s", app, json);
     return taken;
 }
 
-/* How many saves the port holds for the worker, which hasn't taken them (apps_store.h). The app task's alone: a case reads it between rounds. */
+/* How many saves the port holds for the worker, which hasn't taken them (apps_values.h). The app task's alone: a case reads it between rounds. */
 static int store_pending_count(void) {
     int n = 0;
     for (size_t i = 0; i < ARRAY_LEN(s_pending); i++) {
@@ -1475,6 +1580,10 @@ void apps_lv_hide_cards(void) {
         event("hide cards");
     }
     lv_launcher = lv_crash = false;
+}
+
+bool apps_lv_launcher_shown(void) {
+    return lv_launcher;
 }
 
 bool apps_lv_cards_shown(void) {
@@ -4400,7 +4509,7 @@ static void no_worker_and_no_room_to_make_one(int from) {
 #define NO_ROOM_LINE "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused"
 
 /* A save the worker refuses isn't lost: the port keeps it in PSRAM, takes it as saved (the runtime has nothing to ask again), and offers it
- * again every APPS_STORE_RETRY_MS, no oftener (a retry with no period would write a line at every round); the worker has it once it can. */
+ * again every APPS_VALUES_RETRY_MS, no oftener (a retry with no period would write a line at every round); the worker has it once it can. */
 static void a_save_the_worker_refuses_is_kept_and_offered_every_two_seconds(void) {
     char err[300];
     clock_stop_at(apps_port_mono_ms());
@@ -4752,13 +4861,24 @@ static void io_op_from_another_task_asserts(void) {
 }
 
 /* A worker that ran only ops (the drain jobs that bring it to them aren't work of its own) says it goes at debug level: a save every 2 s
- * would otherwise write a line each. One that ran a job says it, as it did. */
+ * would otherwise write a line each. One that ran a job says it, as it did; so does the boot's first worker, which mounted the store
+ * before its op (apps_io_set_first: the mount is work of its own, and its stack is the one to watch), and no later worker mounts again. */
 static void the_idle_line_of_a_worker_that_ran_only_ops_is_debug(void) {
     apps_io_register_op_task();
     int from = mark();
+    CHECK(atomic_load(&store_mounts) == 0, "no worker yet, no mount: %d", atomic_load(&store_mounts));
+    CHECK(apps_io_submit_op(io_op, "first"), "an op, with no worker");
+    WAIT(from, "op first on muse_apps_io");
+    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+    CHECK(atomic_load(&store_mounts) == 1, "the first worker mounts the store: %d mounts", atomic_load(&store_mounts));
+    CHECK(count_from(from, "log I io: idle, stack") == 1 && count_from(from, "log D io: idle") == 0,
+          "the idle line of the worker that mounted: %d at info, %d at debug", count_from(from, "log I io: idle, stack"),
+          count_from(from, "log D io: idle"));
+    from = mark();
     CHECK(apps_io_submit_op(io_op, "only"), "an op, with no worker");
     WAIT(from, "op only on muse_apps_io");
     wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+    CHECK(atomic_load(&store_mounts) == 1, "a worker made again doesn't mount again: %d mounts", atomic_load(&store_mounts));
     CHECK(count_from(from, "log D io: idle, stack") == 1 && count_from(from, "log I io: idle") == 0,
           "the idle line of a worker that ran only ops: %d at debug, %d at info", count_from(from, "log D io: idle, stack"),
           count_from(from, "log I io: idle"));
@@ -4808,6 +4928,175 @@ static void a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second(voi
     CHECK(held_now(&port_held) == apps_heap && held_now(&caps_held) == own, "%zu and %zu bytes held after the worker's turn, not %zu and %zu",
           held_now(&port_held), held_now(&caps_held), apps_heap, own);
     CHECK(count_from(from, "log W launch stored: no app: ") == 1, "one log line for the refused launch: %d", count_from(from, "log W launch stored: no app: "));
+}
+
+/* ---- Task 20: the store's mode, the quarantine's marker, the values' backend, the alarms' records and the heartbeat's brief ---- */
+
+/* The launcher says "Loading apps..." (APPS_LV_LOADING rows) until the store's mount has ended (the mode is none until then), and is shown
+ * again, with the list, when the list comes while it is up (the mount's end gives one). A list that comes while it is closed opens nothing. */
+static void the_launcher_says_loading_until_the_store_is_mounted(void) {
+    static const apps_listed_t listed[] = {{"hello", "Hello"}};
+    atomic_store(&store_mode, APPS_STORAGE_NONE);
+    int from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher -1");
+    WAIT_FRAMES(5);
+    CHECK(count_from(from, "launcher ") == 1, "shown once while it loads: %d", count_from(from, "launcher "));
+    from = mark();
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);  /* the mount publishes its mode, then its list (apps_store.c) */
+    apps_task_set_list(listed, 1);
+    WAIT(from, "launcher 1 hello:Hello");
+    WAIT_FRAMES(5);
+    CHECK(count_from(from, "launcher ") == 1, "shown again once, with the list: %d", count_from(from, "launcher "));
+    TURN(true);  /* a voice turn closes the cards */
+    TURN(false);
+    from = mark();
+    apps_task_set_list(listed, 1);
+    WAIT_FRAMES(5);
+    ABSENT(from, "launcher");
+}
+
+/* The quarantine's marker (apps_store.h): every launch marks it with the app's id before any of the app runs (begin_app), and every end that
+ * isn't a reset clears it: a stop, a crash, a main.lua that gives no app. A reset in between leaves it marked, for the next boot to count. */
+static void a_launch_marks_the_quarantine_and_every_end_clears_it(void) {
+    char err[300];
+    CHECK(apps_task_run(make_pkg("hello", "Hello", HELLO, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    CHECK(atomic_load(&marker_launches) == 1 && strcmp(marker_id, "hello") == 0 && atomic_load(&marker_stops) == 0,
+          "marked for hello, not cleared while it runs: %d launches ('%s'), %d clears", atomic_load(&marker_launches), marker_id,
+          atomic_load(&marker_stops));
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    FIFO_SYNC();
+    CHECK(atomic_load(&marker_stops) == 1, "a stop clears it: %d", atomic_load(&marker_stops));
+    const file_t crash[] = {LUA("main.lua", APP_START_CRASH)};
+    CHECK(!apps_task_run(make_pkg("crashy", "Crashy", crash, 1), false, 0, NULL, err, sizeof err), "a crash isn't a run");
+    FIFO_SYNC();
+    CHECK(atomic_load(&marker_launches) == 2 && strcmp(marker_id, "crashy") == 0 && atomic_load(&marker_stops) == 2,
+          "a crash in start(): marked, then cleared: %d launches ('%s'), %d clears", atomic_load(&marker_launches), marker_id,
+          atomic_load(&marker_stops));
+    static const char bad[] = "local x = = 1\n";
+    const file_t syntax[] = {LUA("main.lua", bad)};
+    CHECK(!apps_task_run(make_pkg("syntax", "Syntax", syntax, 1), false, 0, NULL, err, sizeof err), "no app isn't a run");
+    FIFO_SYNC();
+    CHECK(atomic_load(&marker_launches) == 3 && strcmp(marker_id, "syntax") == 0 && atomic_load(&marker_stops) == 3,
+          "no app: marked, then cleared: %d launches ('%s'), %d clears", atomic_load(&marker_launches), marker_id,
+          atomic_load(&marker_stops));
+}
+
+/* The heartbeat's brief (muse_apps_brief): the app that is loaded, the record's state and the Lua heap now; once the app has ended, no
+ * resident and no heap, with the state it ended in. */
+static void the_brief_names_the_loaded_app(void) {
+    char resident[APPS_ID_MAX + 1];
+    const char *state = NULL;
+    unsigned lua_kb = 99;
+    muse_apps_brief(resident, sizeof resident, &state, &lua_kb);
+    CHECK(strcmp(resident, "") == 0 && strcmp(state, "stopped") == 0 && lua_kb == 0, "before any app: '%s' %s %uK", resident, state, lua_kb);
+    char err[300];
+    CHECK(apps_task_run(make_pkg("hello", "Hello", HELLO, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    muse_apps_brief(resident, sizeof resident, &state, &lua_kb);
+    CHECK(strcmp(resident, "hello") == 0 && strcmp(state, "running") == 0 && lua_kb > 0, "running: '%s' %s %uK", resident, state, lua_kb);
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    FIFO_SYNC();
+    muse_apps_brief(resident, sizeof resident, &state, &lua_kb);
+    CHECK(strcmp(resident, "") == 0 && strcmp(state, "stopped") == 0 && lua_kb == 0, "stopped: '%s' %s %uK", resident, state, lua_kb);
+    const file_t crash[] = {LUA("main.lua", APP_START_CRASH)};
+    CHECK(!apps_task_run(make_pkg("crashy", "Crashy", crash, 1), false, 0, NULL, err, sizeof err), "a crash isn't a run");
+    FIFO_SYNC();
+    muse_apps_brief(resident, sizeof resident, &state, &lua_kb);
+    CHECK(strcmp(resident, "") == 0 && strcmp(state, "crashed") == 0 && lua_kb == 0, "crashed: '%s' %s %uK", resident, state, lua_kb);
+}
+
+/* Values on flash (apps_nvs): the app's values are loaded from it and saved to it, by the worker. A save it refuses (full) is said once a
+ * streak, in a log line and in the app's log while the app runs; the next save it takes ends the streak, and a later refusal is said again. */
+static void a_full_apps_nvs_is_said_once_a_streak(void) {
+    char err[300];
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    atomic_store(&flash_refuses, true);
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print stored runs nil");  /* apps_nvs had nothing for it: "{}" */
+    clock_jump(2000);  /* start()'s change is due */
+    ROUNDS();
+    WAIT(from, "flash save stored {\"runs\":1}");
+    WAIT(from, "log W store: apps_nvs refused 10 bytes of values for stored");
+    worker_sync();  /* the op has said how it went */
+    ROUNDS();
+    WAIT(from, "log W stored: " APPS_VALUES_FULL);
+    WAIT(from, "print stored " APPS_VALUES_FULL);
+    say("stored", "set", "{\"k\":\"a\",\"v\":1}");
+    clock_jump(2000);
+    ROUNDS();
+    worker_sync();
+    ROUNDS();
+    CHECK(count_from(from, "flash save stored") == 2, "the next save was offered: %d", count_from(from, "flash save stored"));
+    CHECK(count_from(from, "log W stored: store:") == 1 && count_from(from, "print stored store:") == 1, "said once a streak: %d, %d",
+          count_from(from, "log W stored: store:"), count_from(from, "print stored store:"));
+    atomic_store(&flash_refuses, false);
+    say("stored", "set", "{\"k\":\"a\",\"v\":2}");
+    clock_jump(2000);
+    ROUNDS();
+    worker_sync();  /* taken: the streak ends */
+    atomic_store(&flash_refuses, true);
+    say("stored", "set", "{\"k\":\"a\",\"v\":3}");
+    clock_jump(2000);
+    ROUNDS();
+    worker_sync();
+    ROUNDS();
+    CHECK(count_from(from, "flash save stored") == 4, "four saves: %d", count_from(from, "flash save stored"));
+    CHECK(count_from(from, "log W stored: store:") == 2 && count_from(from, "print stored store:") == 2, "a new streak is said again: %d, %d",
+          count_from(from, "log W stored: store:"), count_from(from, "print stored store:"));
+    CHECK(store_pending_count() == 0, "a refusal of the backend isn't kept for the worker: %d", store_pending_count());
+    atomic_store(&flash_refuses, false);
+    clock_go();
+}
+
+/* The alarms' records follow the alarm table (apps_values.h) where the store is on flash: an arming (the port marks the app, as
+ * apps_port_idf.c does) or a firing that is told marks it, and the round APPS_VALUES_ALARM_DELAY_MS after the first mark hands the store
+ * what the table has of the app then, as an op of the worker. Where the store is in RAM nothing is handed: nothing outlives a reset there. */
+static void the_alarms_records_follow_the_table_on_flash(void) {
+    char err[300];
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    CHECK(apps_task_run(alarmy(), false, 0, NULL, err, sizeof err), "run: %s", err);  /* start() arms t, 5000 ms ahead */
+    WAIT(from, "print alarmy start");
+    clock_jump(APPS_VALUES_ALARM_DELAY_MS - 1);
+    ROUNDS();
+    worker_sync();
+    ABSENT(from, "records");
+    clock_jump(1);
+    ROUNDS();
+    worker_sync();
+    CHECK(count_from(from, "records alarmy 1 t") == 1 && count_from(from, "records") == 1, "t's record, once: %d",
+          count_from(from, "records"));
+    from = mark();
+    tell_alarmy("arm", "{\"name\":\"u\",\"ms\":60000}");
+    clock_jump(APPS_VALUES_ALARM_DELAY_MS);
+    ROUNDS();
+    worker_sync();
+    CHECK(count_from(from, "records alarmy 2 ") == 1 && count_from(from, "records") == 1, "t's and u's: %d", count_from(from, "records"));
+    from = mark();
+    clock_jump(5000 - 2 * APPS_VALUES_ALARM_DELAY_MS);  /* t fires */
+    fake_esp_timer_sync();
+    WAIT(from, "print alarmy rang t");
+    clock_jump(APPS_VALUES_ALARM_DELAY_MS);
+    ROUNDS();
+    worker_sync();
+    CHECK(count_from(from, "records alarmy 1 u") == 1 && count_from(from, "records") == 1, "t's record went once it was told: %d",
+          count_from(from, "records"));
+    tell_alarmy("stop", "{}");  /* the ring */
+    /* In RAM: the marks go, and nothing is handed, then or later. */
+    atomic_store(&store_mode, APPS_STORAGE_RAM);
+    from = mark();
+    tell_alarmy("arm", "{\"name\":\"v\",\"ms\":60000}");
+    clock_jump(APPS_VALUES_ALARM_DELAY_MS);
+    ROUNDS();
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    clock_jump(APPS_VALUES_ALARM_DELAY_MS);
+    ROUNDS();
+    worker_sync();
+    ABSENT(from, "records");
+    clock_go();
 }
 
 #ifdef HARNESS_CONSOLE
@@ -5019,8 +5308,10 @@ static void an_alarm_starts_a_stopped_app_and_calls_it_after_start(void) {
     store(alarmy());
     CHECK(apps_task_run(alarmy(), true, 0, NULL, err, sizeof err), "run: %s", err);
     WAIT(0, "print alarmy start");
+    int stopping = mark();
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
     WAIT(0, "print alarmy stop");
+    WAIT(stopping, "front 0");  /* the layer has gone behind (a frame of the LVGL task's): the alarm's front is one of its own */
     CHECK(apps_alarm_remaining("alarmy", "t") == 5000, "the alarm outlives its app: %lld", (long long)apps_alarm_remaining("alarmy", "t"));
     int from = mark();
     clock_jump(5000);
@@ -5721,6 +6012,11 @@ int main(int argc, char **argv) {
         {"io_op_for_an_idle_worker_runs_at_the_end_of_its_wait", io_op_for_an_idle_worker_runs_at_the_end_of_its_wait},
         {"io_op_from_another_task_asserts", io_op_from_another_task_asserts},
         {"the_idle_line_of_a_worker_that_ran_only_ops_is_debug", the_idle_line_of_a_worker_that_ran_only_ops_is_debug},
+        {"the_launcher_says_loading_until_the_store_is_mounted", the_launcher_says_loading_until_the_store_is_mounted},
+        {"a_launch_marks_the_quarantine_and_every_end_clears_it", a_launch_marks_the_quarantine_and_every_end_clears_it},
+        {"the_brief_names_the_loaded_app", the_brief_names_the_loaded_app},
+        {"a_full_apps_nvs_is_said_once_a_streak", a_full_apps_nvs_is_said_once_a_streak},
+        {"the_alarms_records_follow_the_table_on_flash", the_alarms_records_follow_the_table_on_flash},
 #ifdef HARNESS_CONSOLE
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},

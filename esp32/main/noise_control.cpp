@@ -51,6 +51,9 @@ extern "C" {
 #include "muse_state.h"
 }
 #endif
+#if CONFIG_MUSE_APPS
+#include "muse_apps.h"
+#endif
 }
 
 #include <xplat/noise/core/ClientSession.h>
@@ -1692,6 +1695,15 @@ static void send_device_health(
     const esp_app_desc_t *desc = esp_app_get_description();
     cJSON_AddStringToObject(health, "version",
                             desc ? desc->version : "unknown");
+#if CONFIG_MUSE_APPS
+    // Muse apps: the resident app, its state and Lua heap, and where the
+    // store keeps apps ("flash", "ram" without the apps partition, "none"
+    // until it is mounted) with the room it has.
+    cJSON *apps = muse_apps_health();
+    if (apps) {
+        cJSON_AddItemToObject(health, "apps", apps);
+    }
+#endif
 
     char *payload = cJSON_PrintUnformatted(health);
     cJSON_Delete(health);

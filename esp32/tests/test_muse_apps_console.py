@@ -53,6 +53,14 @@ STAGED = {
                   "#define ESP_LOGW(tag, ...) fake_esp_log('W', tag, __VA_ARGS__)\n"
                   "#define ESP_LOGI(tag, ...) fake_esp_log('I', tag, __VA_ARGS__)\n"),
     "sdkconfig.h": "#pragma once\n#define CONFIG_MUSE_APPS 1\n#define CONFIG_MUSE_APPS_HEAP_MAX_KB 1024\n",
+    # The stage's lock (a FreeRTOS mutex): the harness's one thread holds it or not.
+    "freertos/FreeRTOS.h": ("#pragma once\n#include <stdint.h>\ntypedef uint32_t TickType_t;\ntypedef int BaseType_t;\n"
+                            "#define pdTRUE 1\n#define pdFALSE 0\n#define portMAX_DELAY ((TickType_t)0xffffffffu)\n"),
+    "freertos/semphr.h": ("#pragma once\n#include \"freertos/FreeRTOS.h\"\ntypedef struct fake_mutex *SemaphoreHandle_t;\n"
+                          "typedef struct { void *opaque[4]; } StaticSemaphore_t;\n"
+                          "SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer);\n"
+                          "BaseType_t xSemaphoreTake(SemaphoreHandle_t mutex, TickType_t wait);\n"
+                          "BaseType_t xSemaphoreGive(SemaphoreHandle_t mutex);\n"),
 }
 
 # The protocol's replies: an acknowledgement, a result or a refusal, each one line.
@@ -66,6 +74,7 @@ def stage(directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     for name, text in STAGED.items():
+        (directory / name).parent.mkdir(parents=True, exist_ok=True)
         (directory / name).write_text(text)
     return directory
 
@@ -328,6 +337,12 @@ class Console(unittest.TestCase):
 
     def test_list_shows_installed_apps(self):
         self.run_case("list_shows_installed_apps")
+
+    def test_health_says_the_app_and_the_store(self):  # device.health's "apps": resident null with none loaded; the store's mode and room
+        self.run_case("health_says_the_app_and_the_store")
+
+    def test_an_idle_stage_is_freed(self):  # ten minutes with no put, by the app task's rounds; never while the console holds it
+        self.run_case("an_idle_stage_is_freed")
 
     def test_send_returns_the_reply(self):
         self.run_case("send_returns_the_reply")

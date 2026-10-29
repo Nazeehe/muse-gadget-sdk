@@ -436,6 +436,9 @@ static bool add_payload(cJSON *p, const view_t *v) {
     if (ok && v->unchanged) {
         ok = cJSON_AddTrueToObject(p, "unchanged") != NULL;
     }
+    if (ok && strcmp(v->storage, "ram") == 0) {
+        ok = cJSON_AddStringToObject(p, "hint", APPS_RAM_HINT) != NULL;
+    }
     return ok;
 }
 
@@ -719,10 +722,12 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
     }
     bool ok = apps_manifest_parse((const char *)data, len, id, CONFIG_MUSE_APPS_HEAP_MAX_KB, &pkg->manifest, in->raw,
                                   sizeof in->raw);
-    apps_port_free(data);
     if (!ok) {
+        apps_port_free(data);
         return failure(APPS_ERR_INVALID_PACKAGE, in->raw);
     }
+    pkg->manifest_json = (char *)data;  /* the package's from here: the store writes it as it came */
+    pkg->manifest_len = len;
     if (!rehome_messages(&pkg->manifest)) {
         return failure(APPS_ERR_OUT_OF_MEMORY, MSG_NO_MEMORY);
     }
@@ -777,6 +782,9 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
     if (!ops->commit(pkg, &unchanged, in->raw, sizeof in->raw)) {
         return failure(APPS_ERR_COMMIT_FAILED, in->raw);
     }
+    apps_port_free(pkg->manifest_json);  /* the store has it: the app that runs doesn't need it */
+    pkg->manifest_json = NULL;
+    pkg->manifest_len = 0;
     keep_infos(in, pkg);
     return run ? run_pkg(in, ops, "installed but ") : success(in, ops, NULL, unchanged);
 }
@@ -923,6 +931,8 @@ static bool ram_room(const char *id, size_t bytes, unsigned memory_kb, int *drop
 static bool pkg_copy(const apps_pkg_t *src, apps_pkg_t *out) {
     memcpy(out, src, sizeof *out);
     out->manifest.messages_json = NULL;
+    out->manifest_json = NULL;  /* not kept: nothing reads it back from RAM */
+    out->manifest_len = 0;
     for (int i = 0; i < APPS_MAX_FILES; i++) {
         out->files[i].data = NULL;
     }
@@ -978,6 +988,25 @@ bool apps_ram_remove(const char *id) {
     }
     ram_drop(i);
     ram_publish();
+    return true;
+}
+
+bool apps_ram_manifest(const char *id, apps_manifest_t *m) {
+    memset(m, 0, sizeof *m);
+    int i = ram_find(id);
+    if (i < 0) {
+        return false;
+    }
+    *m = s_ram[i]->manifest;
+    m->messages_json = NULL;
+    const char *messages = s_ram[i]->manifest.messages_json;
+    if (messages != NULL) {
+        m->messages_json = dup_block(messages, strlen(messages) + 1);
+        if (m->messages_json == NULL) {
+            memset(m, 0, sizeof *m);
+            return false;
+        }
+    }
     return true;
 }
 

@@ -187,15 +187,23 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * next frame. Without a layer they do nothing.
  */
 
-/* Rows the launcher shows; more apps are left out (Task 20 makes the list longer). */
+/* Rows the launcher shows; more apps are left out. */
 #define APPS_LV_LAUNCHER_ROWS 4
 
+/* The launcher's n while the store hasn't been mounted (apps_store.h): "Loading apps..." in place of the rows (the font has no
+ * ellipsis). */
+#define APPS_LV_LOADING (-1)
+
 /* The launcher: "Apps", and a row for each app, ids[i] named names[i] (NULL: the id), at most APPS_LV_LAUNCHER_ROWS,
- * or, for n 0, "No apps yet. Ask Muse to make one." Both are copied. A tap on a row closes the launcher and calls pick
- * with the row's id, on the LVGL task inside the tap (pick posts and returns). A tap anywhere else (the text
- * included: it isn't clickable, so LVGL gives the tap to the launcher) or a right swipe closes it. Any other swipe
- * does nothing, even one that begins on a row: it picks nothing. Showing it again makes its rows again. */
+ * or, for n 0 (or any other n under 1), "No apps yet. Ask Muse to make one.", or for APPS_LV_LOADING "Loading apps...".
+ * Both are copied. A tap on a row closes the launcher and calls pick with the row's id, on the LVGL task inside the tap
+ * (pick posts and returns). A tap anywhere else (the text included: it isn't clickable, so LVGL gives the tap to the
+ * launcher) or a right swipe closes it. Any other swipe does nothing, even one that begins on a row: it picks nothing.
+ * Showing it again makes its rows again (the app task's glue does when the store's list changes while it is shown). */
 void apps_lv_show_launcher(const char *const *ids, const char *const *names, int n, void (*pick)(const char *id));
+
+/* Whether the launcher is showing. */
+bool apps_lv_launcher_shown(void);
 
 /* The crash card: "<name> stopped" over first_line (the crash record's first line), or "<name> stopped responding"
  * when first_line is NULL (the supervisor's card for a hung app); "Tap to close" under them. NULL or "" name is "The

@@ -512,6 +512,12 @@ static void log_note(apps_rt_t *rt, const char *line) {
     apps_port_log(rt->pkg->manifest.id, line);
 }
 
+void apps_rt_note(apps_rt_t *rt, const char *line) {
+    if (rt != NULL && line != NULL) {
+        log_note(rt, line);
+    }
+}
+
 bool apps_rt_store_key_valid(const char *key, size_t len) {
     const unsigned char *p = (const unsigned char *)key, *end = p + len;
     size_t chars = 0;

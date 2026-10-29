@@ -401,6 +401,23 @@ class AppTaskTest(HarnessCase):
     def test_the_idle_line_of_a_worker_that_ran_only_ops_is_debug(self):  # N: a save every 2 s makes a worker and says it goes
         self.run_case("the_idle_line_of_a_worker_that_ran_only_ops_is_debug")
 
+    # ---- Task 20: the store's mode, the quarantine's marker, the values on flash, the alarms' records, the brief ----
+
+    def test_the_launcher_says_loading_until_the_store_is_mounted(self):  # and is shown again with the mount's list
+        self.run_case("the_launcher_says_loading_until_the_store_is_mounted")
+
+    def test_a_launch_marks_the_quarantine_and_every_end_clears_it(self):  # a stop, a crash, no app; only a reset leaves it
+        self.run_case("a_launch_marks_the_quarantine_and_every_end_clears_it")
+
+    def test_the_brief_names_the_loaded_app(self):  # the heartbeat's apps=<id>/<state> lua=<KB>K
+        self.run_case("the_brief_names_the_loaded_app")
+
+    def test_a_full_apps_nvs_is_said_once_a_streak(self):  # in a log line and the app's log
+        self.run_case("a_full_apps_nvs_is_said_once_a_streak")
+
+    def test_the_alarms_records_follow_the_table_on_flash(self):  # 1 s after the first mark; nothing in RAM mode
+        self.run_case("the_alarms_records_follow_the_table_on_flash")
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))

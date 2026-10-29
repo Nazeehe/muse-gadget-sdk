@@ -201,6 +201,10 @@ const char *apps_state_name(apps_state_t state);
 
 typedef struct apps_rt apps_rt_t;
 
+/* A line of the system's in the app's log, as the store's own notes go (the ring, and the port's echo): line is clean text of at most
+ * APPS_LOG_LINE_MAX bytes. The app task's ("store: the gadget's app storage is full; values weren't saved"). NULL rt is ignored. */
+void apps_rt_note(apps_rt_t *rt, const char *line);
+
 /*
  * Makes the runtime for pkg: a VM with the manifest's memory_kb of heap, `json`, print and require, and
  * main.lua run to the table it returns (APPS_BUDGET_START), whose handlers are then known. pkg stays the

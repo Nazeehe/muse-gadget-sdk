@@ -741,6 +741,9 @@ void apps_pkg_free(apps_pkg_t *pkg, void (*free_fn)(void *)) {
             release(pkg->files[i].data, free_fn);
         }
     }
+    if (pkg->manifest_json != NULL) {
+        release(pkg->manifest_json, free_fn);
+    }
     apps_manifest_clear(&pkg->manifest, free_fn);
     memset(pkg, 0, sizeof *pkg);
 }

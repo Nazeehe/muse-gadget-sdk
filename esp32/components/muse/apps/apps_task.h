@@ -248,6 +248,12 @@ bool apps_task_stop(char *err, size_t err_len);
  * copies. */
 void apps_task_status(apps_status_t *st);
 
+/* The record's few words, for device.health and the heartbeat (muse_apps_health, muse_apps_brief): the app that is loaded (id, cap bytes:
+ * from its launch to its end, a stuck one included; "" when none is), the record's state (the last app's once it has ended; HUNG while the
+ * supervisor's mark is up), its Lua heap now (0 when none is loaded) and the last app's peak, in KB. Any task: the record's lock, held for
+ * copies; STOPPED, "" and 0 when the task isn't up or the record stays busy. */
+void apps_task_brief(char *id, size_t cap, apps_state_t *state, uint32_t *mem_kb, uint32_t *peak_kb);
+
 /* An app the launcher lists: its id and the name it shows (its manifest's name, or its id). */
 typedef struct {
     char id[APPS_ID_MAX + 1], name[25];

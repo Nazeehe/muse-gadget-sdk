@@ -69,7 +69,7 @@ BUDGET_CALL = "stopped: ran more than 2000000 VM instructions in one callback (u
 BUDGET_START = "stopped: ran more than 5000000 VM instructions in one callback (use timer.every for long work)"
 # The commands apphost lists when it doesn't know one.
 COMMANDS = ("(commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, sync, timers, restart, "
-            "other_alarm, other_cancel, hold_alarms)")
+            "install, other_alarm, other_cancel, hold_alarms)")
 # The ring: a line takes its length plus one of 8192 bytes; print cuts a line at 200 bytes.
 RING_BYTES = 8192
 LINE_MAX = 200
@@ -1204,6 +1204,47 @@ class RuntimeTest(AppHostTestCase):
         cmake = (ROOT / "components/muse/CMakeLists.txt").read_text()
         block = re.search(r"if\(CONFIG_MUSE_APPS\)(.*?)endif\(\)", cmake, re.S).group(1)
         self.assertIn('"apps/apps_rt.c"', block)
+
+    # ---- install: a new version replaces the app that runs (Task 20) ----
+
+    def test_reinstall_running_app_stops_flushes_and_replaces(self):
+        # apps_task_run's replacement, as apphost's `install DIR` emulates it: the app that runs is stopped (its stop() prints), its
+        # store is flushed (the value set a moment ago, which the 2 s debounce hadn't saved yet), it is freed, and the new version is
+        # made and started, reading back what the old one saved. The screen is the new version's alone.
+        v1 = FIXTURES / "reinstall_v1/reinstall"
+        v2 = FIXTURES / "reinstall_v2/reinstall"
+        run = self.host(v1, script=['message set {"n":7}', f"install {v2}", "dump"])
+        self.assertEqual(run.kinds(), ["log", "started", "reply", "log", "store_save", "log", "started", "dump"])
+        self.assertEqual(run.logs(), ["v1 start 0", "v1 stop", "v2 start 7"])
+        self.assertEqual(run.of("store_save"), [{"event": "store_save", "bytes": len('{"n":7}')}])
+        self.assertEqual([e["id"] for e in run.of("started")], ["reinstall", "reinstall"])
+        self.assertEqual([w["text"] for w in run.of("dump")[0]["widgets"]], ["v2"])
+
+    def test_install_of_a_package_that_fails_keeps_the_app(self):
+        # The device's pipeline reads and compiles the new package before apps_task_run replaces anything: a package that fails says why
+        # and leaves the app that runs as it was (no stop, no save, its screen).
+        v1 = FIXTURES / "reinstall_v1/reinstall"
+        broken = self.make_app("reinstall", "return {start = function( end}")
+        missing = Path(self.tmp) / "nowhere" / "reinstall"
+        run = self.host(v1, script=[f"install {broken}", f"install {missing}", "install", "dump"])
+        self.assertEqual(run.kinds(), ["log", "started", "error", "error", "error", "dump"])
+        errors = run.messages("error")
+        self.assertTrue(errors[0].startswith("compile failed: main.lua:1: "), errors)
+        self.assertTrue(errors[1].startswith("reading manifest.json: "), errors)
+        self.assertEqual(errors[2], "install needs an app folder: install <dir>")
+        self.assertEqual([w["text"] for w in run.of("dump")[0]["widgets"]], ["v1"])
+
+    def test_install_of_another_app_replaces_the_one_that_runs(self):
+        # The id is the folder's: another app replaces the one that runs, as a run of another package does on the gadget, and the store
+        # it reads is its own.
+        v1 = FIXTURES / "reinstall_v1/reinstall"
+        other = self.make_app("other", 'return {start = function() ui.label{text = "other", x = 1, y = 2} print("other", '
+                                       'store.get("n", 0)) end}', manifest={"permissions": ["store"]})
+        run = self.host(v1, script=['message set {"n":3}', f"install {other}", "dump"])
+        self.assertEqual(run.kinds(), ["log", "started", "reply", "log", "store_save", "log", "started", "dump"])
+        self.assertEqual(run.logs(), ["v1 start 0", "v1 stop", "other\t0"])
+        self.assertEqual([e["id"] for e in run.of("started")], ["reinstall", "other"])
+        self.assertEqual([w["text"] for w in run.of("dump")[0]["widgets"]], ["other"])
 
 
 class CompileStepTest(AppHostTestCase):

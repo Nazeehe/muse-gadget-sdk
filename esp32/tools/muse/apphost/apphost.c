@@ -119,6 +119,11 @@
  *   restart                the app is stopped if it runs (stop() runs, its store is saved, its alarms are told, as the stop command does),
  *                          its runtime freed and a new one made and started, as a launch is (main.lua's top level runs again, then
  *                          start()): the values it saved are read back. It works on an app that crashed, too
+ *   install DIR            the package in DIR (the app id is the folder's name) replaces the app that runs, as apps_task_run's
+ *                          replacement does on the gadget: DIR is read and compiled first, as the install pipeline does (a package that
+ *                          fails is an error event, and the app that runs is left as it was); then the app that runs is stopped (stop()
+ *                          runs, its store is saved, its alarms are told "app replaced"), freed, and the new one is made and started,
+ *                          reading the store of its id. Another id is another app, as on the gadget
  * sys.exit() ends the app once the callback it was called in has returned, as the app task does: the callback runs to its end (its
  * reply is given), then stop() runs, the store is saved and the alarms are told ("app exited"), and no other callback runs, a
  * timer that was due in the same pass included. It is no event of its own. Called in start(), the app has started and then ends;
@@ -453,10 +458,22 @@ static bool compile_package(const apps_pkg_t *pkg, char *raw, size_t raw_len) {
     return apps_rt_compile(code, n, pkg->manifest.memory_kb, raw, raw_len);
 }
 
+/* The compile, and when it fails the install's words for it in message (cap bytes): what a launch's crash event and an install's
+ * error say. */
+static bool compiles(const apps_pkg_t *pkg, char *message, size_t cap) {
+    char raw[512];  /* what the app task gives Lua's message in its compile: the install's words are made from the same */
+    if (compile_package(pkg, raw, sizeof raw)) {
+        return true;
+    }
+    apps_pkg_compile_message(pkg, raw, message, cap);
+    return false;
+}
+
 /* ---- The app, and the commands that drive it ---- */
 
 typedef struct {
     const apps_pkg_t *pkg;
+    apps_pkg_t *owned;                /* the package an install loaded (pkg then), freed when another replaces it or the run ends */
     apps_rt_t *rt;                    /* NULL when the runtime couldn't be made */
     char crash_text[APPS_ERROR_MAX];  /* then, the reason: the crash record of an app that never ran */
     size_t warned;                    /* the bytes of apps_rt_warnings that have been printed as events */
@@ -752,6 +769,54 @@ static void cmd_restart(app_t *app) {
     app->rt = NULL;
     app->warned = 0;
     app->alarm_window = false;
+    make_and_start(app);
+}
+
+static const char *folder_name(const char *folder, char *buf, size_t cap);
+
+/* install DIR (the header says what it does): the new package is read and compiled before anything of the app that runs is touched. */
+static void cmd_install(app_t *app, const char *dir) {
+    if (*dir == '\0') {
+        emit_text("error", "install needs an app folder: install <dir>");
+        return;
+    }
+    char name_buf[PATH_MAX + 1], err[APPS_ERROR_MAX];
+    apps_pkg_t *pkg = calloc(1, sizeof *pkg);  /* about 7 KB: not for the stack */
+    if (pkg == NULL) {
+        emit_text("error", "install: out of memory");
+        return;
+    }
+    if (!load_package(dir, folder_name(dir, name_buf, sizeof name_buf), pkg, err, sizeof err)) {
+        emit_text("error", err);
+        free(pkg);
+        return;
+    }
+    if (!compiles(pkg, err, sizeof err)) {
+        emit_text("error", err);
+        apps_pkg_free(pkg, NULL);
+        free(pkg);
+        return;
+    }
+    if (app->rt != NULL && apps_rt_state(app->rt) == APPS_STATE_RUNNING) {
+        apps_rt_stop(app->rt);  /* stop() runs, and the store is saved */
+        flush_warnings(app);
+        report_crash(app, false);
+        if (!crashed(app)) {
+            end_alarms(app, false, "app replaced");
+        }
+    }
+    (void)apphost_take_exit();  /* asked while it stopped: it has ended */
+    apps_rt_free(app->rt);
+    app->rt = NULL;
+    app->warned = 0;
+    app->alarm_window = false;
+    apps_pkg_t *old = app->owned;  /* the runtime that read from it is gone */
+    app->pkg = app->owned = pkg;
+    if (old != NULL) {
+        apps_pkg_free(old, NULL);
+        free(old);
+    }
+    emit_warnings(pkg->manifest.warnings);
     make_and_start(app);
 }
 
@@ -1061,6 +1126,8 @@ static void run_line(app_t *app, char *line) {
         } else {
             apphost_sync(epoch_ms);
         }
+    } else if (strcmp(cmd, "install") == 0) {
+        cmd_install(app, args);
     } else if (strcmp(cmd, "other_alarm") == 0) {
         cmd_other_alarm(app, args);
     } else if (strcmp(cmd, "other_cancel") == 0) {
@@ -1096,7 +1163,7 @@ static void run_line(app_t *app, char *line) {
     } else {
         snprintf(text, sizeof text,
                  "unknown command '%.60s' (commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, "
-                 "sync, timers, restart, other_alarm, other_cancel, hold_alarms)",
+                 "sync, timers, restart, install, other_alarm, other_cancel, hold_alarms)",
                  cmd);
         emit_text("error", text);
     }
@@ -1173,10 +1240,8 @@ static void make_and_start(app_t *app) {
  * false) is refused first, with one crash event and the status 1, and nothing else happens. A script that can't be read
  * is the status 2, after what it did run. */
 static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name, bool compile) {
-    char raw[512];  /* what the app task gives Lua's message in its compile: the install's words are made from the same */
-    if (compile && !compile_package(pkg, raw, sizeof raw)) {
-        char message[APPS_ERROR_MAX];
-        apps_pkg_compile_message(pkg, raw, message, sizeof message);
+    char message[APPS_ERROR_MAX];
+    if (compile && !compiles(pkg, message, sizeof message)) {
         emit_text("crash", message);
         return 1;
     }
@@ -1198,6 +1263,10 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name,
         status = crashed(&app) ? 1 : 0;
     }
     apps_rt_free(app.rt);  /* a store with a change in it is saved: the run's last event, if there is one */
+    if (app.owned != NULL) {  /* an install's package, which the runtime read from */
+        apps_pkg_free(app.owned, NULL);
+        free(app.owned);
+    }
     apphost_store_clear();
     return status;
 }

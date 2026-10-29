@@ -43,8 +43,10 @@
 #include "apps_install.h"
 #include "apps_io.h"
 #include "apps_port.h"
+#include "apps_store.h"
 #include "apps_task.h"
 #include "cJSON.h"
+#include "freertos/semphr.h"
 #include "muse_apps.h"
 #include "muse_apps_exact_stack.h"
 
@@ -339,8 +341,12 @@ void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
 
 /* cJSON's allocations, counted. */
 static size_t cjson_held;
+static long cjson_refuse = -1; /* refuse the Nth allocation from now (0: the next), -1: never */
 
 static void *cjson_malloc(size_t n) {
+    if (cjson_refuse >= 0 && cjson_refuse-- == 0) {
+        return NULL;
+    }
     block_t *b = malloc(sizeof *b + n);
     if (b == NULL) {
         return NULL;
@@ -390,7 +396,95 @@ static void run_jobs(void) {
     }
 }
 
+/* ---- The fakes: the store of packages (apps_store.h) ---- */
+
+/* The RAM store's packages (apps_install.c), as on a gadget without the apps partition, in whatever mode a case gives. */
+static apps_storage_t store_mode = APPS_STORAGE_RAM;
+static uint32_t store_free_kb;
+
+apps_storage_t apps_store_mode(void) {
+    return store_mode;
+}
+
+const char *apps_storage_name(apps_storage_t mode) {
+    return mode == APPS_STORAGE_FLASH ? "flash" : mode == APPS_STORAGE_RAM ? "ram" : "none";
+}
+
+bool apps_store_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t n) {
+    return apps_ram_commit(pkg, unchanged, err, n);
+}
+
+bool apps_store_load(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
+    return apps_ram_load(id, pkg, err, n);
+}
+
+bool apps_store_has(const char *id) {
+    return apps_ram_has(id);
+}
+
+int apps_store_list(char ids[][APPS_ID_MAX + 1], char names[][25], int max) {
+    apps_ram_entry_t e[APPS_RAM_APPS];
+    int n = apps_ram_list(e, max < APPS_RAM_APPS ? max : APPS_RAM_APPS);
+    for (int i = 0; i < n; i++) {
+        snprintf(ids[i], APPS_ID_MAX + 1, "%s", e[i].id);
+        snprintf(names[i], 25, "%s", e[i].name);
+    }
+    return n;
+}
+
+bool apps_store_manifest(const char *id, apps_manifest_t *m) {
+    return apps_ram_manifest(id, m);
+}
+
+uint32_t apps_store_free_kb(void) {
+    return store_free_kb;
+}
+
+/* ---- The fakes: the stage's lock (a FreeRTOS mutex) ---- */
+
+/* This harness has one thread, the serial task's and the app task's both: a take that would wait finds a holder that can never give it
+ * back, and fails the case. console_holds_the_stage makes the app task's try (wait 0) find the console at the stage. */
+struct fake_mutex {
+    bool held;
+};
+static bool console_holds_the_stage;
+
+SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer) {
+    struct fake_mutex *m = (struct fake_mutex *)buffer;
+    m->held = false;
+    return m;
+}
+
+BaseType_t xSemaphoreTake(SemaphoreHandle_t m, TickType_t wait) {
+    if (wait == 0 && console_holds_the_stage) {
+        return pdFALSE;
+    }
+    CHECK(!m->held, "a take of the stage's lock that would wait forever");
+    m->held = true;
+    return pdTRUE;
+}
+
+BaseType_t xSemaphoreGive(SemaphoreHandle_t m) {
+    CHECK(m->held, "a give of the stage's lock, which nobody holds");
+    m->held = false;
+    return pdTRUE;
+}
+
 /* ---- The fakes: the app task ---- */
+
+/* The record's few words (apps_task_brief), as a case sets them. */
+static struct {
+    char id[APPS_ID_MAX + 1];
+    apps_state_t state;
+    uint32_t mem_kb, peak_kb;
+} brief;
+
+void apps_task_brief(char *id, size_t cap, apps_state_t *state, uint32_t *mem_kb, uint32_t *peak_kb) {
+    snprintf(id, cap, "%s", brief.id);
+    *state = brief.state;
+    *mem_kb = brief.mem_kb;
+    *peak_kb = brief.peak_kb;
+}
 
 /* What compile was given: each file's path and bytes. */
 static struct {
@@ -1260,7 +1354,7 @@ static void list_shows_installed_apps(void) {
     CHECK(line("app.list"), "list");
     EXPECT("");
     run_jobs();
-    EXPECT("@app {\"op\":\"list\",\"storage\":\"ram\",\"apps\":[]}\n");
+    EXPECT("@app {\"op\":\"list\",\"storage\":\"ram\",\"hint\":\"" APPS_RAM_HINT "\",\"apps\":[]}\n");
     install_hello();
     put_text("timer", "manifest.json", "{\"id\":\"timer\",\"name\":\"Timer\",\"version\":\"0.3\",\"api\":1}");
     put_text("timer", "main.lua", "return {}\n");
@@ -1270,11 +1364,93 @@ static void list_shows_installed_apps(void) {
     CHECK(line("app.list"), "list");
     run_jobs();
     /* Most recent first, as the launcher lists them (F1). */
-    EXPECT("@app {\"op\":\"list\",\"storage\":\"ram\",\"apps\":[{\"id\":\"timer\",\"name\":\"Timer\",\"version\":"
-           "\"0.3\"},{\"id\":\"hello\",\"name\":\"Hello\",\"version\":\"1.0.0\"}]}\n");
+    EXPECT("@app {\"op\":\"list\",\"storage\":\"ram\",\"hint\":\"" APPS_RAM_HINT "\",\"apps\":[{\"id\":\"timer\",\"name\":"
+           "\"Timer\",\"version\":\"0.3\"},{\"id\":\"hello\",\"name\":\"Hello\",\"version\":\"1.0.0\"}]}\n");
     CHECK(strcmp(listed, "timer:Timer hello:Hello") == 0, "the launcher's list: %s", listed);
+    /* A store on the apps partition says so, with no hint. */
+    store_mode = APPS_STORAGE_FLASH;
+    CHECK(line("app.list"), "list");
+    run_jobs();
+    EXPECT("@app {\"op\":\"list\",\"storage\":\"flash\",\"apps\":[{\"id\":\"timer\",\"name\":\"Timer\",\"version\":"
+           "\"0.3\"},{\"id\":\"hello\",\"name\":\"Hello\",\"version\":\"1.0.0\"}]}\n");
+    store_mode = APPS_STORAGE_RAM;
     CHECK(line("app.list all"), "list");
     EXPECT("@app.err {\"op\":\"list\",\"message\":\"usage: app.list\"}\n");
+}
+
+/* device.health's "apps" (muse_apps_health): the record's few words and the store's mode and room. resident is null with no app loaded. */
+static void health_says_the_app_and_the_store(void) {
+    static const struct {
+        const char *id;
+        apps_state_t state;
+        uint32_t mem_kb, peak_kb;
+        apps_storage_t mode;
+        uint32_t free_kb;
+        const char *want;
+    } cases[] = {
+        {"timer", APPS_STATE_RUNNING, 180, 220, APPS_STORAGE_FLASH, 5824,
+         "{\"resident\":\"timer\",\"state\":\"running\",\"lua_kb\":180,\"peak_kb\":220,\"storage\":\"flash\",\"storage_free_kb\":5824}"},
+        {"spin", APPS_STATE_HUNG, 300, 310, APPS_STORAGE_FLASH, 5824,
+         "{\"resident\":\"spin\",\"state\":\"hung\",\"lua_kb\":300,\"peak_kb\":310,\"storage\":\"flash\",\"storage_free_kb\":5824}"},
+        {"", APPS_STATE_CRASHED, 0, 220, APPS_STORAGE_RAM, 0,
+         "{\"resident\":null,\"state\":\"crashed\",\"lua_kb\":0,\"peak_kb\":220,\"storage\":\"ram\",\"storage_free_kb\":0}"},
+        {"", APPS_STATE_STOPPED, 0, 0, APPS_STORAGE_NONE, 0,
+         "{\"resident\":null,\"state\":\"stopped\",\"lua_kb\":0,\"peak_kb\":0,\"storage\":\"none\",\"storage_free_kb\":0}"},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
+        snprintf(brief.id, sizeof brief.id, "%s", cases[i].id);
+        brief.state = cases[i].state;
+        brief.mem_kb = cases[i].mem_kb;
+        brief.peak_kb = cases[i].peak_kb;
+        store_mode = cases[i].mode;
+        store_free_kb = cases[i].free_kb;
+        cJSON *h = muse_apps_health();
+        CHECK(h != NULL, "no health");
+        char *text = cJSON_PrintUnformatted(h);
+        CHECK(text != NULL && strcmp(text, cases[i].want) == 0, "health %s instead of %s", text != NULL ? text : "(null)", cases[i].want);
+        cJSON_free(text);
+        cJSON_Delete(h);
+    }
+    store_mode = APPS_STORAGE_RAM;
+    /* Out of memory: NULL, and nothing held. */
+    cjson_refuse = 2;
+    CHECK(muse_apps_health() == NULL, "health without memory");
+    cjson_refuse = -1;
+}
+
+/* A stage that has had no put for MUSE_APPS_STAGE_IDLE_MS is freed by the app task's rounds (muse_apps_console_tick), with one log line,
+ * and a commit then finds nothing; a round before that, or one that finds the console at the stage, leaves it, and a put since starts
+ * the time again. A round before any stage was made does nothing. */
+static void an_idle_stage_is_freed(void) {
+    muse_apps_console_tick(fake_ms + MUSE_APPS_STAGE_IDLE_MS);  /* no stage was ever made: no lock yet */
+    size_t before = port_held;
+    int logs_before = logs;
+    stage_hello();
+    size_t staged = port_held;
+    CHECK(staged > before, "staged");
+    fake_ms += MUSE_APPS_STAGE_IDLE_MS - 1;
+    muse_apps_console_tick(fake_ms);
+    CHECK(port_held == staged && logs == logs_before, "a minute short of idle: left");
+    put_text("hello", "main.lua", MAIN_HELLO);  /* a put (main.lua again, from seq 0): the time starts again */
+    staged = port_held;
+    fake_ms += MUSE_APPS_STAGE_IDLE_MS - 1;
+    muse_apps_console_tick(fake_ms);
+    CHECK(port_held == staged && logs == logs_before, "idle counts from the last put: left");
+    fake_ms += 1;
+    console_holds_the_stage = true;
+    muse_apps_console_tick(fake_ms);
+    console_holds_the_stage = false;
+    CHECK(port_held == staged && logs == logs_before, "the console is at it: left for the next round");
+    muse_apps_console_tick(fake_ms);
+    CHECK(port_held == before, "freed: %zu bytes held, %zu before", port_held, before);
+    CHECK(logs == logs_before + 1 &&
+              strcmp(last_log, "W muse_apps: console: the files put for hello had no commit for 10 minutes: freed") == 0,
+          "one log line: %d, %s", logs - logs_before, last_log);
+    CHECK(line("app.commit hello"), "commit");
+    EXPECT("@app.err {\"op\":\"commit\",\"id\":\"hello\",\"message\":\"nothing is staged for hello: send its files with "
+           "app.put first\"}\n");
+    muse_apps_console_tick(fake_ms + 2 * MUSE_APPS_STAGE_IDLE_MS);  /* nothing staged: nothing to say */
+    CHECK(logs == logs_before + 1, "said once");
 }
 
 static void send_returns_the_reply(void) {
@@ -1515,6 +1691,8 @@ int main(int argc, char **argv) {
         {"launch_for_alarms_tells_the_app_task_what_came_of_it", launch_for_alarms_tells_the_app_task_what_came_of_it},
         {"status_prints_the_record", status_prints_the_record},
         {"list_shows_installed_apps", list_shows_installed_apps},
+        {"health_says_the_app_and_the_store", health_says_the_app_and_the_store},
+        {"an_idle_stage_is_freed", an_idle_stage_is_freed},
         {"send_returns_the_reply", send_returns_the_reply},
         {"foreign_and_unknown_lines", foreign_and_unknown_lines},
         {"stage_out_of_memory", stage_out_of_memory},

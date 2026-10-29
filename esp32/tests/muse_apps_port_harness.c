@@ -44,6 +44,7 @@
 #include "apps_port.h"
 #include "apps_store.h"
 #include "apps_task.h"
+#include "apps_values.h"
 #include "muse_apps_task_fakes.h"
 #include "muse_sntp.h"
 #include "muse_state.h"
@@ -319,6 +320,61 @@ int apps_alarm_list(const char *app, char names[4][24], int64_t remaining[4]) {
 
 void apps_alarm_ring_stop(void) {
     alarm_calls.stops++;
+}
+
+/* What the alarms' records read of an app's alarms (apps_values.c): the case sets them. */
+static apps_alarm_info_t listed_info[APPS_ALARMS_PER_APP];
+static int n_listed_info, info_asks;
+
+int apps_alarm_list_info(const char *app, apps_alarm_info_t out[APPS_ALARMS_PER_APP]) {
+    (void)app;
+    info_asks++;
+    memcpy(out, listed_info, sizeof listed_info);
+    return n_listed_info;
+}
+
+/* ---- The store of packages (apps_store.h): the mode that picks the values' backend, and the flash backend, recorded ---- */
+
+static apps_storage_t fake_mode = APPS_STORAGE_RAM;
+static bool flash_answer = true;  /* what apps_nvs says to a save */
+static char flash_app[APPS_ID_MAX + 1], flash_json[64];
+static int flash_saves, flash_loads;
+
+apps_storage_t apps_store_mode(void) {
+    return fake_mode;
+}
+
+bool apps_store_save_values(const char *id, const char *json, size_t len) {
+    flash_saves++;
+    snprintf(flash_app, sizeof flash_app, "%s", id);
+    snprintf(flash_json, sizeof flash_json, "%.*s", (int)len, json);
+    return flash_answer;
+}
+
+char *apps_store_load_values(const char *id, size_t *len) {
+    flash_loads++;
+    const char *json = strcmp(id, flash_app) == 0 ? flash_json : "{}";
+    *len = strlen(json);
+    char *copy = apps_port_realloc(NULL, *len + 1);
+    if (copy != NULL) {
+        memcpy(copy, json, *len + 1);
+    }
+    return copy;
+}
+
+static struct {
+    char app[APPS_ID_MAX + 1];
+    apps_store_alarm_t alarms[APPS_ALARMS_PER_APP];
+    int n, calls;
+    bool epochs;
+} synced;
+
+void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n, bool epochs) {
+    snprintf(synced.app, sizeof synced.app, "%s", id);
+    memcpy(synced.alarms, alarms, (size_t)n * sizeof *alarms);
+    synced.n = n;
+    synced.epochs = epochs;
+    synced.calls++;
 }
 
 void muse_voice_request_chirp(void) {
@@ -929,7 +985,7 @@ static void store_refusals(void) {
     CHECK(apps_port_store_save("clock", "{}", 2), "a save the worker refused is kept, and says true");
     CHECK(live_blocks() - before == 1 && n_pending == 0, "one block kept, nothing queued: %d blocks, %d waiting", live_blocks() - before, n_pending);
     ops_refused = false;
-    apps_store_tick(100000);  /* the worker takes it now */
+    apps_values_tick(100000);  /* the worker takes it now */
     worker_runs(1);
     CHECK(n_pending == 0 && live_blocks() - before == 1, "the worker's map holds it: %d blocks, %d waiting", live_blocks() - before, n_pending);
     before = live_blocks();  /* what the map holds isn't what the cases below count */
@@ -968,7 +1024,7 @@ static void store_refusals(void) {
     free(big);
 }
 
-/* The map keeps STORE_APPS = 16 apps. A save for an app that is there replaces it and makes it the newest saved; one for a 17th app
+/* The map keeps APPS_VALUES_RAM_APPS = 16 apps. A save for an app that is there replaces it and makes it the newest saved; one for a 17th app
  * drops the one saved longest ago (with a log line that names it, and no values), whatever was loaded since. */
 static void store_keeps_16_apps_and_drops_the_oldest_saved(void) {
     worker_answers = true;
@@ -1020,7 +1076,7 @@ static void store_load_request_is_a_small_internal_block(void) {
 }
 
 /* A save the worker refuses isn't lost: the port keeps it in PSRAM, says true (it has it), reads it back to a load before the worker has it,
- * replaces it with a newer save of the app, and offers it again at the tick, APPS_STORE_RETRY_MS after the refusal and no sooner. */
+ * replaces it with a newer save of the app, and offers it again at the tick, APPS_VALUES_RETRY_MS after the refusal and no sooner. */
 static void store_a_save_the_worker_refuses_is_kept(void) {
     worker_answers = false;
     clock_at_ms(10000);
@@ -1035,22 +1091,22 @@ static void store_a_save_the_worker_refuses_is_kept(void) {
     CHECK(live_blocks() - before == 1, "it took the place of the first: %d blocks", live_blocks() - before);
     expect_load("clock", "{\"a\":2}", "the newer is what is kept");
     calls = submit_calls;
-    apps_store_tick(11999);
+    apps_values_tick(11999);
     CHECK(submit_calls == calls, "offered again before the retry time: %d submits", submit_calls - calls);
-    apps_store_tick(12000);
+    apps_values_tick(12000);
     CHECK(submit_calls - calls == 1 && n_pending == 0 && live_blocks() - before == 1, "offered at 12000 and refused again: %d submits, %d blocks",
           submit_calls - calls, live_blocks() - before);
     calls = submit_calls;
-    apps_store_tick(13999);
+    apps_values_tick(13999);
     CHECK(submit_calls == calls, "offered 1999 ms after the second refusal: %d submits", submit_calls - calls);
     ops_refused = false;
-    apps_store_tick(14000);
+    apps_values_tick(14000);
     CHECK(submit_calls - calls == 1 && n_pending == 1, "offered at 14000 and taken: %d submits, %d queued", submit_calls - calls, n_pending);
     worker_answers = true;
     worker_runs(1);
     CHECK(n_pending == 0 && live_blocks() - before == 1, "the worker has it, and the port keeps nothing: %d blocks", live_blocks() - before);
     calls = submit_calls;
-    apps_store_tick(99999);
+    apps_values_tick(99999);
     CHECK(submit_calls == calls, "nothing is kept: no submit at the tick");
     expect_load("clock", "{\"a\":2}", "the worker's map has the newer");
     CHECK(n_logged == 0, "%d lines logged for what was kept", n_logged);
@@ -1074,14 +1130,14 @@ static void store_kept_saves_are_one_for_each_app_and_bounded(void) {
     CHECK(apps_port_store_save("app03", "{\"n\":33}", 8) && live_blocks() - before == 16, "a second save of an app takes its place");
     CHECK(live_blocks() - before == 16, "%d blocks kept after the 17th was refused", live_blocks() - before);
     ops_refused = false;
-    apps_store_tick(12000);
+    apps_values_tick(12000);
     CHECK(n_pending == APPS_IO_OPS, "a tick offers them until the ring is full: %d queued of %d", n_pending, APPS_IO_OPS);
     worker_answers = true;
     worker_runs(1 << 20);
     CHECK(n_pending == 0, "the worker ran them");
-    apps_store_tick(12001);
-    CHECK(n_pending == 0, "the next offer waits for its time (%d ms): %d queued", APPS_STORE_RETRY_MS, n_pending);
-    apps_store_tick(14000);
+    apps_values_tick(12001);
+    CHECK(n_pending == 0, "the next offer waits for its time (%d ms): %d queued", APPS_VALUES_RETRY_MS, n_pending);
+    apps_values_tick(14000);
     CHECK(n_pending == 8, "the rest are offered at the next: %d queued", n_pending);
     worker_runs(1 << 20);
     expect_load("app00", "{\"n\":0}", "the first");
@@ -1102,7 +1158,7 @@ static void store_a_kept_save_comes_after_the_one_the_worker_took(void) {
     worker_runs(1);  /* the worker applies the first */
     expect_load("clock", "{\"n\":2}", "a load between them is given the kept one");
     ops_refused = false;
-    apps_store_tick(12000);
+    apps_values_tick(12000);
     worker_runs(1);
     worker_answers = true;
     expect_load("clock", "{\"n\":2}", "the later is the object");
@@ -1130,6 +1186,136 @@ static void store_load_begins_the_call_again(void) {
     CHECK(restamps == 1, "%d restarts for a load that was refused", restamps);
     ops_refused = false;
     n_logged = 0;
+}
+
+/* ---- Task 20: the flash backend, its failures, the alarms' records ---- */
+
+/* On a gadget with the apps partition (the store's mode FLASH) the same ops write and read apps_nvs (apps_store_save_values,
+ * apps_store_load_values) instead of the RAM map: in the order of the calls, a load after the save it follows, and nothing kept in RAM. */
+static void values_go_to_apps_nvs_on_flash(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    worker_answers = true;
+    int before = live_blocks();
+    CHECK(apps_port_store_save("timer", "{\"s\":420}", 9), "queued");
+    CHECK(n_pending == 1 && flash_saves == 0, "the save waits for the worker");
+    worker_runs(1);
+    CHECK(flash_saves == 1 && strcmp(flash_app, "timer") == 0 && strcmp(flash_json, "{\"s\":420}") == 0, "written: %s %s", flash_app,
+          flash_json);
+    CHECK(live_blocks() == before, "nothing is kept in RAM: %d blocks", live_blocks() - before);
+    expect_load("timer", "{\"s\":420}", "read back from apps_nvs");
+    CHECK(flash_loads == 1, "one read");
+    expect_load("clock", "{}", "an app with nothing");
+    CHECK(live_blocks() == before && n_logged == 0, "%d blocks, %d lines", live_blocks() - before, n_logged);
+}
+
+/* apps_nvs full (or a write error): the save isn't offered again, and the failure is said once a streak: apps_values_take_failure
+ * hands the app over once, a second failure says nothing more, a success ends the streak and the next failure is said again. The
+ * gadget's log has one line for each failure, with no values. */
+static void a_backend_failure_is_said_once_a_streak(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    worker_answers = true;
+    char app[APPS_ID_MAX + 1] = "";
+    CHECK(!apps_values_take_failure(app, sizeof app), "nothing to say yet");
+    flash_answer = false;
+    CHECK(apps_port_store_save("timer", "{\"a\":1}", 7), "taken (the failure is the backend's, not a refusal)");
+    worker_runs(1);
+    CHECK(apps_values_take_failure(app, sizeof app) && strcmp(app, "timer") == 0, "said, for timer: '%s'", app);
+    CHECK(!apps_values_take_failure(app, sizeof app), "once");
+    CHECK(apps_port_store_save("timer", "{\"a\":2}", 7), "taken again");
+    worker_runs(1);
+    CHECK(!apps_values_take_failure(app, sizeof app), "the streak goes on: nothing more to say");
+    int calls = submit_calls;
+    apps_values_tick(1 << 30);
+    CHECK(submit_calls == calls, "a failed save isn't offered again");
+    flash_answer = true;
+    CHECK(apps_port_store_save("timer", "{\"a\":3}", 7), "a save that succeeds");
+    worker_runs(1);
+    CHECK(!apps_values_take_failure(app, sizeof app), "nothing to say: the streak is over");
+    flash_answer = false;
+    CHECK(apps_port_store_save("clock", "{\"b\":1}", 7), "another failure");
+    worker_runs(1);
+    CHECK(apps_values_take_failure(app, sizeof app) && strcmp(app, "clock") == 0, "said again, for clock: '%s'", app);
+    CHECK(n_logged == 3 && strstr(logged[0], "store: apps_nvs refused 7 bytes of values for timer") != NULL &&
+              strstr(logged[2], "for clock") != NULL,
+          "%d lines: '%s'", n_logged, n_logged > 0 ? logged[0] : "");
+    flash_answer = true;
+    n_logged = 0;
+}
+
+/* An arming or a cancel marks the app (apps_port_alarm_arm, apps_port_alarm_cancel); APPS_VALUES_ALARM_DELAY_MS after the first mark a
+ * tick reads what the table has of the app and hands the worker one op, which syncs the records: each alarm with the time it fires (the
+ * clock now and the time left), or without times when the clock isn't valid. A burst of changes is one op; a refused op is asked again
+ * APPS_VALUES_RETRY_MS later; RAM mode drops the marks, with no op. */
+static void alarm_records_follow_the_table(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    worker_answers = true;
+    clock_at_ms(10000);
+    clock_is_set = true;
+    alarm_calls.answer = APPS_ALARM_ARMED;
+    n_listed_info = 1;
+    snprintf(listed_info[0].name, sizeof listed_info[0].name, "done");
+    listed_info[0].remaining_ms = 120000;
+    listed_info[0].sound = listed_info[0].wake = true;
+    int before = live_blocks();
+    (void)apps_port_alarm_arm("timer", "done", 120000, true, true);
+    apps_port_alarm_cancel("timer", "old");
+    (void)apps_port_alarm_arm("timer", "done", 120000, true, true);
+    apps_values_tick(10999);
+    CHECK(n_pending == 0 && info_asks == 0, "nothing before the delay: %d ops", n_pending);
+    int64_t epoch_now = 0;
+    CHECK(apps_port_epoch_ms(&epoch_now), "the clock is valid");
+    apps_values_tick(11000);
+    CHECK(n_pending == 1 && info_asks == 1, "one op for the burst: %d ops, %d asks", n_pending, info_asks);
+    worker_runs(1);
+    CHECK(synced.calls == 1 && strcmp(synced.app, "timer") == 0 && synced.n == 1 && synced.epochs &&
+              strcmp(synced.alarms[0].name, "done") == 0 && synced.alarms[0].epoch_ms == epoch_now + 120000 && synced.alarms[0].sound &&
+              synced.alarms[0].wake,
+          "synced %s: %d alarms, epochs %d, %s at %lld (now %lld)", synced.app, synced.n, synced.epochs, synced.alarms[0].name,
+          (long long)synced.alarms[0].epoch_ms, (long long)epoch_now);
+    CHECK(live_blocks() == before, "%d blocks held", live_blocks() - before);
+    apps_values_tick(20000);
+    CHECK(n_pending == 0, "nothing more without a change");
+    /* Without a valid clock: the same op, without times. */
+    clock_is_set = false;
+    apps_port_alarm_cancel("timer", "done");
+    n_listed_info = 0;
+    apps_values_tick(21000);
+    worker_runs(1);
+    CHECK(synced.calls == 2 && synced.n == 0 && !synced.epochs, "the cancel synced: %d alarms, epochs %d", synced.n, synced.epochs);
+    /* A refusal: asked again 2 s later. */
+    apps_port_alarm_cancel("timer", "x");
+    ops_refused = true;
+    apps_values_tick(30000);
+    CHECK(n_pending == 0 && live_blocks() == before, "refused: nothing queued or held");
+    ops_refused = false;
+    apps_values_tick(30000 + APPS_VALUES_RETRY_MS - 1);
+    CHECK(n_pending == 0, "not before the retry");
+    apps_values_tick(30000 + APPS_VALUES_RETRY_MS);
+    CHECK(n_pending == 1, "asked again");
+    worker_runs(1);
+    /* RAM mode: nothing outlives a reset, so no op. */
+    fake_mode = APPS_STORAGE_RAM;
+    (void)apps_port_alarm_arm("timer", "done", 1000, false, false);
+    apps_values_tick(60000);
+    CHECK(n_pending == 0 && synced.calls == 3, "RAM mode: no op");
+    fake_mode = APPS_STORAGE_FLASH;
+    apps_values_tick(70000);
+    CHECK(n_pending == 0, "and the mark is gone");
+}
+
+/* RAM mode's remove forgets the app's values (apps_values_forget, the worker's): its load reads {} again, and another app's stay. */
+static void the_ram_map_forgets_a_removed_app(void) {
+    worker_answers = true;
+    int before = live_blocks();
+    CHECK(apps_port_store_save("timer", "{\"a\":1}", 7) && apps_port_store_save("clock", "{\"b\":2}", 7), "saved");
+    worker_runs(2);
+    CHECK(live_blocks() - before == 2, "two nodes");
+    apps_values_forget("timer");
+    CHECK(live_blocks() - before == 1, "timer's node went");
+    expect_load("timer", "{}", "forgotten");
+    expect_load("clock", "{\"b\":2}", "the other's stays");
+    apps_values_forget("nobody");
+    CHECK(live_blocks() - before == 1, "forgetting an app with nothing changes nothing");
 }
 
 /* sys.battery()'s numbers are muse_state's, a percentage clamped to 0 to 100 and -1 for none. sys.wifi() is connected only when the
@@ -1211,6 +1397,10 @@ static const struct {
     {"store_load_begins_the_call_again", store_load_begins_the_call_again},
     {"battery_and_wifi_are_the_systems", battery_and_wifi_are_the_systems},
     {"show_keep_awake_and_exit_go_to_the_app_task", show_keep_awake_and_exit_go_to_the_app_task},
+    {"values_go_to_apps_nvs_on_flash", values_go_to_apps_nvs_on_flash},
+    {"a_backend_failure_is_said_once_a_streak", a_backend_failure_is_said_once_a_streak},
+    {"alarm_records_follow_the_table", alarm_records_follow_the_table},
+    {"the_ram_map_forgets_a_removed_app", the_ram_map_forgets_a_removed_app},
 };
 
 int main(int argc, char **argv) {

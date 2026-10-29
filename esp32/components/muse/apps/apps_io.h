@@ -64,6 +64,11 @@
  * anything can submit; a submit before it, or after it failed, is refused. */
 void apps_io_init(void);
 
+/* fn runs on the worker once, before the first job or op that comes after this call: the store's mount (apps_store.h), so that
+ * whatever is submitted first (the boot's mount job, an install, a launch, a values' op) finds the store mounted. muse_apps_start()
+ * sets it before anything can submit. A worker that idles out and is made again doesn't run it again. */
+void apps_io_set_first(void (*fn)(void));
+
 /*
  * Queues fn(arg) for the worker, making the worker if there is none. Any task, the worker's own jobs included; it
  * never waits for another task's progress. True once the job is queued: fn(arg) then runs exactly once, on the worker.

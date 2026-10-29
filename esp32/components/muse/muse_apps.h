@@ -27,6 +27,7 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -46,7 +47,8 @@ esp_err_t muse_apps_start(void);
  * keeps its frames small and never waits long: an install or a launch is a job for the I/O worker, which prints the
  * result. Every reply is one line: "@app.ack <path> <seq>", "@app {...}" or "@app.err {...}" (valid JSON).
  *   app.put <id> <path> <seq> <base64>   a piece of a file: seq 0 starts it again, each later one is the last + 1
- *   app.commit <id> [run]                installs what was put (apps_install.h), in RAM, and runs it with "run"
+ *   app.commit <id> [run]                installs what was put (apps_install.h) in the store (apps_store.h: the apps
+ *                                        partition, or RAM on a gadget without one), and runs it with "run"
  *   app.launch <id>                      runs an installed app in front
  *   app.stop                             stops the app that runs
  *   app.status                           the app task's record
@@ -54,6 +56,12 @@ esp_err_t muse_apps_start(void);
  *   app.send <id> <event> [json]         message(event, data) to the app that runs, and its reply
  */
 bool muse_apps_console(const char *line);
+
+/* The console's stage (the files app.put sent, waiting for app.commit) is freed once it has had no put for this long, with one log
+ * line: a sender that stopped half-way would otherwise hold up to 2 MB of PSRAM until the next put for another id or a commit. The app
+ * task's housekeeping calls muse_apps_console_tick each round; it never waits (a console that holds the stage keeps it). */
+#define MUSE_APPS_STAGE_IDLE_MS 600000
+void muse_apps_console_tick(int64_t now_ms);
 
 /*
  * Launches the installed app id, from any task, the LVGL task included: it queues app.launch's job on the I/O worker
@@ -102,5 +110,19 @@ bool muse_apps_front(void);
 /* Any task: the app layer is in front or a card (the launcher, a crash card) is shown, as of the LVGL task's last
  * frame or change. The watch yields to it (muse_ui_clock_showing). */
 bool muse_apps_covering(void);
+
+/*
+ * device.health's "apps" (main/noise_control.cpp), any task: {"resident":<id>|null,"state":"running"|"stopped"|"crashed"|"hung",
+ * "lua_kb":N,"peak_kb":N,"storage":"flash"|"ram"|"none","storage_free_kb":N}. resident is the app that is loaded (running, or
+ * stuck in a call), null otherwise; state and peak_kb are the app task's record (the last app's, once it has ended), lua_kb its Lua
+ * heap now (0 with none loaded); storage is the store's mode ("none" until the mount has run, with storage_free_kb 0). The caller
+ * owns the object (cJSON_Delete); NULL without memory. cJSON's struct, declared here so that this header needs none of cJSON's.
+ */
+struct cJSON;
+struct cJSON *muse_apps_health(void);
+
+/* The heartbeat's " apps=<resident>/<state> lua=<KB>K" (main/app.c), any task: resident, state and lua_kb as above (resident "" for
+ * none, state its name). */
+void muse_apps_brief(char *resident, size_t cap, const char **state, unsigned *lua_kb);
 
 #endif

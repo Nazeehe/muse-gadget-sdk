@@ -22,3 +22,5 @@
 
 esp_err_t nvs_flash_init(void);
 esp_err_t nvs_flash_init_partition(const char *part_name);
+esp_err_t nvs_flash_erase(void);
+esp_err_t nvs_flash_erase_partition(const char *part_name);

@@ -750,6 +750,32 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertRegex(c_function(port, "bool apps_port_dark(void)"), r"return muse_ui_dark\(\);")
         self.assertNotIn("EPOCH_2025", port)
 
+    def test_the_store_health_and_heartbeat_are_wired(self):  # Task 20
+        # The I/O worker mounts the store before its first job or op: set as the worker is made ready (muse_apps_start), before
+        # anything can submit.
+        task = strip_c_comments((MUSE / "apps/apps_task.c").read_text())
+        self.assertRegex(c_function(task, "esp_err_t muse_apps_start(void)"),
+                         r"apps_io_init\(\);\s*apps_io_set_first\(apps_store_mount_once\);")
+        # The port marks an app whose alarms change, after the change: its records follow (apps_values.h).
+        port = strip_c_comments((MUSE / "apps/apps_port_idf.c").read_text())
+        self.assertRegex(c_function(port, "apps_alarm_result_t apps_port_alarm_arm("),
+                         r"apps_alarm_arm\([^;]*;\s*apps_values_alarms_changed\(app\);")
+        self.assertRegex(c_function(port, "void apps_port_alarm_cancel("),
+                         r"apps_alarm_cancel\(app, name\);\s*apps_values_alarms_changed\(app\);")
+        # device.health's "apps" and the heartbeat's " apps=<resident>/<state> lua=<KB>K": only in a build with the apps.
+        health = (ROOT / "main/noise_control.cpp").read_text()
+        for needle in ('#include "muse_apps.h"', "muse_apps_health()", 'cJSON_AddItemToObject(health, "apps", apps);'):
+            with self.subTest(needle):
+                self.assertEqual(health.count(needle), 1)
+                self.assertIn("if CONFIG_MUSE_APPS", open_conditions(health, health.index(needle)))
+        self.assertLess(health.index('"version"'), health.index('"apps"'), "after the version, in send_device_health")
+        app = (ROOT / "main/app.c").read_text()
+        for needle in ('#include "muse_apps.h"', "muse_apps_brief(", '" apps=%s/%s lua=%uK"'):
+            with self.subTest(needle):
+                self.assertEqual(app.count(needle), 1)
+                self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, app.index(needle)))
+        self.assertIn('psram=%uK%s "', app)
+
 
 if __name__ == "__main__":
     unittest.main()

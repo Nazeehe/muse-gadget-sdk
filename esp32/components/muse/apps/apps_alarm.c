@@ -127,6 +127,10 @@ static EXT_RAM_BSS_ATTR char s_ring_told[APPS_ID_MAX + 1];  /* the app last told
 
 static EXT_RAM_BSS_ATTR budget_t s_budget[BUDGET_APPS];
 
+/* The apps cancel_app_locked emptied since the app task last took them (apps_alarm_take_cancelled), each once: under the lock. */
+static EXT_RAM_BSS_ATTR char s_cancelled[APPS_ALARMS_MAX][APPS_ID_MAX + 1];
+static int s_cancelled_n;
+
 static EXT_RAM_BSS_ATTR entry_t s_journal[JOURNAL_LEN];
 static unsigned s_j_head;
 static atomic_uint s_j_count;   /* the lines waiting: changed under the lock, read without it (the drain's quick look) */
@@ -371,6 +375,18 @@ static int collect(const slot_t **out, int max, const char *app, bool fired_only
     return n;
 }
 
+/* app is one whose alarms were cancelled (its records follow): noted once, among the first APPS_ALARMS_MAX. */
+static void note_cancelled_locked(const char *app) {
+    for (int i = 0; i < s_cancelled_n; i++) {
+        if (strcmp(s_cancelled[i], app) == 0) {
+            return;
+        }
+    }
+    if (s_cancelled_n < APPS_ALARMS_MAX) {
+        snprintf(s_cancelled[s_cancelled_n++], sizeof s_cancelled[0], "%s", app);
+    }
+}
+
 /* Disarms every alarm of app and drops every firing of it that waits; how many slots that freed. */
 static int cancel_app_locked(const char *app) {
     int n = 0;
@@ -384,6 +400,9 @@ static int cancel_app_locked(const char *app) {
             clear_fired(s);
             n++;
         }
+    }
+    if (n > 0) {
+        note_cancelled_locked(app);
     }
     return n;
 }
@@ -751,4 +770,39 @@ bool apps_alarm_wanted(const char *app, uint32_t upto) {
     }
     unlock();
     return wanted;
+}
+
+/* ---- The records' side ---- */
+
+int apps_alarm_list_info(const char *app, apps_alarm_info_t out[APPS_ALARMS_PER_APP]) {
+    if (!id_valid(app) || atomic_load(&s_init) != INIT_READY) {
+        return 0;
+    }
+    const slot_t *mine[APPS_ALARMS_PER_APP];
+    lock();
+    int64_t now_us = esp_timer_get_time();
+    int n = collect(mine, APPS_ALARMS_PER_APP, app, false);
+    for (int i = 0; i < n; i++) {
+        snprintf(out[i].name, sizeof out[i].name, "%s", mine[i]->name);
+        out[i].remaining_ms = left_ms(mine[i], now_us);
+        out[i].sound = mine[i]->used ? mine[i]->sound : mine[i]->fired_sound;
+        out[i].wake = mine[i]->used ? mine[i]->wake : mine[i]->fired_wake;
+    }
+    unlock();
+    return n;
+}
+
+int apps_alarm_take_cancelled(char ids[][APPS_ID_MAX + 1], int max) {
+    if (atomic_load(&s_init) != INIT_READY || max <= 0) {
+        return 0;
+    }
+    lock();
+    int n = s_cancelled_n < max ? s_cancelled_n : max;
+    for (int i = 0; i < n; i++) {
+        memcpy(ids[i], s_cancelled[i], sizeof s_cancelled[i]);  /* the same size, NUL within */
+    }
+    memmove(&s_cancelled[0], &s_cancelled[n], (size_t)(s_cancelled_n - n) * sizeof s_cancelled[0]);
+    s_cancelled_n -= n;
+    unlock();
+    return n;
 }

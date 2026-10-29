@@ -59,6 +59,7 @@ static job_t s_ops[APPS_IO_OPS];  /* under s_lock: the ops waiting, a ring from 
 static unsigned s_ops_head, s_ops_n;
 static bool s_ops_nudged;         /* under s_lock: a drain job is queued, and has not looked yet */
 static TaskHandle_t s_op_task;    /* the task that submits ops: set by it, before it submits any */
+static void (*s_first)(void);     /* under s_lock: the step a new worker runs once, before anything else (apps_io_set_first) */
 
 /* Runs the ops that are waiting, in order. The worker's thread alone calls it, and no lock is held while an op runs. */
 static void drain_ops(void) {
@@ -92,6 +93,14 @@ static void drain_job(void *arg) {
 static void worker(void *arg) {
     (void)arg;
     bool ran_job = false;  /* a job of its own: the drain jobs that bring it to the ops are not */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    void (*first)(void) = s_first;
+    s_first = NULL;  /* once: a worker made again later finds it done */
+    xSemaphoreGive(s_lock);
+    if (first != NULL) {
+        first();  /* before any job or op: they were queued for a worker that does this first */
+        ran_job = true;
+    }
     for (;;) {
         job_t job;
         if (xQueueReceive(s_jobs, &job, pdMS_TO_TICKS(APPS_IO_IDLE_MS)) == pdTRUE) {
@@ -121,6 +130,15 @@ static void worker(void *arg) {
 
 void apps_io_register_op_task(void) {
     s_op_task = xTaskGetCurrentTaskHandle();
+}
+
+void apps_io_set_first(void (*fn)(void)) {
+    if (s_lock == NULL) {
+        return;  /* apps_io_init first */
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_first = fn;
+    xSemaphoreGive(s_lock);
 }
 
 void apps_io_init(void) {

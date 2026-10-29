@@ -68,7 +68,7 @@ class AppPortTest(unittest.TestCase):
         cls.addClassCleanup(tmp.cleanup)
         cls.tmp = tmp.name
         stage = stage_fakes(Path(tmp.name) / "fake_headers")
-        cls.harness = apps_host.build("muse_apps_port_harness", [HARNESS, APPS / "apps_port_idf.c", APPS / "apps_store_ram.c"], tmp.name,
+        cls.harness = apps_host.build("muse_apps_port_harness", [HARNESS, APPS / "apps_port_idf.c", APPS / "apps_values.c"], tmp.name,
                                       include_dirs=[APPS, MUSE, stage, TESTS])
 
     def run_case(self, case, timeout=60):
@@ -146,6 +146,20 @@ class AppPortTest(unittest.TestCase):
 
     def test_show_keep_awake_and_exit_are_the_app_tasks(self):  # C10, C11
         self.run_case("show_keep_awake_and_exit_go_to_the_app_task")
+
+    # ---- Task 20: the values' backend picked by the store's mode, its failures, the alarms' records ----
+
+    def test_values_go_to_apps_nvs_on_flash(self):
+        self.run_case("values_go_to_apps_nvs_on_flash")
+
+    def test_a_backend_failure_is_said_once_a_streak(self):  # the ruling: logged once per streak, not retried every 2 s
+        self.run_case("a_backend_failure_is_said_once_a_streak")
+
+    def test_alarm_records_follow_the_table(self):  # the ruling: queued, done after the call, and never from the esp_timer task
+        self.run_case("alarm_records_follow_the_table")
+
+    def test_the_ram_map_forgets_a_removed_app(self):
+        self.run_case("the_ram_map_forgets_a_removed_app")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

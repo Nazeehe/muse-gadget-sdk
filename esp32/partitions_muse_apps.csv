@@ -1,0 +1,33 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Name,    Type, SubType, Offset,   Size,    Flags
+# Muse apps builds (devices/sdkconfig.muse-apps) on boards with the full UI (16 MB+
+# flash): partitions_muse.csv as it is, entry for entry, so nothing moves (the
+# pairing's nvs stays at 0x11000 and the app slots where they were), and two
+# entries after them for the apps (components/muse/apps/apps_store.h):
+#   apps      a FAT file system on wear levelling, one folder for each installed app;
+#   apps_nvs  the apps' own NVS: their saved values, their alarms' records and the
+#             quarantine (64 KB for all of them). The pairing's nvs is never touched.
+# A gadget updated over the air keeps the table it had (OTA doesn't write it) and
+# runs its apps from RAM until it is flashed over USB once.
+nvs,       data, nvs,     0x11000,  0xC000,
+otadata,   data, ota,     0x1D000,  0x2000,
+phy_init,  data, phy,     0x1F000,  0x1000,
+ota_0,     app,  ota_0,   0x20000,  4M,
+ota_1,     app,  ota_1,   0x420000, 4M,
+prod_data, data, 0x40,    0x820000, 0x1000,
+prod_bak,  data, 0x41,    0x821000, 0x1000,
+apps,      data, fat,     0x830000, 0x600000,
+apps_nvs,  data, nvs,     0xE30000, 0x10000,

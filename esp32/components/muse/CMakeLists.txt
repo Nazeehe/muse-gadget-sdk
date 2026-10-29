@@ -66,13 +66,14 @@ if(CONFIG_MUSE_ENABLED)
         # Lua mini-apps (apps/): the sandboxed Lua state, its did-you-mean helper, JSON, the package rules, the
         # runtime of one app, its services (the time, os, timer, alarm and sound modules), its widgets (the ui
         # module and the shadow table) and the LVGL task's step that draws them, the app task and the device's port,
-        # the system's alarms and their ring, the I/O worker and the store of the apps' values behind it
-        # (apps_store_ram.c: Task 20's flash backend replaces that file), the install pipeline and its RAM store,
-        # the USB console's >app.* lines, and the big digit fonts (apps/fonts/, made by tools/muse/gen_app_fonts.sh).
+        # the system's alarms and their ring, the I/O worker, the apps' values behind it (apps_values.c: apps_nvs
+        # or a map in RAM) and the store of the packages (apps_store.c: the FAT partition "apps" and apps_nvs, or
+        # RAM when the table has no apps partition), the install pipeline and its RAM store, the USB console's
+        # >app.* lines, and the big digit fonts (apps/fonts/, made by tools/muse/gen_app_fonts.sh).
         list(APPEND srcs "apps/apps_vm.c" "apps/apps_suggest.c" "apps/apps_json.c" "apps/apps_pkg.c"
             "apps/apps_rt.c" "apps/apps_svc.c" "apps/apps_ui.c" "apps/apps_lv.c" "apps/apps_task.c"
-            "apps/apps_port_idf.c" "apps/apps_alarm.c" "apps/apps_io.c" "apps/apps_store_ram.c" "apps/apps_install.c"
-            "apps/apps_console.c" "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
+            "apps/apps_port_idf.c" "apps/apps_alarm.c" "apps/apps_io.c" "apps/apps_values.c" "apps/apps_store.c"
+            "apps/apps_install.c" "apps/apps_console.c" "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
     endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
     # avatar when avatar/muse_pixel.c exists here; this avatar/ is gitignored. The
@@ -170,9 +171,10 @@ set(muse_priv_requires
     noise_core minimp3 muse_vstream tinyh264 libvpx_vp8 lua
     esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi esp_netif
     esp_driver_pcnt efuse
-    # The Sticky's microSD (CONFIG_MUSE_STICKY_SD). Requirements are resolved
-    # before Kconfig values exist, so these can't depend on it; only the code does.
-    fatfs esp_driver_sdspi sdmmc)
+    # The Sticky's microSD (CONFIG_MUSE_STICKY_SD), and the apps' FAT partition
+    # (CONFIG_MUSE_APPS: apps/apps_store.c). Requirements are resolved before
+    # Kconfig values exist, so these can't depend on them; only the code does.
+    fatfs esp_partition esp_driver_sdspi sdmmc)
 list(APPEND muse_priv_requires camera)
 
 idf_component_register(

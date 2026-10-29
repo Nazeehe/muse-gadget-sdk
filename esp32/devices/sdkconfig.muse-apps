@@ -18,3 +18,13 @@
 # (CONFIG_MUSE_CLOCK), which the other boards' overlays don't turn on, and
 # without it Kconfig drops this option.
 CONFIG_MUSE_APPS=y
+
+# The apps' storage: partitions_muse.csv plus the FAT for the apps and their own
+# NVS (apps_nvs). Writing it takes a USB flash; a build dir made before this line
+# keeps the table in its own sdkconfig until both PARTITION_TABLE_*FILENAME lines
+# there say partitions_muse_apps.csv.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_apps.csv"
+# Long file names on the FAT, their buffers on the heap and in PSRAM: ids like
+# stopwatch and paths like timer_face.lua aren't 8.3 names.
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y

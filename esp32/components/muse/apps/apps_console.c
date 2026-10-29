@@ -15,6 +15,7 @@
  */
 
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,9 +24,12 @@
 #include "apps_install.h"
 #include "apps_io.h"
 #include "apps_port.h"
+#include "apps_store.h"
 #include "apps_task.h"
 #include "cJSON.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "muse_apps.h"
 
 /*
@@ -37,7 +41,9 @@
  * Who owns what. The stage (the files put for one id, in PSRAM) is the serial task's, until a commit moves it into its
  * job; the job, on the I/O worker, reads the files out of it (taking each one's bytes), runs the install pipeline and
  * frees what is left. The stage's blocks hold at most STAGE_SLACK bytes beyond what was put, so it is never much more
- * than the 2 MB an app may be. The RAM store is the worker's (apps_install.h), so a launch and the list are jobs too.
+ * than the 2 MB an app may be, and a stage that has had no put for MUSE_APPS_STAGE_IDLE_MS is freed by the app task's
+ * rounds (muse_apps_console_tick): the stage's lock, which the serial task makes before its first stage and holds while
+ * it touches one, keeps the two apart. The store is the worker's (apps_store.h), so a launch and the list are jobs too.
  * Stop, status and send wait on the serial task, each bounded by the app task's own waits (APPS_TASK_WAIT_MS). The
  * launch job is also muse_apps_launch's, for any task (the launcher's pick comes through apps_task_launch): that one
  * runs the app where it was asked to, with no settle, by id (apps_task_run_by_id: an app of that id that runs by then
@@ -81,7 +87,24 @@ typedef struct {
 } job_t;
 
 static const char *TAG = "muse_apps";
-static stage_t *s_stage;  /* the serial task's */
+static stage_t *s_stage;  /* under the stage's lock: the serial task's, and the app task's to free once it is idle */
+static int64_t s_stage_at;  /* under the stage's lock: the last put's time */
+static StaticSemaphore_t s_stage_lock_buf;
+static _Atomic(SemaphoreHandle_t) s_stage_lock;  /* made by the serial task before its first stage */
+
+/* The stage's lock: the serial task's, held while it touches the stage. */
+static void stage_take(void) {
+    SemaphoreHandle_t lock = atomic_load(&s_stage_lock);
+    if (lock == NULL) {
+        lock = xSemaphoreCreateMutexStatic(&s_stage_lock_buf);  /* the serial task alone makes it: nothing else can */
+        atomic_store(&s_stage_lock, lock);
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+}
+
+static void stage_give(void) {
+    xSemaphoreGive(atomic_load(&s_stage_lock));
+}
 
 /* ---- Replies ---- */
 
@@ -385,6 +408,8 @@ static bool stage_read(void *ctx, const char *rel, size_t max, int64_t deadline_
 
 /* ---- The commands ---- */
 
+static void put_staged(const char *id, const char *path, apps_file_kind_t kind, unsigned seq, const char *b64, size_t n);
+
 static void put(const char *args) {
     const char *at = args;
     word_t id_w = next_word(&at), path_w = next_word(&at), seq_w = next_word(&at);
@@ -421,6 +446,14 @@ static void put(const char *args) {
         fail("put", NULL, path, "bad base64: %u characters isn't a multiple of 4", (unsigned)n);
         return;
     }
+    stage_take();
+    put_staged(id, path, kind, seq, b64, n);
+    stage_give();
+}
+
+/* The stage part of a put (the stage's lock held): the piece goes into the file, or the refusal is said. */
+static void put_staged(const char *id, const char *path, apps_file_kind_t kind, unsigned seq, const char *b64, size_t n) {
+    s_stage_at = apps_port_mono_ms();
     if (s_stage == NULL || strcmp(s_stage->id, id) != 0) {
         stage_free(s_stage);  /* a new id: the old stage goes */
         s_stage = apps_port_realloc(NULL, sizeof *s_stage);
@@ -491,12 +524,12 @@ static bool install_run(apps_pkg_t *p, int settle_ms, apps_status_t *st, char *e
     return apps_task_run(p, true, settle_ms, st, err, n);  /* C2: an install with a run fronts the app */
 }
 
-static const char *ram_storage(void) {
-    return "ram";
+static const char *store_storage(void) {
+    return apps_storage_name(apps_store_mode());
 }
 
-/* Until Task 20's store, a package stays in PSRAM (apps_install.h's RAM store). */
-static const apps_install_ops_t USB_OPS = {apps_task_compile, apps_ram_commit, install_run, ram_storage};
+/* The store keeps the package (apps_store.h): on the apps partition, or in PSRAM on a gadget without one. */
+static const apps_install_ops_t USB_OPS = {apps_task_compile, apps_store_commit, install_run, store_storage};
 
 static void commit_job(void *arg) {
     job_t *job = arg;
@@ -508,6 +541,8 @@ static void commit_job(void *arg) {
     cJSON_Delete(r);
     apps_port_free(job);
 }
+
+static void commit_staged(const char *id, bool run);
 
 static void commit(const char *args) {
     const char *at = args;
@@ -526,6 +561,13 @@ static void commit(const char *args) {
         fail("commit", id, NULL, APPS_INSTALL_BUSY);
         return;
     }
+    stage_take();
+    commit_staged(id, run_w.n > 0);
+    stage_give();
+}
+
+/* The stage part of a commit (the stage's lock held): the stage goes into the job, or the refusal is said. */
+static void commit_staged(const char *id, bool run) {
     bool staged = false;
     if (s_stage != NULL && strcmp(s_stage->id, id) == 0) {
         for (int i = 0; i < STAGE_FILES; i++) {
@@ -545,11 +587,12 @@ static void commit(const char *args) {
     }
     memset(job, 0, sizeof *job);
     snprintf(job->id, sizeof job->id, "%s", id);
-    job->run = run_w.n > 0;
+    job->run = run;
     job->stage = s_stage;
     s_stage = NULL;  /* the job's from here: a put after this starts a new stage */
     if (!apps_io_submit(commit_job, job)) {
         s_stage = job->stage;  /* kept for another try */
+        s_stage_at = apps_port_mono_ms();
         apps_port_free(job);
         apps_install_end();
         fail("commit", id, NULL, APPS_IO_REFUSED);
@@ -570,7 +613,7 @@ static void launch_job(void *arg) {
     }
     apps_pkg_t *pkg = apps_port_realloc(NULL, sizeof *pkg);
     snprintf(job->why, sizeof job->why, "out of memory: no room to load the app");
-    if (pkg != NULL && apps_ram_load(job->id, pkg, job->why, sizeof job->why)) {
+    if (pkg != NULL && apps_store_load(job->id, pkg, job->why, sizeof job->why)) {
         if (job->print) {
             cJSON *r = apps_install_launch(pkg, &USB_OPS);  /* it takes the copy: the app task frees it */
             print_result("launch", job->id, r);
@@ -596,7 +639,7 @@ static void launch_job(void *arg) {
             ESP_LOGW(TAG, "launch %s: %s", job->id, job->why);
         }
         if (job->alarm_upto != 0) {  /* the alarms that fired for it are given up on: the store has no such app, or it can't be loaded now */
-            apps_task_alarm_launch_result(job->alarm_upto, apps_ram_has(job->id) ? APPS_ALARM_LAUNCH_FAILED : APPS_ALARM_LAUNCH_MISSING);
+            apps_task_alarm_launch_result(job->alarm_upto, apps_store_has(job->id) ? APPS_ALARM_LAUNCH_FAILED : APPS_ALARM_LAUNCH_MISSING);
         }
     }
     apps_port_free(job);
@@ -699,14 +742,24 @@ static void status(const char *args) {
     cJSON_Delete(r);
 }
 
+/* The store's apps, most recent first, each with its manifest's version (apps_store_manifest, D26), and where the store keeps them;
+ * in RAM mode with the hint. */
+typedef struct {
+    char ids[APPS_STORE_APPS_MAX][APPS_ID_MAX + 1];
+    char names[APPS_STORE_APPS_MAX][25];
+    apps_manifest_t m;
+} list_t;
+
 static void list_job(void *arg) {
     (void)arg;
-    apps_ram_entry_t *e = apps_port_realloc(NULL, APPS_RAM_APPS * sizeof *e);
-    int n = e != NULL ? apps_ram_list(e, APPS_RAM_APPS) : 0;
-    cJSON *r = e != NULL ? cJSON_CreateObject() : NULL;
-    cJSON *apps = r != NULL && cJSON_AddStringToObject(r, "storage", "ram") != NULL ? cJSON_AddArrayToObject(r, "apps")
-                                                                                   : NULL;
-    bool ok = apps != NULL;
+    list_t *l = apps_port_realloc(NULL, sizeof *l);  /* a few KB: never on the worker's stack */
+    int n = l != NULL ? apps_store_list(l->ids, l->names, APPS_STORE_APPS_MAX) : 0;
+    apps_storage_t mode = apps_store_mode();
+    cJSON *r = l != NULL ? cJSON_CreateObject() : NULL;
+    bool ok = r != NULL && cJSON_AddStringToObject(r, "storage", apps_storage_name(mode)) != NULL &&
+              (mode != APPS_STORAGE_RAM || cJSON_AddStringToObject(r, "hint", APPS_RAM_HINT) != NULL);
+    cJSON *apps = ok ? cJSON_AddArrayToObject(r, "apps") : NULL;
+    ok = apps != NULL;
     for (int i = 0; ok && i < n; i++) {
         cJSON *a = cJSON_CreateObject();
         if (a == NULL || !cJSON_AddItemToArray(apps, a)) {
@@ -714,12 +767,14 @@ static void list_job(void *arg) {
             ok = false;
             break;
         }
-        ok = cJSON_AddStringToObject(a, "id", e[i].id) != NULL && cJSON_AddStringToObject(a, "name", e[i].name) != NULL &&
-             cJSON_AddStringToObject(a, "version", e[i].version) != NULL;
+        bool known = apps_store_manifest(l->ids[i], &l->m);
+        ok = cJSON_AddStringToObject(a, "id", l->ids[i]) != NULL && cJSON_AddStringToObject(a, "name", l->names[i]) != NULL &&
+             cJSON_AddStringToObject(a, "version", known ? l->m.version : "") != NULL;
+        apps_manifest_clear(&l->m, apps_port_free);
     }
     print_result("list", NULL, ok ? r : NULL);
     cJSON_Delete(r);
-    apps_port_free(e);
+    apps_port_free(l);
 }
 
 static void list(const char *args) {
@@ -767,6 +822,41 @@ static void send(const char *args) {
     apps_port_free(reply);
     apps_port_free(err);
     apps_port_free(event);
+}
+
+void muse_apps_console_tick(int64_t now_ms) {
+    SemaphoreHandle_t lock = atomic_load(&s_stage_lock);
+    if (lock == NULL || xSemaphoreTake(lock, 0) != pdTRUE) {
+        return;  /* no stage was ever made, or the console is at it: next round */
+    }
+    if (s_stage != NULL && now_ms - s_stage_at >= MUSE_APPS_STAGE_IDLE_MS) {
+        ESP_LOGW(TAG, "console: the files put for %s had no commit for %d minutes: freed", s_stage->id,
+                 MUSE_APPS_STAGE_IDLE_MS / 60000);
+        stage_free(s_stage);
+        s_stage = NULL;
+    }
+    xSemaphoreGive(lock);
+}
+
+cJSON *muse_apps_health(void) {
+    char id[APPS_ID_MAX + 1];
+    apps_state_t state;
+    uint32_t mem_kb, peak_kb;
+    apps_task_brief(id, sizeof id, &state, &mem_kb, &peak_kb);
+    bool resident = id[0] != '\0';  /* loaded: running, or stuck in a call */
+    apps_storage_t mode = apps_store_mode();
+    cJSON *h = cJSON_CreateObject();
+    bool ok = h != NULL &&
+              (resident ? cJSON_AddStringToObject(h, "resident", id) != NULL : cJSON_AddNullToObject(h, "resident") != NULL) &&
+              cJSON_AddStringToObject(h, "state", apps_state_name(state)) != NULL &&
+              cJSON_AddNumberToObject(h, "lua_kb", mem_kb) != NULL && cJSON_AddNumberToObject(h, "peak_kb", peak_kb) != NULL &&
+              cJSON_AddStringToObject(h, "storage", apps_storage_name(mode)) != NULL &&
+              cJSON_AddNumberToObject(h, "storage_free_kb", apps_store_free_kb()) != NULL;
+    if (!ok) {
+        cJSON_Delete(h);
+        return NULL;
+    }
+    return h;
 }
 
 bool muse_apps_console(const char *line) {

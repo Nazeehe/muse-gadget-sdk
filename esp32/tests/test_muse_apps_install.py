@@ -39,7 +39,8 @@ APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_install_harness.c"
 SOURCES = [HARNESS, APPS / "apps_install.c", APPS / "apps_pkg.c", APPS / "apps_json.c", APPS / "apps_vm.c",
-           APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_ui.c", ROOT / "tools/muse/apphost/sha256.c"]
+           APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_svc.c",
+           ROOT / "tools/muse/apphost/sha256.c"]
 SDKCONFIG = "#pragma once\n#define CONFIG_MUSE_APPS 1\n#define CONFIG_MUSE_APPS_HEAP_MAX_KB 1024\n"
 # The store logs what it drops (ESP_LOGW): the harness keeps each line.
 ESP_LOG = ("#pragma once\n"

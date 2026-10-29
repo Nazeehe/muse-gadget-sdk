@@ -17,9 +17,11 @@
 /*
  * apps_port.h on the host, for apphost (sha256.c has apps_port_sha256).
  *
- * The clock is fake and never moves: a run doesn't depend on how fast the machine is, so the VM's wall-clock
- * backstop (APPS_WALL_MS) never fires and a runaway app is stopped by its instruction budget alone, the same
- * way on every run. (A later task that needs time to pass, for timers, adds a way to move it.)
+ * The clocks are fake and move only when a script says so (apphost_advance): a run doesn't depend on how fast the machine
+ * is, and time stands still inside a call, so the VM's wall-clock backstop (APPS_WALL_MS) never fires and a runaway app is
+ * stopped by its instruction budget alone, the same way on every run. The monotonic clock starts at FAKE_MONO_MS; the wall
+ * clock is unset until a script syncs it (as on the gadget before SNTP), and then moves with the monotonic one. The
+ * screen is lit until a script says it is dark.
  *
  * The heap is malloc with a header that records each block's size, so that apphost can say how many bytes the
  * apps' heap holds (apphost_heap_held): a leak check that needs no LeakSanitizer, which macOS doesn't have.
@@ -28,7 +30,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 
 #include "apphost_port.h"
 #include "apps_port.h"
@@ -45,17 +46,38 @@ typedef union {
 static size_t held;
 static apphost_log_fn log_fn;
 
+static int64_t mono_ms = FAKE_MONO_MS;
+static bool epoch_set, screen_dark;
+static int64_t epoch_at_sync, mono_at_sync;
+
 int64_t apps_port_mono_ms(void) {
-    return FAKE_MONO_MS;
+    return mono_ms;
 }
 
 bool apps_port_epoch_ms(int64_t *out) {
-    time_t now = time(NULL);
-    if (now == (time_t)-1) {
+    if (!epoch_set) {
         return false;
     }
-    *out = (int64_t)now * 1000;
+    *out = epoch_at_sync + (mono_ms - mono_at_sync);
     return true;
+}
+
+bool apps_port_dark(void) {
+    return screen_dark;
+}
+
+void apphost_advance(int64_t ms) {
+    mono_ms += ms;
+}
+
+void apphost_sync(int64_t epoch_ms) {
+    epoch_set = true;
+    epoch_at_sync = epoch_ms;
+    mono_at_sync = mono_ms;
+}
+
+void apphost_set_dark(bool dark) {
+    screen_dark = dark;
 }
 
 static bool ui_locked;

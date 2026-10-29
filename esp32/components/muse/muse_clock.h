@@ -20,13 +20,13 @@
 
 /*
  * Pocket watch page (CONFIG_MUSE_CLOCK): an analog dial left of Muse's face.
- * The time comes from SNTP once Wi-Fi joins, in CONFIG_MUSE_CLOCK_TZ.
- * Both run in the LVGL task.
+ * The time comes from SNTP once Wi-Fi joins (muse_sntp.h), in CONFIG_MUSE_CLOCK_TZ,
+ * which muse_clock_build sets. Both run in the LVGL task.
  */
 
 /* Draws the watch into `tile`, the tileview's first tile. */
 void muse_clock_build(lv_obj_t *tile);
 
-/* Every frame: starts SNTP once Wi-Fi is up. While the watch is on screen
- * (`visible`), moves the hands when the time has changed. */
+/* Every frame: while the watch is on screen (`visible`), moves the hands when
+ * the time has changed. */
 void muse_clock_tick(bool visible);

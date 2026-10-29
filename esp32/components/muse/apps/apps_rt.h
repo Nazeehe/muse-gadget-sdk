@@ -27,8 +27,9 @@
  * handler call is one apps_vm_call, with APPS_BUDGET_START for main.lua's own top level and for start(),
  * and APPS_BUDGET_CALL for the rest.
  *
- * What the app's code is given besides the sandbox's libraries (apps_vm.h), `json` (apps_json.h) and `ui`
- * (apps_ui.h; main.lua's top level can already draw, so ui.image finds the package's images from the start):
+ * What the app's code is given besides the sandbox's libraries (apps_vm.h), `json` (apps_json.h), `ui`
+ * (apps_ui.h; main.lua's top level can already draw, so ui.image finds the package's images from the start) and
+ * `time`, `os` and `timer` (apps_svc.h; main.lua's top level can already arm a timer, which runs once start() has):
  * - print(...): the tostring of each argument, joined with tabs, as the lines of the app's log. The text
  *   is split at each "\n". In each line, a byte under 0x20 but tab, 0x7F, a C1 control character
  *   (U+0080 to U+009F) and anything that isn't valid UTF-8 (RFC 3629) become '?', one for each byte, or
@@ -87,6 +88,32 @@
  *   - the crash: last_error, when the handler was killed or the heap ran out, and also for a runtime that
  *     had crashed already. The runtime is CRASHED from then on.
  *   err is cut to err_len on a character boundary; it may be NULL.
+ *
+ * Timers. timer.after(ms, fn) and timer.every(ms, fn) arm one of at most APPS_TIMERS_MAX timers, ms from APPS_TIMER_MIN_MS
+ * to APPS_TIMER_MAX_MS, on the monotonic clock (apps_port_mono_ms: SNTP setting the wall clock moves none of them). The loop
+ * that serves the app (the app task's, apphost's `advance`) asks apps_rt_next_deadline when to come back, and runs the timers
+ * that are due, each as one apps_vm_call of APPS_BUDGET_CALL: apps_rt_run_one_timer for one, apps_rt_run_timers for a pass.
+ * - Only a RUNNING app's timers run, and none while the screen is dark (apps_port_dark): nothing is lost, the first pass after
+ *   the wake runs every timer that came due once, and an every timer's next run is a period after that pass, not the runs
+ *   that were missed. The earliest due runs first, and of two that were due together the one armed first.
+ * - A one-shot's slot is free before its callback runs, so the callback can arm another at the limit. A callback may cancel
+ *   itself, or another timer, also one that is due in the same pass (which then doesn't run). A handle that names a timer
+ *   that has fired (a one-shot) or was cancelled cancels nothing, the one that took its slot included.
+ * - Every timer is gone when stop() has returned, and when the app crashes. A callback that fails is a crash, as the failure
+ *   of any handler nobody waits for is (a widget's, show, hide, alarm): last_error is the record. Only message() fails alone,
+ *   as it has a caller to tell.
+ *
+ * The duty cycle. The VM's instructions are counted in windows of one second of the monotonic clock, over every call into the
+ * app (a callback, a handler, a message, main.lua's top level). A window of more than APPS_DUTY_INSTR_PER_S is hot, any other
+ * is cool, and a second in which the app ran nothing is cool. Windows are closed when a call begins and by every pass of the
+ * timers (apps_rt_has_work, apps_rt_run_one_timer), which the loop that serves the app makes at least once a second, so a
+ * warning and a kill come when the second ends, with or without a call to carry them.
+ * - After APPS_DUTY_THROTTLE_WINDOWS hot windows in a row the app is throttled: every timer's next run moves 100 ms later, so
+ *   does each one armed or rescheduled while it lasts, and the warning "throttled: using more than 40% of the CPU" is added to
+ *   apps_rt_warnings and to the log, once for the runtime. A cool window ends the throttle and the count.
+ * - After APPS_DUTY_KILL_WINDOWS hot windows in a row the VM is killed (apps_vm_kill) and the app has crashed, with the
+ *   reason "stopped: used more than 40% of the CPU for 5 s" as its record: at the next call into it, or at the next step of
+ *   a pass, which makes one to say so.
  *
  * Messages (the runtime's own; <main> is the manifest's main file, "main.lua" unless it says otherwise):
  *   <main> must return a table of handlers: local app = {} … return app
@@ -233,6 +260,56 @@ apps_ui_t *apps_rt_ui(apps_rt_t *rt);
  * fails crashes the app, like any other.
  */
 void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event);
+
+/* ---- Timers and the duty cycle (above) ---- */
+
+#define APPS_TIMERS_MAX 16
+#define APPS_TIMER_MIN_MS 40
+#define APPS_TIMER_MAX_MS 86400000  /* a day */
+
+/* The most instructions a window of one second may hold and not be hot: the plan's number, about 40% of 10 M a second, and
+ * Task 27 sets it from its own measurement. The 1.75C's VM runs 2.5 M a second of the cheapest instruction (a loop that only
+ * counts; Task 16 measured it on the board, with the count hook on), so until Task 27 lowers this no window on that board is
+ * hot, and the throttle and the kill don't come: 40% of 2.5 M is about 1 M. */
+#define APPS_DUTY_INSTR_PER_S 4000000u
+#define APPS_DUTY_THROTTLE_WINDOWS 3
+#define APPS_DUTY_KILL_WINDOWS 5
+
+/* The monotonic time the earliest timer is due at, for the wait of the loop that serves the app: INT64_MAX when there is no
+ * timer, the app isn't RUNNING, or the screen is dark (the loop looks again within its second). Any time at or before now is
+ * due. */
+int64_t apps_rt_next_deadline(const apps_rt_t *rt);
+
+/* Whether apps_rt_run_one_timer(rt, now_ms) would make a call: a timer is due, or the app was killed and no call has found
+ * out. It closes the duty cycle's windows that have ended by now_ms first, so a loop that makes no call otherwise (the app
+ * task's rounds) asks this once a round, and brackets the step with its own bookkeeping only when it says true. */
+bool apps_rt_has_work(apps_rt_t *rt, int64_t now_ms);
+
+/* One step of a pass at now_ms (it closes the duty windows first, as above). The earliest timer due at now_ms runs, as one
+ * call of APPS_BUDGET_CALL, and true comes back. An every timer's next run is now_ms + its period (a throttled app's: 100 ms
+ * more), so no timer is due twice in a pass, and what a callback arms is a period away. A killed app (the duty cycle's kill,
+ * or another task's) that no call has found out is the step's call: a call that does nothing and records the crash. False,
+ * with nothing run, when no timer is due, the app isn't RUNNING, or the screen is dark. A callback that fails has crashed the
+ * app: the caller checks apps_rt_state, as after any call, before the next step. */
+bool apps_rt_run_one_timer(apps_rt_t *rt, int64_t now_ms);
+
+/* A whole pass: each timer due at now_ms once, earliest first (apps_rt_run_one_timer until it says false, or the app crashes). */
+void apps_rt_run_timers(apps_rt_t *rt, int64_t now_ms);
+
+/* What the timer module (apps_svc.c) is built on; the Lua side owns its handles. Arms a timer for the function at registry
+ * reference fn_ref, ms from now (APPS_TIMER_MIN_MS to APPS_TIMER_MAX_MS: the module has checked), and every ms after each run
+ * when `every`. Returns its slot, with its life in *gen (never 0), or -1 when APPS_TIMERS_MAX are armed. A handle is a slot
+ * and the gen the timer was armed with. */
+int apps_rt_timer_add(apps_rt_t *rt, int fn_ref, int64_t ms, bool every, uint32_t *gen);
+
+/* Disarms the timer a handle (slot, gen) names, if it is still armed: true, with the reference of its function in *fn_ref,
+ * which the caller gives back to the registry (luaL_unref, on the thread that called: not the main thread's while a coroutine
+ * runs). False for a timer that has fired (a one-shot), was cancelled, or went with the app's end, and for a slot out of
+ * range. */
+bool apps_rt_timer_take(apps_rt_t *rt, int slot, uint32_t gen, int *fn_ref);
+
+/* How many timers are armed. */
+int apps_rt_timer_count(const apps_rt_t *rt);
 
 /* The VM, for what the runtime doesn't wrap: apps_vm_kill, apps_vm_in_call, apps_vm_call_started_ms and the
  * memory counters (apps_vm.h). What is installed into its globals through it is there for the handlers, not for

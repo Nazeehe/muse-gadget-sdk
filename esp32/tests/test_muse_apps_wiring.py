@@ -692,6 +692,47 @@ class MuseAppsWiringTest(unittest.TestCase):
         header = dict(re.findall(r"^#define\s+(\w+)\s+(\S+)", (MUSE / "apps/apps_io.h").read_text(), re.M))
         self.assertEqual(header.get("APPS_IO_CORE"), "0")
 
+    def test_sntp_left_the_clock(self):  # Task 16: the watch and the apps' time module share one SNTP helper
+        clock = strip_c_comments((MUSE / "muse_clock.c").read_text())
+        sntp_source = (MUSE / "muse_sntp.c").read_text()
+        sntp = strip_c_comments(sntp_source)
+        # SNTP starts in muse_sntp.c and nowhere else, and the year test is its muse_time_valid().
+        self.assertEqual(sntp.count("esp_netif_sntp_init("), 1)
+        for gone in ("esp_netif_sntp", "esp_sntp", "VALID_YEAR", "s_sntp", "muse_wifi"):
+            self.assertNotIn(gone, clock, f"{gone} is still in muse_clock.c")
+        self.assertIn("muse_time_valid()", clock)
+        self.assertEqual(clock.count("muse_time_valid()"), 1)
+        # The watch keeps its time zone (muse_clock_build), and the boot log keeps its line: `SNTP started`.
+        build = c_function(clock, "void muse_clock_build(lv_obj_t *tile)")
+        self.assertRegex(build, r'setenv\("TZ", CONFIG_MUSE_CLOCK_TZ, 1\);\s*tzset\(\);')
+        self.assertIn('"SNTP %s, time zone %s", err == ESP_OK ? "started"', sntp)
+        self.assertNotIn("setenv", sntp)
+        # What the two functions are (the header), and where each may be called from.
+        header = (MUSE / "muse_sntp.h").read_text()
+        self.assertIn("void muse_sntp_poll(void);", header)
+        self.assertIn("bool muse_time_valid(void);", header)
+        self.assertIn("#include <stdbool.h>", header)
+        # The CMake line sits with the watch's: muse_sntp.c exists exactly when CONFIG_MUSE_CLOCK does.
+        cmake = (MUSE / "CMakeLists.txt").read_text()
+        block = cmake[cmake.index("    if(CONFIG_MUSE_CLOCK)\n"):]
+        block = block[:block.index("    endif()")]
+        self.assertEqual(re.findall(r'"(muse_\w+\.c)"', block), ["muse_clock.c", "muse_sntp.c"])
+        # muse_ui.c: polled in the LVGL task's frame, straight after update_sleep()'s early return (so it goes on while an
+        # app covers the screen, which returns before the watch's tick), and guarded as the watch itself is (C19).
+        ui = (MUSE / "muse_ui.c").read_text()
+        frame = c_function(ui, "static void frame_tick(lv_timer_t *timer)")
+        self.assertRegex(frame, r"if \(update_sleep\(\)\) \{\s*return;\s*\}\s*#if CONFIG_MUSE_CLOCK\s*muse_sntp_poll\(\);[^\n]*\s*#endif")
+        for needle in ('#include "muse_sntp.h"', "muse_sntp_poll();"):
+            with self.subTest(needle):
+                self.assertEqual(ui.count(needle), 1)
+                self.assertIn("if CONFIG_MUSE_CLOCK", open_conditions(ui, ui.index(needle)))
+        # The apps' port asks the same two helpers: the wall clock counts when muse_time_valid() says so, and the screen is
+        # dark when the UI says so (nothing in it keeps a year or a flag of its own).
+        port = strip_c_comments((MUSE / "apps/apps_port_idf.c").read_text())
+        self.assertRegex(c_function(port, "bool apps_port_epoch_ms(int64_t *out)"), r"muse_time_valid\(\)")
+        self.assertRegex(c_function(port, "bool apps_port_dark(void)"), r"return muse_ui_dark\(\);")
+        self.assertNotIn("EPOCH_2025", port)
+
 
 if __name__ == "__main__":
     unittest.main()

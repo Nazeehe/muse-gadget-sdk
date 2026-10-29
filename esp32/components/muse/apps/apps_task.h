@@ -43,6 +43,13 @@
  * stops Lua that runs too long, and the callers' waits stay bounded: they end with their own timeout rather than
  * the hung message.
  *
+ * Timers. The loop waits for an event until the app's earliest timer is due (apps_rt_next_deadline), and never more than a
+ * second, which is also how long it waits while the screen is dark, when no timer runs (apps_port_dark): the first round after
+ * the wake runs the timers that came due, each once. Each round, after the event it got, runs the timer that is due, one a
+ * round: a call of the app like any other, bracketed for the supervisor and counted in the status, and an error in it ends the
+ * app as an error in a handler does. The runtime's warnings that come after the run's start (the duty cycle's) are added to
+ * the record's as they come, and its kill is a crash like any.
+ *
  * An app's end (stop, a new run, sys.exit, a crash, a hang) is one order, the rulings': the pending request is
  * answered; the table is unpublished (apps_lv_set_ui(NULL) under the UI lock); the record takes the crash record,
  * the log and the widget dump; the runtime is freed; the LVGL task is asked to reset the layer (apps_lv_reset) and

@@ -40,6 +40,7 @@
 #include "apps_json.h"
 #include "apps_port.h"
 #include "apps_suggest.h"
+#include "apps_svc.h"
 #include "apps_ui.h"
 #include "apps_vm.h"
 #include "lauxlib.h"
@@ -66,12 +67,37 @@ static const char *const handler_names[H_COUNT] = {"start", "stop", "show", "hid
 
 #define NOT_RUNNING "the app is not running"
 
+/* The duty cycle (apps_rt.h): a window is a second of the monotonic clock; a throttled app's timers are this much later. */
+#define DUTY_WINDOW_MS 1000
+#define THROTTLE_DELAY_MS 100
+#define STR_(x) #x
+#define STR(x) STR_(x)
+static const char THROTTLE_WARNING[] = "throttled: using more than 40% of the CPU";
+/* A static string: apps_vm_kill keeps the pointer. */
+static const char DUTY_KILL_REASON[] = "stopped: used more than 40% of the CPU for " STR(APPS_DUTY_KILL_WINDOWS) " s";
+
+/* An armed timer; gen 0 is a free slot. */
+typedef struct {
+    int fn_ref;      /* the callback, a registry reference; LUA_NOREF when free */
+    int64_t due;     /* monotonic ms */
+    int64_t period;  /* ms between runs of an every timer; 0 for a one-shot */
+    uint32_t gen;    /* its life: a handle names (slot, gen); never 0 while armed */
+} armed_t;
+
 struct apps_rt {
     const apps_pkg_t *pkg;
     apps_vm_t *vm;
     apps_ui_t *ui;
     apps_state_t state;
     int handler[H_COUNT];  /* registry references; LUA_NOREF for a handler the app hasn't */
+    armed_t timers[APPS_TIMERS_MAX];
+    uint32_t timer_gen;  /* the last gen given */
+    /* The duty cycle: the window that began at duty_start, the VM's instruction count then, how many hot windows in a row
+     * have closed, and whether the app is throttled and has been told so. */
+    int64_t duty_start;
+    uint64_t duty_base;
+    int duty_hot;
+    bool throttled, throttle_warned;
     /* apps_vm_call writes its error here. It is the crash record while the state is CRASHED (and nothing runs
      * after that), and the scratch of a call that fails the message alone otherwise. */
     char err[APPS_ERROR_MAX];
@@ -409,10 +435,15 @@ static int rt_require(lua_State *L) {
 
 /* ---- Calling into the app ---- */
 
+static void duty_roll(apps_rt_t *rt, int64_t now_ms);
+static void timers_disarm(apps_rt_t *rt);
+
 /* Runs fn(arg) as one apps_vm_call with the budget: fn is a C function that gets arg as a light userdata and
  * does everything that touches the app's heap, so that a refusal there is an error inside the call. The
- * result is apps_vm_call's; a call that can't start for want of stack room is an error too. */
+ * result is apps_vm_call's; a call that can't start for want of stack room is an error too. Every way into the app
+ * comes through here, so this is where the duty cycle's windows are closed: a kill it decides on is the call's result. */
 static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t budget) {
+    duty_roll(rt, apps_port_mono_ms());
     lua_State *L = apps_vm_lua(rt->vm);
     if (!lua_checkstack(L, 2)) {
         snprintf(rt->err, sizeof rt->err, "out of memory: no room on the Lua stack");
@@ -423,10 +454,11 @@ static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t b
     return apps_vm_call(rt->vm, 1, 0, budget, rt->err, sizeof rt->err);
 }
 
-/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. */
+/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. Its timers go. */
 static void crash(apps_rt_t *rt) {
     apps_text_clean(rt->err, strlen(rt->err), true);
     rt->state = APPS_STATE_CRASHED;
+    timers_disarm(rt);
 }
 
 /* ---- Loading main.lua ---- */
@@ -631,6 +663,9 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     for (int h = 0; h < H_COUNT; h++) {
         rt->handler[h] = LUA_NOREF;
     }
+    for (int i = 0; i < APPS_TIMERS_MAX; i++) {
+        rt->timers[i].fn_ref = LUA_NOREF;
+    }
     rt->ui = apps_ui_new();
     if (rt->ui == NULL) {
         put_text(err, err_len, "out of memory: can't make room for the app's screen");
@@ -649,6 +684,9 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     lua_State *L = apps_vm_lua(rt->vm);
     apps_json_open(L);  /* safe outside a call: if the heap refuses, the call below ends out of memory */
     apps_ui_open(L, rt->ui);
+    apps_svc_open(L, rt);  /* time, os and timer: before main.lua, so its top level can arm a timer */
+    rt->duty_start = apps_port_mono_ms();  /* main.lua's top level is the first window's */
+    rt->duty_base = apps_vm_instructions(rt->vm);
 
     boot_t boot = {.rt = rt, .main = main, .outcome = BOOT_OK};
     apps_call_t result = vm_run(rt, boot_trampoline, &boot, APPS_BUDGET_START);
@@ -735,6 +773,7 @@ void apps_rt_stop(apps_rt_t *rt) {
     }
     if (rt->handler[H_STOP] == LUA_NOREF || call_handler(rt, H_STOP, NULL, APPS_BUDGET_CALL)) {
         rt->state = APPS_STATE_STOPPED;
+        timers_disarm(rt);
     }
 }
 
@@ -771,6 +810,200 @@ void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event) {
     touch_call_t t = {rt, slot, gen, event};
     if (vm_run(rt, touch_trampoline, &t, APPS_BUDGET_CALL) != APPS_CALL_OK) {
         crash(rt);
+    }
+}
+
+/* ---- Timers ---- */
+
+static void timer_free(armed_t *t) {
+    t->gen = 0;
+    t->fn_ref = LUA_NOREF;
+}
+
+/* Every timer given back to the registry and disarmed: the app has ended, or stopped. luaL_unref allocates nothing, so it
+ * is safe wherever the VM is, and the main thread's stack is empty here (no call is running). */
+static void timers_disarm(apps_rt_t *rt) {
+    lua_State *L = apps_vm_lua(rt->vm);
+    for (int i = 0; i < APPS_TIMERS_MAX; i++) {
+        if (rt->timers[i].gen != 0) {
+            luaL_unref(L, LUA_REGISTRYINDEX, rt->timers[i].fn_ref);
+            timer_free(&rt->timers[i]);
+        }
+    }
+}
+
+int apps_rt_timer_add(apps_rt_t *rt, int fn_ref, int64_t ms, bool every, uint32_t *gen) {
+    for (int i = 0; i < APPS_TIMERS_MAX; i++) {
+        armed_t *t = &rt->timers[i];
+        if (t->gen == 0) {
+            if (++rt->timer_gen == 0) {
+                rt->timer_gen = 1;  /* never 0: that is a free slot */
+            }
+            int64_t due = apps_port_mono_ms() + ms + (rt->throttled ? THROTTLE_DELAY_MS : 0);
+            *t = (armed_t){.fn_ref = fn_ref, .due = due, .period = every ? ms : 0, .gen = rt->timer_gen};
+            *gen = t->gen;
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool apps_rt_timer_take(apps_rt_t *rt, int slot, uint32_t gen, int *fn_ref) {
+    if (slot < 0 || slot >= APPS_TIMERS_MAX || gen == 0 || rt->timers[slot].gen != gen) {
+        return false;
+    }
+    *fn_ref = rt->timers[slot].fn_ref;
+    timer_free(&rt->timers[slot]);
+    return true;
+}
+
+int apps_rt_timer_count(const apps_rt_t *rt) {
+    int n = 0;
+    for (int i = 0; i < APPS_TIMERS_MAX; i++) {
+        n += rt->timers[i].gen != 0 ? 1 : 0;
+    }
+    return n;
+}
+
+/* Whether a runs before b: the earlier due, and of two due together the one armed first. */
+static bool runs_first(const armed_t *a, const armed_t *b) {
+    return a->due < b->due || (a->due == b->due && a->gen < b->gen);
+}
+
+int64_t apps_rt_next_deadline(const apps_rt_t *rt) {
+    int64_t next = INT64_MAX;
+    if (rt == NULL || rt->state != APPS_STATE_RUNNING || apps_port_dark()) {
+        return next;
+    }
+    for (int i = 0; i < APPS_TIMERS_MAX; i++) {
+        if (rt->timers[i].gen != 0 && rt->timers[i].due < next) {
+            next = rt->timers[i].due;
+        }
+    }
+    return next;
+}
+
+typedef struct {
+    apps_rt_t *rt;
+    int slot;
+    uint32_t gen;
+} timer_call_t;
+
+/* Runs under apps_vm_call: the callback, which a one-shot gives up its slot for before it runs. */
+static int timer_trampoline(lua_State *L) {
+    const timer_call_t *call = lua_touserdata(L, 1);
+    armed_t *t = &call->rt->timers[call->slot];
+    if (t->gen != call->gen) {
+        return 0;  /* not the timer picked (it can't happen: nothing runs between the pick and here) */
+    }
+    lua_rawgeti(L, LUA_REGISTRYINDEX, t->fn_ref);
+    if (t->period == 0) {
+        luaL_unref(L, LUA_REGISTRYINDEX, t->fn_ref);  /* the function stays on the stack for its call */
+        timer_free(t);
+    }
+    lua_call(L, 0, 0);
+    return 0;
+}
+
+bool apps_rt_has_work(apps_rt_t *rt, int64_t now_ms) {
+    if (rt == NULL || rt->state != APPS_STATE_RUNNING) {
+        return false;
+    }
+    duty_roll(rt, now_ms);
+    return apps_vm_dying(rt->vm) || apps_rt_next_deadline(rt) <= now_ms;
+}
+
+static int nop_trampoline(lua_State *L) {
+    (void)L;
+    return 0;
+}
+
+bool apps_rt_run_one_timer(apps_rt_t *rt, int64_t now_ms) {
+    if (rt == NULL || rt->state != APPS_STATE_RUNNING) {
+        return false;
+    }
+    duty_roll(rt, now_ms);
+    if (apps_vm_dying(rt->vm)) {
+        /* Killed (by the duty cycle just now, or by another task) with no call to find out: this one does, and the app has
+         * crashed with the reason. */
+        if (vm_run(rt, nop_trampoline, NULL, APPS_BUDGET_CALL) != APPS_CALL_OK) {
+            crash(rt);
+        }
+        return true;
+    }
+    if (apps_port_dark()) {
+        return false;
+    }
+    armed_t *pick = NULL;
+    for (int i = 0; i < APPS_TIMERS_MAX; i++) {
+        armed_t *t = &rt->timers[i];
+        if (t->gen != 0 && t->due <= now_ms && (pick == NULL || runs_first(t, pick))) {
+            pick = t;
+        }
+    }
+    if (pick == NULL) {
+        return false;
+    }
+    timer_call_t call = {.rt = rt, .slot = (int)(pick - rt->timers), .gen = pick->gen};
+    if (pick->period > 0) {  /* before the call, so a callback that cancels itself finds it armed */
+        pick->due = now_ms + pick->period + (rt->throttled ? THROTTLE_DELAY_MS : 0);
+    }
+    if (vm_run(rt, timer_trampoline, &call, APPS_BUDGET_CALL) != APPS_CALL_OK) {
+        crash(rt);
+    }
+    return true;
+}
+
+void apps_rt_run_timers(apps_rt_t *rt, int64_t now_ms) {
+    /* Each timer once: one that a callback arms is a period away, so no more steps than there are timers (a now_ms that isn't
+     * the port's clock can't make a pass endless). */
+    for (int step = 0; step < APPS_TIMERS_MAX && apps_rt_run_one_timer(rt, now_ms); step++) {
+    }
+}
+
+/* ---- The duty cycle ---- */
+
+/* The app has been hot for APPS_DUTY_THROTTLE_WINDOWS windows: every timer moves later, and it is told once. */
+static void throttle_begin(apps_rt_t *rt) {
+    rt->throttled = true;
+    for (int i = 0; i < APPS_TIMERS_MAX; i++) {
+        if (rt->timers[i].gen != 0) {
+            rt->timers[i].due += THROTTLE_DELAY_MS;
+        }
+    }
+    if (!rt->throttle_warned) {
+        rt->throttle_warned = true;
+        warn_add(rt, THROTTLE_WARNING);
+        ring_push(rt, THROTTLE_WARNING, sizeof THROTTLE_WARNING - 1);
+        apps_port_log(rt->pkg->manifest.id, THROTTLE_WARNING);
+    }
+}
+
+/* Closes the windows that have ended by now_ms: the first holds what the VM ran since the last one was closed (every call is
+ * run through vm_run, which comes here first, and a pass of the timers comes here too, so a second with no call in it is closed
+ * all the same), any others nothing. The throttle and the kill follow the count of hot windows in a row. */
+static void duty_roll(apps_rt_t *rt, int64_t now_ms) {
+    int64_t ended = (now_ms - rt->duty_start) / DUTY_WINDOW_MS;
+    if (ended <= 0) {
+        return;
+    }
+    uint64_t total = apps_vm_instructions(rt->vm);
+    bool hot = total - rt->duty_base > APPS_DUTY_INSTR_PER_S;
+    rt->duty_base = total;
+    rt->duty_start += ended * DUTY_WINDOW_MS;
+    if (ended > 1) {
+        rt->duty_hot = 0;  /* a cool window came after the first */
+    } else {
+        rt->duty_hot = hot ? rt->duty_hot + 1 : 0;
+    }
+    if (rt->duty_hot >= APPS_DUTY_KILL_WINDOWS) {
+        apps_vm_kill(rt->vm, DUTY_KILL_REASON);
+    } else if (rt->duty_hot >= APPS_DUTY_THROTTLE_WINDOWS) {
+        if (!rt->throttled) {
+            throttle_begin(rt);
+        }
+    } else {
+        rt->throttled = false;
     }
 }
 

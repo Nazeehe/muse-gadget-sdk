@@ -103,6 +103,8 @@ static const char *TAG = "muse_apps";
 #define SHOWN_MAX 40         /* text an app supplied, as a message shows it (apps_ui.h) */
 #define WHAT_MAX (APPS_PATH_MAX + 32)
 
+#define NO_WARNED ((size_t)-1)
+
 #define MSG_HUNG "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"
 #define MSG_BUSY "the app task is busy; try again"
 #define MSG_DOWN "Muse apps aren't running"
@@ -206,6 +208,8 @@ static struct {
     uint32_t worst_ms;
     bool dirty;              /* the app ran since the record was refreshed */
     int64_t refresh_at;
+    size_t warned;           /* the bytes of apps_rt_warnings that the record has taken; NO_WARNED until the run has taken
+                              * main.lua's own, after start() */
     parked_t *parked;
 } T;
 
@@ -727,6 +731,22 @@ static void abandon(void) {
     end_app(END_HUNG);
 }
 
+/* The warnings the runtime adds to a RUNNING app after the run began (the duty cycle's: they can come with a call or with a
+ * pass of the timers, which makes none), into the record's. The warnings main.lua's table gave are the run's (run_locked). */
+static void merge_warnings(void) {
+    if (T.rt == NULL || T.warned == NO_WARNED || apps_rt_state(T.rt) != APPS_STATE_RUNNING) {
+        return;
+    }
+    const char *all = apps_rt_warnings(T.rt);
+    size_t have = strlen(all);
+    if (have > T.warned && rec_take(LOCK_MS)) {
+        const char *fresh = all + T.warned;
+        add_warning(s_rec->st.warnings, sizeof s_rec->st.warnings, strncmp(fresh, "; ", 2) == 0 ? fresh + 2 : fresh);
+        rec_give();
+        T.warned = have;
+    }
+}
+
 /* After a call into the app: whether it is still there. A hang the supervisor saw abandons it, a crash contains it. */
 static bool call_end(void) {
     call_finish();
@@ -734,6 +754,7 @@ static bool call_end(void) {
         abandon();
         return false;
     }
+    merge_warnings();
     if (T.rt != NULL && apps_rt_state(T.rt) == APPS_STATE_CRASHED) {
         end_app(END_CRASHED);
         return false;
@@ -748,6 +769,7 @@ static void begin_app(apps_pkg_t *pkg) {
     T.pkg = pkg;
     T.rt = NULL;
     T.shown = T.abandoned = T.publish = T.was_published = T.dirty = false;
+    T.warned = NO_WARNED;
     T.worst_ms = 0;
     T.cpu_pct = 0;
     T.window = apps_port_mono_ms() / 1000;
@@ -909,6 +931,7 @@ static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms) {
         add_warning(s_rec->st.warnings, sizeof s_rec->st.warnings, apps_rt_warnings(T.rt));
         rec_give();
     }
+    T.warned = strlen(apps_rt_warnings(T.rt));  /* later ones are merge_warnings' */
     T.publish = true;
     try_publish();
     set_running(true);  /* up: the launcher lists it first if it must, and the store never drops it */
@@ -1048,12 +1071,42 @@ static void housekeeping(void) {
     apps_port_log_drain();
 }
 
+/* How long the loop waits for an event: until the pending run settles or the app's earliest timer is due, and never more
+ * than RECEIVE_MS (C22), which is also how long it waits while the screen is dark and no timer can run. A timer that is due
+ * already still waits a tick: a task that came straight back would never let the idle task run. */
 static int receive_ms(void) {
-    if (T.pending == NULL) {
-        return RECEIVE_MS;
+    int64_t now = apps_port_mono_ms();
+    int64_t wait = RECEIVE_MS;
+    if (T.pending != NULL) {
+        int64_t left = T.settle_until - now;
+        wait = left <= 0 ? 0 : left < RECEIVE_MS ? left : RECEIVE_MS;
     }
-    int64_t left = T.settle_until - apps_port_mono_ms();
-    return left <= 0 ? 0 : left < RECEIVE_MS ? (int)left : RECEIVE_MS;
+    if (T.rt != NULL && !T.abandoned) {
+        int64_t due = apps_rt_next_deadline(T.rt);
+        if (due != INT64_MAX) {
+            int64_t until = due - now < 1 ? 1 : due - now;
+            wait = until < wait ? until : wait;
+        }
+    }
+    return (int)wait;
+}
+
+/* The timer that is due runs, as a call of the app like any other: bracketed for the supervisor and the status, and an
+ * error in it ends the app as an error in a handler does (the card, the record). One a round, so that a touch or a stop
+ * waits behind one callback and not behind all of them; the next one that is due comes a tick later (receive_ms). Every round
+ * asks, which also closes the duty cycle's second (apps_rt_has_work), so its warning and its kill come on time. */
+static void run_timers(void) {
+    if (T.rt == NULL || T.abandoned) {
+        return;
+    }
+    int64_t now = apps_port_mono_ms();
+    if (apps_rt_has_work(T.rt, now)) {
+        call_begin();
+        (void)apps_rt_run_one_timer(T.rt, now);
+        (void)call_end();
+    } else {
+        merge_warnings();  /* a pass that made no call can still have warned */
+    }
 }
 
 static void apps_task(void *arg) {
@@ -1067,6 +1120,7 @@ static void apps_task(void *arg) {
         if (got) {
             handle(&ev);
         }
+        run_timers();
     }
 }
 

@@ -23,6 +23,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Where apps_port_log sends a line: apphost.c's event writer, or nothing (NULL, the start) for --cycles. */
 typedef void (*apphost_log_fn)(const char *app_id, const char *line);
@@ -41,3 +42,10 @@ bool apphost_ui_locked(void);
 /* How many times the UI lock has been taken. apphost compares it across a command: a command that left the screen
  * changed without taking the lock even once is a binding that writes the table where the LVGL task reads it. */
 unsigned long apphost_ui_lock_takes(void);
+
+/* The clocks and the screen, which a script moves (apphost_port.c): the monotonic clock only by apphost_advance, which
+ * moves the wall clock with it once that is set; the wall clock is unset until apphost_sync gives it the epoch ms of now;
+ * the screen is lit until apphost_set_dark. Time stands still inside a call, as nothing here advances it there. */
+void apphost_advance(int64_t ms);
+void apphost_sync(int64_t epoch_ms);
+void apphost_set_dark(bool dark);

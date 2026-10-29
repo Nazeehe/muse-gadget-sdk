@@ -125,6 +125,10 @@ bool apps_port_epoch_ms(int64_t *out) {
     return false;
 }
 
+bool apps_port_dark(void) {
+    return false;
+}
+
 void apps_port_log(const char *app_id, const char *line) {
     (void)app_id;
     (void)line;

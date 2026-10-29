@@ -694,6 +694,7 @@ static _Thread_local struct fake_task thread_task;  /* what a thread of the harn
 static _Thread_local struct fake_task *current_task;
 static pthread_mutex_t tasks_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic(TickType_t) longest_receive;  /* the longest wait the app task asked of xQueueReceive */
+static atomic_uint zero_receives;            /* how many times it asked for no wait at all: it never blocked then */
 
 static struct fake_task *self_task(void) {
     return current_task != NULL ? current_task : &thread_task;
@@ -889,6 +890,9 @@ BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t wait) {
 BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t wait) {
     if (app_task_of_thread() != NULL && wait > atomic_load(&longest_receive)) {
         atomic_store(&longest_receive, wait);
+    }
+    if (app_task_of_thread() != NULL && wait == 0) {
+        atomic_fetch_add(&zero_receives, 1);
     }
     pthread_mutex_lock(&q->mu);
     if (!queue_wait(q, wait, has_item)) {
@@ -1277,6 +1281,11 @@ static void *job_arg;
 static bool job_done;
 static atomic_bool lvgl_paused, lvgl_asleep, lvgl_quit;
 static atomic_uint frames, paused_rounds;
+
+/* The screen is dark when the case says the LVGL task sleeps: it runs no apply step then, as the real one doesn't. */
+bool apps_port_dark(void) {
+    return atomic_load(&lvgl_asleep);
+}
 static atomic_bool last_tick;  /* what muse_apps_ui_tick returned at the last frame: frame_tick returns early on true */
 
 static void *lvgl_main(void *arg) {
@@ -2939,6 +2948,231 @@ static void an_echo_waits_outside_the_call(void) {
     heap_caps_free(st);
 }
 
+/* ---- Timers (Task 16) ---- */
+
+/* A timer's callback is a call into the app like any other: it runs on the app task's loop (which wakes for the timer, not
+ * at its next round a second away), is bracketed for the supervisor and the status, and its app ends as any app ends. */
+static const char APP_TIMERS[] =
+    "local app = {}\n"
+    "local n = 0\n"
+    "function app.start()\n"
+    "  timer.after(60, function() print('after') end)\n"
+    "  timer.every(100, function() n = n + 1 print('tick ' .. n) end)\n"
+    "  timer.after(86400000, function() print('tomorrow') end)\n"
+    "end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+
+static void timers_run_on_the_app_task(void) {
+    const file_t files[] = {LUA("main.lua", APP_TIMERS)};
+    apps_status_t *st = new_status();
+    char err[200];
+    int from = mark();
+    const int64_t began = real_ms();
+    CHECK(apps_task_run(make_pkg("timers", "Timers", files, 1), false, 0, st, err, sizeof err), "run: %s", err);
+    WAIT(from, "print timers after");
+    int64_t took = real_ms() - began;
+    CHECK(took < 700, "the timer due in 60 ms ran %lld ms after the launch: the loop wakes for a timer, it doesn't wait for its round",
+          (long long)took);
+    WAIT(from, "print timers tick 3");
+    ORDERED(from, "print timers after", "print timers tick 1");
+    ORDERED(from, "print timers tick 1", "print timers tick 2");
+    ABSENT(from, "print timers tomorrow");
+    /* Each callback is a call, which the status counts; and the loop never waits longer than its second for a day-long
+     * timer (finish() checks the longest wait). */
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_RUNNING && st->instructions > 0, "the status: %s %llu", apps_state_name(st->state),
+          (unsigned long long)st->instructions);
+    FIFO_SYNC();
+    CHECK(atomic_load(&longest_receive) > 0 && atomic_load(&longest_receive) <= 1000, "the longest wait: %u ticks",
+          (unsigned)atomic_load(&longest_receive));
+    /* Stopping the app takes its timers with it: nothing ticks after stop(). */
+    CHECK(stop_app(err, sizeof err), "stop: '%s'", err);
+    int stopped = WAIT(from, "print timers stop");
+    sleep_ms(300);
+    CHECK(at_from(stopped, "print timers tick") < 0, "a timer ran after the app was stopped");
+    heap_caps_free(st);
+}
+
+/* A callback stuck in C is a hung call whichever way it began, so the supervisor must see timers' calls: the app is
+ * marked HUNG after 3 s as for a handler, and nothing of it runs again. */
+static const char APP_HANG_TIMER[] =
+    "local app = {}\n"
+    "function app.start() timer.after(50, function() print('hang') end) end\n"
+    "return app\n";
+
+static void a_hung_timer_callback_is_abandoned(void) {
+    const file_t files[] = {LUA("main.lua", APP_HANG_TIMER)};
+    char err[200];
+    block_print("hang");
+    int from = mark();
+    CHECK(apps_task_run(make_pkg("hangt", "Hangt", files, 1), true, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT_PRINT_BLOCKED();
+    WAIT_FRAMES(5);
+    ABSENT(from, "crash ");  /* a call isn't hung until it has run for more than 3 s */
+    clock_jump(APPS_TASK_HUNG_MS + 1);
+    int card = WAIT(from, "crash Hangt | (stopped responding)");
+    CHECK(at_from(from, "priority muse_apps 1") >= 0, "the app task drops to priority 1");
+    CHECK(at_from(from, "log W Hangt stopped responding") >= 0, "the log says so");
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_HUNG, "the status: %s", apps_state_name(st->state));
+    int back = mark();
+    release_print();
+    WAIT(back, "priority muse_apps 2");
+    ORDERED(back, "set_ui NULL", "reset");
+    CHECK(at_from(back, "log I stop hangt: hung, peak ") >= 0, "the stop line");
+    CHECK(card >= 0 && at_from(back, "print hangt") < 0, "nothing of the app runs again");
+    heap_caps_free(st);
+}
+
+/* Timers that are due when the loop comes round again (two that were due together: one runs a round) never make it wait for
+ * nothing: a task at priority 2 that went straight back to its work would never let the idle task run. */
+static const char APP_TWINS[] =
+    "local app = {}\n"
+    "function app.start()\n"
+    "  timer.after(1000, function() print('one') end)\n"
+    "  timer.after(1000, function() print('two') end)\n"
+    "end\n"
+    "return app\n";
+
+static void due_timers_never_make_the_loop_spin(void) {
+    const file_t files[] = {LUA("main.lua", APP_TWINS)};
+    char err[200];
+    CHECK(apps_task_run(make_pkg("twins", "Twins", files, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    clock_stop_at(apps_port_mono_ms());
+    FIFO_SYNC();  /* the run has settled: nothing but a timer can ask for a wait of 0 from here */
+    unsigned zeros = atomic_load(&zero_receives);
+    int from = mark();
+    clock_jump(1000);  /* both are due */
+    FIFO_SYNC();
+    WAIT(from, "print twins one");
+    WAIT(from, "print twins two");
+    ORDERED(from, "print twins one", "print twins two");  /* the one armed first */
+    FIFO_SYNC();
+    CHECK(atomic_load(&zero_receives) == zeros, "the loop asked for a wait of 0 %u times with a timer due",
+          atomic_load(&zero_receives) - zeros);
+    clock_go();
+}
+
+/* While the screen is dark no timer runs; after the wake each overdue timer runs once, and the next comes a whole period
+ * after that, not the ten that were missed. The clock stands still between the case's steps, and each FIFO_SYNC makes the
+ * loop come round, as the wake does within its second. */
+static const char APP_TICKER[] =
+    "local app = {}\n"
+    "local n = 0\n"
+    "function app.start() timer.every(1000, function() n = n + 1 print('tick ' .. n) end) end\n"
+    "return app\n";
+
+static void dark_pauses_the_timers_and_the_wake_runs_each_once(void) {
+    const file_t files[] = {LUA("main.lua", APP_TICKER)};
+    char err[200];
+    CHECK(apps_task_run(make_pkg("ticker", "Ticker", files, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    clock_jump(1000);
+    FIFO_SYNC();
+    WAIT(from, "print ticker tick 1");
+    atomic_store(&lvgl_asleep, true);  /* the screen goes dark */
+    int dark = mark();
+    clock_jump(10000);  /* ten periods */
+    FIFO_SYNC();
+    FIFO_SYNC();  /* the loop has been round, with a timer overdue */
+    ABSENT(dark, "print ticker");
+    atomic_store(&lvgl_asleep, false);
+    FIFO_SYNC();
+    WAIT(dark, "print ticker tick 2");
+    FIFO_SYNC();
+    FIFO_SYNC();
+    CHECK(count_from(dark, "print ticker tick") == 1, "%d ticks at the wake, one is due", count_from(dark, "print ticker tick"));
+    clock_jump(999);
+    FIFO_SYNC();
+    FIFO_SYNC();
+    CHECK(count_from(dark, "print ticker tick") == 1, "the next one comes a whole period after the wake's");
+    clock_jump(1);
+    FIFO_SYNC();
+    WAIT(dark, "print ticker tick 3");
+    clock_go();
+}
+
+/* An error in a timer's callback crashes the app as one in a widget's handler does: the table comes down, the card is
+ * shown after the reset, and the record has the error and its traceback. */
+static const char APP_TIMER_BOOM[] =
+    "local app = {}\n"
+    "function app.start()\n"
+    "  ui.image{src = 'a.bin'}\n"
+    "  timer.after(50, function() print('boom soon') error('timer boom') end)\n"
+    "end\n"
+    "return app\n";
+
+static void a_timer_error_crashes_the_app_and_shows_the_card(void) {
+    const file_t files[] = {LUA("main.lua", APP_TIMER_BOOM), IMAGE("a.bin")};
+    char err[200];
+    int from = mark();
+    CHECK(apps_task_run(make_pkg("boomer", "Boomer", files, 2), true, 0, NULL, err, sizeof err), "run: %s", err);
+    int card = WAIT(from, "crash Boomer | main.lua:4: timer boom");
+    ORDERED(from, "print boomer boom soon", "set_ui NULL");
+    ORDERED(from, "set_ui NULL", "reset");
+    ORDERED(from, "reset", "free image boomer/a.bin");
+    CHECK(at_from(from, "reset") < card, "the card after the reset");
+    WAIT(from, "front 0");
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_CRASHED && strncmp(st->last_error, "main.lua:4: timer boom\nstack traceback:", 39) == 0 &&
+              strcmp(st->log_tail, "boom soon") == 0,
+          "the record: %s '%s' '%s'", apps_state_name(st->state), st->last_error, st->log_tail);
+    heap_caps_free(st);
+}
+
+/* The duty cycle, which every call counts toward (a message here, not a timer: the case fills each second of the clock it
+ * holds still with three calls that burn the rate between them). The third hot second in a row is a warning in the status
+ * and the log, once; the fifth ends the app with the reason, and a card. */
+static const char APP_BURNER[] =
+    "local app = {}\n"
+    "function app.start() ui.label{text = 'Busy'} end\n"
+    "function app.message(event, data) for i = 1, data do end return true end\n"
+    "return app\n";
+
+#define THROTTLED_TEXT "throttled: using more than 40% of the CPU"
+#define KILLED_TEXT "stopped: used more than 40% of the CPU for 5 s"
+
+static void the_duty_cycle_warns_the_status_then_kills(void) {
+    const file_t files[] = {LUA("main.lua", APP_BURNER)};
+    apps_status_t *st = new_status();
+    char err[300], data[32];
+    int from = mark();
+    CHECK(apps_task_run(make_pkg("burner", "Burner", files, 1), true, 0, NULL, err, sizeof err), "run: %s", err);
+    clock_stop_at(apps_port_mono_ms());
+    snprintf(data, sizeof data, "%u", APPS_DUTY_INSTR_PER_S / 3 + 5000);  /* three of them are over the rate */
+    for (int window = 1; window <= 5; window++) {
+        for (int call = 0; call < 3; call++) {
+            char *reply = apps_task_message("burner", "burn", data, false, 0, err, sizeof err);
+            CHECK(reply != NULL, "window %d, call %d: %s", window, call + 1, err);
+            apps_port_free(reply);
+            if (call == 0) {  /* this call has closed the window before it */
+                apps_task_status(st);
+                bool warned = strstr(st->warnings, THROTTLED_TEXT) != NULL;
+                CHECK(warned == (window >= 4), "window %d: the warning is %s", window, warned ? "there" : "not there");
+            }
+        }
+        clock_jump(1000);
+    }
+    CHECK(count_from(from, "print burner " THROTTLED_TEXT) == 1, "the log line, once: %d",
+          count_from(from, "print burner " THROTTLED_TEXT));
+    apps_task_status(st);
+    CHECK(strcmp(st->warnings, THROTTLED_TEXT) == 0, "the status warns once: '%s'", st->warnings);
+    ABSENT(from, "crash ");
+    /* The sixth window's first call closes the fifth: the app is killed. */
+    char *reply = apps_task_message("burner", "burn", data, false, 0, err, sizeof err);
+    CHECK(reply == NULL && strcmp(err, KILLED_TEXT) == 0, "the kill: '%s'", err);
+    WAIT(from, "crash Burner | " KILLED_TEXT);
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_CRASHED && strcmp(st->last_error, KILLED_TEXT) == 0, "the record: %s '%s'",
+          apps_state_name(st->state), st->last_error);
+    clock_go();
+    heap_caps_free(st);
+}
+
 /* The I/O worker's jobs: "hold" waits while io_hold is set, "chain" submits "chained". */
 static atomic_bool io_hold, io_held;
 
@@ -3310,6 +3544,12 @@ int main(int argc, char **argv) {
         {"io_refuses_when_fragmented", io_refuses_when_fragmented},
         {"io_takes_a_job_that_came_as_it_timed_out", io_takes_a_job_that_came_as_it_timed_out},
         {"an_echo_waits_outside_the_call", an_echo_waits_outside_the_call},
+        {"timers_run_on_the_app_task", timers_run_on_the_app_task},
+        {"a_hung_timer_callback_is_abandoned", a_hung_timer_callback_is_abandoned},
+        {"due_timers_never_make_the_loop_spin", due_timers_never_make_the_loop_spin},
+        {"dark_pauses_the_timers_and_the_wake_runs_each_once", dark_pauses_the_timers_and_the_wake_runs_each_once},
+        {"a_timer_error_crashes_the_app_and_shows_the_card", a_timer_error_crashes_the_app_and_shows_the_card},
+        {"the_duty_cycle_warns_the_status_then_kills", the_duty_cycle_warns_the_status_then_kills},
 #ifdef HARNESS_CONSOLE
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},

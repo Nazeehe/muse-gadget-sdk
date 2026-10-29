@@ -40,6 +40,8 @@
 #include "apps_echo.h"
 #include "apps_port.h"
 #include "muse_apps_task_fakes.h"
+#include "muse_sntp.h"
+#include "muse_ui.h"
 #include "psa/crypto.h"
 
 static int failures;
@@ -203,6 +205,18 @@ psa_status_t psa_hash_compute(psa_algorithm_t alg, const uint8_t *input, size_t 
     memset(hash, 0xab, hash_size < 32 ? hash_size : 32);
     *hash_length = 32;
     return PSA_SUCCESS;
+}
+
+/* ---- What the port asks of the UI and of the SNTP helper ---- */
+
+static bool ui_is_dark, clock_is_set;
+
+bool muse_ui_dark(void) {
+    return ui_is_dark;
+}
+
+bool muse_time_valid(void) {
+    return clock_is_set;
 }
 
 /* ---- The console: stdout, into a file ---- */
@@ -560,6 +574,33 @@ static void breach_kinds(void) {
     }
 }
 
+/* The screen is dark when the UI says so, and the port keeps no flag of its own: it is read at each call. */
+static void dark_follows_the_ui(void) {
+    ui_is_dark = false;
+    CHECK(!apps_port_dark(), "dark while the UI is lit");
+    ui_is_dark = true;
+    CHECK(apps_port_dark(), "lit while the UI is dark");
+    ui_is_dark = false;
+    CHECK(!apps_port_dark(), "dark again after the wake");
+}
+
+/* The wall clock counts when muse_time_valid() says so and not before, whatever the system clock reads (the host's reads
+ * the real time, long after 2025): then it is the system clock, in milliseconds. */
+static void the_wall_clock_counts_when_the_helper_says(void) {
+    int64_t ms = 123;
+    clock_is_set = false;
+    CHECK(!apps_port_epoch_ms(&ms) && ms == 123, "an unset clock gave %lld", (long long)ms);
+    clock_is_set = true;
+    struct timespec before, after;
+    clock_gettime(CLOCK_REALTIME, &before);
+    CHECK(apps_port_epoch_ms(&ms), "a set clock gave nothing");
+    clock_gettime(CLOCK_REALTIME, &after);
+    int64_t low = (int64_t)before.tv_sec * 1000 + before.tv_nsec / 1000000;
+    int64_t high = (int64_t)after.tv_sec * 1000 + after.tv_nsec / 1000000;
+    CHECK(ms >= low - 1 && ms <= high + 1, "%lld is not between %lld and %lld", (long long)ms, (long long)low,
+          (long long)high);
+}
+
 static const struct {
     const char *name;
     void (*run)(void);
@@ -570,6 +611,8 @@ static const struct {
     {"echo_queue_is_bounded", echo_queue_is_bounded},
     {"echo_drain_holds_the_console", echo_drain_holds_the_console},
     {"breach_kinds", breach_kinds},
+    {"dark_follows_the_ui", dark_follows_the_ui},
+    {"the_wall_clock_counts_when_the_helper_says", the_wall_clock_counts_when_the_helper_says},
 };
 
 int main(int argc, char **argv) {

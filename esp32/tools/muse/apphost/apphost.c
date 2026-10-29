@@ -35,7 +35,8 @@
  *
  * Output is one JSON object a line on stdout, flushed as it is written, whatever the app printed or raised:
  * every string is escaped, and bytes that aren't valid UTF-8 come out as U+FFFD.
- *   {"event":"warning","message":"…"}      a manifest or runtime warning (each one, split at "; "), at launch
+ *   {"event":"warning","message":"…"}      a manifest or runtime warning (each one, split at "; "), at launch, and the
+ *                                          runtime's that come later (the CPU duty cycle's), as they come
  *   {"event":"started","id":"…","name":"…"}   the app is running: at launch, and for each `start` that returns
  *   {"event":"log","app":"…","line":"…"}     a line the app printed, as it is printed; and the lines of `log`
  *   {"event":"reply","data":<json>}        what message() returned
@@ -47,6 +48,7 @@
  *                                          with the install's words: "compile failed: util.lua:7: …" and the
  *                                          lines of the file around line 7 (apps_pkg_compile_message)
  *   {"event":"state","state":"running"}    the `state` command: stopped, running or crashed
+ *   {"event":"timers","count":2}           the `timers` command: how many timers the app has armed
  *   {"event":"dump","widgets":[...]}       the `dump` command: one object an alive widget (apps_ui.h), with
  *                                          "dropped":N after them when N didn't fit the size asked for
  *   {"event":"leak_check","bytes":0}       --cycles: what the apps' heap still holds
@@ -68,6 +70,14 @@
  *   tap "TEXT"             a tap on the first button or label (in slot order) whose text is TEXT, a JSON string
  *   dump [N]               the widgets as the gadget reports them (apps_ui_dump), in at most N bytes (all of
  *                          them by default)
+ *   advance MS             time passes: the monotonic clock moves MS ms (0 to 86400000) in steps of 10 ms, and after each
+ *                          step the timers that are due run, as the app task's loop runs them, and the screen is applied,
+ *                          as a frame follows. Always at least one pass, so `advance 0` runs the timers that came due
+ *                          while the screen was dark. A crash in a timer prints a crash event, as it happens.
+ *   dark on | dark off     the screen goes dark (no timer runs) or wakes; nothing runs at once
+ *   sync EPOCH_MS          the wall clock is set (to 2025 or later, in ms since 1970, as SNTP sets the gadget's), and moves
+ *                          with the monotonic clock from then on. Unset, time.now() is nil. The time zone is UTC0.
+ *   timers                 -> timers: how many timers the app has armed
  * The LVGL task's apply step has no counterpart here but a stand-in that runs after each command: it takes every
  * request as applied, so a deleted widget's slot is free for the next command, as it is on the gadget after
  * a frame. Nothing is laid out, so a dump shows the declared geometry.
@@ -87,7 +97,9 @@
  * Exit status: 0, the app didn't crash; 1, it crashed, or its package can't be loaded; 2, the command line or
  * the script can't be read (the reason, and the usage, on stderr).
  *
- * Time stands still here (apphost_port.c), so only the instruction budgets stop a runaway app.
+ * Time stands still here unless a script moves it (apphost_port.c: advance), and never inside a call, so only the
+ * instruction budgets stop a runaway app: the VM's wall-clock backstop doesn't fire, and a run is the same on every
+ * machine. The clocks start at a fixed time and the wall clock is unset; the time zone is UTC0.
  */
 
 /* getline, realpath and PATH_MAX come with POSIX 2008 and a C library's default definitions. One that hides
@@ -103,6 +115,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "apphost_port.h"
 #include "apps_json.h"
@@ -354,6 +367,7 @@ typedef struct {
     const apps_pkg_t *pkg;
     apps_rt_t *rt;                    /* NULL when the runtime couldn't be made */
     char crash_text[APPS_ERROR_MAX];  /* then, the reason: the crash record of an app that never ran */
+    size_t warned;                    /* the bytes of apps_rt_warnings that have been printed as events */
 } app_t;
 
 static bool crashed(const app_t *app) {
@@ -367,13 +381,30 @@ static void report_crash(const app_t *app, bool was_crashed) {
     }
 }
 
+/* The runtime's warnings that came since the last call here (the duty cycle's, which a call can add): one event each. Called
+ * right after a call into the app, before what the call itself printed, which is how they happened. */
+static void flush_warnings(app_t *app) {
+    if (app->rt == NULL) {
+        return;
+    }
+    const char *all = apps_rt_warnings(app->rt);
+    size_t have = strlen(all);
+    if (have > app->warned) {
+        const char *fresh = all + app->warned;
+        emit_warnings(strncmp(fresh, "; ", 2) == 0 ? fresh + 2 : fresh);
+        app->warned = have;
+    }
+}
+
 static void cmd_start(app_t *app) {
     if (app->rt == NULL) {
         emit_text("error", app->crash_text);
         return;
     }
     bool was_crashed = crashed(app);
-    if (apps_rt_start(app->rt)) {
+    bool started = apps_rt_start(app->rt);
+    flush_warnings(app);
+    if (started) {
         begin("started");
         field("id", app->pkg->manifest.id, strlen(app->pkg->manifest.id));
         field("name", app->pkg->manifest.name, strlen(app->pkg->manifest.name));
@@ -393,6 +424,7 @@ static void cmd_message(app_t *app, const char *event, const char *data) {
     char err[APPS_ERROR_MAX];
     bool was_crashed = crashed(app);
     char *reply = apps_rt_message(app->rt, event, data, strlen(data), err, sizeof err);
+    flush_warnings(app);
     if (reply != NULL) {
         begin("reply");
         fputs(",\"data\":", stdout);
@@ -538,6 +570,7 @@ static void cmd_tap(app_t *app, const char *args) {
     }
     bool was_crashed = crashed(app);
     apps_rt_touch(app->rt, (uint16_t)slot, (uint16_t)gen, APPS_UI_TAP);
+    flush_warnings(app);
     report_crash(app, was_crashed);
 }
 
@@ -572,7 +605,42 @@ static void cmd_handler(app_t *app, const char *name) {
     } else {
         apps_rt_show(app->rt, strcmp(name, "show") == 0);
     }
+    flush_warnings(app);
     report_crash(app, was_crashed);
+}
+
+/* The most `advance` moves the clock in one command: a day. */
+#define ADVANCE_MAX_MS 86400000
+/* How far the app task's loop is from the clock: the pass of the timers after each step. */
+#define ADVANCE_STEP_MS 10
+
+static void begin_command(void);
+static void end_of_command(const app_t *app);
+
+/* advance MS: the clock moves in steps and after each one the timers that are due run (apps_rt_run_timers: what the app task's
+ * loop does, on the same clock), and the screen is applied, as the LVGL task's frame follows a callback. At least one step,
+ * so `advance 0` is a pass. Every step is a command as far as the UI lock goes (end_of_command). */
+static void cmd_advance(app_t *app, long ms) {
+    long done = 0;
+    do {
+        long step = ms - done < ADVANCE_STEP_MS ? ms - done : ADVANCE_STEP_MS;
+        apphost_advance(step);
+        done += step;
+        if (app->rt != NULL) {
+            begin_command();
+            bool was_crashed = crashed(app);
+            apps_rt_run_timers(app->rt, apps_port_mono_ms());
+            flush_warnings(app);
+            report_crash(app, was_crashed);
+            end_of_command(app);
+        }
+    } while (done < ms);
+}
+
+static void cmd_timers(const app_t *app) {
+    begin("timers");
+    printf(",\"count\":%d", app->rt != NULL ? apps_rt_timer_count(app->rt) : 0);
+    end_event();
 }
 
 static bool is_space(char c) {
@@ -608,6 +676,32 @@ static bool parse_count(const char *s, long max, long *out) {
         if (v > max) {
             v = max;
         }
+    }
+    *out = v;
+    return true;
+}
+
+/* The epoch ms a `sync` gives: digits only, from the start of 2025 (when the gadget counts its clock as set: muse_time_valid) to
+ * the end of 9999. */
+#define SYNC_MIN_MS 1735689600000LL
+#define SYNC_MAX_MS 253402300799999LL
+
+static bool parse_epoch_ms(const char *s, int64_t *out) {
+    if (*s == '\0') {
+        return false;
+    }
+    int64_t v = 0;
+    for (; *s != '\0'; s++) {
+        if (*s < '0' || *s > '9') {
+            return false;
+        }
+        v = v * 10 + (*s - '0');
+        if (v > SYNC_MAX_MS) {
+            return false;  /* too big, and it can't overflow: SYNC_MAX_MS * 10 fits */
+        }
+    }
+    if (v < SYNC_MIN_MS) {
+        return false;
     }
     *out = v;
     return true;
@@ -656,8 +750,28 @@ static void run_line(app_t *app, char *line) {
         } else {
             cmd_dump(app, (size_t)cap);
         }
+    } else if (strcmp(cmd, "advance") == 0) {
+        long ms;
+        if (!parse_count(args, ADVANCE_MAX_MS + 1, &ms) || ms > ADVANCE_MAX_MS) {
+            emit_text("error", "advance needs a number of milliseconds, 0 to 86400000: advance 250");
+        } else {
+            cmd_advance(app, ms);
+        }
+    } else if (strcmp(cmd, "dark") == 0) {
+        if (strcmp(args, "on") == 0 || strcmp(args, "off") == 0) {
+            apphost_set_dark(args[1] == 'n');
+        } else {
+            emit_text("error", "dark needs on or off: dark on | dark off");
+        }
+    } else if (strcmp(cmd, "sync") == 0) {
+        int64_t epoch_ms;
+        if (!parse_epoch_ms(args, &epoch_ms)) {
+            emit_text("error", "sync needs the time in milliseconds since 1970 (2025 or later): sync 1767225600000");
+        } else {
+            apphost_sync(epoch_ms);
+        }
     } else if (strcmp(cmd, "start") == 0 || strcmp(cmd, "stop") == 0 || strcmp(cmd, "show") == 0 ||
-               strcmp(cmd, "hide") == 0 || strcmp(cmd, "state") == 0) {
+               strcmp(cmd, "hide") == 0 || strcmp(cmd, "state") == 0 || strcmp(cmd, "timers") == 0) {
         if (*args != '\0') {
             snprintf(text, sizeof text, "%s takes no arguments", cmd);
             emit_text("error", text);
@@ -665,12 +779,16 @@ static void run_line(app_t *app, char *line) {
             cmd_start(app);
         } else if (strcmp(cmd, "state") == 0) {
             cmd_state(app);
+        } else if (strcmp(cmd, "timers") == 0) {
+            cmd_timers(app);
         } else {
             cmd_handler(app, cmd);
         }
     } else {
         snprintf(text, sizeof text,
-                 "unknown command '%.60s' (commands: message, stop, start, show, hide, state, log, tap, dump)", cmd);
+                 "unknown command '%.60s' (commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, "
+                 "sync, timers)",
+                 cmd);
         emit_text("error", text);
     }
 }
@@ -744,6 +862,7 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name,
         emit_text("crash", apps_rt_last_error(app.rt));
     } else {
         emit_warnings(apps_rt_warnings(app.rt));
+        app.warned = strlen(apps_rt_warnings(app.rt));
         cmd_start(&app);
     }
     end_of_command(&app);
@@ -911,6 +1030,8 @@ int main(int argc, char **argv) {
     if (o.sha256 != NULL) {
         return sha256_command(o.sha256);
     }
+    setenv("TZ", "UTC0", 1);  /* the clock's zone, whatever this machine's is: a run is the same everywhere */
+    tzset();
     FILE *script = NULL;
     if (o.script != NULL) {
         script = strcmp(o.script, "-") == 0 ? stdin : fopen(o.script, "r");

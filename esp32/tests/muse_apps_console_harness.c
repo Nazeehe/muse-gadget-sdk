@@ -220,6 +220,10 @@ bool apps_port_epoch_ms(int64_t *out) {
     return false;
 }
 
+bool apps_port_dark(void) {
+    return false;
+}
+
 /* The store's room: plenty (tests/test_muse_apps_install.py has the budget). */
 size_t apps_port_psram_free(void) {
     return (size_t)64 << 20;

@@ -40,7 +40,7 @@ APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_task_harness.c"
 SOURCES = [HARNESS, APPS / "apps_task.c", APPS / "apps_io.c", APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c",
-           APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c"]
+           APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_svc.c"]
 CONSOLE_SOURCES = [APPS / "apps_console.c", APPS / "apps_install.c"]
 
 # What apps_task.c and muse_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one is a line that includes the fakes.
@@ -228,6 +228,26 @@ class AppTaskTest(HarnessCase):
 
     def test_an_echo_waits_outside_the_call(self):  # F3: a print only queues; the drain comes after the call
         self.run_case("an_echo_waits_outside_the_call")
+
+    # ---- Task 16: timers and the duty cycle on the loop ----
+
+    def test_timers_run_on_the_app_task_and_the_loop_wakes_for_them(self):
+        self.run_case("timers_run_on_the_app_task")
+
+    def test_a_hung_timer_callback_is_abandoned(self):  # each callback is bracketed for the supervisor
+        self.run_case("a_hung_timer_callback_is_abandoned")
+
+    def test_timers_that_are_due_never_make_the_loop_spin(self):  # a wait of a tick at least, or the idle task starves
+        self.run_case("due_timers_never_make_the_loop_spin")
+
+    def test_dark_pauses_the_timers_and_the_wake_runs_each_once(self):
+        self.run_case("dark_pauses_the_timers_and_the_wake_runs_each_once")
+
+    def test_a_timer_error_crashes_the_app_and_shows_the_card(self):
+        self.run_case("a_timer_error_crashes_the_app_and_shows_the_card")
+
+    def test_the_duty_cycle_warns_the_status_then_kills(self):
+        self.run_case("the_duty_cycle_warns_the_status_then_kills")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

@@ -45,11 +45,10 @@
 #include "apps_echo.h"
 #include "apps_pkg.h"
 #include "muse_mem.h"
+#include "muse_sntp.h"
+#include "muse_ui.h"
 
 static const char *TAG = "muse_apps";
-
-/* The wall clock counts once it reads 2025 or later: SNTP has set it (Task 16 asks muse_time_valid()). */
-#define EPOCH_2025_S 1735689600LL
 
 static StaticSemaphore_t s_ui_lock_buf;
 static SemaphoreHandle_t s_ui_lock;
@@ -88,11 +87,15 @@ int64_t apps_port_mono_ms(void) {
 
 bool apps_port_epoch_ms(int64_t *out) {
     struct timeval tv;
-    if (gettimeofday(&tv, NULL) != 0 || tv.tv_sec < EPOCH_2025_S) {
+    if (!muse_time_valid() || gettimeofday(&tv, NULL) != 0) {
         return false;
     }
     *out = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
     return true;
+}
+
+bool apps_port_dark(void) {
+    return muse_ui_dark();
 }
 
 void *apps_port_realloc(void *ptr, size_t n) {

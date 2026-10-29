@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "apps_pkg.h"
@@ -106,13 +107,25 @@ void apps_port_free(void *ptr) {
     }
 }
 
+/* The clocks and the screen's sleep, which a case sets (the monotonic clock stands still at 0 and the wall clock isn't set,
+ * as they were before the time module). */
+static int64_t port_mono_ms, port_epoch_ms;
+static bool port_epoch_valid, port_dark;
+
 int64_t apps_port_mono_ms(void) {
-    return 0;
+    return port_mono_ms;
 }
 
 bool apps_port_epoch_ms(int64_t *out) {
-    (void)out;
-    return false;
+    if (!port_epoch_valid) {
+        return false;
+    }
+    *out = port_epoch_ms;
+    return true;
+}
+
+bool apps_port_dark(void) {
+    return port_dark;
 }
 
 void apps_port_ui_lock(void) {}
@@ -1444,6 +1457,398 @@ static void require_refused(void) {
     }
 }
 
+/* ---- The time module ---- */
+
+/* The conversions that depend on the time zone, which apphost (UTC0 always) can't tell from UTC: the board's zone,
+ * PST8PDT, on both sides of a change of the clock, and a local time that doesn't exist. Each line is one check, as
+ * the app joins its values with spaces; the expected values are the zone's, worked out with Python's zoneinfo
+ * (America/Los_Angeles) and not with this code. A is 2026-01-01T00:00:00Z, B is 2026-07-01T12:30:45Z, SPRING is
+ * 2026-03-08T10:00:00Z (2:00 PST, when the clocks go to 3:00 PDT) and FALL is 2026-11-01T09:00:00Z (2:00 PDT, 1:00 PST).
+ * The last is the calendar's start (0000-01-01T00:00:00Z) seen from PST: the year -1 for %Y, and 99 for %y. */
+static const char *const ZONE_APP =
+    "local A, B, SPRING, FALL = 1767225600000, 1782909045000, 1772964000000, 1793523600000\n"
+    "local out = {}\n"
+    "local function add(...) out[#out + 1] = table.concat({...}, ' ') end\n"
+    "local function when(ms) return time.format('%Y-%m-%d %H:%M:%S %a %j', ms) end\n"
+    "return {message = function()\n"
+    "  add(when(A)) add(when(B)) add(when(SPRING - 1000)) add(when(SPRING)) add(when(FALL - 1000)) add(when(FALL))\n"
+    "  local d = time.date(A)\n"
+    "  add(d.year, d.month, d.day, d.hour, d.min, d.sec, d.wday, d.yday)\n"
+    "  add(os.date('%H:%M', A // 1000), os.date('!%H:%M', A // 1000))\n"
+    "  local local_t, utc_t = os.date('*t', B // 1000), os.date('!*t', B // 1000)\n"
+    "  add(local_t.hour, tostring(local_t.isdst), utc_t.hour, tostring(utc_t.isdst))\n"
+    "  add(os.time{year = 2026, month = 7, day = 1, hour = 5, min = 30, sec = 45})\n"
+    "  add(os.time{year = 2026, month = 1, day = 1, hour = 0})\n"
+    "  add(os.time{year = 2026, month = 7, day = 1})\n"
+    "  local t = {year = 2026, month = 13, day = 32, hour = 25}\n"
+    "  add(os.time(t), t.year, t.month, t.day, t.hour, t.min, t.sec, t.wday, t.yday)\n"
+    "  add(time.format('%Y %y', -62167219200000))\n"
+    "  return out\n"
+    "end}\n";
+
+static const char *const ZONE_WANT =
+    "[\"2025-12-31 16:00:00 Wed 365\","
+    "\"2026-07-01 05:30:45 Wed 182\","
+    "\"2026-03-08 01:59:59 Sun 067\","
+    "\"2026-03-08 03:00:00 Sun 067\","
+    "\"2026-11-01 01:59:59 Sun 305\","
+    "\"2026-11-01 01:00:00 Sun 305\","
+    "\"2025 12 31 16 0 0 4 365\","
+    "\"16:00 00:00\","
+    "\"5 true 12 false\","
+    "\"1782909045\","
+    "\"1767254400\","
+    "\"1782932400\","
+    "\"1801558800 2027 2 2 1 0 0 3 33\","
+    "\"-1 99\"]";
+
+static void time_zone(void) {
+    CHECK(setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1) == 0, "setenv");
+    tzset();
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, ZONE_APP);
+    if (rt != NULL) {
+        char err[256] = "";
+        char *reply = send(rt, "go", err, sizeof err);
+        CHECK(reply != NULL, "the message failed: %s", err);
+        if (reply != NULL) {
+            /* One line each, so that a difference says which. */
+            const char *want = ZONE_WANT;
+            for (const char *got = reply; *got != '\0' && *want != '\0';) {
+                const char *got_end = strstr(got, "\",\""), *want_end = strstr(want, "\",\"");
+                size_t got_n = got_end != NULL ? (size_t)(got_end - got) + 1 : strlen(got);
+                size_t want_n = want_end != NULL ? (size_t)(want_end - want) + 1 : strlen(want);
+                CHECK(got_n == want_n && strncmp(got, want, got_n) == 0, "got  %.*s\n   want %.*s", (int)got_n, got,
+                      (int)want_n, want);
+                if (got_end == NULL || want_end == NULL) {
+                    break;
+                }
+                got += got_n + 1;
+                want += want_n + 1;
+            }
+            CHECK(strcmp(reply, ZONE_WANT) == 0, "the replies differ: %s", reply);
+        }
+        apps_port_free(reply);
+    }
+    finish(rt, pkg);
+    CHECK(setenv("TZ", "UTC0", 1) == 0, "setenv");
+    tzset();
+}
+
+/* Every binding of the time module and the timers allocates (tables, a handle, a registry reference), so a heap that
+ * refuses at any of them is the app running out of memory: a crashed app with its record, as anywhere else, and never
+ * an abort or a leak. */
+static const char *const SERVICES_APP =
+    "local function f() end\n"
+    "return {message = function()\n"
+    "  local d = time.date(0)\n"
+    "  local text = time.format('%a %b %e %H:%M:%S %Y', 86400000)\n"
+    "  local t = os.date('*t', 0)\n"
+    "  local s = os.time{year = 2026, month = 1, day = 1, hour = 0}\n"
+    "  timer.after(100, f)\n"
+    "  timer.every(100, f):cancel()\n"
+    "  return {d.year, text, t.year, s > 0}\n"
+    "end}\n";
+
+static void services_refused(void) {
+    CHECK(setenv("TZ", "UTC0", 1) == 0, "setenv");
+    tzset();
+    bool saw_crash = false, saw_soft_failure = false;
+    long reached = 0;
+    for (long k = 1; k < 100000; k++) {
+        char err[256] = "";
+        apps_pkg_t *pkg = make_pkg(SERVICES_APP);
+        apps_rt_t *rt = apps_rt_new(pkg, err, sizeof err);
+        CHECK(rt != NULL && apps_rt_start(rt), "%s", err);
+        if (rt == NULL) {
+            free_pkg(pkg);
+            return;
+        }
+        long before = growths;
+        refuse_from = growths + k;
+        char *reply = send(rt, "go", err, sizeof err);
+        bool refused = growths >= refuse_from;
+        refuse_from = -1;
+        if (refused) {
+            CHECK(reply == NULL, "k=%ld: refused, but a reply came: '%s'", k, reply);
+            if (apps_rt_state(rt) == APPS_STATE_CRASHED) {
+                saw_crash = true;
+                CHECK(strcmp(err, apps_rt_last_error(rt)) == 0 && strstr(err, "out of memory") != NULL, "k=%ld: '%s'", k,
+                      err);
+            } else {  /* only the reply's own block can be refused without the app running out of memory */
+                saw_soft_failure = true;
+                CHECK(strcmp(err, "message: out of memory") == 0 && apps_rt_state(rt) == APPS_STATE_RUNNING,
+                      "k=%ld: '%s', state %d", k, err, apps_rt_state(rt));
+            }
+        } else {
+            CHECK(reply != NULL && strcmp(reply, "[1970,\"Fri Jan  2 00:00:00 1970\",1970,true]") == 0 && err[0] == '\0',
+                  "k=%ld: '%s' '%s'", k, reply != NULL ? reply : "(none)", err);
+            reached = growths - before;
+        }
+        apps_port_free(reply);
+        finish(rt, pkg);
+        if (!refused) {
+            break;
+        }
+    }
+    CHECK(reached > 10, "only %ld growth requests in the message", reached);
+    CHECK(saw_crash, "no refusal ever crashed the app");
+    CHECK(saw_soft_failure, "the reply's block was never the one refused");
+}
+
+/* The timers' contract at the runtime's own API, which the app task and apphost build on, where a script only sees events:
+ * when the next one is due, what one step of a pass does (which timer, in what order, from what time it reschedules), what the
+ * dark screen, a stop, a crash and a kill from outside leave. The clocks are the case's. */
+static const char *const TIMER_APP =
+    "local app = {}\n"
+    "function app.start()\n"
+    "  timer.after(300, function() print('c') end)\n"
+    "  timer.after(100, function() print('a') end)\n"
+    "  timer.every(200, function() print('b') end)\n"
+    "  timer.after(100, function() print('a2') end)\n"
+    "end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+
+static void timer_api(void) {
+    port_mono_ms = 5000;
+    port_dark = false;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, TIMER_APP);
+    if (rt == NULL) {
+        return;
+    }
+    CHECK(apps_rt_timer_count(rt) == 4, "%d timers", apps_rt_timer_count(rt));
+    CHECK(apps_rt_next_deadline(rt) == 5100, "the earliest is due at %lld", (long long)apps_rt_next_deadline(rt));
+    CHECK(apps_rt_next_deadline(NULL) == INT64_MAX && !apps_rt_has_work(NULL, 0) && !apps_rt_run_one_timer(NULL, 0), "NULL");
+    /* Nothing is due a millisecond early. */
+    CHECK(!apps_rt_has_work(rt, 5099) && !apps_rt_run_one_timer(rt, 5099), "a timer ran early");
+    expect_no_logs();
+    /* Two are due at 5100: a step runs one, the one armed first, and the next step the other. */
+    CHECK(apps_rt_has_work(rt, 5100), "no work at the deadline");
+    CHECK(apps_rt_run_one_timer(rt, 5100), "no step at 5100");
+    expect_logged("a");
+    CHECK(apps_rt_timer_count(rt) == 3 && apps_rt_next_deadline(rt) == 5100, "a one-shot is gone, its twin is due");
+    CHECK(apps_rt_run_one_timer(rt, 5100), "no second step");
+    CHECK(!apps_rt_run_one_timer(rt, 5100) && !apps_rt_has_work(rt, 5100), "a third step at 5100");
+    expect_logged("a", "a2");
+    CHECK(apps_rt_next_deadline(rt) == 5200, "next: %lld", (long long)apps_rt_next_deadline(rt));
+    /* A dark screen: no deadline, no work, no step, whatever is overdue. */
+    port_dark = true;
+    CHECK(apps_rt_next_deadline(rt) == INT64_MAX && !apps_rt_has_work(rt, 99999) && !apps_rt_run_one_timer(rt, 99999),
+          "a timer was due while the screen was dark");
+    expect_logged("a", "a2");
+    port_dark = false;
+    /* A pass at 9000, long after: each due timer once, earliest first, and the every timer's next run is a period after the
+     * pass's time, not after the port's clock (which is still 5000). */
+    apps_rt_run_timers(rt, 9000);
+    expect_logged("a", "a2", "b", "c");
+    CHECK(apps_rt_timer_count(rt) == 1 && apps_rt_next_deadline(rt) == 9200, "after the pass: %d timers, next at %lld",
+          apps_rt_timer_count(rt), (long long)apps_rt_next_deadline(rt));
+    /* A stop takes the timers with it, and a stopped runtime has no deadline and runs none. */
+    apps_rt_stop(rt);
+    CHECK(apps_rt_state(rt) == APPS_STATE_STOPPED && apps_rt_timer_count(rt) == 0, "stopped: %d timers", apps_rt_timer_count(rt));
+    CHECK(apps_rt_next_deadline(rt) == INT64_MAX && !apps_rt_has_work(rt, 99999) && !apps_rt_run_one_timer(rt, 99999),
+          "a stopped runtime has work");
+    expect_logged("a", "a2", "b", "c", "stop");
+    finish(rt, pkg);
+
+    /* A callback that fails is a crash, and the other timers go with the app. */
+    rt = launch(&pkg, "return {start = function()\n"
+                      "  timer.every(1000, function() print('never') end)\n"
+                      "  timer.after(100, function() error('boom') end)\n"
+                      "end}");
+    if (rt != NULL) {
+        apps_rt_run_timers(rt, 5100);
+        CHECK(apps_rt_state(rt) == APPS_STATE_CRASHED && strncmp(apps_rt_last_error(rt), "main.lua:3: boom\nstack traceback:", 33) == 0,
+              "%d '%s'", apps_rt_state(rt), apps_rt_last_error(rt));
+        CHECK(apps_rt_timer_count(rt) == 0 && apps_rt_next_deadline(rt) == INT64_MAX && !apps_rt_run_one_timer(rt, 99999),
+              "a crashed app keeps timers");
+        expect_no_logs();
+    }
+    finish(rt, pkg);
+
+    /* An app that another task killed, with no call to find out: the next step is the call that does, and the crash has the
+     * kill's reason. */
+    rt = launch(&pkg, "return {start = function() timer.every(1000, function() print('never') end) end}");
+    if (rt != NULL) {
+        apps_vm_kill(apps_rt_vm(rt), "stopped: killed by the case");
+        CHECK(apps_rt_state(rt) == APPS_STATE_RUNNING, "the kill alone doesn't crash it");
+        CHECK(apps_rt_has_work(rt, 5000), "a killed app has no work to do");
+        CHECK(apps_rt_run_one_timer(rt, 5000), "no step for a killed app");
+        CHECK(apps_rt_state(rt) == APPS_STATE_CRASHED && strcmp(apps_rt_last_error(rt), "stopped: killed by the case") == 0,
+              "%d '%s'", apps_rt_state(rt), apps_rt_last_error(rt));
+        CHECK(apps_rt_timer_count(rt) == 0 && !apps_rt_has_work(rt, 5000), "a crashed app has work");
+        expect_no_logs();
+    }
+    finish(rt, pkg);
+    port_mono_ms = 0;
+}
+
+/* ---- The duty cycle's windows at the runtime's own API ----
+ *
+ * What apphost can't show: it passes through every 10 ms and closes each window as it ends, while the app task can sleep in its
+ * queue across a boundary, wake for an event, and find windows over. The clock and the calls are the case's: `burn` is one call
+ * of the app that runs a loop of n iterations, n VM instructions, at a time of its choosing. A window is hot over
+ * APPS_DUTY_INSTR_PER_S, so a call of 0.4 of it is cool twice in a window and hot three times. */
+static const char *const BURN_APP = "return {message = function(event, n) for i = 1, n do end return true end}\n";
+
+#define THROTTLED_TEXT "throttled: using more than 40% of the CPU"
+#define KILLED_TEXT "stopped: used more than 40% of the CPU for 5 s"
+
+static unsigned burn_size(void) {
+    unsigned n = APPS_DUTY_INSTR_PER_S / 10 * 4;
+    CHECK(n < APPS_BUDGET_CALL, "a call of 0.4 of the rate (%u) is over the call budget (%u)", n, (unsigned)APPS_BUDGET_CALL);
+    return n;
+}
+
+static void burn(apps_rt_t *rt, int64_t at, unsigned n) {
+    char data[16], err[256] = "";
+    snprintf(data, sizeof data, "%u", n);
+    port_mono_ms = at;
+    char *reply = apps_rt_message(rt, "burn", data, strlen(data), err, sizeof err);
+    CHECK(reply != NULL, "a call of %u at %lld: '%s'", n, (long long)at, err);
+    apps_port_free(reply);
+}
+
+/* Three calls inside the window that began at `begin`: hot. */
+static void hot_window(apps_rt_t *rt, int64_t begin) {
+    for (int i = 0; i < 3; i++) {
+        burn(rt, begin + 100 + 100 * i, burn_size());
+    }
+}
+
+/* A window that closes together with a cool one (the task slept across both) is the hot one's alone: the count begins again. */
+static void duty_jump(void) {
+    port_mono_ms = 1000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, BURN_APP);  /* the first window began at 1000 */
+    if (rt == NULL) {
+        return;
+    }
+    for (int w = 0; w < 2; w++) {
+        hot_window(rt, 1000 + 1000 * w);
+        CHECK(!apps_rt_has_work(rt, 2000 + 1000 * w), "work at the end of window %d", w);
+    }
+    CHECK(apps_rt_warnings(rt)[0] == '\0', "two hot windows are not three: '%s'", apps_rt_warnings(rt));
+    /* The third is hot as well, and nothing looks at the clock until 5100: the window that ended at 4000 (hot) and the one that
+     * ended at 5000 (nothing in it) are closed together. The last of them is cool, so the count is back at 0. */
+    hot_window(rt, 3000);
+    CHECK(!apps_rt_has_work(rt, 5100), "work after the jump");
+    CHECK(apps_rt_warnings(rt)[0] == '\0' && apps_rt_state(rt) == APPS_STATE_RUNNING,
+          "a hot window followed by a silent one throttles: '%s'", apps_rt_warnings(rt));
+    expect_no_logs();
+    /* It takes three hot windows from there: those of 5000, 6000 and 7000. */
+    for (int w = 0; w < 3; w++) {
+        hot_window(rt, 5000 + 1000 * w);
+        CHECK(!apps_rt_has_work(rt, 6000 + 1000 * w), "work at the end of window %d after the jump", w);
+        CHECK((apps_rt_warnings(rt)[0] != '\0') == (w == 2), "after %d hot windows: '%s'", w + 1, apps_rt_warnings(rt));
+    }
+    expect_logged(THROTTLED_TEXT);
+    CHECK(strcmp(apps_rt_warnings(rt), THROTTLED_TEXT) == 0, "'%s'", apps_rt_warnings(rt));
+    finish(rt, pkg);
+    port_mono_ms = 0;
+}
+
+/* The loop's pass at the end of a window closes it, with no call or timer in it: the warning at the third hot window, and at the
+ * fifth the kill, which the pass reports as work and the step after it as the app's crash. */
+static void duty_pass(void) {
+    port_mono_ms = 1000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, BURN_APP);
+    if (rt == NULL) {
+        return;
+    }
+    for (int w = 0; w < 5; w++) {
+        hot_window(rt, 1000 + 1000 * w);
+        CHECK(!apps_rt_has_work(rt, 1999 + 1000 * w), "window %d closed a millisecond early", w + 1);
+        bool work = apps_rt_has_work(rt, 2000 + 1000 * w);
+        CHECK(work == (w == 4), "after %d hot windows: work %d", w + 1, work);
+        CHECK((apps_rt_warnings(rt)[0] != '\0') == (w >= 2), "after %d hot windows: '%s'", w + 1, apps_rt_warnings(rt));
+    }
+    expect_logged(THROTTLED_TEXT);
+    CHECK(apps_rt_state(rt) == APPS_STATE_RUNNING, "the kill alone doesn't crash it");
+    CHECK(apps_rt_run_one_timer(rt, 6000), "no step for a killed app");
+    CHECK(apps_rt_state(rt) == APPS_STATE_CRASHED && strcmp(apps_rt_last_error(rt), KILLED_TEXT) == 0, "%d '%s'",
+          apps_rt_state(rt), apps_rt_last_error(rt));
+    finish(rt, pkg);
+    port_mono_ms = 0;
+}
+
+/* A throttled app's timers wait 100 ms more, those it arms while it is throttled too, and a cool window ends it. */
+static const char *const ARM_APP =
+    "return {message = function(event, n)\n"
+    "  if event == 'arm' then timer.after(50, function() end) return true end\n"
+    "  for i = 1, n do end return true end}\n";
+
+/* The monotonic time the earliest timer is due at, after `arm` at `at` ms; then that timer runs, which frees its slot. */
+static int64_t arm_at(apps_rt_t *rt, int64_t at) {
+    char err[256] = "";
+    port_mono_ms = at;
+    char *reply = apps_rt_message(rt, "arm", NULL, 0, err, sizeof err);
+    CHECK(reply != NULL, "arm at %lld: '%s'", (long long)at, err);
+    apps_port_free(reply);
+    int64_t due = apps_rt_next_deadline(rt);
+    CHECK(due != INT64_MAX && apps_rt_run_one_timer(rt, due) && apps_rt_timer_count(rt) == 0, "the timer armed at %lld",
+          (long long)at);
+    return due;
+}
+
+static void duty_throttle(void) {
+    port_mono_ms = 1000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, ARM_APP);
+    if (rt == NULL) {
+        return;
+    }
+    int64_t due = arm_at(rt, 1050);
+    CHECK(due == 1100, "a timer armed at 1050 for 50 ms is due at %lld", (long long)due);
+    for (int w = 0; w < 3; w++) {
+        hot_window(rt, 1000 + 1000 * w);
+        CHECK(!apps_rt_has_work(rt, 2000 + 1000 * w), "work at the end of window %d", w + 1);
+    }
+    CHECK(strcmp(apps_rt_warnings(rt), THROTTLED_TEXT) == 0, "three hot windows: '%s'", apps_rt_warnings(rt));
+    due = arm_at(rt, 4050);
+    CHECK(due == 4200, "a timer armed at 4050 for 50 ms, while throttled, is due at %lld", (long long)due);
+    /* Nothing but those two calls in the window that follows: it is cool, and the throttle ends with it. */
+    CHECK(!apps_rt_has_work(rt, 5000), "work at the end of the cool window");
+    due = arm_at(rt, 5050);
+    CHECK(due == 5100, "a timer armed at 5050 for 50 ms, after the throttle, is due at %lld", (long long)due);
+    expect_logged(THROTTLED_TEXT);
+    finish(rt, pkg);
+    port_mono_ms = 0;
+}
+
+/* A call closes the windows that have ended before it runs, with no pass of the loop in between (the task asleep in its queue
+ * across a boundary wakes for an event): the warning is there after the first call of the window that follows the third hot
+ * one, and the first call of the one after the fifth is refused, with the kill as its result. */
+static void duty_calls(void) {
+    port_mono_ms = 1000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, BURN_APP);
+    if (rt == NULL) {
+        return;
+    }
+    for (int w = 0; w < 5; w++) {
+        hot_window(rt, 1000 + 1000 * w);
+        /* Window w is closed by the call that opens window w + 1, so the third hot one by the first call of the fourth. */
+        CHECK((apps_rt_warnings(rt)[0] != '\0') == (w >= 3), "after the calls of window %d: '%s'", w + 1, apps_rt_warnings(rt));
+    }
+    expect_logged(THROTTLED_TEXT);
+    CHECK(apps_rt_state(rt) == APPS_STATE_RUNNING, "state %d", apps_rt_state(rt));
+    char data[16], err[256] = "";
+    snprintf(data, sizeof data, "%u", burn_size());
+    port_mono_ms = 6100;
+    char *reply = apps_rt_message(rt, "burn", data, strlen(data), err, sizeof err);
+    CHECK(reply == NULL && strcmp(err, KILLED_TEXT) == 0, "the call after the fifth hot window: '%s' '%s'",
+          reply != NULL ? reply : "(none)", err);
+    CHECK(apps_rt_state(rt) == APPS_STATE_CRASHED && strcmp(apps_rt_last_error(rt), KILLED_TEXT) == 0, "%d '%s'",
+          apps_rt_state(rt), apps_rt_last_error(rt));
+    apps_port_free(reply);
+    finish(rt, pkg);
+    port_mono_ms = 0;
+}
+
 /* ---- The C stack under this module's bindings ----
  *
  * The recursions that go deepest in C through print and require, each to Lua's C-call limit, on a thread whose
@@ -1507,6 +1912,18 @@ static void stack_print_chain(void) {
                              "return 'x' end})\n"
                              "return {message = function() print(o) end}"}};
     stack_chain("print_chain", files, 1);
+}
+
+/* Task 16: os.time reads the fields of the table it is given with lua_getfield, which runs the table's __index, which
+ * here calls os.time with the same table again, to the C-call limit. (time.format, os.date and the timer functions run no
+ * app code from C: the timers' callbacks are called by the runtime, outside any C frame of the module.) */
+static void stack_os_time_chain(void) {
+    const file_t files[] = {{"main.lua",
+                             "depth = 0\n"
+                             "local t = setmetatable({}, {__index = function(self, key) depth = depth + 1 "
+                             "return os.time(self) end})\n"
+                             "return {message = function() return os.time(t) end}"}};
+    stack_chain("os_time_chain", files, 1);
 }
 
 /* The reviewer's probe (Task 8's review): string.format('%s', o), which holds a luaL_Buffer, calls o's __tostring,
@@ -1613,7 +2030,9 @@ static size_t on_exact_stack(stack_case_t *c) {
 #define REQUIRE_SLACK ((size_t)4096)
 
 static void c_stack(void) {
-    static stack_case_t cases[] = {{"require_chain", stack_require_chain}, {"print_chain", stack_print_chain}};
+    static stack_case_t cases[] = {{"require_chain", stack_require_chain},
+                                   {"print_chain", stack_print_chain},
+                                   {"os_time_chain", stack_os_time_chain}};
     for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
         stack_depth = 0;
         size_t used = on_exact_stack(&cases[i]);
@@ -1679,6 +2098,13 @@ int main(int argc, char **argv) {
         {"handlers_refused", handlers_refused},
         {"message_refused", message_refused},
         {"require_refused", require_refused},
+        {"time_zone", time_zone},
+        {"services_refused", services_refused},
+        {"timer_api", timer_api},
+        {"duty_jump", duty_jump},
+        {"duty_pass", duty_pass},
+        {"duty_calls", duty_calls},
+        {"duty_throttle", duty_throttle},
         {"c_stack", c_stack},
     };
     if (argc != 2) {

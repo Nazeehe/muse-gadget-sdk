@@ -38,6 +38,7 @@
 #include "muse_chat.h"
 #if CONFIG_MUSE_CLOCK
 #include "muse_clock.h"
+#include "muse_sntp.h"
 #endif
 #if CONFIG_MUSE_APPS
 #include "muse_apps.h"
@@ -1903,6 +1904,9 @@ static void frame_tick(lv_timer_t *timer)
     if (update_sleep()) {
         return;
     }
+#if CONFIG_MUSE_CLOCK
+    muse_sntp_poll();   /* before anything that returns early (an app, the video): the clock is set for them too */
+#endif
 #if CONFIG_MUSE_VIDEO
     if (muse_video_tick()) {
         muse_menu_close();

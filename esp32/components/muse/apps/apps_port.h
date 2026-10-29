@@ -34,8 +34,13 @@
 int64_t apps_port_mono_ms(void);
 
 /* The wall clock, as milliseconds since 1970-01-01 UTC. False, leaving *out alone, until the clock is
- * set (SNTP). Any task. */
+ * set (SNTP: the device asks muse_time_valid()). It jumps when SNTP sets it, so timers run on
+ * apps_port_mono_ms. Any task. */
 bool apps_port_epoch_ms(int64_t *out);
+
+/* Whether the screen is dark for sleep (the device: muse_ui_dark()). The apps' timers don't run while it is, and
+ * the first round after it ends runs each one that came due. Any task. */
+bool apps_port_dark(void);
 
 /* The apps' heap: PSRAM on the device. realloc(3) for n > 0: ptr NULL allocates, otherwise the block is
  * resized and may move; on failure it returns NULL and leaves ptr as it was. It is never called with

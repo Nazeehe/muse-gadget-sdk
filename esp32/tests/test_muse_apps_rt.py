@@ -41,7 +41,8 @@ ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
 FIXTURES = ROOT / "tests/muse_apps_fixtures"
 HARNESS_SOURCES = [ROOT / "tests/muse_apps_rt_harness.c", APPS / "apps_rt.c", APPS / "apps_vm.c",
-                   APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_ui.c"]
+                   APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_ui.c",
+                   APPS / "apps_svc.c"]
 INCLUDES = [ROOT / "components/lua/src", APPS]
 
 # The messages, exactly (apps_rt.h lists them, and apps_vm.h the kills').
@@ -50,6 +51,8 @@ NO_MESSAGE = "main.lua has no message(event, data) handler"
 NOT_RUNNING = "the app is not running"
 BUDGET_CALL = "stopped: ran more than 2000000 VM instructions in one callback (use timer.every for long work)"
 BUDGET_START = "stopped: ran more than 5000000 VM instructions in one callback (use timer.every for long work)"
+# The commands apphost lists when it doesn't know one.
+COMMANDS = "(commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, sync, timers)"
 # The ring: a line takes its length plus one of 8192 bytes; print cuts a line at 200 bytes.
 RING_BYTES = 8192
 LINE_MAX = 200
@@ -968,7 +971,7 @@ class RuntimeTest(AppHostTestCase):
         self.assertEqual(run.events[2]["data"], "ping")
         self.assertEqual(run.messages("error"), [
             "message needs an event name: message <event> [json]",
-            "unknown command 'frobnicate' (commands: message, stop, start, show, hide, state, log, tap, dump)",
+            "unknown command 'frobnicate' " + COMMANDS,
             "log needs a number of lines: log [n]",
             "log needs a number of lines: log [n]",
             "state takes no arguments"])
@@ -1097,7 +1100,7 @@ class RuntimeTest(AppHostTestCase):
                              input=b'\xff\xc3(\ncaf\xc3\xa9\x01\nq"uote\\back\n')
         self.assertEqual(done.returncode, 0)
         self.assertEqual(done.stderr, b"")
-        tail = " (commands: message, stop, start, show, hide, state, log, tap, dump)"
+        tail = " " + COMMANDS
         self.assertEqual(Run(done).messages("error"), [
             "unknown command '\ufffd\ufffd('" + tail,
             "unknown command 'caf\u00e9\x01'" + tail,
@@ -1358,9 +1361,10 @@ class HarnessTest(unittest.TestCase):
 
     def test_c_stack_chains_through_print_and_require_fit_the_task_stack(self):
         # The Task 5 rule for what this module adds: the recursions that go deepest in C through print and
-        # require, each to Lua's C-call limit, on an exact 96 KB region (the host's stand-in for the device's
-        # 56 KB task stack), in a build without the sanitizers, which fatten frames. The high-water marks go
-        # to the log.
+        # require (and, from Task 16, through os.time's reads of a table's fields, the one binding of the time
+        # services that runs app code from C), each to Lua's C-call limit, on an exact 96 KB region (the host's
+        # stand-in for the device's 56 KB task stack), in a build without the sanitizers, which fatten frames. The
+        # high-water marks go to the log.
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         plain = apps_host.build("muse_apps_rt_stack", [*HARNESS_SOURCES, *apps_host.lua_sources()], tmp.name,

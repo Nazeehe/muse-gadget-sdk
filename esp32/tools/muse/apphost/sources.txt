@@ -11,6 +11,7 @@ components/muse/apps/apps_json.c
 components/muse/apps/apps_pkg.c
 components/muse/apps/apps_rt.c
 components/muse/apps/apps_ui.c
+components/muse/apps/apps_svc.c
 tools/muse/apphost/apphost.c
 tools/muse/apphost/apphost_port.c
 tools/muse/apphost/sha256.c

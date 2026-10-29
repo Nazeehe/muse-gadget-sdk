@@ -22,9 +22,8 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_netif_sntp.h"
 
-#include "muse_wifi.h"
+#include "muse_sntp.h"
 
 static const char *TAG = "muse_clock";
 
@@ -43,12 +42,9 @@ static const char *TAG = "muse_clock";
 #define COLOR_FAINT 0x8a7f6c
 #define COLOR_BLUED 0x1f3a70
 
-#define VALID_YEAR 2025         /* before SNTP the RTC counts from 1970 */
-
 static lv_obj_t *s_hands;      /* over the whole tile, so its centre is the watch's */
 static lv_obj_t *s_status;
 static int s_r;                 /* the case's radius */
-static bool s_sntp;
 
 /* What the hands show, in degrees clockwise from XII; -1 before the first. */
 static float s_hour_deg = -1, s_min_deg = -1, s_sec_deg = -1;
@@ -314,13 +310,6 @@ void muse_clock_build(lv_obj_t *tile)
 
 void muse_clock_tick(bool visible)
 {
-    if (!s_sntp && muse_wifi_connected()) {
-        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-        esp_err_t err = esp_netif_sntp_init(&cfg);
-        ESP_LOGI(TAG, "SNTP %s, time zone %s", err == ESP_OK ? "started" : esp_err_to_name(err),
-                 CONFIG_MUSE_CLOCK_TZ);
-        s_sntp = true;
-    }
     if (!visible || !s_hands) {
         return;
     }
@@ -331,7 +320,7 @@ void muse_clock_tick(bool visible)
         return;
     }
     s_shown_sec = tm.tm_sec;
-    bool valid = tm.tm_year + 1900 >= VALID_YEAR;
+    bool valid = muse_time_valid();
     if ((int)valid != s_shown_valid) {
         lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, valid);
         s_shown_valid = valid;

@@ -734,6 +734,19 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   `>app.send ID EVENT [JSON]`; `>app.status` takes no id and reports the app
   that runs. The first line after the port opens can be lost, so send `w`
   first and wait a second.
+- **Boot:** the apps' storage waits for the Link (`muse_apps.h`). The app task
+  mounts the FAT and `apps_nvs`, and the I/O worker that does it is made, once
+  the reply to the first `link.register` has come, accepted or not
+  (`noise_control.cpp`); at once when no Link session was started at boot (no
+  Wi-Fi or pairing, or it couldn't connect: `app.c`); and 20 s after boot at
+  the latest (`APPS_BOOT_DEADLINE_MS`, `apps_task.h`). The boot's lowest
+  internal RAM falls between the Link's handshake and its registration, and
+  this keeps the mount's internal allocations out of that window. Until the
+  store is mounted the apps are starting: `app.*` answers `unavailable`, "apps
+  are starting; try again in a few seconds", the launcher says "Loading
+  apps...", and an alarm the store re-arms after a restart fires once it is
+  mounted, up to the deadline late. A console `>app.*` line mounts it at once
+  (the I/O worker's first step).
 - **Limits:** a callback may run 1,000,000 Lua VM instructions and
   `main.lua`'s top level with `start()` 2,000,000, each in at most 1 s; the
   1.75C runs about 2.5 M instructions a second of the simplest loop (and,
@@ -780,10 +793,13 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   stored). Its lowest since boot is set while the Link's session comes up and
   registers. The apps' commands make the registration 3,967 bytes against
   2,669, and an apps build prints it into PSRAM (`noise_control.cpp`): under
-  4 KB, malloc takes internal RAM. Over 24 boots each, that lowest was
-  15.4 KB at the median and 9.1 KB at the least with the apps, and 11.2 KB and
-  10.3 KB without; one image's median moves by a few KB from one run of boots
-  to the next. The boots that fall under the Link's 16 KB TX margin do so in
+  4 KB, malloc takes internal RAM. A build without the apps still prints its
+  2,669 bytes into a 3,072-byte malloc buffer, in internal RAM, so while the
+  registration is sent it holds 3 KB more internal RAM than an apps build, and
+  the two builds' floors aren't like for like. Before the boot's mount waited for the
+  Link (b944c60), over 24 boots each, that lowest was 15.4 KB at the median
+  and 9.1 KB at the least with the apps, and 11.2 KB and 10.3 KB without; one
+  image's median moves by a few KB from one run of boots to the next. The boots that fall under the Link's 16 KB TX margin do so in
   the Link's own setup (between the session's handshake and the registration's
   send), with or without the apps: that floor is an open item of the Link's.
   The deepest stacks seen: the app task 13,012 bytes free of 57,344, the I/O

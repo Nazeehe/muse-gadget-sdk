@@ -2886,6 +2886,14 @@ void app_run(void) {
         ESP_LOGI(TAG, "no wifi creds, waiting for BLE provision");
     }
 
+#if CONFIG_MUSE_APPS
+    // The apps' storage waits for the Link's registration (muse_apps.h). With
+    // no Link session started (no Wi-Fi or pairing, or it couldn't connect),
+    // none will register at boot: it starts now.
+    if (!noise_ctrl_is_running()) {
+        muse_apps_link_offline();
+    }
+#endif
 #if CONFIG_MUSE_ENABLED
     muse_glue_link_ready();
 #endif

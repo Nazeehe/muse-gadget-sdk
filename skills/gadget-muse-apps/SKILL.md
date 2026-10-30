@@ -30,6 +30,7 @@ This guide is for Muse, writing apps for a Muse gadget with a round screen. It c
 - One app runs at a time. It runs on the gadget itself: Muse installs it and can talk to it, and it keeps working without Muse, the VM or Wi-Fi.
 - The user opens apps from the launcher (a long press on the watch face; it lists the four most recently used). A right swipe puts the app behind, where it keeps running. A voice turn puts the app behind too, and brings it back when the turn ends. An alarm brings its app to the front, and starts it first if it isn't running.
 - Installed apps are kept in the gadget's flash and outlive a restart. A gadget without the apps partition keeps them in RAM until it restarts: results then say `"storage":"ram"` with a hint.
+- Right after a restart the apps start once the gadget has registered with Muse, or 20 s after the restart at the latest. Until then the launcher says "Loading apps..." and the `app.*` commands answer `unavailable`: try again in a few seconds.
 - The gadget stops an app that runs away; it doesn't restart for one. Each callback has a budget of Lua VM instructions (1,000,000, about 0.4 s on the gadget; 2,000,000 for main.lua's top level and `start()`) and 1 s of time, the Lua heap is capped at the manifest's `memory_kb`, and an app that uses more than 40% of the CPU for 5 s is stopped. Those are checked as the app's Lua runs; a call held up inside the gadget's own code is bounded by a supervisor instead. A call that hasn't returned after 3 s marks the app hung, and the gadget says so on screen.
 - The Lua is sandboxed. It has the base library, `coroutine`, `table`, `string`, `math` and `utf8`, and the gadget's modules below. There is no `io`, `debug`, `load`, `dofile` or `collectgarbage`, and `require` loads only the app's own files. `string.match`, `string.gmatch` and `string.gsub` raise an error (patterns can run without bound); `string.find` searches plain text only. Globals are strict: reading one that was never set is an error, with a suggestion when a name is close. Declare everything `local`: a global set to nil is gone, and reading it again is that error. `setmetatable` refuses a metatable with `__gc`, and to-be-closed variables (`local x <close> = ...`) are not available.
 
@@ -171,7 +172,7 @@ These need the `alarm` permission. An alarm belongs to the gadget, not to the ap
 
 At most 4 alarms an app and 8 on the gadget. One app's alarms may fire at most 6 times in a minute: when they fire more than 6 times within a minute, all of its alarms are cancelled, with no event to tell it (the gadget's log says `alarm: <id> fired more than 6 alarms in a minute; its alarms are cancelled`). Use `timer.every` for anything that repeats, and alarms for rare set times.
 
-An alarm outlives a restart of the gadget once the gadget has stored it, about a second after it is armed; one armed before the gadget has set its clock is kept once the clock is set. After a restart the stored alarms come back once the gadget has set its clock, and until then `alarm.remaining` is nil for them; an app that arms or cancels one of those names first has its way. On a gadget that keeps its apps in RAM, no alarm outlives a restart.
+An alarm outlives a restart of the gadget once the gadget has stored it, about a second after it is armed; one armed before the gadget has set its clock is kept once the clock is set. After a restart the stored alarms come back once the gadget has set its clock and its apps have started (up to 20 s after the restart, so an alarm due before then fires that late), and until then `alarm.remaining` is nil for them; an app that arms or cancels one of those names first has its way. On a gadget that keeps its apps in RAM, no alarm outlives a restart.
 
 What an app that uses alarms must guard against (the timer example shows the first five):
 
@@ -331,6 +332,7 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `reading <file>: out of memory; <id> is running, and an update needs room for two copies of it: stop it, then install again`: stop the app with `app.control`, then install it again.
 - `the app stopped responding; no app can run until its stuck call returns or the gadget restarts`: a hung call; ask the user to restart the gadget.
 - `the app task is busy; try again`: try again in a moment.
+- `apps are starting; try again in a few seconds`: the gadget has just restarted: try again in a few seconds.
 - `the gadget is short of memory right now; try again in a few seconds`: try again in a few seconds.
 - `not enough memory for a full-size snapshot right now; take it at scale 2`: take the snapshot again with `scale: 2`.
 - `not enough memory for a snapshot while the app runs; stop it (app.control stop) or make it use less memory, then try again`: the running app holds the room a snapshot needs: stop it with `app.control`, or give it smaller images or a smaller `memory_kb`, and take the snapshot again.

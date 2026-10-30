@@ -132,6 +132,13 @@ void muse_apps_set_vm_ops(const muse_apps_vm_ops_t *ops) {
     vm_ops = ops;
 }
 
+/* Whether the apps are still starting (muse_apps_starting): a case sets it. */
+static bool apps_starting;
+
+bool muse_apps_starting(void) {
+    return apps_starting;
+}
+
 bool muse_apps_id_valid(const char *id, char *err, size_t err_len) {
     size_t n = id != NULL ? strlen(id) : 0;
     bool ok = n >= 2 && n <= 24 && id[0] >= 'a' && id[0] <= 'z';
@@ -1076,6 +1083,32 @@ static bool vm_read(const char *path, size_t max, int64_t deadline_us, const cha
     return vm_ops->read(path, max, keep_sunk, sunk, deadline_us, code, err, err_len);
 }
 
+
+/* I2: while the apps start (the boot's mount waits for the Link's registration, then runs), each of the four commands answers
+ * unavailable with MUSE_APPS_STARTING and starts nothing; a command that isn't the apps' is still unsupported. Once they have
+ * started, the commands are handled again. */
+static void commands_wait_while_the_apps_start(void) {
+    static const char want[] =
+        "{\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"apps are starting; try again in a few seconds\"}}";
+    apps_starting = true;
+    expect_reply_at(__LINE__, "app.install", "{\"id\":\"timer\"}", "r1", want);
+    expect_reply_at(__LINE__, "app.api", NULL, "r1", want);
+    expect_reply_at(__LINE__, "app.control", "{\"action\":\"list\"}", "r1", want);
+    expect_reply_at(__LINE__, "app.control", "{\"action\":\"launch\",\"id\":\"timer\"}", "r1", want);
+    expect_reply_at(__LINE__, "app.send", "{\"id\":\"timer\",\"event\":\"start\"}", "r1", want);
+    CHECK(installs == 0 && lists == 0 && asyncs == 0 && sends == 0 && writes == 0 && guides == 0, "something was started");
+    char *got = printed(apps_link_handle("app.nope", NULL, "r1", 7));
+    CHECK(strcmp(got, "{\"ok\":false,\"error\":{\"code\":\"unsupported\",\"message\":\"unknown app command\"}}") == 0, "%s", got);
+    free(got);
+    CHECK(psram_blocks == 0, "%d blocks held", psram_blocks);
+    apps_starting = false;
+    cJSON *list = cJSON_Parse("{\"action\":\"list\"}");
+    got = printed(apps_link_handle("app.control", list, "r1", 7));
+    cJSON_Delete(list);
+    CHECK(lists == 1, "the list wasn't asked for once the apps had started: %s", got);
+    free(got);
+}
+
 /*
  * apps_link_init puts vm_file behind the apps' VM ops. read opens the reader for the path with the install's owner and no keep
  * (the install runs on a PSRAM-stack task), reads it whole into the sink with max and the deadline as given, and always closes
@@ -1201,6 +1234,7 @@ int main(int argc, char **argv) {
         {"send_done_frees_context", send_done_frees_context},
         {"send_failures_pass_through", send_failures_pass_through},
         {"vm_ops_are_vm_file", vm_ops_are_vm_file},
+        {"commands_wait_while_the_apps_start", commands_wait_while_the_apps_start},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

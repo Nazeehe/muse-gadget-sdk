@@ -1980,6 +1980,11 @@ static void process_inbound_body_chunk(
                                 && strcmp(status->valuestring, "registered") == 0
                                 && !failure;
                         }
+#if CONFIG_MUSE_APPS
+                        // The apps' storage waits for this reply, either way: the
+                        // boot's lowest internal RAM is behind it (muse_apps.h).
+                        muse_apps_link_registered();
+#endif
                     }
                     cJSON_Delete(msg);
                 }

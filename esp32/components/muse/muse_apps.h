@@ -42,6 +42,25 @@
 esp_err_t muse_apps_start(void);
 
 /*
+ * I2: the boot's start of the apps' storage. What takes internal RAM (the FAT mount, apps_nvs and the I/O worker that mounts
+ * them) waits until the Link's boot is past, since the lowest internal RAM of a boot falls between the Link's handshake and its
+ * registration. The app task mounts the store at its first round after the first of:
+ * - muse_apps_link_registered(): the reply to the first link.register, accepted or not (noise_control.cpp);
+ * - muse_apps_link_offline(): the Link won't come up at boot (no Wi-Fi credentials, Wi-Fi not joined, no pairing, or its
+ *   connection failed: app.c);
+ * - APPS_BOOT_DEADLINE_MS after boot (apps_task.h).
+ * Any task, before or after muse_apps_start (a word that comes first is kept); the first word counts, and each wakes the app
+ * task with no wait. Until the store is mounted the apps are starting (muse_apps_starting): app.* commands answer unavailable
+ * with MUSE_APPS_STARTING, the launcher says it is loading, and an alarm the store re-arms fires once it is mounted (up to the
+ * deadline late). A USB console command mounts it at once (the worker's first step).
+ */
+void muse_apps_link_registered(void);
+void muse_apps_link_offline(void);
+#define MUSE_APPS_STARTING "apps are starting; try again in a few seconds"
+/* Whether the app task is up and the store not mounted yet. Any task. */
+bool muse_apps_starting(void);
+
+/*
  * The USB console's ">app.*" lines (apps_console.c), as a muse_input console hook: line comes without its '>', and it
  * returns false for a line that doesn't start "app.". It runs on the console's task (muse_serial: a 3,584-byte stack),
  * keeps its frames small and never waits long: an install or a launch is a job for the I/O worker, which prints the

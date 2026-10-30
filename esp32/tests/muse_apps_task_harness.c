@@ -2004,6 +2004,23 @@ static void preboot(const char *name) {
     if (strcmp(name, "handed_over_records_are_armed_again_when_the_clock_comes") == 0) {
         atomic_store(&store_mode, APPS_STORAGE_NONE);
     }
+    /* I2: the boot's mount waits for a word from the Link or the deadline. The gate's cases boot with the clock stopped short of the
+     * deadline and the store not mounted; every other case boots as a gadget with no Link would, so that none depends on how long the
+     * host has been up. */
+    if (strcmp(name, "the_boot_mount_waits_for_the_links_registration") == 0 ||
+        strcmp(name, "the_boot_mount_starts_at_once_when_the_link_wont_come_up") == 0 ||
+        strcmp(name, "a_word_before_the_task_starts_is_kept") == 0) {
+        clock_stop_at(5000);
+        atomic_store(&store_mode, APPS_STORAGE_NONE);
+    } else if (strcmp(name, "the_boot_mount_starts_at_the_deadline") == 0) {
+        clock_stop_at(APPS_BOOT_DEADLINE_MS - 10);
+        atomic_store(&store_mode, APPS_STORAGE_NONE);
+    } else {
+        muse_apps_link_offline();
+    }
+    if (strcmp(name, "a_word_before_the_task_starts_is_kept") == 0) {
+        muse_apps_link_registered();  /* before muse_apps_start: kept, and nothing posted */
+    }
 }
 
 static void boot(void) {
@@ -5459,6 +5476,75 @@ static void the_alarms_records_follow_the_table_on_flash(void) {
     clock_go();
 }
 
+/* ---- I2: the boot's mount waits for the Link ---- */
+
+/* Waits up to ms of real time for the store's first tick. */
+static bool store_ticked_within(int ms) {
+    for (int64_t until = real_ms() + ms; atomic_load(&store_ticks) == 0;) {
+        if (real_ms() > until) {
+            return false;
+        }
+        sleep_ms(1);
+    }
+    return true;
+}
+
+/* The mount waits for the Link's registration (its reply, accepted or not: muse_apps_link_registered, any task), which wakes the
+ * app task at once: well within a round of RECEIVE_MS. Until the store is mounted the apps are starting (muse_apps_starting). A later
+ * word changes nothing, and the start is logged once. */
+static void the_boot_mount_waits_for_the_links_registration(void) {
+    ROUNDS();
+    CHECK(atomic_load(&store_ticks) == 0, "the store was ticked before the registration: %d", atomic_load(&store_ticks));
+    CHECK(muse_apps_starting(), "the apps aren't starting");
+    int from = mark();
+    muse_apps_link_registered();
+    CHECK(store_ticked_within(500), "no tick within 500 ms of the registration");
+    WAIT(from, "log I boot: the apps start at 5000 ms: the Link has registered");
+    muse_apps_link_offline();
+    ROUNDS();
+    CHECK(count_from(0, "log I boot: the apps start") == 1, "the start is logged once: %d", count_from(0, "log I boot: the apps start"));
+    CHECK(muse_apps_starting(), "starting until the store is mounted");
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    CHECK(!muse_apps_starting(), "started once the store is mounted");
+    clock_go();
+}
+
+/* With no word from the Link, the mount goes at APPS_BOOT_DEADLINE_MS after boot, at the round that finds it passed. */
+static void the_boot_mount_starts_at_the_deadline(void) {
+    ROUNDS();
+    CHECK(atomic_load(&store_ticks) == 0, "the store was ticked before the deadline: %d", atomic_load(&store_ticks));
+    int from = mark();
+    clock_jump(10);
+    ROUNDS();
+    CHECK(atomic_load(&store_ticks) > 0, "no tick at the deadline");
+    char want[96];
+    snprintf(want, sizeof want, "log I boot: the apps start at %d ms: the deadline", APPS_BOOT_DEADLINE_MS);
+    WAIT(from, want);
+    atomic_store(&store_mode, APPS_STORAGE_RAM);
+    clock_go();
+}
+
+/* When the Link won't come up (no Wi-Fi or pairing, or it couldn't connect: app.c's muse_apps_link_offline), the mount goes at once. */
+static void the_boot_mount_starts_at_once_when_the_link_wont_come_up(void) {
+    ROUNDS();
+    CHECK(atomic_load(&store_ticks) == 0, "the store was ticked before the word: %d", atomic_load(&store_ticks));
+    int from = mark();
+    muse_apps_link_offline();
+    CHECK(store_ticked_within(500), "no tick within 500 ms of the word");
+    WAIT(from, "log I boot: the apps start at 5000 ms: the Link won't come up");
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    clock_go();
+}
+
+/* A word that comes before the app task exists is kept: the task's start finds it and mounts at once. */
+static void a_word_before_the_task_starts_is_kept(void) {
+    CHECK(atomic_load(&store_ticks) >= 1, "the task's start didn't tick the store");
+    CHECK(at_from(0, "log I boot: the apps start at 5000 ms: the Link has registered") >= 0, "the start's line");
+    ORDERED(0, "log I boot: the apps start at 5000 ms", "log I up: stack ");
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    clock_go();
+}
+
 /* ---- Task 20, fix round 1 ---- */
 
 /* V: the worker mounts the store before it runs anything of the boot's (apps_io_set_first): the first op it runs finds the mount done. And
@@ -6562,6 +6648,10 @@ int main(int argc, char **argv) {
         {"a_late_reset_parks_the_images", a_late_reset_parks_the_images},
         {"a_new_run_replaces_the_app", a_new_run_replaces_the_app},
         {"a_run_is_admitted_once_the_app_it_replaces_has_gone", a_run_is_admitted_once_the_app_it_replaces_has_gone},
+        {"the_boot_mount_waits_for_the_links_registration", the_boot_mount_waits_for_the_links_registration},
+        {"the_boot_mount_starts_at_the_deadline", the_boot_mount_starts_at_the_deadline},
+        {"the_boot_mount_starts_at_once_when_the_link_wont_come_up", the_boot_mount_starts_at_once_when_the_link_wont_come_up},
+        {"a_word_before_the_task_starts_is_kept", a_word_before_the_task_starts_is_kept},
         {"a_crash_in_start_is_contained", a_crash_in_start_is_contained},
         {"a_crash_in_a_callback_is_contained", a_crash_in_a_callback_is_contained},
         {"a_crash_at_the_top_level_is_contained", a_crash_at_the_top_level_is_contained},

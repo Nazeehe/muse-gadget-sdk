@@ -172,6 +172,9 @@ class LinkCommands(unittest.TestCase):
     def test_vm_ops_put_vm_file_behind_the_apps(self):  # D3: the deadline forwarded; vm_file's answers as the apps' codes
         self.run_case("vm_ops_are_vm_file")
 
+    def test_commands_answer_unavailable_while_the_apps_start(self):  # I2: the boot's mount waits for the registration
+        self.run_case("commands_wait_while_the_apps_start")
+
 def guide_section(text, heading):
     """The text of the guide's "## heading" section, its heading line included, up to the next "## "."""
     start = text.index(f"\n## {heading}\n") + 1
@@ -364,6 +367,26 @@ class GuideAndSkill(unittest.TestCase):
         guide = " ".join(GUIDE.read_text().split())
         self.assertIn("A launch while another app runs counts what that app frees when it ends: it is refused up front, with the app that "
                       "runs left running, when it wouldn't fit even then, or when its files don't fit beside that app now.", guide)
+
+    def test_guide_says_the_apps_start_after_the_link(self):
+        # I2: after a restart the apps' storage waits for the Link's registration, APPS_BOOT_DEADLINE_MS at the latest. The guide
+        # says what Muse and the user see meanwhile (the launcher's words, app.*'s answer, the alarms' delay), with the deadline
+        # from the header (D12), and its Common errors quote MUSE_APPS_STARTING with what to do.
+        deadline_s = header_number("apps_task.h", "APPS_BOOT_DEADLINE_MS") // 1000
+        guide = " ".join(GUIDE.read_text().split())
+        self.assertIn(f"Right after a restart the apps start once the gadget has registered with Muse, or {deadline_s} s after the "
+                      'restart at the latest. Until then the launcher says "Loading apps..." and the `app.*` commands answer '
+                      "`unavailable`: try again in a few seconds.", guide)
+        self.assertIn(f"once the gadget has set its clock and its apps have started (up to {deadline_s} s after the restart, so an "
+                      "alarm due before then fires that late)", guide)
+        self.assertIn('"Loading apps..."', (APPS / "apps_lv.c").read_text())
+        match = re.search(r'^#define MUSE_APPS_STARTING "([^"]+)"', (MUSE / "muse_apps.h").read_text(), re.M)
+        self.assertIsNotNone(match, "no #define MUSE_APPS_STARTING in muse_apps.h")
+        section = " ".join(guide_section(GUIDE.read_text(), "Common errors").split())
+        self.assertIn(f"- `{match.group(1)}`: the gadget has just restarted: try again in a few seconds.", section)
+        agents = " ".join((ROOT / "AGENTS.md").read_text().split())
+        self.assertIn(f"and {deadline_s} s after boot at the latest (`APPS_BOOT_DEADLINE_MS`, `apps_task.h`)", agents)
+        self.assertIn(f'answers `unavailable`, "{match.group(1)}"', agents)
 
     def test_guide_quotes_the_cpu_limits_as_the_firmware_has_them(self):
         # Task 27 set the budgets from the board's measured speed (D12: a test pins each number the guide quotes; the skill

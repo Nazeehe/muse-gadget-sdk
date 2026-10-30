@@ -150,6 +150,18 @@ class AppTaskTest(HarnessCase):
     def test_a_run_is_admitted_once_the_app_it_replaces_has_gone(self):  # C1: an update of the running app, admitted after its old copy
         self.run_case("a_run_is_admitted_once_the_app_it_replaces_has_gone")
 
+    def test_the_boot_mount_waits_for_the_links_registration(self):  # I2: the registration's reply wakes the task; starting until mounted
+        self.run_case("the_boot_mount_waits_for_the_links_registration")
+
+    def test_the_boot_mount_starts_at_the_deadline(self):  # I2: 20 s after boot with no word from the Link
+        self.run_case("the_boot_mount_starts_at_the_deadline")
+
+    def test_the_boot_mount_starts_at_once_when_the_link_wont_come_up(self):  # I2: no Wi-Fi, no pairing, no connection
+        self.run_case("the_boot_mount_starts_at_once_when_the_link_wont_come_up")
+
+    def test_a_word_from_the_link_before_the_task_starts_is_kept(self):  # I2
+        self.run_case("a_word_before_the_task_starts_is_kept")
+
     def test_a_crash_in_start_is_contained(self):  # crash containment follows the teardown order
         self.run_case("a_crash_in_start_is_contained")
 

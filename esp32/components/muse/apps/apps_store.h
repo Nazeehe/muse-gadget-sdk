@@ -29,12 +29,14 @@
  * - the I/O worker (apps_io.h), alone, mounts, commits, removes, loads and reads or writes apps_nvs: every function marked
  *   "worker" below runs from a job or an op;
  * - any task reads what the mount and the worker's changes cache: the mode, the hint, the list of apps and the room left;
- * - the app task's rounds call apps_store_tick, which submits the mount job until the worker has taken it, and the write of the
+ * - the app task's rounds call apps_store_tick (once the boot lets them, I2), which submits the mount job until the worker has taken it, and the write of the
  *   launcher's order that the write budget held back (apps_values.h), once it fits; and take the alarms' records the mount read
  *   (apps_store_take_records), which the app task arms again (apps_values.h).
  *
- * The mount. muse_apps_start() makes it the worker's first step (apps_io_set_first) and submits the boot job that brings the
- * worker; apps_store_tick asks again every APPS_STORE_RETRY_MS while the worker refuses. In order:
+ * The mount. muse_apps_start() makes it the worker's first step (apps_io_set_first), and the app task's first apps_store_tick
+ * submits the boot job that brings the worker, once the boot lets it (I2: after the Link's registration, at once without the Link,
+ * or APPS_BOOT_DEADLINE_MS after boot: muse_apps.h); apps_store_tick asks again every APPS_STORE_RETRY_MS while the worker refuses.
+ * In order:
  *   1. the partition: none, and the store is in RAM mode ("store: no apps partition: ... reflash over USB once to keep apps");
  *   2. FAT at APPS_STORE_BASE on "apps": format_if_mount_failed, 4 files open at most, units of 4 KB (a partition with no file
  *      system is formatted: approved for its first mount). A mount that fails even so is RAM mode for this boot, with its own line

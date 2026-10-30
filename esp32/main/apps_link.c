@@ -423,6 +423,9 @@ bool apps_link_handles(const char *command) {
 
 cJSON *apps_link_handle(const char *command, cJSON *params, const char *request_id,
                         noise_ctrl_session_generation_t session_generation) {
+    if (apps_link_handles(command) && muse_apps_starting()) {
+        return error_result("unavailable", MUSE_APPS_STARTING);  /* I2: the store isn't mounted yet (muse_apps.h) */
+    }
     if (command && strcmp(command, "app.install") == 0) {
         return install_command(params, request_id, session_generation);
     }

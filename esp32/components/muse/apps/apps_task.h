@@ -114,6 +114,7 @@
 #define APPS_TASK_SEND_LAUNCH_MS 3000  /* app.send's launch of a stored app: store load is the worker's, this is the load and start() (about 750 ms of instructions); with the 5 s reply it stays 2 s under the VM's 10 s */
 #define APPS_TASK_WAIT_MS 2000       /* compile and stop */
 #define APPS_TASK_HUNG_MS 3000       /* a call that has run longer is hung (strictly longer) */
+#define APPS_BOOT_DEADLINE_MS 20000  /* I2: the boot's mount goes by then (apps_port_mono_ms) with no word from the Link (muse_apps.h) */
 #define APPS_TASK_RESET_MS 500       /* the app task's wait for the LVGL task's reset */
 #define APPS_TASK_LAYOUT_MS 500      /* a run's wait for a pass of the apply step that has laid its widgets out */
 #define APPS_QUEUE_LEN 16            /* the queue's events: a touch or an alarm's post leaves the last 2 to requests */

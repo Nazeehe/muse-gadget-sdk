@@ -95,8 +95,9 @@
  * alarms (end_alarms): the ring ends with the app that was told it, and an app that its alarm launched and that crashed loses its
  * alarms. What they record to log, the app task prints (drain_logs: in housekeeping and after each call, never inside one).
  *
- * The store (apps_store.h). The task submits the mount job as it starts, and housekeeping asks again every APPS_STORE_RETRY_MS while
- * the worker refuses it (the worker's first step mounts too: apps_io_set_first). Housekeeping also offers the values' saves that wait
+ * The store (apps_store.h). The task submits the mount job once the boot lets it (I2, boot_open: the Link has registered or won't
+ * come up, or APPS_BOOT_DEADLINE_MS has passed; at its start or at a round), and housekeeping asks again every APPS_STORE_RETRY_MS
+ * while the worker refuses it (the worker's first step mounts too: apps_io_set_first). Housekeeping also offers the values' saves that wait
  * and brings the alarms' records in line (apps_values_tick): the names an app touched are its records' to follow (an arming or a
  * cancel in the port, a firing that is told or given up on here, and a cancel of all of an app's alarms, the budget's, a crash's or a
  * remove's, through apps_alarm_take_cancelled), and the records the mount handed over whose names nothing touched are armed again
@@ -258,7 +259,12 @@ static EXT_RAM_BSS_ATTR struct {
     bool exit_asked;          /* sys.exit() was called in the call that runs: the app ends when it returns (call_end) */
     bool keep_awake;          /* sys.keep_awake(true): while the layer is in front, the idle timer is poked each second */
     int64_t poke_at;          /* the earliest the next poke may be (apps_port_mono_ms) */
+    bool boot_open;           /* I2: the boot's mount may go (boot_open) */
 } T;
+
+/* I2: the Link's word on the boot's mount (muse_apps.h): the first one stays. Any task; internal, as an atomic. */
+enum { BOOT_WAITING, BOOT_REGISTERED, BOOT_OFFLINE };
+static atomic_int s_boot_word;
 
 /* ---- The LVGL task's own ---- (plain state of one task: PSRAM, I2) */
 
@@ -1347,6 +1353,22 @@ static void say_for_app(const char *app, const char *what) {
 }
 
 /* Every round of the loop, whatever woke it. */
+/* I2: whether the boot's mount may go: once the Link has said it registered or won't come up (muse_apps_link_registered,
+ * muse_apps_link_offline), or APPS_BOOT_DEADLINE_MS after boot, whichever comes first. One line says when, and why. */
+static bool boot_open(int64_t now) {
+    if (T.boot_open) {
+        return true;
+    }
+    int word = atomic_load(&s_boot_word);
+    if (word == BOOT_WAITING && now < APPS_BOOT_DEADLINE_MS) {
+        return false;
+    }
+    T.boot_open = true;
+    ESP_LOGI(TAG, "boot: the apps start at %lld ms: %s", (long long)now,
+             word == BOOT_REGISTERED ? "the Link has registered" : word == BOOT_OFFLINE ? "the Link won't come up" : "the deadline");
+    return true;
+}
+
 static void housekeeping(void) {
     if (atomic_load(&s_rec->hung)) {
         abandon();  /* marked when its call had already come back */
@@ -1371,7 +1393,9 @@ static void housekeeping(void) {
     }
     int64_t now = apps_port_mono_ms();
     apps_values_tick(now);  /* the saves that wait, with or without an app, the alarms' records and their re-arm (apps_values.h) */
-    apps_store_tick(now);   /* the mount, until the worker has taken it; the launcher's order, once the write budget has room */
+    if (boot_open(now)) {
+        apps_store_tick(now);  /* the mount, until the worker has taken it; the launcher's order, once the write budget has room */
+    }
     muse_apps_console_tick(now);  /* a stage the console was sent and that waits for no commit any more goes */
     char id[APPS_ID_MAX + 1];
     while (apps_values_take_failure(id, sizeof id)) {
@@ -1434,7 +1458,10 @@ static void run_timers(void) {
 static void apps_task(void *arg) {
     (void)arg;
     apps_io_register_op_task();  /* the store's loads and saves are ops of the I/O worker, and only this task submits them (apps_io.h) */
-    apps_store_tick(apps_port_mono_ms());  /* the boot's mount job (asked again by housekeeping while the worker refuses it) */
+    int64_t now = apps_port_mono_ms();
+    if (boot_open(now)) {
+        apps_store_tick(now);  /* the boot's mount job (asked again by housekeeping while the worker refuses it) */
+    }
     ESP_LOGI(TAG, "up: stack %u in PSRAM", (unsigned)APPS_TASK_STACK);
     for (;;) {
         apps_event_t ev;
@@ -2167,6 +2194,27 @@ void apps_task_call_restart(void) {
 
 void apps_task_exit(void) {
     T.exit_asked = true;
+}
+
+/* The Link's first word on the boot's mount, kept; the app task, if it is up, is woken to act on it at once. */
+static void boot_word(int word) {
+    int waiting = BOOT_WAITING;
+    if (atomic_compare_exchange_strong(&s_boot_word, &waiting, word) && atomic_load(&s_up)) {
+        apps_event_t ev = {.type = APPS_EV_WAKE};
+        (void)xQueueSend(s_queue, &ev, 0);  /* with the queue full the app task is awake anyway */
+    }
+}
+
+void muse_apps_link_registered(void) {
+    boot_word(BOOT_REGISTERED);
+}
+
+void muse_apps_link_offline(void) {
+    boot_word(BOOT_OFFLINE);
+}
+
+bool muse_apps_starting(void) {
+    return atomic_load(&s_up) && apps_store_mode() == APPS_STORAGE_NONE;
 }
 
 bool apps_task_current(void) {

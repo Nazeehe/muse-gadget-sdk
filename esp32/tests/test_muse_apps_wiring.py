@@ -635,6 +635,31 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, start))
         self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, app.index('#include "muse_apps.h"')))
 
+    def test_the_boot_mount_waits_for_the_links_registration(self):  # I2
+        # The apps' storage (FAT, apps_nvs, the I/O worker) is mounted once the Link's first link.register has its reply, accepted
+        # or not (noise_control.cpp), at once when app.c finds the Link won't come up, or at APPS_BOOT_DEADLINE_MS. Both hooks sit
+        # inside #if CONFIG_MUSE_APPS (X5), and both of the app task's store ticks wait for the gate.
+        control = strip_c_comments((ROOT / "main/noise_control.cpp").read_text())
+        call = control.index("muse_apps_link_registered();")
+        self.assertIn("if CONFIG_MUSE_APPS", open_conditions(control, call))
+        self.assertEqual(control.count("muse_apps_link_registered("), 1)
+        rejected = control.index('"link.register rejected: %s"')
+        acked = control.index('"link.register acked; tunnel may open"')
+        self.assertLess(max(rejected, acked), call, "after the reply, either way")
+        self.assertLess(call, control.index("cJSON_Delete(msg);", acked), "inside the reply's block")
+        app = strip_c_comments((ROOT / "main/app.c").read_text())
+        offline = app.index("muse_apps_link_offline();")
+        self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, offline))
+        self.assertEqual(app.count("muse_apps_link_offline("), 1)
+        self.assertLess(offline, app.index("muse_glue_link_ready();"))
+        self.assertRegex(app[:offline], r"if \(!noise_ctrl_is_running\(\)\) \{\s*$")
+        task = strip_c_comments((MUSE / "apps/apps_task.c").read_text())
+        ticks = [m.start() for m in re.finditer(r"apps_store_tick\(now\);", task)]
+        self.assertEqual(len(ticks), 2, "the task's start and housekeeping")
+        for index in ticks:
+            self.assertRegex(task[:index], r"if \(boot_open\(now\)\) \{\s*$")
+        self.assertIn("#define APPS_BOOT_DEADLINE_MS 20000", (MUSE / "apps/apps_task.h").read_text())
+
     def test_task_shape(self):
         task = (MUSE / "apps/apps_task.c").read_text()
         # The queue's length is in the header (the harnesses size their floods by it), the rest are the task's own.

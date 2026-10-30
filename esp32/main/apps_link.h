@@ -49,7 +49,9 @@ bool apps_link_handles(const char *command);
 // queued and answer {"_async": true}, and the result follows through
 // noise_ctrl_send_command_result(), once; app.control's list, status and logs
 // answer at once (a wait of at most MUSE_APPS_CONTROL_WAIT_MS for the apps' I/O
-// worker); a refusal is the reply.
+// worker); a refusal is the reply. While the apps are starting (the boot's
+// mount waits for the Link: muse_apps_starting), each answers unavailable,
+// MUSE_APPS_STARTING, and starts nothing.
 cJSON *apps_link_handle(const char *command, cJSON *params, const char *request_id,
                         noise_ctrl_session_generation_t session_generation);
 

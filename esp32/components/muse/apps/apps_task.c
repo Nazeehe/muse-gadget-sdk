@@ -207,7 +207,7 @@ typedef struct {
         uint32_t card_after;
         char card_name[25], card_line[FIRST_LINE_MAX];
     } names;
-    apps_listed_t rows[APPS_LV_LAUNCHER_ROWS];  /* the LVGL task's alone: the launcher's rows, copied out of names */
+    apps_listed_t rows[APPS_TASK_LIST_MAX];  /* the LVGL task's alone: the launcher's rows, copied out of names (the old card takes the first APPS_LV_LAUNCHER_ROWS) */
 } record_t;
 
 static atomic_bool s_up;
@@ -1637,8 +1637,8 @@ static void carry_out_front(void) {
 }
 
 /*
- * The launcher's rows, into s_rec->rows (the names lock held): the store's apps, most recent first, as many as there
- * are rows, with the app that runs on the first row when they don't have it (the store never drops it, but a run that
+ * The launcher's rows, into s_rec->rows (the names lock held): the store's apps, most recent first, as many as the old
+ * card has rows (APPS_LV_LAUNCHER_ROWS: the list and s_rec->rows hold more, for the carousel that replaces it), with the app that runs on the first row when they don't have it (the store never drops it, but a run that
  * didn't come from the store, as on the host, isn't in it), so the launcher can always bring it back.
  */
 static int launcher_rows(void) {
@@ -1990,6 +1990,7 @@ void apps_task_set_list(const apps_listed_t *apps, int n) {
     for (int i = 0; i < n; i++) {
         put_text(s_rec->names.list[i].id, sizeof s_rec->names.list[i].id, apps[i].id);
         put_text(s_rec->names.list[i].name, sizeof s_rec->names.list[i].name, apps[i].name);
+        put_text(s_rec->names.list[i].icon, sizeof s_rec->names.list[i].icon, apps[i].icon);
     }
     s_rec->names.list_n = n;
     names_give();

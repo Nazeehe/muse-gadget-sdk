@@ -92,6 +92,15 @@ class Store(unittest.TestCase):
     def test_list_reads_names(self):
         self.run_case("list_reads_names")
 
+    def test_list_carries_icon_paths(self):  # the manifest's icon, or "" for an app with none
+        self.run_case("list_carries_icon_paths")
+
+    def test_list_has_every_app(self):  # twelve, where the launcher's list once stopped at eight
+        self.run_case("list_has_every_app")
+
+    def test_unordered_tail_is_alphabetical_by_name(self):  # after the order's ids: by name, case-insensitively, ties by id
+        self.run_case("unordered_tail_is_alphabetical_by_name")
+
     def test_unchanged_skips_commit(self):
         self.run_case("unchanged_skips_commit")
 

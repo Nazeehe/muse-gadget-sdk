@@ -102,6 +102,7 @@
 
 #include "apps_pkg.h"
 #include "apps_rt.h"
+#include "apps_store.h"
 
 /* The refusals every call returns, and the wait's: as text, in err. Link's app.send (apps_control.c) tells them from a handler's error. */
 #define APPS_TASK_MSG_HUNG "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"
@@ -271,19 +272,19 @@ void apps_task_status(apps_status_t *st);
  * copies; STOPPED, "" and 0 when the task isn't up or the record stays busy. */
 void apps_task_brief(char *id, size_t cap, apps_state_t *state, uint32_t *mem_kb, uint32_t *peak_kb);
 
-/* An app the launcher lists: its id and the name it shows (its manifest's name, or its id). */
+/* An app the launcher lists: its id, the name it shows (its manifest's name, or its id) and its icon's path (the manifest's, or ""). */
 typedef struct {
-    char id[APPS_ID_MAX + 1], name[25];
+    char id[APPS_ID_MAX + 1], name[25], icon[APPS_PATH_MAX + 1];  /* icon: the manifest's path, "" for none */
 } apps_listed_t;
 
-#define APPS_TASK_LIST_MAX 8  /* the store's apps the launcher is told of (the RAM store keeps 8) */
+#define APPS_TASK_LIST_MAX APPS_STORE_APPS_MAX  /* the store's apps the launcher is told of: every one (the RAM store keeps 8) */
 
 /*
  * The launcher's list (cached data for the LVGL task, X11): the store's apps, most recent first, n of them (at most
  * APPS_TASK_LIST_MAX; more are left out). The store's owner, the I/O worker, gives it after every change of the store
  * (apps_install.h). It is copied under the names lock, which the caller waits for (held only for copies; a W log line
  * says so in the unlikely case it stays busy for a second, and the list waits for the next change). When the launcher
- * opens, the LVGL task shows the first APPS_LV_LAUNCHER_ROWS of it (taking the lock with its 2 ms try), the app that
+ * opens, the LVGL task shows the first APPS_LV_LAUNCHER_ROWS of it (the old card; the list holds every app) (taking the lock with its 2 ms try), the app that
  * runs on the first row when they don't have it, so the launcher can always bring it back. A pick of the app that runs
  * fronts it; a pick of any other launches it (apps_task_launch).
  */

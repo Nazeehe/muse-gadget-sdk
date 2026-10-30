@@ -209,7 +209,7 @@ cJSON *apps_install_status(const apps_status_t *st);
 #define APPS_RAM_APPS 8
 
 typedef struct {
-    char id[APPS_ID_MAX + 1], name[25], version[24];
+    char id[APPS_ID_MAX + 1], name[25], version[24], icon[APPS_PATH_MAX + 1];
 } apps_ram_entry_t;
 
 /* A deep copy of id's package into out (a caller's apps_pkg_t), every block of it from apps_port_realloc, for the caller

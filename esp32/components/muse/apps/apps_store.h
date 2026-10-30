@@ -72,7 +72,7 @@
  * may not be set): an install (changed or unchanged) and a launch (a load for a run, an alarm's included) make the app the first, a
  * remove drops it, and each of those writes the ids, NUL-terminated, most recent first, to "order", within the write budget
  * (apps_values.h: one that doesn't fit is written later, apps_store_tick). At the mount, an id of "order" with no folder is left out,
- * and a folder that "order" doesn't name goes after the rest, by id. The list, the launcher and app.list all have this order.
+ * and a folder that "order" doesn't name goes after the rest, by name (case-insensitively, ties by id). The list, the launcher and app.list all have this order.
  *
  * Quarantine. The marker (apps_marker_t) is in RTC memory, which keeps it across a reset but not a power-on. The app task marks an
  * app's launch and its clean end (any end that isn't a reset: a stop, a crash of the app that the runtime caught, an exit, a

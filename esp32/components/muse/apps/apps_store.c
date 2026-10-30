@@ -82,7 +82,7 @@ static const char *TAG = "muse_apps";
 _Static_assert(RECORD_LEN + APPS_VALUES_ENTRY_COST == APPS_VALUES_RECORD_COST, "apps_values.h's cost of a record is its blob's");
 
 typedef struct {
-    char id[APPS_ID_MAX + 1], name[25];
+    char id[APPS_ID_MAX + 1], name[25], icon[APPS_PATH_MAX + 1];
 } entry_t;
 
 static apps_storage_t s_kind;        /* the worker's: what the mount has found so far */
@@ -433,7 +433,7 @@ uint32_t apps_store_free_kb(void) {
     }
 }
 
-/* The launcher's list (apps_task.h): the first APPS_TASK_LIST_MAX of the cache. */
+/* The launcher's list (apps_task.h): the cache, every app (APPS_TASK_LIST_MAX is the store's most). */
 static void publish(void) {
     apps_listed_t listed[APPS_TASK_LIST_MAX];
     lock();
@@ -441,6 +441,7 @@ static void publish(void) {
     for (int i = 0; i < n; i++) {
         copy_text(listed[i].id, sizeof listed[i].id, s_list[i].id);
         copy_text(listed[i].name, sizeof listed[i].name, s_list[i].name[0] != '\0' ? s_list[i].name : s_list[i].id);
+        copy_text(listed[i].icon, sizeof listed[i].icon, s_list[i].icon);
     }
     unlock();
     apps_task_set_list(listed, n);
@@ -455,6 +456,7 @@ static void cache_ram(void) {
     for (int i = 0; i < n && i < APPS_STORE_APPS_MAX; i++) {
         copy_text(s_list[i].id, sizeof s_list[i].id, e[i].id);
         copy_text(s_list[i].name, sizeof s_list[i].name, e[i].name);
+        copy_text(s_list[i].icon, sizeof s_list[i].icon, e[i].icon);
         s_list_n++;
     }
     unlock();
@@ -505,10 +507,27 @@ static int order_rank(const char *id) {
     return INT_MAX;
 }
 
-/* Whether a goes before b in the list: the more recent in the order, then (for the ids it doesn't have) by id. */
+/* strcmp of the names the launcher shows (an empty name shows the id), ignoring ASCII case. */
+static int name_cmp(const entry_t *a, const entry_t *b) {
+    const char *x = a->name[0] != '\0' ? a->name : a->id, *y = b->name[0] != '\0' ? b->name : b->id;
+    for (;; x++, y++) {
+        int cx = *x >= 'A' && *x <= 'Z' ? *x + ('a' - 'A') : (unsigned char)*x;
+        int cy = *y >= 'A' && *y <= 'Z' ? *y + ('a' - 'A') : (unsigned char)*y;
+        if (cx != cy || cx == '\0') {
+            return cx - cy;
+        }
+    }
+}
+
+/* Whether a goes before b in the list: the more recent in the order, then (for the ids it doesn't have) by name, case-insensitively,
+ * and by id when the names tie. */
 static bool goes_before(const entry_t *a, const entry_t *b) {
     int ra = order_rank(a->id), rb = order_rank(b->id);
-    return ra != rb ? ra < rb : strcmp(a->id, b->id) < 0;
+    if (ra != rb) {
+        return ra < rb;
+    }
+    int by_name = name_cmp(a, b);
+    return by_name != 0 ? by_name < 0 : strcmp(a->id, b->id) < 0;
 }
 
 /* The list sorted by the order again, after the order changed. */
@@ -657,6 +676,7 @@ static bool scan(void) {
         entry_t item;
         copy_text(item.id, sizeof item.id, e->d_name);
         copy_text(item.name, sizeof item.name, m->name);
+        copy_text(item.icon, sizeof item.icon, m->icon);
         apps_manifest_clear(m, NULL);
         int at = n;
         for (; at > 0 && goes_before(&item, &found[at - 1]); at--) {

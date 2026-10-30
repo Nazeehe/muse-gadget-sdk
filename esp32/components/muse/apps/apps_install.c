@@ -1005,6 +1005,7 @@ static void ram_publish(void) {
         const apps_manifest_t *m = &s_ram[i]->manifest;
         put_text(list[i].id, sizeof list[i].id, m->id);
         put_text(list[i].name, sizeof list[i].name, m->name[0] != '\0' ? m->name : m->id);
+        put_text(list[i].icon, sizeof list[i].icon, m->icon);
     }
     apps_task_set_list(list, s_ram_count);
 }
@@ -1168,6 +1169,7 @@ int apps_ram_list(apps_ram_entry_t *out, int max) {
         put_text(out[n].id, sizeof out[n].id, m->id);
         put_text(out[n].name, sizeof out[n].name, m->name);
         put_text(out[n].version, sizeof out[n].version, m->version);
+        put_text(out[n].icon, sizeof out[n].icon, m->icon);
     }
     return n;
 }

@@ -5310,7 +5310,7 @@ static void a_load_the_worker_cannot_serve_refuses_the_launch_after_a_second(voi
 /* The launcher says "Loading apps..." (APPS_LV_LOADING rows) until the store's mount has ended (the mode is none until then), and is shown
  * again, with the list, when the list comes while it is up (the mount's end gives one). A list that comes while it is closed opens nothing. */
 static void the_launcher_says_loading_until_the_store_is_mounted(void) {
-    static const apps_listed_t listed[] = {{"hello", "Hello"}};
+    static const apps_listed_t listed[] = {{"hello", "Hello", ""}};
     atomic_store(&store_mode, APPS_STORAGE_NONE);
     int from = mark();
     muse_apps_open_launcher();
@@ -5621,8 +5621,8 @@ static void the_store_is_mounted_first_and_ticked_every_round(void) {
 /* R: a list that comes while the launcher is up is shown, even when the frame that first looks can't have the names (another task holds
  * them past its short try): the change is taken only with the names, so a later frame shows it. */
 static void a_list_change_survives_a_frame_without_the_names(void) {
-    static const apps_listed_t one[] = {{"hello", "Hello"}};
-    static const apps_listed_t two[] = {{"timer", "Timer"}, {"hello", "Hello"}};
+    static const apps_listed_t one[] = {{"hello", "Hello", ""}};
+    static const apps_listed_t two[] = {{"timer", "Timer", ""}, {"hello", "Hello", ""}};
     atomic_store(&store_mode, APPS_STORAGE_FLASH);
     apps_task_set_list(one, 1);
     int from = mark();
@@ -5907,6 +5907,26 @@ static void the_launcher_lists_the_store(void) {
     EXPECT_LAUNCHER("launcher 4 hello:Hello q4:Q4 q3:Q3 q2:Q2");
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
     EXPECT_LAUNCHER("launcher 4 q4:Q4 q3:Q3 q2:Q2 q1:Q1");
+    on_worker(empty_store_job, NULL);
+    EXPECT_LAUNCHER("launcher 0");
+}
+
+/* P1: the list holds every app the store keeps (up to APPS_TASK_LIST_MAX), but the old launcher card has APPS_LV_LAUNCHER_ROWS rows until the
+ * carousel replaces it: eight installed apps, four rows, the most recent first; the app that runs still comes first. */
+static void the_old_launcher_card_still_gets_four_rows(void) {
+    char err[200];
+    CHECK(APPS_LV_LAUNCHER_ROWS == 4, "the old card's rows");
+    static const char *const ids[8] = {"p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"};
+    for (size_t i = 0; i < ARRAY_LEN(ids); i++) {
+        store(make_pkg(ids[i], ids[i], QUIET, 1));
+    }
+    EXPECT_LAUNCHER("launcher 4 p8:p8 p7:p7 p6:p6 p5:p5");
+    int picked = mark();
+    ON_LVGL(pick_job, "p1");
+    WAIT(picked, "log I launch p1 (256 KB)");
+    WAIT(picked, "front 1");
+    EXPECT_LAUNCHER("launcher 4 p1:p1 p8:p8 p7:p7 p6:p6");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
     on_worker(empty_store_job, NULL);
     EXPECT_LAUNCHER("launcher 0");
 }
@@ -6802,6 +6822,7 @@ int main(int argc, char **argv) {
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},
         {"the_launcher_lists_the_store", the_launcher_lists_the_store},
+        {"the_old_launcher_card_still_gets_four_rows", the_old_launcher_card_still_gets_four_rows},
         {"the_launcher_keeps_apps_that_ended", the_launcher_keeps_apps_that_ended},
         {"two_launches_of_one_id_run_it_once", two_launches_of_one_id_run_it_once},
         {"an_alarm_starts_a_stopped_app_and_calls_it_after_start", an_alarm_starts_a_stopped_app_and_calls_it_after_start},

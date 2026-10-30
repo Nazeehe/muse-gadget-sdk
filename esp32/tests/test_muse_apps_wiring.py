@@ -695,11 +695,11 @@ class MuseAppsWiringTest(unittest.TestCase):
 
     def test_task_header_compiles_on_the_host(self):
         # C29: apps_task.h stays portable C (the host harness and later tasks' host tests include it): the runtime's and
-        # the package's headers and the standard ones, no FreeRTOS. A file that includes only it compiles with nothing
+        # the package's and the store's headers (APPS_TASK_LIST_MAX is APPS_STORE_APPS_MAX) and the standard ones, no FreeRTOS. A file that includes only it compiles with nothing
         # but the apps directory on the include path, so no type can come in through whatever is included first (T2).
         header = (MUSE / "apps/apps_task.h").read_text()
         includes = re.findall(r'^#include\s+[<"]([^>"]+)[>"]', header, re.M)
-        self.assertEqual(sorted(name for name in includes if not name.startswith("std")), ["apps_pkg.h", "apps_rt.h"])
+        self.assertEqual(sorted(name for name in includes if not name.startswith("std")), ["apps_pkg.h", "apps_rt.h", "apps_store.h"])
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "only_apps_task.c"
             path.write_text('#include "apps_task.h"\n')

@@ -541,6 +541,9 @@ class AppTaskStoreTest(HarnessCase):
     def test_the_launcher_lists_the_store(self):  # F1: most recent first, four rows, the running app first
         self.run_case("the_launcher_lists_the_store")
 
+    def test_the_old_launcher_card_still_gets_four_rows(self):  # P1: the list holds eight; the card, until the carousel, four
+        self.run_case("the_old_launcher_card_still_gets_four_rows")
+
     def test_the_launcher_keeps_apps_that_ended(self):  # T4: installed, crashed, no app, hung and back
         self.run_case("the_launcher_keeps_apps_that_ended")
 

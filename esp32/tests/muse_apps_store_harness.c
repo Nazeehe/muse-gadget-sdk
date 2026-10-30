@@ -730,6 +730,7 @@ int apps_ram_list(apps_ram_entry_t *out, int max) {
         snprintf(out[n].id, sizeof out[n].id, "%s", ram_kept[n]->manifest.id);
         snprintf(out[n].name, sizeof out[n].name, "%s", ram_kept[n]->manifest.name);
         snprintf(out[n].version, sizeof out[n].version, "%s", ram_kept[n]->manifest.version);
+        snprintf(out[n].icon, sizeof out[n].icon, "%s", ram_kept[n]->manifest.icon);
     }
     return n;
 }
@@ -1143,6 +1144,60 @@ static void list_reads_names(void) {
     CHECK(!apps_store_manifest("notes", m) && !apps_store_manifest("gamma", m), "no manifest for what isn't an app");
     apps_port_free(m);
     CHECK(exists("apps_fs/notes") && exists("apps_fs/readme.txt") && exists("apps_fs/gamma/main.lua"), "left alone");
+}
+
+static const char *list_text(void);
+static void commit_app(const char *id);
+
+/* put_app with an icon: the manifest names icon.bin, which is one of its files (the launcher's carousel reads it). */
+static void put_app_icon(const char *dir, const char *id, const char *name, const char *icon) {
+    char path[256], json[512];
+    snprintf(path, sizeof path, "%s/manifest.json", dir);
+    snprintf(json, sizeof json, "{\"id\":\"%s\",\"name\":\"%s\",\"version\":\"1.0.0\",\"api\":1,\"files\":[\"%s\"],\"icon\":\"%s\"}", id,
+             name, icon, icon);
+    spit(path, json);
+    snprintf(path, sizeof path, "%s/main.lua", dir);
+    spit(path, "-- main\n");
+}
+
+/* The launcher's list carries each app's icon path: the manifest's, or "" for an app with none. */
+static void list_carries_icon_paths(void) {
+    mkdir("apps_fs/art", 0777);
+    put_app_icon("apps_fs/art", "art", "Art", "img/icon.bin");
+    put_app("apps_fs/plain", "plain", "Plain", "-- p\n");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    CHECK(listed_n == 2, "two apps, not %d", listed_n);
+    CHECK(listed_n == 2 && strcmp(listed[0].id, "art") == 0 && strcmp(listed[0].icon, "img/icon.bin") == 0, "art lists its icon: '%s'",
+          listed[0].icon);
+    CHECK(listed_n == 2 && strcmp(listed[1].id, "plain") == 0 && listed[1].icon[0] == '\0', "plain lists none: '%s'", listed[1].icon);
+}
+
+/* The list isn't cut at the launcher's old eight: every app the store keeps (up to 32) is in it. */
+static void list_has_every_app(void) {
+    char dir[64], id[16];
+    for (int i = 1; i <= 12; i++) {
+        snprintf(id, sizeof id, "app%02d", i);
+        snprintf(dir, sizeof dir, "apps_fs/%s", id);
+        put_app(dir, id, id, "-- a\n");
+    }
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    CHECK(listed_n == 12, "twelve apps, not %d", listed_n);
+    CHECK(listed_n == 12 && strcmp(listed[11].id, "app12") == 0, "the last is there");
+    CHECK(APPS_TASK_LIST_MAX == APPS_STORE_APPS_MAX, "the list holds as many as the store keeps");
+}
+
+/* Folders the order doesn't name follow the ones it does, by name (case-insensitively), ties by id. */
+static void unordered_tail_is_alphabetical_by_name(void) {
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    commit_app("oo");
+    put_app("apps_fs/aaa", "aaa", "zeta", "-- z\n");
+    put_app("apps_fs/bbb", "bbb", "Alpha", "-- a\n");
+    put_app("apps_fs/ccc", "ccc", "mid", "-- m\n");
+    put_app("apps_fs/t2", "t2", "Same", "-- s\n");
+    put_app("apps_fs/t1", "t1", "same", "-- s\n");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "remount");
+    CHECK(strcmp(list_text(), "oo bbb ccc t1 t2 aaa") == 0, "the order's, then by name, ties by id: '%s'", list_text());
+    CHECK(listed_n == 6 && strcmp(listed[1].id, "bbb") == 0 && strcmp(listed[5].id, "aaa") == 0, "the launcher's list has it too");
 }
 
 /* A package whose every file is the stored copy's (and whose manifest is) commits nothing: the folder isn't touched. */
@@ -2133,6 +2188,9 @@ static const case_t CASES[] = {
     {"old_layout_stage_is_deleted", old_layout_stage_is_deleted},
     {"remove", remove_app},
     {"list_reads_names", list_reads_names},
+    {"list_carries_icon_paths", list_carries_icon_paths},
+    {"list_has_every_app", list_has_every_app},
+    {"unordered_tail_is_alphabetical_by_name", unordered_tail_is_alphabetical_by_name},
     {"unchanged_skips_commit", unchanged_skips_commit},
     {"values_roundtrip", values_roundtrip},
     {"values_that_cannot_be_read_are_not_empty", values_that_cannot_be_read_are_not_empty},

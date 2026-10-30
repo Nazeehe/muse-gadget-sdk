@@ -124,6 +124,26 @@ class AppTaskTest(HarnessCase):
     def test_a_reset_that_comes_late_parks_the_images(self):  # the reset's invariants: the ack's timeout
         self.run_case("a_late_reset_parks_the_images")
 
+    def test_plain_state_is_in_psram(self):  # I2: the app task's, the LVGL task's and the worker's plain state off internal RAM
+        # What one task alone, or one under a lock, touches with plain loads and stores is in PSRAM (EXT_RAM_BSS_ATTR); what is
+        # atomic or a lock stays internal (no read-modify-write atomics on PSRAM on the S3).
+        for path, plain, internal in ((APPS / "apps_task.c", ("T", "L"), ("s_rec_lock_buf", "s_launcher_wanted", "s_covering")),
+                                      (APPS / "apps_io.c", ("s_ops",), ("s_lock_buf", "s_ops_nudged"))):
+            source = path.read_text()
+            self.assertIn('#include "esp_attr.h"', source, path.name)
+            for name in plain:
+                with self.subTest(path.name, name=name):
+                    # A struct's name is on its closing line: each "static EXT_RAM_BSS_ATTR struct {" up to the next "\n} ".
+                    structs = [source[i:source.index("\n} ", i) + 3 + len(name) + 1]
+                               for i in range(len(source)) if source.startswith("\nstatic EXT_RAM_BSS_ATTR struct {\n", i)]
+                    placed = any(s.endswith(f"\n}} {name};") for s in structs) or re.search(
+                        rf"(?m)^static EXT_RAM_BSS_ATTR [^\n]*\b{name}\b", source) is not None
+                    self.assertTrue(placed, f"{name}: PSRAM")
+            for name in internal:
+                with self.subTest(path.name, name=name):
+                    self.assertRegex(source, rf"(?m)^static [^\n]*\b{name}\b", name)
+                    self.assertNotRegex(source, rf"(?m)^static [^\n]*EXT_RAM_BSS_ATTR[^\n]*\b{name}\b", f"{name} stays internal")
+
     def test_a_new_app_is_published_after_the_old_ones_reset(self):  # the reset's invariants
         self.run_case("a_new_run_replaces_the_app")
 

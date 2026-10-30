@@ -38,6 +38,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -180,9 +181,9 @@ void apps_port_free(void *ptr) {
  */
 #define ECHO_EOL_BYTES 2  /* the console ends a line with CRLF (CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF) */
 
-static apps_echo_t s_echo;
+static EXT_RAM_BSS_ATTR apps_echo_t s_echo;    /* the app task's alone: PSRAM (I2) */
 static uint32_t s_unechoed;                     /* lines not echoed since the last echoed one */
-static char s_unechoed_id[APPS_ID_MAX + 1];
+static EXT_RAM_BSS_ATTR char s_unechoed_id[APPS_ID_MAX + 1];
 static size_t s_echo_used;                      /* bytes of s_echo_queue used: entries, each NUL-terminated */
 static size_t s_echo_bytes;                     /* what they are as the console sends them, at most APPS_ECHO_QUEUE */
 

@@ -1572,7 +1572,14 @@ static char *build_register_json(void) {
     // into one buffer sized to fit instead.
     char *json = nullptr;
     for (int size = 2048; size <= 8192 && !json; size += 512) {
+#if CONFIG_MUSE_APPS
+        // With Muse's apps the registration is near 4 KB, where malloc takes
+        // internal RAM (SPIRAM_MALLOC_ALWAYSINTERNAL), as the boot's lowest
+        // internal and DMA free is being set: PSRAM, which free() returns.
+        json = (char *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
         json = (char *)malloc(size);
+#endif
         if (!json) break;
         if (!cJSON_PrintPreallocated(root, json, size, false)) {
             free(json);

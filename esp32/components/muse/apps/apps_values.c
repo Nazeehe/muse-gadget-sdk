@@ -285,7 +285,7 @@ void apps_values_forget(const char *app) {
 /* The saves the worker hasn't taken: a slot for each app, as many as the RAM map has (APPS_VALUES_RAM_APPS), the app task's alone (a save
  * and a load are its calls, and so is the tick that offers them again). A slot's node is no longer ours once an op has it: nothing touches
  * it then but a clear of the slot. s_retry_at is when the tick offers them again, APPS_VALUES_RETRY_MS after the worker's last refusal. */
-static store_node_t *s_pending[APPS_VALUES_RAM_APPS];
+static EXT_RAM_BSS_ATTR store_node_t *s_pending[APPS_VALUES_RAM_APPS];
 static int64_t s_retry_at;
 
 static EXT_RAM_BSS_ATTR char s_slow[APPS_VALUES_RAM_APPS][APPS_ID_MAX + 1];     /* apps whose saves the budget holds back: a streak each */

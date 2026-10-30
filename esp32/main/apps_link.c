@@ -57,11 +57,12 @@ _Static_assert(MUSE_APPS_SNAPSHOT_TOTAL_MS < CONTROL_TIMEOUT_MS, "a snapshot's d
 #define REQUEST_ID_MAX 64
 
 // The headroom rule (D11): link.register carries the apps' entries in at most
-// 4499 bytes (APPS_REGISTER_BUDGET). All four, app.send's and snapshot's scale
-// included, measure well under it (tests/test_muse_apps_link.py asserts it and
-// prints the size), so app.control is advertised. Were they over, this would
-// be 0: app.control would still dispatch, and app.api's payload would name it
-// ("control").
+// APPS_REGISTER_BUDGET bytes (tests/test_muse_apps_link.py asserts it and prints
+// the size). The registration goes out as the Link's setup sets the boot's
+// lowest internal and DMA free, so each entry is a sentence and app.api's guide
+// carries the rest (I2). All four fit, so app.control is advertised. Were they
+// over, this would be 0: app.control would still dispatch, and app.api's
+// payload would name it ("control").
 #define ADVERTISE_CONTROL 1
 
 // app.control's actions, as typed.
@@ -152,38 +153,31 @@ static void add_command(cJSON *commands, const char *name, const char *descripti
 static void register_send(cJSON *commands) {
     cJSON *required = cJSON_CreateObject(), *optional = cJSON_CreateObject();
     cJSON_AddItemToObject(required, "id", param("string", "App id."));
-    cJSON_AddItemToObject(required, "event", param("string", "One of the app's messages (app.control list shows them)."));
-    cJSON_AddItemToObject(optional, "data", param("object", "The event's data, e.g. {\"seconds\":300}."));
-    cJSON_AddItemToObject(optional, "show", param("boolean", "Bring the app to the front once this turn ends."));
-    add_command(commands, "app.send",
-                "Send an event to a gadget app (its manifest's messages list them). Starts the app if needed. show=true "
-                "brings it to the front once this turn ends. Returns the app's reply.",
-                required, optional, SEND_TIMEOUT_MS);
+    cJSON_AddItemToObject(required, "event", param("string", "One of its manifest's messages."));
+    cJSON_AddItemToObject(optional, "data", param("object", "The event's data."));
+    cJSON_AddItemToObject(optional, "show", param("boolean", "Bring it to the front after this turn."));
+    add_command(commands, "app.send", "Send one of an app's messages to it, starting it if needed; returns its reply.", required,
+                optional, SEND_TIMEOUT_MS);
 }
 
 void apps_link_register(cJSON *commands) {
     add_command(commands, "app.api",
-                "Call before writing an app. Writes the gadget app guide and a timer example to workspace/apps/_guide/ on "
-                "this VM and returns the API level, screen, fonts, limits, storage and installed apps.",
+                "Call before writing an app: writes the app guide to workspace/apps/_guide/ and returns the gadget's limits.",
                 NULL, NULL, API_TIMEOUT_MS);
     cJSON *required = cJSON_CreateObject(), *optional = cJSON_CreateObject();
-    cJSON_AddItemToObject(required, "id", param("string", "App id: lowercase, the folder name."));
+    cJSON_AddItemToObject(required, "id", param("string", "App id (the folder name)."));
     cJSON_AddItemToObject(optional, "run", param("boolean", "Run it after installing (default true)."));
     add_command(commands, "app.install",
-                "Install the app in workspace/apps/<id>/ on this VM (manifest.json and the files it lists) onto the "
-                "gadget, and run it. Returns compile errors, a crash traceback and logs, a widget dump and round-screen "
-                "warnings. Call app.api first.",
-                required, optional, INSTALL_TIMEOUT_MS);
+                "Install and run the app in workspace/apps/<id>/; returns errors, logs and a widget dump.", required,
+                optional, INSTALL_TIMEOUT_MS);
     if (ADVERTISE_CONTROL) {
         required = cJSON_CreateObject();
         optional = cJSON_CreateObject();
         cJSON_AddItemToObject(required, "action", param("string", "list, status, logs, launch, stop, remove or snapshot."));
         cJSON_AddItemToObject(optional, "id", param("string", "App id, for every action but list."));
         cJSON_AddItemToObject(optional, "scale", param("integer", "1 full size (default), 2 half"));
-        add_command(commands, "app.control",
-                    "Manage gadget apps. action: list, status, logs, launch, stop, remove or snapshot; id for all but list. "
-                    "status and logs return state, errors with traceback, the last 50 log lines, memory and CPU.",
-                    required, optional, CONTROL_TIMEOUT_MS);
+        add_command(commands, "app.control", "Manage gadget apps; app.api's guide says what each action returns.", required,
+                    optional, CONTROL_TIMEOUT_MS);
     }
     register_send(commands);
 }

@@ -48,22 +48,17 @@ MUSE = ROOT / "components/muse"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_link_harness.c"
 
-# The room link.register has for the apps' commands, in bytes. /tmp/muse-apps-log.md, "## Baseline", "### REGISTER_BUDGET"
-# (Task 1, measured on the 1.75C on 2026-10-26): "REGISTER_BUDGET = 7168 - 2669 = 4499 bytes (Task 22). 2669 is the N in this
-# board's `sent link.register (N bytes)` boot-log line." 7168 is the global constraint's 7 KB; 2669 the registration without
-# the apps (it carries the Wi-Fi network's name, so a longer one costs a few bytes more). Tasks 23 to 25 add their entries
-# under the same budget.
-APPS_REGISTER_BUDGET = 4499
+# The room link.register has for the apps' commands, in bytes. The registration's size costs the boot's lowest internal and DMA
+# free: it is sent at the moment the Link's setup sets that floor, its Wi-Fi TX buffers in flight (DMA RAM), so the entries are a
+# sentence each and app.api's guide carries the rest (I2). The budget is the trimmed entries' size as this test prints it (1,299
+# bytes on 2026-10-30) rounded up to the next 128, so that growing them is a deliberate change to this number. The first budget was
+# what fit under the 7 KB cap: 7,168 less the 2,669 bytes of the board's `sent link.register (N bytes)` boot line without the apps.
+APPS_REGISTER_BUDGET = 1408
 
-INSTALL_DESCRIPTION = ("Install the app in workspace/apps/<id>/ on this VM (manifest.json and the files it lists) onto the "
-                       "gadget, and run it. Returns compile errors, a crash traceback and logs, a widget dump and round-screen "
-                       "warnings. Call app.api first.")
-API_DESCRIPTION = ("Call before writing an app. Writes the gadget app guide and a timer example to workspace/apps/_guide/ on "
-                   "this VM and returns the API level, screen, fonts, limits, storage and installed apps.")
-CONTROL_DESCRIPTION = ("Manage gadget apps. action: list, status, logs, launch, stop, remove or snapshot; id for all but list. "
-                       "status and logs return state, errors with traceback, the last 50 log lines, memory and CPU.")
-SEND_DESCRIPTION = ("Send an event to a gadget app (its manifest's messages list them). Starts the app if needed. show=true "
-                    "brings it to the front once this turn ends. Returns the app's reply.")
+INSTALL_DESCRIPTION = "Install and run the app in workspace/apps/<id>/; returns errors, logs and a widget dump."
+API_DESCRIPTION = "Call before writing an app: writes the app guide to workspace/apps/_guide/ and returns the gadget's limits."
+CONTROL_DESCRIPTION = "Manage gadget apps; app.api's guide says what each action returns."
+SEND_DESCRIPTION = "Send one of an app's messages to it, starting it if needed; returns its reply."
 
 GUIDE = MUSE / "apps/apps_guide.md"
 SKILLS = ROOT.parent / "skills"
@@ -129,7 +124,7 @@ class LinkCommands(unittest.TestCase):
         self.assertLessEqual(size, APPS_REGISTER_BUDGET)
         self.assertEqual(everything["app.install"], {
             "description": INSTALL_DESCRIPTION,
-            "required": {"id": {"type": "string", "description": "App id: lowercase, the folder name."}},
+            "required": {"id": {"type": "string", "description": "App id (the folder name)."}},
             "optional": {"run": {"type": "boolean", "description": "Run it after installing (default true)."}},
             "timeout_ms": 120000,
         })
@@ -518,6 +513,14 @@ class GuideAndSkill(unittest.TestCase):
 
 
 class LinkWiring(unittest.TestCase):
+    def test_the_registration_is_printed_into_psram_in_an_apps_build(self):
+        # I2: with the apps the registration is near 4 KB, where malloc picks internal RAM (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096),
+        # and every size build_register_json tries takes it while the Link's setup sets the boot's lowest internal and DMA free. An
+        # apps build prints it into PSRAM; a build without the apps is as it was (X5).
+        body = c_function((MAIN / "noise_control.cpp").read_text(), "static char *build_register_json(")
+        self.assertRegex(body, r"#if CONFIG_MUSE_APPS\n[^#]*json = \(char \*\)heap_caps_malloc\(size, MALLOC_CAP_SPIRAM \| MALLOC_CAP_8BIT\);"
+                               r"\n#else\n\s*json = \(char \*\)malloc\(size\);\n#endif")
+
     def test_adapter_reads_vm_files_own_words(self):
         # The adapter tells a dropped session, a timeout, a busy writer and a lack of memory by vm_file's texts: each it
         # compares against must be one of vm_file.c's literals, or the code falls back to "failed" (and the guide goes inline).

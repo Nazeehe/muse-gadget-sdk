@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <stddef.h>
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -69,7 +70,7 @@ static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_jobs;   /* APPS_IO_JOBS of job_t, in PSRAM */
 static TaskHandle_t s_worker;  /* under s_lock: the worker, or NULL when there is none */
 static TaskHandle_t s_parked;  /* under s_lock: a worker that went idle, suspended or about to be, for a submit to delete */
-static job_t s_ops[APPS_IO_OPS];  /* under s_lock: the ops waiting, a ring from s_ops_head */
+static EXT_RAM_BSS_ATTR job_t s_ops[APPS_IO_OPS];  /* under s_lock: the ops waiting, a ring from s_ops_head (plain: PSRAM, I2) */
 static unsigned s_ops_head, s_ops_n;
 static bool s_ops_nudged;         /* under s_lock: a drain job is queued, and has not looked yet */
 static TaskHandle_t s_op_task;    /* the task that submits ops: set by it, before it submits any */

@@ -236,6 +236,9 @@ class MuseAppsWiringTest(unittest.TestCase):
         lines = overlay.read_text().splitlines()
         self.assertIn("CONFIG_FATFS_LFN_HEAP=y", lines)
         self.assertIn("CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y", lines)
+        # I2: NVS's in-memory cache (its pages' tables and key hash lists, of nvs and apps_nvs) in PSRAM, which on the 1.75C stays
+        # readable while flash is written (X18). It moves only the cache: what NVS writes to flash is the same.
+        self.assertIn("CONFIG_NVS_ALLOCATE_CACHE_IN_SPIRAM=y", lines)
         # Nothing else turns it on, the 1.75C's overlay included.
         for other in [*(ROOT / "devices").glob("sdkconfig.*"), *ROOT.glob("sdkconfig.defaults*")]:
             if other != overlay:

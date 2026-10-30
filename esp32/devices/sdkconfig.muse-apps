@@ -30,6 +30,13 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_apps.csv"
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y
 
+# NVS's in-memory cache (each page's table and the keys' hash lists, for nvs and
+# apps_nvs) in PSRAM, off the internal RAM the Link's setup runs short of at boot.
+# Only the cache moves: what NVS writes to flash is the same. The 1.75C keeps the
+# cache on while flash is written (SPIRAM_FETCH_INSTRUCTIONS and SPIRAM_RODATA), so
+# PSRAM stays readable throughout.
+CONFIG_NVS_ALLOCATE_CACHE_IN_SPIRAM=y
+
 # app.control's snapshot draws the screen with LVGL's snapshot (apps_snapshot.c);
 # the bench overlay has it for the USB screenshots, which this brings to an apps
 # build too.

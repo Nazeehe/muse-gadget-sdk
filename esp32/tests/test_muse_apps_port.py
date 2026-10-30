@@ -198,13 +198,24 @@ class AppPortTest(unittest.TestCase):
     def test_the_values_tables_are_in_psram(self):  # the gadget's internal RAM is the Link's
         source = (APPS / "apps_values.c").read_text()
         self.assertIn('#include "esp_attr.h"', source)
-        for name in ("s_failing", "s_failed", "s_slow", "s_slow_new", "s_marked", "s_recs", "s_unclocked", "s_waits", "s_forgotten"):
+        for name in ("s_failing", "s_failed", "s_slow", "s_slow_new", "s_marked", "s_recs", "s_unclocked", "s_waits", "s_forgotten",
+                     "s_pending"):
             with self.subTest(name):
                 self.assertRegex(source, rf"(?m)^static EXT_RAM_BSS_ATTR [^\n]*\b{name}\[", f"{name}: plain memory of tasks, PSRAM")
         for name in ("s_lock_buf", "s_lock"):
             with self.subTest(name):
                 self.assertRegex(source, rf"(?m)^static [^\n]*\b{name};", name)
                 self.assertNotRegex(source, rf"(?m)^static [^\n]*EXT_RAM_BSS_ATTR[^\n]*\b{name};", f"{name}: the lock stays internal")
+
+    def test_the_echos_state_is_in_psram(self):  # I2: the app task's alone, plain loads and stores
+        source = (APPS / "apps_port_idf.c").read_text()
+        self.assertIn('#include "esp_attr.h"', source)
+        for name in ("s_echo", "s_unechoed_id"):
+            with self.subTest(name):
+                self.assertRegex(source, rf"(?m)^static EXT_RAM_BSS_ATTR [^\n]*\b{name}\b", f"{name}: PSRAM")
+        for name in ("s_ui_lock_buf", "s_breaches_logged"):
+            with self.subTest(name):
+                self.assertNotRegex(source, rf"(?m)^static [^\n]*EXT_RAM_BSS_ATTR[^\n]*\b{name}\b", f"{name} stays internal")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

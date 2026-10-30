@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -215,7 +216,7 @@ static atomic_bool s_launcher_wanted;  /* any task asks; the LVGL task shows it 
 static atomic_bool s_alarm_posted;     /* the esp_timer task posted APPS_EV_ALARM and the loop hasn't looked at the table since */
 static atomic_bool s_list_changed;     /* the store gave a new list: the LVGL task shows the launcher again if it is up */
 
-/* ---- The app task's own ---- */
+/* ---- The app task's own ---- (plain state of one task: PSRAM, I2) */
 
 typedef struct parked {
     struct parked *next;
@@ -223,7 +224,7 @@ typedef struct parked {
     uint32_t reset;  /* freed once this reset has run */
 } parked_t;
 
-static struct {
+static EXT_RAM_BSS_ATTR struct {
     apps_rt_t *rt;
     apps_pkg_t *pkg;
     uint32_t gen;
@@ -256,9 +257,9 @@ static struct {
     int64_t poke_at;          /* the earliest the next poke may be (apps_port_mono_ms) */
 } T;
 
-/* ---- The LVGL task's own ---- */
+/* ---- The LVGL task's own ---- (plain state of one task: PSRAM, I2) */
 
-static struct {
+static EXT_RAM_BSS_ATTR struct {
     bool in_turn;
     bool dark;               /* the screen was dark at the last frame (apps_port_dark) */
     bool turn_ended;         /* the next supervise decides the layer's place */

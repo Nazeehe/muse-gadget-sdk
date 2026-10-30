@@ -43,6 +43,7 @@
 #include "apps_install.h"
 #include "apps_json.h"
 #include "apps_port.h"
+#include "apps_store.h"
 #include "cJSON.h"
 #include "muse_apps.h"
 #include "muse_apps_exact_stack.h"
@@ -237,6 +238,16 @@ void apps_task_set_list(const apps_listed_t *apps, int n) {
         at += (size_t)snprintf(listed + at, sizeof listed - at, "%s%s:%s", i > 0 ? " " : "", apps[i].id, apps[i].name);
     }
     listings++;
+}
+
+/* apps_result.c's store check (apps_result_installed), which the install never makes: this harness has no store. */
+apps_storage_t apps_store_mode(void) {
+    return APPS_STORAGE_NONE;
+}
+
+bool apps_store_has(const char *id) {
+    (void)id;
+    return false;
 }
 
 /* ---- The log: the store's lines, kept ---- */

@@ -22,12 +22,14 @@
  *
  * 1. The caller (the Noise session's task) checks the parameters and the admission (APPS_SNAPSHOT_PSRAM_MIN of PSRAM free, one
  *    snapshot at a time) and queues one job on the I/O worker (apps_io.h). It never waits.
- * 2. The job checks that the app is installed (the store is the worker's: X11), wakes the screen if it is dark (E9:
- *    muse_input_wake("snapshot")), and asks the LVGL task for the screen: it leaves a request with a deadline,
+ * 2. The job checks that the app is installed (the store is the worker's: X11), wakes the screen (E9:
+ *    muse_input_wake("snapshot"), which lights a dark screen and keeps a lit one from going dark before the take), and asks
+ *    the LVGL task for the screen: it leaves a request with a deadline,
  *    MUSE_APPS_SNAPSHOT_SCREEN_MS from then, and polls for the answer, running the app task's ops as it waits (apps_io_assist).
  * 3. The LVGL task, every frame, in muse_apps_ui_supervise (apps_snapshot_take_pending): on the first frame the screen isn't dark
  *    and the deadline hasn't come, it draws the active screen, whatever is on it (D22), into a block of PSRAM of its own
- *    (lv_snapshot_take_to_draw_buf, RGB565) and hands the block to the job. A request it finds after its deadline is dropped,
+ *    (lv_snapshot_take_to_draw_buf, RGB565) and hands the block to the job, with what the picture is of: the app layer's place
+ *    and the app that runs, read as it is drawn. A request it finds after its deadline is dropped,
  *    never taken: the job's own look at the deadline answers it, unavailable, MUSE_APPS_SNAPSHOT_NO_WAKE. The time the drawing
  *    took is the app task's core's, not the app's: apps_rt_steal_ms keeps it off the running app's duty cycle and 1 s backstop.
  * 4. The job masks the pixels to the round screen (apps_snapshot_mask) into a 16-byte aligned block (jpeg_calloc_align), frees

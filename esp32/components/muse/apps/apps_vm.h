@@ -79,8 +79,12 @@ typedef struct {
     size_t mem_limit;                          /* bytes */
     void *(*realloc_fn)(void *ptr, size_t n);  /* device: PSRAM; host: realloc */
     void (*free_fn)(void *ptr);
-    int64_t (*now_ms)(void);                   /* monotonic */
+    int64_t (*now_ms)(void);                   /* ms; only spans are taken of it (see below) */
 } apps_vm_config_t;
+/* now_ms is the clock of the 1 s wall backstop and of apps_vm_call_started_ms, which only ever take spans of it. The device's
+ * (apps_rt.c's vm_clock_ms) is the monotonic clock less the time a snapshot's drawing took from the core (apps_rt_steal_ms), so
+ * that the drawing isn't the call's: it steps back by a drawing's length once the drawing is booked, and isn't comparable with
+ * apps_port_mono_ms. The host's is plain monotonic. */
 
 /* A state with the sandbox open. NULL if out of memory (realloc_fn failed, or the
  * libraries don't fit in mem_limit), or if cfg lacks a function. */
@@ -187,7 +191,8 @@ void apps_vm_charge(lua_State *L, unsigned n);
  */
 unsigned apps_vm_table_slots(lua_State *L, int idx);
 /* Whether apps_vm_call is running, and since when (now_ms() when the outermost call
- * began). Any task: the supervisor reads them to spot a hung app. Read in_call first,
+ * began: the VM's clock, which on the device isn't apps_port_mono_ms). Any task: the
+ * supervisor reads them to spot a hung app. Read in_call first,
  * then the start: apps_vm_call stores the start before it sets in_call, so a reader that
  * saw in_call true gets that call's start, or a later call's. */
 bool apps_vm_in_call(const apps_vm_t *vm);

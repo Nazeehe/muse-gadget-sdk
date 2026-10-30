@@ -52,6 +52,8 @@
 #define API_TIMEOUT_MS 30000       // app.api's: the guide's writes (MUSE_APPS_GUIDE_WRITE_MS) and the answer
 #define CONTROL_TIMEOUT_MS 30000   // app.control's: a launch's load, run and settle; a snapshot's 25 s (MUSE_APPS_SNAPSHOT_TOTAL_MS)
 #define SEND_TIMEOUT_MS 10000      // app.send's: the app's reply bound (5 s, MUSE_APPS_SEND_REPLY_MS) and the round trip
+// A snapshot answers by its own deadline, so the VM never gives up on app.control first.
+_Static_assert(MUSE_APPS_SNAPSHOT_TOTAL_MS < CONTROL_TIMEOUT_MS, "a snapshot's deadline must end before app.control's timeout");
 #define REQUEST_ID_MAX 64
 
 // The headroom rule (D11): link.register carries the apps' entries in at most

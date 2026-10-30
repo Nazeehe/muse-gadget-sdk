@@ -383,9 +383,9 @@ int apps_rt_timer_count(const apps_rt_t *rt);
 const char *apps_rt_id(const apps_rt_t *rt);
 bool apps_rt_permits(const apps_rt_t *rt, unsigned perm);
 
-/* The VM, for what the runtime doesn't wrap: apps_vm_kill, apps_vm_in_call, apps_vm_call_started_ms and the
- * memory counters (apps_vm.h). What is installed into its globals through it is there for the handlers, not for
- * main.lua's top level, which has run by the time the runtime exists. */
+/* The VM, for what the runtime doesn't wrap: apps_vm_kill, apps_vm_in_call, apps_vm_call_started_ms (on the VM's clock,
+ * which leaves out stolen time: apps_vm.h) and the memory counters (apps_vm.h). What is installed into its globals
+ * through it is there for the handlers, not for main.lua's top level, which has run by the time the runtime exists. */
 apps_vm_t *apps_rt_vm(apps_rt_t *rt);
 
 /* ---- The store, show and exit (above; the `store` and `sys` modules of apps_svc.c are built on these) ---- */

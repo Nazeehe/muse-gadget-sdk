@@ -269,6 +269,20 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertIn("void *__wrap_jpeg_calloc_inner(size_t size) {", source)
         self.assertIn("void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned) {", source)
 
+    def test_d14_results_are_made_in_one_place(self):  # Task 25 fix 1 A
+        # The D14 result shapes, the store check and the VM codes' mapping are apps_result.c's: no job keeps its own copy.
+        shared = (MUSE / "apps/apps_result.c").read_text()
+        for name in ("cJSON *apps_result_failure(", "cJSON *apps_result_success(", "bool apps_result_installed(",
+                     "const char *apps_result_vm_code("):
+            self.assertIn(name, shared)
+        for name in ("apps_control.c", "apps_snapshot.c", "apps_install.c"):
+            source = (MUSE / "apps" / name).read_text()
+            self.assertIn('#include "apps_result.h"', source, name)
+            self.assertNotRegex(source, r"static cJSON \*success\(cJSON \*payload\)", name)
+            self.assertNotRegex(source, r"static bool installed\(", name)
+            self.assertNotIn('"storage not ready"', source, name)
+            self.assertNotIn("strcmp(code, MUSE_APPS_VM_BUSY)", source, name)
+
     def test_option_selects_every_font_an_app_can_name(self):
         # font = "sans14" ... "mono16" are lv_font_montserrat_14/16/20/28 and lv_font_unscii_8/16, which a build
         # only has when its sdkconfig enables them; the option does, so no board's overlay has to remember.

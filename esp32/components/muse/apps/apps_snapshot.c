@@ -25,8 +25,8 @@
 #include "apps_lv.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
+#include "apps_result.h"
 #include "apps_rt.h"
-#include "apps_store.h"
 #include "apps_task.h"
 #include "cJSON.h"
 #include "esp_heap_caps.h"
@@ -55,8 +55,6 @@
 
 static const char *TAG = "muse_apps";
 
-#define STORE_NOT_READY "storage not ready"  /* apps_store.c's words, for a store that isn't mounted yet */
-#define NO_ROOM_RESULT "out of memory: no room for the result"
 #define BAD_ID "app id must match ^[a-z][a-z0-9_]{1,23}$"
 #define ALREADY "another snapshot is being taken; try again in a few seconds"
 #define SCREEN_BUSY "the screen is still drawing the last snapshot; try again in a few seconds"
@@ -78,6 +76,7 @@ typedef struct {
     uint16_t *px;
     int w, h, stride_px;
     bool layer_front;    /* the app layer was in front and no card covered it */
+    char running[APPS_ID_MAX + 1];  /* the app that ran when it was drawn ("" for none) */
     uint32_t render_ms;  /* what the drawing took */
     const char *why;     /* a failure's, a literal */
     bool no_memory;
@@ -85,12 +84,12 @@ typedef struct {
 
 static atomic_int s_cap;         /* the handshake's word */
 static atomic_bool s_claimed;    /* a snapshot command is under way, from its admission to its done */
-static int64_t s_deadline_ms;    /* the job's, set before it says CAP_REQUESTED */
+static _Atomic int64_t s_deadline_ms;  /* the job's, set before it says CAP_REQUESTED: a word the LVGL task can't read torn */
 static shot_t s_shot;            /* the LVGL task's, set before it says CAP_TAKEN or CAP_FAILED */
 static lv_draw_buf_t s_draw_buf; /* the LVGL task's: its pixels are s_shot's block */
 
 void apps_snapshot_take_pending(void) {
-    if (atomic_load(&s_cap) != CAP_REQUESTED || apps_port_dark() || apps_port_mono_ms() >= s_deadline_ms) {
+    if (atomic_load(&s_cap) != CAP_REQUESTED || apps_port_dark() || apps_port_mono_ms() >= atomic_load(&s_deadline_ms)) {
         return;  /* nothing asked, the screen not lit yet (its first lit frame takes it), or too late: the job's deadline answers */
     }
     int expected = CAP_REQUESTED;
@@ -118,7 +117,10 @@ void apps_snapshot_take_pending(void) {
     }
     shot.render_ms = (uint32_t)(apps_port_mono_ms() - began);
     apps_rt_steal_ms(shot.render_ms);  /* the drawing held the app task's core: not the app's time (apps_rt.h) */
+    /* What the picture is of, read with it: the layer's place and the app that runs (its names lock is a mutex held only for
+     * copies, so the wait is one copy's). */
     shot.layer_front = apps_lv_front() && !apps_lv_cards_shown();
+    apps_task_running(shot.running, sizeof shot.running);
     s_shot = shot;
     expected = CAP_TAKING;
     if (!atomic_compare_exchange_strong(&s_cap, &expected, shot.px != NULL ? CAP_TAKEN : CAP_FAILED)) {
@@ -165,32 +167,6 @@ void apps_snapshot_mask(const uint16_t *src, int w, int h, int stride_px, int sc
     }
 }
 
-/* ---- Results ---- */
-
-/* {"ok":false,"error":{"code","message"}}; NULL without memory. */
-static cJSON *failure(const char *code, const char *message) {
-    cJSON *r = cJSON_CreateObject();
-    cJSON *e = NULL;
-    bool ok = r != NULL && cJSON_AddFalseToObject(r, "ok") != NULL && (e = cJSON_AddObjectToObject(r, "error")) != NULL &&
-              cJSON_AddStringToObject(e, "code", code) != NULL && cJSON_AddStringToObject(e, "message", message) != NULL;
-    if (!ok) {
-        cJSON_Delete(r);
-        return NULL;
-    }
-    return r;
-}
-
-/* {"ok":true,"payload":payload}, payload taken; NULL (payload freed) without memory. */
-static cJSON *success(cJSON *payload) {
-    cJSON *r = payload != NULL ? cJSON_CreateObject() : NULL;
-    if (r != NULL && cJSON_AddTrueToObject(r, "ok") != NULL && cJSON_AddItemToObject(r, "payload", payload)) {
-        return r;
-    }
-    cJSON_Delete(r);
-    cJSON_Delete(payload);
-    return NULL;
-}
-
 /* ---- The job (the I/O worker's) ---- */
 
 typedef struct {
@@ -214,35 +190,22 @@ static void snapshot_path(const char *id, char *out, size_t cap) {
     snprintf(out, cap, APPS_VM_DIR "%s/" MUSE_APPS_SNAPSHOT_FILE, id);
 }
 
-/* True when the store is mounted and has id; otherwise *r is the refusal. */
-static bool installed(const char *id, cJSON **r) {
-    if (apps_store_mode() == APPS_STORAGE_NONE) {
-        *r = failure(APPS_ERR_UNAVAILABLE, STORE_NOT_READY);
-        return false;
-    }
-    if (!apps_store_has(id)) {
-        char msg[sizeof MUSE_APPS_NOT_FOUND + APPS_ID_MAX];
-        snprintf(msg, sizeof msg, MUSE_APPS_NOT_FOUND, id);
-        *r = failure("not_found", msg);
-        return false;
-    }
-    return true;
-}
-
 /* Asks the LVGL task for the screen, waking it if it is dark (E9), and waits for its answer until the screen's deadline (and, for a
  * drawing begun before it, APPS_SNAPSHOT_RENDER_MS more), running the app task's ops as it looks. True with *shot the pixels (the
  * caller's to free); otherwise *r is the refusal. */
 static bool capture(const snap_job_t *job, shot_t *shot, cJSON **r) {
     if (atomic_load(&s_cap) != CAP_IDLE) {
-        *r = failure(APPS_ERR_BUSY, SCREEN_BUSY);  /* a drawing given up on is still drawing into its pixels */
+        *r = apps_result_failure(APPS_ERR_BUSY, SCREEN_BUSY);  /* a drawing given up on is still drawing into its pixels */
         return false;
     }
     if (apps_port_dark()) {
         ESP_LOGI(TAG, "snapshot %s: waking the screen", job->id);
-        muse_input_wake("snapshot");
     }
+    /* Always: it lights a dark screen, and pokes a lit one's idle timer, so that the screen can't go dark before a frame takes
+     * it (a wake only for a screen found dark would never come for that one, and the request would time out). */
+    muse_input_wake("snapshot");
     const int64_t deadline = apps_port_mono_ms() + MUSE_APPS_SNAPSHOT_SCREEN_MS;
-    s_deadline_ms = deadline;
+    atomic_store(&s_deadline_ms, deadline);
     memset(&s_shot, 0, sizeof s_shot);
     atomic_store(&s_cap, CAP_REQUESTED);
     const TickType_t ticks = pdMS_TO_TICKS(APPS_SNAPSHOT_POLL_MS) > 0 ? pdMS_TO_TICKS(APPS_SNAPSHOT_POLL_MS) : 1;
@@ -256,14 +219,15 @@ static bool capture(const snap_job_t *job, shot_t *shot, cJSON **r) {
             int expected = state;
             if (state == CAP_REQUESTED && atomic_compare_exchange_strong(&s_cap, &expected, CAP_IDLE)) {
                 ESP_LOGW(TAG, "snapshot %s: the screen wasn't lit and drawn within %d ms", job->id, MUSE_APPS_SNAPSHOT_SCREEN_MS);
-                *r = failure(APPS_ERR_UNAVAILABLE, MUSE_APPS_SNAPSHOT_NO_WAKE);  /* a frame after this finds nothing to take */
+                /* A frame after this finds nothing to take. */
+                *r = apps_result_failure(APPS_ERR_UNAVAILABLE, MUSE_APPS_SNAPSHOT_NO_WAKE);
                 return false;
             }
             if (state == CAP_TAKING && now >= deadline + APPS_SNAPSHOT_RENDER_MS &&
                 atomic_compare_exchange_strong(&s_cap, &expected, CAP_ABANDONED)) {
                 ESP_LOGW(TAG, "snapshot %s: the drawing didn't end %d ms after the deadline: given up", job->id,
                          APPS_SNAPSHOT_RENDER_MS);
-                *r = failure(APPS_ERR_UNAVAILABLE, DRAWING_SLOW);  /* the LVGL task frees the pixels when it is done */
+                *r = apps_result_failure(APPS_ERR_UNAVAILABLE, DRAWING_SLOW);  /* the LVGL task frees the pixels when it is done */
                 return false;
             }
             if (expected != state) {
@@ -277,7 +241,8 @@ static bool capture(const snap_job_t *job, shot_t *shot, cJSON **r) {
     const bool taken = atomic_load(&s_cap) == CAP_TAKEN;
     atomic_store(&s_cap, CAP_IDLE);
     if (!taken) {
-        *r = failure(shot->no_memory ? APPS_ERR_OUT_OF_MEMORY : APPS_ERR_UNAVAILABLE, shot->why != NULL ? shot->why : NO_DRAWING);
+        *r = apps_result_failure(shot->no_memory ? APPS_ERR_OUT_OF_MEMORY : APPS_ERR_UNAVAILABLE,
+                                 shot->why != NULL ? shot->why : NO_DRAWING);
         return false;
     }
     return true;
@@ -317,7 +282,7 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
         apps_port_free(shot->px);
         shot->px = NULL;
         snprintf(msg, sizeof msg, "the JPEG encoder refused %dx%d (error %d)", fw, fh, (int)err);
-        *r = failure(err == JPEG_ERR_NO_MEM ? APPS_ERR_OUT_OF_MEMORY : APPS_ERR_UNAVAILABLE, msg);
+        *r = apps_result_failure(err == JPEG_ERR_NO_MEM ? APPS_ERR_OUT_OF_MEMORY : APPS_ERR_UNAVAILABLE, msg);
         return false;
     }
     const size_t dma_open = heap_caps_get_free_size(MALLOC_CAP_DMA);
@@ -327,7 +292,7 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
         jpeg_enc_close(enc);
         apps_port_free(shot->px);
         shot->px = NULL;
-        *r = failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the masked pixels");
+        *r = apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the masked pixels");
         return false;
     }
     apps_snapshot_mask(shot->px, shot->w, shot->h, shot->stride_px, job->scale, in, fw);
@@ -342,13 +307,13 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
     jpeg_enc_close(enc);
     jpeg_free_align(in);
     if (out == NULL) {
-        *r = failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the JPEG");
+        *r = apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the JPEG");
         return false;
     }
     if (err != JPEG_ERR_OK || len <= 0 || len > APPS_SNAPSHOT_JPEG_MAX) {
         apps_port_free(out);
         snprintf(msg, sizeof msg, "the JPEG encoder failed (error %d); try scale 2", (int)err);
-        *r = failure(APPS_ERR_UNAVAILABLE, msg);
+        *r = apps_result_failure(APPS_ERR_UNAVAILABLE, msg);
         return false;
     }
     char padded[32] = "";
@@ -505,10 +470,7 @@ static bool save(const snap_job_t *job, const encoded_t *e, cJSON **r) {
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA));
     char msg[PATH_MAX_LEN + sizeof why + 40];
     snprintf(msg, sizeof msg, "couldn't save the snapshot to %s: %s", path, why);
-    *r = failure(strcmp(code, MUSE_APPS_VM_BUSY) == 0            ? APPS_ERR_BUSY
-                 : strcmp(code, MUSE_APPS_VM_OUT_OF_MEMORY) == 0 ? APPS_ERR_OUT_OF_MEMORY
-                                                                 : APPS_ERR_UNAVAILABLE,
-                 msg);
+    *r = apps_result_failure(apps_result_vm_code(code), msg);
     return false;
 }
 
@@ -518,16 +480,15 @@ static cJSON *snapshot_result(const snap_job_t *job) {
     if (job->deadline_ms - at < APPS_SNAPSHOT_MIN_LEFT_MS) {  /* it waited in the worker's queue: nothing is done */
         char msg[80];
         snprintf(msg, sizeof msg, "the gadget was busy for %d ms; take the snapshot again", (int)(at - job->stamp_ms));
-        return failure(APPS_ERR_BUSY, msg);
+        return apps_result_failure(APPS_ERR_BUSY, msg);
     }
     cJSON *r = NULL;
     shot_t shot;
-    if (!installed(job->id, &r) || !capture(job, &shot, &r)) {
+    if (!apps_result_installed(job->id, &r) || !capture(job, &shot, &r)) {
         return r;
     }
     const uint32_t answered_ms = (uint32_t)(apps_port_mono_ms() - at);
-    char running[APPS_ID_MAX + 1];
-    const bool runs = apps_task_running(running, sizeof running) && strcmp(running, job->id) == 0;
+    const bool runs = strcmp(shot.running, job->id) == 0;  /* as drawn: an app that has begun since isn't in the picture */
     const bool front = runs && shot.layer_front;
     encoded_t e;
     if (!encode(job, &shot, answered_ms, &e, &r)) {
@@ -540,7 +501,7 @@ static cJSON *snapshot_result(const snap_job_t *job) {
         cJSON_Delete(p);
         return r;  /* the write's failure, or NULL without memory for the payload */
     }
-    return success(p);
+    return apps_result_success(p);
 }
 
 static void snap_run(void *arg) {
@@ -548,7 +509,7 @@ static void snap_run(void *arg) {
     ESP_LOGI(TAG, "snapshot %s: scale %d", job->id, job->scale);
     cJSON *r = snapshot_result(job);
     if (r == NULL) {
-        r = failure(APPS_ERR_OUT_OF_MEMORY, NO_ROOM_RESULT);
+        r = apps_result_failure(APPS_ERR_OUT_OF_MEMORY, APPS_NO_ROOM_RESULT);
     }
     const cJSON *error = cJSON_GetObjectItemCaseSensitive(r, "error");
     if (error != NULL) {

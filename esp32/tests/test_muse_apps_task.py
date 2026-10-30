@@ -42,7 +42,7 @@ HARNESS = TESTS / "muse_apps_task_harness.c"
 SOURCES = [HARNESS, TESTS / "muse_apps_fake_esp_timer.c", APPS / "apps_task.c", APPS / "apps_io.c", APPS / "apps_alarm.c",
            APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c", APPS / "apps_pkg.c",
            APPS / "apps_suggest.c", APPS / "apps_svc.c"]
-CONSOLE_SOURCES = [APPS / "apps_console.c", APPS / "apps_install.c"]
+CONSOLE_SOURCES = [APPS / "apps_console.c", APPS / "apps_install.c", APPS / "apps_result.c"]
 
 # What apps_task.c and muse_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one is a line that includes the fakes.
 FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/idf_additions.h", "freertos/queue.h", "freertos/semphr.h",

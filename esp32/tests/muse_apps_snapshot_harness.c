@@ -165,16 +165,24 @@ int64_t apps_port_mono_ms(void) {
     return atomic_load(&now_ms);
 }
 
+static _Atomic int64_t idle_dark_at;  /* the idle timer: dark from then on (0: never), unless a wake pokes it first */
+
 bool apps_port_dark(void) {
-    return atomic_load(&dark_forever) || atomic_load(&now_ms) < atomic_load(&dark_until);
+    const int64_t now = atomic_load(&now_ms), idle = atomic_load(&idle_dark_at);
+    return atomic_load(&dark_forever) || now < atomic_load(&dark_until) || (idle != 0 && now >= idle);
 }
 
 static int wakes;
 static const char *wake_why;
 
+/* A wake pokes the idle timer, as muse_input_wake's does: a lit screen stays lit. */
 void muse_input_wake(const char *why) {
     wakes++;
     wake_why = why;
+    const int64_t idle = atomic_load(&idle_dark_at);
+    if (idle != 0 && atomic_load(&now_ms) < idle) {
+        atomic_store(&idle_dark_at, 0);
+    }
 }
 
 static _Atomic uint32_t stolen_ms;
@@ -240,6 +248,7 @@ bool apps_store_has(const char *id) {
 
 static const char *running_id = "timer";
 static const char *record_id = "timer";
+static const char *after_take_running;  /* the app that runs (and has the record) from the frame after the drawing */
 static const char *record_dump;
 static int record_truncated;
 static int statuses;
@@ -481,8 +490,10 @@ static char written_path[160];
 static uint8_t written[200000];
 static size_t written_len;
 static int64_t written_deadline_us;
+static int64_t written_left_ms;  /* what was left of the deadline when the write began */
 static const char *write_code;   /* NULL: the write works; else the code it fails with */
 static const char *write_why = "the VM answered HTTP 507";
+static int write_takes_ms;       /* the write's time on the clock: past the deadline, it times out there */
 
 static bool vm_write(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
                      size_t err_len) {
@@ -491,6 +502,14 @@ static bool vm_write(const char *path, const void *data, size_t len, int64_t dea
     written_len = len <= sizeof written ? len : 0;
     memcpy(written, data, written_len);
     written_deadline_us = deadline_us;
+    written_left_ms = deadline_us / 1000 - atomic_load(&now_ms);
+    if (write_takes_ms > written_left_ms) {
+        atomic_store(&now_ms, deadline_us / 1000);
+        *code = MUSE_APPS_VM_TIMED_OUT;
+        snprintf(err, err_len, "no answer from the VM in time");
+        return false;
+    }
+    atomic_fetch_add(&now_ms, write_takes_ms);
     if (write_code != NULL) {
         *code = write_code;
         snprintf(err, err_len, "%s", write_why);
@@ -598,7 +617,13 @@ void vTaskDelay(TickType_t ticks) {
     }
     if (frames_on) {
         frames++;
+        const int drawn = renders;
         apps_snapshot_take_pending();
+        if (renders != drawn && after_take_running != NULL) {  /* the app task switches apps once the screen is drawn */
+            running_id = after_take_running;
+            record_id = after_take_running;
+            after_take_running = NULL;
+        }
     }
 }
 
@@ -652,6 +677,10 @@ static void reset(void) {
     opens = closes = processes = 0;
     caps_calls = 0;
     last_caps = 0;
+    atomic_store(&idle_dark_at, 0);
+    after_take_running = NULL;
+    written_left_ms = 0;
+    write_takes_ms = 0;
     last_alignment = 0;
     psram_out = false;
     memset(&last_config, 0, sizeof last_config);
@@ -805,7 +834,7 @@ static void refusals(void) {
     EXPECT_REFUSAL("timer", 1, done_cb, "out_of_memory", "out of memory: no room for the command");
     port_refuses = false;
     CHECK(snap("timer", 1, &c, &e), "and then one is taken: %s %s", c, e);
-    CHECK(wakes == 0 && dones == 3, "no wake (the screen is lit), three done");
+    CHECK(wakes == 3 && dones == 3, "three done, each with its wake (a lit screen's idle timer poked): %d", wakes);
     EXPECT_CLEAN();
 }
 
@@ -862,7 +891,8 @@ static void in_front(void) {
     CHECK(renders == 1 && steals == 1 && atomic_load(&stolen_ms) == 37, "renders %d, stolen %u", renders,
           (unsigned)atomic_load(&stolen_ms));
     CHECK(statuses == 1, "the record read %d times", statuses);
-    CHECK(wakes == 0, "a lit screen isn't woken");
+    CHECK(wakes == 1 && !logged_has("waking the screen"), "a lit screen's idle timer poked, and not said to be woken: %d",
+          wakes);
     CHECK(logged_has("I muse_apps: snapshot timer: scale 1\n"), "the start line:\n%s", logged);
     CHECK(logged_has("I muse_apps: snapshot timer: 466x466 jpeg 23456 bytes (q80), drawn in 37 ms, encoded in "), "the encode "
           "line:\n%s", logged);
@@ -952,7 +982,7 @@ static void lit_at_deadline(void) {
     atomic_store(&dark_until, atomic_load(&now_ms) + MUSE_APPS_SNAPSHOT_SCREEN_MS);
     EXPECT_FAILURE("timer", "unavailable", MUSE_APPS_SNAPSHOT_NO_WAKE);
     CHECK(renders == 0, "nothing drawn: %d", renders);
-    /* One millisecond earlier is in time. */
+    /* Lit one poll (APPS_SNAPSHOT_POLL_MS) before the deadline is in time. */
     atomic_store(&dark_until, atomic_load(&now_ms) + MUSE_APPS_SNAPSHOT_SCREEN_MS - APPS_SNAPSHOT_POLL_MS);
     const char *c, *e;
     CHECK(snap("timer", 1, &c, &e) && strstr(result, "\"ok\":true") != NULL, "in time: %s", result);
@@ -1212,6 +1242,70 @@ static void drawing_time_is_stolen(void) {
     EXPECT_CLEAN();
 }
 
+static void lit_then_dark_before_the_take(void) {
+    /* Lit when the job asks, but the idle timer would darken it before the next frame: the request's wake keeps it lit (a wake
+     * only once dark would never come, and the job would time out with "didn't wake"). */
+    atomic_store(&idle_dark_at, atomic_load(&now_ms) + 1);
+    const char *c, *e;
+    CHECK(snap("timer", 1, &c, &e), "refused: %s %s", c, e);
+    CHECK(strstr(result, "\"ok\":true") != NULL, "taken: %s", result);
+    CHECK(wakes == 1 && wake_why != NULL && strcmp(wake_why, "snapshot") == 0, "woken once, as \"snapshot\": %d", wakes);
+    CHECK(renders == 1, "drawn once: %d", renders);
+    CHECK(!logged_has("waking the screen"), "a lit screen isn't said to be woken:\n%s", logged);
+    EXPECT_CLEAN();
+}
+
+static void app_switched_after_the_take(void) {
+    const char *c, *e;
+    /* hello was on screen when it was drawn; timer runs by the time the job looks: the picture isn't timer's. */
+    running_id = "hello";
+    record_id = "hello";
+    after_take_running = "timer";
+    CHECK(snap("timer", 1, &c, &e), "refused: %s %s", c, e);
+    cJSON *p = PAYLOAD();
+    CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(p, "front")), "front false, as drawn: %s", result);
+    char w[2048];
+    warnings_of(p, w, sizeof w);
+    CHECK(strcmp(w, "'timer' isn't running: the snapshot shows what is on screen") == 0, "warnings: %s", w);
+    CHECK(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(p, "ui")) == 0, "no widgets: %s", result);
+    cJSON_Delete(p);
+    /* timer was drawn; hello runs by the time the job looks: the picture is timer's (front), and the record is hello's (no
+     * widgets rather than another app's). */
+    running_id = "timer";
+    record_id = "timer";
+    after_take_running = "hello";
+    CHECK(snap("timer", 1, &c, &e), "refused: %s %s", c, e);
+    p = PAYLOAD();
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(p, "front")), "front true, as drawn: %s", result);
+    CHECK(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(p, "ui")) == 0, "no widgets of another app: %s", result);
+    cJSON_Delete(p);
+    EXPECT_CLEAN();
+}
+
+static void write_gets_whats_left(void) {
+    const char *c, *e;
+    const int64_t asked = atomic_load(&now_ms);
+    CHECK(muse_apps_snapshot("timer", 1, done_cb, &dones, &c, &e), "refused: %s %s", c, e);
+    /* The job starts with MIN_LEFT (8 s) left, the screen lights 4.9 s later and takes 2 s to draw: 1.1 s is left for the
+     * write, which takes 3 s. */
+    atomic_fetch_add(&now_ms, MUSE_APPS_SNAPSHOT_TOTAL_MS - APPS_SNAPSHOT_MIN_LEFT_MS);
+    atomic_store(&dark_until, atomic_load(&now_ms) + 4900);
+    render_ms = 2000;
+    write_takes_ms = 3000;
+    run_jobs();
+    CHECK(dones == 1, "done once: %d", dones);
+    CHECK(renders == 1 && writes == 1, "drawn %d, written %d", renders, writes);
+    CHECK(written_deadline_us == (asked + MUSE_APPS_SNAPSHOT_TOTAL_MS) * 1000LL, "the write's deadline is the command's: %lld",
+          (long long)written_deadline_us);
+    CHECK(written_left_ms > 1000 && written_left_ms <= 1100, "the write had what was left: %lld ms",
+          (long long)written_left_ms);
+    CHECK(strcmp(result, "{\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"couldn't save the snapshot to "
+                         ASYNC_OK_PATH ": no answer from the VM in time\"}}") == 0,
+          "%s", result);
+    CHECK(atomic_load(&now_ms) == asked + MUSE_APPS_SNAPSHOT_TOTAL_MS, "answered at the deadline");
+    EXPECT_CLEAN();
+}
+
 static void encoder_buffers_are_psram(void) {
     /* esp_new_jpeg's internal-first allocators, which the linker sends here: zeroed PSRAM, never the Link's DMA heap. */
     unsigned char *a = __wrap_jpeg_calloc_inner(100);
@@ -1254,6 +1348,9 @@ static const struct {
     {"every_allocation_refused", every_allocation_refused},
     {"drawing_time_is_stolen", drawing_time_is_stolen},
     {"encoder_buffers_are_psram", encoder_buffers_are_psram},
+    {"lit_then_dark_before_the_take", lit_then_dark_before_the_take},
+    {"app_switched_after_the_take", app_switched_after_the_take},
+    {"write_gets_whats_left", write_gets_whats_left},
 };
 
 int main(int argc, char **argv) {

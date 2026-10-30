@@ -24,6 +24,7 @@
 #include "apps_io.h"
 #include "apps_json.h"
 #include "apps_port.h"
+#include "apps_result.h"
 #include "apps_rt.h"
 #include "apps_store.h"
 #include "apps_task.h"
@@ -58,10 +59,7 @@
 static const char *TAG = "muse_apps";
 
 #define POLL_MS 10
-#define CODE_NOT_FOUND "not_found"
-#define STORE_NOT_READY "storage not ready"  /* apps_store.c's words, for a store that isn't mounted yet */
 #define CONTROL_BUSY "the gadget is busy with another app job (an install, a launch or the guide); try again in a few seconds"
-#define NO_ROOM_RESULT "out of memory: no room for the result"
 
 /* What app.api says the gadget is: the round screen (apps_ui.h's ui.W, ui.H and ui.SAFE), the api of manifest.json, the
  * memory_kb a manifest may ask for (apps_pkg.h: 64 to min(1024, the device's heap max), 256 or that max if less). */
@@ -100,30 +98,6 @@ static const guide_file_t GUIDE_FILES[] = {
 
 /* ---- Results ---- */
 
-/* {"ok":false,"error":{"code","message"}}; NULL without memory. */
-static cJSON *failure(const char *code, const char *message) {
-    cJSON *r = cJSON_CreateObject();
-    cJSON *e = NULL;
-    bool ok = r != NULL && cJSON_AddFalseToObject(r, "ok") != NULL && (e = cJSON_AddObjectToObject(r, "error")) != NULL &&
-              cJSON_AddStringToObject(e, "code", code) != NULL && cJSON_AddStringToObject(e, "message", message) != NULL;
-    if (!ok) {
-        cJSON_Delete(r);
-        return NULL;
-    }
-    return r;
-}
-
-/* {"ok":true,"payload":payload}, payload taken; NULL (payload freed) without memory. */
-static cJSON *success(cJSON *payload) {
-    cJSON *r = payload != NULL ? cJSON_CreateObject() : NULL;
-    if (r != NULL && cJSON_AddTrueToObject(r, "ok") != NULL && cJSON_AddItemToObject(r, "payload", payload)) {
-        return r;
-    }
-    cJSON_Delete(r);
-    cJSON_Delete(payload);
-    return NULL;
-}
-
 /* item added to o as key, or freed: false then. */
 static bool add_item(cJSON *o, const char *key, cJSON *item) {
     if (item == NULL || !cJSON_AddItemToObject(o, key, item)) {
@@ -133,30 +107,11 @@ static bool add_item(cJSON *o, const char *key, cJSON *item) {
     return true;
 }
 
-static cJSON *not_found(const char *id) {
-    char msg[sizeof MUSE_APPS_NOT_FOUND + APPS_ID_MAX];
-    snprintf(msg, sizeof msg, MUSE_APPS_NOT_FOUND, id);
-    return failure(CODE_NOT_FOUND, msg);
-}
-
 /* A refusal in the store's or the app task's words: out_of_memory for a lack of memory, else code. They give their refusals as
  * text only, with no code, and their lack-of-memory texts vary ("out of memory: no room to load the app", "... for the request"),
  * so this one reads the start of the text. */
 static cJSON *refusal(const char *code, const char *why) {
-    return failure(strncmp(why, "out of memory", 13) == 0 ? APPS_ERR_OUT_OF_MEMORY : code, why);
-}
-
-/* On the worker: true when the store is mounted and has id; otherwise *r is the refusal. */
-static bool installed(const char *id, cJSON **r) {
-    if (apps_store_mode() == APPS_STORAGE_NONE) {
-        *r = failure(APPS_ERR_UNAVAILABLE, STORE_NOT_READY);
-        return false;
-    }
-    if (!apps_store_has(id)) {
-        *r = not_found(id);
-        return false;
-    }
-    return true;
+    return apps_result_failure(strncmp(why, "out of memory", 13) == 0 ? APPS_ERR_OUT_OF_MEMORY : code, why);
 }
 
 /* ---- status and the list (the worker's side) ---- */
@@ -205,7 +160,7 @@ static cJSON *status_payload(apps_status_t *st, bool logs) {
             cJSON_Delete(p);
             return NULL;
         }
-        return success(p);
+        return apps_result_success(p);
     }
     cJSON *s = apps_install_status(st);
     const char *hint = apps_store_hint();
@@ -214,7 +169,7 @@ static cJSON *status_payload(apps_status_t *st, bool logs) {
         cJSON_Delete(s);
         return NULL;
     }
-    return success(s);
+    return apps_result_success(s);
 }
 
 /* st made a stopped app id, as its manifest has it (m is scratch). */
@@ -232,14 +187,14 @@ static void stopped_record(const char *id, apps_status_t *st, apps_manifest_t *m
 
 static cJSON *status_result(const char *id, bool logs) {
     cJSON *r = NULL;
-    if (!installed(id, &r)) {
+    if (!apps_result_installed(id, &r)) {
         return r;
     }
     apps_status_t *st = apps_port_realloc(NULL, sizeof *st);  /* several KB: never on a stack (X12) */
     apps_manifest_t *m = st != NULL ? apps_port_realloc(NULL, sizeof *m) : NULL;
     if (m == NULL) {
         apps_port_free(st);
-        return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the status");
+        return apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the status");
     }
     apps_task_status(st);
     if (strcmp(st->id, id) != 0) {  /* not the record's app: it isn't running, and has said nothing since it ran */
@@ -295,7 +250,7 @@ static cJSON *apps_array(catalog_t *c, bool full) {
 static cJSON *list_result(void) {
     catalog_t *c = apps_port_realloc(NULL, sizeof *c);  /* tens of KB: the record's among them */
     if (c == NULL) {
-        return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the list");
+        return apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the list");
     }
     memset(c, 0, sizeof *c);
     cJSON *apps = apps_array(c, true);
@@ -309,7 +264,7 @@ static cJSON *list_result(void) {
         cJSON_Delete(p);
         return NULL;
     }
-    return success(p);
+    return apps_result_success(p);
 }
 
 /* ---- The synchronous wait ---- */
@@ -327,7 +282,7 @@ typedef struct {
 static void sync_job(void *arg) {
     sync_t *s = arg;
     cJSON *r = s->id[0] != '\0' ? status_result(s->id, s->logs) : list_result();
-    s->result = r != NULL ? r : failure(APPS_ERR_OUT_OF_MEMORY, NO_ROOM_RESULT);
+    s->result = r != NULL ? r : apps_result_failure(APPS_ERR_OUT_OF_MEMORY, APPS_NO_ROOM_RESULT);
     int expected = WAITING;
     if (!atomic_compare_exchange_strong(&s->state, &expected, ANSWERED)) {  /* the caller gave up: nobody will read it */
         cJSON_Delete(s->result);
@@ -339,7 +294,7 @@ static void sync_job(void *arg) {
 static cJSON *sync_call(const char *id, bool logs) {
     sync_t *s = heap_caps_malloc(sizeof *s, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (s == NULL) {
-        return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the request");
+        return apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the request");
     }
     memset(s, 0, sizeof *s);
     atomic_init(&s->state, WAITING);
@@ -347,14 +302,14 @@ static cJSON *sync_call(const char *id, bool logs) {
     s->logs = logs;
     if (!apps_io_submit(sync_job, s)) {  /* it says why, in one log line */
         heap_caps_free(s);
-        return failure(APPS_ERR_OUT_OF_MEMORY, APPS_IO_REFUSED);
+        return apps_result_failure(APPS_ERR_OUT_OF_MEMORY, APPS_IO_REFUSED);
     }
     const int64_t until = apps_port_mono_ms() + MUSE_APPS_CONTROL_WAIT_MS;
     while (atomic_load(&s->state) != ANSWERED) {
         if (apps_port_mono_ms() >= until) {
             int expected = WAITING;
             if (atomic_compare_exchange_strong(&s->state, &expected, ABANDONED)) {
-                return failure(APPS_ERR_BUSY, CONTROL_BUSY);  /* the job frees the request */
+                return apps_result_failure(APPS_ERR_BUSY, CONTROL_BUSY);  /* the job frees the request */
             }
             break;  /* it answered just now */
         }
@@ -373,7 +328,7 @@ cJSON *muse_apps_list(void) {
 cJSON *muse_apps_status(const char *id, bool logs) {
     char msg[128];
     if (!muse_apps_id_valid(id, msg, sizeof msg)) {
-        return failure(APPS_ERR_INVALID_PARAMS, msg);
+        return apps_result_failure(APPS_ERR_INVALID_PARAMS, msg);
     }
     return sync_call(id, logs);
 }
@@ -391,12 +346,12 @@ static const apps_install_ops_t LAUNCH_OPS = {NULL, NULL, run_in_front, apps_sto
  * *r the refusal, when id isn't installed (not_found), the store isn't ready, the load is refused (the quarantine, a damaged copy, no
  * room: unavailable) or there is no memory. The load makes the app the most recent. */
 static apps_pkg_t *load_package(const char *id, cJSON **r) {
-    if (!installed(id, r)) {
+    if (!apps_result_installed(id, r)) {
         return NULL;
     }
     apps_pkg_t *pkg = apps_port_realloc(NULL, sizeof *pkg);
     if (pkg == NULL) {
-        *r = failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room to load the app");
+        *r = apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room to load the app");
         return NULL;
     }
     char why[256];
@@ -421,7 +376,7 @@ static cJSON *launch_result(const char *id) {
     cJSON_Delete(r);
     apps_status_t *st = apps_port_realloc(NULL, sizeof *st);
     if (st == NULL) {
-        return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the status");
+        return apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the status");
     }
     apps_task_status(st);
     r = status_payload(st, false);
@@ -434,7 +389,7 @@ static cJSON *stop_result(const char *id) {
     if (apps_task_running(running, sizeof running) && strcmp(running, id) == 0 && !apps_task_stop(why, sizeof why)) {
         return refusal(APPS_ERR_BUSY, why);
     }
-    return success(cJSON_CreateObject());
+    return apps_result_success(cJSON_CreateObject());
 }
 
 /* The store's remove, which can also take a folder it doesn't list (its manifest.json damaged). Its refusals: not mounted,
@@ -447,15 +402,15 @@ static cJSON *remove_result(const char *id) {
             cJSON_Delete(p);
             return NULL;
         }
-        return success(p);
+        return apps_result_success(p);
     }
     if (apps_store_mode() == APPS_STORAGE_NONE) {
-        return failure(APPS_ERR_UNAVAILABLE, why);
+        return apps_result_failure(APPS_ERR_UNAVAILABLE, why);
     }
     if (apps_task_running(running, sizeof running) && strcmp(running, id) == 0) {
-        return failure(APPS_ERR_BUSY, why);
+        return apps_result_failure(APPS_ERR_BUSY, why);
     }
-    return strcmp(why, APPS_STORE_NO_SUCH_APP) == 0 ? not_found(id) : refusal(APPS_ERR_UNAVAILABLE, why);
+    return strcmp(why, APPS_STORE_NO_SUCH_APP) == 0 ? apps_result_not_found(id) : refusal(APPS_ERR_UNAVAILABLE, why);
 }
 
 /* ---- The guide (the worker's side) ---- */
@@ -576,10 +531,7 @@ static cJSON *guide_result(const muse_apps_vm_ops_t *vm) {
         log_dma("couldn't write", more);
         char msg[256];
         snprintf(msg, sizeof msg, "couldn't write the guide to the VM: %s; call app.api again", why);
-        return failure(strcmp(code, MUSE_APPS_VM_BUSY) == 0            ? APPS_ERR_BUSY
-                       : strcmp(code, MUSE_APPS_VM_OUT_OF_MEMORY) == 0 ? APPS_ERR_OUT_OF_MEMORY
-                                                                       : APPS_ERR_UNAVAILABLE,
-                       msg);
+        return apps_result_failure(apps_result_vm_code(code), msg);
     }
     cJSON *p = cJSON_CreateObject();
     bool ok = p != NULL && cJSON_AddStringToObject(p, "delivered", written ? "vm" : "inline") != NULL;
@@ -594,7 +546,7 @@ static cJSON *guide_result(const muse_apps_vm_ops_t *vm) {
         cJSON_Delete(p);
         return NULL;
     }
-    return success(p);
+    return apps_result_success(p);
 }
 
 /* ---- The asynchronous calls ---- */
@@ -616,7 +568,7 @@ static void job_run(void *arg) {
                : job->act == DO_STOP   ? stop_result(job->id)
                : job->act == DO_REMOVE ? remove_result(job->id)
                                        : guide_result(job->vm);
-    job->done(job->ctx, r != NULL ? r : failure(APPS_ERR_OUT_OF_MEMORY, NO_ROOM_RESULT));
+    job->done(job->ctx, r != NULL ? r : apps_result_failure(APPS_ERR_OUT_OF_MEMORY, APPS_NO_ROOM_RESULT));
     apps_port_free(job);
 }
 
@@ -703,7 +655,7 @@ static cJSON *send_too_late(const send_job_t *job) {
     char msg[96];
     snprintf(msg, sizeof msg, "the gadget was busy for %d ms; the event wasn't sent, so try again",
              (int)(apps_port_mono_ms() - SEND_STAMP(job)));
-    return failure(APPS_ERR_BUSY, msg);
+    return apps_result_failure(APPS_ERR_BUSY, msg);
 }
 
 /* The ms left of the send's deadline (negative once past it). */
@@ -719,28 +671,28 @@ static cJSON *send_failure(const send_job_t *job, int bound_ms, const char *why)
     if (strncmp(why, APPS_TASK_MSG_NO_ANSWER, sizeof APPS_TASK_MSG_NO_ANSWER - 1) == 0) {
         char msg[64];
         if (bound_ms >= MUSE_APPS_SEND_REPLY_MS) {
-            return failure("timed_out", MUSE_APPS_SEND_NO_REPLY);
+            return apps_result_failure("timed_out", MUSE_APPS_SEND_NO_REPLY);
         }
         snprintf(msg, sizeof msg, "the app didn't reply within %d ms", bound_ms);
-        return failure("timed_out", msg);
+        return apps_result_failure("timed_out", msg);
     }
     if (strcmp(why, APPS_TASK_MSG_BUSY) == 0) {
-        return failure(APPS_ERR_BUSY, why);
+        return apps_result_failure(APPS_ERR_BUSY, why);
     }
     if (strcmp(why, APPS_TASK_MSG_HUNG) == 0 || strcmp(why, APPS_TASK_MSG_DOWN) == 0) {
-        return failure(APPS_ERR_UNAVAILABLE, why);
+        return apps_result_failure(APPS_ERR_UNAVAILABLE, why);
     }
     char gone[APPS_ID_MAX + 16];  /* the app task's own words for an app that isn't there (apps_task.c on_message) */
     snprintf(gone, sizeof gone, "%s isn't running", job->id);
     if (strcmp(why, gone) == 0) {
-        return failure(APPS_ERR_NOT_RUNNING, why);
+        return apps_result_failure(APPS_ERR_NOT_RUNNING, why);
     }
     if (strncmp(why, "out of memory", 13) == 0) {
-        return failure(APPS_ERR_OUT_OF_MEMORY, why);
+        return apps_result_failure(APPS_ERR_OUT_OF_MEMORY, why);
     }
     char running[APPS_ID_MAX + 1];
     bool alive = apps_task_running(running, sizeof running) && strcmp(running, job->id) == 0;
-    return failure(alive ? "app_error" : APPS_ERR_CRASHED, why);
+    return apps_result_failure(alive ? "app_error" : APPS_ERR_CRASHED, why);
 }
 
 /* The launch an app.send needs when id isn't the app that runs: the store's copy of id, run behind, in at most bound_ms. The
@@ -766,7 +718,7 @@ static cJSON *send_launch(const send_job_t *job) {
     char msg[sizeof why + APPS_ID_MAX + 32];
     if (strncmp(why, APPS_TASK_MSG_NO_ANSWER, sizeof APPS_TASK_MSG_NO_ANSWER - 1) == 0) {
         snprintf(msg, sizeof msg, "'%s' didn't start within %d ms", job->id, bound_ms);
-        return failure("timed_out", msg);
+        return apps_result_failure("timed_out", msg);
     }
     snprintf(msg, sizeof msg, "'%s' didn't start: %s", job->id, why);
     apps_status_t *st = apps_port_realloc(NULL, sizeof *st);  /* a crash is what the record says (apps_install.c's run_failure) */
@@ -776,7 +728,7 @@ static cJSON *send_launch(const send_job_t *job) {
         crashed = st->state == APPS_STATE_CRASHED && strcmp(st->id, job->id) == 0;
         apps_port_free(st);
     }
-    return failure(crashed ? APPS_ERR_CRASHED : APPS_ERR_NOT_RUNNING, msg);
+    return apps_result_failure(crashed ? APPS_ERR_CRASHED : APPS_ERR_NOT_RUNNING, msg);
 }
 
 /* On the worker: the message, after the launch it needs, as a result. */
@@ -798,7 +750,7 @@ static cJSON *send_result(const send_job_t *job) {
     int bound_ms = left < MUSE_APPS_SEND_REPLY_MS ? left : MUSE_APPS_SEND_REPLY_MS;
     char *why = apps_port_realloc(NULL, APPS_ERROR_MAX);
     if (why == NULL) {
-        return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the message");
+        return apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the message");
     }
     char *reply = apps_task_message(job->id, job->event, job->data[0] != '\0' ? job->data : NULL, job->show, bound_ms, why,
                                     APPS_ERROR_MAX);
@@ -806,7 +758,7 @@ static cJSON *send_result(const send_job_t *job) {
     if (reply == NULL) {
         r = send_failure(job, bound_ms, why);
     } else if (strlen(reply) > MUSE_APPS_SEND_REPLY_MAX) {
-        r = failure("app_error", "the app's reply is larger than 4 KB");  /* the app keeps running */
+        r = apps_result_failure("app_error", "the app's reply is larger than 4 KB");  /* the app keeps running */
     } else {
         /* The handler's value is JSON text (apps_rt_message encoded it): a parse that fails then is no memory. Text that isn't JSON at
          * all goes as a string. */
@@ -815,14 +767,14 @@ static cJSON *send_result(const send_job_t *job) {
         cJSON *value = json ? cJSON_Parse(reply) : cJSON_CreateString(reply);
         cJSON *p = value != NULL ? cJSON_CreateObject() : NULL;
         if (p != NULL && add_item(p, "reply", value)) {
-            r = success(p);
+            r = apps_result_success(p);
         } else {
             if (p == NULL) {
                 cJSON_Delete(value);
             }
             cJSON_Delete(p);
             if (value == NULL && json) {
-                r = failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the reply");
+                r = apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the reply");
             }
         }
     }
@@ -851,7 +803,7 @@ static void send_run(void *arg) {
         ESP_LOGI(TAG, "app.send %s %s: %s", job->id, event,
                  cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(r, "error"), "code")));
     }
-    job->done(job->ctx, r != NULL ? r : failure(APPS_ERR_OUT_OF_MEMORY, NO_ROOM_RESULT));
+    job->done(job->ctx, r != NULL ? r : apps_result_failure(APPS_ERR_OUT_OF_MEMORY, APPS_NO_ROOM_RESULT));
     apps_port_free(job);
 }
 

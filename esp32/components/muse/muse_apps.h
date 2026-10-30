@@ -249,7 +249,8 @@ bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code,
 /*
  * Link's app.control snapshot (Task 25; apps/apps_snapshot.h has how it runs): a JPEG of the gadget's screen, whatever is on it (D22),
  * written to workspace/apps/<id>/snapshot.jpg on Muse's VM through the VM ops' write (D2: no base64 in the result). scale 1 is the
- * screen's 466 x 466, 2 half of it. A dark screen is woken (muse_input_wake("snapshot")) and taken on its first lit frame (E9). Any
+ * screen's 466 x 466, 2 half of it. The screen is woken (muse_input_wake("snapshot"): a dark one lights, a lit one stays lit) and
+ * taken on its first lit frame (E9). Any
  * task, the Noise session's included: it never waits. True once queued: done then runs exactly once, on the I/O worker; false, with
  * nothing queued and done never called, and *code and *err (literals) saying why (D14's codes):
  *   invalid_params   not an app id, a scale that isn't 1 or 2 (MUSE_APPS_SNAPSHOT_BAD_SCALE), no done
@@ -263,7 +264,8 @@ bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code,
  *   {"ok":true,"payload":{"path":"workspace/apps/<id>/snapshot.jpg","format":"jpeg","w","h","bytes","front","warnings":[...],
  *    "ui":[...][,"ui_truncated":N]}}
  * w and h the picture's (466 or 233; a size the encoder refuses is padded with black to a multiple of 16 in the file, and a warning
- * says so); front whether id is the app on screen (it runs, its layer is in front and no card covers it); ui its widgets as the app
+ * says so); front whether id is the app on screen as it was drawn (it ran, its layer was in front and no card covered it: a
+ * downloaded image over the layer isn't seen); ui its widgets as the app
  * task's record has them (at most a second old), for an app that runs, whole entries from the start of the dump so that the result
  * prints in APPS_RESULT_MAX bytes (ui_truncated counts the rest); warnings say when id isn't on screen or the file is padded, and
  * which widgets extend past the round edge (worked out again from the dump; APPS_SNAPSHOT_WARNINGS_MAX bytes of them, then how

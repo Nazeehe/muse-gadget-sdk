@@ -25,6 +25,7 @@
 
 #include "apps_json.h"
 #include "apps_port.h"
+#include "apps_result.h"
 #include "esp_log.h"
 #include "muse_apps.h"
 #include "sdkconfig.h"
@@ -175,25 +176,20 @@ static bool add_uint(cJSON *obj, const char *key, uint64_t v) {
 /* ---- Failures ---- */
 
 /*
- * {"ok":false,"error":{"code":code,"message":message}}: the message as valid UTF-8, cut at its end on a character
- * boundary so that the whole prints in at most APPS_RESULT_MAX bytes. NULL without memory.
+ * apps_result_failure's {"ok":false,"error":{"code":code,"message":message}}, with the message as valid UTF-8, cut at its end on
+ * a character boundary so that the whole prints in at most APPS_RESULT_MAX bytes (it can carry what an app or the VM wrote). NULL
+ * without memory.
  */
 static cJSON *failure(const char *code, const char *message) {
     char *text = dup_block(message, strlen(message) + 1);
-    cJSON *r = text != NULL ? cJSON_CreateObject() : NULL;
-    cJSON *e = NULL;
-    bool ok = r != NULL && cJSON_AddFalseToObject(r, "ok") != NULL && (e = cJSON_AddObjectToObject(r, "error")) != NULL;
-    if (ok) {
-        clean_utf8(text);
-        size_t skeleton = strlen("{\"ok\":false,\"error\":{\"code\":\"\",\"message\":\"\"}}") + json_len(code, strlen(code));
-        text[fit_len(text, APPS_RESULT_MAX - skeleton)] = '\0';
-        ok = cJSON_AddStringToObject(e, "code", code) != NULL && cJSON_AddStringToObject(e, "message", text) != NULL;
-    }
-    apps_port_free(text);
-    if (!ok) {
-        cJSON_Delete(r);
+    if (text == NULL) {
         return NULL;
     }
+    clean_utf8(text);
+    size_t skeleton = strlen("{\"ok\":false,\"error\":{\"code\":\"\",\"message\":\"\"}}") + json_len(code, strlen(code));
+    text[fit_len(text, APPS_RESULT_MAX - skeleton)] = '\0';
+    cJSON *r = apps_result_failure(code, text);
+    apps_port_free(text);
     return r;
 }
 

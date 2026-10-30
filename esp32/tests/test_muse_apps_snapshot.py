@@ -37,7 +37,7 @@ MUSE = ROOT / "components/muse"
 APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_snapshot_harness.c"
-SOURCES = [HARNESS, APPS / "apps_snapshot.c", APPS / "apps_pkg.c", APPS / "apps_json.c", APPS / "apps_vm.c",
+SOURCES = [HARNESS, APPS / "apps_snapshot.c", APPS / "apps_result.c", APPS / "apps_pkg.c", APPS / "apps_json.c", APPS / "apps_vm.c",
            APPS / "apps_suggest.c"]
 
 SIDE = 466
@@ -302,6 +302,15 @@ class Snapshot(unittest.TestCase):
 
     def test_the_drawing_is_not_the_apps_time(self):  # apps_rt_steal_ms gets the drawing's time (the Task 19 carry)
         self.run_case("drawing_time_is_stolen")
+
+    def test_a_screen_that_darkens_before_the_take_is_kept_lit(self):  # fix 1 C: the request's wake pokes the idle timer
+        self.run_case("lit_then_dark_before_the_take")
+
+    def test_front_is_what_was_drawn(self):  # fix 1 E: the app that runs is read at the take, with the layer's place
+        self.run_case("app_switched_after_the_take")
+
+    def test_the_write_gets_what_is_left_of_the_deadline(self):  # fix 1 H: a slow capture leaves the write little
+        self.run_case("write_gets_whats_left")
 
     def test_the_encoders_buffers_are_psram(self):  # the Link's DMA margin: esp_new_jpeg's internal-first allocators, wrapped
         self.run_case("encoder_buffers_are_psram")

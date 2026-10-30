@@ -693,6 +693,103 @@ the design, the Wi-Fi protocol and the numbers.
   `../protocols/VIDEO.md`'s Trust section when changing the transport, the
   decoders' glue (`muse_vdec.c`) or the drawing (`fill()` in `muse_video.c`).
 
+## Muse apps
+
+`MUSE_APPS=1 tools/muse/board.sh build|flash s3` (overlay
+`devices/sdkconfig.muse-apps`, `CONFIG_MUSE_APPS`) adds Muse apps: small Lua
+5.4 programs that Muse writes on its VM and installs on the gadget over Link.
+Each draws its own screen and runs in a sandbox with its own memory cap and CPU
+budget, and keeps working without Muse, the VM or Wi-Fi. It's for the Waveshare
+S3 1.75C only (`board.sh` refuses `MUSE_APPS=1` for other boards): the launcher
+hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
+(screenshots, injected touch, `>mem`). Without the option nothing changes.
+
+- **Pieces:** `components/lua` (Lua 5.4.9, unmodified) and, in
+  `components/muse/apps/`: `apps_vm.c` (the sandboxed state, the budgets and
+  the kill), `apps_rt.c` (handlers, timers, the duty cycle, the log),
+  `apps_pkg.c` (the manifest and package rules), `apps_ui.c` and `apps_lv.c`
+  (widgets: what Lua holds, and the LVGL task's apply step), `apps_svc.c`
+  (`time`, `os`, `timer`, `alarm`, `sound`, `store`, `sys`), `apps_json.c`,
+  `apps_task.c` (the app task and the supervisor that marks a hung call),
+  `apps_io.c` (the I/O worker, which does every flash access), `apps_store.c`
+  and `apps_values.c` (the apps' FAT and `apps_nvs`), `apps_install.c` (the one
+  install pipeline), `apps_alarm.c`, `apps_console.c` (the console's
+  `>app.*`), `apps_control.c` (`app.api`, `app.control`), `apps_snapshot.c`
+  (JPEG snapshots) and the digit fonts (`fonts/`); `main/apps_link.c` (the Link
+  commands); `tools/muse/app.py` and `tools/muse/apphost/` (the host runner).
+  `components/muse/apps/apps_guide.md` is the guide Muse reads, and
+  `skills/gadget-muse-apps/SKILL.md` holds it for an agent.
+- **Using it:** a long press on the pocket watch opens the launcher, which
+  lists the four most recently used apps; a right swipe puts the app behind,
+  where it keeps running. Muse uses four Link commands: `app.api` (writes the
+  guide and a timer example to `workspace/apps/_guide/` on its VM and returns
+  the gadget's limits), `app.install` (the gadget reads `workspace/apps/<id>/`
+  from the VM, checks, compiles, stores and runs it), `app.control` (list,
+  status, logs, launch, stop, remove, snapshot) and `app.send` (an event to the
+  app's `message()`). From a laptop, `tools/muse/app.py check DIR` runs an app
+  on the host, `push PORT DIR [--run] [--snap OUT.png]` installs it over USB,
+  `watch PORT DIR` pushes it on every change and `logs PORT` follows its log.
+  The console's own lines are `>app.put`, `>app.commit ID [run]`,
+  `>app.launch ID`, `>app.stop`, `>app.status`, `>app.list` and
+  `>app.send ID EVENT [JSON]`; `>app.status` takes no id and reports the app
+  that runs. The first line after the port opens can be lost, so send `w`
+  first and wait a second.
+- **Limits:** a callback may run 1,000,000 Lua VM instructions and
+  `main.lua`'s top level with `start()` 2,000,000, each in at most 1 s; the
+  1.75C runs about 2.5 M instructions a second of the simplest loop (2.1 M of
+  table and call work), so that is about 0.4 s and 0.8 s.
+  `tests/muse_apps_fixtures/bench` measures the speed, and `APPS_BUDGET_*`
+  (`apps_vm.h`) and `APPS_DUTY_INSTR_PER_S` (`apps_rt.h`) are set from it. A
+  second with more than 1,000,000 instructions or 400 ms of calls is over 40%
+  of the CPU: 3 such seconds in a row throttle the app's timers, 5 stop the
+  app, and a call that hasn't returned after 3 s marks it hung.
+- **Memory:** PSRAM holds the app task's 56 KB stack, the running app's Lua
+  heap (its manifest's `memory_kb`, at most `MUSE_APPS_HEAP_MAX_KB`), the I/O
+  worker's 8 KB stack and, while one is taken, a snapshot (admitted with 1.5 MB
+  free; about 0.9 MB used). The stacks can be in PSRAM because the 1.75C's
+  `CONFIG_SPIRAM_FETCH_INSTRUCTIONS` and `CONFIG_SPIRAM_RODATA` keep the cache
+  on while flash is written; `apps_io.c` refuses to build without them.
+  Against the same build without the option, the image is 441,064 bytes
+  bigger (Lua 101 KB, the JPEG encoder 30 KB, FAT 32 KB, the digit fonts
+  27 KB) and an idle gadget has about 552 KB less free PSRAM, most of it that
+  image, since the board runs code and constant data from PSRAM. Internal RAM
+  is the tight one: about 3.8 KB less free when idle, and its lowest since
+  boot is set while the Link's session comes up, not by apps. The deepest
+  stacks seen: the app task 13,012 bytes free of 57,344, the I/O worker 4,340
+  of 8,192, and the LVGL task 1,240 free after 128 widgets, Settings, the
+  launcher, a crash card, a snapshot and a `display.draw_file`.
+- **Storage:** `partitions_muse_apps.csv` is `partitions_muse.csv` with two
+  partitions added and no offset moved: `apps`, a 6 MB FAT at `0x830000` (a
+  folder per app), and `apps_nvs`, 64 KB at `0xE30000` (the apps' saved values
+  and their alarms). A new partition table takes one flash over USB
+  (`board.sh flash`); an update over the air can't write one. A gadget whose
+  table has no `apps` partition keeps its apps in RAM until it restarts, and
+  results say `"storage":"ram"` with the hint "reflash over USB once to keep
+  apps". A build directory made before the overlay keeps its old table in its
+  own `sdkconfig`: delete that file.
+- **Test** with `tests/test_muse_apps_*.py` (the VM and the sandbox, JSON,
+  packages, widgets and the apply step, the services, the runtime and its duty
+  cycle, the app task, the store, the install, the console and `app.py`, the
+  Link commands and the guide, snapshots; the guide's quoted numbers are pinned
+  to the headers), `tests/test_vm_file.py` and `tests/test_muse_bench.py`.
+  They compile the apps' sources with ASan and UBSan where the compiler can,
+  and need `CJSON_SOURCE_DIR` or a `managed_components/` from a build. On a
+  board, `app.py push PORT tests/muse_apps_fixtures/<fixture> --run --snap
+  OUT.png`, then `>app.status`, `>mem` and `tools/muse/snap.py`; a typed turn
+  through `tools/muse/chat.py` checks the Link commands with Muse.
+- **Untrusted input:** the package, the app's code and what `app.send` brings
+  are all untrusted. The sandbox loads Lua source text only (bytecode is
+  refused) and has no `io`, `debug`, `load`, `dofile` or `collectgarbage`, no
+  string patterns, strict globals and `require` of the app's own files only;
+  `setmetatable` refuses `__gc`, and every metatable C hands out is protected.
+  Every value is checked before LVGL sees it, since LVGL asserts abort. Paths
+  are `a-z 0-9 _ . / -`, at most 64 characters, with no `..` and no leading
+  `/` or `.`, and the install reads only `workspace/apps/<id>/`, a path the
+  gadget makes. A file's type is its ending (`.lua` source text, `.json` that
+  must parse, `.bin` an LVGL image whose header is checked), under per-file and
+  per-app size limits. Keep these when changing the bindings
+  (`apps_*_funcs[]`), the package rules (`apps_pkg.c`) or the install.
+
 ## Configuration gotchas
 
 - `sdkconfig.defaults.esp32c5` is loaded after `sdkconfig.defaults` for C5
@@ -864,6 +961,14 @@ or `CXX` to change compilers.
 The e-ink navigation tests use the pinned FreeInk source: set
 `FREEINK_SOURCE_DIR` to its checkout, or use `managed_components/freeink-sdk`
 from a Sticky configure. CI checks out that exact pin for the host tests.
+
+The Muse apps tests (`tests/test_muse_apps_*.py`; see "Muse apps") build Lua
+and the apps' sources with ASan and UBSan where the compiler can. The ones that
+need cJSON find it through `CJSON_SOURCE_DIR` or `managed_components/`, which
+every `tools/muse/board.sh` build deletes: keep a copy of
+`managed_components/espressif__cjson/cJSON` and point `CJSON_SOURCE_DIR` at it
+(`test_muse_chat_link_errors` and `test_muse_chat_link_note` read only
+`managed_components/`, so copy it back there after a board build).
 
 Two tests skip quietly when their inputs are missing; check the summary for
 `skipped=`:

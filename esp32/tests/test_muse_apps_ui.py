@@ -30,7 +30,7 @@ import unittest
 from pathlib import Path
 
 import apps_host
-from test_muse_apps_rt import BUDGET_CALL, AppHostTestCase, Run
+from test_muse_apps_rt import BUDGET_CALL, CALL, START, AppHostTestCase, Run
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
@@ -963,13 +963,15 @@ class UiTest(UiTestCase):
         self.assertEqual(run.events[-1], {"event": "state", "state": "crashed"})  # and the second tap ran nothing
 
     def test_a_tap_handler_has_the_budget_of_a_callback(self):
-        # start() may run 5 M instructions and any other callback 2 M: a handler of 3 M is stopped, 1.5 M isn't.
-        main = """
-            local app = {}
+        # start() may run START instructions and any other callback CALL (apps_vm.h): a handler between the two is stopped,
+        # one of 3/4 of CALL isn't, and start() itself runs the one between them.
+        slow, quick = (CALL + START) // 2, CALL * 3 // 4
+        main = f"""
+            local app = {{}}
             function app.start()
-                for i = 1, 3000000 do end
-                ui.button{text = "Slow"}:on("tap", function() for i = 1, 3000000 do end print("slow") end)
-                ui.button{text = "Quick", y = 50}:on("tap", function() for i = 1, 1500000 do end print("quick") end)
+                for i = 1, {slow} do end
+                ui.button{{text = "Slow"}}:on("tap", function() for i = 1, {slow} do end print("slow") end)
+                ui.button{{text = "Quick", y = 50}}:on("tap", function() for i = 1, {quick} do end print("quick") end)
             end
             return app
         """
@@ -990,8 +992,10 @@ class UiTest(UiTestCase):
             end
             return app
         """
-        run = self.host(self.make_app("scratch", main), script=["message 100", "message 600"], rc=1)
-        self.assertEqual(run.kinds(), ["started", "reply", "crash"])  # 100 calls are 0.4 M, 600 are 2.5 M
+        # A call costs 4097: what a tenth of CALL holds is a reply, and what 1.25 CALL holds is over the budget.
+        few, many = CALL // 10 // 4097, CALL * 5 // 4 // 4097
+        run = self.host(self.make_app("scratch", main), script=[f"message {few}", f"message {many}"], rc=1)
+        self.assertEqual(run.kinds(), ["started", "reply", "crash"])
         self.assertEqual(run.messages("crash"), [BUDGET_CALL])
 
     def test_a_tap_runs_nothing_unless_the_app_is_running(self):

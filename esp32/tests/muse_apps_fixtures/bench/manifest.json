@@ -1,0 +1,16 @@
+{
+  "id": "bench",
+  "name": "Bench",
+  "version": "1",
+  "api": 1,
+  "permissions": [
+    "keep_awake"
+  ],
+  "memory_kb": 128,
+  "messages": {
+    "run": "data {seconds (10), period_ms (500), n (400000, at most), kind loop|mix}: timer.every callbacks of n loop turns each, for seconds of time.mono(). Replies {running}.",
+    "result": "The last run: {kind, n, calls, turns, busy_ms (time inside the loops), elapsed_ms, worst_ms, worst_gap_ms, done}.",
+    "fill": "data {lines (50), widgets (60)}: print lines of 100 characters and make labels, so that a status is a few KB. Replies {lines, widgets}.",
+    "spin": "Run without end: the call budget stops it and the app crashes with the budget's reason (a check of the budget)."
+  }
+}

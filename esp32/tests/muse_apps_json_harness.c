@@ -1502,7 +1502,9 @@ static void encode_shared_subtables(void) {
 /* ---- encode_scan_work (ruling R6.8, amended): the walk over a table's slots is charged ---- */
 
 /* The exact reasons apps_vm kills with. */
-#define BUDGET_MSG(n) "stopped: ran more than " n " VM instructions in one callback (use timer.every for long work)"
+/* The reason for APPS_BUDGET_CALL, made from the constant in main() (D12): Task 27 sets the budgets from the board's
+ * measured speed, and a retune changes no case. */
+static char budget_call_msg[160];
 #define WALL_MSG "stopped: one callback ran longer than 1 s"
 
 /* In a fresh VM of cap bytes, setup runs to its end and then work ends KILLED with exactly reason,
@@ -1549,19 +1551,19 @@ static void encode_scan_work(void) {
     /* The reviewer's shape: the same table many times in an array. */
     expect_killed(1 * MB, "local t = {} for i = 1, 8192 do t[i] = true end for i = 1, 8191 do t[i] = nil end\n"
                           "arr = {} for i = 1, 1500 do arr[i] = t end",
-                  "json.encode(arr) survived = true", BUDGET_MSG("2000000"));
+                  "json.encode(arr) survived = true", budget_call_msg);
     /* Shared through nesting: 15 levels of four. */
     expect_killed(1 * MB, "local t = {} for i = 1, 8192 do t[i] = true end for i = 1, 8191 do t[i] = nil end\n"
                           "for d = 1, 15 do t = {t, t, t, t} end top = t",
-                  "json.encode(top) survived = true", BUDGET_MSG("2000000"));
+                  "json.encode(top) survived = true", budget_call_msg);
     /* The same through the C entry point, which raises the kill as the binding does. */
     expect_killed(1 * MB, "local t = {} for i = 1, 8192 do t[i] = true end for i = 1, 8191 do t[i] = nil end\n"
                           "arr = {} for i = 1, 1500 do arr[i] = t end",
-                  "c_encode(arr) survived = true", BUDGET_MSG("2000000"));
+                  "c_encode(arr) survived = true", budget_call_msg);
     /* A hash part is walked the same: 128 slots, none live. */
     expect_killed(4 * MB, "local t = {} for i = 1, 100 do t['k' .. i] = i end for k in pairs(t) do t[k] = nil end\n"
                           "arr = {} for i = 1, 40000 do arr[i] = t end",
-                  "json.encode(arr) survived = true", BUDGET_MSG("2000000"));
+                  "json.encode(arr) survived = true", budget_call_msg);
 
     /* The charge is the table's slots and one, for each visit, and nothing for a value that isn't a table. */
     apps_vm_t *vm = new_json_vm(4 * MB);
@@ -1585,14 +1587,19 @@ static void encode_scan_work(void) {
     expect_charged(vm, "json.decode(text)", 0);
 
     /* Work that is legitimate still passes: a table of 20000 small ones, text of 250 KB, and the sparse
-     * table a hundred times, well under the budget. */
-    run_ok(vm,
-           "local big = {} for i = 1, 20000 do big[i] = {i, i + 1} end\n"
-           "local s = json.encode(big)\n"
-           "eq(s:sub(1, 12), '[[1,2],[2,3]'); eq(s:sub(-15), ',[20000,20001]]')\n"
-           "local sparse = keep local arr = {} for i = 1, 100 do arr[i] = sparse end\n"
-           "local out = json.encode(arr)\n"
-           "eq(#out, 2 + 99 + 100 * #json.encode(sparse))\n");
+     * table once for every 20000 instructions of the budget (50 times at 1 M, 8193 of the charge each), well under
+     * the budget. */
+    unsigned sparse = (unsigned)APPS_BUDGET_CALL / 20000;
+    char legit[512];
+    snprintf(legit, sizeof legit,
+             "local big = {} for i = 1, 20000 do big[i] = {i, i + 1} end\n"
+             "local s = json.encode(big)\n"
+             "eq(s:sub(1, 12), '[[1,2],[2,3]'); eq(s:sub(-15), ',[20000,20001]]')\n"
+             "local sparse = keep local arr = {} for i = 1, %u do arr[i] = sparse end\n"
+             "local out = json.encode(arr)\n"
+             "eq(#out, 2 + %u + %u * #json.encode(sparse))\n",
+             sparse, sparse - 1, sparse);
+    run_ok(vm, legit);
     apps_vm_free(vm);
 }
 
@@ -3045,6 +3052,9 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
+    snprintf(budget_call_msg, sizeof budget_call_msg,
+             "stopped: ran more than %u VM instructions in one callback (use timer.every for long work)",
+             (unsigned)APPS_BUDGET_CALL);
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (strcmp(argv[1], cases[i].name) == 0) {
             cases[i].run();

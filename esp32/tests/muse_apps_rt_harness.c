@@ -65,8 +65,11 @@ static int failures;
 
 /* The exact messages (apps_rt.h and apps_vm.h). */
 #define NOT_RUNNING "the app is not running"
-#define BUDGET_CALL "stopped: ran more than 2000000 VM instructions in one callback (use timer.every for long work)"
-#define BUDGET_START "stopped: ran more than 5000000 VM instructions in one callback (use timer.every for long work)"
+/* The kill reasons of the two budgets, made from apps_vm.h's constants in main() (D12): Task 27 sets the budgets from
+ * the board's measured speed, and a retune changes no case. The budgets case prints the constants as compiled. */
+static char budget_call_msg[160], budget_start_msg[160];
+#define BUDGET_CALL budget_call_msg
+#define BUDGET_START budget_start_msg
 
 /* e-acute (2 bytes), euro (3), a grinning face (4), then " end": 13 bytes. */
 #define WIDE "\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80"
@@ -3125,12 +3128,15 @@ static void os_time_charge(void) {
     apps_pkg_t *pkg;
     apps_rt_t *rt = launch(&pkg, CHARGE_APP);
     if (rt != NULL) {
+        /* As many calls as half the call budget takes (D12: sized from the constant), and at least 10 of each. */
+        const unsigned half = APPS_BUDGET_CALL / 2;
+        CHECK(half / 25249 >= 10, "the call budget (%u) holds too few os.time calls to measure", (unsigned)APPS_BUDGET_CALL);
         EXPECT_OS_TIME_COST(rt, "plain", 100, 1);
-        EXPECT_OS_TIME_COST(rt, "day", 50, 25001);    /* 2500000 days */
-        EXPECT_OS_TIME_COST(rt, "hour", 50, 25001);   /* 60000000 / 24 = 2500000 days */
-        EXPECT_OS_TIME_COST(rt, "min", 80, 14914);    /* 2147483647 / 1440 = 1491308 days */
-        EXPECT_OS_TIME_COST(rt, "sec", 100, 249);     /* 2147483647 / 86400 = 24855 days */
-        EXPECT_OS_TIME_COST(rt, "all", 50, 25249);    /* 1000000 + 1000000 + 500000 + 24855 */
+        EXPECT_OS_TIME_COST(rt, "day", half / 25001, 25001);    /* 2500000 days */
+        EXPECT_OS_TIME_COST(rt, "hour", half / 25001, 25001);   /* 60000000 / 24 = 2500000 days */
+        EXPECT_OS_TIME_COST(rt, "min", half / 14914, 14914);    /* 2147483647 / 1440 = 1491308 days */
+        EXPECT_OS_TIME_COST(rt, "sec", 100, 249);               /* 2147483647 / 86400 = 24855 days */
+        EXPECT_OS_TIME_COST(rt, "all", half / 25249, 25249);    /* 1000000 + 1000000 + 500000 + 24855 */
         /* A year and month that can't land in the calendar are refused before the days are charged (and before the C library
          * sees them): 200 refusals that charged their one instruction each would leave the count 200 off a step. */
         EXPECT_OS_TIME_FREE(rt, "refused", 100);
@@ -3338,8 +3344,8 @@ static void duty_calls(void) {
 /* ---- Calls that take time ----
  *
  * apphost's clock stands still inside a call, so there no call straddles the end of a window and the time a call takes is 0:
- * the instructions are the only measure. On the board a call takes up to 0.8 s (the budget of 2 M instructions at 2.5 M a
- * second) and C work costs time and no instructions. The app of these cases says how long each call took by calling
+ * the instructions are the only measure. On the board a call takes up to about 0.4 s (the budget of 1 M instructions at
+ * 2.5 M a second, which Task 27 measured) and C work costs time and no instructions. The app of these cases says how long each call took by calling
  * advance_ms(n), a function of the harness's own, which moves the case's clock n ms right there: a call that begins at 1250
  * and takes 760 ms ends at 2010, in the next window. The windows are the whole seconds of the clock (the first began at
  * 1000), and a call's instructions and time go to the windows it spans in proportion to the time it spent in each. */
@@ -3411,9 +3417,9 @@ static bool warned(const apps_rt_t *rt) {
     return apps_rt_warnings(rt)[0] != '\0';
 }
 
-/* The review's trace: a call of 1.9 M instructions, which takes 0.76 s on the board, every 1.25 s. A call is booked to the
- * windows it ran in, so no second goes unseen: calls at 1250, 2500, 3750, 5000 fill 750, 510, 510, 510 and 760 ms of the
- * windows from 1000 on (each is a hot window: over 400 ms and over the rate in instructions). The old rule booked a call wholly
+/* The review's trace: a call of 0.95 of the call budget that takes 0.76 s (C work, on the board), every 1.25 s. A call is booked
+ * to the windows it ran in, so no second goes unseen: calls at 1250, 2500, 3750, 5000 fill 750, 510, 510, 510 and 760 ms of the
+ * windows from 1000 on (each is a hot window: over 400 ms). The old rule booked a call wholly
  * to the window it began in, and the window the call at 3750 ran on into (4000 to 5000) had no call that began there: a cool
  * window, the count began again, and the app was never killed. Here the third hot window ends inside the call at 3750, and
  * its share closes it: the warning is there when that call returns. The fifth, 5000 to 6000, is closed by the loop's pass. */
@@ -3444,13 +3450,15 @@ static void duty_trace(void) {
     port_mono_ms = 0;
 }
 
-/* A call's instructions go to the windows it spanned in proportion to the time in each. Calls of 400 ms and 1.9 M instructions
- * that begin 200 ms before a boundary (at 1800, 2800, ...) put half of each in each window: the window 1000 to 2000 holds
- * 950 k (the call's first half), and every window after it a tail and a head, 1.9 M in 400 ms: hot by instructions, with its
- * time exactly the 400 ms that isn't over the limit. So the hot windows are those from 2000 on, the third is closed when the
- * call at 4800 ends (it runs into 5000), and the fifth when the call at 6800 does: that call is not refused (the kill is
- * for the one after it). Booked to the window it began in, every window from 1000 on would be hot, and the call at 6800 would
- * be refused. */
+/* A call's instructions go to the windows it spanned in proportion to the time in each. In every second there is a call of half
+ * the rate (A, at x300, taking no time) and a call S of 0.95 of the rate (under the call budget, which is at least the rate)
+ * that takes 400 ms and begins 200 ms before the next boundary (at x800): half of each S goes to each window it spans. The
+ * window 1000 to 2000 holds A and S's first half, 0.975 of the rate: cool. Every window after it holds a tail of S, A and a head
+ * of the next S, 1.45 of the rate in 400 ms: hot by instructions, with its time exactly the 400 ms that isn't over the limit.
+ * So the hot windows are those from 2000 on, the third is closed when the S at 4800 ends (it runs into 5000), and the fifth when
+ * the S at 6800 does: that call is not refused (the kill is for the one after it). Booked to the window it began in, every
+ * window from 1000 on would be hot (A and all of S, 1.45 of the rate), the warning would come a second early, and the S at 6800
+ * would be refused. The sizes come from the constants (D12): Task 27 set the budget and the rate equal. */
 static void duty_split(void) {
     port_mono_ms = 1000;
     apps_pkg_t *pkg;
@@ -3458,12 +3466,14 @@ static void duty_split(void) {
     if (rt == NULL) {
         return;
     }
-    const unsigned n = APPS_BUDGET_CALL / 100 * 95;
+    const unsigned a = APPS_DUTY_INSTR_PER_S / 2, n = APPS_DUTY_INSTR_PER_S / 100 * 95;
+    CHECK(n < APPS_BUDGET_CALL, "S (%u) is over the call budget (%u)", n, (unsigned)APPS_BUDGET_CALL);
     for (int k = 0; k < 6; k++) {
+        WORK(rt, 1300 + 1000 * k, a, 0);
         WORK(rt, 1800 + 1000 * k, n, 400);
-        /* The call at 1800 + 1000 k ends at 2200 + 1000 k and closes the window it began in only when that window has a tail and
+        /* The S at 1800 + 1000 k ends at 2200 + 1000 k and closes the window it began in only when that window has a tail and
          * a head (k >= 1): the windows 2000 to 3000, 3000 to 4000, 4000 to 5000 are the first three hot ones, so the warning is
-         * there after the call at 4800 (k = 3). */
+         * there after the S at 4800 (k = 3). */
         CHECK(warned(rt) == (k >= 3), "after the call at %d: '%s'", 1800 + 1000 * k, apps_rt_warnings(rt));
     }
     CHECK(apps_rt_state(rt) == APPS_STATE_RUNNING, "state %d", apps_rt_state(rt));
@@ -3740,10 +3750,11 @@ static void duty_pace(void) {
           apps_rt_warnings(rt), apps_rt_state(rt));
     finish(rt, pkg);
 
-    /* An app that is hot all the same while it is throttled is killed: every(40) with a callback of 400 ms and a rate of
-     * instructions begins every 401 ms (due long ago: the loop's tick), and after the third hot window every 540 (the
-     * callback's end, and 40, and 100), which is idle time (it is 74% of the core still: the fifth window is the kill). */
-    rt = launch_every(&pkg, 40, APPS_DUTY_INSTR_PER_S, 400);
+    /* An app that is hot all the same while it is throttled is killed: every(40) with a callback of 400 ms and 0.95 of a rate
+     * of instructions (under the call budget) begins every 401 ms (due long ago: the loop's tick), and after the third hot
+     * window every 540 (the callback's end, and 40, and 100), which is idle time (it is 74% of the core still: the fifth window
+     * is the kill). */
+    rt = launch_every(&pkg, 40, APPS_DUTY_INSTR_PER_S / 100 * 95, 400);
     if (rt == NULL) {
         return;
     }
@@ -3775,7 +3786,7 @@ static void duty_pace(void) {
     CHECK(!warned(rt) && apps_rt_state(rt) == APPS_STATE_RUNNING, "'%s' %d", apps_rt_warnings(rt), apps_rt_state(rt));
     finish(rt, pkg);
 
-    /* The review's app, as a timer: every(1250), 760 ms, 1.9 M instructions. Hot from the first window; throttled when the third
+    /* The review's app, as a timer: every(1250), 760 ms, 0.95 of the call budget. Hot from the first window; throttled when the third
      * ends (inside the call that began at 4750), and from then each call is 760 + 1250 + 100 = 2110 ms after the last began.
      * That is 36% of the core, so its windows turn cool and the throttle ends: the old gaps, and the throttle again. The kill is
      * for an app that stays over 40% in spite of the throttle (the one above); this one is held to the 40% by it. */
@@ -3799,8 +3810,10 @@ static void duty_pace(void) {
 }
 
 /* A window of exactly APPS_DUTY_INSTR_PER_S instructions isn't over it: cool, so four of them in a row are no throttle; the rate
- * and one more is hot, and three of those are. The call charges its instructions to the instruction (charge: a loop's are counted
- * in the hook's thousands), and each call's count is checked to be what it was charged, so that the boundary is hit exactly. */
+ * and one more is hot, and three of those are. Each window's instructions are two calls (half the rate, then the rest), each
+ * under the call budget, which Task 27 set equal to the rate (D12). A call charges its instructions to the instruction
+ * (charge: a loop's are counted in the hook's thousands), and each call's count is checked to be what it was charged, so that
+ * the boundary is hit exactly. */
 static const char *const RATE_APP = "return {message = function(event, n) charge(n) return true end}\n";
 
 static void duty_rate(void) {
@@ -3811,18 +3824,22 @@ static void duty_rate(void) {
         return;
     }
     for (int w = 0; w < 7; w++) {
-        const unsigned n = APPS_DUTY_INSTR_PER_S + (w < 4 ? 0 : 1);
-        char data[16], err[256] = "";
-        snprintf(data, sizeof data, "%u", n);
-        uint64_t before = apps_vm_instructions(apps_rt_vm(rt));
-        port_mono_ms = 1100 + 1000 * w;
-        char *reply = apps_rt_message(rt, "charge", data, strlen(data), err, sizeof err);
-        CHECK(reply != NULL, "the call at %lld: '%s'", (long long)port_mono_ms, err);
-        apps_port_free(reply);
-        uint64_t counted = apps_vm_instructions(apps_rt_vm(rt)) - before;
-        CHECK(counted == n, "a call charged %u was counted %llu", n, (unsigned long long)counted);
+        const unsigned total = APPS_DUTY_INSTR_PER_S + (w < 4 ? 0 : 1);
+        const unsigned parts[2] = {APPS_DUTY_INSTR_PER_S / 2, total - APPS_DUTY_INSTR_PER_S / 2};
+        for (int c = 0; c < 2; c++) {
+            const unsigned n = parts[c];
+            char data[16], err[256] = "";
+            snprintf(data, sizeof data, "%u", n);
+            uint64_t before = apps_vm_instructions(apps_rt_vm(rt));
+            port_mono_ms = 1100 + 400 * c + 1000 * w;
+            char *reply = apps_rt_message(rt, "charge", data, strlen(data), err, sizeof err);
+            CHECK(reply != NULL, "the call at %lld: '%s'", (long long)port_mono_ms, err);
+            apps_port_free(reply);
+            uint64_t counted = apps_vm_instructions(apps_rt_vm(rt)) - before;
+            CHECK(counted == n, "a call charged %u was counted %llu", n, (unsigned long long)counted);
+        }
         CHECK(!apps_rt_has_work(rt, 2000 + 1000 * w), "work at the end of window %d", w + 1);
-        CHECK(warned(rt) == (w == 6), "after window %d (%u instructions): '%s'", w + 1, n, apps_rt_warnings(rt));
+        CHECK(warned(rt) == (w == 6), "after window %d (%u instructions): '%s'", w + 1, total, apps_rt_warnings(rt));
     }
     CHECK(strcmp(apps_rt_warnings(rt), THROTTLED_TEXT) == 0 && apps_rt_state(rt) == APPS_STATE_RUNNING, "'%s' %d",
           apps_rt_warnings(rt), apps_rt_state(rt));
@@ -4105,11 +4122,22 @@ static void c_stack(void) {
 
 #endif /* UNDER_ASAN */
 
+/* ---- budgets: the constants as this harness was compiled with them (D12) ----
+ *
+ * test_muse_apps_svc.py reads them and builds the messages it expects from them, and checks them against the headers' text, which
+ * the apphost tests size their work from. */
+static void budgets(void) {
+    printf("APPS_BUDGET_CALL %u\nAPPS_BUDGET_START %u\nAPPS_DUTY_INSTR_PER_S %u\n", (unsigned)APPS_BUDGET_CALL,
+           (unsigned)APPS_BUDGET_START, (unsigned)APPS_DUTY_INSTR_PER_S);
+    printf("BUDGET_CALL %s\nBUDGET_START %s\n", BUDGET_CALL, BUDGET_START);
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
         void (*run)(void);
     } cases[] = {
+        {"budgets", budgets},
         {"lifecycle", lifecycle},
         {"crashed", crashed},
         {"external_kill", external_kill},
@@ -4165,6 +4193,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);
         return 2;
     }
+    snprintf(budget_call_msg, sizeof budget_call_msg,
+             "stopped: ran more than %u VM instructions in one callback (use timer.every for long work)",
+             (unsigned)APPS_BUDGET_CALL);
+    snprintf(budget_start_msg, sizeof budget_start_msg,
+             "stopped: ran more than %u VM instructions in one callback (use timer.every for long work)",
+             (unsigned)APPS_BUDGET_START);
     for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
         if (strcmp(argv[1], cases[i].name) == 0) {
             cases[i].run();

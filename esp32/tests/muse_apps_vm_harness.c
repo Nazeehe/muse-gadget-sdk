@@ -1402,6 +1402,10 @@ static void suggest(void) {
 
 /* The exact reasons (the brief's), for a budget of n instructions and a cap of kb KB. */
 #define BUDGET_MSG(n) "stopped: ran more than " n " VM instructions in one callback (use timer.every for long work)"
+/* BUDGET_MSG of APPS_BUDGET_CALL, made from the constant in main() (D12): Task 27 sets the budgets from the board's
+ * measured speed, and a retune changes no case. The infinite_loop case prints the constant and the reason it got, and
+ * test_muse_apps_vm.py builds the message it expects from the number printed. */
+static char budget_call_msg[160];
 #define WALL_MSG "stopped: one callback ran longer than 1 s"
 #define NOMEM_MSG(kb) "out of memory: this app may use " kb " KB (memory_kb in manifest.json)"
 
@@ -1454,7 +1458,7 @@ static void expect_end_at(int line, size_t cap, uint32_t budget, const char *src
     apps_vm_free(vm);
 }
 #define expect_killed(src) \
-    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_KILLED, BUDGET_MSG("2000000"), NULL)
+    expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_KILLED, budget_call_msg, NULL)
 #define expect_nomem(src) expect_end_at(__LINE__, 256 * KB, APPS_BUDGET_CALL, src, APPS_CALL_NOMEM, NOMEM_MSG("256"), NULL)
 /* A generic for's closing value saw the out-of-memory error during the unwind and couldn't keep it. */
 #define expect_nomem_seen(src) \
@@ -1492,16 +1496,17 @@ static void infinite_loop(void) {
     char err[512] = "";
     uint64_t before = apps_vm_instructions(vm);
     int rc = call(vm, "while true do end", 0, APPS_BUDGET_CALL, err, sizeof err);
-    CHECK(rc == APPS_CALL_KILLED && strcmp(err, BUDGET_MSG("2000000")) == 0, "got %s '%s'", call_name(rc), err);
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, budget_call_msg) == 0, "got %s '%s'", call_name(rc), err);
     /* Stopped at the hook's first count past the budget. */
     uint64_t ran = apps_vm_instructions(vm) - before;
-    CHECK(ran == 2001000, "ran %llu instructions", (unsigned long long)ran);
+    CHECK(ran == (uint64_t)APPS_BUDGET_CALL + 1000, "ran %llu instructions", (unsigned long long)ran);
+    printf("@budget_call %u\n@ran %llu\n@reason %s\n", (unsigned)APPS_BUDGET_CALL, (unsigned long long)ran, err);
     CHECK(lua_gettop(L) == 0 && apps_vm_dying(vm) && !apps_vm_in_call(vm), "stack %d, dying %d, in a call %d",
           lua_gettop(L), apps_vm_dying(vm), apps_vm_in_call(vm));
 
     /* For good: the next call runs nothing and says why. */
     rc = call(vm, "ran = true", 0, APPS_BUDGET_CALL, err, sizeof err);
-    CHECK(rc == APPS_CALL_KILLED && strcmp(err, BUDGET_MSG("2000000")) == 0, "after the kill: %s '%s'", call_name(rc), err);
+    CHECK(rc == APPS_CALL_KILLED && strcmp(err, budget_call_msg) == 0, "after the kill: %s '%s'", call_name(rc), err);
     CHECK(lua_gettop(L) == 0 && raw_global(L, "ran") == LUA_TNIL, "a dying VM ran a chunk");
     lua_settop(L, 0);
     apps_vm_free(vm);
@@ -2832,6 +2837,9 @@ int main(int argc, char **argv) {
         fputs("usage: muse_apps_vm_harness <case>\n", stderr);
         return 2;
     }
+    snprintf(budget_call_msg, sizeof budget_call_msg,
+             "stopped: ran more than %u VM instructions in one callback (use timer.every for long work)",
+             (unsigned)APPS_BUDGET_CALL);
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (strcmp(argv[1], cases[i].name) == 0) {
             cases[i].run();

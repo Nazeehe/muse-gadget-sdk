@@ -26,6 +26,7 @@ import unittest
 from pathlib import Path
 
 import apps_host
+from test_muse_apps_rt import header_number
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
@@ -133,7 +134,15 @@ class MuseAppsVmTest(unittest.TestCase):
     # Budgets and the kill (Task 5). The kill cases' timeouts are short: a kill that doesn't
     # land leaves a loop running until the budget, seconds later, or for ever.
     def test_infinite_loop_killed(self):
-        self.run_case("infinite_loop", timeout=10)
+        # D12: the harness prints APPS_BUDGET_CALL as it was compiled, and the reason and the count it got; the message
+        # expected is built from that number, which is apps_vm.h's (Task 27 set it from the board's speed).
+        out = self.run_case("infinite_loop", timeout=10).stdout
+        printed = dict(line[1:].split(" ", 1) for line in out.splitlines() if line.startswith("@"))
+        budget = int(printed["budget_call"])
+        self.assertEqual(budget, header_number("apps_vm.h", "APPS_BUDGET_CALL"))
+        self.assertEqual(printed["reason"],
+                         f"stopped: ran more than {budget} VM instructions in one callback (use timer.every for long work)")
+        self.assertEqual(int(printed["ran"]), budget + 1000)  # stopped at the count hook's first check past it
 
     def test_wall_clock_backstop(self):
         self.run_case("wall_clock", timeout=10)

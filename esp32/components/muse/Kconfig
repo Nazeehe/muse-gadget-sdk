@@ -275,12 +275,27 @@ menu "Muse"
             the pocket watch (MUSE_CLOCK), which the launcher hangs off.
             devices/sdkconfig.muse-apps turns it on:
             MUSE_APPS=1 tools/muse/board.sh build|flash s3
-            Costs: about 130 KB of flash for Lua (measured on the S3) and
-            perhaps another 100 to 150 KB for the apps runtime and its fonts
-            (an estimate); PSRAM for the running app's Lua heap (up to
-            MUSE_APPS_HEAP_MAX_KB) and a 56 KB task stack; and two flash
-            partitions, 6 MB for the apps' files and 64 KB for what they
-            save.
+            Costs, measured on the 1.75C against the same build without the
+            option:
+            - Flash: 441,064 bytes more image (about 431 KB): Lua 101 KB, the
+              apps runtime with its guide, strings and digit fonts about
+              250 KB (the digit fonts 27 KB), the JPEG encoder with FAT and
+              wear levelling 62 KB, libc's maths, time and file functions
+              16 KB.
+            - PSRAM: an idle gadget has about 552 KB less free (2,707,584
+              against 3,272,432 bytes). Most of it is the image itself: this
+              board runs code and constant data from PSRAM
+              (SPIRAM_XIP_FROM_PSRAM), so the extra flash costs as much PSRAM.
+              The rest is 16 KB of static data, the runtime's buffers and a
+              56 KB task stack. A running app adds its Lua heap (up
+              to MUSE_APPS_HEAP_MAX_KB), and a snapshot is taken only with
+              1.5 MB free (it used about 0.9 MB).
+            - Internal RAM: about 3.8 KB less free when idle (27,539 against
+              31,379 bytes), 1.9 KB of it DMA-capable.
+            - Two flash partitions: 6 MB for the apps' files and 64 KB for
+              what they save.
+            The 1.75C runs about 2.5 M instructions a second of the simplest
+            Lua loop; the CPU budgets in apps/apps_vm.h come from that.
 
     config MUSE_APPS_HEAP_MAX_KB
         int "Most PSRAM one app may ask for (KB)"

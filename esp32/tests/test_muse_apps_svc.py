@@ -35,7 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import apps_host
-from test_muse_apps_rt import BUDGET_CALL, HARNESS_SOURCES, INCLUDES, AppHostTestCase, rt_harness, unknown_handler
+from test_muse_apps_rt import (BUDGET_CALL, CALL, DUTY, HARNESS_SOURCES, INCLUDES, START, AppHostTestCase, header_number,
+                                rt_harness, unknown_handler)
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
@@ -84,13 +85,6 @@ def unsupported(function, spec):
 
 def too_long(function):
     return f"{function}: the result is longer than 128 bytes"
-
-
-def header_number(header, name):
-    """What `#define NAME 1000000u` is in a header of components/muse/apps."""
-    match = re.search(rf"^#define\s+{name}\s+(\d+)u?\b", (APPS / header).read_text(), re.M)
-    assert match, f"no #define {name} in {header}"
-    return int(match.group(1))
 
 
 def chunks(run):
@@ -385,14 +379,18 @@ class TimerTest(SvcTestCase):
 
     def test_timers_cancelled_in_coroutines_give_their_registry_references_back(self):
         # 3000 coroutines (each is 1000 instructions of the budget) each arm a timer and cancel it: in a heap of 64 KB, 3000
-        # references that were never given back (16 bytes of registry each, in an array that doubles) end the app.
+        # references that were never given back (16 bytes of registry each, in an array that doubles) end the app. They go in
+        # messages of 3/4 of what CALL holds (D12), as many as make 3000.
+        per_call = CALL // 1000 * 3 // 4
+        calls = -(-3000 // per_call)
         main = """
             local function f() end
-            return {start = function()
-                for i = 1, 3000 do coroutine.wrap(function() timer.after(100, f):cancel() end)() end
+            return {message = function(e, n)
+                for i = 1, n do coroutine.wrap(function() timer.after(100, f):cancel() end)() end
+                return true
             end}
         """
-        run = self.run_app(main, mem_kb=64, script=["timers", "state"])
+        run = self.run_app(main, mem_kb=64, script=[f"message arm {per_call}"] * calls + ["timers", "state"])
         self.assertEqual(run.messages("crash"), [])
         self.assertEqual(run.events[-2:], [{"event": "timers", "count": 0}, {"event": "state", "state": "running"}])
 
@@ -1392,7 +1390,7 @@ class TimeTest(SvcTestCase):
 
     def test_a_callback_of_big_os_time_calls_is_killed_by_the_budget(self):
         # mktime goes through 2.5 M days in C for each of these calls, 10 ms on the board, and os.time charges the walk: 25,001
-        # instructions each (about 100 days to an instruction), so a hundred of them are over a callback's 2 M.
+        # instructions each (about 100 days to an instruction), so a hundred of them are over a callback's budget.
         run = self.handler_app("""
             function app.message()
                 for i = 1, 100 do os.time{year = 9999, month = 12, day = -2500000} end
@@ -1425,6 +1423,98 @@ class TimeTest(SvcTestCase):
         for line in lines[1:4]:
             self.assertRegex(line, r"^os\.difftime: both arguments must be numbers, got ")
         self.assertEqual(lines[4], "true\tfloat")
+
+
+# The VM's speed on the Waveshare 1.75C, measured by Task 27 on 2026-10-30 (/tmp/muse-apps-log.md, "## Task 27b"; the report is
+# .superpowers/sdd/2026-10-26-muse-gadget-apps/task-27b-report.md): the bench fixture (tests/muse_apps_fixtures/bench) runs
+# `for i = 1, n do end`, one VM instruction a turn, with the count hook on; >app.status's instructions before and after a run of
+# 21 callbacks of 400,000, over the time inside the loops (E13). Three runs: 2,524,423, 2,521,392 and 2,522,907 a second.
+MEASURED_RATE = 2_522_907
+
+
+class BudgetTest(unittest.TestCase):
+    """Task 27's tuning (the brief, Step 2): a callback's budget is about 300 ms of the measured rate and main.lua's top level
+    and start()'s about 750 ms, each rounded to 0.5 M; the duty cycle's rate is 40% of it, to 0.1 M. The headers hold the
+    result (apps_vm.h, apps_rt.h), and the guide quotes it (test_muse_apps_link.py)."""
+
+    def test_the_budgets_are_the_measured_ones(self):
+        def to_half_million(x):
+            return round(x / 500_000) * 500_000
+
+        self.assertEqual(CALL, to_half_million(0.3 * MEASURED_RATE))    # 756,872 -> 1,000,000: 396 ms of the loop
+        self.assertEqual(START, to_half_million(0.75 * MEASURED_RATE))  # 1,892,180 -> 2,000,000: 793 ms
+        self.assertEqual(DUTY, round(0.4 * MEASURED_RATE, -5))         # 1,009,163 -> 1,000,000
+        self.assertEqual((CALL, START, DUTY), (1_000_000, 2_000_000, 1_000_000))
+
+    def test_the_harness_was_built_with_the_headers_budgets(self):
+        # D12: the rt harness prints the constants as compiled, and the kill messages it checks against; the apphost tests
+        # size their work from the headers' text (header_number), so the two must agree.
+        done = apps_host.run(rt_harness(), "budgets", timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        printed = dict(line.split(" ", 1) for line in done.stdout.splitlines() if line)
+        self.assertEqual(int(printed["APPS_BUDGET_CALL"]), CALL)
+        self.assertEqual(int(printed["APPS_BUDGET_START"]), START)
+        self.assertEqual(int(printed["APPS_DUTY_INSTR_PER_S"]), DUTY)
+        for name, n in (("BUDGET_CALL", CALL), ("BUDGET_START", START)):
+            self.assertEqual(printed[name],
+                             f"stopped: ran more than {n} VM instructions in one callback (use timer.every for long work)")
+        self.assertEqual(printed["BUDGET_CALL"], BUDGET_CALL)
+
+
+class BenchFixtureTest(SvcTestCase):
+    """tests/muse_apps_fixtures/bench, the board's speed test (Task 27, E13): a run of timer.every callbacks of n loop turns
+    each, and its numbers. apphost's clock stands still inside a call, so here the loops take 0 ms; the board's busy_ms is real."""
+
+    def test_a_run_reports_its_callbacks_and_ends_by_itself(self):
+        run = self.host(FIXTURES / "bench", script=[
+            'message run {"seconds": 2, "period_ms": 500, "n": 1000}', "advance 2600", "message result", "timers",
+            'message run {"seconds": 1, "period_ms": 100, "n": 50, "kind": "mix"}', "advance 1200", "message result"])
+        first, second = replies(run)[1], replies(run)[3]
+        self.assertEqual(replies(run)[0], {"running": True})
+        self.assertEqual(first, {"kind": "loop", "n": 1000, "calls": 5, "turns": 5000, "busy_ms": 0, "elapsed_ms": 2000,
+                                 "worst_ms": 0, "worst_gap_ms": 500, "done": True})
+        self.assertEqual(run.of("timers")[0]["count"], 0)  # the run cancelled its timer
+        self.assertEqual((second["kind"], second["calls"], second["done"]), ("mix", 11, True))
+        self.assertIn("bench loop: 5 calls of 1000, 5000 turns, busy 0 ms, elapsed 2000 ms, worst 0 ms, worst gap 500 ms",
+                      run.logs())
+        self.assertEqual(run.messages("crash"), [])
+
+    def test_its_defaults_stay_inside_the_budgets(self):
+        # The board's runs use the defaults: a callback under CALL, and a window of them cool by instructions (two of 400,000
+        # a second against DUTY), so the measurement is never throttled or killed by what it measures.
+        main = (FIXTURES / "bench/main.lua").read_text()
+        n = int(re.search(r'whole\(data, "n", 1, (\d+), (\d+)\)', main).group(2))
+        top = int(re.search(r'whole\(data, "n", 1, (\d+), (\d+)\)', main).group(1))
+        period = int(re.search(r'whole\(data, "period_ms", 40, 1000, (\d+)\)', main).group(1))
+        self.assertEqual((n, top, period), (400000, 400000, 500))
+        self.assertLess(top, CALL)
+        self.assertLessEqual(n * (1000 // period), DUTY)
+        run = self.host(FIXTURES / "bench", script=["message run", "advance 10600", "message result"])
+        result = replies(run)[1]
+        self.assertEqual((result["calls"], result["turns"], result["done"]), (21, 21 * n, True))
+        self.assertEqual(run.messages("warning"), [])
+
+    def test_bad_data_is_the_messages_error(self):
+        lines = (FIXTURES / "bench/main.lua").read_text().splitlines()
+
+        def at(code):  # the line of main.lua that raises it
+            return next(i for i, line in enumerate(lines, 1) if code in line)
+
+        whole, kind, unknown = at('error(key .. " must be'), at('error("kind must be'), at('error("unknown event')
+        run = self.host(FIXTURES / "bench", script=[
+            'message run {"n": 400001}', 'message run {"kind": "fast"}', 'message run {"period_ms": 20}', "message nope",
+            "state"])
+        self.assertEqual(run.messages("error"), [
+            f"main.lua:{whole}: n must be a whole number from 1 to 400000", f"main.lua:{kind}: kind must be loop or mix",
+            f"main.lua:{whole}: period_ms must be a whole number from 40 to 1000",
+            f"main.lua:{unknown}: unknown event 'nope'; use run, result, fill or spin"])
+        self.assertEqual(run.of("state")[-1], {"event": "state", "state": "running"})
+
+    def test_spin_is_stopped_by_the_call_budget(self):
+        # The board check of the budget: the message never returns, the call budget stops it, and the app has crashed.
+        run = self.host(FIXTURES / "bench", script=["message spin", "state"], rc=1)
+        self.assertEqual(run.messages("crash"), [BUDGET_CALL])
+        self.assertEqual(run.of("state")[-1], {"event": "state", "state": "crashed"})
 
 
 class DutyCycleTest(SvcTestCase):

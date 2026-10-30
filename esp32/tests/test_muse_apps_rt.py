@@ -65,8 +65,30 @@ def rt_harness():
 NOT_A_TABLE = "main.lua must return a table of handlers: local app = {} … return app"
 NO_MESSAGE = "main.lua has no message(event, data) handler"
 NOT_RUNNING = "the app is not running"
-BUDGET_CALL = "stopped: ran more than 2000000 VM instructions in one callback (use timer.every for long work)"
-BUDGET_START = "stopped: ran more than 5000000 VM instructions in one callback (use timer.every for long work)"
+
+
+def header_number(header, name):
+    """What `#define NAME 1000000u` is in a header of components/muse/apps."""
+    match = re.search(rf"^#define\s+{name}\s+(\d+)u?\b", (APPS / header).read_text(), re.M)
+    assert match, f"no #define {name} in {header}"
+    return int(match.group(1))
+
+
+# The budgets and the duty cycle's rate, in VM instructions, as the headers have them: Task 27 set them from the
+# board's measured speed (apps_vm.h, apps_rt.h). Tests size their work from these and build the kill messages from them
+# (D12), so a retune changes no test; test_the_budgets_are_the_measured_ones (test_muse_apps_svc.py) pins the values,
+# and the harnesses print them as they were compiled.
+CALL = header_number("apps_vm.h", "APPS_BUDGET_CALL")
+START = header_number("apps_vm.h", "APPS_BUDGET_START")
+DUTY = header_number("apps_rt.h", "APPS_DUTY_INSTR_PER_S")
+
+
+def budget_message(n):
+    return f"stopped: ran more than {n} VM instructions in one callback (use timer.every for long work)"
+
+
+BUDGET_CALL = budget_message(CALL)
+BUDGET_START = budget_message(START)
 # The commands apphost lists when it doesn't know one.
 COMMANDS = ("(commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, sync, timers, restart, "
             "install, other_alarm, other_cancel, hold_alarms)")
@@ -518,8 +540,11 @@ class RuntimeTest(AppHostTestCase):
     # ---- Budgets (R8.3) ----
 
     def test_budgets_main_chunk_and_start_each_get_start_and_the_rest_get_call(self):
+        # A loop between the two budgets is over CALL and under START; one over START by half a CALL is over both (sized
+        # from the constants, D12).
         loop = "for i = 1, {n} do end"
-        three, six = loop.format(n=3000000), loop.format(n=6000000)
+        self.assertLess(CALL * 5 // 4, START)
+        three, six = loop.format(n=(CALL + START) // 2), loop.format(n=START + CALL // 2)
         cases = {
             "top level under START": (f"{three}\nreturn {{}}", None, ["started"]),
             "top level over START": (f"{six}\nreturn {{}}", None, [("crash", BUDGET_START)]),
@@ -541,8 +566,8 @@ class RuntimeTest(AppHostTestCase):
                 self.assertEqual(got, want)
 
     def test_every_call_has_a_fresh_budget(self):
-        # 1.5 M instructions is under CALL; three in a row aren't one call.
-        run = self.run_app("return {message = function() for i = 1, 1500000 do end return 1 end}",
+        # Three quarters of CALL is under it; three in a row aren't one call.
+        run = self.run_app(f"return {{message = function() for i = 1, {CALL * 3 // 4} do end return 1 end}}",
                            script=["message a"] * 3)
         self.assertEqual(run.kinds(), ["started", "reply", "reply", "reply"])
 
@@ -566,9 +591,13 @@ class RuntimeTest(AppHostTestCase):
         kept = [e["line"] for e in run.between_states(0)]
         self.assertEqual(len(kept), 40)
         self.assertEqual(kept, [chr(64 + i % 26) * 200 for i in range(61, 101)])
-        # Empty lines cost one byte each.
-        run = self.run_app("return {start = function() for i = 1, 9000 do print() end print('last') end}",
-                           script=["state", "log 100000", "state"])
+        # Empty lines cost one byte each. A print costs 250 instructions (LINE_COST), so the 9000 lines go in messages of
+        # a third of what CALL allows each (a callback logs at most CALL / 250 lines).
+        per_call = CALL // 250 // 3
+        calls = 9000 // per_call + 1
+        run = self.run_app("return {message = function(e, n) for i = 1, n do print() end if e == 'last' then print('last') end "
+                           "end}", script=[f"message more {per_call}"] * (calls - 1) + [f"message last {per_call}", "state",
+                                                                                        "log 100000", "state"])
         kept = [e["line"] for e in run.between_states(0)]
         self.assertEqual(kept, [""] * (RING_BYTES - 5) + ["last"])
 
@@ -642,7 +671,8 @@ class RuntimeTest(AppHostTestCase):
             self.assertLessEqual(len(line.encode()), LINE_MAX)
 
     def test_a_call_that_prints_without_end_is_killed(self):
-        # Each line costs the call's budget, and the wall clock is read at each: 20000 lines at most.
+        # Each line costs the call's budget (250 instructions), and the wall clock is read at each: START / 250 lines at
+        # most.
         run = self.run_app("return {start = function() while true do print('x') end end}", rc=1)
         self.assertEqual(run.messages("crash"), [BUDGET_START])
         self.assertLess(len(run.logs()), 60000)
@@ -660,15 +690,18 @@ class RuntimeTest(AppHostTestCase):
 
     def test_print_charges_for_the_length_of_what_it_reads(self):
         # A string is read in place, so it costs the heap nothing, but not the CPU: 400 KB is 25000
-        # instructions a print. Forty of them fit one callback and a hundred don't.
+        # instructions a print, and 250 for its line. Half of what CALL holds fit one callback and twice as many don't.
+        fit = CALL // 25250
+        few, many = fit // 2, fit * 2
         main = ("local s = string.rep('y', 400000)\n"
-                "return {message = function(e) for i = 1, e == 'few' and 40 or 100 do print(s) end end}")
+                f"return {{message = function(e) for i = 1, e == 'few' and {few} or {many} do print(s) end end}}")
         run = self.run_app(main, mem_kb=1024, script=["message few", "message many"], rc=1)
         kinds = run.kinds()
-        self.assertEqual(kinds[:42], ["started"] + ["log"] * 40 + ["reply"])
+        self.assertEqual(kinds[:few + 2], ["started"] + ["log"] * few + ["reply"])
         self.assertEqual(kinds[-1], "crash")
         self.assertEqual(run.messages("crash"), [BUDGET_CALL])
-        self.assertTrue(70 < len(kinds) - 43 < 100, len(kinds))  # the lines the killed callback got to print
+        printed = len(kinds) - few - 3  # the lines the killed callback got to print: about what CALL holds
+        self.assertTrue(fit * 9 // 10 < printed <= fit + 1, (printed, fit))
 
     def test_print_when_tostring_fails(self):
         run = self.run_app("return {start = function() print('before') print(setmetatable({}, {__tostring = "

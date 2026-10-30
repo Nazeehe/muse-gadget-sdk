@@ -55,7 +55,7 @@ static const char *const handler_names[H_COUNT] = {"start", "stop", "show", "hid
 
 /* What print charges the call's budget, in VM instructions: per line it logs (the work after it, the port's
  * console write, is the platform's, and the wall clock is read at each), and per 16 bytes it scans. So a
- * call logs at most 20000 lines of START's 5000000 (8000 of CALL's 2000000). */
+ * call logs at most 8000 lines of START's 2000000 (4000 of CALL's 1000000). */
 #define LINE_COST 250
 #define SCAN_BYTES_PER_COST 16
 

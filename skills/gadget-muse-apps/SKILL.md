@@ -30,7 +30,7 @@ This guide is for Muse, writing apps for a Muse gadget with a round screen. It c
 - One app runs at a time. It runs on the gadget itself: Muse installs it and can talk to it, and it keeps working without Muse, the VM or Wi-Fi.
 - The user opens apps from the launcher (a long press on the watch face; it lists the four most recently used). A right swipe puts the app behind, where it keeps running. A voice turn puts the app behind too, and brings it back when the turn ends. An alarm brings its app to the front, and starts it first if it isn't running.
 - Installed apps are kept in the gadget's flash and outlive a restart. A gadget without the apps partition keeps them in RAM until it restarts: results then say `"storage":"ram"` with a hint.
-- An app can't hang or crash the gadget. Each callback has a budget of Lua VM instructions (2,000,000; 5,000,000 for main.lua's top level and `start()`) and 1 s of time, the Lua heap is capped at the manifest's `memory_kb`, and an app that uses more than 40% of the CPU for 5 s is stopped. A call that hasn't returned after 3 s marks the app hung, and the gadget says so on screen.
+- An app can't hang or crash the gadget. Each callback has a budget of Lua VM instructions (1,000,000, about 0.4 s on the gadget; 2,000,000 for main.lua's top level and `start()`) and 1 s of time, the Lua heap is capped at the manifest's `memory_kb`, and an app that uses more than 40% of the CPU for 5 s is stopped. A call that hasn't returned after 3 s marks the app hung, and the gadget says so on screen.
 - The Lua is sandboxed. It has the base library, `coroutine`, `table`, `string`, `math` and `utf8`, and the gadget's modules below. There is no `io`, `debug`, `load`, `dofile` or `collectgarbage`, and `require` loads only the app's own files. `string.match`, `string.gmatch` and `string.gsub` raise an error (patterns can run without bound); `string.find` searches plain text only. Globals are strict: reading one that was never set is an error, with a suggestion when a name is close. Declare everything `local`: a global set to nil is gone, and reading it again is that error. `setmetatable` refuses a metatable with `__gc`, and to-be-closed variables (`local x <close> = ...`) are not available.
 
 ## Files and the manifest
@@ -258,7 +258,7 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 - The gadget calls `message(event, data)`, with data as a Lua value (a table for an object; nil for none). What it returns, as JSON, is the reply (null for nothing). `error("...")` makes the reply that error, and the app keeps running.
 - Check data before you use it: `type(data) == "table"` first (indexing anything else is an error), and note that `math.tointeger` also takes numeric strings like `"90"`.
 - `sys.show()` inside `message()` brings the app to the front; `show = true` in `app.send` does the same once the voice turn ends.
-- A message has the budget of any callback (2,000,000 instructions, 1 s): do the work, store what changed, reply.
+- A message has the budget of any callback (1,000,000 instructions, 1 s): do the work, store what changed, reply.
 
 ## Common errors
 
@@ -302,6 +302,7 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `ui: no more than 128 widgets per app`: reuse widgets with `w:set{...}` rather than making new ones.
 - `widget was deleted`: a handle of a widget that `w:delete()` or `ui.clear()` removed; make it again.
 - `<kind>#<n> '<text>' extends <n> px past the round edge`: a warning: move the widget in, or make it smaller.
+- `layout not checked: the screen was asleep`: a warning: the screen was dark, so the install didn't check the layout (the round-edge warnings above); take an `app.control` `snapshot`, which wakes the screen, and read its `warnings`.
 - `ui.<kind>: src '<path>' is not one of this app's images (manifest.json "files")`: list the `.bin` in `files`.
 - `ui.<kind>: boxes nest at most 4 deep`: flatten the layout; a label, button, arc, bar or image may still go in the fourth box.
 - `<module>: add "<permission>" to "permissions" in manifest.json`: add the permission (`alarm`, `store`, `sound` or `keep_awake`).

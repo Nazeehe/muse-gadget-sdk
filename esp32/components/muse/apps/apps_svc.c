@@ -88,7 +88,7 @@ _Static_assert(STORE_KB * 1024 == APPS_STORE_MAX_BYTES, "the message says the li
 #define OS_TIME_MAX_DAYS 3000000
 /* The days of that walk a VM instruction pays for. The board's mktime takes about 3.2 ns a day (10 ms for 3.16 M days, measured),
  * and an instruction of the VM about 0.4 us (2.5 M a second): about 120, rounded down to 100, so that a table at the bound costs
- * 30,001 instructions of the call's 2 M, and a callback can make about 66 of them. */
+ * 30,001 instructions of the call's 1 M, and a callback can make about 33 of them. */
 #define OS_TIME_DAYS_PER_INSTR 100
 #define CALENDAR_MIN_YEAR 0
 #define CALENDAR_MAX_YEAR 9999

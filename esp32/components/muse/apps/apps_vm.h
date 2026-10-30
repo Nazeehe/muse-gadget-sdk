@@ -138,8 +138,12 @@ size_t apps_vm_mem_refusals(const apps_vm_t *vm);
  */
 
 typedef enum { APPS_CALL_OK = 0, APPS_CALL_ERROR, APPS_CALL_KILLED, APPS_CALL_NOMEM } apps_call_t;
-#define APPS_BUDGET_CALL  2000000u   /* VM instructions per callback; Task 27 tunes */
-#define APPS_BUDGET_START 5000000u   /* load + start() */
+/* The 1.75C's VM runs 2.52 M instructions a second of the simplest loop with the count hook on (Task 27's bench fixture:
+ * 2,521,392 to 2,524,423 over three runs), and about 2.1 M of table and call work. A callback gets about 300 ms of that and
+ * main.lua's top level with start() about 750 ms, each rounded to 0.5 M: 756,872 -> 1 M (0.4 s), 1,892,180 -> 2 M (0.8 s).
+ * Heavier work reaches APPS_WALL_MS first. */
+#define APPS_BUDGET_CALL  1000000u   /* VM instructions per callback */
+#define APPS_BUDGET_START 2000000u   /* load + start() */
 #define APPS_WALL_MS      1000
 
 /*

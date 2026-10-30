@@ -40,6 +40,8 @@ from pathlib import Path
 
 import apps_host
 from test_muse_apps_wiring import c_function, open_conditions, strip_c_comments
+from test_muse_apps_rt import header_number
+from test_muse_apps_svc import MEASURED_RATE
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "main"
@@ -335,6 +337,66 @@ class GuideAndSkill(unittest.TestCase):
                 if len(piece) >= 6:
                     with self.subTest(message, piece=piece):
                         self.assertIn(piece, corpus, "not the firmware's words")
+
+    def test_guide_quotes_the_cpu_limits_as_the_firmware_has_them(self):
+        # Task 27 set the budgets from the board's measured speed (D12: a test pins each number the guide quotes; the skill
+        # holds the guide verbatim). Each sentence with its numbers made from the headers, with thousands separators.
+        call = header_number("apps_vm.h", "APPS_BUDGET_CALL")
+        start = header_number("apps_vm.h", "APPS_BUDGET_START")
+        wall_s = header_number("apps_vm.h", "APPS_WALL_MS") // 1000
+        busy = header_number("apps_rt.h", "APPS_DUTY_BUSY_PCT")
+        kill_s = header_number("apps_rt.h", "APPS_DUTY_KILL_WINDOWS")
+        hung_s = header_number("apps_task.h", "APPS_TASK_HUNG_MS") // 1000
+        call_s = round(call / MEASURED_RATE, 1)  # what CALL is in seconds of the simplest loop on the gadget
+        guide = " ".join(GUIDE.read_text().split())
+        for sentence in (
+                f"Each callback has a budget of Lua VM instructions ({call:,}, about {call_s:g} s on the gadget; {start:,} for "
+                f"main.lua's top level and `start()`) and {wall_s} s of time",
+                f"an app that uses more than {busy}% of the CPU for {kill_s} s is stopped",
+                f"A call that hasn't returned after {hung_s} s marks the app hung",
+                f"A message has the budget of any callback ({call:,} instructions, {wall_s} s)"):
+            with self.subTest(sentence):
+                self.assertIn(sentence, guide)
+        # No other count of instructions is quoted.
+        quoted = {int(n.replace(",", "")) for n in re.findall(r"\b(\d{1,3}(?:,\d{3})+) (?:VM )?instructions", guide)}
+        quoted |= {int(n.replace(",", "")) for n in re.findall(r"instructions \((\d{1,3}(?:,\d{3})+)", guide)}
+        self.assertEqual(quoted - {call, start}, set())
+
+    def test_agents_md_and_kconfig_quote_the_cpu_limits_as_the_firmware_has_them(self):
+        # The same numbers in esp32/AGENTS.md's "Muse apps" section and the option's Kconfig help (D12), and the speed they come
+        # from as test_muse_apps_svc.py's MEASURED_RATE has it.
+        call = header_number("apps_vm.h", "APPS_BUDGET_CALL")
+        start = header_number("apps_vm.h", "APPS_BUDGET_START")
+        duty = header_number("apps_rt.h", "APPS_DUTY_INSTR_PER_S")
+        wall_s = header_number("apps_vm.h", "APPS_WALL_MS") // 1000
+        busy = header_number("apps_rt.h", "APPS_DUTY_BUSY_PCT")
+        throttle = header_number("apps_rt.h", "APPS_DUTY_THROTTLE_WINDOWS")
+        kill = header_number("apps_rt.h", "APPS_DUTY_KILL_WINDOWS")
+        hung_s = header_number("apps_task.h", "APPS_TASK_HUNG_MS") // 1000
+        rate = f"{MEASURED_RATE / 1e6:.1f} M instructions a second"
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        for sentence in (
+                f"a callback may run {call:,} Lua VM instructions and `main.lua`'s top level with `start()` {start:,}, each in "
+                f"at most {wall_s} s; the 1.75C runs about {rate} of the simplest loop",
+                f"so that is about {call / MEASURED_RATE:.1f} s and {start / MEASURED_RATE:.1f} s",
+                f"A second with more than {duty:,} instructions or {busy * 10} ms of calls is over {busy}% of the CPU: {throttle} "
+                f"such seconds in a row throttle the app's timers, {kill} stop the app, and a call that hasn't returned after "
+                f"{hung_s} s marks it hung"):
+            with self.subTest(sentence):
+                self.assertIn(sentence, section)
+        kconfig = " ".join((MUSE / "Kconfig").read_text().split())
+        self.assertIn(f"runs about {rate}", kconfig)
+
+    def test_guide_says_what_the_asleep_warning_means(self):
+        # Task 26: an install onto a dark screen warns "layout not checked: the screen was asleep", the firmware's MSG_ASLEEP:
+        # the overflow check didn't run, and a snapshot (which wakes the screen) checks the layout. The Common errors entry
+        # quotes it (test_common_errors_are_the_firmwares_words checks the words).
+        task = (APPS / "apps_task.c").read_text()
+        self.assertIn('#define MSG_ASLEEP "layout not checked: the screen was asleep"', task)
+        section = " ".join(guide_section(GUIDE.read_text(), "Common errors").split())
+        self.assertRegex(section, r"- `layout not checked: the screen was asleep`: [^`]*didn't check[^`]*`app\.control` "
+                                  r"`snapshot`[^`]*wakes")
 
     def test_guide_states_the_layout_and_alarm_facts(self):
         # Facts an app goes wrong without, with no error to tell it (fix round 1, A and B), each still true of the code and said

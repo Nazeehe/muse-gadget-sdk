@@ -69,13 +69,14 @@ if(CONFIG_MUSE_ENABLED)
         # the system's alarms and their ring, the I/O worker, the apps' values behind it (apps_values.c: apps_nvs
         # or a map in RAM) and the store of the packages (apps_store.c: the FAT partition "apps" and apps_nvs, or
         # RAM when the table has no apps partition), the install pipeline and its RAM store, the USB console's
-        # >app.* lines, Link's app.control and app.api, and the big digit fonts (apps/fonts/, made by
+        # >app.* lines, Link's app.control and app.api, app.control's snapshot (apps_snapshot.c: LVGL's snapshot and
+        # esp_new_jpeg, which idf_component.yml brings in with the apps), and the big digit fonts (apps/fonts/, made by
         # tools/muse/gen_app_fonts.sh).
         list(APPEND srcs "apps/apps_vm.c" "apps/apps_suggest.c" "apps/apps_json.c" "apps/apps_pkg.c"
             "apps/apps_rt.c" "apps/apps_svc.c" "apps/apps_ui.c" "apps/apps_lv.c" "apps/apps_task.c"
             "apps/apps_port_idf.c" "apps/apps_alarm.c" "apps/apps_io.c" "apps/apps_values.c" "apps/apps_store.c"
-            "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/fonts/apps_digits_48.c"
-            "apps/fonts/apps_digits_96.c")
+            "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/apps_snapshot.c"
+            "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
         # What app.api writes to Muse's VM (apps_control.c): the app guide and the timer example.
         list(APPEND embed "apps/apps_guide.md" "apps/examples/timer/manifest.json" "apps/examples/timer/main.lua")
     endif()
@@ -211,4 +212,15 @@ elseif(CONFIG_MUSE_ENABLED)
     target_compile_definitions(${lvgl_lib} PUBLIC
         "LV_ASSERT_HANDLER_INCLUDE=<stdlib.h>"
         "LV_ASSERT_HANDLER=abort()\;")
+endif()
+
+if(CONFIG_MUSE_APPS)
+    # app.control's snapshot: esp_new_jpeg asks for its working buffers in
+    # internal RAM first, the Link's DMA heap (the encoder's 8 KB took it under
+    # the Link's 16 KB margin). Its two internal-first allocators go to
+    # apps/apps_snapshot.c's PSRAM ones: the library calls them across its own
+    # objects, so the linker can redirect them (WHOLE_ARCHIVE links ours).
+    target_link_libraries(${COMPONENT_LIB} INTERFACE
+        "-Wl,--wrap=jpeg_calloc_inner"
+        "-Wl,--wrap=jpeg_calloc_align_inner")
 endif()

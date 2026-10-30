@@ -350,6 +350,19 @@ uint8_t apps_rt_cpu_pct(apps_rt_t *rt, int64_t now_ms);
 /* A whole pass: each timer due at now_ms once, earliest first (apps_rt_run_one_timer until it says false, or the app crashes). */
 void apps_rt_run_timers(apps_rt_t *rt, int64_t now_ms);
 
+/*
+ * Time the app task's core spent on work that isn't the app's: a snapshot's drawing (apps_snapshot.h), which the LVGL task does at a
+ * priority over the app task's, on its core (the Task 19 carry: a 350 ms call that was a snapshot's). Any task adds the ms it took, once
+ * it is over; a call into the app that was running meanwhile books that much less time to the duty cycle (the window it ended in is
+ * cut short from its end, never before its start), and the VM's 1 s backstop doesn't count it either (the VM's clock is the monotonic
+ * clock less this). Its instructions are the VM's count, unchanged. A total that began before a call counts only what was added during
+ * it, so a drawing that ended before the call began is nothing to it; one that straddles the call's start is all forgiven to the call,
+ * which can only make the call look shorter than it was, and only by a drawing's length. One total for every runtime (the core is
+ * one), in ms, wrapping at 2^32 (49 days of drawings).
+ */
+void apps_rt_steal_ms(uint32_t ms);
+uint32_t apps_rt_stolen_ms(void);
+
 /* What the timer module (apps_svc.c) is built on; the Lua side owns its handles. Arms a timer for the function at registry
  * reference fn_ref, ms from now (APPS_TIMER_MIN_MS to APPS_TIMER_MAX_MS: the module has checked), and every ms after each run
  * when `every`. Returns its slot, with its life in *gen (never 0), or -1 when APPS_TIMERS_MAX are armed. A handle is a slot

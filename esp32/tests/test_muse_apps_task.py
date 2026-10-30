@@ -183,6 +183,12 @@ class AppTaskTest(HarnessCase):
     def test_cpu_pct_follows_idle_time(self):  # F9, T9 (1)
         self.run_case("cpu_pct_follows_idle_time")
 
+    def test_a_snapshot_is_not_the_calls_time(self):  # Task 25: the drawing's time is left out of the worst call and cpu_pct
+        self.run_case("a_snapshot_is_not_the_calls_time")
+
+    def test_the_snapshot_is_offered_every_frame(self):  # Task 25, E9: the supervisor offers it, dark frames included
+        self.run_case("the_snapshot_is_offered_every_frame")
+
     def test_dropped_is_read_with_its_base(self):  # F10
         self.run_case("dropped_is_read_with_its_base")
 

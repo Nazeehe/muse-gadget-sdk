@@ -37,9 +37,10 @@
 // became of the session meanwhile (noise_ctrl_send_command_result drops a
 // result of a session that has ended). app.api (the guide's writes, which only
 // this task can pump), app.send (the launch an app may need, and the app's
-// reply, awaited for at most 5 s) and app.control's launch, stop and remove go
-// the same way; app.control's list, status and logs answer at once, after a
-// wait for the worker of at most MUSE_APPS_CONTROL_WAIT_MS (D20).
+// reply, awaited for at most 5 s) and app.control's launch, stop, remove and
+// snapshot (the screen drawn, encoded and written to the VM) go the same way;
+// app.control's list, status and logs answer at once, after a wait for the
+// worker of at most MUSE_APPS_CONTROL_WAIT_MS (D20).
 //
 // The VM's files. The apps read Muse's VM through muse_apps_vm_ops_t, which this
 // file puts vm_file behind: a read opens the one reader for the install, with
@@ -49,15 +50,16 @@
 
 #define INSTALL_TIMEOUT_MS 120000  // the VM's wait for app.install's result: over the gadget's 90 s deadline and a run's settle
 #define API_TIMEOUT_MS 30000       // app.api's: the guide's writes (MUSE_APPS_GUIDE_WRITE_MS) and the answer
-#define CONTROL_TIMEOUT_MS 30000   // app.control's: a launch's load, run and settle
+#define CONTROL_TIMEOUT_MS 30000   // app.control's: a launch's load, run and settle; a snapshot's 25 s (MUSE_APPS_SNAPSHOT_TOTAL_MS)
 #define SEND_TIMEOUT_MS 10000      // app.send's: the app's reply bound (5 s, MUSE_APPS_SEND_REPLY_MS) and the round trip
 #define REQUEST_ID_MAX 64
 
 // The headroom rule (D11): link.register carries the apps' entries in at most
-// 4499 bytes (APPS_REGISTER_BUDGET). All four, app.send's included, measure
-// well under it (tests/test_muse_apps_link.py asserts it and prints the size),
-// so app.control is advertised. Were they over, this would be 0: app.control
-// would still dispatch, and app.api's payload would name it ("control").
+// 4499 bytes (APPS_REGISTER_BUDGET). All four, app.send's and snapshot's scale
+// included, measure well under it (tests/test_muse_apps_link.py asserts it and
+// prints the size), so app.control is advertised. Were they over, this would
+// be 0: app.control would still dispatch, and app.api's payload would name it
+// ("control").
 #define ADVERTISE_CONTROL 1
 
 // app.control's actions, as typed.
@@ -175,6 +177,7 @@ void apps_link_register(cJSON *commands) {
         optional = cJSON_CreateObject();
         cJSON_AddItemToObject(required, "action", param("string", "list, status, logs, launch, stop, remove or snapshot."));
         cJSON_AddItemToObject(optional, "id", param("string", "App id, for every action but list."));
+        cJSON_AddItemToObject(optional, "scale", param("integer", "1 full size (default), 2 half"));
         add_command(commands, "app.control",
                     "Manage gadget apps. action: list, status, logs, launch, stop, remove or snapshot; id for all but list. "
                     "status and logs return state, errors with traceback, the last 50 log lines, memory and CPU.",
@@ -233,7 +236,7 @@ static void finish_request(void *ctx, cJSON *result, const char *no_room) {
     heap_caps_free(req);
 }
 
-// app.control's and app.send's queued actions.
+// app.control's and app.send's queued actions (a snapshot's among them).
 static void command_done(void *ctx, cJSON *result) {
     finish_request(ctx, result, "out of memory: no room for the result");
 }
@@ -367,7 +370,15 @@ static cJSON *answer(cJSON *result) {
     return result ? result : error_result("out_of_memory", "out of memory: no room for the answer");
 }
 
-// app.control: action is one of ACTIONS, as typed; id an app id, for every action but list.
+// snapshot's scale: absent or null is 1; else the number 1 or 2 (2.0 is 2). 0 for anything else.
+static int snapshot_scale(const cJSON *params) {
+    const cJSON *scale = cJSON_GetObjectItemCaseSensitive(params, "scale");
+    if (!scale || cJSON_IsNull(scale)) return 1;
+    if (!cJSON_IsNumber(scale)) return 0;
+    return scale->valuedouble == 1 ? 1 : scale->valuedouble == 2 ? 2 : 0;
+}
+
+// app.control: action is one of ACTIONS, as typed; id an app id, for every action but list; snapshot's scale 1 or 2.
 static cJSON *control_command(cJSON *params, const char *request_id,
                               noise_ctrl_session_generation_t session_generation) {
     cJSON *action = cJSON_GetObjectItemCaseSensitive(params, "action");
@@ -391,15 +402,17 @@ static cJSON *control_command(cJSON *params, const char *request_id,
     char msg[128];
     if (!muse_apps_id_valid(id->valuestring, msg, sizeof(msg))) return error_result("invalid_params", msg);
     if (act == ACT_STATUS || act == ACT_LOGS) return answer(muse_apps_status(id->valuestring, act == ACT_LOGS));
-    if (act == ACT_SNAPSHOT) return error_result("unavailable", "snapshots arrive in a later firmware");  // D27: Task 25's
+    int scale = act == ACT_SNAPSHOT ? snapshot_scale(params) : 1;
+    if (!scale) return error_result("invalid_params", MUSE_APPS_SNAPSHOT_BAD_SCALE);
 
     cJSON *refusal = NULL;
     request_t *req = new_request(request_id, session_generation, &refusal);
     if (!req) return refusal;
     const char *code = "out_of_memory", *err = "failed to queue the action";
-    bool queued = act == ACT_LAUNCH ? muse_apps_launch_async(id->valuestring, command_done, req, &code, &err)
-                  : act == ACT_STOP ? muse_apps_stop(id->valuestring, command_done, req, &code, &err)
-                                    : muse_apps_remove(id->valuestring, command_done, req, &code, &err);
+    bool queued = act == ACT_LAUNCH   ? muse_apps_launch_async(id->valuestring, command_done, req, &code, &err)
+                  : act == ACT_STOP   ? muse_apps_stop(id->valuestring, command_done, req, &code, &err)
+                  : act == ACT_REMOVE ? muse_apps_remove(id->valuestring, command_done, req, &code, &err)
+                                      : muse_apps_snapshot(id->valuestring, scale, command_done, req, &code, &err);
     if (!queued) {
         heap_caps_free(req);
         return error_result(code, err);

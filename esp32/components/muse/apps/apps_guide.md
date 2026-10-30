@@ -219,7 +219,7 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 2. Write the app on your VM: `workspace/apps/<id>/manifest.json`, `main.lua` and the files it lists. Start from the timer example.
 3. Call `app.install` with the id. The gadget reads the files itself, checks them, compiles, stores and runs the app in front, and returns `ok` with its `state`, `log`, `ui` (every widget with where it was laid out) and `warnings` (unknown keys, widgets past the round edge); or an error with a `code` (invalid_package, read_failed, compile_failed with the lines around the error, crashed with the traceback and the log, busy) and a message that says what to fix.
 4. Fix and install again: an install replaces the app, and its store stays.
-5. Check it with `app.control`: `status` (state, the error with its traceback, the last 50 log lines, memory, CPU, the widgets), `logs`, and `snapshot`, a picture of the screen (a firmware without it says `snapshots arrive in a later firmware`).
+5. Check it with `app.control`: `status` (state, the error with its traceback, the last 50 log lines, memory, CPU, the widgets), `logs`, and `snapshot`, a picture of the screen that you open and look at.
 
 `app.control` takes `action` and, for all but list, `id`:
 
@@ -228,6 +228,7 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 - `launch`: runs the app in front (or brings it to the front if it runs) and returns its status.
 - `stop`: stops it, if it is the one running.
 - `remove`: deletes the app with its store and alarms. Stop it first if it runs.
+- `snapshot`: saves a JPEG of the gadget's screen to `workspace/apps/<id>/snapshot.jpg` on this VM (open it to see the screen) and returns its `path`, `w`, `h`, `bytes`, `front` (whether the app is what is on screen: the picture is whatever is), the app's `ui` and `warnings` (widgets past the round edge). `scale: 2` makes it half size. A dark screen is woken for it.
 
 ## Messages
 

@@ -246,6 +246,44 @@ bool muse_apps_json_object_valid(const char *s, size_t len, char *err, size_t er
  */
 bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code, const char **err);
 
+/*
+ * Link's app.control snapshot (Task 25; apps/apps_snapshot.h has how it runs): a JPEG of the gadget's screen, whatever is on it (D22),
+ * written to workspace/apps/<id>/snapshot.jpg on Muse's VM through the VM ops' write (D2: no base64 in the result). scale 1 is the
+ * screen's 466 x 466, 2 half of it. A dark screen is woken (muse_input_wake("snapshot")) and taken on its first lit frame (E9). Any
+ * task, the Noise session's included: it never waits. True once queued: done then runs exactly once, on the I/O worker; false, with
+ * nothing queued and done never called, and *code and *err (literals) saying why (D14's codes):
+ *   invalid_params   not an app id, a scale that isn't 1 or 2 (MUSE_APPS_SNAPSHOT_BAD_SCALE), no done
+ *   unavailable      the gadget has no VM ops
+ *   busy             a snapshot is already under way (one at a time)
+ *   out_of_memory    less than APPS_SNAPSHOT_PSRAM_MIN of PSRAM free (MUSE_APPS_SNAPSHOT_NO_MEMORY), no memory for the job, or the
+ *                    I/O worker can't take it now
+ * One deadline for the whole snapshot, MUSE_APPS_SNAPSHOT_TOTAL_MS from this call, under app.control's 30 s: a job that starts with
+ * less than APPS_SNAPSHOT_MIN_LEFT_MS of it left does nothing and answers busy. The screen has MUSE_APPS_SNAPSHOT_SCREEN_MS from the
+ * job's request to be lit and drawn; the write has what is left of the deadline. The result is
+ *   {"ok":true,"payload":{"path":"workspace/apps/<id>/snapshot.jpg","format":"jpeg","w","h","bytes","front","warnings":[...],
+ *    "ui":[...][,"ui_truncated":N]}}
+ * w and h the picture's (466 or 233; a size the encoder refuses is padded with black to a multiple of 16 in the file, and a warning
+ * says so); front whether id is the app on screen (it runs, its layer is in front and no card covers it); ui its widgets as the app
+ * task's record has them (at most a second old), for an app that runs, whole entries from the start of the dump so that the result
+ * prints in APPS_RESULT_MAX bytes (ui_truncated counts the rest); warnings say when id isn't on screen or the file is padded, and
+ * which widgets extend past the round edge (worked out again from the dump; APPS_SNAPSHOT_WARNINGS_MAX bytes of them, then how
+ * many more). Or {"ok":false,"error":{"code","message"}}:
+ *   not_found        MUSE_APPS_NOT_FOUND; unavailable "storage not ready" for a store that isn't mounted
+ *   busy             the job came too late ("the gadget was busy for <n> ms; take the snapshot again"), or an abandoned drawing
+ *                    is still under way
+ *   unavailable      MUSE_APPS_SNAPSHOT_NO_WAKE (the screen wasn't lit and drawn in time), LVGL or the encoder failed
+ *   out_of_memory    no memory for the pixels, the encoder or the result
+ *   the write's      "couldn't save the snapshot to <path>: <the writer's words>", busy or out_of_memory as the writer says,
+ *                    unavailable for anything else (a refusal, a dropped session, the deadline): without the file Muse sees nothing
+ */
+#define MUSE_APPS_SNAPSHOT_TOTAL_MS 25000   /* the whole snapshot's, from muse_apps_snapshot: 5 s under app.control's 30 s */
+#define MUSE_APPS_SNAPSHOT_SCREEN_MS 5000   /* E9: the screen's, from the job's request, to be lit and drawn */
+#define MUSE_APPS_SNAPSHOT_FILE "snapshot.jpg"
+#define MUSE_APPS_SNAPSHOT_NO_WAKE "the gadget's screen didn't wake for the snapshot; try again"
+#define MUSE_APPS_SNAPSHOT_NO_MEMORY "not enough memory for a snapshot right now"
+#define MUSE_APPS_SNAPSHOT_BAD_SCALE "scale must be 1 (full size) or 2 (half)"
+bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
+
 /* Makes the app layer on screen (apps_lv_build) and takes its touches and swipes. In build_overlays(), after the
  * page dots and before the downloaded image, under the display lock and before the frame timer exists. */
 void muse_apps_ui_build(lv_obj_t *screen);
@@ -253,7 +291,8 @@ void muse_apps_ui_build(lv_obj_t *screen);
 /* The LVGL task, every frame, before update_sleep(): the hang supervisor (a call into the app that has run more than
  * APPS_TASK_HUNG_MS), the reset of an app that ended (before any apply in the frame), the front and back the app task
  * asked for (a front once the app's table is published), the layer's place after a voice turn has ended, and the
- * cards (neither of these two during a turn). */
+ * cards (neither of these two during a turn); last, a snapshot app.control asked for, on the first frame the screen
+ * isn't dark (apps_snapshot_take_pending). */
 void muse_apps_ui_supervise(void);
 
 /* The LVGL task, every frame the screen is awake: the apply step (apps_lv_apply). True while the app layer or a card

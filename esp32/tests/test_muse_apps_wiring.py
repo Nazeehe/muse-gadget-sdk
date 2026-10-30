@@ -241,6 +241,34 @@ class MuseAppsWiringTest(unittest.TestCase):
             if other != overlay:
                 self.assertNotIn("CONFIG_MUSE_APPS=y", other.read_text(), other.name)
 
+    def test_snapshot_wiring(self):  # Task 25
+        # The apps' overlay turns LVGL's snapshot on (the bench overlay had it alone), and the JPEG encoder comes from the
+        # registry only into a build with the apps, keyed on MUSE_APPS_JPEG: a string that every build defines (its Kconfig block,
+        # with no depends on, is test_option_is_opt_in's, D22).
+        lines = (ROOT / "devices/sdkconfig.muse-apps").read_text().splitlines()
+        self.assertIn("CONFIG_LV_USE_SNAPSHOT=y", lines)
+        manifest = (MUSE / "idf_component.yml").read_text()
+        entry = re.search(r"^  espressif/esp_new_jpeg:\n((?:    .*\n)+)", manifest, re.M)
+        self.assertIsNotNone(entry, "no espressif/esp_new_jpeg in components/muse/idf_component.yml")
+        self.assertEqual(entry.group(1), '    version: "1.0.2"\n    rules:\n      - if: "$CONFIG{MUSE_APPS_JPEG} == \\"y\\""\n')
+        # The LVGL task takes a snapshot that was asked for in muse_apps_ui_supervise, which runs every frame, the dark ones
+        # included (E9: the request waits for the first lit frame, and its deadline is the job's).
+        supervise = c_function((MUSE / "apps/apps_task.c").read_text(), "void muse_apps_ui_supervise(void)")
+        self.assertIn("apps_snapshot_take_pending();", supervise)
+        self.assertIn('#include "apps_snapshot.h"', (MUSE / "apps/apps_task.c").read_text())
+        # esp_new_jpeg asks for its working buffers in internal RAM first, the Link's DMA heap: on the 1.75C the encoder's 8 KB
+        # took it from 24211 to 16127 bytes, under the Link's 16 KB margin. The linker sends both of its internal-first allocators
+        # to apps_snapshot.c's PSRAM ones, in a build with the apps (where the library is).
+        cmake = (MUSE / "CMakeLists.txt").read_text()
+        wrap = re.search(r"^if\(CONFIG_MUSE_APPS\)\n((?:    .*\n|\n)+?)endif\(\)", cmake, re.M)
+        self.assertIsNotNone(wrap, "no if(CONFIG_MUSE_APPS) block after idf_component_register in components/muse/CMakeLists.txt")
+        self.assertGreater(wrap.start(), cmake.index("idf_component_register("))
+        self.assertIn('target_link_libraries(${COMPONENT_LIB} INTERFACE\n'
+                      '        "-Wl,--wrap=jpeg_calloc_inner"\n        "-Wl,--wrap=jpeg_calloc_align_inner")', wrap.group(1))
+        source = (MUSE / "apps/apps_snapshot.c").read_text()
+        self.assertIn("void *__wrap_jpeg_calloc_inner(size_t size) {", source)
+        self.assertIn("void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned) {", source)
+
     def test_option_selects_every_font_an_app_can_name(self):
         # font = "sans14" ... "mono16" are lv_font_montserrat_14/16/20/28 and lv_font_unscii_8/16, which a build
         # only has when its sdkconfig enables them; the option does, so no board's overlay has to remember.

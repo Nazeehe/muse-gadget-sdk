@@ -222,6 +222,14 @@ bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code,
     return async_call("guide", NULL, done, ctx, code, err);
 }
 
+/* app.control snapshot's call (Task 25): kept like the other asynchronous ones, with the scale the handler gave. */
+static int snapshot_scale;
+
+bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void *ctx, const char **code, const char **err) {
+    snapshot_scale = scale;
+    return async_call("snapshot", id, done, ctx, code, err);
+}
+
 /* app.send's call (Task 24): kept like the other asynchronous ones, with what the handler made of the parameters. */
 static char send_event[300];
 static char send_data[8192];
@@ -548,9 +556,9 @@ static void finish_async_at(int line, const char *rid) {
 /*
  * app.control's parser, on the Noise session's task: action is one of the seven, as typed; id is an app id for all but
  * list. list, status and logs answer at once with what muse_apps_list and muse_apps_status gave (status false, logs true);
- * launch, stop and remove are queued like an install, {"_async":true}, their request copied and freed once done has sent
- * the result; snapshot is refused until Task 25 (D27). A refusal of a call is the reply, with its code, and frees the
- * request.
+ * launch, stop, remove and snapshot are queued like an install, {"_async":true}, their request copied and freed once done has
+ * sent the result; snapshot takes an optional scale, 1 (the default, also for null) or 2 and nothing else. A refusal of a call is
+ * the reply, with its code, and frees the request.
  */
 static void control_handler(void) {
     /* The action. */
@@ -603,8 +611,8 @@ static void control_handler(void) {
     status_result = "{\"ok\":true,\"payload\":{\"state\":\"running\"}}";
     CHECK(psram_blocks == 0 && sends == 0, "nothing held, nothing sent: the reply is the answer");
 
-    /* launch, stop and remove: queued, and done sends the result once. */
-    static const char *const queued[] = {"launch", "stop", "remove"};
+    /* launch, stop, remove and snapshot: queued, and done sends the result once. */
+    static const char *const queued[] = {"launch", "stop", "remove", "snapshot"};
     for (size_t i = 0; i < ARRAY_LEN(queued); i++) {
         char params[96], request[16];
         snprintf(params, sizeof params, "{\"action\":\"%s\",\"id\":\"timer\"}", queued[i]);
@@ -652,10 +660,42 @@ static void control_handler(void) {
     psram_refuses = false;
     CHECK(asyncs == calls && psram_blocks == 0, "none of them queued");
 
-    /* snapshot: not in this firmware (D27). */
-    EXPECT_CONTROL("{\"action\":\"snapshot\",\"id\":\"timer\"}",
-                   "{\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"snapshots arrive in a later firmware\"}}");
-    CHECK(asyncs == calls && psram_blocks == 0 && installs == 0, "nothing queued for a snapshot");
+    /* snapshot's scale (Task 25): absent or null is 1, 1 and 2 are taken; anything else is refused before anything is queued. */
+    static const struct {
+        const char *params;
+        int scale;
+    } scales[] = {
+        {"{\"action\":\"snapshot\",\"id\":\"timer\"}", 1},
+        {"{\"action\":\"snapshot\",\"id\":\"timer\",\"scale\":null}", 1},
+        {"{\"action\":\"snapshot\",\"id\":\"timer\",\"scale\":1}", 1},
+        {"{\"action\":\"snapshot\",\"id\":\"hello\",\"scale\":2}", 2},
+        {"{\"action\":\"snapshot\",\"id\":\"hello\",\"scale\":2.0}", 2},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(scales); i++) {
+        snapshot_scale = 0;
+        EXPECT_CONTROL(scales[i].params, ASYNC);
+        CHECK(strcmp(async_what, "snapshot") == 0 && snapshot_scale == scales[i].scale, "%s: %s at scale %d", scales[i].params,
+              async_what, snapshot_scale);
+        FINISH_ASYNC("r1");
+    }
+    calls = asyncs;
+    static const char *const bad_scales[] = {"0", "3", "-1", "1.5", "\"2\"", "true", "[2]", "{}", "2e9", "1e300"};
+    for (size_t i = 0; i < ARRAY_LEN(bad_scales); i++) {
+        char params[96];
+        snprintf(params, sizeof params, "{\"action\":\"snapshot\",\"id\":\"timer\",\"scale\":%s}", bad_scales[i]);
+        EXPECT_CONTROL(params, "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"" MUSE_APPS_SNAPSHOT_BAD_SCALE
+                               "\"}}");
+    }
+    CHECK(asyncs == calls && psram_blocks == 0, "a bad scale queues nothing and holds nothing");
+    /* A refusal of the call (one is pending: busy) is the reply, and frees the request. */
+    async_ok = false;
+    async_code = "busy";
+    async_err = "another snapshot is being taken; try again in a few seconds";
+    EXPECT_CONTROL("{\"action\":\"snapshot\",\"id\":\"timer\",\"scale\":2}",
+                   "{\"ok\":false,\"error\":{\"code\":\"busy\",\"message\":\"another snapshot is being taken; try again in a few "
+                   "seconds\"}}");
+    async_ok = true;
+    CHECK(psram_blocks == 0 && installs == 0, "the refused request freed");
 }
 
 /* Whether link.register advertises app.control (the headroom rule: tests/test_muse_apps_link.py measures it). */

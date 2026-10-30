@@ -3349,6 +3349,15 @@ static int advance_ms(lua_State *L) {
     return 0;
 }
 
+/* steal(n): a snapshot's drawing that holds the core for n ms during the call (the LVGL task, over the app task): the clock moves n
+ * ms and the n ms are noted as others' (apps_rt_steal_ms), as apps_snapshot_take_pending does. */
+static int steal_ms(lua_State *L) {
+    lua_Integer n = luaL_checkinteger(L, 1);
+    port_mono_ms += n;
+    apps_rt_steal_ms((uint32_t)n);
+    return 0;
+}
+
 /* charge(n): n VM instructions to the call, to the instruction, as a C function that walks does (apps_vm_charge). */
 static int charge_instr(lua_State *L) {
     apps_vm_charge(L, (unsigned)luaL_checkinteger(L, 1));
@@ -3367,6 +3376,8 @@ static apps_rt_t *launch_clocked(apps_pkg_t **pkg_out, const char *main_src) {
         lua_setglobal(L, "advance_ms");
         lua_pushcfunction(L, charge_instr);
         lua_setglobal(L, "charge");
+        lua_pushcfunction(L, steal_ms);
+        lua_setglobal(L, "steal");
         CHECK(apps_rt_start(rt), "start: %s", apps_rt_last_error(rt));
     }
     return rt;
@@ -3543,6 +3554,79 @@ static void duty_busy(void) {
         CHECK(!apps_rt_has_work(rt, 2000 + 1000 * second) && !warned(rt), "second %d: '%s'", second, apps_rt_warnings(rt));
     }
     CHECK(apps_rt_state(rt) == APPS_STATE_RUNNING, "state %d", apps_rt_state(rt));
+    finish(rt, pkg);
+    port_mono_ms = 0;
+}
+
+/* A snapshot during an app's timer callback (the Task 19 carry, Task 25's ruling): the LVGL task's drawing holds the core, so the
+ * callback's wall clock runs on, but the time is noted as others' and isn't booked to the app. Each second's callback here does 100 ms
+ * of its own and is held up 450 ms by a drawing: 550 ms of wall clock, over the 400 ms that makes a window hot, yet each window is
+ * cool (10% of it) and the app is never throttled. The same 550 ms of the app's own make it throttled by the third window. And a
+ * call held up past the 1 s backstop by a drawing (700 ms of its own, 600 drawn) isn't killed for it; 1300 ms of its own is. */
+static const char *const SNAP_APP =
+    "local own, drawn = 0, 0\n"
+    "return {message = function(event, d)\n"
+    "  if event == 'arm' then\n"
+    "    own, drawn = d[1], d[2]\n"
+    "    timer.every(1000, function() advance_ms(own) if drawn > 0 then steal(drawn) end end)\n"
+    "    return true\n"
+    "  end\n"
+    "  advance_ms(d[1]) if d[2] > 0 then steal(d[2]) end\n"
+    "  for i = 1, 5000 do end\n"
+    "  return true\n"
+    "end}\n";
+
+/* The SNAP_APP's timer, armed at 1000 with own and drawn ms a second, run at each second from 2000 for `seconds`, then the loop's pass
+ * at the end of the last window: whether the app was throttled then (never before: the third hot window closes there). */
+static void snap_seconds(int line, int own, int drawn, int seconds, bool hot) {
+    port_mono_ms = 1000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_clocked(&pkg, SNAP_APP);
+    if (rt == NULL) {
+        return;
+    }
+    char data[32], err[256] = "";
+    snprintf(data, sizeof data, "[%d,%d]", own, drawn);
+    char *reply = apps_rt_message(rt, "arm", data, strlen(data), err, sizeof err);
+    CHECK_AT(line, reply != NULL, "arm: '%s'", err);
+    apps_port_free(reply);
+    const uint32_t stolen_before = apps_rt_stolen_ms();
+    for (int k = 0; k < seconds; k++) {
+        const int64_t at = 2000 + 1000 * k;
+        port_mono_ms = at;
+        CHECK_AT(line, apps_rt_next_deadline(rt) == at && apps_rt_run_one_timer(rt, at), "the timer at %lld", (long long)at);
+        CHECK_AT(line, port_mono_ms == at + own + drawn, "the callback at %lld took %lld ms", (long long)at,
+                 (long long)(port_mono_ms - at));
+        CHECK_AT(line, !warned(rt), "after the callback at %lld: '%s'", (long long)at, apps_rt_warnings(rt));
+    }
+    const int64_t end = 2000 + 1000 * seconds;
+    (void)apps_rt_has_work(rt, end);  /* the loop's pass closes the last window */
+    CHECK_AT(line, warned(rt) == hot, "at %lld: '%s'", (long long)end, apps_rt_warnings(rt));
+    CHECK_AT(line, apps_rt_state(rt) == APPS_STATE_RUNNING, "state %d", apps_rt_state(rt));
+    CHECK_AT(line, apps_rt_stolen_ms() - stolen_before == (uint32_t)(drawn * seconds), "stolen %u",
+             (unsigned)(apps_rt_stolen_ms() - stolen_before));
+    const uint8_t pct = apps_rt_cpu_pct(rt, end);
+    CHECK_AT(line, pct == own / 10, "the last window's share: %u%%", (unsigned)pct);
+    finish(rt, pkg);
+}
+
+static void duty_snapshot(void) {
+    snap_seconds(__LINE__, 100, 450, 7, false);  /* cool: the drawings are nobody's but the core's */
+    snap_seconds(__LINE__, 550, 0, 3, true);     /* hot: throttled when the third window closes */
+    /* The backstop. */
+    port_mono_ms = 1000;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_clocked(&pkg, SNAP_APP);
+    if (rt == NULL) {
+        return;
+    }
+    char err[256] = "";
+    char *reply = apps_rt_message(rt, "long", "[700,600]", 9, err, sizeof err);
+    CHECK(reply != NULL && apps_rt_state(rt) == APPS_STATE_RUNNING, "700 ms of its own and a 600 ms drawing: '%s'", err);
+    apps_port_free(reply);
+    reply = apps_rt_message(rt, "long", "[1300,0]", 8, err, sizeof err);
+    CHECK(reply == NULL && strcmp(err, "stopped: one callback ran longer than 1 s") == 0, "1300 ms of its own: '%s'", err);
+    apps_port_free(reply);
     finish(rt, pkg);
     port_mono_ms = 0;
 }
@@ -4071,6 +4155,7 @@ int main(int argc, char **argv) {
         {"duty_split", duty_split},
         {"duty_busy", duty_busy},
         {"duty_cpu_pct", duty_cpu_pct},
+        {"duty_snapshot", duty_snapshot},
         {"duty_pace", duty_pace},
         {"duty_rate", duty_rate},
         {"duty_swap", duty_swap},

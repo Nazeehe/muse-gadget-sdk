@@ -29,3 +29,8 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_apps.csv"
 # stopwatch and paths like timer_face.lua aren't 8.3 names.
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y
+
+# app.control's snapshot draws the screen with LVGL's snapshot (apps_snapshot.c);
+# the bench overlay has it for the USB screenshots, which this brings to an apps
+# build too.
+CONFIG_LV_USE_SNAPSHOT=y

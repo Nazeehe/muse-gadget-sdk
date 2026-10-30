@@ -34,6 +34,7 @@
 #include "apps_json.h"
 #include "apps_lv.h"
 #include "apps_port.h"
+#include "apps_snapshot.h"
 #include "apps_store.h"
 #include "apps_ui.h"
 #include "apps_values.h"
@@ -234,6 +235,7 @@ static struct {
     int64_t settle_until;
     char what[WHAT_MAX];     /* what a crash now is, to the pending run */
     int64_t call_began;
+    uint32_t call_stolen;    /* apps_rt_stolen_ms when the call began: the time others took from the core isn't the call's */
     uint8_t cpu_pct;         /* what the runtime last said of the share of a window its calls took (apps_rt_cpu_pct) */
     uint32_t worst_ms;
     bool dirty;              /* the app ran since the record was refreshed */
@@ -680,14 +682,19 @@ static void roll_window(void) {
 
 static void call_begin(void) {
     T.call_began = apps_port_mono_ms();
+    T.call_stolen = apps_rt_stolen_ms();
     atomic_store(&s_rec->call_started, (uint32_t)T.call_began);
     atomic_store(&s_rec->in_call, 1);
 }
 
-/* The call is over: the counters (its time is the runtime's to book). */
+/* The call is over: the counters (its time is the runtime's to book). A snapshot's drawing that held the core meanwhile isn't the
+ * call's time (apps_rt_steal_ms), for the worst call as for the duty cycle. */
 static void call_finish(void) {
     atomic_store(&s_rec->in_call, 0);
-    int64_t took = apps_port_mono_ms() - T.call_began;
+    int64_t took = apps_port_mono_ms() - T.call_began - (int64_t)(uint32_t)(apps_rt_stolen_ms() - T.call_stolen);
+    if (took < 0) {
+        took = 0;
+    }
     if (took > (int64_t)T.worst_ms) {
         T.worst_ms = took > UINT32_MAX ? UINT32_MAX : (uint32_t)took;
     }
@@ -1650,6 +1657,7 @@ void muse_apps_ui_supervise(void) {
     }
     note_wake();
     update_covering();
+    apps_snapshot_take_pending();  /* app.control snapshot's request, on the first lit frame (it looks at the dark itself) */
 }
 
 bool muse_apps_ui_tick(void) {
@@ -2098,6 +2106,7 @@ void apps_task_keep_awake(bool on) {
 void apps_task_call_restart(void) {
     if (s_rec != NULL && atomic_load(&s_rec->in_call)) {
         T.call_began = apps_port_mono_ms();  /* the call's time, for the supervisor and for the status's worst call, begins here */
+        T.call_stolen = apps_rt_stolen_ms();
         atomic_store(&s_rec->call_started, (uint32_t)T.call_began);
     }
 }

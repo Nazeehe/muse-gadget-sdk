@@ -2455,6 +2455,11 @@ class SvcHarnessTest(unittest.TestCase):
         # The same booking as the duty cycle's: a call that runs into the next window is in both, an idle window is 0.
         self.run_case("duty_cpu_pct")
 
+    def test_a_snapshot_during_a_timer_callback_is_not_the_apps_time(self):
+        # Task 25 (the Task 19 carry): a drawing that holds the core during a callback is noted as others' (apps_rt_steal_ms), so
+        # the window stays cool and the 1 s backstop doesn't count it; the same wall time of the app's own is hot, and killed.
+        self.run_case("duty_snapshot")
+
     def test_a_throttled_timer_waits_from_the_end_of_its_callback(self):
         # The throttle's 100 ms are idle time, also for a callback that outlasts its period and 100 ms; unthrottled it is a period.
         self.run_case("duty_pace")

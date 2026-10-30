@@ -38,6 +38,12 @@ dependencies:
     public: true
     rules:
       - if: "$CONFIG{MUSE_BOARD_ID} != \"none\""
+  # Muse apps' snapshots (apps/apps_snapshot.c): the JPEG encoder. MUSE_APPS_JPEG is a string every build defines, so the rule
+  # can be read before Kconfig's dependencies are.
+  espressif/esp_new_jpeg:
+    version: "1.0.2"
+    rules:
+      - if: "$CONFIG{MUSE_APPS_JPEG} == \"y\""
   espressif/esp_lvgl_adapter:
     version: "0.6.4"
     rules:

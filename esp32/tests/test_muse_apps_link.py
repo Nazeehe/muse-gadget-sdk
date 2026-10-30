@@ -107,8 +107,9 @@ class LinkCommands(unittest.TestCase):
         return done.stdout
 
     def test_register_entries_fit_budget(self):
-        # D11, re-asserted by Task 24: all four of the apps' entries, app.send's included, are advertised, and fit the budget (the
-        # headroom rule would leave app.control out when they didn't; it still dispatches, and app.api's payload names it).
+        # D11, re-asserted by Tasks 24 and 25: all four of the apps' entries, app.send's and app.control's snapshot scale included,
+        # are advertised, and fit the budget (the headroom rule would leave app.control out when they didn't; it still dispatches,
+        # and app.api's payload names it).
         stdout = self.run_case("register_entries")
         printed = {}
         for line in stdout.splitlines():
@@ -136,9 +137,10 @@ class LinkCommands(unittest.TestCase):
         control = everything["app.control"]
         self.assertEqual(control["description"], CONTROL_DESCRIPTION)
         self.assertEqual(sorted(control["required"]), ["action"])
-        self.assertEqual(sorted(control["optional"]), ["id"])
+        self.assertEqual(sorted(control["optional"]), ["id", "scale"])
         self.assertEqual(control["required"]["action"]["type"], "string")
         self.assertEqual(control["optional"]["id"]["type"], "string")
+        self.assertEqual(control["optional"]["scale"], {"type": "integer", "description": "1 full size (default), 2 half"})
         self.assertEqual(control["timeout_ms"], 30000)
         send = everything["app.send"]
         self.assertEqual(send["description"], SEND_DESCRIPTION)
@@ -156,7 +158,7 @@ class LinkCommands(unittest.TestCase):
         self.run_case("install_handler")
         self.run_case("handles")
 
-    def test_control_actions_validated(self):  # the action as typed, the id for all but list, the sync and async ones, D27
+    def test_control_actions_validated(self):  # the action as typed, the id for all but list, the sync and async ones, scale
         self.run_case("control_handler")
 
     def test_api_is_async_and_frees_its_context(self):  # D2: _async, the request copied, freed once done has sent

@@ -34,6 +34,7 @@
 
 #include "apps_rt.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -481,6 +482,7 @@ static void store_flush_final(apps_rt_t *rt);
  * kill it decides on is the call's result; the call's time and instructions are booked to the windows it ran in after it. */
 static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t budget) {
     int64_t began = apps_port_mono_ms();
+    const uint32_t stolen = apps_rt_stolen_ms();
     duty_roll(rt, began);
     lua_State *L = apps_vm_lua(rt->vm);
     if (!lua_checkstack(L, 2)) {
@@ -491,7 +493,10 @@ static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t b
     lua_pushlightuserdata(L, arg);
     uint64_t before = apps_vm_instructions(rt->vm);
     apps_call_t result = apps_vm_call(rt->vm, 1, 0, budget, rt->err, sizeof rt->err);
-    duty_book(rt, began, apps_port_mono_ms(), apps_vm_instructions(rt->vm) - before);
+    /* The time others took from the core during the call (a snapshot's drawing) isn't the app's: the call ends that much sooner
+     * (duty_book never lets it end before it began). */
+    const int64_t ended = apps_port_mono_ms() - (int64_t)(uint32_t)(apps_rt_stolen_ms() - stolen);
+    duty_book(rt, began, ended, apps_vm_instructions(rt->vm) - before);
     return result;
 }
 
@@ -942,13 +947,31 @@ static int build_assets(const apps_pkg_t *pkg, apps_asset_t *assets) {
     return n;
 }
 
+/* The time the app task's core spent on others' work (apps_rt_steal_ms): one total for every runtime, a word of internal RAM (a
+ * static), read and added to with atomics. */
+static atomic_uint s_stolen_ms;
+
+void apps_rt_steal_ms(uint32_t ms) {
+    atomic_fetch_add(&s_stolen_ms, ms);
+}
+
+uint32_t apps_rt_stolen_ms(void) {
+    return atomic_load(&s_stolen_ms);
+}
+
+/* The VM's clock, for its 1 s backstop: the monotonic clock less the stolen time, so a call that a snapshot's drawing held up isn't
+ * killed for the drawing's time. It steps back when time is stolen; the VM only ever measures a call's span on it. */
+static int64_t vm_clock_ms(void) {
+    return apps_port_mono_ms() - (int64_t)apps_rt_stolen_ms();
+}
+
 /* A VM for an app: memory_kb of heap from the port. NULL, with err saying so, when it can't be made. */
 static apps_vm_t *make_vm(unsigned memory_kb, char *err, size_t err_len) {
     apps_vm_config_t cfg = {
         .mem_limit = (size_t)memory_kb * 1024u,
         .realloc_fn = apps_port_realloc,
         .free_fn = apps_port_free,
-        .now_ms = apps_port_mono_ms,
+        .now_ms = vm_clock_ms,
     };
     apps_vm_t *vm = apps_vm_new(&cfg);
     if (vm == NULL) {

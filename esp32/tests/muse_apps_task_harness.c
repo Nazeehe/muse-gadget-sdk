@@ -1730,6 +1730,18 @@ bool apps_port_dark(void) {
 }
 static atomic_bool last_tick;  /* what muse_apps_ui_tick returned at the last frame: frame_tick returns early on true */
 
+/* app.control snapshot's LVGL side (apps_snapshot.c, which has its own harness): the supervisor offers it every frame, the dark ones
+ * included, on the LVGL task. */
+static atomic_uint snapshot_offers, snapshot_offers_dark;
+
+void apps_snapshot_take_pending(void) {
+    lvgl_only("apps_snapshot_take_pending");
+    atomic_fetch_add(&snapshot_offers, 1);
+    if (atomic_load(&lvgl_asleep)) {
+        atomic_fetch_add(&snapshot_offers_dark, 1);
+    }
+}
+
 static void *lvgl_main(void *arg) {
     (void)arg;
     lvgl_thread = pthread_self();
@@ -3043,6 +3055,60 @@ static void cpu_pct_follows_idle_time(void) {
           st->worst_dispatch_ms);
     clock_go();
     heap_caps_free(st);
+}
+
+/* Task 25 (the Task 19 carry): a snapshot's drawing that held the core during a call (apps_rt_steal_ms, which the LVGL task calls
+ * when it has drawn) isn't the call's time: neither the worst call's nor the duty cycle's, whose share of the second is cpu_pct.
+ * A 400 ms call of which 300 ms were a drawing is a 100 ms call. On the stoppable clock. */
+static void a_snapshot_is_not_the_calls_time(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 0, NULL, err, sizeof err), "run: %s", err);
+    const int64_t t0 = (apps_port_mono_ms() / 1000 + 3) * 1000;  /* a whole second, ahead */
+    apps_status_t *st = new_status();
+    clock_stop_at(t0);
+    block_print("busy");
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 400);
+    apps_rt_steal_ms(300);  /* the drawing, while the call was held up */
+    release_print();
+    FIFO_SYNC();  /* the call is over */
+    clock_stop_at(t0 + 1001);
+    FIFO_SYNC();  /* its second has closed */
+    apps_task_status(st);
+    CHECK(st->cpu_pct == 10 && st->worst_dispatch_ms == 100, "a 400 ms call, 300 of them drawn: cpu %u%%, worst %u ms",
+          st->cpu_pct, st->worst_dispatch_ms);
+    /* A drawing between calls is no call's. */
+    apps_rt_steal_ms(500);
+    clock_stop_at(t0 + 1100);
+    block_print("busy");
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 1300);
+    release_print();
+    FIFO_SYNC();
+    clock_stop_at(t0 + 2001);
+    FIFO_SYNC();
+    apps_task_status(st);
+    CHECK(st->cpu_pct == 20 && st->worst_dispatch_ms == 200, "a 200 ms call after a drawing: cpu %u%%, worst %u ms", st->cpu_pct,
+          st->worst_dispatch_ms);
+    clock_go();
+    heap_caps_free(st);
+}
+
+/* The supervisor offers app.control's snapshot to apps_snapshot.c every frame, while the screen sleeps too (E9: the request waits for
+ * the first lit frame, which apps_snapshot.c tells for itself). */
+static void the_snapshot_is_offered_every_frame(void) {
+    unsigned frames_before = atomic_load(&frames), offers_before = atomic_load(&snapshot_offers);
+    sleep_ms(60);
+    unsigned frames_seen = atomic_load(&frames) - frames_before, offers = atomic_load(&snapshot_offers) - offers_before;
+    CHECK(frames_seen >= 5 && offers + 1 >= frames_seen && offers <= frames_seen + 1, "%u offers in %u frames", offers, frames_seen);
+    atomic_store(&lvgl_asleep, true);
+    unsigned dark_before = atomic_load(&snapshot_offers_dark);
+    sleep_ms(60);
+    CHECK(atomic_load(&snapshot_offers_dark) - dark_before >= 5, "offered while asleep: %u",
+          atomic_load(&snapshot_offers_dark) - dark_before);
+    atomic_store(&lvgl_asleep, false);
 }
 
 /* F10: a status read while touches are dropped and a new app begins never reports a count from before the app's base.
@@ -6346,6 +6412,8 @@ int main(int argc, char **argv) {
         {"a_new_app_drops_an_old_crash_card", a_new_app_drops_an_old_crash_card},
         {"a_new_app_drops_an_old_hung_card", a_new_app_drops_an_old_hung_card},
         {"cpu_pct_follows_idle_time", cpu_pct_follows_idle_time},
+        {"a_snapshot_is_not_the_calls_time", a_snapshot_is_not_the_calls_time},
+        {"the_snapshot_is_offered_every_frame", the_snapshot_is_offered_every_frame},
         {"dropped_is_read_with_its_base", dropped_is_read_with_its_base},
         {"a_front_asked_during_a_turn_comes_after_it", a_front_asked_during_a_turn_comes_after_it},
         {"a_card_waits_for_the_turn_to_end", a_card_waits_for_the_turn_to_end},

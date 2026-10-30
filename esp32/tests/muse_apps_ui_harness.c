@@ -820,6 +820,7 @@ typedef struct {
     apps_ui_t *ui;
     uint16_t slot, gen;
     uint8_t event;
+    int fill;  /* nils pushed first, to leave the call LUA_MINSTACK - fill free slots */
     bool result;
     int top_before, top_after;
 } probe_t;
@@ -827,6 +828,9 @@ typedef struct {
 /* Under apps_vm_call: push_handler, and call what it pushed. */
 static int probe_trampoline(lua_State *L) {
     probe_t *p = lua_touserdata(L, 1);
+    for (int i = 0; i < p->fill; i++) {
+        lua_pushnil(L);
+    }
     p->top_before = lua_gettop(L);
     p->result = apps_ui_push_handler(L, p->ui, p->slot, p->gen, p->event);
     p->top_after = lua_gettop(L);
@@ -836,14 +840,20 @@ static int probe_trampoline(lua_State *L) {
     return 0;
 }
 
-/* One touch's dispatch, as apps_rt_touch does it: inside a call. *status is how the call ended. */
-static probe_t probe_status(env_t *e, int slot, int gen, uint8_t event, apps_call_t *status, char *err, size_t err_len) {
-    probe_t p = {.ui = e->ui, .slot = (uint16_t)slot, .gen = (uint16_t)gen, .event = event};
+/* One touch's dispatch, as apps_rt_touch does it: inside a call, with fill nils under it. *status is how the call
+ * ended. */
+static probe_t probe_filled(env_t *e, int slot, int gen, uint8_t event, int fill, apps_call_t *status, char *err,
+                            size_t err_len) {
+    probe_t p = {.ui = e->ui, .slot = (uint16_t)slot, .gen = (uint16_t)gen, .event = event, .fill = fill};
     lua_State *L = apps_vm_lua(e->vm);
     lua_pushcfunction(L, probe_trampoline);
     lua_pushlightuserdata(L, &p);
     *status = apps_vm_call(e->vm, 1, 0, APPS_BUDGET_CALL, err, err_len);
     return p;
+}
+
+static probe_t probe_status(env_t *e, int slot, int gen, uint8_t event, apps_call_t *status, char *err, size_t err_len) {
+    return probe_filled(e, slot, gen, event, 0, status, err, err_len);
 }
 
 static probe_t probe_at(int line, env_t *e, int slot, int gen, uint8_t event) {
@@ -932,6 +942,24 @@ static void push_handler(void) {
     RUN(&e, "c:on('tap', nil)");
     p = PROBE(&e, 0, 1, APPS_UI_TAP);
     CHECK(!p.result, "after on(tap, nil)");
+    finish(&e);
+}
+
+/* push_handler reserves what it pushes, whatever room its caller left: a C function starts with LUA_MINSTACK free
+ * slots, and the probe fills them down to `left`. Its highest point is a handle the app already holds (create keeps
+ * it): luaL_testudata's two metatables over the handler, the handle table and the handle, 5 slots. The test builds
+ * this harness on a Lua with LUA_USE_APICHECK, which aborts on a push past the slots reserved. */
+static void push_handler_reserves_its_slots(void) {
+    OPEN(e);
+    RUN(&e, "hits = 0 a = ui.button{text = 'Go'} a:on('tap', function(w) assert(w == a) hits = hits + 1 end)");
+    for (int left = 0; left <= 6; left++) {
+        char err[256] = "";
+        apps_call_t status;
+        probe_t p = probe_filled(&e, 0, 0, APPS_UI_TAP, LUA_MINSTACK - left, &status, err, sizeof err);
+        CHECK(status == APPS_CALL_OK && p.result && p.top_after == p.top_before + 3, "%d slots left: %d, %s", left,
+              p.result, err);
+    }
+    RUN(&e, "assert(hits == 7, hits)");
     finish(&e);
 }
 
@@ -1424,6 +1452,7 @@ int main(int argc, char **argv) {
         {"clear", clear},
         {"bg", bg},
         {"push_handler", push_handler},
+        {"push_handler_reserves_its_slots", push_handler_reserves_its_slots},
         {"handlers_dropped", handlers_dropped},
         {"assets", assets},
         {"dump_resolved", dump_resolved},

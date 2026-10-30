@@ -1490,7 +1490,7 @@ bool apps_ui_push_handler(lua_State *L, apps_ui_t *ui, uint16_t slot, uint16_t g
         return false;
     }
     const apps_widget_t *w = &ui->w[slot];
-    if (!w->alive || w->gen != gen || (w->events & event) == 0 || !lua_checkstack(L, 4)) {
+    if (!w->alive || w->gen != gen || (w->events & event) == 0 || !lua_checkstack(L, 5)) {
         return false;
     }
     if (lua_rawgetp(L, LUA_REGISTRYINDEX, ui) != LUA_TTABLE) {

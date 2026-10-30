@@ -348,9 +348,13 @@ class GuideAndSkill(unittest.TestCase):
                 f"main.lua's top level and `start()`) and {wall_s} s of time",
                 f"an app that uses more than {busy}% of the CPU for {kill_s} s is stopped",
                 f"A call that hasn't returned after {hung_s} s marks the app hung",
-                f"A message has the budget of any callback ({call:,} instructions, {wall_s} s)"):
+                f"A message has the budget of any callback ({call:,} instructions, {wall_s} s)",
+                # M4: what is true. The VM stops Lua; C that runs long is the supervisor's, and the gadget restarts for neither.
+                "The gadget stops an app that runs away; it doesn't restart for one.",
+                "a call held up inside the gadget's own code is bounded by a supervisor instead."):
             with self.subTest(sentence):
                 self.assertIn(sentence, guide)
+        self.assertNotIn("can't hang or crash", guide)
         # No other count of instructions is quoted.
         quoted = {int(n.replace(",", "")) for n in re.findall(r"\b(\d{1,3}(?:,\d{3})+) (?:VM )?instructions", guide)}
         quoted |= {int(n.replace(",", "")) for n in re.findall(r"instructions \((\d{1,3}(?:,\d{3})+)", guide)}

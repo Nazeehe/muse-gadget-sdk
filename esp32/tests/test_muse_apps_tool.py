@@ -460,11 +460,23 @@ class PackageTest(ToolTestCase):
         os.mkfifo(folder / "pipe")
         os.symlink(folder / "pipe", folder / "util.lua")
         found["a link to a FIFO"] = folder
+        folder = make_package(self.tmp, app_id="loop", manifest={"files": ["util.lua"]})
+        os.symlink("util.lua", folder / "util.lua")
+        found["a link to itself"] = folder
+        folder = make_package(self.tmp, app_id="mloop")
+        (folder / "manifest.json").unlink()
+        os.symlink("manifest.json", folder / "manifest.json")
+        found["a manifest linked to itself"] = folder
+        folder = self.tmp / "folderloop"
+        os.symlink("folderloop", folder)
+        found["a folder linked to itself"] = folder
         return found
 
     def test_a_file_that_is_not_regular_or_not_in_the_folder_is_refused_before_it_is_opened(self):
+        # Ledger 45: a link loop is a refusal in words too (Python 3.12's resolve() raises RuntimeError on one).
         words = {"a FIFO in the folder": "regular file", "a folder": "regular file", "a FIFO for a manifest": "regular file",
-                 "a link out of the folder": "outside the app's folder", "a link to a FIFO": "regular file"}
+                 "a link out of the folder": "outside the app's folder", "a link to a FIFO": "regular file",
+                 "a link to itself": "loop", "a manifest linked to itself": "loop", "a folder linked to itself": "loop"}
         for what, folder in self.make_hazards().items():
             with self.subTest(what), no_longer_than(10), self.assertRaises(self.app.AppError) as raised:
                 self.app.read_package(folder)
@@ -2125,6 +2137,7 @@ class CheckTest(unittest.TestCase):
         secret.write_text("SECRET_LINE_ONE\nlocal b = = 2\n")
         for what, make, words in (
                 ("a link out", lambda path: os.symlink(secret, path), "outside the app's folder"),
+                ("a link loop", lambda path: os.symlink(path.name, path), "loop"),
                 ("a FIFO", os.mkfifo, "regular file"),
                 ("a folder", os.mkdir, "regular file")):
             with self.subTest(what):

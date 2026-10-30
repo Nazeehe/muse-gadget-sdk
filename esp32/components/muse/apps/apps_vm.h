@@ -28,7 +28,7 @@
  * - string has no dump; match, gmatch and gsub raise (Lua's pattern matching
  *   backtracks without bound, out of reach of any hook); find searches plain text
  *   only, in linear time; split and trim are added.
- * - No library call loops in C without allocating, since count hooks never fire
+ * - No library call runs an unbounded loop in C, since count hooks never fire
  *   there: rep of an empty string returns "" at once, and table's concat, move,
  *   insert, remove and sort refuse to walk more elements than the heap could hold
  *   (mem_limit / 16: a range or a __len with nothing behind it). A C function that
@@ -39,7 +39,8 @@
  * load...); assigning one defines it. Strictness lives in the table's __index, so C
  * code reads globals with lua_rawget: lua_getglobal of a missing name raises.
  *
- * CPU and memory: app code can't hang or crash the gadget.
+ * CPU and memory: the VM stops an app that runs away, and the gadget goes on. What a C function does in
+ * between is bounded by the rules above and, past them, by the app task's supervisor (apps_task.h).
  * - A count hook runs every 1000 VM instructions, in every coroutine (lua_newthread
  *   copies it). A coroutine starts its own countdown, so creating one counts as 1000
  *   instructions: one that runs fewer is still paid for. Inside apps_vm_call, a call that
@@ -56,9 +57,11 @@
  *   apps_vm_check and apps_vm_call. App code can still run while the error unwinds: a generic
  *   for's closing value is a to-be-closed slot made at run time with no OP_TBC, so it can't be
  *   refused at load the way a <close> variable is. It is bounded all the same: it runs with the
- *   hook on and can't swallow the error, which is already final, so the kill lands within 1000
- *   pure-Lua instructions of it, and no binding acts in between, since each calls apps_vm_check
- *   first. (<close> is still refused at load and __gc is out, so this is the only such code.)
+ *   hook on and can't swallow the error, which is already final, so the kill lands within about
+ *   1000 pure-Lua instructions per closer (exactly 1000 for a table or string refusal; a refused
+ *   stack growth can take one count per closer, bounded by the stack's room), and no binding acts in
+ *   between, since each calls apps_vm_check first. (<close> is still refused at load and __gc is
+ *   out, so this is the only such code.)
  * - A kill lands within 1000 VM instructions; a C function runs to its end first, which
  *   the bounds above keep short. Spec §8.2 re-arms the hook with a count of 1 at once:
  *   lua_sethook from another task isn't safe (ruling A15). Once the kill is raised, the
@@ -123,7 +126,8 @@ bool apps_vm_load_on(lua_State *L, const char *chunkname, const char *src, size_
 
 /* The Lua heap against mem_limit: bytes held now, the most ever held, and how many
  * requests were refused (past the cap, or realloc_fn failing). A refusal returns NULL
- * to Lua, which collects garbage and retries at once; one that retry doesn't answer is
+ * to Lua, which may collect garbage and retry it once (never under gcstopem: a stack
+ * growth or a lua_checkstack); one it won't retry, or whose retry is refused too, is
  * the app running out of memory (above). */
 size_t apps_vm_mem_used(const apps_vm_t *vm);
 size_t apps_vm_mem_peak(const apps_vm_t *vm);
@@ -173,9 +177,11 @@ void apps_vm_kill(apps_vm_t *vm, const char *reason);
 /* Whether the VM has been killed. Any task. Running out of memory becomes the kill at the
  * next check on the VM's task, so until then this can trail it. */
 bool apps_vm_dying(const apps_vm_t *vm);
-/* Every C function the sandbox gives apps calls this first: when the VM is dying, or out
- * of memory, it raises the kill, so a binding starts no work for a dying app. It pushes one
- * value before raising, which the slots Lua guarantees a C function hold. */
+/* The modules and bindings Muse gives apps call this first, and so do the sandbox's split,
+ * trim, pcall, xpcall and coroutine functions; the rest of the library starts no work outside
+ * the VM and doesn't. When the VM is dying, or out of memory, it raises the kill, so a binding
+ * starts no work for a dying app. It pushes one value before raising, which the slots Lua
+ * guarantees a C function hold. */
 void apps_vm_check(lua_State *L);
 /*
  * Charges n VM instructions to the call and to the VM's lifetime, as the count hook does for the
@@ -201,8 +207,8 @@ unsigned apps_vm_table_slots(lua_State *L, int idx);
  * saw in_call true gets that call's start, or a later call's. */
 bool apps_vm_in_call(const apps_vm_t *vm);
 int64_t apps_vm_call_started_ms(const apps_vm_t *vm);
-/* VM instructions run in the VM's lifetime, counted 1000 at a time by the hook, and 1000
- * for each coroutine created. */
+/* VM instructions run in the VM's lifetime, counted 1000 at a time by the hook, 1000
+ * for each coroutine created, and what apps_vm_charge charges. */
 uint64_t apps_vm_instructions(const apps_vm_t *vm);
 
 /*

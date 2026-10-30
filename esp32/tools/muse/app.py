@@ -62,6 +62,7 @@ nothing else (an app may print U+2028).
 import argparse
 import base64
 import contextlib
+import errno
 import json
 import os
 import re
@@ -149,18 +150,32 @@ class Package(NamedTuple):
     files: list   # [(path, bytes)]: manifest.json first, then main, then the manifest's "files" in order
 
 
+LINK_LOOP = "its links go round in a loop"
+
+
+def resolved(path, cant_read):
+    """path.resolve(), or AppError(cant_read(why)) for a path whose links go round in a loop (Python 3.12's resolve()
+    raises RuntimeError on one, later ones OSError or nothing, which stat() then meets) or that can't be looked at."""
+    try:
+        return path.resolve()
+    except RuntimeError:
+        raise AppError(cant_read(LINK_LOOP))
+    except OSError as e:
+        raise AppError(cant_read(LINK_LOOP if e.errno == errno.ELOOP else e.strerror or e))
+
+
 def listed_file(here, path, cant_read):
     """`path` (the manifest's, relative to the app's folder `here`) as the file it is on this machine: -> (where, how
     big). Where it leads after its links must be inside the folder and be a regular file, and it is looked at before
     it is opened, as a FIFO nobody writes never ends, and a file of a gigabyte is no reason to read a gigabyte.
     `cant_read(why)` is the message for a file that isn't there, or can't be looked at."""
-    target = (here / path).resolve()
+    target = resolved(here / path, cant_read)
     if here not in target.parents:
         raise AppError(f"'{path}' is outside the app's folder {here}")
     try:
         info = target.stat()   # resolve() has followed the links
     except OSError as e:
-        raise AppError(cant_read(e.strerror or e))
+        raise AppError(cant_read(LINK_LOOP if e.errno == errno.ELOOP else e.strerror or e))
     if not stat.S_ISREG(info.st_mode):
         raise AppError(f"'{path}' isn't a regular file: the board takes files, and only those")
     return target, info.st_size
@@ -188,7 +203,7 @@ def read_package(folder):
     it decided by looking at the files, not by reading them. A manifest that can't be read is said in words."""
     folder = Path(folder)
     manifest_path = folder / "manifest.json"
-    here = folder.resolve()
+    here = resolved(folder, lambda why: f"can't read {folder}: {why}")
     target, size = listed_file(here, "manifest.json", lambda why: f"can't read {manifest_path}: {why}")
     if size > MANIFEST_MAX:
         raise AppError(f"manifest.json is larger than {MANIFEST_MAX // 1024} KB")   # before it is parsed: that bounds the nesting

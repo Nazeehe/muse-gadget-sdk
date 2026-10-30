@@ -1166,6 +1166,13 @@ static int open_sandbox(lua_State *L) {
     wrap_lua_own(L, "rep", sandbox_rep);
     luaL_setfuncs(L, apps_string_funcs, 0);
     lua_pop(L, 1);
+    /* Every string's metatable, protected as the handles' are (X17): getmetatable('') gives "string", and an app can't change
+     * what s:find() and the rest reach. */
+    lua_pushliteral(L, "");
+    lua_getmetatable(L, -1);
+    lua_pushliteral(L, "string");
+    lua_setfield(L, -2, "__metatable");
+    lua_pop(L, 2);
 
     /* The table functions that can walk a range or a __len with nothing behind it. */
     lua_pushliteral(L, LUA_TABLIBNAME);
@@ -1177,10 +1184,13 @@ static int open_sandbox(lua_State *L) {
     wrap_lua_own(L, "concat", sandbox_concat);
     lua_pop(L, 1);
 
-    /* Strict globals: __index raises. No __newindex, so assigning defines. */
-    lua_createtable(L, 0, 1);
+    /* Strict globals: __index raises. No __newindex, so assigning defines. Protected (X17): getmetatable(_G) gives its
+     * name. */
+    lua_createtable(L, 0, 2);
     lua_pushcfunction(L, sandbox_index);
     lua_setfield(L, -2, "__index");
+    lua_pushliteral(L, "muse.globals");
+    lua_setfield(L, -2, "__metatable");
     lua_setmetatable(L, -2);
     lua_pop(L, 1);
     return 0;

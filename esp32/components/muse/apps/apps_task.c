@@ -178,6 +178,7 @@ typedef struct {
 typedef struct {
     atomic_uint in_call;       /* app task: a call into the app runs */
     atomic_uint call_started;  /* app task: when it began, apps_port_mono_ms's low 32 bits; stored before in_call */
+    atomic_uint call_stolen;   /* app task: apps_rt_stolen_ms then; stored before call_started */
     atomic_uint app_gen;       /* app task: the current app's number; touches, show and hide carry it */
     atomic_uint published;     /* app task: its table is published */
     atomic_uint waiting;       /* app task: it waits for a reset, with a table to publish or a package to free */
@@ -684,6 +685,7 @@ static void roll_window(void) {
 static void call_begin(void) {
     T.call_began = apps_port_mono_ms();
     T.call_stolen = apps_rt_stolen_ms();
+    atomic_store(&s_rec->call_stolen, T.call_stolen);
     atomic_store(&s_rec->call_started, (uint32_t)T.call_began);
     atomic_store(&s_rec->in_call, 1);
 }
@@ -1452,6 +1454,12 @@ static void on_widget_event(uint16_t slot, uint16_t gen, uint8_t event) {
     if (!atomic_load(&s_up)) {
         return;
     }
+    /* A reset is outstanding: the objects on screen are an app's that has ended (a new app's come only after the reset), and
+     * one of them can carry the slot and gen of a widget of the app that runs now, whose app_gen this would stamp (M2). The
+     * reset is this task's own, so nothing touched before it runs is the new app's. */
+    if (atomic_load(&s_rec->reset_req) != atomic_load(&s_rec->reset_done)) {
+        return;
+    }
     apps_event_t ev = {
         .type = APPS_EV_TOUCH, .code = event, .slot = slot, .gen = gen, .app_gen = atomic_load(&s_rec->app_gen),
     };
@@ -1500,13 +1508,17 @@ static void note_wake(void) {
     L.dark = dark;
 }
 
-/* The supervisor: a call that has run for more than APPS_TASK_HUNG_MS is hung. */
+/* The supervisor: a call that has run for more than APPS_TASK_HUNG_MS is hung, less the time a snapshot's drawing took from the
+ * core meanwhile (apps_rt_steal_ms), as for the worst call and the duty cycle. */
 static void watch_for_hang(void) {
     if (atomic_load(&s_rec->hung) || !atomic_load(&s_rec->in_call)) {
         return;
     }
-    uint32_t started = atomic_load(&s_rec->call_started);  /* read after in_call: this call's start, or a later one's */
-    if ((uint32_t)(now32() - started) <= APPS_TASK_HUNG_MS) {
+    /* Read after in_call, the stolen total before the start: this call's, or a later one's start, which can only make it shorter. */
+    uint32_t stolen_at = atomic_load(&s_rec->call_stolen);
+    uint32_t started = atomic_load(&s_rec->call_started);
+    uint32_t ran = (uint32_t)(now32() - started), drawn = apps_rt_stolen_ms() - stolen_at;
+    if (ran <= drawn || ran - drawn <= APPS_TASK_HUNG_MS) {  /* a drawing that straddled the start is all forgiven */
         return;
     }
     atomic_store(&s_rec->hung, 1);
@@ -2115,6 +2127,7 @@ void apps_task_call_restart(void) {
     if (s_rec != NULL && atomic_load(&s_rec->in_call)) {
         T.call_began = apps_port_mono_ms();  /* the call's time, for the supervisor and for the status's worst call, begins here */
         T.call_stolen = apps_rt_stolen_ms();
+        atomic_store(&s_rec->call_stolen, T.call_stolen);
         atomic_store(&s_rec->call_started, (uint32_t)T.call_began);
     }
 }

@@ -2875,6 +2875,40 @@ static void touches_past_a_full_queue_are_counted(void) {
     heap_caps_free(st);
 }
 
+/* The gen the published table's widget at slot was made for, as touch_job reads it (0 too when no table is published). */
+static uint16_t published_gen(int slot) {
+    uint16_t gen = 0;
+    if (apps_port_ui_trylock(100)) {
+        pthread_mutex_lock(&lv_mu);
+        if (lv_ui != NULL) {
+            gen = apps_ui_slot(lv_ui, slot)->gen;
+        }
+        pthread_mutex_unlock(&lv_mu);
+        apps_port_ui_unlock();
+    }
+    return gen;
+}
+
+/* M2: while a reset is outstanding the objects on screen are an app's that has ended (the new app's come only after the reset), and one
+ * of them can carry the slot and gen of a widget of the new app: a touch then is dropped, never posted with the new app's app_gen. After
+ * the reset, touches reach the new app as ever. */
+static void a_touch_on_an_ended_apps_object_never_reaches_the_new_app(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("one", "One", BUSY, 1), true, 50, NULL, err, sizeof err), "run one: %s", err);
+    WAIT(0, "set_ui table#1");
+    uint16_t gen = published_gen(0);  /* a new table's first widget has the same: two's button will match it */
+    pause_lvgl();  /* one's reset can't run: its button stays on the screen */
+    CHECK(apps_task_run(make_pkg("two", "Two", BUSY, 1), true, 50, NULL, err, sizeof err), "run two: %s", err);
+    int from = mark();
+    lv_event_cb(0, gen, APPS_UI_TAP);  /* a tap on one's button, as apps_lv's callback sends it (the paused LVGL task's stand-in) */
+    ROUNDS();
+    ABSENT(from, "print two busy");
+    atomic_store(&lvgl_paused, false);
+    WAIT(from, "set_ui table#2");
+    TAP(0);
+    WAIT(from, "print two busy");
+}
+
 /* ---- Fix round 1 ---- */
 
 /* F1: with LVGL paused (battery sleep), only an app whose table was published can have objects up, so only its package
@@ -3132,6 +3166,41 @@ static void a_snapshot_is_not_the_calls_time(void) {
     CHECK(st->cpu_pct == 20 && st->worst_dispatch_ms == 200, "a 200 ms call after a drawing: cpu %u%%, worst %u ms", st->cpu_pct,
           st->worst_dispatch_ms);
     clock_go();
+    heap_caps_free(st);
+}
+
+/* Ledger 69a: the supervisor's 3000 ms leave out the drawing too, as the worst call and the duty cycle do. A drawing that ended
+ * before the call is nothing to it; one longer than the call so far (it straddled the start) makes it no call yet, never a wrapped
+ * one; and a call 3400 ms old with 400 of them drawn is 3000 ms: not hung, until 3001. */
+static void a_snapshot_is_not_hung_time(void) {
+    const file_t files[] = {LUA("main.lua", APP_HANG)};
+    char err[200];
+    CHECK(apps_task_run(make_pkg("hangy", "Hangy", files, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "front 1");
+    const int64_t t0 = (apps_port_mono_ms() / 1000 + 3) * 1000;
+    clock_stop_at(t0);
+    apps_rt_steal_ms(1000);  /* before the call */
+    block_print("hang");
+    int from = mark();
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 100);
+    apps_rt_steal_ms(400);  /* more than the call has run */
+    WAIT_FRAMES(5);
+    ABSENT(from, "crash ");
+    clock_stop_at(t0 + 3400);
+    WAIT_FRAMES(10);
+    ABSENT(from, "crash ");
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_RUNNING, "3400 ms with 400 drawn isn't hung: %s", apps_state_name(st->state));
+    clock_stop_at(t0 + 3401);
+    WAIT(from, "crash Hangy | (stopped responding)");
+    int back = mark();
+    clock_go();
+    release_print();
+    WAIT(back, "priority muse_apps 2");
+    WAIT(back, "free pkg hangy");
     heap_caps_free(st);
 }
 
@@ -6445,6 +6514,7 @@ int main(int argc, char **argv) {
         {"the_launcher_lists_the_running_app", the_launcher_lists_the_running_app},
         {"a_late_answer_writes_nothing", a_late_answer_writes_nothing},
         {"touches_past_a_full_queue_are_counted", touches_past_a_full_queue_are_counted},
+        {"a_touch_on_an_ended_apps_object_never_reaches_the_new_app", a_touch_on_an_ended_apps_object_never_reaches_the_new_app},
         {"parking_is_bounded", parking_is_bounded},
         {"a_replace_whose_stop_hangs_drops_the_run", a_replace_whose_stop_hangs_drops_the_run},
         {"a_back_request_in_the_turns_last_frame", a_back_request_in_the_turns_last_frame},
@@ -6453,6 +6523,7 @@ int main(int argc, char **argv) {
         {"a_new_app_drops_an_old_hung_card", a_new_app_drops_an_old_hung_card},
         {"cpu_pct_follows_idle_time", cpu_pct_follows_idle_time},
         {"a_snapshot_is_not_the_calls_time", a_snapshot_is_not_the_calls_time},
+        {"a_snapshot_is_not_hung_time", a_snapshot_is_not_hung_time},
         {"the_snapshot_is_offered_every_frame", the_snapshot_is_offered_every_frame},
         {"dropped_is_read_with_its_base", dropped_is_read_with_its_base},
         {"a_front_asked_during_a_turn_comes_after_it", a_front_asked_during_a_turn_comes_after_it},

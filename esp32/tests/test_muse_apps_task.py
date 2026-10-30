@@ -183,6 +183,9 @@ class AppTaskTest(HarnessCase):
     def test_touches_past_a_full_queue_are_counted(self):
         self.run_case("touches_past_a_full_queue_are_counted")
 
+    def test_a_touch_on_an_ended_apps_object_never_reaches_the_new_app(self):  # M2: dropped while a reset is outstanding
+        self.run_case("a_touch_on_an_ended_apps_object_never_reaches_the_new_app")
+
     # ---- Fix round 1 ----
 
     def test_parking_is_bounded_to_one_package(self):  # F1
@@ -208,6 +211,9 @@ class AppTaskTest(HarnessCase):
 
     def test_a_snapshot_is_not_the_calls_time(self):  # Task 25: the drawing's time is left out of the worst call and cpu_pct
         self.run_case("a_snapshot_is_not_the_calls_time")
+
+    def test_a_snapshot_is_not_hung_time(self):  # ledger 69a: nor the supervisor's 3000 ms
+        self.run_case("a_snapshot_is_not_hung_time")
 
     def test_the_snapshot_is_offered_every_frame(self):  # Task 25, E9: the supervisor offers it, dark frames included
         self.run_case("the_snapshot_is_offered_every_frame")

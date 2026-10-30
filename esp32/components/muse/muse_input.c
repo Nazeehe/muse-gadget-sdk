@@ -873,7 +873,10 @@ static bool console_command(char *line, bool whole)
      * largest block, DMA and PSRAM free (PSRAM's lowest ever too), and the unused
      * stack of the LVGL task and of this one (muse_serial, which runs every console
      * command, the >app.* ones too), each -1 when no task has that name. Both are
-     * high-water marks: the least that was free since boot. */
+     * high-water marks: the least that was free since boot. The free figures are
+     * taken while this command's own SERIAL_LINE (1 KB) buffer is held, in PSRAM
+     * (MUSE_BIG_CAPS) or, on a board without it, internal RAM: they are that much
+     * lower than the heartbeat's, so don't compare the two. */
     if (!strcmp(line, "mem")) {
         TaskHandle_t lvgl = xTaskGetHandle("lvgl");
         TaskHandle_t serial = xTaskGetHandle("muse_serial");

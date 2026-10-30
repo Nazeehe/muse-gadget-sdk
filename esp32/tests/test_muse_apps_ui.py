@@ -1158,6 +1158,16 @@ class HarnessTest(unittest.TestCase):
     def test_push_handler_checks_slot_gen_and_event(self):
         self.run_case("push_handler")
 
+    def test_push_handler_reserves_the_slots_it_pushes(self):
+        # Ledger 36: on a Lua with LUA_USE_APICHECK a push past the slots a C function reserved aborts; the case
+        # leaves push_handler 0 to 6 free slots on its highest path (a handle the app holds: 5).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        exe = apps_host.build("muse_apps_ui_harness_apicheck", [*HARNESS_SOURCES, *apps_host.lua_sources()], tmp.name,
+                              include_dirs=INCLUDES, lua_extra_defines=["LUA_USE_APICHECK"])
+        done = apps_host.run(exe, "push_handler_reserves_its_slots", timeout=300)
+        self.assertEqual(done.returncode, 0, done.stdout[-2000:] + done.stderr)
+
     def test_a_deleted_widgets_handlers_are_let_go_of(self):
         self.run_case("handlers_dropped")
 

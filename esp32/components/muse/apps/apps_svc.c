@@ -81,8 +81,8 @@ _Static_assert(STORE_KB * 1024 == APPS_STORE_MAX_BYTES, "the message says the li
 #define CALENDAR_YEARS "(the years 0 to 9999)"
 
 /* How far from its year and month an os.time table may put the date, in days: day, hour, min and sec added up (each by its
- * size). picolibc's mktime goes through the days it is given a month at a time, about a microsecond a month, so 2^31 days
- * would hold the app for six seconds, with the app task's watchdog and the supervisor's three seconds both passed. This is
+ * size). picolibc's mktime goes through the days it is given a month at a time, about 0.1 us a month on the board (3.2 ns a
+ * day, measured: below), so 2^31 days would hold the app for about seven seconds, past the supervisor's three. This is
  * about 8200 years and costs 10 ms at most. Month and year offsets walk nothing: the library takes the months out in a division,
  * and the years it counts are those between 1970 and the date, which the calendar bounds (below). */
 #define OS_TIME_MAX_DAYS 3000000

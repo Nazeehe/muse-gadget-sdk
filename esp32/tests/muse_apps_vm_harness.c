@@ -523,6 +523,21 @@ static int reachable(lua_State *L, int idx, const lua_CFunction *bad, int nbad, 
     return hits;
 }
 
+/* string_mt(): the harness's way to the strings' metatable, which an app's getmetatable('') no longer gives (M3, X17): its cases
+ * still put a C function's chain behind a string (lua_getmetatable is raw). Only the harness's states have it. */
+static int string_mt(lua_State *L) {
+    lua_pushliteral(L, "");
+    if (!lua_getmetatable(L, -1)) {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+static void give_string_mt(lua_State *L) {
+    lua_pushcfunction(L, string_mt);
+    lua_setglobal(L, "string_mt");
+}
+
 /* Everything a state's code could reach: its registry (globals, loaded modules) and the
  * string metatable, which lives outside the registry. */
 static int reachable_in_state(lua_State *L, const lua_CFunction *bad, int nbad) {
@@ -541,6 +556,7 @@ static int reachable_in_state(lua_State *L, const lua_CFunction *bad, int nbad) 
 static void patterns(void) {
     apps_vm_t *vm = new_vm(256 * KB);
     lua_State *L = apps_vm_lua(vm);
+    give_string_mt(L);
 
     /* The brief's five. */
     expect_error(vm, "return ('a,b'):match(',')", "main.lua:1: " NO_PATTERNS("match"));
@@ -566,9 +582,9 @@ static void patterns(void) {
         {"local f = string.find return f('aaa', '%a')", "main.lua:1: " FIND_MSG},
         {"local f = string.find return f('aaa', '.', 1, false)", "main.lua:1: " FIND_MSG},
         {"local f = string.find return f('aaa', '.', 1, nil)", "main.lua:1: " FIND_MSG},
-        {"return getmetatable('').__index.gsub('aaa', 'a', 'b')", "main.lua:1: " NO_PATTERNS("gsub")},
-        {"return getmetatable('').__index.gmatch('aaa', 'a')", "main.lua:1: " NO_PATTERNS("gmatch")},
-        {"return getmetatable('').__index.find('aaa', '^a')", "main.lua:1: " FIND_MSG},
+        {"return string_mt().__index.gsub('aaa', 'a', 'b')", "main.lua:1: " NO_PATTERNS("gsub")},
+        {"return string_mt().__index.gmatch('aaa', 'a')", "main.lua:1: " NO_PATTERNS("gmatch")},
+        {"return string_mt().__index.find('aaa', '^a')", "main.lua:1: " FIND_MSG},
         {"return ('aaa'):gsub('a', {a = 'b'})", "main.lua:1: " NO_PATTERNS("gsub")},
         {"return ('aaa'):gsub('a', function() end)", "main.lua:1: " NO_PATTERNS("gsub")},
     };
@@ -791,8 +807,8 @@ static void split_linear(void) {
 
 /* Two lines: t, whose missing elements read as "" without running Lua code or
  * allocating. The chain goes through a string, and a string's metatable is the app's. */
-#define EMPTY_READS                             \
-    "getmetatable('').__index = string.lower\n" \
+#define EMPTY_READS                       \
+    "string_mt().__index = string.lower\n" \
     "local t = setmetatable({}, {__index = ''})\n"
 
 /* What src raises in a stock state (base, coroutine, string, table, math), named
@@ -824,6 +840,7 @@ static void expect_stock_error_at(int line, apps_vm_t *vm, const char *src) {
 static apps_vm_t *bounded_vm(void) {
     apps_vm_t *vm = new_vm(256 * KB);
     lua_State *L = apps_vm_lua(vm);
+    give_string_mt(L);
     lua_pushinteger(L, (lua_Integer)(256 * KB / 16));
     lua_setglobal(L, "LIMIT");
     return vm;
@@ -999,10 +1016,10 @@ static void concat_bounded(void) {
                     "return table.concat(t) == 'abc' and calls == 1");
     /* A string is table-like to concat once its metatable has __index and __len. Its
      * length is its own (Lua never asks a string's __len), but a range needn't be. */
-    expect_error(vm, "local mt = getmetatable('') mt.__index, mt.__len = string.sub, true\n"
+    expect_error(vm, "local mt = string_mt() mt.__index, mt.__len = string.sub, true\n"
                      "table.concat('abc', '', 1, math.maxinteger)",
                  "main.lua:2: " TOO_MANY("concat"));
-    expect_true(vm, "local mt = getmetatable('') mt.__index, mt.__len = string.sub, true\n"
+    expect_true(vm, "local mt = string_mt() mt.__index, mt.__len = string.sub, true\n"
                     "return table.concat('abc') == 'abcbcc' and table.concat('abc', ',', 2, 5) == 'bc,c,,'");
     apps_vm_free(vm);
 }
@@ -1910,8 +1927,10 @@ static void memory_kill(void) {
                              "end)\n"
                              "survived = true");
     /* The resizebox path (luaL_Buffer calls the allocator directly and never retries): string.rep
-     * at the cap, with a closing value that repeats the identical string.rep. Even if that
-     * identical request would now fit, no emergency collection ran, so the refusal stays sticky. */
+     * at the cap, with a closing value that repeats the identical string.rep. The refusal stays
+     * final. Which rule keeps it so isn't pinned: the closing value's string.rep asks for its box
+     * first, a different request, so no emergency collection and a different request can't be
+     * told apart here. */
     expect_nomem_seen(FOR_IT "pcall(function()\n"
                              "  " FOR_CLOSE("function(_, e) seen = e local s = " HUGE_REP " end") " local s = " HUGE_REP " end\n"
                              "end)\n"
@@ -1999,6 +2018,20 @@ static void a_refusal_below_the_cap_is_the_gadgets(void) {
         apps_vm_free(vm);
     }
     expect_nomem("local t = {} for i = 1, 1e7 do t[i] = i end");  /* the cap's, as before */
+}
+
+/* M3 (X17): the strings' metatable and the strict globals' are protected too, as every metatable C hands out is: getmetatable gives a
+ * name, setmetatable refuses, and neither can be changed. Strict globals and string methods work as before. */
+static void protected_string_and_global_metatables(void) {
+    apps_vm_t *vm = new_vm(256 * KB);
+    expect_true(vm, "return getmetatable('') == 'string' and getmetatable('abc') == 'string'");
+    expect_true(vm, "return getmetatable(_G) == 'muse.globals'");
+    expect_error(vm, "setmetatable(_G, {})", "main.lua:1: cannot change a protected metatable");
+    expect_error(vm, "getmetatable('').__index = nil", "main.lua:1: attempt to index a string value");
+    expect_true(vm, "return ('abc'):upper() == 'ABC' and ('a,b'):split(',')[2] == 'b' and ('x'):rep(3) == 'xxx'");
+    expect_error(vm, "return nothing_here", "main.lua:1: unknown global 'nothing_here'");
+    expect_true(vm, "defined_now = 5 return defined_now == 5");
+    apps_vm_free(vm);
 }
 
 /* ---- churn (ruling A2) ---- */
@@ -2831,6 +2864,7 @@ int main(int argc, char **argv) {
         {"registry_globals", registry_globals},
         {"sandbox_contents", sandbox_contents},
         {"patterns", patterns},
+        {"protected_string_and_global_metatables", protected_string_and_global_metatables},
         {"plain_find", plain_find},
         {"split_trim", split_trim},
         {"find_linear", find_linear},

@@ -760,19 +760,21 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   bigger (Lua 101 KB, the JPEG encoder 30 KB, FAT 32 KB, the digit fonts
   27 KB) and an idle gadget has about 552 KB less free PSRAM, most of it that
   image, since the board runs code and constant data from PSRAM. Internal RAM
-  is the tight one: about 2.1 KB less free 25 s after boot. The state only one
+  is the tight one: about 2 KB less free 25 s after boot. The state only one
   task touches with plain loads and stores is in PSRAM (`EXT_RAM_BSS_ATTR`;
   atomics and locks stay internal), and the overlay puts NVS's cache there
   (`CONFIG_NVS_ALLOCATE_CACHE_IN_SPIRAM`, which moves the cache, not what is
   stored). Its lowest since boot is set while the Link's session comes up and
   registers. The apps' commands make the registration 3,967 bytes against
   2,669, and an apps build prints it into PSRAM (`noise_control.cpp`): under
-  4 KB, malloc takes internal RAM. Over 12 boots each, that lowest was 16.5 KB
-  at the median and 10.3 KB at the least with the apps, and 11.2 KB and
-  10.8 KB without. The boots that fall under the Link's 16 KB TX margin do so
-  in the Link's own setup, with or without the apps: that floor is an open
-  item of the Link's. The deepest stacks seen: the app task 13,012 bytes
-  free of 57,344, the I/O worker 4,340 of 8,192, and the LVGL task 1,240 free
+  4 KB, malloc takes internal RAM. Over 24 boots each, that lowest was
+  15.4 KB at the median and 9.1 KB at the least with the apps, and 11.2 KB and
+  10.3 KB without; one image's median moves by a few KB from one run of boots
+  to the next. The boots that fall under the Link's 16 KB TX margin do so in
+  the Link's own setup (between the session's handshake and the registration's
+  send), with or without the apps: that floor is an open item of the Link's.
+  The deepest stacks seen: the app task 13,012 bytes free of 57,344, the I/O
+  worker 4,340 of 8,192, and the LVGL task 1,240 free
   after 128 widgets, Settings, the launcher, a crash card, a snapshot and a
   `display.draw_file`.
 - **Storage:** `partitions_muse_apps.csv` is `partitions_muse.csv` with two

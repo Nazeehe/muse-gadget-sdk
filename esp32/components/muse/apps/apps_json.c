@@ -20,8 +20,10 @@
  *
  * Rules this file keeps, since the app task's 56 KB stack also carries Lua's own C recursion and
  * no count hook interrupts C:
- * - Work is bounded. Decoding is bounded by its 32 KB input; encoding writes at least one byte per
- *   value it visits, so the app's memory cap bounds it even when one table appears many times.
+ * - Work is bounded. Decoding is bounded by its 32 KB input. Encoding charges each table it visits
+ *   its slots, empty ones too, to the call's instruction budget (a table that appears many times,
+ *   or one emptied after it grew, costs every walk), and its output grows in the app's capped heap.
+ *   Both read the clock every 256 values (CLOCK_EVERY_MASK), so APPS_WALL_MS holds inside one call.
  * - Stacks are small. The recursive functions (value, object, array, encode_at, encode_table) keep
  *   a few scalars each; every buffer lives in a NOINLINE leaf the compiler can't fold into their
  *   frames (push_string's luaL_Buffer, push_number's strtod copy, put_float's digits). Both
@@ -61,9 +63,10 @@
 #define DECODE_SLOTS 7
 #define ENCODE_SLOTS 3
 
-/* Decoding and encoding call apps_vm_charge(L, 0) after every 256 values they build or write: it reads the
- * clock, which kills a call past APPS_WALL_MS and raises an external kill, inside one big table. A float costs the S3
- * 7 to 11 us to decode and, at the most, 109 us to encode (put_float's three tries), so 256 of them are under 30 ms. */
+/* Decoding and encoding call apps_vm_charge(L, 0) after every 256 values they build or write, and encoding after
+ * every 256 keys of the walk that tells an array from an object: it reads the clock, which kills a call past
+ * APPS_WALL_MS and raises an external kill, inside one big table. A float costs the S3 7 to 11 us to decode and, at
+ * the most, 109 us to encode (put_float's three tries), so 256 of them are under 30 ms. */
 #define CLOCK_EVERY_MASK 0xFFu
 
 /* json.null is this address. */
@@ -1150,7 +1153,9 @@ static bool encode_table(enc_t *e, int idx, int level) {
     lua_pushnil(L);
     while (lua_next(L, idx) != 0) {
         lua_pop(L, 1);  /* the value; lua_next wants the key */
-        count++;
+        if ((++count & CLOCK_EVERY_MASK) == 0) {
+            apps_vm_charge(L, 0);  /* the clock: this walk writes nothing, so encode_at's checks don't run */
+        }
         if (lua_isinteger(L, -1) && lua_tointeger(L, -1) >= 1) {
             if (lua_tointeger(L, -1) > largest) {
                 largest = lua_tointeger(L, -1);

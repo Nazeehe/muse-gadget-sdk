@@ -1610,7 +1610,10 @@ static void encode_scan_work(void) {
  * that runs no VM instruction the hook would count, so only the loops inside json can read the clock.
  * Encoding charges its one table first (a read), so the first check of the loop is the kill: a list of
  * 300 values is killed by a check every 256 and not by one every 512. Decoding has no such read, so the
- * second check is the kill: 600 values are killed by a check every 256 (at 512) and not every 512. */
+ * second check is the kill: 600 values are killed by a check every 256 (at 512) and not every 512. The pass that
+ * tells an array from an object walks every key before a value is written (ledger 30): a list of 300 whose first
+ * value can't be encoded fails at its first value, so only that walk's check, at its 256th key, can kill it, and
+ * the failure pcall would catch is never reached. */
 static void clock_checks(void) {
     static const struct {
         const char *what;
@@ -1619,6 +1622,8 @@ static void clock_checks(void) {
     } cases[] = {
         {"encode", "list = {} for i = 1, 300 do list[i] = i end", "json.encode(list) survived = true"},
         {"decode", "text = '[' .. string.rep('1,', 599) .. '1]'", "json.decode(text) survived = true"},
+        {"encode's array-or-object walk", "list = {function() end} for i = 2, 300 do list[i] = i end",
+         "pcall(json.encode, list) survived = true"},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         for (int slow = 1; slow >= 0; slow--) {

@@ -238,10 +238,11 @@ bool apps_ui_take_clear(apps_ui_t *ui);
 /* ---- The app task ---- */
 
 /*
- * For apps_vm_call, inside a C function the call runs, with 4 free stack slots: when the widget at slot is
- * alive on that gen and subscribed to event (one APPS_UI_* bit) with a handler, pushes the handler, the widget
- * (the handle the app already holds, if it does) and the event's name, returns true, and the caller calls it with
- * nargs 2. Otherwise (a slot that is gone, a gen that isn't its, an event nobody asked for, or no room) returns
+ * For apps_vm_call, inside a C function the call runs; it reserves the 5 stack slots it uses at most (checking a
+ * handle the app holds). When the widget at slot is alive on that gen and subscribed to event (one APPS_UI_* bit)
+ * with a handler, pushes the handler, the widget (the handle the app already holds, if it does) and the event's
+ * name, returns true, and the caller calls it with nargs 2. Otherwise (a slot that is gone, a gen that isn't its,
+ * an event nobody asked for, or no room) returns
  * false and pushes nothing. It allocates (the handle, the name), so it raises when the app's heap refuses: only
  * inside a protected call.
  */

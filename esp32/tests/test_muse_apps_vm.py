@@ -75,6 +75,16 @@ class MuseAppsVmTest(unittest.TestCase):
     def test_patterns_absent_with_guidance(self):
         self.run_case("patterns")
 
+    def test_the_string_and_global_metatables_are_protected(self):  # M3, X17: getmetatable gives a name for these too
+        self.run_case("protected_string_and_global_metatables")
+        # And the sandbox's code sets it (X17's static rule, for the two metatables apps_vm.c makes without luaL_newmetatable).
+        source = (APPS / "apps_vm.c").read_text()
+        strict = source[source.index("/* Strict globals:"):]
+        strict = strict[:strict.index("lua_setmetatable(L, -2);")]
+        self.assertIn('lua_setfield(L, -2, "__metatable");', strict, "the strict globals' metatable")
+        self.assertRegex(source, r'lua_getmetatable\(L, -1\);\n\s*lua_pushliteral\(L, "string"\);\n\s*lua_setfield\(L, -2, "__metatable"\);',
+                         "the strings' metatable")
+
     def test_plain_find_keeps_string_find_semantics(self):
         self.run_case("plain_find")
 
@@ -148,8 +158,9 @@ class MuseAppsVmTest(unittest.TestCase):
         self.run_case("wall_clock", timeout=10)
 
     def test_close_variables_refused(self):
-        # Ruling: <close> runs app code during an unwind, so it is refused at load. That closes
-        # the last path by which a __close handler could swallow a kill or out-of-memory error.
+        # Ruling: <close> runs app code during an unwind, so it is refused at load. A generic for's
+        # closing value still runs while an error unwinds (apps_vm.h); by then a kill or running out of
+        # memory is final, so it can't swallow either.
         self.run_case("tbc_refused", timeout=10)
 
     def test_short_coroutines_are_counted(self):

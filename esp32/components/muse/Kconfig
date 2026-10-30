@@ -294,8 +294,10 @@ menu "Muse"
               block of 565,392 bytes (scale 1) or 434,312 (scale 2), taken
               only with that, 65,536 or 40,960 bytes for the encoder and the
               1 MB free.
-            - Internal RAM: about 3.8 KB less free when idle (27,539 against
-              31,379 bytes), 1.9 KB of it DMA-capable.
+            - Internal RAM: about 2.0 KB less free 25 s after boot (29,395
+              against 31,411 bytes; measured on the 1.75C, the median of 24
+              boots each). Free DMA-capable RAM is about the same (27,599
+              against 27,063).
             - Two flash partitions: 6 MB for the apps' files and 64 KB for
               what they save.
             The 1.75C runs about 2.5 M instructions a second of the simplest

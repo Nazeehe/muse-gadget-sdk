@@ -789,22 +789,30 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   bigger (Lua 101 KB, the JPEG encoder 30 KB, FAT 32 KB, the digit fonts
   27 KB) and an idle gadget has about 552 KB less free PSRAM, most of it that
   image, since the board runs code and constant data from PSRAM. Internal RAM
-  is the tight one: about 2 KB less free 25 s after boot. The state only one
-  task touches with plain loads and stores is in PSRAM (`EXT_RAM_BSS_ATTR`;
-  atomics and locks stay internal), and the overlay puts NVS's cache there
+  is the tight one: about 2.0 KB less free 25 s after boot (measured, the
+  median of 24 boots each). The state only one task touches with plain loads
+  and stores is in PSRAM (`EXT_RAM_BSS_ATTR`; atomics and locks stay
+  internal), and the overlay puts NVS's cache there
   (`CONFIG_NVS_ALLOCATE_CACHE_IN_SPIRAM`, which moves the cache, not what is
   stored). Its lowest since boot is set while the Link's session comes up and
-  registers. The apps' commands make the registration 3,967 bytes against
-  2,669, and an apps build prints it into PSRAM (`noise_control.cpp`): under
-  4 KB, malloc takes internal RAM. A build without the apps still prints its
-  2,669 bytes into a 3,072-byte malloc buffer, in internal RAM, so while the
-  registration is sent it holds 3 KB more internal RAM than an apps build, and
-  the two builds' floors aren't like for like. Before the boot's mount waited for the
-  Link (b944c60), over 24 boots each, that lowest was 15.4 KB at the median
-  and 9.1 KB at the least with the apps, and 11.2 KB and 10.3 KB without; one
-  image's median moves by a few KB from one run of boots to the next. The boots that fall under the Link's 16 KB TX margin do so in
-  the Link's own setup (between the session's handshake and the registration's
-  send), with or without the apps: that floor is an open item of the Link's.
+  registers, before the apps' storage mounts (Boot, below). The apps' commands
+  make the registration 3,967 bytes against 2,669, and an apps build prints it
+  into PSRAM (`noise_control.cpp`): under 4 KB, malloc takes internal RAM. A
+  build without the apps still prints its 2,669 bytes into a 3,072-byte malloc
+  buffer, in internal RAM, so while the registration is sent it holds 3 KB
+  more internal RAM than an apps build. That buffer is taken at the send,
+  after the lowest is usually set, and measured it doesn't move the floor.
+  Measured on the 1.75C on one day, over 24 boots each, the lowest was 12.6 KB
+  at the median and 9.7 KB at the least with the apps, and 11.4 KB and 9.6 KB
+  without; a build without the apps that printed its registration into PSRAM
+  (for measurement only) gave 11.7 KB and 10.5 KB over 12. The apps build from
+  before the mount waited (b944c60) gave 13.0 KB and 9.1 KB over 12 boots that
+  day, and 15.4 KB and 9.1 KB over 24 on its own day: a run of boots moves the
+  median by a few KB. Sampled every 40 ms, 11 of 12 apps boots set their
+  lowest between the session's handshake and the registration's send, before
+  the apps start. 22 of 24 boots fall under the Link's 16 KB TX margin, with
+  or without the apps, in the Link's own setup: that floor is an open item of
+  the Link's.
   The deepest stacks seen: the app task 13,012 bytes free of 57,344, the I/O
   worker 4,340 of 8,192, and the LVGL task 1,240 free
   after 128 widgets, Settings, the launcher, a crash card, a snapshot and a

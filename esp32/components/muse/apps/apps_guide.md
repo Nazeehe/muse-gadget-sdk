@@ -230,7 +230,7 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 - `launch`: runs the app in front (or brings it to the front if it runs) and returns its status.
 - `stop`: stops it, if it is the one running.
 - `remove`: deletes the app with its store and alarms. Stop it first if it runs.
-- `snapshot`: saves a JPEG of the gadget's screen to `workspace/apps/<id>/snapshot.jpg` on this VM (open it to see the screen) and returns its `path`, `w`, `h`, `bytes`, `front` (whether the app is what is on screen: the picture is whatever is), the app's `ui` and `warnings` (widgets past the round edge). `scale: 2` makes it half size. A dark screen is woken for it.
+- `snapshot`: saves a JPEG of the gadget's screen to `workspace/apps/<id>/snapshot.jpg` on this VM (open it to see the screen) and returns its `path`, `w`, `h`, `bytes`, `front` (whether the app is what is on screen: the picture is whatever is), the app's `ui` and `warnings` (widgets past the round edge). `scale: 2` makes it half size. A dark screen is woken for it. A snapshot needs room in the gadget's memory: when there isn't any it is refused before anything is drawn (`out_of_memory`), and a full-size one says when `scale: 2` would fit. The app that runs keeps running either way.
 
 ## Messages
 
@@ -308,4 +308,7 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `the app stopped responding; no app can run until its stuck call returns or the gadget restarts`: a hung call; ask the user to restart the gadget.
 - `the app task is busy; try again`: try again in a moment.
 - `the gadget is short of memory right now; try again in a few seconds`: try again in a few seconds.
+- `not enough memory for a full-size snapshot right now; take it at scale 2`: take the snapshot again with `scale: 2`.
+- `not enough memory for a snapshot while the app runs; stop it (app.control stop) or make it use less memory, then try again`: the running app holds the room a snapshot needs: stop it with `app.control`, or give it smaller images or a smaller `memory_kb`, and take the snapshot again.
+- `not enough memory for a snapshot right now`: try again in a few seconds.
 - `the gadget is busy with another app job (an install, a launch or the guide); try again in a few seconds`: try again once the install has finished.

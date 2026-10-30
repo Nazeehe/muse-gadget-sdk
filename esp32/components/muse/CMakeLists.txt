@@ -216,13 +216,17 @@ endif()
 
 if(CONFIG_MUSE_APPS)
     # app.control's snapshot: esp_new_jpeg asks for its working buffers in
-    # internal RAM first, the Link's DMA heap (the encoder's 8 KB took it under
-    # the Link's 16 KB margin). Its two internal-first allocators go to
-    # apps/apps_snapshot.c's PSRAM ones: the library calls them across its own
-    # objects, so the linker can redirect them (WHOLE_ARCHIVE links ours).
-    # The wrap is the whole image's: the library's JPEG decoder calls the same
-    # two, so a decoder user in a build with the apps gets PSRAM buffers too.
+    # internal RAM first (the _inner pair), or as a fallback when PSRAM is out
+    # (the other pair): internal RAM is the Link's DMA heap (the encoder's 8 KB
+    # took it under the Link's 16 KB margin). All four allocators go to
+    # apps/apps_snapshot.c's, which are PSRAM only and keep the apps' floor
+    # (N1): the library calls them across its own objects, so the linker can
+    # redirect them (WHOLE_ARCHIVE links ours). The wrap is the whole image's:
+    # the library's JPEG decoder calls the _inner pair, so a decoder user in a
+    # build with the apps gets PSRAM buffers under the floor too.
     target_link_libraries(${COMPONENT_LIB} INTERFACE
         "-Wl,--wrap=jpeg_calloc_inner"
-        "-Wl,--wrap=jpeg_calloc_align_inner")
+        "-Wl,--wrap=jpeg_calloc_align_inner"
+        "-Wl,--wrap=jpeg_calloc"
+        "-Wl,--wrap=jpeg_calloc_align")
 endif()

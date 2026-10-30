@@ -2136,6 +2136,10 @@ void apps_task_exit(void) {
     T.exit_asked = true;
 }
 
+bool apps_task_current(void) {
+    return s_task != NULL && xTaskGetCurrentTaskHandle() == s_task;
+}
+
 esp_err_t muse_apps_start(void) {
     static bool console_added;
     if (s_task != NULL) {

@@ -113,8 +113,9 @@
 /*
  * Room for an app (C1). An app's files and its Lua heap (memory_kb) come out of the gadget's free PSRAM, and the apps always
  * leave APPS_RAM_RESERVE of it to the rest of the gadget: Muse's session (about 430 KB while it is up, about 630 KB at the
- * peak of a turn), LVGL's working memory, Wi-Fi's and TLS's buffers (PSRAM on the 1.75C) and a snapshot's encoder (about
- * 460 KB that apps_port_realloc doesn't hand out). LVGL asserts, and so aborts, when it can't allocate. So:
+ * peak of a turn), LVGL's working memory and Wi-Fi's and TLS's buffers (PSRAM on the 1.75C). LVGL asserts, and so aborts, when
+ * it can't allocate. A snapshot takes its blocks through the same floor (N1: apps_snapshot.h), so it comes out of the room above
+ * the reserve too. So:
  * - apps_port_realloc refuses growth that would leave less than APPS_RAM_RESERVE free (apps_port.h);
  * - an app is admitted only when free PSRAM holds the files still to be read, its heap and the reserve: the store's load
  *   (apps_store.h), the RAM store's copies (apps_install.h), and every run once the app it replaces has gone (apps_task.h),

@@ -43,14 +43,13 @@
 #endif
 
 /*
- * app.control snapshot (apps_snapshot.h has how it runs, muse_apps.h the contract). The caller's side and the job are the I/O
- * worker's way of doing things (apps_control.c's): a job of its own in PSRAM, one done, the store read on the worker. The LVGL
- * task's side touches nothing but the handshake, LVGL and a block of PSRAM it allocates for the pixels.
+ * app.control snapshot (apps_snapshot.h has how it runs and what it takes of memory, muse_apps.h the contract). The caller's side and
+ * the job are the I/O worker's way of doing things (apps_control.c's): a job of its own in PSRAM, one done, the store read on the
+ * worker. The LVGL task's side touches nothing but the handshake, LVGL and the one block of PSRAM it allocates for the sequence.
  *
- * Memory, at the peak (a full-size snapshot): the screen's pixels (434 KB) and the masked copy (434 KB, or 460 KB padded to 480),
- * then the masked copy, the encoder's working buffers and the JPEG's 128 KB; the screen's block goes before the encoder runs. All of
- * it is PSRAM, the encoder's working buffers included (the wrapped allocators at the end of this file); the job logs the DMA heap
- * before and with the encoder open, so the Link's margin can be watched.
+ * Memory (N1): one block, through the apps' floor, holds the screen's pixels, the masked picture (in place) and the JPEG; the
+ * encoder's working buffers are PSRAM through the floor too (the wrapped allocators at the end of this file). The job logs the DMA
+ * heap (the Link's margin) and free PSRAM before and with the encoder open, and how long the app waited for the snapshot's memory.
  */
 
 static const char *TAG = "muse_apps";
@@ -62,6 +61,7 @@ static const char *TAG = "muse_apps";
 #define NO_SIZE "the screen has no size"
 #define NO_DRAWING "LVGL couldn't draw the screen into the snapshot"
 #define NO_PIXELS "out of memory: no room for the screen's pixels"
+#define NO_JPEG_ROOM "out of memory: no room for the JPEG"
 #define SHOWN_MAX 40  /* text an app supplied, as a warning shows it (apps_task.c's overflow warnings) */
 #define RESULT_SKELETON "{\"ok\":true,\"payload\":}"
 #define UI_TRUNCATED_ROOM 24  /* ,"ui_truncated":NNNNN */
@@ -71,9 +71,11 @@ static const char *TAG = "muse_apps";
 
 enum { CAP_IDLE, CAP_REQUESTED, CAP_TAKING, CAP_TAKEN, CAP_FAILED, CAP_ABANDONED };
 
-/* The LVGL task's answer: the pixels (a block of apps_port_realloc, NULL when it failed, with why) and what it saw. */
+/* The LVGL task's answer: the pixels (the snapshot's block, apps_port_snapshot_alloc: block_len bytes, the screen's first; NULL when
+ * it failed, with why) and what it saw. */
 typedef struct {
     uint16_t *px;
+    size_t block_len;
     int w, h, stride_px;
     bool layer_front;    /* the app layer was in front and no card covered it */
     char running[APPS_ID_MAX + 1];  /* the app that ran when it was drawn ("" for none) */
@@ -85,8 +87,60 @@ typedef struct {
 static atomic_int s_cap;         /* the handshake's word */
 static atomic_bool s_claimed;    /* a snapshot command is under way, from its admission to its done */
 static _Atomic int64_t s_deadline_ms;  /* the job's, set before it says CAP_REQUESTED: a word the LVGL task can't read torn */
+static atomic_int s_scale;       /* the job's, set before it says CAP_REQUESTED: the block is sized for it */
 static shot_t s_shot;            /* the LVGL task's, set before it says CAP_TAKEN or CAP_FAILED */
 static lv_draw_buf_t s_draw_buf; /* the LVGL task's: its pixels are s_shot's block */
+
+/* ---- The memory a snapshot takes (apps_snapshot.h: N1) ---- */
+
+static size_t align16(size_t n) {
+    return (n + 15) / 16 * 16;
+}
+
+/* The block a snapshot at scale takes of a w x h screen whose pixels are screen bytes: the pixels, the picture masked in place at
+ * their start, and the JPEG's room after the picture (16-byte aligned), whichever reaches further. */
+static size_t block_of(int w, int h, size_t screen, int scale) {
+    scale = scale == 2 ? 2 : 1;
+    const size_t picture = (size_t)(w / scale) * (size_t)(h / scale) * 2;
+    const size_t in_place = align16(picture) + APPS_SNAPSHOT_JPEG_MAX;
+    return screen > in_place ? screen : in_place;
+}
+
+size_t apps_snapshot_block(int side, int scale) {
+    return block_of(side, side, (size_t)side * (size_t)side * 2, scale);
+}
+
+size_t apps_snapshot_peak(int scale) {
+    return apps_snapshot_block(APPS_SNAPSHOT_SIDE, scale) + APPS_SNAPSHOT_ENCODER_BYTES;
+}
+
+static bool fits(int scale, size_t free_bytes, size_t largest) {
+    const size_t need = APPS_RAM_RESERVE + apps_snapshot_peak(scale);
+    return free_bytes >= need && largest >= need;
+}
+
+const char *apps_snapshot_admit(int scale, size_t free_bytes, size_t largest, bool app_runs) {
+    if (fits(scale, free_bytes, largest)) {
+        return NULL;
+    }
+    if (scale == 1 && fits(2, free_bytes, largest)) {
+        return MUSE_APPS_SNAPSHOT_TRY_SCALE_2;
+    }
+    return app_runs ? MUSE_APPS_SNAPSHOT_STOP_APP : MUSE_APPS_SNAPSHOT_NO_MEMORY;
+}
+
+/* The admission now, with its refusal in one log line (what was free, and what the snapshot needed). */
+static const char *admit_now(const char *id, int scale) {
+    char running[APPS_ID_MAX + 1];
+    const size_t free_bytes = apps_port_psram_free(), largest = apps_port_psram_largest();
+    const char *refusal = apps_snapshot_admit(scale, free_bytes, largest, apps_task_running(running, sizeof running));
+    if (refusal != NULL) {
+        ESP_LOGI(TAG, "snapshot %s: scale %d refused: PSRAM free %u, largest block %u; it needs %u of each (the reserve and %u)", id,
+                 scale, (unsigned)free_bytes, (unsigned)largest, (unsigned)(APPS_RAM_RESERVE + apps_snapshot_peak(scale)),
+                 (unsigned)apps_snapshot_peak(scale));
+    }
+    return refusal;
+}
 
 void apps_snapshot_take_pending(void) {
     if (atomic_load(&s_cap) != CAP_REQUESTED || apps_port_dark() || apps_port_mono_ms() >= atomic_load(&s_deadline_ms)) {
@@ -103,7 +157,8 @@ void apps_snapshot_take_pending(void) {
     const uint32_t stride = w > 0 && h > 0 ? lv_draw_buf_width_to_stride((uint32_t)w, LV_COLOR_FORMAT_RGB565) : 0;
     const size_t size = (size_t)stride * (size_t)(h > 0 ? h : 0);
     shot_t shot = {.w = w, .h = h, .stride_px = (int)(stride / 2)};
-    shot.px = size > 0 ? apps_port_realloc(NULL, size) : NULL;
+    shot.block_len = size > 0 ? block_of(w, h, size, atomic_load(&s_scale)) : 0;
+    shot.px = size > 0 ? apps_port_snapshot_alloc(shot.block_len) : NULL;
     if (shot.px == NULL) {
         shot.why = size > 0 ? NO_PIXELS : NO_SIZE;
         shot.no_memory = size > 0;
@@ -111,7 +166,7 @@ void apps_snapshot_take_pending(void) {
                    LV_RESULT_OK ||
                lv_snapshot_take_to_draw_buf(screen, LV_COLOR_FORMAT_RGB565, &s_draw_buf) != LV_RESULT_OK ||
                s_draw_buf.header.w != (uint32_t)w || s_draw_buf.header.h != (uint32_t)h) {
-        apps_port_free(shot.px);
+        apps_port_snapshot_free(shot.px);
         shot.px = NULL;
         shot.why = NO_DRAWING;
     }
@@ -125,7 +180,7 @@ void apps_snapshot_take_pending(void) {
     expected = CAP_TAKING;
     if (!atomic_compare_exchange_strong(&s_cap, &expected, shot.px != NULL ? CAP_TAKEN : CAP_FAILED)) {
         /* The job gave it up (CAP_ABANDONED) while it was drawn: the pixels are nobody's but this task's. */
-        apps_port_free(shot.px);
+        apps_port_snapshot_free(shot.px);
         s_shot.px = NULL;
         atomic_store(&s_cap, CAP_IDLE);
     }
@@ -178,7 +233,7 @@ typedef struct {
     int64_t stamp_ms, deadline_ms;  /* apps_port_mono_ms when it was asked for, and the whole snapshot's end */
 } snap_job_t;
 
-/* The encoded picture: the JPEG (a block of apps_port_realloc) and its sizes. */
+/* The encoded picture: the JPEG (the snapshot's block, cut to it: apps_port_snapshot_free) and its sizes. */
 typedef struct {
     uint8_t *jpeg;
     int len;
@@ -206,6 +261,7 @@ static bool capture(const snap_job_t *job, shot_t *shot, cJSON **r) {
     muse_input_wake("snapshot");
     const int64_t deadline = apps_port_mono_ms() + MUSE_APPS_SNAPSHOT_SCREEN_MS;
     atomic_store(&s_deadline_ms, deadline);
+    atomic_store(&s_scale, job->scale);
     memset(&s_shot, 0, sizeof s_shot);
     atomic_store(&s_cap, CAP_REQUESTED);
     const TickType_t ticks = pdMS_TO_TICKS(APPS_SNAPSHOT_POLL_MS) > 0 ? pdMS_TO_TICKS(APPS_SNAPSHOT_POLL_MS) : 1;
@@ -262,14 +318,18 @@ static jpeg_error_t open_encoder(int w, int h, jpeg_enc_handle_t *enc) {
     return jpeg_enc_open(&cfg, enc);
 }
 
-/* The pixels masked, scaled and encoded: true with *e the JPEG; otherwise *r is the refusal. The screen's block (shot->px) is freed
- * either way, as soon as it has been masked. answered_ms is how long the LVGL task took to answer, for the log. */
+/* The pixels masked, scaled and encoded in the snapshot's block: true with *e the JPEG (the block, cut to it); otherwise *r is the
+ * refusal, and the block is freed. In place, the picture is masked at the block's start and the JPEG written after it; padded (an
+ * encoder that refuses the size), the picture goes into a zeroed copy of its own, through the floor, and the JPEG into the block.
+ * answered_ms is how long the LVGL task took to answer, for the log. */
 static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, encoded_t *e, cJSON **r) {
     memset(e, 0, sizeof *e);
     const int w = shot->w / job->scale, h = shot->h / job->scale;
-    const size_t dma_before = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    const size_t dma_before = heap_caps_get_free_size(MALLOC_CAP_DMA), psram_before = apps_port_psram_free();
     const int64_t began = apps_port_mono_ms();
     char msg[96];
+    uint8_t *block = (uint8_t *)shot->px;
+    shot->px = NULL;  /* the block is this function's from here */
     jpeg_enc_handle_t enc = NULL;
     int fw = w, fh = h;
     jpeg_error_t err = open_encoder(fw, fh, &enc);
@@ -279,54 +339,60 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
         err = open_encoder(fw, fh, &enc);
     }
     if (err != JPEG_ERR_OK) {
-        apps_port_free(shot->px);
-        shot->px = NULL;
+        apps_port_snapshot_free(block);
         snprintf(msg, sizeof msg, "the JPEG encoder refused %dx%d (error %d)", fw, fh, (int)err);
         *r = apps_result_failure(err == JPEG_ERR_NO_MEM ? APPS_ERR_OUT_OF_MEMORY : APPS_ERR_UNAVAILABLE, msg);
         return false;
     }
-    const size_t dma_open = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    const size_t dma_open = heap_caps_get_free_size(MALLOC_CAP_DMA), psram_open = apps_port_psram_free();
     const size_t in_len = (size_t)fw * (size_t)fh * 2;
-    uint16_t *in = jpeg_calloc_align(in_len, 16);  /* zeroed: the padding is black */
-    if (in == NULL) {
+    const bool in_place = fw == w && fh == h && fw <= shot->stride_px;
+    uint16_t *in = (uint16_t *)block;
+    uint8_t *out = block;
+    if (in_place) {
+        out = block + align16(in_len);  /* after the picture: the drawing's pixels there are done with once it is masked */
+    } else if ((in = apps_port_snapshot_alloc(in_len)) != NULL) {
+        memset(in, 0, in_len);  /* the padding is black */
+    }
+    if (in == NULL || (size_t)(out - block) + APPS_SNAPSHOT_JPEG_MAX > shot->block_len) {
         jpeg_enc_close(enc);
-        apps_port_free(shot->px);
-        shot->px = NULL;
-        *r = apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the masked pixels");
+        if (!in_place) {
+            apps_port_snapshot_free(in);
+        }
+        apps_port_snapshot_free(block);
+        *r = apps_result_failure(APPS_ERR_OUT_OF_MEMORY, in == NULL ? "out of memory: no room for the masked pixels" : NO_JPEG_ROOM);
         return false;
     }
-    apps_snapshot_mask(shot->px, shot->w, shot->h, shot->stride_px, job->scale, in, fw);
-    apps_port_free(shot->px);
-    shot->px = NULL;
-    uint8_t *out = apps_port_realloc(NULL, APPS_SNAPSHOT_JPEG_MAX);
+    apps_snapshot_mask((const uint16_t *)block, shot->w, shot->h, shot->stride_px, job->scale, in, fw);
     int len = 0;
-    if (out != NULL) {
-        err = jpeg_enc_process(enc, (const uint8_t *)in, (int)in_len, out, APPS_SNAPSHOT_JPEG_MAX, &len);
-    }
+    err = jpeg_enc_process(enc, (const uint8_t *)in, (int)in_len, out, APPS_SNAPSHOT_JPEG_MAX, &len);
     const UBaseType_t stack_free = uxTaskGetStackHighWaterMark(NULL);  /* the worker's, with the encoder's frames on it */
     jpeg_enc_close(enc);
-    jpeg_free_align(in);
-    if (out == NULL) {
-        *r = apps_result_failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the JPEG");
-        return false;
+    if (!in_place) {
+        apps_port_snapshot_free(in);
     }
     if (err != JPEG_ERR_OK || len <= 0 || len > APPS_SNAPSHOT_JPEG_MAX) {
-        apps_port_free(out);
+        apps_port_snapshot_free(block);
         snprintf(msg, sizeof msg, "the JPEG encoder failed (error %d); try scale 2", (int)err);
         *r = apps_result_failure(APPS_ERR_UNAVAILABLE, msg);
         return false;
     }
+    /* The JPEG to the block's start, and the block cut to it: the write holds only the JPEG. */
+    memmove(block, out, (size_t)len);
+    block = apps_port_snapshot_shrink(block, (size_t)len);
     char padded[32] = "";
     if (fw != w || fh != h) {
         snprintf(padded, sizeof padded, ", padded to %dx%d", fw, fh);
     }
     ESP_LOGI(TAG,
              "snapshot %s: %dx%d jpeg %d bytes (q%d%s), drawn in %u ms, encoded in %u ms, answered %u ms after the request; "
-             "io stack %u of %u free; DMA free %u before, %u with the encoder open, lowest %u",
+             "io stack %u of %u free; DMA free %u before, %u with the encoder open, lowest %u; PSRAM free %u before, %u with the "
+             "encoder open",
              job->id, w, h, len, APPS_SNAPSHOT_QUALITY, padded, (unsigned)shot->render_ms,
              (unsigned)(apps_port_mono_ms() - began), (unsigned)answered_ms, (unsigned)stack_free, (unsigned)APPS_IO_STACK,
-             (unsigned)dma_before, (unsigned)dma_open, (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA));
-    *e = (encoded_t){.jpeg = out, .len = len, .w = w, .h = h, .file_w = fw, .file_h = fh};
+             (unsigned)dma_before, (unsigned)dma_open, (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
+             (unsigned)psram_before, (unsigned)psram_open);
+    *e = (encoded_t){.jpeg = block, .len = len, .w = w, .h = h, .file_w = fw, .file_h = fh};
     return true;
 }
 
@@ -484,7 +550,14 @@ static cJSON *snapshot_result(const snap_job_t *job) {
     }
     cJSON *r = NULL;
     shot_t shot;
-    if (!apps_result_installed(job->id, &r) || !capture(job, &shot, &r)) {
+    if (!apps_result_installed(job->id, &r)) {
+        return r;
+    }
+    const char *refusal = admit_now(job->id, job->scale);  /* again: the memory may have gone while the job waited */
+    if (refusal != NULL) {
+        return apps_result_failure(APPS_ERR_OUT_OF_MEMORY, refusal);
+    }
+    if (!capture(job, &shot, &r)) {
         return r;
     }
     const uint32_t answered_ms = (uint32_t)(apps_port_mono_ms() - at);
@@ -496,7 +569,7 @@ static cJSON *snapshot_result(const snap_job_t *job) {
     }
     cJSON *p = payload(job, &e, runs, front);
     bool saved = p != NULL && save(job, &e, &r);
-    apps_port_free(e.jpeg);
+    apps_port_snapshot_free(e.jpeg);
     if (!saved) {
         cJSON_Delete(p);
         return r;  /* the write's failure, or NULL without memory for the payload */
@@ -515,6 +588,11 @@ static void snap_run(void *arg) {
     if (error != NULL) {
         ESP_LOGI(TAG, "snapshot %s: %s: %s", job->id, cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(error, "code")),
                  cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(error, "message")));
+    }
+    uint32_t waited_ms = 0, waits = apps_port_snapshot_waits(&waited_ms);
+    if (waits > 0) {
+        ESP_LOGI(TAG, "snapshot %s: the app waited %u ms for the snapshot's memory (%u times)", job->id, (unsigned)waited_ms,
+                 (unsigned)waits);
     }
     atomic_store(&s_claimed, false);  /* before done: a snapshot asked once the result is read isn't busy */
     job->done(job->ctx, r);
@@ -550,9 +628,10 @@ bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void 
         return false;
     }
     *code = APPS_ERR_OUT_OF_MEMORY;
-    if (apps_port_psram_free() < APPS_SNAPSHOT_PSRAM_MIN) {
+    const char *refusal = admit_now(id, scale);  /* before anything is drawn (N1) */
+    if (refusal != NULL) {
         atomic_store(&s_claimed, false);
-        *err = MUSE_APPS_SNAPSHOT_NO_MEMORY;
+        *err = refusal;
         return false;
     }
     snap_job_t *job = apps_port_realloc(NULL, sizeof *job);
@@ -581,16 +660,27 @@ bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void 
 /* ---- esp_new_jpeg's working buffers ---- */
 
 /*
- * esp_new_jpeg asks for its working buffers with jpeg_calloc_inner and jpeg_calloc_align_inner: internal RAM first, PSRAM when
- * that is out. Internal RAM is the Link's DMA heap: on the 1.75C the encoder's 8 KB there took it from 24211 bytes to 16127, under
- * the Link's 16 KB margin, for as long as the encoder was open. The linker sends the library's calls here
- * (components/muse/CMakeLists.txt): PSRAM only, so a PSRAM that is out is the encoder's JPEG_ERR_NO_MEM (the snapshot's
- * out_of_memory), never the Link's margin. The library frees both kinds with heap_caps_free, which takes PSRAM blocks too.
+ * esp_new_jpeg asks for its working buffers with jpeg_calloc_inner and jpeg_calloc_align_inner (internal RAM first, PSRAM when that
+ * is out) and jpeg_calloc and jpeg_calloc_align (PSRAM first, internal RAM when that is out). Internal RAM is the Link's DMA heap:
+ * on the 1.75C the encoder's 8 KB there took it from 24211 bytes to 16127, under the Link's 16 KB margin, for as long as the encoder
+ * was open. The linker sends all four here (components/muse/CMakeLists.txt): PSRAM only, and through the apps' floor (N1), so a
+ * PSRAM that is short is the encoder's JPEG_ERR_NO_MEM (the snapshot's out_of_memory), never the Link's margin or the reserve. The
+ * library frees all of them with heap_caps_free (jpeg_free and jpeg_free_align), which takes PSRAM blocks too.
  */
+#define CAPS_PSRAM (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+
 void *__wrap_jpeg_calloc_inner(size_t size) {
-    return heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return apps_port_room(size) ? heap_caps_calloc(1, size, CAPS_PSRAM) : NULL;
 }
 
 void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned) {
-    return heap_caps_aligned_calloc((size_t)aligned, 1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return apps_port_room(size) ? heap_caps_aligned_calloc((size_t)aligned, 1, size, CAPS_PSRAM) : NULL;
+}
+
+void *__wrap_jpeg_calloc(size_t size) {
+    return __wrap_jpeg_calloc_inner(size);
+}
+
+void *__wrap_jpeg_calloc_align(size_t size, int aligned) {
+    return __wrap_jpeg_calloc_align_inner(size, aligned);
 }

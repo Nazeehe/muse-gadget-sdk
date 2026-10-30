@@ -89,6 +89,7 @@ void *heap_caps_realloc(void *ptr, size_t size, uint32_t caps);  /* apps_port_id
 void heap_caps_free(void *ptr);
 size_t heap_caps_get_largest_free_block(uint32_t caps);  /* the port's floor asks (C1); apps_io_submit no longer does (R1) */
 size_t heap_caps_get_allocated_size(void *ptr);          /* the port's floor: what a block has (C1) */
+void *heap_caps_aligned_alloc(size_t alignment, size_t size, uint32_t caps);  /* the port's snapshot blocks (N1) */
 
 /* ---- FreeRTOS ---- */
 

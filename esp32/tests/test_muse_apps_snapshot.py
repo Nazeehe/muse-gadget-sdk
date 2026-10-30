@@ -67,6 +67,8 @@ MASK_MAIN = r"""
 static uint16_t src[H * STRIDE];
 static uint16_t dst[H * W];
 static uint16_t half[240 * 240];
+static uint16_t block[H * STRIDE];  /* the mask in place (N1): the drawing's block, masked where it is */
+static uint16_t half_tight[233 * 233];
 
 static uint16_t pattern(int x, int y) {
     return (uint16_t)(0x0841u + (unsigned)((x * 7 + y * 13) & 0x0FFF));  /* never 0 */
@@ -136,6 +138,16 @@ int main(void) {
         }
     }
     printf("\n");
+
+    /* In place, rows of the picture's own width in the block of the screen's rows: the same picture as out of place, both scales. */
+    apps_snapshot_mask(src, W, H, STRIDE, 1, dst, W);
+    memcpy(block, src, sizeof block);
+    apps_snapshot_mask(block, W, H, STRIDE, 1, block, W);
+    printf("inplace1 %d\n", memcmp(block, dst, sizeof dst) == 0);
+    apps_snapshot_mask(src, W, H, STRIDE, 2, half_tight, 233);
+    memcpy(block, src, sizeof block);
+    apps_snapshot_mask(block, W, H, STRIDE, 2, block, 233);
+    printf("inplace2 %d\n", memcmp(block, half_tight, sizeof half_tight) == 0);
     return 0;
 }
 """
@@ -170,6 +182,9 @@ class MaskAndScale(unittest.TestCase):
         self.assertEqual(lines[10], want2, "the half-size mask isn't the circle")
         # red 31 + 0 + 0 + 31 -> 16 (rounded); green 0 + 63 + 0 + 63 -> 32; blue 0 + 0 + 31 + 31 -> 16.
         self.assertEqual(values["mean"], f"{(16 << 11) | (32 << 5) | 16:04x}")
+        # N1: masked in place (the job's way: one block for the whole snapshot), the picture is the out-of-place one at both scales.
+        self.assertEqual(values["inplace1"], "1")
+        self.assertEqual(values["inplace2"], "1")
 
 
 # What apps_snapshot.c and the headers it includes need of ESP-IDF, FreeRTOS, LVGL, the encoder and the input task: the little
@@ -314,6 +329,18 @@ class Snapshot(unittest.TestCase):
 
     def test_the_encoders_buffers_are_psram(self):  # the Link's DMA margin: esp_new_jpeg's internal-first allocators, wrapped
         self.run_case("encoder_buffers_are_psram")
+
+    def test_admission_before_drawing(self):  # N1: the peak and the block against free and largest; scale 2 suggested; job too
+        self.run_case("admission_before_drawing")
+
+    def test_one_block_through_the_floor(self):  # N1: the drawing, the in-place mask and the JPEG in one floored block
+        self.run_case("one_block_through_the_floor")
+
+    def test_the_padded_copy_is_floored(self):  # N1: the masked copy is the port's; refused, out_of_memory and nothing held
+        self.run_case("the_padded_copy_is_floored")
+
+    def test_the_apps_waits_are_logged(self):  # N1: how long the app waited for the snapshot's memory
+        self.run_case("the_apps_waits_are_logged")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

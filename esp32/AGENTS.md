@@ -746,14 +746,22 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   app, and a call that hasn't returned after 3 s marks it hung.
 - **Memory:** PSRAM holds the app task's 56 KB stack, the running app's Lua
   heap (its manifest's `memory_kb`, at most `MUSE_APPS_HEAP_MAX_KB`), the I/O
-  worker's 8 KB stack and, while one is taken, a snapshot (admitted with 1.5 MB
-  free; about 0.9 MB used). The apps always leave 1 MB of PSRAM to the rest of
-  the gadget (`APPS_RAM_RESERVE`, `apps_pkg.h`): Muse's session takes about
-  430 KB while it is up and about 630 KB at the peak of a turn, and LVGL aborts
-  when it can't allocate. So `apps_port_realloc` refuses growth below it (the
-  app, an install's read or a load ends out of memory, cleanly), a load and
-  every run are admitted only with room for the app's files, its heap and the
-  reserve, and `app.api` gives what is left as `limits.room_kb`. The stacks can be in PSRAM because the 1.75C's
+  worker's 8 KB stack and, while one is taken, a snapshot. The apps always
+  leave 1 MB of PSRAM to the rest of the gadget (`APPS_RAM_RESERVE`,
+  `apps_pkg.h`): Muse's session takes about 430 KB while it is up and about
+  630 KB at the peak of a turn, and LVGL aborts when it can't allocate. So
+  `apps_port_realloc` refuses growth below it (the app, an install's read or a
+  load ends out of memory, cleanly), a load and every run are admitted only
+  with room for the app's files, its heap and the reserve, and `app.api` gives
+  what is left as `limits.room_kb`. A snapshot is one block through
+  the same floor (the screen's pixels, the picture masked in place and the
+  JPEG's room: 565,392 bytes at scale 1 and 434,312 at scale 2, with 32 KB
+  allowed for the encoder's own buffers, also floored). It is admitted, before
+  anything is drawn, only when free PSRAM and the largest free block each hold
+  that above the reserve, and refused otherwise with `out_of_memory` (scale 2
+  suggested when it fits). An app task allocation the floor refuses while a
+  snapshot holds its block waits for the snapshot, up to 1 s, then is tried
+  once more, so a snapshot never kills the app that runs. The stacks can be in PSRAM because the 1.75C's
   `CONFIG_SPIRAM_FETCH_INSTRUCTIONS` and `CONFIG_SPIRAM_RODATA` keep the cache
   on while flash is written; `apps_io.c` refuses to build without them.
   Against the same build without the option, the image is 441,064 bytes

@@ -100,6 +100,18 @@ class AppPortTest(unittest.TestCase):
     def test_the_psram_floor_refuses_growth_and_never_a_shrink(self):  # C1: a clean out of memory, never LVGL's abort
         self.run_case("psram_floor")
 
+    def test_a_snapshots_blocks_go_through_the_floor(self):  # N1: both clauses, aligned, counted, never a wait
+        self.run_case("snapshot_blocks_go_through_the_floor")
+
+    def test_an_app_that_grows_during_a_snapshot_waits_then_succeeds(self):  # N1's ruling: a snapshot never kills the app
+        self.run_case("an_app_that_grows_during_a_snapshot_waits_then_succeeds")
+
+    def test_only_the_app_task_waits_and_only_when_it_helps(self):  # never the snapshot's job, the LVGL task, the worker
+        self.run_case("only_the_app_task_waits_and_only_when_it_helps")
+
+    def test_the_wait_is_bounded_once_a_snapshot(self):  # 1 s at most, stolen, then refused as ever
+        self.run_case("the_wait_is_bounded_once_a_snapshot")
+
     def test_the_screen_is_dark_when_the_ui_says_so(self):  # Task 16: timers pause while it is
         self.run_case("dark_follows_the_ui")
 

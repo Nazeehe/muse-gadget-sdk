@@ -317,7 +317,8 @@ class GuideAndSkill(unittest.TestCase):
         # message between its <placeholders>, "..." and numbers (which the code may spell through a macro), and between the
         # prefixes the code puts in front (": "), is inside one string literal of the apps' sources (comments don't count),
         # so a paraphrase fails.
-        literals = [text for p in [*sorted(APPS.glob("*.[ch]")), MAIN / "apps_link.c", MAIN / "vm_file.c", MAIN / "vm_file.h"]
+        literals = [text for p in [*sorted(APPS.glob("*.[ch]")), MUSE / "muse_apps.h", MAIN / "apps_link.c", MAIN / "vm_file.c",
+                                   MAIN / "vm_file.h"]
                     for text in c_literals(p.read_text())]
         self.assertIn("busy: another install is running", literals)  # a #define's
         self.assertNotIn("The one install pipeline of Muse apps", "\n".join(literals))  # a comment's
@@ -331,6 +332,21 @@ class GuideAndSkill(unittest.TestCase):
                 if len(piece) >= 6:
                     with self.subTest(message, piece=piece):
                         self.assertIn(piece, corpus, "not the firmware's words")
+
+    def test_guide_says_what_to_do_when_a_snapshot_has_no_room(self):
+        # N1: a snapshot is refused before anything is drawn when the gadget has no room for it. The guide's Common errors quote each
+        # of the three refusals as muse_apps.h has them, with what to do, and its snapshot entry says that it happens.
+        header = (MUSE / "muse_apps.h").read_text()
+        section = " ".join(guide_section(GUIDE.read_text(), "Common errors").split())
+        for name, fix in (("MUSE_APPS_SNAPSHOT_TRY_SCALE_2", "`scale: 2`"), ("MUSE_APPS_SNAPSHOT_STOP_APP", "stop it with `app.control`"),
+                          ("MUSE_APPS_SNAPSHOT_NO_MEMORY", "try again in a few seconds")):
+            with self.subTest(name):
+                match = re.search(rf'^#define {name} (?:\\\n\s*)?"([^"]+)"', header, re.M)
+                self.assertIsNotNone(match, f"no #define {name} in muse_apps.h")
+                self.assertRegex(section, rf"- `{re.escape(match.group(1))}`: [^`]*{re.escape(fix)}")
+        guide = " ".join(GUIDE.read_text().split())
+        self.assertIn("it is refused before anything is drawn (`out_of_memory`), and a full-size one says when `scale: 2` would fit",
+                      guide)
 
     def test_guide_quotes_the_cpu_limits_as_the_firmware_has_them(self):
         # Task 27 set the budgets from the board's measured speed (D12: a test pins each number the guide quotes; the skill
@@ -401,8 +417,17 @@ class GuideAndSkill(unittest.TestCase):
 
         task_stack = header_number("apps_task.c", "APPS_TASK_STACK")
         io_stack = header_number("apps_io.h", "APPS_IO_STACK")
-        snapshot_mb = define_kb(APPS / "apps_snapshot.h", "APPS_SNAPSHOT_PSRAM_MIN") / 1024
         reserve_mb = define_kb(APPS / "apps_pkg.h", "APPS_RAM_RESERVE") / 1024
+        # N1: the snapshot's one block at each scale (apps_snapshot.c's block_of, for the 466 x 466 screen), the encoder's
+        # allowance and the app task's wait for it.
+        side = header_number("apps_snapshot.h", "APPS_SNAPSHOT_SIDE")
+        jpeg_max = define_kb(APPS / "apps_snapshot.h", "APPS_SNAPSHOT_JPEG_MAX") * 1024
+        encoder_kb = define_kb(APPS / "apps_snapshot.h", "APPS_SNAPSHOT_ENCODER_BYTES")
+        screen = side * side * 2
+        block1 = max(screen, (screen + 15) // 16 * 16 + jpeg_max)
+        half = (side // 2) * (side // 2) * 2
+        block2 = max(screen, (half + 15) // 16 * 16 + jpeg_max)
+        wait_s = header_number("apps_port.h", "APPS_PORT_SNAPSHOT_WAIT_MS") / 1000
         tx_margin_kb = define_kb(MAIN / "noise_tunnel_internal.h", "NOISE_TX_DMA_RESERVE_BYTES")
         rows = header_number("apps_lv.h", "APPS_LV_LAUNCHER_ROWS")
         path_max = header_number("apps_pkg.h", "APPS_PATH_MAX")
@@ -423,7 +448,8 @@ class GuideAndSkill(unittest.TestCase):
                 f"free of {task_stack:,}",
                 f"the I/O worker's {kb(io_stack)} KB stack",
                 f"of {io_stack:,}, and the LVGL task",
-                f"admitted with {snapshot_mb:g} MB free",
+                f"JPEG's room: {block1:,} bytes at scale 1 and {block2:,} at scale 2, with {encoder_kb} KB",
+                f"waits for the snapshot, up to {wait_s:g} s",
                 f"apps always leave {reserve_mb:g} MB of PSRAM to the rest of the gadget",
                 f"under the Link's {tx_margin_kb} KB TX margin",
                 f"`apps`, a {apps_size // (1024 * 1024)} MB FAT at `{apps_offset:#X}`".replace("0X", "0x"),
@@ -433,7 +459,8 @@ class GuideAndSkill(unittest.TestCase):
                 self.assertIn(phrase, section)
         kconfig = " ".join((MUSE / "Kconfig").read_text().split())
         for phrase in (f"and a {kb(task_stack)} KB task stack",
-                       f"taken only with {snapshot_mb:g} MB free",
+                       f"block of {block1:,} bytes (scale 1) or {block2:,} (scale 2), taken only with that, {encoder_kb * 1024:,} "
+                       f"bytes for the encoder and the {reserve_mb:g} MB free",
                        f"the apps always leave {reserve_mb:g} MB of it free for the rest of the firmware",
                        f"{apps_size // (1024 * 1024)} MB for the apps' files and {kb(nvs_size)} KB for what they save"):
             with self.subTest(phrase):

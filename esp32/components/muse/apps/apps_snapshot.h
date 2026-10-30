@@ -20,25 +20,38 @@
  * Link's app.control snapshot (Task 25): a JPEG of the gadget's screen, written to Muse's VM. muse_apps.h has the command's
  * contract (muse_apps_snapshot); this is how its three tasks meet.
  *
- * 1. The caller (the Noise session's task) checks the parameters and the admission (APPS_SNAPSHOT_PSRAM_MIN of PSRAM free, one
- *    snapshot at a time) and queues one job on the I/O worker (apps_io.h). It never waits.
- * 2. The job checks that the app is installed (the store is the worker's: X11), wakes the screen (E9:
- *    muse_input_wake("snapshot"), which lights a dark screen and keeps a lit one from going dark before the take), and asks
- *    the LVGL task for the screen: it leaves a request with a deadline,
+ * 1. The caller (the Noise session's task) checks the parameters and one snapshot at a time, and admits it before anything is drawn
+ *    (apps_snapshot_admit, below), then queues one job on the I/O worker (apps_io.h). It never waits.
+ * 2. The job checks that the app is installed (the store is the worker's: X11), admits it again (the memory may have gone while it
+ *    waited in the queue), wakes the screen (E9: muse_input_wake("snapshot"), which lights a dark screen and keeps a lit one from
+ *    going dark before the take), and asks the LVGL task for the screen at its scale: it leaves a request with a deadline,
  *    MUSE_APPS_SNAPSHOT_SCREEN_MS from then, and polls for the answer, running the app task's ops as it waits (apps_io_assist).
  * 3. The LVGL task, every frame, in muse_apps_ui_supervise (apps_snapshot_take_pending): on the first frame the screen isn't dark
- *    and the deadline hasn't come, it draws the active screen, whatever is on it (D22), into a block of PSRAM of its own
- *    (lv_snapshot_take_to_draw_buf, RGB565) and hands the block to the job, with what the picture is of: the app layer's place
- *    and the app that runs, read as it is drawn. A request it finds after its deadline is dropped,
- *    never taken: the job's own look at the deadline answers it, unavailable, MUSE_APPS_SNAPSHOT_NO_WAKE. The time the drawing
- *    took is the app task's core's, not the app's: apps_rt_steal_ms keeps it off the running app's duty cycle and 1 s backstop.
- * 4. The job masks the pixels to the round screen (apps_snapshot_mask) into a 16-byte aligned block (jpeg_calloc_align), frees
- *    the screen's block, encodes the JPEG (esp_new_jpeg: RGB565 little-endian, 4:2:0, quality APPS_SNAPSHOT_QUALITY) into
- *    APPS_SNAPSHOT_JPEG_MAX bytes of PSRAM, builds the result (the app's widgets as the app task's record has them, and the
- *    overflow warnings worked out again from them), and writes the JPEG to workspace/apps/<id>/snapshot.jpg through the VM ops
- *    (vm_file_write: POST /fs/upload). A write that fails fails the command: without the file Muse sees nothing.
+ *    and the deadline hasn't come, it draws the active screen, whatever is on it (D22), into one block of its own
+ *    (apps_port_snapshot_alloc: PSRAM, through the floor, aligned for the encoder; RGB565, lv_snapshot_take_to_draw_buf), sized for
+ *    the whole sequence below, and hands the block to the job, with what the picture is of: the app layer's place and the app that
+ *    runs, read as it is drawn. A request it finds after its deadline is dropped, never taken: the job's own look at the deadline
+ *    answers it, unavailable, MUSE_APPS_SNAPSHOT_NO_WAKE. The time the drawing took is the app task's core's, not the app's:
+ *    apps_rt_steal_ms keeps it off the running app's duty cycle and 1 s backstop.
+ * 4. The job opens the encoder (esp_new_jpeg: RGB565 little-endian, 4:2:0, quality APPS_SNAPSHOT_QUALITY), masks the pixels to the
+ *    round screen in place (apps_snapshot_mask: at scale 2 the half-size picture takes the block's first quarter), and encodes the
+ *    JPEG into the block's room after the picture (APPS_SNAPSHOT_JPEG_MAX bytes); then it moves the JPEG to the block's start and
+ *    cuts the block to the JPEG's size (apps_port_snapshot_shrink), so the write holds only that. It builds the result (the app's
+ *    widgets as the app task's record has them, and the overflow warnings worked out again from them), and writes the JPEG to
+ *    workspace/apps/<id>/snapshot.jpg through the VM ops (vm_file_write: POST /fs/upload). A write that fails fails the command:
+ *    without the file Muse sees nothing.
  * The job calls done once, on every way, after it has let go of the admission (so a snapshot asked once the result is read
  * isn't busy).
+ *
+ * Memory (N1). Every block of a snapshot goes through the apps' floor (apps_port.h: APPS_RAM_RESERVE stays free, and a big block
+ * leaves the largest free block at least that): the screen's block, the padded copy below and the encoder's own buffers (the
+ * wrapped allocators at the end of apps_snapshot.c). So a snapshot never takes free PSRAM under the reserve. Its peak is one block
+ * and the encoder's buffers held at once (apps_snapshot_peak): at scale 1 the screen's pixels and the JPEG's room after them
+ * (434,320 + 131,072 bytes), at scale 2 the screen's pixels alone (434,312: the half-size picture and the JPEG fit in them once the
+ * picture is masked). It is admitted, before anything is drawn, only when free PSRAM and the largest free block each hold the peak
+ * above the reserve (apps_snapshot_admit): the encoder's buffers are counted in the block too, as if they came out of it. While
+ * the snapshot holds its block, an app task growth the floor refuses waits for it (apps_port.h), so the snapshot never kills the
+ * app that runs.
  *
  * The handshake (one atomic word, in internal RAM): IDLE, REQUESTED (the job asked), TAKING (the LVGL task is drawing), TAKEN
  * or FAILED (it has answered: the job reads the answer and sets IDLE). At its deadline the job takes a REQUESTED back (IDLE) or,
@@ -46,15 +59,18 @@
  * is done, frees its block and sets IDLE. A job that finds the word not IDLE (an abandoned drawing still under way) answers busy.
  *
  * The encoder's sizes. A size the encoder refuses is padded with black to the next multiple of 16 (480 for 466, 240 for 233:
- * D22); the result's w and h stay the screen's (or half of it), and a warning says the file is larger.
+ * D22); the result's w and h stay the screen's (or half of it), and a warning says the file is larger. A padded picture can't be
+ * masked in place: it goes into a zeroed copy of its own (apps_port_snapshot_alloc, so through the floor), and the JPEG into the
+ * screen's block, whose pixels are done with by then. The 1.75C's encoder takes 466 and 233 (Task 25), so its snapshots never pad.
  */
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#define APPS_SNAPSHOT_PSRAM_MIN (1536 * 1024)  /* free PSRAM a snapshot is admitted with: the screen, the masked copy, the JPEG */
 #define APPS_SNAPSHOT_JPEG_MAX (128 * 1024)    /* the encoder's output, PSRAM */
+#define APPS_SNAPSHOT_SIDE 466                 /* the 1.75C's screen, as the admission counts it (the drawing takes the screen's size) */
+#define APPS_SNAPSHOT_ENCODER_BYTES (32 * 1024)  /* what the admission allows for the encoder's own buffers */
 #define APPS_SNAPSHOT_QUALITY 80
 #define APPS_SNAPSHOT_MIN_LEFT_MS 8000         /* a job that starts with less of its deadline left does nothing: busy */
 #define APPS_SNAPSHOT_RENDER_MS 2000           /* a drawing begun before the screen's deadline is waited for this much longer */
@@ -75,11 +91,28 @@ void apps_snapshot_take_pending(void);
  * and (465, 233), 232 px from the centre column, is kept. Any task; it allocates nothing.
  */
 void apps_snapshot_mask(const uint16_t *src, int w, int h, int stride_px, int scale, uint16_t *dst, int dst_stride_px);
+/* dst may be src (the mask in place, as the job does it) when dst_stride_px is at most stride_px: an output pixel is written at or
+ * before the first input pixel it is made of, after it has been read, and no later one is read from there. The rest of the block
+ * then still holds what was drawn: only the (w / scale) x (h / scale) picture is the mask's. */
 
 /*
- * esp_new_jpeg's internal-first allocators (jpeg_calloc_inner and jpeg_calloc_align_inner, its working buffers), which the linker
- * sends here in a build with the apps (components/muse/CMakeLists.txt): zeroed PSRAM, never internal RAM, which is the Link's DMA
- * heap. NULL when PSRAM is out (the encoder's JPEG_ERR_NO_MEM). Any task.
+ * The admission (N1, above). apps_snapshot_block is the block a snapshot at scale takes of a side x side screen (the drawing's block:
+ * the pixels, and at scale 1 the JPEG's room after them, 16-byte aligned); apps_snapshot_peak adds APPS_SNAPSHOT_ENCODER_BYTES.
+ * apps_snapshot_admit: NULL when free_bytes and largest (the largest free block) each hold the peak at scale above APPS_RAM_RESERVE
+ * for the 1.75C's screen; else the refusal, out_of_memory's words: MUSE_APPS_SNAPSHOT_TRY_SCALE_2 for scale 1 when scale 2 fits,
+ * otherwise MUSE_APPS_SNAPSHOT_STOP_APP when an app runs (app_runs) and MUSE_APPS_SNAPSHOT_NO_MEMORY when none does. Any task.
+ */
+size_t apps_snapshot_block(int side, int scale);
+size_t apps_snapshot_peak(int scale);
+const char *apps_snapshot_admit(int scale, size_t free_bytes, size_t largest, bool app_runs);
+
+/*
+ * esp_new_jpeg's allocators (jpeg_calloc_inner and jpeg_calloc_align_inner, internal RAM first in the library, and jpeg_calloc and
+ * jpeg_calloc_align: its working buffers), which the linker sends here in a build with the apps (components/muse/CMakeLists.txt):
+ * zeroed PSRAM, never internal RAM, which is the Link's DMA heap, and through the apps' floor (apps_port_room). NULL when the floor
+ * refuses or PSRAM is out (the encoder's JPEG_ERR_NO_MEM). The library frees them with heap_caps_free. Any task.
  */
 void *__wrap_jpeg_calloc_inner(size_t size);
 void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned);
+void *__wrap_jpeg_calloc(size_t size);
+void *__wrap_jpeg_calloc_align(size_t size, int aligned);

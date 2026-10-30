@@ -329,3 +329,6 @@ void apps_task_show(void);
 void apps_task_keep_awake(bool on);
 void apps_task_call_restart(void);
 void apps_task_exit(void);
+
+/* Whether the caller is the app task (the port's wait for a snapshot's blocks is the app task's alone: apps_port.h). Any task. */
+bool apps_task_current(void);

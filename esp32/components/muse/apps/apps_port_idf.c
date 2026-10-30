@@ -134,18 +134,140 @@ static bool room_to_grow(void *ptr, size_t n) {
     return true;
 }
 
+/*
+ * The snapshot's blocks (N1, apps_port.h). s_snap_bytes is what the snapshot holds now (its blocks' sizes as the heap has them), and
+ * s_snap_gen counts the snapshots: it moves when the count leaves 0. The app task's wait: s_wait is its own (PSRAM, I2), the waits'
+ * totals are read by the snapshot's job (atomics, internal).
+ */
+static atomic_size_t s_snap_bytes;
+static atomic_uint s_snap_gen;
+static atomic_uint s_snap_waits, s_snap_waited_ms;
+static EXT_RAM_BSS_ATTR struct {
+    uint32_t gen;     /* the snapshot the app task last waited for */
+    uint32_t ms;      /* what it has waited for it */
+} s_wait;
+
+static void snap_count(size_t add, size_t sub) {
+    if (add > 0 && atomic_fetch_add(&s_snap_bytes, add) == 0) {
+        atomic_fetch_add(&s_snap_gen, 1);
+    }
+    if (sub > 0) {
+        atomic_fetch_sub(&s_snap_bytes, sub);
+    }
+}
+
+/* Whether growing ptr to n would pass the floor's free clause were the snapshot's blocks free. */
+static bool fits_without_snapshot(void *ptr, size_t n) {
+    size_t had = ptr != NULL ? heap_caps_get_allocated_size(ptr) : 0;
+    size_t grow = n > had ? n - had : 0, free_then = heap_caps_get_free_size(MUSE_BIG_CAPS) + atomic_load(&s_snap_bytes);
+    return free_then >= grow && free_then - grow >= APPS_RAM_RESERVE;
+}
+
+/* The app task's wait for a snapshot's blocks (apps_port.h): true when it waited (or found room meanwhile), for the one more try. */
+static bool wait_for_snapshot(void *ptr, size_t n) {
+    if (atomic_load(&s_snap_bytes) == 0 || !apps_task_current()) {
+        return false;
+    }
+    uint32_t gen = atomic_load(&s_snap_gen);
+    if (gen != s_wait.gen) {
+        s_wait.gen = gen;
+        s_wait.ms = 0;
+    }
+    if (s_wait.ms >= APPS_PORT_SNAPSHOT_WAIT_MS || !fits_without_snapshot(ptr, n)) {
+        return false;
+    }
+    uint32_t waited = 0;
+    const TickType_t poll = pdMS_TO_TICKS(APPS_PORT_SNAPSHOT_POLL_MS) > 0 ? pdMS_TO_TICKS(APPS_PORT_SNAPSHOT_POLL_MS) : 1;
+    /* The floor refused: until it passes. The heap refused with the floor passing (no block that big): until the snapshot is done. */
+    const bool floor_refused = !room_to_grow(ptr, n);
+    while (s_wait.ms < APPS_PORT_SNAPSHOT_WAIT_MS && atomic_load(&s_snap_bytes) > 0 && (!floor_refused || !room_to_grow(ptr, n))) {
+        const int64_t t0 = apps_port_mono_ms();
+        const uint32_t s0 = apps_rt_stolen_ms();
+        vTaskDelay(poll);
+        const int64_t dt = apps_port_mono_ms() - t0;
+        const uint32_t others = apps_rt_stolen_ms() - s0;  /* a drawing meanwhile: stolen once */
+        if (dt > (int64_t)others) {
+            apps_rt_steal_ms((uint32_t)(dt - (int64_t)others));
+        }
+        const uint32_t step = dt > 0 ? (uint32_t)dt : 1;
+        s_wait.ms += step;
+        waited += step;
+    }
+    if (waited > 0) {
+        atomic_fetch_add(&s_snap_waits, 1);
+        atomic_fetch_add(&s_snap_waited_ms, waited);
+    }
+    return true;
+}
+
 void *apps_port_realloc(void *ptr, size_t n) {
     if (held_by_me()) {
         breach(BREACH_HEAP, "the heap was used with the lock held");
     }
-    if (!room_to_grow(ptr, n)) {
-        return NULL;
+    void *p = room_to_grow(ptr, n) ? heap_caps_realloc(ptr, n, MUSE_BIG_CAPS) : NULL;
+    if (p == NULL && wait_for_snapshot(ptr, n)) {
+        p = room_to_grow(ptr, n) ? heap_caps_realloc(ptr, n, MUSE_BIG_CAPS) : NULL;  /* the one more try */
     }
-    return heap_caps_realloc(ptr, n, MUSE_BIG_CAPS);
+    return p;
 }
 
 size_t apps_port_psram_free(void) {
     return heap_caps_get_free_size(MUSE_BIG_CAPS);
+}
+
+size_t apps_port_psram_largest(void) {
+    return heap_caps_get_largest_free_block(MUSE_BIG_CAPS);
+}
+
+bool apps_port_room(size_t n) {
+    return room_to_grow(NULL, n);
+}
+
+void *apps_port_snapshot_alloc(size_t n) {
+    if (held_by_me()) {
+        breach(BREACH_HEAP, "the heap was used with the lock held");
+    }
+    if (n == 0 || !room_to_grow(NULL, n)) {
+        return NULL;
+    }
+    void *p = heap_caps_aligned_alloc(APPS_PORT_SNAPSHOT_ALIGN, n, MUSE_BIG_CAPS);
+    if (p != NULL) {
+        snap_count(heap_caps_get_allocated_size(p), 0);
+    }
+    return p;
+}
+
+void *apps_port_snapshot_shrink(void *p, size_t n) {
+    size_t had = p != NULL ? heap_caps_get_allocated_size(p) : 0;
+    if (p == NULL || n == 0 || n >= had) {
+        return p;
+    }
+    void *q = heap_caps_realloc(p, n, MUSE_BIG_CAPS);  /* a shrink: TLSF trims the block where it is */
+    if (q == NULL) {
+        return p;
+    }
+    size_t got = heap_caps_get_allocated_size(q);
+    snap_count(got > had ? got - had : 0, had > got ? had - got : 0);
+    return q;
+}
+
+void apps_port_snapshot_free(void *p) {
+    if (p != NULL && held_by_me()) {
+        breach(BREACH_HEAP, "a block was freed with the lock held");
+    }
+    if (p != NULL) {
+        snap_count(0, heap_caps_get_allocated_size(p));
+        heap_caps_free(p);
+    }
+}
+
+size_t apps_port_snapshot_bytes(void) {
+    return atomic_load(&s_snap_bytes);
+}
+
+uint32_t apps_port_snapshot_waits(uint32_t *ms) {
+    *ms = atomic_exchange(&s_snap_waited_ms, 0);
+    return atomic_exchange(&s_snap_waits, 0);
 }
 
 void apps_port_free(void *ptr) {

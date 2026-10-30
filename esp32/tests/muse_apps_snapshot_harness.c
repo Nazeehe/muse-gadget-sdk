@@ -150,9 +150,117 @@ void apps_port_free(void *ptr) {
 }
 
 static size_t psram_free = 4 * 1024 * 1024;
+static size_t psram_largest = 4 * 1024 * 1024;
 
 size_t apps_port_psram_free(void) {
     return psram_free;
+}
+
+size_t apps_port_psram_largest(void) {
+    return psram_largest;
+}
+
+/* The floor for the encoder's own buffers (the wrapped allocators): a case can say it refuses. */
+static bool room_refuses;
+static int room_asks;
+
+bool apps_port_room(size_t n) {
+    (void)n;
+    room_asks++;
+    return !room_refuses;
+}
+
+/* The snapshot's blocks (apps_port_snapshot_*): aligned to 16, counted with the rest and refusable as the port's are (take_one); a
+ * shrink keeps the block where it is, as TLSF's realloc does, and recounts. What was asked is kept for the cases. */
+static struct {
+    void *p;
+    size_t n;
+} snaps[8];
+static size_t snap_bytes, snap_peak, snap_sizes[8];
+static int snap_allocs, snap_asks, snap_refuse_at;  /* snap_refuse_at: the snapshot block of this number is refused (0: none) */
+
+void *apps_port_snapshot_alloc(size_t n) {
+    CHECK(n > 0, "apps_port_snapshot_alloc with 0 bytes");
+    pthread_mutex_lock(&heap_mu);
+    bool ok = !port_refuses && take_one();
+    if (ok && ++snap_asks == snap_refuse_at) {
+        ok = false;
+        refused = true;
+    }
+    void *p = ok ? aligned_alloc(16, (n + 15) / 16 * 16) : NULL;
+    if (p != NULL) {
+        size_t i = 0;
+        while (i < ARRAY_LEN(snaps) && snaps[i].p != NULL) {
+            i++;
+        }
+        CHECK(i < ARRAY_LEN(snaps), "more than 8 snapshot blocks held");
+        snaps[i].p = p;
+        snaps[i].n = n;
+        snap_bytes += n;
+        snap_peak = snap_bytes > snap_peak ? snap_bytes : snap_peak;
+        if (snap_allocs < (int)ARRAY_LEN(snap_sizes)) {
+            snap_sizes[snap_allocs] = n;
+        }
+        snap_allocs++;
+        blocks++;
+        port_blocks++;
+    }
+    pthread_mutex_unlock(&heap_mu);
+    return p;
+}
+
+static size_t *snap_size_of(void *p) {
+    for (size_t i = 0; i < ARRAY_LEN(snaps); i++) {
+        if (snaps[i].p == p) {
+            return &snaps[i].n;
+        }
+    }
+    return NULL;
+}
+
+void *apps_port_snapshot_shrink(void *p, size_t n) {
+    pthread_mutex_lock(&heap_mu);
+    size_t *had = snap_size_of(p);
+    CHECK(had != NULL, "a shrink of a block that isn't the snapshot's");
+    if (n > 0 && n < *had) {
+        snap_bytes -= *had - n;
+        *had = n;
+    }
+    pthread_mutex_unlock(&heap_mu);
+    return p;
+}
+
+void apps_port_snapshot_free(void *p) {
+    if (p == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&heap_mu);
+    size_t *had = snap_size_of(p);
+    CHECK(had != NULL, "a free of a block that isn't the snapshot's");
+    snap_bytes -= *had;
+    for (size_t i = 0; i < ARRAY_LEN(snaps); i++) {
+        if (snaps[i].p == p) {
+            snaps[i].p = NULL;
+        }
+    }
+    blocks--;
+    port_blocks--;
+    pthread_mutex_unlock(&heap_mu);
+    free(p);
+}
+
+size_t apps_port_snapshot_bytes(void) {
+    return snap_bytes;
+}
+
+/* The app task's waits for the snapshot's memory (apps_port.h), as the port would report them: a case sets them. */
+static uint32_t fake_waits, fake_wait_ms;
+
+uint32_t apps_port_snapshot_waits(uint32_t *ms) {
+    *ms = fake_wait_ms;
+    uint32_t n = fake_waits;
+    fake_waits = fake_wait_ms = 0;
+    return n;
 }
 
 /* ---- The clock and the screen ---- */
@@ -382,6 +490,8 @@ static int enc_w, enc_h;
 static bool enc_in_aligned;
 static uint16_t enc_corner, enc_centre, enc_pad;
 static int enc_in_size;
+static uint32_t enc_sum;          /* FNV-1a of the input's pixels, the picture's (the encoder's w x h) */
+static size_t enc_held;           /* the snapshot's blocks held as it encoded */
 static struct encoder {
     int w, h;
 } the_encoder;
@@ -414,6 +524,11 @@ jpeg_error_t jpeg_enc_process(const jpeg_enc_handle_t enc, const uint8_t *in, in
     enc_corner = px[0];
     enc_centre = px[(e->h / 2) * e->w + e->w / 2];
     enc_pad = px[(e->h / 2) * e->w + e->w - 1];  /* the last column: padding when the size was padded */
+    enc_sum = 2166136261u;
+    for (int i = 0; i < e->w * e->h; i++) {
+        enc_sum = (enc_sum ^ px[i]) * 16777619u;
+    }
+    enc_held = snap_bytes;
     if (jpeg_process_fails || jpeg_len > out_cap) {
         return JPEG_ERR_FAIL;
     }
@@ -491,6 +606,7 @@ static uint8_t written[200000];
 static size_t written_len;
 static int64_t written_deadline_us;
 static int64_t written_left_ms;  /* what was left of the deadline when the write began */
+static size_t written_held;      /* the snapshot's blocks held as it wrote */
 static const char *write_code;   /* NULL: the write works; else the code it fails with */
 static const char *write_why = "the VM answered HTTP 507";
 static int write_takes_ms;       /* the write's time on the clock: past the deadline, it times out there */
@@ -498,6 +614,7 @@ static int write_takes_ms;       /* the write's time on the clock: past the dead
 static bool vm_write(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
                      size_t err_len) {
     writes++;
+    written_held = snap_bytes;
     snprintf(written_path, sizeof written_path, "%s", path);
     written_len = len <= sizeof written ? len : 0;
     memcpy(written, data, written_len);
@@ -652,6 +769,16 @@ static void reset(void) {
     refused = false;
     port_refuses = false;
     psram_free = 4 * 1024 * 1024;
+    psram_largest = 4 * 1024 * 1024;
+    room_refuses = false;
+    room_asks = 0;
+    snap_peak = 0;
+    snap_allocs = snap_asks = snap_refuse_at = 0;
+    memset(snap_sizes, 0, sizeof snap_sizes);
+    fake_waits = fake_wait_ms = 0;
+    enc_sum = 0;
+    enc_held = 0;
+    written_held = 0;
     atomic_store(&dark_until, 0);
     atomic_store(&dark_forever, false);
     wakes = 0;
@@ -702,9 +829,9 @@ static void reset(void) {
 
 /* Every block given back, nothing queued. */
 static void expect_clean_at(int line) {
-    if (blocks != 0 || n_jobs != 0) {
-        fail_at(line, "held at the end: %d blocks (port %d, encoder %d, cJSON %d), %d jobs", blocks, port_blocks, jpeg_blocks,
-                cjson_blocks, n_jobs);
+    if (blocks != 0 || n_jobs != 0 || snap_bytes != 0) {
+        fail_at(line, "held at the end: %d blocks (port %d, encoder %d, cJSON %d), %zu snapshot bytes, %d jobs", blocks, port_blocks,
+                jpeg_blocks, cjson_blocks, snap_bytes, n_jobs);
     }
 }
 #define EXPECT_CLEAN() expect_clean_at(__LINE__)
@@ -812,11 +939,13 @@ static void refusals(void) {
     vm_ops = NULL;
     EXPECT_REFUSAL("timer", 1, done_cb, "unavailable", "the gadget can't write files on the VM");
     vm_ops = &VM_OPS;
-    /* The admission: PSRAM_MIN free, no more. */
-    psram_free = APPS_SNAPSHOT_PSRAM_MIN - 1;
+    /* The admission (N1; admission_before_drawing has the rest): the reserve and the peak, no more. */
+    running_id = NULL;
+    psram_free = APPS_RAM_RESERVE + apps_snapshot_peak(2) - 1;
     EXPECT_REFUSAL("timer", 1, done_cb, "out_of_memory", MUSE_APPS_SNAPSHOT_NO_MEMORY);
     CHECK(strcmp(MUSE_APPS_SNAPSHOT_NO_MEMORY, "not enough memory for a snapshot right now") == 0, "the brief's words");
-    psram_free = APPS_SNAPSHOT_PSRAM_MIN;
+    running_id = "timer";
+    psram_free = APPS_RAM_RESERVE + apps_snapshot_peak(1);
     /* One at a time: a second while one is pending is busy, and the first's admission goes with its done. */
     const char *c, *e;
     CHECK(muse_apps_snapshot("timer", 1, done_cb, &dones, &c, &e), "the first refused: %s %s", c, e);
@@ -1324,6 +1453,166 @@ static void encoder_buffers_are_psram(void) {
     psram_out = true;
     CHECK(__wrap_jpeg_calloc_inner(100) == NULL && __wrap_jpeg_calloc_align_inner(100, 16) == NULL && caps_calls == 4,
           "out of PSRAM: %d calls", caps_calls);
+    psram_out = false;
+    /* N1: the library's other pair (PSRAM first, internal RAM when it is out) is PSRAM only too, and all four keep the apps' floor:
+     * refused there, the heap isn't asked. */
+    unsigned char *c = __wrap_jpeg_calloc(100);
+    CHECK(c != NULL && caps_calls == 5 && last_caps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT), "jpeg_calloc: caps 0x%x", (unsigned)last_caps);
+    unsigned char *d = __wrap_jpeg_calloc_align(100, 16);
+    CHECK(d != NULL && caps_calls == 6 && last_caps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) && last_alignment == 16 &&
+              (uintptr_t)d % 16 == 0,
+          "jpeg_calloc_align: caps 0x%x aligned to %zu", (unsigned)last_caps, last_alignment);
+    for (int i = 0; i < 100; i++) {
+        CHECK(c[i] == 0 && d[i] == 0, "byte %d isn't zero", i);
+    }
+    free(c);
+    free(d);
+    CHECK(room_asks == 6, "each asked the floor once: %d", room_asks);
+    room_refuses = true;
+    CHECK(__wrap_jpeg_calloc_inner(100) == NULL && __wrap_jpeg_calloc_align_inner(100, 16) == NULL && __wrap_jpeg_calloc(100) == NULL &&
+              __wrap_jpeg_calloc_align(100, 16) == NULL && caps_calls == 6,
+          "the floor refused, yet the heap was asked: %d calls", caps_calls);
+    EXPECT_CLEAN();
+}
+
+/* ---- N1: the admission, the one block, the floor ---- */
+
+/* What the encoder should see at scale: the screen's pattern masked out of place, into a picture of its own (FNV-1a, as the fake
+ * encoder sums its input). */
+static uint32_t expected_sum(int scale) {
+    static uint16_t src[466 * 466], dst[466 * 466];
+    for (int y = 0; y < 466; y++) {
+        for (int x = 0; x < 466; x++) {
+            src[y * 466 + x] = pattern(x, y);
+        }
+    }
+    const int w = 466 / scale, h = 466 / scale;
+    apps_snapshot_mask(src, 466, 466, 466, scale, dst, w);
+    uint32_t sum = 2166136261u;
+    for (int i = 0; i < w * h; i++) {
+        sum = (sum ^ dst[i]) * 16777619u;
+    }
+    return sum;
+}
+
+/*
+ * A snapshot is admitted before anything is drawn, against free PSRAM and the largest free block, each of which must hold its peak at
+ * the asked scale above APPS_RAM_RESERVE (apps_snapshot.h): refused at the call, out_of_memory, with scale 2 suggested for scale 1
+ * when scale 2 fits, stopping the app when one runs and nothing fits, and the plain words when none runs. The job admits it again,
+ * so memory that went while it waited in the queue is a refusal before the drawing too. Nothing is drawn, encoded or written for a
+ * refusal, and done runs once for a queued one.
+ */
+static void admission_before_drawing(void) {
+    CHECK(apps_snapshot_block(466, 1) == 434320 + APPS_SNAPSHOT_JPEG_MAX, "scale 1's block: %zu", apps_snapshot_block(466, 1));
+    CHECK(apps_snapshot_block(466, 2) == 434312, "scale 2's block: %zu", apps_snapshot_block(466, 2));
+    CHECK(apps_snapshot_peak(1) == apps_snapshot_block(466, 1) + APPS_SNAPSHOT_ENCODER_BYTES &&
+              apps_snapshot_peak(2) == apps_snapshot_block(466, 2) + APPS_SNAPSHOT_ENCODER_BYTES,
+          "the peaks: %zu, %zu", apps_snapshot_peak(1), apps_snapshot_peak(2));
+    const size_t need1 = APPS_RAM_RESERVE + apps_snapshot_peak(1), need2 = APPS_RAM_RESERVE + apps_snapshot_peak(2);
+    const char *c, *e;
+    /* Free PSRAM between the two: scale 1 is refused at the call with scale 2 suggested, and scale 2 is taken. */
+    psram_free = need1 - 1;
+    EXPECT_REFUSAL("timer", 1, done_cb, "out_of_memory", MUSE_APPS_SNAPSHOT_TRY_SCALE_2);
+    CHECK(strcmp(MUSE_APPS_SNAPSHOT_TRY_SCALE_2, "not enough memory for a full-size snapshot right now; take it at scale 2") == 0,
+          "the words the guide quotes");
+    CHECK(renders == 0 && wakes == 0 && opens == 0 && writes == 0, "a refusal drew, woke, encoded or wrote");
+    CHECK(logged_has("snapshot timer: scale 1 refused: PSRAM free "), "the refusal's line:\n%s", logged);
+    CHECK(snap("timer", 2, &c, &e) && strstr(result, "\"ok\":true") != NULL, "scale 2 where scale 1 isn't: %s %s %s", c, e, result);
+    CHECK(renders == 1, "drawn once: %d", renders);
+    /* The largest free block decides as well. */
+    psram_free = 4 * 1024 * 1024;
+    psram_largest = need1 - 1;
+    EXPECT_REFUSAL("timer", 1, done_cb, "out_of_memory", MUSE_APPS_SNAPSHOT_TRY_SCALE_2);
+    psram_largest = need2;
+    CHECK(snap("timer", 2, &c, &e) && strstr(result, "\"ok\":true") != NULL, "scale 2 at its block: %s", result);
+    psram_largest = need2 - 1;
+    /* Neither fits: stop the app that runs, or the plain words when none does. */
+    EXPECT_REFUSAL("timer", 2, done_cb, "out_of_memory", MUSE_APPS_SNAPSHOT_STOP_APP);
+    EXPECT_REFUSAL("timer", 1, done_cb, "out_of_memory", MUSE_APPS_SNAPSHOT_STOP_APP);
+    running_id = NULL;
+    EXPECT_REFUSAL("hello", 1, done_cb, "out_of_memory", MUSE_APPS_SNAPSHOT_NO_MEMORY);
+    running_id = "timer";
+    psram_largest = 4 * 1024 * 1024;
+    psram_free = need2 - 1;
+    EXPECT_REFUSAL("timer", 2, done_cb, "out_of_memory", MUSE_APPS_SNAPSHOT_STOP_APP);
+    /* Exactly the need is enough. */
+    psram_free = psram_largest = need1;
+    CHECK(snap("timer", 1, &c, &e) && strstr(result, "\"ok\":true") != NULL, "scale 1 at its need: %s %s %s", c, e, result);
+    /* The job's own admission: the memory went while it waited in the queue. */
+    psram_free = psram_largest = 4 * 1024 * 1024;
+    CHECK(muse_apps_snapshot("timer", 1, done_cb, &dones, &c, &e), "queued: %s %s", c, e);
+    psram_free = need1 - 1;
+    const int drawn = renders, woken = wakes, before = dones;
+    run_jobs();
+    CHECK(dones == before + 1, "done ran %d times", dones - before);
+    CHECK(strcmp(result, "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"" MUSE_APPS_SNAPSHOT_TRY_SCALE_2 "\"}}") == 0,
+          "the job's refusal: %s", result);
+    CHECK(renders == drawn && wakes == woken, "the job's refusal drew or woke");
+    psram_free = 4 * 1024 * 1024;
+    CHECK(snap("timer", 1, &c, &e) && strstr(result, "\"ok\":true") != NULL, "and then one is taken: %s", result);
+    EXPECT_CLEAN();
+}
+
+/*
+ * One block, through the floor (the port's snapshot blocks), holds the whole sequence: the drawing, the picture masked in place at its
+ * start (the encoder sees what an out-of-place mask makes, at both scales), the JPEG after it; and then only the JPEG, while it is
+ * written. The block is what the admission counts (apps_snapshot_block), and nothing else of the snapshot is the encoder's library's.
+ */
+static void one_block_through_the_floor(void) {
+    static const int scales[] = {1, 2};
+    for (size_t i = 0; i < ARRAY_LEN(scales); i++) {
+        const int scale = scales[i];
+        snap_allocs = 0;
+        snap_peak = 0;
+        jpeg_len = 5000 + scale;
+        const char *c, *e;
+        CHECK(snap("timer", scale, &c, &e) && strstr(result, "\"ok\":true") != NULL, "scale %d: %s %s %s", scale, c, e, result);
+        CHECK(snap_allocs == 1 && snap_sizes[0] == apps_snapshot_block(466, scale) && snap_peak == snap_sizes[0],
+              "scale %d: %d blocks, the first %zu bytes (the admission's %zu), the peak %zu", scale, snap_allocs, snap_sizes[0],
+              apps_snapshot_block(466, scale), snap_peak);
+        CHECK(enc_held == snap_sizes[0], "scale %d: %zu held as it encoded", scale, enc_held);
+        CHECK(enc_sum == expected_sum(scale), "scale %d: the encoder's input isn't the masked picture (%08x, not %08x)", scale, enc_sum,
+              expected_sum(scale));
+        CHECK(written_held == (size_t)jpeg_len, "scale %d: %zu held as it wrote, not the JPEG's %d", scale, written_held, jpeg_len);
+        CHECK(written_len == (size_t)jpeg_len && written[0] == 0xFF && written[1] == 0xD8 && written[100] == (uint8_t)((100 * 31) & 0xFF),
+              "scale %d: the JPEG's bytes moved to the block's start: %zu", scale, written_len);
+        EXPECT_CLEAN();
+    }
+    CHECK(room_asks == 0, "the fake encoder asked the floor");
+}
+
+/* A padded picture (an encoder that refuses the size) can't be masked in place: its zeroed copy is the port's, through the floor, and
+ * a refusal of it is out_of_memory with nothing held; the JPEG then goes into the drawing's block. */
+static void the_padded_copy_is_floored(void) {
+    jpeg_refuses_unaligned = true;
+    const char *c, *e;
+    CHECK(snap("timer", 2, &c, &e) && strstr(result, "\"ok\":true") != NULL, "padded: %s", result);
+    CHECK(snap_allocs == 2 && snap_sizes[1] == 240 * 240 * 2, "the drawing's block and the copy: %d blocks, %zu", snap_allocs,
+          snap_sizes[1]);
+    CHECK(enc_pad == 0 && enc_corner == 0, "the copy is zeroed: pad %04x", enc_pad);
+    CHECK(written_held == (size_t)jpeg_len, "%zu held as it wrote", written_held);
+    EXPECT_CLEAN();
+    for (long n = 1; n <= 2; n++) {  /* each of the two snapshot blocks refused: the drawing's, then the copy */
+        reset();
+        jpeg_refuses_unaligned = true;
+        snap_refuse_at = (int)n;
+        EXPECT_FAILURE("timer", "out_of_memory", n == 1 ? "out of memory: no room for the screen's pixels" :
+                                                          "out of memory: no room for the masked pixels");
+        CHECK(refused && opens == (n == 1 ? 0 : 2) && writes == 0, "refusal %ld: %d opens, %d writes", n, opens, writes);
+        EXPECT_CLEAN();
+    }
+}
+
+/* The app's waits for the snapshot's memory, as the port counts them, are said once the snapshot ends; none, nothing is said. */
+static void the_apps_waits_are_logged(void) {
+    const char *c, *e;
+    CHECK(snap("timer", 1, &c, &e), "refused: %s %s", c, e);
+    CHECK(!logged_has("the app waited"), "a wait was said with none:\n%s", logged);
+    fake_waits = 2;
+    fake_wait_ms = 120;
+    CHECK(snap("timer", 1, &c, &e), "refused: %s %s", c, e);
+    CHECK(logged_has("I muse_apps: snapshot timer: the app waited 120 ms for the snapshot's memory (2 times)\n"), "the line:\n%s",
+          logged);
     EXPECT_CLEAN();
 }
 
@@ -1351,6 +1640,10 @@ static const struct {
     {"lit_then_dark_before_the_take", lit_then_dark_before_the_take},
     {"app_switched_after_the_take", app_switched_after_the_take},
     {"write_gets_whats_left", write_gets_whats_left},
+    {"admission_before_drawing", admission_before_drawing},
+    {"one_block_through_the_floor", one_block_through_the_floor},
+    {"the_padded_copy_is_floored", the_padded_copy_is_floored},
+    {"the_apps_waits_are_logged", the_apps_waits_are_logged},
 };
 
 int main(int argc, char **argv) {

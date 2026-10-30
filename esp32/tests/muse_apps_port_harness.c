@@ -189,6 +189,24 @@ size_t heap_caps_get_allocated_size(void *ptr) {
     return usable_size(ptr);
 }
 
+/* The snapshot's blocks (N1): aligned as asked, counted as the port's other blocks are. */
+static atomic_int aligned_asked;
+static size_t aligned_last;
+
+void *heap_caps_aligned_alloc(size_t alignment, size_t size, uint32_t caps) {
+    (void)caps;
+    atomic_fetch_add(&aligned_asked, 1);
+    aligned_last = alignment;
+    if (alloc_fails()) {
+        return NULL;
+    }
+    void *block = aligned_alloc(alignment, (size + alignment - 1) / alignment * alignment);
+    if (block != NULL) {
+        atomic_fetch_add(&blocks_held, 1);
+    }
+    return block;
+}
+
 void heap_caps_free(void *ptr) {
     if (ptr != NULL) {
         atomic_fetch_sub(&blocks_held, 1);
@@ -548,12 +566,40 @@ static void worker_runs(int n) {
     this_task = caller;
 }
 
-/* A sleep moves the clock by what it asks (nothing really waits), and the worker, if the case lets it, answers meanwhile. */
+/* A sleep moves the clock by what it asks (nothing really waits), and the worker, if the case lets it, answers meanwhile; then a
+ * case's hook runs (another task's work that comes while the caller sleeps: a snapshot that lets go of its blocks). */
+static int delays;
+static void (*on_delay)(void);
+
 void vTaskDelay(const TickType_t ticks) {
+    delays++;
     now_us += (int64_t)ticks * 1000000 / configTICK_RATE_HZ;
     if (worker_answers) {
         worker_runs(1 << 20);
     }
+    if (on_delay != NULL) {
+        on_delay();
+    }
+}
+
+/* The app task (apps_task_current): none of the harness's tasks unless a case names one. */
+static struct fake_task *fake_app_task;
+
+bool apps_task_current(void) {
+    return fake_app_task != NULL && this_task == fake_app_task;
+}
+
+/* The time others took from the app task's core (apps_rt_steal_ms): one total, as the runtime keeps it. */
+static atomic_uint stolen_total;
+static int steals;
+
+void apps_rt_steal_ms(uint32_t ms) {
+    atomic_fetch_add(&stolen_total, ms);
+    steals++;
+}
+
+uint32_t apps_rt_stolen_ms(void) {
+    return atomic_load(&stolen_total);
 }
 
 /* ---- What the port asks of the system's power and Wi-Fi, and of the app task ---- */
@@ -1008,6 +1054,213 @@ static void psram_floor(void) {
     apps_port_free(small);
     psram_free_now = psram_largest = (size_t)3 << 20;
     CHECK(live_blocks() == held, "%d blocks held", live_blocks() - held);
+}
+
+/*
+ * N1: a snapshot's blocks (apps_port_snapshot_alloc, _shrink, _free) go through the same floor as the apps' heap, both of its
+ * clauses, 16-byte aligned (the JPEG encoder's input), and are counted as the snapshot's while held (apps_port_snapshot_bytes). A
+ * shrink is never refused, and none of them ever waits. apps_port_room is the floor for a new block (the encoder's buffers ask it).
+ */
+static void snapshot_blocks_go_through_the_floor(void) {
+    apps_port_init();
+    int held = live_blocks();
+    psram_free_now = psram_largest = (size_t)3 << 20;
+    CHECK(apps_port_snapshot_bytes() == 0, "%zu bytes held before any snapshot", apps_port_snapshot_bytes());
+    CHECK(apps_port_psram_largest() == psram_largest, "the largest free block: %zu", apps_port_psram_largest());
+    uint16_t *px = apps_port_snapshot_alloc(434312);
+    CHECK(px != NULL && ((uintptr_t)px & 15) == 0 && aligned_last == 16, "the screen's block, aligned to 16: %p (%zu)", (void *)px,
+          aligned_last);
+    size_t had = px != NULL ? heap_caps_get_allocated_size(px) : 0;
+    CHECK(apps_port_snapshot_bytes() == had, "counted: %zu, not %zu", apps_port_snapshot_bytes(), had);
+    int before = delays;
+    psram_free_now = APPS_RAM_RESERVE + 131072 - 1;
+    void *out = apps_port_snapshot_alloc(131072);
+    CHECK(out == NULL, "a snapshot block that left less than the reserve free");
+    psram_free_now = (size_t)3 << 20;
+    psram_largest = APPS_RAM_RESERVE + 131072 - 1;
+    out = apps_port_snapshot_alloc(131072);
+    CHECK(out == NULL, "a snapshot block that left the largest free block under the reserve");
+    psram_largest = (size_t)3 << 20;
+    CHECK(delays == before && steals == 0, "a snapshot's refusal waited (%d sleeps, %d steals)", delays - before, steals);
+    CHECK(apps_port_snapshot_bytes() == had, "the refusals counted something: %zu", apps_port_snapshot_bytes());
+    psram_free_now = APPS_RAM_RESERVE + 99;
+    CHECK(!apps_port_room(100) && apps_port_room(99), "apps_port_room is the floor for a new block");
+    psram_free_now = psram_largest = 0;
+    uint16_t *small = apps_port_snapshot_shrink(px, 108578);
+    CHECK(small != NULL, "a shrink was refused");
+    small = small != NULL ? small : px;
+    CHECK(apps_port_snapshot_bytes() == heap_caps_get_allocated_size(small), "the shrink recounted: %zu, not %zu",
+          apps_port_snapshot_bytes(), heap_caps_get_allocated_size(small));
+    psram_free_now = psram_largest = (size_t)3 << 20;
+    apps_port_snapshot_free(small);
+    apps_port_snapshot_free(NULL);
+    CHECK(apps_port_snapshot_bytes() == 0, "%zu bytes counted after the free", apps_port_snapshot_bytes());
+    CHECK(live_blocks() == held, "%d blocks held", live_blocks() - held);
+}
+
+/* A snapshot in flight for the wait's cases: the LVGL task takes the screen's block, and the hook (on_delay, as the app task sleeps)
+ * lets it go, on the worker, once the clock reaches release_at_ms; the free total follows by hand (the heap here is the case's). */
+static void *snap_block;
+static size_t snap_size;
+static int64_t release_at_ms;
+static uint32_t steal_on_next_delay;  /* a drawing that steals the core while the app task sleeps */
+
+static void snapshot_takes(size_t n) {
+    struct fake_task *caller = this_task;
+    this_task = &tasks[2];  /* the LVGL task */
+    snap_block = apps_port_snapshot_alloc(n);
+    this_task = caller;
+    CHECK(snap_block != NULL, "the snapshot's block of %zu bytes", n);
+    snap_size = n;
+    psram_free_now -= n;
+}
+
+static void snapshot_lets_go(void) {
+    if (steal_on_next_delay != 0) {
+        apps_rt_steal_ms(steal_on_next_delay);
+        steal_on_next_delay = 0;
+    }
+    if (snap_block != NULL && now_us / 1000 >= release_at_ms) {
+        struct fake_task *caller = this_task;
+        this_task = &tasks[1];  /* the snapshot's job, on the I/O worker */
+        apps_port_snapshot_free(snap_block);
+        this_task = caller;
+        snap_block = NULL;
+        psram_free_now += snap_size;
+    }
+}
+
+static void wait_case_begins(void) {
+    apps_port_init();
+    fake_app_task = &tasks[0];
+    on_delay = snapshot_lets_go;
+    clock_at_ms(1000);
+    psram_largest = (size_t)3 << 20;
+}
+
+/*
+ * The ruling: a snapshot never kills the running app. A growth of the app task's that the floor refuses while a snapshot holds blocks,
+ * and that would fit were they free, waits (polls of APPS_PORT_SNAPSHOT_POLL_MS) until the snapshot lets go, then is tried once more;
+ * the wait is the core's, not the app's (apps_rt_steal_ms, less what others stole meanwhile, so a drawing isn't counted twice), and the
+ * snapshot's job reads how long the app waited (apps_port_snapshot_waits).
+ */
+static void an_app_that_grows_during_a_snapshot_waits_then_succeeds(void) {
+    wait_case_begins();
+    int held = live_blocks();
+    psram_free_now = APPS_RAM_RESERVE + 600 * 1024;
+    snapshot_takes(434312);
+    release_at_ms = 1050;
+    steal_on_next_delay = 5;
+    uint32_t stolen = apps_rt_stolen_ms();
+    char *a = apps_port_realloc(NULL, 200 * 1024);
+    CHECK(a != NULL, "the app's growth was refused: it should have waited for the snapshot");
+    CHECK(snap_block == NULL && now_us / 1000 == 1050, "it waited until the snapshot let go, at %lld ms", (long long)(now_us / 1000));
+    CHECK(apps_rt_stolen_ms() - stolen == 50, "%u ms stolen, not the 50 ms waited (the drawing's 5 counted once)",
+          apps_rt_stolen_ms() - stolen);
+    uint32_t ms = 0;
+    CHECK(apps_port_snapshot_waits(&ms) == 1 && ms == 50, "the waits: %u ms", ms);
+    CHECK(apps_port_snapshot_waits(&ms) == 0 && ms == 0, "read once: %u ms", ms);
+    /* A block of the app's that grows: the same. */
+    psram_free_now = APPS_RAM_RESERVE + 600 * 1024;
+    snapshot_takes(434312);
+    release_at_ms = now_us / 1000 + 20;
+    size_t have = heap_caps_get_allocated_size(a);
+    char *b = apps_port_realloc(a, have + 190 * 1024);  /* more than is free over the reserve */
+    CHECK(b != NULL, "the growth of a block was refused during the snapshot");
+    a = b != NULL ? b : a;
+    CHECK(apps_port_snapshot_waits(&ms) == 1 && ms == 20, "the second wait: %u ms", ms);
+    /* The floor passes but the heap has no block that big (a fragmented PSRAM): it waits until the snapshot is done. */
+    psram_free_now = APPS_RAM_RESERVE + 900 * 1024;
+    snapshot_takes(434312);
+    release_at_ms = now_us / 1000 + 40;
+    alloc_fail_in = 0;
+    char *c = apps_port_realloc(NULL, 100 * 1024);
+    CHECK(c != NULL && snap_block == NULL, "a growth the heap refused during the snapshot didn't wait for it");
+    CHECK(apps_port_snapshot_waits(&ms) == 1 && ms == 40, "the heap's wait: %u ms", ms);
+    apps_port_free(c);
+    apps_port_free(a);
+    on_delay = NULL;
+    fake_app_task = NULL;
+    psram_free_now = (size_t)3 << 20;
+    CHECK(apps_port_snapshot_bytes() == 0 && live_blocks() == held, "%zu snapshot bytes, %d blocks held",
+          apps_port_snapshot_bytes(), live_blocks() - held);
+}
+
+/* Never a wait for the snapshot's own tasks (its job on the I/O worker, the LVGL task's drawing) or any task but the app task: their
+ * refusal is at once. Nor for the app task when no snapshot holds anything, or when the growth wouldn't fit even with the snapshot's
+ * blocks free. */
+static void only_the_app_task_waits_and_only_when_it_helps(void) {
+    wait_case_begins();
+    int held = live_blocks();
+    psram_free_now = APPS_RAM_RESERVE + 600 * 1024;
+    snapshot_takes(434312);
+    release_at_ms = INT64_MAX;
+    static struct fake_task *const others[] = {&tasks[1], &tasks[2]};
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        this_task = others[i];
+        int before = delays;
+        void *p = apps_port_realloc(NULL, 200 * 1024);
+        CHECK(p == NULL && delays == before && steals == 0, "task %d waited (%d sleeps) or was given the block", others[i]->number,
+              delays - before);
+        apps_port_free(p);
+    }
+    this_task = &tasks[0];
+    int before = delays;
+    void *p = apps_port_realloc(NULL, 700 * 1024);  /* over the snapshot's bytes and what is free together */
+    CHECK(p == NULL && delays == before, "a growth that couldn't fit with the snapshot gone waited (%d sleeps)", delays - before);
+    apps_port_free(p);
+    snapshot_lets_go();
+    release_at_ms = 0;
+    snapshot_lets_go();
+    CHECK(snap_block == NULL && apps_port_snapshot_bytes() == 0, "the snapshot let go");
+    psram_free_now = APPS_RAM_RESERVE + 100 * 1024;
+    p = apps_port_realloc(NULL, 200 * 1024);
+    CHECK(p == NULL && delays == before, "a refusal with no snapshot in flight waited (%d sleeps)", delays - before);
+    apps_port_free(p);
+    uint32_t ms;
+    CHECK(apps_port_snapshot_waits(&ms) == 0, "no wait counted");
+    on_delay = NULL;
+    fake_app_task = NULL;
+    psram_free_now = (size_t)3 << 20;
+    CHECK(live_blocks() == held, "%d blocks held", live_blocks() - held);
+}
+
+/* The wait is bounded: APPS_PORT_SNAPSHOT_WAIT_MS at most, all of it stolen, then one more try, refused (the app runs out of memory as
+ * ever); and that bound is the snapshot's, so a later refusal during the same snapshot doesn't wait again. The next snapshot gets its
+ * own. */
+static void the_wait_is_bounded_once_a_snapshot(void) {
+    wait_case_begins();
+    int held = live_blocks();
+    psram_free_now = APPS_RAM_RESERVE + 600 * 1024;
+    snapshot_takes(434312);
+    release_at_ms = INT64_MAX;
+    uint32_t stolen = apps_rt_stolen_ms();
+    int before = delays;
+    void *p = apps_port_realloc(NULL, 200 * 1024);
+    CHECK(p == NULL, "the growth got a block with the snapshot still holding its own");
+    apps_port_free(p);
+    CHECK(now_us / 1000 == 1000 + APPS_PORT_SNAPSHOT_WAIT_MS && delays - before == APPS_PORT_SNAPSHOT_WAIT_MS / APPS_PORT_SNAPSHOT_POLL_MS,
+          "waited until %lld ms in %d sleeps", (long long)(now_us / 1000), delays - before);
+    CHECK(apps_rt_stolen_ms() - stolen == APPS_PORT_SNAPSHOT_WAIT_MS, "%u ms stolen", apps_rt_stolen_ms() - stolen);
+    before = delays;
+    p = apps_port_realloc(NULL, 200 * 1024);
+    CHECK(p == NULL && delays == before, "a second refusal in the same snapshot waited (%d sleeps)", delays - before);
+    apps_port_free(p);
+    uint32_t ms;
+    CHECK(apps_port_snapshot_waits(&ms) == 1 && ms == APPS_PORT_SNAPSHOT_WAIT_MS, "the waits: %u ms", ms);
+    release_at_ms = 0;
+    snapshot_lets_go();
+    snapshot_takes(434312);  /* the next snapshot */
+    release_at_ms = now_us / 1000 + 30;
+    p = apps_port_realloc(NULL, 200 * 1024);
+    CHECK(p != NULL, "the next snapshot's wait was refused");
+    apps_port_free(p);
+    CHECK(apps_port_snapshot_waits(&ms) == 1 && ms == 30, "the next wait: %u ms", ms);
+    on_delay = NULL;
+    fake_app_task = NULL;
+    psram_free_now = (size_t)3 << 20;
+    CHECK(apps_port_snapshot_bytes() == 0 && live_blocks() == held, "%zu snapshot bytes, %d blocks held",
+          apps_port_snapshot_bytes(), live_blocks() - held);
 }
 
 /* The screen is dark when the UI says so, and the port keeps no flag of its own: it is read at each call. */
@@ -1923,6 +2176,10 @@ static const struct {
     {"echo_drain_holds_the_console", echo_drain_holds_the_console},
     {"breach_kinds", breach_kinds},
     {"psram_floor", psram_floor},
+    {"snapshot_blocks_go_through_the_floor", snapshot_blocks_go_through_the_floor},
+    {"an_app_that_grows_during_a_snapshot_waits_then_succeeds", an_app_that_grows_during_a_snapshot_waits_then_succeeds},
+    {"only_the_app_task_waits_and_only_when_it_helps", only_the_app_task_waits_and_only_when_it_helps},
+    {"the_wait_is_bounded_once_a_snapshot", the_wait_is_bounded_once_a_snapshot},
     {"dark_follows_the_ui", dark_follows_the_ui},
     {"the_wall_clock_counts_when_the_helper_says", the_wall_clock_counts_when_the_helper_says},
     {"alarms_and_sound_go_to_their_owners", alarms_and_sound_go_to_their_owners},

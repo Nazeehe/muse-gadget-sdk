@@ -257,8 +257,10 @@ bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code,
  *   invalid_params   not an app id, a scale that isn't 1 or 2 (MUSE_APPS_SNAPSHOT_BAD_SCALE), no done
  *   unavailable      the gadget has no VM ops
  *   busy             a snapshot is already under way (one at a time)
- *   out_of_memory    less than APPS_SNAPSHOT_PSRAM_MIN of PSRAM free (MUSE_APPS_SNAPSHOT_NO_MEMORY), no memory for the job, or the
- *                    I/O worker can't take it now
+ *   out_of_memory    no room for it now, before anything is drawn (apps/apps_snapshot.h's admission: free PSRAM and the largest
+ *                    free block must each hold its peak above APPS_RAM_RESERVE): MUSE_APPS_SNAPSHOT_TRY_SCALE_2 for scale 1 when
+ *                    scale 2 fits, else MUSE_APPS_SNAPSHOT_STOP_APP while an app runs and MUSE_APPS_SNAPSHOT_NO_MEMORY when none
+ *                    does; no memory for the job; or the I/O worker can't take it now
  * One deadline for the whole snapshot, MUSE_APPS_SNAPSHOT_TOTAL_MS from this call, under app.control's 30 s: a job that starts with
  * less than APPS_SNAPSHOT_MIN_LEFT_MS of it left does nothing and answers busy. The screen has MUSE_APPS_SNAPSHOT_SCREEN_MS from the
  * job's request to be lit and drawn; the write has what is left of the deadline. The result is
@@ -275,7 +277,8 @@ bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code,
  *   busy             the job came too late ("the gadget was busy for <n> ms; take the snapshot again"), or an abandoned drawing
  *                    is still under way
  *   unavailable      MUSE_APPS_SNAPSHOT_NO_WAKE (the screen wasn't lit and drawn in time), LVGL or the encoder failed
- *   out_of_memory    no memory for the pixels, the encoder or the result
+ *   out_of_memory    the admission's refusal again (the memory went while the job waited in the queue), or no memory for the
+ *                    pixels, the encoder or the result
  *   the write's      "couldn't save the snapshot to <path>: <the writer's words>", busy or out_of_memory as the writer says,
  *                    unavailable for anything else (a refusal, a dropped session, the deadline): without the file Muse sees nothing
  */
@@ -284,6 +287,9 @@ bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code,
 #define MUSE_APPS_SNAPSHOT_FILE "snapshot.jpg"
 #define MUSE_APPS_SNAPSHOT_NO_WAKE "the gadget's screen didn't wake for the snapshot; try again"
 #define MUSE_APPS_SNAPSHOT_NO_MEMORY "not enough memory for a snapshot right now"
+#define MUSE_APPS_SNAPSHOT_TRY_SCALE_2 "not enough memory for a full-size snapshot right now; take it at scale 2"
+#define MUSE_APPS_SNAPSHOT_STOP_APP \
+    "not enough memory for a snapshot while the app runs; stop it (app.control stop) or make it use less memory, then try again"
 #define MUSE_APPS_SNAPSHOT_BAD_SCALE "scale must be 1 (full size) or 2 (half)"
 bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
 

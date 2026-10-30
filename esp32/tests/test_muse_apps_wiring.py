@@ -260,17 +260,21 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertIn("apps_snapshot_take_pending();", supervise)
         self.assertIn('#include "apps_snapshot.h"', (MUSE / "apps/apps_task.c").read_text())
         # esp_new_jpeg asks for its working buffers in internal RAM first, the Link's DMA heap: on the 1.75C the encoder's 8 KB
-        # took it from 24211 to 16127 bytes, under the Link's 16 KB margin. The linker sends both of its internal-first allocators
-        # to apps_snapshot.c's PSRAM ones, in a build with the apps (where the library is).
+        # took it from 24211 to 16127 bytes, under the Link's 16 KB margin; its other pair falls back to internal RAM when PSRAM is
+        # out. The linker sends all four allocators to apps_snapshot.c's PSRAM ones, which keep the apps' floor (N1), in a build
+        # with the apps (where the library is).
         cmake = (MUSE / "CMakeLists.txt").read_text()
         wrap = re.search(r"^if\(CONFIG_MUSE_APPS\)\n((?:    .*\n|\n)+?)endif\(\)", cmake, re.M)
         self.assertIsNotNone(wrap, "no if(CONFIG_MUSE_APPS) block after idf_component_register in components/muse/CMakeLists.txt")
         self.assertGreater(wrap.start(), cmake.index("idf_component_register("))
         self.assertIn('target_link_libraries(${COMPONENT_LIB} INTERFACE\n'
-                      '        "-Wl,--wrap=jpeg_calloc_inner"\n        "-Wl,--wrap=jpeg_calloc_align_inner")', wrap.group(1))
+                      '        "-Wl,--wrap=jpeg_calloc_inner"\n        "-Wl,--wrap=jpeg_calloc_align_inner"\n'
+                      '        "-Wl,--wrap=jpeg_calloc"\n        "-Wl,--wrap=jpeg_calloc_align")', wrap.group(1))
         source = (MUSE / "apps/apps_snapshot.c").read_text()
-        self.assertIn("void *__wrap_jpeg_calloc_inner(size_t size) {", source)
-        self.assertIn("void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned) {", source)
+        for wrapper in ("void *__wrap_jpeg_calloc_inner(size_t size) {", "void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned) {",
+                        "void *__wrap_jpeg_calloc(size_t size) {", "void *__wrap_jpeg_calloc_align(size_t size, int aligned) {"):
+            self.assertIn(wrapper, source)
+        self.assertNotRegex(source, r"\bjpeg_calloc_align\(", "the masked copy is the port's (the floor's), not the library's")
 
     def test_d14_results_are_made_in_one_place(self):  # Task 25 fix 1 A
         # The D14 result shapes, the store check and the VM codes' mapping are apps_result.c's: no job keeps its own copy.

@@ -233,7 +233,7 @@ static void finish_request(void *ctx, cJSON *result, const char *no_room) {
     heap_caps_free(req);
 }
 
-// app.control's queued actions.
+// app.control's and app.send's queued actions.
 static void command_done(void *ctx, cJSON *result) {
     finish_request(ctx, result, "out of memory: no room for the result");
 }
@@ -327,11 +327,6 @@ static const char *send_data_json(const cJSON *data, char **owned, cJSON **refus
     return text;
 }
 
-// app.send's.
-static void send_done(void *ctx, cJSON *result) {
-    finish_request(ctx, result, "out of memory: no room for the result");
-}
-
 // app.send: id and event required; data an object or JSON text (send_data_json); show a boolean. The job (muse_apps_send) starts
 // the app if it isn't running and waits for the reply on the I/O worker, so this answers {"_async": true}.
 static cJSON *send_command(cJSON *params, const char *request_id, noise_ctrl_session_generation_t session_generation) {
@@ -342,6 +337,9 @@ static cJSON *send_command(cJSON *params, const char *request_id, noise_ctrl_ses
     cJSON *event = cJSON_GetObjectItemCaseSensitive(params, "event");
     if (!cJSON_IsString(event) || !event->valuestring || !event->valuestring[0]) {
         return error_result("missing_param", "event is required");
+    }
+    if (strlen(event->valuestring) > MUSE_APPS_SEND_EVENT_MAX) {
+        return error_result("invalid_params", "event must be 1 to 64 characters");
     }
     cJSON *show = cJSON_GetObjectItemCaseSensitive(params, "show");
     if (show && !cJSON_IsBool(show)) return error_result("invalid_params", "show must be true or false");
@@ -355,7 +353,7 @@ static cJSON *send_command(cJSON *params, const char *request_id, noise_ctrl_ses
         return refusal;
     }
     const char *code = "out_of_memory", *err = "failed to send the event";
-    bool queued = muse_apps_send(id->valuestring, event->valuestring, data, cJSON_IsTrue(show), send_done, req, &code, &err);
+    bool queued = muse_apps_send(id->valuestring, event->valuestring, data, cJSON_IsTrue(show), command_done, req, &code, &err);
     cJSON_free(owned);  // muse_apps_send copied what it needs
     if (!queued) {
         heap_caps_free(req);

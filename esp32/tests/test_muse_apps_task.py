@@ -214,6 +214,9 @@ class AppTaskTest(HarnessCase):
     def test_a_message_gets_its_reply(self):  # apps_task_message
         self.run_case("a_message_gets_its_reply")
 
+    def test_run_for_send_is_by_id_behind_and_bounded(self):  # app.send's launch: a resident app stays, a stopped one starts behind
+        self.run_case("run_for_send_is_by_id_behind_and_bounded")
+
     def test_a_message_after_its_caller_gave_up(self):
         self.run_case("a_message_after_its_caller_gave_up")
 

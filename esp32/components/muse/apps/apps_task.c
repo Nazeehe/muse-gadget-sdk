@@ -1821,8 +1821,9 @@ bool apps_task_run_for_alarm(apps_pkg_t *pkg, uint32_t upto, apps_status_t *st, 
     return run_request(pkg, true, true, upto, 0, APPS_TASK_RUN_EXTRA_MS, st, err, err_len);
 }
 
-bool apps_task_run_for_send(apps_pkg_t *pkg, char *err, size_t err_len) {
-    return run_request(pkg, false, true, 0, 0, APPS_TASK_SEND_LAUNCH_MS, NULL, err, err_len);
+bool apps_task_run_for_send(apps_pkg_t *pkg, int bound_ms, char *err, size_t err_len) {
+    int extra_ms = bound_ms < 1 ? 1 : bound_ms > APPS_TASK_SEND_LAUNCH_MS ? APPS_TASK_SEND_LAUNCH_MS : bound_ms;
+    return run_request(pkg, false, true, 0, 0, extra_ms, NULL, err, err_len);
 }
 
 void apps_task_alarm_launch_result(uint32_t upto, apps_alarm_launch_t outcome) {

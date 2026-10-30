@@ -3359,6 +3359,46 @@ static void a_message_gets_its_reply(void) {
     heap_caps_free(st);
 }
 
+/* apps_task_run_for_send (app.send's launch): by id and behind, and bound by what it is given. An app of that id that runs stays as it is
+ * (its state is kept); a stopped one is started, behind; and a launch the app task doesn't answer within its bound fails with the wait's
+ * words in about that long (the app task is held in a call), leaving the app that runs in place. */
+static void run_for_send_is_by_id_behind_and_bounded(void) {
+    char err[300];
+    CHECK(apps_task_run(make_pkg("msg", "Msg", MSG, 1), false, 50, NULL, err, sizeof err), "run: %s", err);
+    char *reply = apps_task_message("msg", "add", "{\"by\":2}", false, 0, err, sizeof err);
+    CHECK(reply != NULL, "add: %s", err);
+    apps_port_free(reply);
+    /* The app runs: left in place, not started again. */
+    CHECK(apps_task_run_for_send(make_pkg("msg", "Msg", MSG, 1), 3000, err, sizeof err), "resident: %s", err);
+    reply = apps_task_message("msg", "add", "{\"by\":3}", false, 0, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "{\"n\":5}") == 0, "its state is kept: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_RUNNING && !st->front, "running, behind: %s %d", apps_state_name(st->state), st->front);
+    /* A stopped app is started, behind, with no settle. */
+    CHECK(apps_task_stop(err, sizeof err), "stop: %s", err);
+    CHECK(apps_task_run_for_send(make_pkg("msg", "Msg", MSG, 1), 3000, err, sizeof err), "stopped: %s", err);
+    reply = apps_task_message("msg", "add", "{\"by\":1}", false, 0, err, sizeof err);
+    CHECK(reply != NULL && strcmp(reply, "{\"n\":1}") == 0, "started afresh: %s", reply != NULL ? reply : err);
+    apps_port_free(reply);
+    apps_task_status(st);
+    CHECK(st->state == APPS_STATE_RUNNING && !st->front, "behind: %d", st->front);
+    /* The bound: the app task is held in a handler, the launch gives up in its bound and says so. */
+    block_print("stuck");
+    CHECK(apps_task_message("msg", "stuck", NULL, false, 200, err, sizeof err) == NULL, "the caller gave up");
+    WAIT_PRINT_BLOCKED();
+    int64_t began = apps_port_mono_ms();
+    CHECK(!apps_task_run_for_send(make_pkg("msg", "Msg", MSG, 1), 300, err, sizeof err) &&
+              strcmp(err, "the app task didn't answer within 300 ms") == 0,
+          "a launch held up: '%s'", err);
+    int64_t took = apps_port_mono_ms() - began;
+    CHECK(took >= 290 && took < 1500, "in about its bound: %lld ms", (long long)took);
+    release_print();
+    FIFO_SYNC();
+    heap_caps_free(st);
+}
+
 /* A caller that gives up: the reply that comes later is the app task's to free (finish() checks that nothing is held).
  * A handler that never returns is killed, and the app ends as on any crash. */
 static void a_message_after_its_caller_gave_up(void) {
@@ -6315,6 +6355,7 @@ int main(int argc, char **argv) {
         {"a_turn_during_a_new_apps_load_fronts_nothing", a_turn_during_a_new_apps_load_fronts_nothing},
         {"a_turn_brings_back_the_app_that_was_in_front", a_turn_brings_back_the_app_that_was_in_front},
         {"a_message_gets_its_reply", a_message_gets_its_reply},
+        {"run_for_send_is_by_id_behind_and_bounded", run_for_send_is_by_id_behind_and_bounded},
         {"a_message_after_its_caller_gave_up", a_message_after_its_caller_gave_up},
         {"io_runs_jobs_in_order", io_runs_jobs_in_order},
         {"io_refuses_when_full_or_unmade", io_refuses_when_full_or_unmade},

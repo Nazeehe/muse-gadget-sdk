@@ -480,7 +480,10 @@ bool apps_store_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t
 /* A refusal of the store's load, as a case sets it (the quarantine's, a damaged copy's), or NULL. */
 static const char *store_load_refusal;
 
+static int64_t store_load_ms;  /* the time a load takes, which a case sets */
+
 bool apps_store_load(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
+    fake_ms += store_load_ms;
     if (store_load_refusal != NULL) {
         memset(pkg, 0, sizeof *pkg);
         snprintf(err, n, "%s", store_load_refusal);
@@ -638,11 +641,14 @@ static int runs_by_id;
 
 bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len);
 
-/* app.send's launch: counted apart, run behind with no settle (the bound it asks for is apps_task.c's). */
-static int send_launches;
+/* app.send's launch: counted apart, run behind with no settle, with the bound it was given kept, and the time it took (a case's) spent. */
+static int send_launches, send_bound;
+static int64_t send_launch_ms;
 
-bool apps_task_run_for_send(apps_pkg_t *pkg, char *err, size_t err_len) {
+bool apps_task_run_for_send(apps_pkg_t *pkg, int bound_ms, char *err, size_t err_len) {
     send_launches++;
+    send_bound = bound_ms;
+    fake_ms += send_launch_ms;
     return apps_task_run(pkg, false, 0, NULL, err, err_len);
 }
 
@@ -760,6 +766,7 @@ void apps_task_status(apps_status_t *st) {
     memcpy(st, &status_record, sizeof *st);
 }
 
+static bool fail_ends_app;  /* the message that fails here ends the app, as a killed handler does */
 static char message_id[64], message_event[256], message_data[512];
 static bool message_data_null, message_show;
 static int message_timeout, messages;
@@ -777,6 +784,9 @@ char *apps_task_message(const char *id, const char *event, const char *data_json
     message_timeout = timeout_ms;
     if (message_reply == NULL) {
         snprintf(err, err_len, "%s", message_err);
+        if (fail_ends_app) {
+            running_app[0] = '\0';  /* a killed handler ends the app */
+        }
         return NULL;
     }
     size_t n = strlen(message_reply) + 1;
@@ -2332,11 +2342,24 @@ static void control_send(void) {
     /* The app crashes in start() on its launch: no message goes. */
     run_ok = false;
     snprintf(run_err, sizeof run_err, "crashed in start(): main.lua:2: boom");
+    record_hello_crashed(0);  /* the app task's record says it crashed (apps_install.c's run_failure reads the same) */
     CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
     run_jobs();
     CHECK_AT(done_result, "error.code", "crashed");
     CHECK_AT(done_result, "error.message", "'hello' didn't start: crashed in start(): main.lua:2: boom");
     snprintf(run_err, sizeof run_err, "main.lua:3: unexpected symbol near 'x'");
+    memset(&status_record, 0, sizeof status_record);  /* no runtime was made: the record is not a crash of hello */
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    /* A launch the app task didn't answer in time (D): timed_out, in the bound it had, not not_running. */
+    snprintf(run_err, sizeof run_err, "the app task didn't answer within 3000 ms");
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "error.code", "timed_out");
+    CHECK_AT(done_result, "error.message", "'hello' didn't start within 3000 ms");
+    run_ok = true;
+    snprintf(run_err, sizeof run_err, "main.lua:3: unexpected symbol near 'x'");
+    run_ok = false;
     CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
     run_jobs();
     run_ok = true;
@@ -2347,25 +2370,37 @@ static void control_send(void) {
     /* The message's failures. The handler's text is as it is, and the app keeps running. */
     static const struct {
         const char *text, *code, *message;
+        bool app_ended;  /* the app is no longer the one that runs when the message fails: its handler was killed (C) */
     } failures[] = {
-        {"main.lua:142: unknown event 'nope'; use start, pause", "app_error", "main.lua:142: unknown event 'nope'; use start, pause"},
+        {"main.lua:142: unknown event 'nope'; use start, pause", "app_error", "main.lua:142: unknown event 'nope'; use start, pause", false},
         {"main.lua:7: boom\nstack traceback:\n\tmain.lua:7: in function 'message'", "app_error",
-         "main.lua:7: boom\\nstack traceback:\\n\\tmain.lua:7: in function 'message'"},
-        {"data: unexpected character", "app_error", "data: unexpected character"},
-        {"the app task didn't answer within 5000 ms", "timed_out", MUSE_APPS_SEND_NO_REPLY},
-        {"hello isn't running", "not_running", "hello isn't running"},
-        {"the app task is busy; try again", "busy", "the app task is busy; try again"},
+         "main.lua:7: boom\\nstack traceback:\\n\\tmain.lua:7: in function 'message'", false},
+        {"data: unexpected character", "app_error", "data: unexpected character", false},
+        {"the app task didn't answer within 5000 ms", "timed_out", MUSE_APPS_SEND_NO_REPLY, false},
+        {"hello isn't running", "not_running", "hello isn't running", false},
+        {"main.lua:9: the sensor isn't running", "app_error", "main.lua:9: the sensor isn't running", false},  /* B: a handler's, not the app task's */
+        {"hello isn't running now", "app_error", "hello isn't running now", false},
+        {"the app task is busy; try again", "busy", "the app task is busy; try again", false},
         {"the app stopped responding; no app can run until its stuck call returns or the gadget restarts", "unavailable",
-         "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"},
-        {"Muse apps aren't running", "unavailable", "Muse apps aren't running"},
-        {"out of memory: no room for the request", "out_of_memory", "out of memory: no room for the request"},
+         "the app stopped responding; no app can run until its stuck call returns or the gadget restarts", false},
+        {"Muse apps aren't running", "unavailable", "Muse apps aren't running", false},
+        {"out of memory: no room for the request", "out_of_memory", "out of memory: no room for the request", false},
+        {"main.lua:7: not enough memory", "crashed", "main.lua:7: not enough memory", true},  /* C: killed, out of memory: the app ended */
+        {"main.lua:7: instruction budget exceeded", "crashed", "main.lua:7: instruction budget exceeded", true},
     };
-    snprintf(running_app, sizeof running_app, "hello");
     message_reply = NULL;
     for (size_t i = 0; i < ARRAY_LEN(failures); i++) {
+        snprintf(running_app, sizeof running_app, "%s", failures[i].app_ended ? "" : "hello");
         message_err = failures[i].text;
         CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+        cJSON_Delete(done_result);
+        done_result = NULL;
+        if (failures[i].app_ended) {  /* it was resident when the job began, and ended during its message */
+            snprintf(running_app, sizeof running_app, "hello");
+            fail_ends_app = true;
+        }
         run_jobs();
+        fail_ends_app = false;
         CHECK_AT(done_result, "ok", "false");
         CHECK(strcmp(at_path(done_result, "error.code"), failures[i].code) == 0, "'%s' is %s, not %s", failures[i].text,
               at_path(done_result, "error.code"), failures[i].code);
@@ -2388,6 +2423,45 @@ static void control_send(void) {
     message_reply = "{}";
     running_app[0] = '\0';
 
+    /* H: a reply over 4 KB is an error, the app keeps running; 4096 bytes are taken. */
+    snprintf(running_app, sizeof running_app, "hello");
+    char *big_reply = malloc(MUSE_APPS_SEND_REPLY_MAX + 8);
+    CHECK(big_reply != NULL, "no memory");
+    memset(big_reply, 'x', MUSE_APPS_SEND_REPLY_MAX + 1);
+    big_reply[0] = '"';
+    big_reply[MUSE_APPS_SEND_REPLY_MAX - 1] = '"';
+    big_reply[MUSE_APPS_SEND_REPLY_MAX] = '\0';  /* a string of exactly 4096 bytes */
+    message_reply = big_reply;
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "ok", "true");
+    big_reply[MUSE_APPS_SEND_REPLY_MAX - 1] = 'x';
+    big_reply[MUSE_APPS_SEND_REPLY_MAX] = '"';
+    big_reply[MUSE_APPS_SEND_REPLY_MAX + 1] = '\0';  /* 4097 */
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    free(big_reply);
+    message_reply = "{}";
+    CHECK_AT(done_result, "error.code", "app_error");
+    CHECK_AT(done_result, "error.message", "the app's reply is larger than 4 KB");
+    /* H: an event of 64 bytes goes, one of 65 is refused at once. */
+    char event[80];
+    memset(event, 'e', 64);
+    event[64] = '\0';
+    CHECK(muse_apps_send("hello", event, NULL, false, on_done, NULL, &code, &err), "64 bytes: %s", err);
+    run_jobs();
+    CHECK(strcmp(message_event, event) == 0, "the 64-byte event went");
+    event[64] = 'e';
+    event[65] = '\0';
+    int refused_calls = dones;
+    CHECK(!muse_apps_send("hello", event, NULL, false, on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0 &&
+              strcmp(err, "event must be 1 to 64 characters") == 0,
+          "65 bytes: %s", err);
+    CHECK(n_jobs == 0 && dones == refused_calls, "nothing queued for it");
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    running_app[0] = '\0';
+
     /* No memory for the result, whichever allocation of it fails: done is still called, once, with the result or the lack of memory
      * (NULL when there is none for even that; Link's done says so), and nothing is left held (the harness checks at its end). */
     snprintf(running_app, sizeof running_app, "hello");
@@ -2400,6 +2474,10 @@ static void control_send(void) {
         cjson_refuse = -1;
         CHECK(dones == calls + 1, "done called once (allocation %ld refused)", refused);
         const char *ok = at_path(done_result, "ok");
+        if (strcmp(ok, "true") == 0) {  /* a JSON reply is never sent as a string (H) */
+            const cJSON *reply = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(done_result, "payload"), "reply");
+            CHECK(cJSON_IsObject(reply), "the reply is an object, allocation %ld refused", refused);
+        }
         CHECK(done_result == NULL || strcmp(ok, "true") == 0 ||
                   strcmp(at_path(done_result, "error.code"), "out_of_memory") == 0,
               "a result or the lack of memory (allocation %ld refused)", refused);
@@ -2433,6 +2511,105 @@ static void control_send(void) {
     CHECK(!muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err) && strcmp(code, "out_of_memory") == 0, "no memory");
     port_refuse = -1;
     CHECK(n_jobs == 0 && dones == calls, "nothing queued, done never called");
+}
+
+/* The send's one deadline (A): MUSE_APPS_SEND_TOTAL_MS from muse_apps_send, spent by the worker queue's wait, the store's load, the launch
+ * and the reply. */
+static void control_send_deadline(void) {
+    install_two();
+    const char *code = NULL, *err = NULL;
+    int tag;
+    message_reply = "{\"state\":\"running\"}";
+    snprintf(running_app, sizeof running_app, "timer");
+    int sends_before = messages, launches_before = send_launches;
+    /* The normal path: the bounds are the full ones. */
+    CHECK(muse_apps_send("timer", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "ok", "true");
+    CHECK(message_timeout == MUSE_APPS_SEND_REPLY_MS, "full reply bound: %d", message_timeout);
+    running_app[0] = '\0';
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "ok", "true");
+    CHECK(send_bound == APPS_TASK_SEND_LAUNCH_MS && message_timeout == MUSE_APPS_SEND_REPLY_MS, "full bounds: %d, %d", send_bound,
+          message_timeout);
+    /* A job that starts 8.5 s late does nothing and says busy: resident or not. */
+    for (int resident = 0; resident < 2; resident++) {
+        snprintf(running_app, sizeof running_app, "%s", resident ? "timer" : "");
+        sends_before = messages;
+        launches_before = send_launches;
+        int loads_before = 0;
+        CHECK(muse_apps_send("timer", "start", NULL, true, on_done, &tag, &code, &err), "queued");
+        fake_ms += 8500;
+        run_jobs();
+        (void)loads_before;
+        CHECK_AT(done_result, "error.code", "busy");
+        CHECK_AT(done_result, "error.message", "the gadget was busy for 8500 ms; the event wasn't sent, so try again");
+        CHECK(messages == sends_before && send_launches == launches_before, "nothing launched, nothing delivered (resident %d)", resident);
+    }
+    /* Exactly 1 s left is enough; under it is not. */
+    snprintf(running_app, sizeof running_app, "timer");
+    CHECK(muse_apps_send("timer", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    fake_ms += MUSE_APPS_SEND_TOTAL_MS - MUSE_APPS_SEND_MIN_LEFT_MS;
+    run_jobs();
+    CHECK_AT(done_result, "ok", "true");
+    CHECK(message_timeout == MUSE_APPS_SEND_MIN_LEFT_MS, "1 s left is the bound: %d", message_timeout);
+    sends_before = messages;
+    CHECK(muse_apps_send("timer", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    fake_ms += MUSE_APPS_SEND_TOTAL_MS - MUSE_APPS_SEND_MIN_LEFT_MS + 1;
+    run_jobs();
+    CHECK_AT(done_result, "error.code", "busy");
+    CHECK(messages == sends_before, "999 ms left: nothing delivered");
+    /* A job that starts 5 s late (resident) gets a reply bound of what is left, and its timeout says so. */
+    CHECK(muse_apps_send("timer", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    fake_ms += 5000;
+    message_reply = NULL;
+    message_err = "the app task didn't answer within 4000 ms";
+    run_jobs();
+    message_reply = "{}";
+    CHECK(message_timeout == 4000, "reply bound shortened to what is left: %d", message_timeout);
+    CHECK_AT(done_result, "error.code", "timed_out");
+    CHECK_AT(done_result, "error.message", "the app didn't reply within 4000 ms");
+    /* Not resident, 3 s late: the launch has its full 3 s, the reply 5 s (6 s are left, 3 s are not spent). */
+    running_app[0] = '\0';
+    message_reply = "{}";
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    fake_ms += 3000;
+    run_jobs();
+    CHECK(send_bound == 3000 && message_timeout == 5000, "3 s late: %d, %d", send_bound, message_timeout);
+    /* 7 s late: 2 s left, the launch is bounded by them and so is the reply. */
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    fake_ms += 7000;
+    run_jobs();
+    CHECK(send_bound == 2000 && message_timeout == 2000, "7 s late: %d, %d", send_bound, message_timeout);
+    /* The store's load counts: it takes 6.5 s of 9, the launch gets the 2.5 s left. */
+    store_load_ms = 6500;
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    run_jobs();
+    store_load_ms = 0;
+    CHECK(send_bound == 2500 && message_timeout == 2500, "a load of 6.5 s: %d, %d", send_bound, message_timeout);
+    /* A load that takes it under 1 s left: nothing launched or delivered. */
+    store_load_ms = 8200;
+    launches_before = send_launches;
+    sends_before = messages;
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    run_jobs();
+    store_load_ms = 0;
+    CHECK_AT(done_result, "error.code", "busy");
+    CHECK_AT(done_result, "error.message", "the gadget was busy for 8200 ms; the event wasn't sent, so try again");
+    CHECK(send_launches == launches_before && messages == sends_before, "the load took the time: nothing launched or delivered");
+    /* A launch that takes it under 1 s left: the app runs, the event isn't sent. */
+    send_launch_ms = 5000;
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, &tag, &code, &err), "queued");
+    fake_ms += 4000;  /* 5 s left, 5 s of launch */
+    run_jobs();
+    send_launch_ms = 0;
+    CHECK_AT(done_result, "error.code", "busy");
+    CHECK(send_launches == launches_before + 1 && messages == sends_before, "launched, not delivered");
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    running_app[0] = '\0';
+    message_err = "";
 }
 
 /* The wrapper main/ validates data through: one JSON value, an object at the top (D25). */
@@ -2765,6 +2942,7 @@ int main(int argc, char **argv) {
         {"control_list_waits_at_most_500_ms", control_list_waits_at_most_500_ms},
         {"control_launch_stop_remove", control_launch_stop_remove},
         {"control_send", control_send},
+        {"control_send_deadline", control_send_deadline},
         {"json_object_valid", json_object_valid},
         {"guide_written_or_inline", guide_written_or_inline},
         {"the_stage_is_bounded", the_stage_is_bounded},

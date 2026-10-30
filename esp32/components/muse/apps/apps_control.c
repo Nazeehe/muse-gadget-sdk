@@ -387,19 +387,32 @@ static bool run_in_front(apps_pkg_t *pkg, int settle_ms, apps_status_t *st, char
 /* A launch runs the store's copy and nothing else of the pipeline (apps_install_launch). */
 static const apps_install_ops_t LAUNCH_OPS = {NULL, NULL, run_in_front, apps_store_storage, apps_store_hint};
 
-static cJSON *launch_result(const char *id) {
-    cJSON *r = NULL;
-    if (!installed(id, &r)) {
-        return r;
+/* On the worker: the store's copy of id, loaded into a block of apps_port_realloc for apps_task_run_by_id (or its kin) to take. NULL, with
+ * *r the refusal, when id isn't installed (not_found), the store isn't ready, the load is refused (the quarantine, a damaged copy, no
+ * room: unavailable) or there is no memory. The load makes the app the most recent. */
+static apps_pkg_t *load_package(const char *id, cJSON **r) {
+    if (!installed(id, r)) {
+        return NULL;
     }
     apps_pkg_t *pkg = apps_port_realloc(NULL, sizeof *pkg);
     if (pkg == NULL) {
-        return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room to load the app");
+        *r = failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room to load the app");
+        return NULL;
     }
     char why[256];
     if (!apps_store_load(id, pkg, why, sizeof why)) {  /* the quarantine, a damaged copy, no room */
         apps_port_free(pkg);
-        return refusal(APPS_ERR_UNAVAILABLE, why);
+        *r = refusal(APPS_ERR_UNAVAILABLE, why);
+        return NULL;
+    }
+    return pkg;
+}
+
+static cJSON *launch_result(const char *id) {
+    cJSON *r = NULL;
+    apps_pkg_t *pkg = load_package(id, &r);
+    if (pkg == NULL) {
+        return r;
     }
     r = apps_install_launch(pkg, &LAUNCH_OPS);  /* it takes the copy: the app task frees it */
     if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok"))) {
@@ -672,21 +685,44 @@ bool muse_apps_json_object_valid(const char *s, size_t len, char *err, size_t er
     return true;
 }
 
-/* A queued app.send: what the job needs, event and data after the struct in the same block (data "" for none). */
+/* A queued app.send: what the job needs, event and data after the struct in the same block (data "" for none). deadline_ms is
+ * apps_port_mono_ms's clock: MUSE_APPS_SEND_TOTAL_MS after muse_apps_send stamped it. */
 typedef struct {
     char id[APPS_ID_MAX + 1];
     bool show;
     muse_apps_done_cb done;
     void *ctx;
     const char *event, *data;
+    int64_t deadline_ms;
 } send_job_t;
 
-/* What the app task said of a message that got no reply (apps_task_message's err), as a result's code and message. A handler's own
- * error is not any of the app task's words, so it is app_error and goes as it is. */
-static cJSON *send_failure(const char *why) {
-    size_t n = strlen(why);
+#define SEND_STAMP(job) ((job)->deadline_ms - MUSE_APPS_SEND_TOTAL_MS)
+
+/* The send gave up before acting (or before delivering): busy, and a retry can't double the event. */
+static cJSON *send_too_late(const send_job_t *job) {
+    char msg[96];
+    snprintf(msg, sizeof msg, "the gadget was busy for %d ms; the event wasn't sent, so try again",
+             (int)(apps_port_mono_ms() - SEND_STAMP(job)));
+    return failure(APPS_ERR_BUSY, msg);
+}
+
+/* The ms left of the send's deadline (negative once past it). */
+static int send_left(const send_job_t *job) {
+    int64_t left = job->deadline_ms - apps_port_mono_ms();
+    return left < -1 ? -1 : left > MUSE_APPS_SEND_TOTAL_MS ? MUSE_APPS_SEND_TOTAL_MS : (int)left;
+}
+
+/* What the app task said of a message that got no reply (apps_task_message's err), as a result's code and message. bound_ms is the
+ * reply bound the message had. A handler's own error is not any of the app task's words, so it is app_error (the app keeps running)
+ * unless the app has ended, which is crashed (a handler that was killed or ran out of memory: the text is its crash record). */
+static cJSON *send_failure(const send_job_t *job, int bound_ms, const char *why) {
     if (strncmp(why, APPS_TASK_MSG_NO_ANSWER, sizeof APPS_TASK_MSG_NO_ANSWER - 1) == 0) {
-        return failure("timed_out", MUSE_APPS_SEND_NO_REPLY);
+        char msg[64];
+        if (bound_ms >= MUSE_APPS_SEND_REPLY_MS) {
+            return failure("timed_out", MUSE_APPS_SEND_NO_REPLY);
+        }
+        snprintf(msg, sizeof msg, "the app didn't reply within %d ms", bound_ms);
+        return failure("timed_out", msg);
     }
     if (strcmp(why, APPS_TASK_MSG_BUSY) == 0) {
         return failure(APPS_ERR_BUSY, why);
@@ -694,62 +730,89 @@ static cJSON *send_failure(const char *why) {
     if (strcmp(why, APPS_TASK_MSG_HUNG) == 0 || strcmp(why, APPS_TASK_MSG_DOWN) == 0) {
         return failure(APPS_ERR_UNAVAILABLE, why);
     }
-    static const char NOT_RUNNING[] = " isn't running";
-    if (n > sizeof NOT_RUNNING - 1 && strcmp(why + n - (sizeof NOT_RUNNING - 1), NOT_RUNNING) == 0) {
+    char gone[APPS_ID_MAX + 16];  /* the app task's own words for an app that isn't there (apps_task.c on_message) */
+    snprintf(gone, sizeof gone, "%s isn't running", job->id);
+    if (strcmp(why, gone) == 0) {
         return failure(APPS_ERR_NOT_RUNNING, why);
     }
-    return refusal("app_error", why);
+    if (strncmp(why, "out of memory", 13) == 0) {
+        return failure(APPS_ERR_OUT_OF_MEMORY, why);
+    }
+    char running[APPS_ID_MAX + 1];
+    bool alive = apps_task_running(running, sizeof running) && strcmp(running, job->id) == 0;
+    return failure(alive ? "app_error" : APPS_ERR_CRASHED, why);
 }
 
-/* The launch an app.send needs when id isn't the app that runs: the store's copy of id, run behind. The refusal as a result, or NULL
- * once it runs. The launch has its own bound (APPS_TASK_SEND_LAUNCH_MS: 3 s for the load and start(), no settle), apart from the reply's, which
- * only starts once the message is in the app task's queue. */
-static cJSON *send_launch(const char *id) {
+/* The launch an app.send needs when id isn't the app that runs: the store's copy of id, run behind, in at most bound_ms. The
+ * refusal as a result, or NULL once it runs. The bound counts from here, the load before it having been counted against the send's
+ * deadline by the caller (send_result). */
+static cJSON *send_launch(const send_job_t *job) {
     cJSON *r = NULL;
-    if (!installed(id, &r)) {
+    apps_pkg_t *pkg = load_package(job->id, &r);
+    if (pkg == NULL) {
         return r;
     }
-    apps_pkg_t *pkg = apps_port_realloc(NULL, sizeof *pkg);
-    if (pkg == NULL) {
-        return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room to load the app");
-    }
-    char why[256];
-    if (!apps_store_load(id, pkg, why, sizeof why)) {  /* the quarantine, a damaged copy, no room; the load is the order's bump */
+    int left = send_left(job);
+    if (left < MUSE_APPS_SEND_MIN_LEFT_MS) {  /* the load took the time */
+        apps_pkg_free(pkg, apps_port_free);
         apps_port_free(pkg);
-        return refusal(APPS_ERR_UNAVAILABLE, why);
+        return send_too_late(job);
     }
-    if (!apps_task_run_for_send(pkg, why, sizeof why)) {  /* behind, no settle; it takes the copy */
-        char msg[sizeof why + APPS_ID_MAX + 32];
-        snprintf(msg, sizeof msg, "'%s' didn't start: %s", id, why);
-        return failure(strncmp(why, "crashed", 7) == 0 ? APPS_ERR_CRASHED : APPS_ERR_NOT_RUNNING, msg);
+    int bound_ms = left < APPS_TASK_SEND_LAUNCH_MS ? left : APPS_TASK_SEND_LAUNCH_MS;
+    char why[256];
+    if (apps_task_run_for_send(pkg, bound_ms, why, sizeof why)) {  /* behind, no settle; it takes the copy */
+        return NULL;
     }
-    return NULL;
+    char msg[sizeof why + APPS_ID_MAX + 32];
+    if (strncmp(why, APPS_TASK_MSG_NO_ANSWER, sizeof APPS_TASK_MSG_NO_ANSWER - 1) == 0) {
+        snprintf(msg, sizeof msg, "'%s' didn't start within %d ms", job->id, bound_ms);
+        return failure("timed_out", msg);
+    }
+    snprintf(msg, sizeof msg, "'%s' didn't start: %s", job->id, why);
+    apps_status_t *st = apps_port_realloc(NULL, sizeof *st);  /* a crash is what the record says (apps_install.c's run_failure) */
+    bool crashed = false;
+    if (st != NULL) {
+        apps_task_status(st);
+        crashed = st->state == APPS_STATE_CRASHED && strcmp(st->id, job->id) == 0;
+        apps_port_free(st);
+    }
+    return failure(crashed ? APPS_ERR_CRASHED : APPS_ERR_NOT_RUNNING, msg);
 }
 
 /* On the worker: the message, after the launch it needs, as a result. */
 static cJSON *send_result(const send_job_t *job) {
+    if (send_left(job) < MUSE_APPS_SEND_MIN_LEFT_MS) {  /* it waited in the worker's queue: nothing is done, nothing delivered */
+        return send_too_late(job);
+    }
     char running[APPS_ID_MAX + 1];
     if (!apps_task_running(running, sizeof running) || strcmp(running, job->id) != 0) {
-        cJSON *r = send_launch(job->id);
+        cJSON *r = send_launch(job);
         if (r != NULL) {
             return r;
         }
     }
+    int left = send_left(job);
+    if (left < MUSE_APPS_SEND_MIN_LEFT_MS) {  /* the launch took the time: the app runs, but the event isn't sent */
+        return send_too_late(job);
+    }
+    int bound_ms = left < MUSE_APPS_SEND_REPLY_MS ? left : MUSE_APPS_SEND_REPLY_MS;
     char *why = apps_port_realloc(NULL, APPS_ERROR_MAX);
     if (why == NULL) {
         return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the message");
     }
-    char *reply = apps_task_message(job->id, job->event, job->data[0] != '\0' ? job->data : NULL, job->show,
-                                    MUSE_APPS_SEND_REPLY_MS, why, APPS_ERROR_MAX);
-    cJSON *r;
+    char *reply = apps_task_message(job->id, job->event, job->data[0] != '\0' ? job->data : NULL, job->show, bound_ms, why,
+                                    APPS_ERROR_MAX);
+    cJSON *r = NULL;
     if (reply == NULL) {
-        r = send_failure(why);
+        r = send_failure(job, bound_ms, why);
+    } else if (strlen(reply) > MUSE_APPS_SEND_REPLY_MAX) {
+        r = failure("app_error", "the app's reply is larger than 4 KB");  /* the app keeps running */
     } else {
-        /* The handler's value is JSON text (apps_rt_message encoded it); a reply that somehow isn't goes as a string. */
-        cJSON *value = cJSON_Parse(reply);
-        if (value == NULL) {
-            value = cJSON_CreateString(reply);
-        }
+        /* The handler's value is JSON text (apps_rt_message encoded it): a parse that fails then is no memory. Text that isn't JSON at
+         * all goes as a string. */
+        char detail[64];
+        bool json = apps_json_validate(reply, strlen(reply), detail, sizeof detail);
+        cJSON *value = json ? cJSON_Parse(reply) : cJSON_CreateString(reply);
         cJSON *p = value != NULL ? cJSON_CreateObject() : NULL;
         if (p != NULL && add_item(p, "reply", value)) {
             r = success(p);
@@ -758,7 +821,9 @@ static cJSON *send_result(const send_job_t *job) {
                 cJSON_Delete(value);
             }
             cJSON_Delete(p);
-            r = NULL;
+            if (value == NULL && json) {
+                r = failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the reply");
+            }
         }
     }
     apps_port_free(reply);
@@ -804,11 +869,12 @@ bool muse_apps_send(const char *id, const char *event, const char *data_json, bo
         *err = "app id must match ^[a-z][a-z0-9_]{1,23}$";
         return false;
     }
-    if (event == NULL || event[0] == '\0') {
-        *err = "event is required";
+    size_t event_len = event != NULL ? strlen(event) : 0;
+    if (event_len < 1 || event_len > MUSE_APPS_SEND_EVENT_MAX) {
+        *err = "event must be 1 to 64 characters";
         return false;
     }
-    size_t event_len = strlen(event), data_len = data_json != NULL ? strlen(data_json) : 0;
+    size_t data_len = data_json != NULL ? strlen(data_json) : 0;
     if (data_len > MUSE_APPS_SEND_DATA_MAX) {
         *err = "data is larger than 4 KB";
         return false;
@@ -833,6 +899,7 @@ bool muse_apps_send(const char *id, const char *event, const char *data_json, bo
     job->show = show;
     job->done = done;
     job->ctx = ctx;
+    job->deadline_ms = apps_port_mono_ms() + MUSE_APPS_SEND_TOTAL_MS;  /* stamped here: the queue's wait is spent too */
     if (!apps_io_submit(send_run, job)) {  /* it says why, in one log line */
         apps_port_free(job);
         *code = APPS_ERR_OUT_OF_MEMORY;

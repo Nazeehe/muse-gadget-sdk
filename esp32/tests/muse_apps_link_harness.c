@@ -901,6 +901,20 @@ static void send_data_forms(void) {
     for (size_t i = 0; i < ARRAY_LEN(no_event); i++) {
         SEND_REFUSED(no_event[i], "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"event is required\"}}");
     }
+    /* The event is at most 64 bytes. */
+    char event_params[160];
+    char long_event[80];
+    memset(long_event, 'e', 64);
+    long_event[64] = '\0';
+    snprintf(event_params, sizeof event_params, "{\"id\":\"timer\",\"event\":\"%s\"}", long_event);
+    EXPECT_SEND(event_params, "r12", ASYNC);
+    CHECK(strcmp(send_event, long_event) == 0, "64 bytes go");
+    FINISH_ASYNC("r12");
+    long_event[64] = 'e';
+    long_event[65] = '\0';
+    snprintf(event_params, sizeof event_params, "{\"id\":\"timer\",\"event\":\"%s\"}", long_event);
+    SEND_REFUSED(event_params,
+                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"event must be 1 to 64 characters\"}}");
     SEND_REFUSED("{\"id\":\"Timer\",\"event\":\"start\"}",
                  "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"app id 'Timer' must match "
                  "^[a-z][a-z0-9_]{1,23}$\"}}");

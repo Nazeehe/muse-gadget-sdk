@@ -192,23 +192,37 @@ bool muse_apps_remove(const char *id, muse_apps_done_cb done, void *ctx, const c
  * Link's app.send (Task 24): message(event, data) to the app id, starting it first when it isn't the one that runs. Queued on the I/O worker
  * (the store is the worker's: X11), so the Noise session's task never waits, and answered once through done, as muse_apps_install is: true
  * once queued, and done then runs exactly once, on the worker; false, with nothing queued and done never called, and *code and *err
- * (literals) saying why: invalid_params (not an app id, an empty event, data over MUSE_APPS_SEND_DATA_MAX bytes, no done) or
- * out_of_memory (no memory for the job, or the worker can't take it now). data_json is JSON text, NULL for none; id, event and
- * data_json are copied. With show, the app is brought to the front once the message has been answered, after the voice turn if one is on
- * (request_front: C11).
+ * (literals) saying why: invalid_params (not an app id, an event that isn't 1 to MUSE_APPS_SEND_EVENT_MAX bytes, data over
+ * MUSE_APPS_SEND_DATA_MAX bytes, no done) or out_of_memory (no memory for the job, or the worker can't take it now). data_json is JSON text,
+ * NULL for none; id, event and data_json are copied. With show, the app is brought to the front once the message has been answered, after
+ * the voice turn if one is on (request_front: C11).
+ *
+ * One deadline for the whole send: MUSE_APPS_SEND_TOTAL_MS from this call (a 1 s margin under the VM's 10 s wait for the result), which
+ * the job's wait in the worker's queue, the store's load, the launch and the reply all spend. A job that finds less than
+ * MUSE_APPS_SEND_MIN_LEFT_MS left does nothing (no load, no launch, no message) and answers busy, "the gadget was busy for <n> ms; the event
+ * wasn't sent, so try again": a retry can't double the event. The same check comes again after a launch.
  *
  * The job, on the worker. When id isn't the app that runs: the store must have it (not_found, MUSE_APPS_NOT_FOUND; "storage not ready" is
  * unavailable), its copy loads (the quarantine and a damaged copy are unavailable, and the load makes it the most recent) and runs behind,
- * through apps_task_run_for_send (a failure to start is crashed or not_running, "'<id>' didn't start: <why>"). That launch has its own
- * bound, APPS_TASK_SEND_LAUNCH_MS (3 s, with no settle), and the reply's MUSE_APPS_SEND_REPLY_MS counts from the message's delivery to the
- * app (the app task's queue), so a launch that is needed doesn't eat it. Then apps_task_message. The result is
+ * through apps_task_run_for_send, in at most the least of APPS_TASK_SEND_LAUNCH_MS and what is left (a failure to start is crashed, when the
+ * app's record says it crashed, or not_running, "'<id>' didn't start: <why>"; one not answered in time is timed_out). Then apps_task_message,
+ * whose bound is the least of MUSE_APPS_SEND_REPLY_MS and what is left. It covers waiting for room in the app task's queue as well as the
+ * handler's reply, so it counts from the post. The result is
  *   {"ok":true,"payload":{"reply":<the handler's return value as JSON, null for none>}}
- * or {"ok":false,"error":{"code","message"}} with the handler's error() text as it is (code app_error: the app keeps running, or it is
- * the crash record when the handler was killed), MUSE_APPS_SEND_NO_REPLY (timed_out), "<id> isn't running" (not_running), or the app
- * task's own refusals (busy, unavailable, out_of_memory).
+ * or {"ok":false,"error":{"code","message"}}:
+ *   not_found, unavailable   as above
+ *   timed_out                no reply in time: MUSE_APPS_SEND_NO_REPLY when the full bound was given, else "the app didn't reply within <n> ms"
+ *   app_error                the handler's error() text as it is (the app keeps running), or a reply over MUSE_APPS_SEND_REPLY_MAX bytes
+ *   crashed                  the handler was killed or ran out of memory: the app has ended, and the text is its crash record
+ *   not_running              "<id> isn't running" (the app ended first)
+ *   busy, unavailable, out_of_memory   the app task's own refusals, or no memory for the reply
  */
 #define MUSE_APPS_SEND_DATA_MAX 4096                /* data's bytes, as JSON text */
-#define MUSE_APPS_SEND_REPLY_MS 5000                /* the app's time to reply, from the message's delivery */
+#define MUSE_APPS_SEND_REPLY_MAX 4096               /* the reply's bytes, as JSON text */
+#define MUSE_APPS_SEND_EVENT_MAX 64                 /* the event's bytes */
+#define MUSE_APPS_SEND_REPLY_MS 5000                /* the app's time to reply, from the message's post */
+#define MUSE_APPS_SEND_TOTAL_MS 9000                /* the whole send's, from muse_apps_send: a 1 s margin under the VM's 10 s */
+#define MUSE_APPS_SEND_MIN_LEFT_MS 1000             /* less than this left, and the job does nothing and says busy */
 #define MUSE_APPS_SEND_NO_REPLY "the app didn't reply within 5 s"
 bool muse_apps_send(const char *id, const char *event, const char *data_json, bool show, muse_apps_done_cb done, void *ctx,
                     const char **code, const char **err);

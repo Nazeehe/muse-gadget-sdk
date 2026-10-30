@@ -1559,7 +1559,7 @@ static char *build_register_json(void) {
     ble_commands_register(commands);
 #endif
 #if CONFIG_MUSE_APPS
-    // Muse's apps: app.api, app.install and app.control (main/apps_link.c).
+    // Muse's apps: app.api, app.install, app.send and app.control (main/apps_link.c).
     apps_link_register(commands);
 #endif
 

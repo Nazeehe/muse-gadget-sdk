@@ -217,10 +217,12 @@ bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status
 void apps_task_launch(const char *id, bool front);
 
 /*
- * apps_task_run_by_id for Link's app.send (apps_control.c, on the I/O worker): behind, no settle, and the wait is at most
- * APPS_TASK_SEND_LAUNCH_MS instead of APPS_TASK_RUN_EXTRA_MS. Otherwise as apps_task_run_by_id (pkg is taken whatever happens).
+ * apps_task_run_by_id for Link's app.send (apps_control.c, on the I/O worker): behind, no settle, and the wait is at most bound_ms,
+ * clamped to 1..APPS_TASK_SEND_LAUNCH_MS, instead of APPS_TASK_RUN_EXTRA_MS (the caller gives what is left of the send's deadline).
+ * Otherwise as apps_task_run_by_id: an app of pkg's id that runs is left where it is, and pkg is taken whatever happens. A launch that
+ * isn't answered in time fails with APPS_TASK_MSG_NO_ANSWER " <bound> ms".
  */
-bool apps_task_run_for_send(apps_pkg_t *pkg, char *err, size_t err_len);
+bool apps_task_run_for_send(apps_pkg_t *pkg, int bound_ms, char *err, size_t err_len);
 
 /*
  * apps_task_run_by_id for a launch for an app's alarms (the I/O worker's, apps_console.c), with no settle and in front: upto is the

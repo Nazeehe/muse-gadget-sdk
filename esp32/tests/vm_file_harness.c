@@ -47,6 +47,7 @@
 // and opens no reader, so a fault in one doesn't turn the other's cases red.
 
 #include <inttypes.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -65,6 +66,7 @@
 
 #if WITH_IMAGE_FETCH
 #include "esp_http_client.h"
+#include "freertos/idf_additions.h"
 #include "image_fetch.h"
 #include "led_status.h"
 #include "rom/tjpgd.h"
@@ -121,7 +123,8 @@ static uint8_t pat(size_t i) {
 // margin too.
 static struct {
     void *ptr;
-    size_t size;
+    size_t size;            // with the allocator's cost
+    size_t bytes;           // as asked for
     bool external;
     bool session;           // the session's copy of a send, not an allocation of the code under test
 } g_allocations[MAX_ALLOCATIONS];
@@ -156,6 +159,7 @@ static void *image_alloc(size_t size, bool external) {
         if (g_allocations[i].ptr) continue;
         g_allocations[i].ptr = ptr;
         g_allocations[i].size = cost;
+        g_allocations[i].bytes = size;
         g_allocations[i].external = external;
         g_allocations[i].session = g_session_copy;
         if (external) {
@@ -178,6 +182,17 @@ static void *image_alloc(size_t size, bool external) {
 void *image_test_malloc(size_t size) {
     return image_alloc(size, false);
 }
+
+#if WITH_IMAGE_FETCH
+// The live allocation that holds ptr, or -1.
+static int allocation_of(const void *ptr) {
+    for (int i = 0; i < MAX_ALLOCATIONS; i++) {
+        const uint8_t *start = g_allocations[i].ptr;
+        if (start && (const uint8_t *)ptr >= start && (const uint8_t *)ptr < start + g_allocations[i].bytes) return i;
+    }
+    return -1;
+}
+#endif
 
 void *image_test_calloc(size_t count, size_t size) {
     void *ptr = image_test_malloc(count * size);
@@ -224,6 +239,12 @@ size_t heap_caps_get_largest_free_block(int caps) {
     if (caps == MALLOC_CAP_8BIT && g_alloc_limit && block > g_alloc_limit) block = g_alloc_limit;
     size_t free = heap_caps_get_free_size(caps);
     return block < free ? block : free;
+}
+
+void *heap_caps_calloc(size_t count, size_t size, int caps) {
+    void *ptr = heap_caps_malloc(count * size, caps);
+    if (ptr) memset(ptr, 0, count * size);
+    return ptr;
 }
 
 void *heap_caps_malloc(size_t size, int caps) {
@@ -323,6 +344,7 @@ static int g_ignore_range_from; // the daemon ignores Range from this request on
 static size_t g_cap_range;      // the daemon sends no more than this of a range; 0 for no cap
 static size_t g_drop_at;        // the session ends once this many bytes are sent
 static int g_stall_after;       // frames sent before the daemon goes quiet
+static bool g_jpeg_head;        // the file starts FF D8, as a JPEG does, and is pat() after that
 static int g_drop_status;       // what the callback gets when the session ends: -1 or TOO_LARGE
 static char g_ranges[MAX_REQUESTS][48];
 static char g_get_path[256];
@@ -647,6 +669,7 @@ static void reset_world(void) {
     g_cap_range = 0;
     g_drop_at = 0;
     g_stall_after = 1 << 30;
+    g_jpeg_head = false;
     g_drop_status = -1;
     memset(g_ranges, 0, sizeof(g_ranges));
     g_get_path[0] = '\0';
@@ -835,7 +858,10 @@ static void get_turn(void) {
     }
     CHECK(n <= g_max_body, "a %u-byte frame would end the session", (unsigned)n);
     uint8_t *data = n ? malloc(n) : NULL;
-    for (size_t i = 0; i < n; i++) data[i] = pat(g_pos + i);
+    for (size_t i = 0; i < n; i++) {
+        size_t at = g_pos + i;
+        data[i] = g_jpeg_head && at < 2 ? (at ? 0xD8 : 0xFF) : pat(at);
+    }
     int status = g_head_sent ? 0 : g_status;
     g_head_sent = true;
     g_pos += n;
@@ -915,7 +941,14 @@ static void expect_refusal(const char *path, size_t keep, const char *owner, con
 }
 
 // The memory and the lock a case leaves back as it found them.
+#if WITH_IMAGE_FETCH
+static void image_settle(void);
+#endif
+
 static void check_nothing_left(void) {
+#if WITH_IMAGE_FETCH
+    image_settle();
+#endif
     g_fail_alloc = 0;
     g_alloc_limit = 0;
     g_fail_mutex = false;
@@ -2427,9 +2460,20 @@ const char *esp_err_to_name(esp_err_t err) {
     return "ESP_FAIL";
 }
 
+// Where the download put its decoder's pool and its fetch (the decoder's device, whose MCU buffer is what
+// a JPEG hands to the screen): the decoder takes all its memory from the pool, and allocates none.
+static int g_pool_bytes, g_pool_external, g_fetch_external;
+
 JRESULT jd_prepare(JDEC *jd, UINT (*infunc)(JDEC *, BYTE *, UINT), void *pool, UINT sz_pool,
                    void *dev) {
-    (void)jd; (void)infunc; (void)pool; (void)sz_pool; (void)dev;
+    (void)jd; (void)infunc;
+    int a = allocation_of(pool), d = allocation_of(dev);
+    CHECK(a >= 0 && d >= 0, "the decoder's pool or device isn't an allocation of the download");
+    CHECK(g_allocations[a].bytes >= sz_pool, "a pool of %zu bytes passed as %u", g_allocations[a].bytes,
+          (unsigned)sz_pool);
+    g_pool_bytes = (int)sz_pool;
+    g_pool_external = g_allocations[a].external;
+    g_fetch_external = g_allocations[d].external;
     return JDR_FMT1;
 }
 JRESULT jd_decomp(JDEC *jd, UINT (*outfunc)(JDEC *, void *, JRECT *), BYTE scale) {
@@ -2441,6 +2485,9 @@ static bool g_fail_task;
 static unsigned g_stack;
 static int g_rows_drawn, g_draw_dones;
 static size_t g_next_byte;
+// Where the rows the screen was handed live: the buffer's size and whether it is PSRAM.
+static size_t g_rows_bytes;
+static int g_rows_external;
 
 static int g_screen_width = SCREEN_WIDTH;
 
@@ -2453,6 +2500,10 @@ bool led_status_display_info(int *width, int *height) {
 bool led_status_draw_rect(int x, int y, int w, int h, const uint16_t *pixels) {
     (void)x;
     (void)y;
+    int a = allocation_of(pixels);
+    CHECK(a >= 0, "the screen was handed pixels that aren't the download's");
+    g_rows_bytes = g_allocations[a].bytes;
+    g_rows_external = g_allocations[a].external;
     const uint8_t *b = (const uint8_t *)pixels;
     for (int i = 0; i < w * h * 2; i++, g_next_byte++) {
         CHECK(b[i] == pat(g_next_byte), "byte %zu drawn as %u", g_next_byte, b[i]);
@@ -2489,6 +2540,65 @@ void vTaskDelete(TaskHandle_t task) {
     (void)task;
 }
 
+// A task made with caps, as IDF's xTaskCreatePinnedToCoreWithCaps makes it: its TCB from the internal heap
+// (sizeof(StaticTask_t)), its stack where the caps say. It runs where it is made, as xTaskCreate's do. One
+// that parks (vTaskSuspend(NULL)) comes back here and keeps its TCB and stack until vTaskDeleteWithCaps, from
+// another task: deleting itself would make IDF start a cleanup task in internal RAM, and abort without it.
+static struct {
+    void *tcb, *stack;
+    bool running, suspended;
+    unsigned caps;
+} g_caps_task;
+static jmp_buf g_caps_task_exit;
+static unsigned g_caps_tasks, g_caps_deleted;
+
+BaseType_t xTaskCreateWithCaps(TaskFunction_t task, const char *name, uint32_t stack_depth, void *params,
+                               UBaseType_t priority, TaskHandle_t *out_handle, UBaseType_t caps) {
+    (void)name;
+    (void)priority;
+    if (g_fail_task) return pdFALSE;
+    CHECK(!g_caps_task.tcb, "a task with caps was made while another was not deleted");
+    void *tcb = image_alloc(sizeof(StaticTask_t), false);
+    void *stack = image_alloc(stack_depth, (caps & MALLOC_CAP_SPIRAM) != 0);
+    if (!tcb || !stack) {
+        image_test_free(tcb);
+        image_test_free(stack);
+        return pdFALSE;
+    }
+    g_caps_task.tcb = tcb;
+    g_caps_task.stack = stack;
+    g_caps_task.caps = caps;
+    g_caps_task.suspended = false;
+    g_caps_task.running = true;
+    g_caps_tasks++;
+    g_stack = stack_depth;
+    if (out_handle) *out_handle = tcb;
+    if (!setjmp(g_caps_task_exit)) task(params);
+    g_caps_task.running = false;
+    return pdPASS;
+}
+
+TaskHandle_t xTaskGetCurrentTaskHandle(void) {
+    CHECK(g_caps_task.running, "asked for the current task outside a task with caps");
+    return g_caps_task.tcb;
+}
+
+void vTaskSuspend(TaskHandle_t task) {
+    CHECK(!task && g_caps_task.running, "only a task with caps suspends itself here");
+    g_caps_task.suspended = true;
+    longjmp(g_caps_task_exit, 1);
+}
+
+void vTaskDeleteWithCaps(TaskHandle_t task) {
+    CHECK(!g_caps_task.running, "a task with caps deleted itself: IDF would need a cleanup task in internal RAM");
+    CHECK(task && task == g_caps_task.tcb, "deleted a task that wasn't made with caps");
+    CHECK(g_caps_task.suspended, "deleted a task with caps that hadn't parked");
+    image_test_free(g_caps_task.stack);
+    image_test_free(g_caps_task.tcb);
+    memset(&g_caps_task, 0, sizeof(g_caps_task));
+    g_caps_deleted++;
+}
+
 static image_fetch_result_t g_result;
 static char g_message[128];
 static bool g_done;
@@ -2515,6 +2625,30 @@ static void reset_image(size_t file_len) {
     reset_vm(file_len);
     g_fail_task = false;
     g_screen_width = SCREEN_WIDTH;
+    g_rows_bytes = 0;
+    g_rows_external = g_pool_external = g_fetch_external = -1;
+    g_pool_bytes = 0;
+    g_caps_tasks = g_caps_deleted = 0;
+}
+
+// The last download's task, if it parked (apps builds), goes with the next start, refused or not: this one is
+// refused for memory once it has taken the download's flag, so it holds nothing after.
+static void image_settle(void) {
+    if (!g_caps_task.tcb) return;
+    size_t dma = g_dma_free, internal = g_internal_free;
+    g_dma_free = g_internal_free = 0;
+    const char *code = NULL, *message = NULL;
+    bool started = image_fetch_start_vm("settle.raw", 0, on_done, NULL, &code, &message);
+    g_dma_free = dma;
+    g_internal_free = internal;
+    CHECK(!started && strcmp(code, "out_of_memory") == 0, "a start with no memory: %d %s", started,
+          started ? "" : code);
+    CHECK(!g_caps_task.tcb, "the next start left the parked task");
+}
+
+// What the download task held when it ended, and whether it parked.
+static void print_parked(const char *tag) {
+    printf("@%s %d %zu %zu\n", tag, g_caps_task.suspended, g_internal_used, g_external_used);
 }
 
 static void case_image_refused_while_an_install_reads(void) {
@@ -2644,6 +2778,113 @@ static void case_image_task_that_will_not_start(void) {
     CHECK(draw_vm("pic.raw", &code, &message), "the reader and the flag are free: %s", message);
     finish();
 }
+
+// On apps builds the download's stack and drawing are PSRAM; the block of internal RAM it needs is its TCB's.
+static void case_image_needs_a_block_for_its_tcb(void) {
+    const char *code = NULL, *message = NULL;
+    size_t tcb = sizeof(StaticTask_t) + 32;     // with the allocator's cost
+    for (size_t block = tcb - 1; block <= tcb; block++) {
+        reset_image(5 * ROW_BYTES);
+        g_largest_block = block;
+        bool started = draw_vm("pic.raw", &code, &message);
+        printf("@tcb_block %zu %d %s | %s\n", block, started, started ? "" : code, started ? "" : message);
+        finish();
+    }
+}
+
+// The one log line that holds `text`, or "".
+static const char *log_line(const char *text) {
+    const char *found = "";
+    for (unsigned i = 0; i < 32 && i < g_log_lines; i++) {
+        if (strstr(g_log[i], text)) found = g_log[i];
+    }
+    return found;
+}
+
+// An idle 1.75C with the Link up has 23.7 to 25.0 KB of DMA RAM free (Task 21): the least of those. A download
+// that starts keeps the Link's margin all the way (open_get checks it at each range, and the lowest is kept).
+static void case_image_on_an_idle_board(void) {
+    reset_image(5 * ROW_BYTES);
+    g_dma_free = g_internal_free = 23743;
+    g_log_lines = 0;
+    const char *code = NULL, *message = NULL;
+    bool started = draw_vm("pic.raw", &code, &message);
+    printf("@idle %d %s | %s | %d\n", started, started ? "" : code, started ? "" : message, g_rows_drawn);
+    if (started) {
+        CHECK(g_result.ok, "the picture: %s", g_message);
+        printf("@dma %d\n", g_min_dma_free >= NOISE_TX_DMA_RESERVE_BYTES);
+        printf("@dmalog %s\n", log_line("image download dma:"));
+    }
+    finish();
+}
+
+// The least DMA RAM (as much internal) with which a download of a file on the VM starts: what the reader
+// counts (the Link's margin, the request, its reserve and the download's `keep`), plus the request path it
+// allocated before it counted.
+static void case_image_admission(void) {
+    size_t lo = 0, hi = 64 * 1024;     // refused at lo, started at hi
+    while (hi - lo > 1) {
+        size_t mid = (lo + hi) / 2;
+        reset_image(5 * ROW_BYTES);
+        g_dma_free = g_internal_free = mid;
+        const char *code = NULL, *message = NULL;
+        bool started = draw_vm("pic.raw", &code, &message);
+        if (started) {
+            CHECK(g_result.ok, "admitted at %zu but: %s", mid, g_message);
+            hi = mid;
+        } else {
+            CHECK(strcmp(message, "failed to allocate") == 0, "refused at %zu: %s", mid, message);
+            lo = mid;
+        }
+        finish();
+    }
+    printf("@admitted %zu\n", hi);
+    printf("@tcb %zu\n", sizeof(StaticTask_t));
+}
+
+// Where a download's memory is: the task (how it was made, its stack, where), the rows handed to the screen,
+// the decoder's pool and the fetch, and the most internal RAM the download itself held.
+static void case_image_placement(void) {
+    reset_image(5 * ROW_BYTES);
+    const char *code = NULL, *message = NULL;
+    CHECK(draw_vm("pic.raw", &code, &message), "raw: %s", message);
+    CHECK(g_result.ok, "raw: %s", g_message);
+    if (g_caps_tasks) {
+        printf("@task caps %u %d\n", g_stack, (g_caps_task.caps & MALLOC_CAP_SPIRAM) != 0);
+    } else {
+        printf("@task internal %u\n", g_stack);
+    }
+    printf("@rows %zu %d\n", g_rows_bytes, g_rows_external);
+    finish();
+
+    reset_image(5 * ROW_BYTES);
+    g_jpeg_head = true;
+    CHECK(draw_vm("pic.jpg", &code, &message), "jpeg: %s", message);
+    printf("@jpeg %s | %s\n", g_result.code, g_message);    // the fake decoder takes nothing for a JPEG
+    printf("@pool %d %d\n", g_pool_bytes, g_pool_external);
+    printf("@fetch %d\n", g_fetch_external);
+    finish();
+}
+
+// On apps builds the download's task parks at its end, with its TCB (internal) and stack (PSRAM), and the next
+// start deletes it before it counts anything: a download, a refused one, or a URL's.
+static void case_image_task_parks(void) {
+    reset_image(5 * ROW_BYTES);
+    const char *code = NULL, *message = NULL;
+    CHECK(draw_vm("pic.raw", &code, &message), "first: %s", message);
+    print_parked("first");
+    CHECK(draw_vm("pic.raw", &code, &message), "second: %s", message);
+    printf("@second %u %u\n", g_caps_tasks, g_caps_deleted);   // made two, deleted the first before the second
+    print_parked("after_second");
+    size_t internal = g_internal_free;
+    g_internal_free = 8 * 1024;     // short of what a URL download asks for: refused before it connects
+    bool started = image_fetch_start("http://host/x.raw", 0, on_done, NULL, &code, &message);
+    g_internal_free = internal;
+    CHECK(!started, "a URL download started with 8 KB free");
+    printf("@url %s | %s | %u\n", code, message, g_caps_deleted);
+    print_parked("after_url");
+    finish();
+}
 #endif
 
 // ---- Main --------------------------------------------------------------------
@@ -2704,6 +2945,11 @@ static const test_case_t cases[] = {
     CASE(image_needs_a_block_for_its_drawing),
     CASE(image_task_that_will_not_start),
     CASE(image_leading_slash),
+    CASE(image_on_an_idle_board),
+    CASE(image_needs_a_block_for_its_tcb),
+    CASE(image_admission),
+    CASE(image_placement),
+    CASE(image_task_parks),
 #endif
 };
 

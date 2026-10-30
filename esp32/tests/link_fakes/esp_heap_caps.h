@@ -25,6 +25,7 @@
 
 #ifdef LINK_FAKE_CUSTOM_HEAP_CAPS
 void *heap_caps_malloc(size_t size, int caps);
+void *heap_caps_calloc(size_t count, size_t size, int caps);
 size_t heap_caps_get_free_size(int caps);
 size_t heap_caps_get_minimum_free_size(int caps);
 size_t heap_caps_get_largest_free_block(int caps);

@@ -22,7 +22,9 @@ rest as @-lines, which these tests assert: the ranges asked for, what the sink w
 the writer sent byte for byte, the size of each send, and how each part read. vm_file.c is built the way
 test_link_image_fetch.py builds image_fetch.c, with its allocations going through the harness's counting
 allocator, once with PSRAM and once without. A third build adds image_fetch.c, for the cases where it and
-the reader meet: who holds the reader, and what a download says when a later range doesn't come.
+the reader meet: who holds the reader, and what a download says when a later range doesn't come. A fourth adds
+image_fetch.c as an apps build has it (CONFIG_MUSE_APPS), where a file from the VM is drawn by a task whose
+stack, like the download's buffers, is in PSRAM, so that it starts with the Link up on an idle 1.75C.
 """
 
 import re
@@ -47,8 +49,20 @@ ESP_LOG = ("#pragma once\n"
            "#define ESP_LOGI(tag, ...) fake_esp_log('I', tag, __VA_ARGS__)\n")
 ESP_TIMER = "#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n"
 ESP_RANDOM = "#pragma once\n#include <stdint.h>\nuint32_t esp_random(void);\n"
-# image_fetch.c logs the stack it has left, which its own harness never evaluates.
-TASK = '#pragma once\n#include "{fake}"\nunsigned uxTaskGetStackHighWaterMark(TaskHandle_t task);\n'
+# image_fetch.c logs the stack it has left, which its own harness never evaluates. On apps builds its download
+# task has caps (freertos/idf_additions.h), parks at its end and is deleted by the next start. StaticTask_t is
+# its size on the 1.75C's apps build (100 bytes, read from the ELF), which IDF allocates the TCB as.
+TASK = ('#pragma once\n#include "{fake}"\n#include <stdint.h>\n'
+        "typedef unsigned UBaseType_t;\n"
+        "typedef struct {{ unsigned char opaque[100]; }} StaticTask_t;\n"
+        "unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task);\n"
+        "void vTaskSuspend(TaskHandle_t task);\n"
+        "TaskHandle_t xTaskGetCurrentTaskHandle(void);\n")
+IDF_ADDITIONS = ('#pragma once\n#include "freertos/FreeRTOS.h"\n#include "freertos/task.h"\n'
+                 "BaseType_t xTaskCreateWithCaps(TaskFunction_t task, const char *name, uint32_t stack_depth,\n"
+                 "                               void *params, UBaseType_t priority, TaskHandle_t *out_handle,\n"
+                 "                               UBaseType_t caps);\n"
+                 "void vTaskDeleteWithCaps(TaskHandle_t task);\n")
 # The allocator hooks of image_fetch's wrapper: malloc, free and the others go to the harness's counting ones.
 WRAPPER = '#include "image_fetch_alloc.h"\n#include "{source}"\n'
 PIECE = 8192            # the file's pieces on a board with PSRAM, the most its session takes in one send
@@ -56,6 +70,10 @@ PIECE_NO_PSRAM = 4096   # and on a Muse board without it
 HEAD_MAX = 4096         # the head of the form is one send of at most this, whatever the pieces
 SEND_MAX = PIECE        # what the session takes in one send
 RESERVE = 16 * 1024     # NOISE_TX_DMA_RESERVE_BYTES: the DMA RAM the Link's TX needs free
+VM_RESERVE = 4 * 1024   # vm_file.c's VM_RESERVE_BYTES, left for Wi-Fi and lwIP
+ALLOC_COST = 32         # what the harness's allocator adds to each block, as the real one's header may
+STACK = 6144            # the download task's stack
+POOL = 3100             # the JPEG decoder's pool
 
 
 def pat(i: int) -> int:
@@ -168,17 +186,21 @@ class VmFileTest(unittest.TestCase):
         (staged / "esp_random.h").write_text(ESP_RANDOM)
         (staged / "freertos").mkdir()
         (staged / "freertos" / "task.h").write_text(TASK.format(fake=TESTS / "link_fakes/freertos/task.h"))
+        (staged / "freertos" / "idf_additions.h").write_text(IDF_ADDITIONS)
         wrapped = root / "vm_file.c"
         wrapped.write_text(WRAPPER.format(source=MAIN / "vm_file.c"))
         wrapped_image = root / "image_fetch.c"
         wrapped_image.write_text(WRAPPER.format(source=MAIN / "image_fetch.c"))
         cls.binaries = {}
-        for name, spiram, image in (("psram", 1, 0), ("nopsram", 0, 0), ("image", 1, 1)):
+        for name, spiram, image, apps in (("psram", 1, 0, 0), ("nopsram", 0, 0, 0), ("image", 1, 1, 0),
+                                          ("image_apps", 1, 1, 1)):
             cls.binaries[name] = apps_host.build(
                 f"vm_file_harness_{name}", [HARNESS, wrapped, *([wrapped_image] if image else [])], root,
                 include_dirs=[staged, TESTS / "image_fetch_fakes", TESTS / "link_fakes", MAIN],
                 defines=["CONFIG_HOMEHUB_DAEMON_REQUESTS=1", f"CONFIG_SPIRAM={spiram}", f"WITH_IMAGE_FETCH={image}",
                          *(["CONFIG_HOMEHUB_DISPLAY_COMMANDS=1"] if image else []),
+                         # An apps build: PSRAM stacks are allowed there, as on every board with apps.
+                         *(["CONFIG_MUSE_APPS=1", "CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=1"] if apps else []),
                          "LINK_FAKE_CUSTOM_TASKS", "LINK_FAKE_CUSTOM_HEAP_CAPS"])
 
     def run_case(self, case, *args, board="psram"):
@@ -562,25 +584,36 @@ class VmFileTest(unittest.TestCase):
 
     # ---- With image_fetch.c ----
 
+    IMAGE_BOARDS = ("image", "image_apps")
+
     def test_a_download_is_refused_while_an_install_reads(self):
-        out = self.run_case("image_refused_while_an_install_reads", board="image")
-        self.assertEqual(out.one("refused"), "busy | the VM file reader is busy (an app install)")
-        self.assertEqual(out.one("drawn"), "5 80 1")   # then, the reader free, the same download draws 5 rows
+        for board in self.IMAGE_BOARDS:
+            with self.subTest(board=board):
+                out = self.run_case("image_refused_while_an_install_reads", board=board)
+                self.assertEqual(out.one("refused"), "busy | the VM file reader is busy (an app install)")
+                self.assertEqual(out.one("drawn"), "5 80 1")   # then, the reader free, the download draws 5 rows
 
     def test_an_install_is_refused_while_an_image_downloads(self):
-        out = self.run_case("install_refused_while_an_image_downloads", board="image")
-        self.assertEqual(out.one("install"), "0 busy | the VM file reader is busy (an image download)")
-        # The download's own flag is still what stops a second download, VM file or URL.
-        self.assertEqual(out.one("again"), "0 busy | another image is still downloading")
-        self.assertEqual(out.one("http"), "0 busy | another image is still downloading")
+        # On the apps build the second start is refused while the first task runs, and doesn't delete it (the
+        # harness fails a delete of a task that hasn't parked).
+        for board in self.IMAGE_BOARDS:
+            with self.subTest(board=board):
+                out = self.run_case("install_refused_while_an_image_downloads", board=board)
+                self.assertEqual(out.one("install"), "0 busy | the VM file reader is busy (an image download)")
+                # The download's own flag is still what stops a second download, VM file or URL.
+                self.assertEqual(out.one("again"), "0 busy | another image is still downloading")
+                self.assertEqual(out.one("http"), "0 busy | another image is still downloading")
 
     def test_a_download_that_stalls_in_a_later_range_timed_out(self):
-        out = self.run_case("image_stalls_in_a_later_range", board="image")
-        self.assertEqual(out.one("late"),
-                         "download_failed | download timed out | rows 1024 | cancels 1 | bytes 16384 | done 1")
-        # The first range is the reader's to explain, and a download that has nothing draws nothing.
-        self.assertEqual(out.one("first"), "download_failed | VM answered HTTP 404 | rows 0 | done 0 | bytes 0")
-        self.assertEqual(out.one("silent"), "download_failed | download timed out | cancels 1")
+        for board in self.IMAGE_BOARDS:
+            with self.subTest(board=board):
+                out = self.run_case("image_stalls_in_a_later_range", board=board)
+                self.assertEqual(out.one("late"),
+                                 "download_failed | download timed out | rows 1024 | cancels 1 | bytes 16384 | done 1")
+                # The first range is the reader's to explain, and a download that has nothing draws nothing.
+                self.assertEqual(out.one("first"),
+                                 "download_failed | VM answered HTTP 404 | rows 0 | done 0 | bytes 0")
+                self.assertEqual(out.one("silent"), "download_failed | download timed out | cancels 1")
 
     def test_a_download_needs_a_block_for_its_stack(self):
         out = self.run_case("image_needs_a_block_for_its_stack", board="image")
@@ -594,14 +627,90 @@ class VmFileTest(unittest.TestCase):
     def test_a_download_keeps_accepting_a_leading_slash(self):
         # draw_file's path may start with a slash, as it always has; the reader itself refuses an absolute path,
         # so the download drops the slashes first. A ".." folder is refused with the reader's words.
-        out = self.run_case("image_leading_slash", board="image")
-        self.assertEqual(out.one("slash"), "/fs/raw/pic.raw 5")
-        self.assertEqual(out.one("dots"), "invalid_params | vm_file_open: bad path | 0")
-        self.assertEqual(out.one("none"), "invalid_params | path names no file")
+        for board in self.IMAGE_BOARDS:
+            with self.subTest(board=board):
+                out = self.run_case("image_leading_slash", board=board)
+                self.assertEqual(out.one("slash"), "/fs/raw/pic.raw 5")
+                self.assertEqual(out.one("dots"), "invalid_params | vm_file_open: bad path | 0")
+                self.assertEqual(out.one("none"), "invalid_params | path names no file")
 
     def test_a_download_whose_task_will_not_start_frees_the_reader(self):
-        out = self.run_case("image_task_that_will_not_start", board="image")
-        self.assertEqual(out.one("task"), "out_of_memory | failed to start the download task | 0")
+        for board in self.IMAGE_BOARDS:
+            with self.subTest(board=board):
+                out = self.run_case("image_task_that_will_not_start", board=board)
+                self.assertEqual(out.one("task"), "out_of_memory | failed to start the download task | 0")
+
+    # ---- With image_fetch.c, as apps builds have it ----
+
+    def test_a_download_starts_on_an_idle_board_with_the_link_up(self):
+        # An idle 1.75C with the Link up has about 24 KB of DMA RAM. The download's stack (6144) and rows or pool
+        # in internal RAM, on top of the Link's margin, ask for about 30 KB: refused, as Task 21 found on the
+        # board. On apps builds they are in PSRAM, and it draws, with the Link's margin kept all the way.
+        out = self.run_case("image_on_an_idle_board", board="image")
+        self.assertEqual(out.one("idle"), "0 out_of_memory | failed to allocate | 0")
+        out = self.run_case("image_on_an_idle_board", board="image_apps")
+        self.assertEqual(out.one("idle"), "1  |  | 5")
+        self.assertEqual(out.one("dma"), "1")
+        # It says what DMA RAM it saw, in bytes: before, the lowest during, after, and the lowest since boot.
+        m = re.fullmatch(r"I link\.image: image download dma: (\d+) free before, (\d+) lowest during, "
+                         r"(\d+) after, (\d+) lowest since boot", out.one("dmalog"))
+        self.assertIsNotNone(m, out.one("dmalog"))
+        before, lowest, after, _ = (int(n) for n in m.groups())
+        self.assertLessEqual(lowest, before)
+        self.assertGreaterEqual(lowest, RESERVE)
+        self.assertGreater(after, lowest)
+
+    def test_the_admission_counts_only_what_stays_internal(self):
+        # On apps builds a download of a file on the VM takes from internal RAM only its task's TCB (IDF allocates
+        # it there whatever the stack's caps): the reader counts that as its `keep`, with the Link's margin, the
+        # request and its reserve, after the request path it allocated.
+        out = self.run_case("image_admission", board="image_apps")
+        tcb = int(out.one("tcb")) + ALLOC_COST
+        request = len("/fs/raw/pic.raw") + 64              # what the reader counts for the queued GET
+        path = len("/fs/raw/") + 3 * len("pic.raw") + 1 + ALLOC_COST    # its copy of the request path
+        self.assertEqual(int(out.one("admitted")), RESERVE + VM_RESERVE + request + tcb + path)
+        # Elsewhere the stack and the pool are internal, and counted: more than 9 KB more.
+        plain = self.run_case("image_admission", board="image")
+        self.assertGreater(int(plain.one("admitted")) - int(out.one("admitted")), STACK + POOL - tcb)
+
+    def test_a_download_needs_a_block_for_its_tcb(self):
+        # On apps builds the only block of internal RAM a download needs of its own is its task's TCB.
+        out = self.run_case("image_needs_a_block_for_its_tcb", board="image_apps")
+        tcb = 100 + ALLOC_COST
+        self.assertEqual(out.all("tcb_block"), [f"{tcb - 1} 0 out_of_memory | failed to allocate", f"{tcb} 1  | "])
+
+    def test_the_download_keeps_its_memory_in_psram(self):
+        # Nothing a download hands the screen is read by DMA: led_status_draw_rect copies the pixels (on boards
+        # with the full UI into the image's PSRAM buffer, which LVGL draws from; the panel's DMA reads only its
+        # two fixed internal buffers). So on apps builds the stack, the rows, the decoder's pool and the fetch
+        # (whose MCU buffer a JPEG hands the screen) are PSRAM, and the internal RAM a download holds is its TCB.
+        out = self.run_case("image_placement", board="image_apps")
+        self.assertEqual(out.one("task"), f"caps {STACK} 1")
+        self.assertEqual(out.one("rows"), f"{4 * 8 * 2} 1")      # four rows of the harness's 8-pixel screen
+        self.assertEqual(out.one("pool"), f"{POOL} 1")
+        self.assertEqual(out.one("fetch"), "1")
+        self.assertEqual(out.one("jpeg"), "invalid_image | not a valid JPEG")
+        # Elsewhere all of it is internal, as it was.
+        out = self.run_case("image_placement", board="image")
+        self.assertEqual(out.one("task"), f"internal {STACK}")
+        self.assertEqual(out.one("rows"), f"{4 * 8 * 2} 0")
+        self.assertEqual(out.one("pool"), f"{POOL} 0")
+        self.assertEqual(out.one("fetch"), "0")
+
+    def test_the_download_task_parks_and_the_next_start_deletes_it(self):
+        # A task with a PSRAM stack can't delete itself without IDF making a cleanup task in internal RAM, which
+        # aborts when there is none: it parks, and the next start deletes it, with its TCB and stack, before it
+        # counts anything, whether that start is a download, one refused, or a URL's.
+        out = self.run_case("image_task_parks", board="image_apps")
+        self.assertEqual(out.one("first"), f"1 {100 + ALLOC_COST} {STACK + ALLOC_COST}")
+        self.assertEqual(out.one("second"), "2 1")
+        self.assertEqual(out.one("after_second"), f"1 {100 + ALLOC_COST} {STACK + ALLOC_COST}")
+        self.assertEqual(out.one("url"), "out_of_memory | not enough free memory for a download | 2")
+        self.assertEqual(out.one("after_url"), "0 0 0")
+        # Elsewhere the task deletes itself, and holds nothing after.
+        out = self.run_case("image_task_parks", board="image")
+        self.assertEqual(out.one("first"), "0 0 0")
+        self.assertEqual(out.one("second"), "0 0")
 
     # ---- Wiring ----
 
@@ -626,6 +735,37 @@ class VmFileTest(unittest.TestCase):
                       "noise_ctrl_req_open", "noise_ctrl_req_cancel"):
             self.assertNotRegex(source, rf"\b{moved}\b", f"{moved} was moved to vm_file.c, not copied")
 
+    def test_the_psram_download_task_is_safe(self):
+        # The code, without its comments (which name what it must not do).
+        source = re.sub(r"//[^\n]*|/\*.*?\*/", "", (MAIN / "image_fetch.c").read_text(), flags=re.S)
+
+        def has(pattern):
+            return re.search(pattern, source) is not None
+
+        # Only apps builds change: elsewhere the download is what it was (X5).
+        self.assertTrue(has(r"#if CONFIG_MUSE_APPS\b"), "the PSRAM download isn't under CONFIG_MUSE_APPS")
+        self.assertTrue(has(r"#define PSRAM_CAPS\s+\(MALLOC_CAP_SPIRAM \| MALLOC_CAP_8BIT\)"), "PSRAM_CAPS")
+        self.assertTrue(has(r"xTaskCreateWithCaps\(fetch_task,[^;]*PSRAM_CAPS\)"), "the task's stack isn't PSRAM")
+        # A task with caps that deletes itself makes IDF start a cleanup task in internal RAM, and abort without
+        # one: the download's task parks, and the next start deletes it.
+        self.assertFalse(has(r"vTaskDeleteWithCaps\(\s*NULL\s*\)"), "the PSRAM task deletes itself")
+        self.assertTrue(has(r"vTaskDeleteWithCaps\(s_parked\)"), "nothing deletes the parked task")
+        # A task with a PSRAM stack must not write flash (safe on the 1.75C anyway, X18): this one writes none.
+        for flash in (r"\bnvs_", r"esp_partition_write", r"esp_flash_write", r"\bfopen\(", r"\bfwrite\("):
+            self.assertFalse(has(flash), f"image_fetch.c calls {flash}")
+        # What the screen is handed is copied, never kept or sent to the panel from there: on boards with the
+        # full UI into the image's PSRAM buffer, which LVGL draws from (the panel's DMA reads only the fixed
+        # internal buffers of muse_lcd_bands.c).
+        ui = (ROOT / "components/muse/muse_ui.c").read_text()
+        draw = ui[ui.index("bool muse_ui_image_draw("):]
+        draw = draw[:draw.index("\n}\n")]
+        self.assertEqual(re.findall(r"\bpixels\b", draw), ["pixels", "pixels"])   # the parameter, and the copy's source
+        self.assertIn("const uint8_t *src = (const uint8_t *)pixels;", draw)
+        self.assertRegex(draw, r"heap_caps_calloc\([^;]*MALLOC_CAP_SPIRAM\)")
+        self.assertNotIn("esp_lcd", draw)
+        bands = (ROOT / "components/muse/boards/muse_lcd_bands.c").read_text()
+        self.assertEqual(len(re.findall(r"s_chunk\[\d\] = heap_caps_aligned_alloc\(16, chunk_bytes, "
+                                        r"MALLOC_CAP_DMA \| MALLOC_CAP_INTERNAL\);", bands)), 2)
 
 if __name__ == "__main__":
     unittest.main()

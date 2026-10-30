@@ -5476,6 +5476,50 @@ static void the_alarms_records_follow_the_table_on_flash(void) {
     clock_go();
 }
 
+/* ---- Fix 1 F: the footprint once start() has returned ---- */
+
+static const char APP_HEAP_AT_START[] =
+    "local app = {}\n"
+    "local hold\n"
+    "function app.start() hold = string.rep('x', 300 * 1024) print('started') end\n"
+    "return app\n";
+
+static atomic_bool footprint_run_done;
+static char footprint_run_err[200];
+
+static void *footprint_runner(void *arg) {
+    apps_pkg_t *pkg = arg;
+    bool ok = apps_task_run(pkg, true, 1500, NULL, footprint_run_err, sizeof footprint_run_err);
+    if (!ok) {
+        fprintf(stderr, "the run failed: %s\n", footprint_run_err);
+    }
+    atomic_store(&footprint_run_done, true);
+    return NULL;
+}
+
+/* What a load beside the app counts (apps_task_footprint) has its heap from when its start() has returned, while its run still
+ * settles: the record is refreshed there, not only at the settle's end. */
+static void the_footprint_has_the_heap_once_start_returns(void) {
+    const file_t files[] = {LUA("main.lua", APP_HEAP_AT_START)};
+    apps_pkg_t *pkg = make_pkg("heapy", "Heapy", files, 1);
+    pkg->manifest.memory_kb = 1024;
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, footprint_runner, pkg) == 0, "no runner");
+    WAIT(0, "print heapy started");
+    char id[APPS_ID_MAX + 1];
+    size_t bytes = 0;
+    for (int64_t until = real_ms() + 300; real_ms() < until && bytes < 300 * 1024;) {
+        CHECK(apps_task_footprint(id, sizeof id, &bytes) && strcmp(id, "heapy") == 0, "nothing loaded: '%s'", id);
+        sleep_ms(2);
+    }
+    CHECK(bytes >= 300 * 1024, "the footprint while the run settles: %zu bytes", bytes);
+    CHECK(!atomic_load(&footprint_run_done), "the run had settled already: the check came too late");
+    pthread_join(t, NULL);
+    char err[200];
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    CHECK(!apps_task_footprint(id, sizeof id, &bytes) && id[0] == '\0' && bytes == 0, "after the stop: '%s' %zu", id, bytes);
+}
+
 /* ---- I2: the boot's mount waits for the Link ---- */
 
 /* Waits up to ms of real time for the store's first tick. */
@@ -6648,6 +6692,7 @@ int main(int argc, char **argv) {
         {"a_late_reset_parks_the_images", a_late_reset_parks_the_images},
         {"a_new_run_replaces_the_app", a_new_run_replaces_the_app},
         {"a_run_is_admitted_once_the_app_it_replaces_has_gone", a_run_is_admitted_once_the_app_it_replaces_has_gone},
+        {"the_footprint_has_the_heap_once_start_returns", the_footprint_has_the_heap_once_start_returns},
         {"the_boot_mount_waits_for_the_links_registration", the_boot_mount_waits_for_the_links_registration},
         {"the_boot_mount_starts_at_the_deadline", the_boot_mount_starts_at_the_deadline},
         {"the_boot_mount_starts_at_once_when_the_link_wont_come_up", the_boot_mount_starts_at_once_when_the_link_wont_come_up},

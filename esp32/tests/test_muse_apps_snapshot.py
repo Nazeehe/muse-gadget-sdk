@@ -202,12 +202,14 @@ STAGED = {
                         "#define MALLOC_CAP_INTERNAL (1u << 11)\n"
                         "size_t heap_caps_get_free_size(uint32_t caps);\nsize_t heap_caps_get_minimum_free_size(uint32_t caps);\n"
                         "void *heap_caps_aligned_calloc(size_t alignment, size_t n, size_t size, uint32_t caps);\n"
-                        "void *heap_caps_calloc(size_t n, size_t size, uint32_t caps);\n"),
+                        "void *heap_caps_calloc(size_t n, size_t size, uint32_t caps);\n"
+                        "size_t heap_caps_get_allocated_size(void *ptr);\nvoid heap_caps_free(void *ptr);\n"),
     "freertos/FreeRTOS.h": ("#pragma once\n#include <stdint.h>\ntypedef uint32_t TickType_t;\ntypedef int BaseType_t;\n"
                             "typedef unsigned UBaseType_t;\ntypedef void *TaskHandle_t;\n#define pdTRUE 1\n#define pdFALSE 0\n"),
     # A tick is a millisecond here, and the harness's clock moves on by the ticks a delay sleeps.
     "freertos/task.h": ("#pragma once\n#include \"freertos/FreeRTOS.h\"\n#define pdMS_TO_TICKS(ms) ((TickType_t)(ms))\n"
-                        "void vTaskDelay(TickType_t ticks);\nUBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task);\n"),
+                        "void vTaskDelay(TickType_t ticks);\nUBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task);\n"
+                        "TaskHandle_t xTaskGetCurrentTaskHandle(void);\n"),
     "muse_input.h": "#pragma once\nvoid muse_input_wake(const char *why);\n",
     "lvgl.h": ("#pragma once\n#include <stdint.h>\n#define LV_USE_SNAPSHOT 1\n"
                "typedef struct lv_obj lv_obj_t;\n"
@@ -341,6 +343,18 @@ class Snapshot(unittest.TestCase):
 
     def test_the_apps_waits_are_logged(self):  # N1: how long the app waited for the snapshot's memory
         self.run_case("the_apps_waits_are_logged")
+
+    def test_the_encoders_blocks_count_with_the_snapshot(self):  # fix 1 A: adopted from open to close, the peak logged, no decoder's
+        self.run_case("the_encoders_blocks_count_with_the_snapshot")
+
+    def test_an_encoder_out_of_memory_is_out_of_memory(self):  # fix 1 A: in the admission's words, not unavailable
+        self.run_case("an_encoder_out_of_memory_is_out_of_memory")
+
+    def test_a_refusal_at_the_take_says_what_the_admission_says(self):  # fix 1 E
+        self.run_case("a_refusal_at_the_take_says_what_the_admission_says")
+
+    def test_a_wider_stride_is_admitted_as_taken(self):  # fix 1 H
+        self.run_case("a_wider_stride_is_admitted_as_taken")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

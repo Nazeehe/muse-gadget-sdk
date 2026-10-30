@@ -51,9 +51,10 @@ bool apps_port_dark(void);
  * that out by walking every block, so a smaller request doesn't ask). A shrink, or growth within the block, never
  * fails. So the apps run out of memory cleanly, and the rest of the gadget never does because of them.
  * A snapshot never kills the app that runs (N1): on the device, a growth of the app task's (apps_task_current) that the floor or
- * the heap refuses while a snapshot holds blocks (apps_port_snapshot_alloc), and that would fit were they free, waits until the
- * snapshot lets go of them, polling every APPS_PORT_SNAPSHOT_POLL_MS for at most APPS_PORT_SNAPSHOT_WAIT_MS in all during one
- * snapshot, and is then tried once more. The wait is stolen time (apps_rt_steal_ms, less what others stole meanwhile), so the duty
+ * the heap refuses while a snapshot holds blocks (apps_port_snapshot_alloc, and the encoder's: apps_port_snapshot_adopt), and that
+ * would fit were they free, waits: after the floor's refusal until the floor passes, after the heap's until the snapshot lets go of
+ * some of what it held, polling every APPS_PORT_SNAPSHOT_POLL_MS for at most APPS_PORT_SNAPSHOT_WAIT_MS in all during one snapshot,
+ * and is then tried once more. Never under the UI lock (the growth is refused at once). The wait is stolen time (apps_rt_steal_ms, less what others stole meanwhile), so the duty
  * cycle, the 1 s backstop and the hang supervisor don't count it. No other task ever waits here: not the snapshot's job (the I/O
  * worker), not the LVGL task. The app task holds no lock across an allocation (apps_task.c), so nothing the snapshot needs waits
  * behind it. */
@@ -75,6 +76,9 @@ size_t apps_port_psram_free(void);
  * - apps_port_snapshot_shrink: the block cut to n bytes in place (the heap trims a shrink where it is: TLSF's realloc), never
  *   refused, the count following; returns the block (p as it was when the heap couldn't cut it). n above the block's size is p.
  * - apps_port_snapshot_free: gives it back (NULL is ignored).
+ * - apps_port_snapshot_adopt, apps_port_snapshot_disown: a block the snapshot holds that the port didn't hand out (the JPEG
+ *   encoder's, from the wrapped allocators: apps_snapshot.c) counted with the snapshot's bytes while it is held, its size as the
+ *   heap has it (heap_caps_get_allocated_size); disown before freeing it. NULL is ignored.
  * - apps_port_snapshot_waits: how many waits of the app task the snapshots' blocks caused since the last call, with *ms what they
  *   came to; the call resets both (the snapshot's job logs them).
  */
@@ -84,6 +88,8 @@ bool apps_port_room(size_t n);
 void *apps_port_snapshot_alloc(size_t n);
 void *apps_port_snapshot_shrink(void *p, size_t n);
 void apps_port_snapshot_free(void *p);
+void apps_port_snapshot_adopt(void *p);
+void apps_port_snapshot_disown(void *p);
 size_t apps_port_snapshot_bytes(void);
 uint32_t apps_port_snapshot_waits(uint32_t *ms);
 

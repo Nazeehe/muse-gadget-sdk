@@ -151,8 +151,9 @@ static void snap_count(size_t add, size_t sub) {
     if (add > 0 && atomic_fetch_add(&s_snap_bytes, add) == 0) {
         atomic_fetch_add(&s_snap_gen, 1);
     }
-    if (sub > 0) {
-        atomic_fetch_sub(&s_snap_bytes, sub);
+    /* Never below 0: a block given back that wasn't counted (a mistake) can't make the count wrap and hold every wait open. */
+    size_t had = atomic_load(&s_snap_bytes);
+    while (sub > 0 && !atomic_compare_exchange_weak(&s_snap_bytes, &had, had > sub ? had - sub : 0)) {
     }
 }
 
@@ -163,9 +164,12 @@ static bool fits_without_snapshot(void *ptr, size_t n) {
     return free_then >= grow && free_then - grow >= APPS_RAM_RESERVE;
 }
 
-/* The app task's wait for a snapshot's blocks (apps_port.h): true when it waited (or found room meanwhile), for the one more try. */
-static bool wait_for_snapshot(void *ptr, size_t n) {
-    if (atomic_load(&s_snap_bytes) == 0 || !apps_task_current()) {
+/* The app task's wait for a snapshot's blocks (apps_port.h): true when it waited (or found room meanwhile), for the one more try.
+ * floor_passed is what the first try found: the floor refused it (wait until the floor passes), or the floor passed and the heap had
+ * no block (wait until the snapshot lets go of some of what it held now). Never under the UI lock: the LVGL task would wait too. */
+static bool wait_for_snapshot(void *ptr, size_t n, bool floor_passed) {
+    const size_t held = atomic_load(&s_snap_bytes);
+    if (held == 0 || !apps_task_current() || held_by_me()) {
         return false;
     }
     uint32_t gen = atomic_load(&s_snap_gen);
@@ -178,9 +182,12 @@ static bool wait_for_snapshot(void *ptr, size_t n) {
     }
     uint32_t waited = 0;
     const TickType_t poll = pdMS_TO_TICKS(APPS_PORT_SNAPSHOT_POLL_MS) > 0 ? pdMS_TO_TICKS(APPS_PORT_SNAPSHOT_POLL_MS) : 1;
-    /* The floor refused: until it passes. The heap refused with the floor passing (no block that big): until the snapshot is done. */
-    const bool floor_refused = !room_to_grow(ptr, n);
-    while (s_wait.ms < APPS_PORT_SNAPSHOT_WAIT_MS && atomic_load(&s_snap_bytes) > 0 && (!floor_refused || !room_to_grow(ptr, n))) {
+    for (;;) {
+        const size_t now_held = atomic_load(&s_snap_bytes);
+        const bool more = floor_passed ? now_held >= held : now_held > 0 && !room_to_grow(ptr, n);
+        if (!more || s_wait.ms >= APPS_PORT_SNAPSHOT_WAIT_MS) {
+            break;
+        }
         const int64_t t0 = apps_port_mono_ms();
         const uint32_t s0 = apps_rt_stolen_ms();
         vTaskDelay(poll);
@@ -204,8 +211,9 @@ void *apps_port_realloc(void *ptr, size_t n) {
     if (held_by_me()) {
         breach(BREACH_HEAP, "the heap was used with the lock held");
     }
-    void *p = room_to_grow(ptr, n) ? heap_caps_realloc(ptr, n, MUSE_BIG_CAPS) : NULL;
-    if (p == NULL && wait_for_snapshot(ptr, n)) {
+    const bool floor_passed = room_to_grow(ptr, n);
+    void *p = floor_passed ? heap_caps_realloc(ptr, n, MUSE_BIG_CAPS) : NULL;
+    if (p == NULL && wait_for_snapshot(ptr, n, floor_passed)) {
         p = room_to_grow(ptr, n) ? heap_caps_realloc(ptr, n, MUSE_BIG_CAPS) : NULL;  /* the one more try */
     }
     return p;
@@ -258,6 +266,18 @@ void apps_port_snapshot_free(void *p) {
     if (p != NULL) {
         snap_count(0, heap_caps_get_allocated_size(p));
         heap_caps_free(p);
+    }
+}
+
+void apps_port_snapshot_adopt(void *p) {
+    if (p != NULL) {
+        snap_count(heap_caps_get_allocated_size(p), 0);
+    }
+}
+
+void apps_port_snapshot_disown(void *p) {
+    if (p != NULL) {
+        snap_count(0, heap_caps_get_allocated_size(p));
     }
 }
 

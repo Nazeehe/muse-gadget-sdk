@@ -62,6 +62,7 @@ static const char *TAG = "muse_apps";
 #define NO_DRAWING "LVGL couldn't draw the screen into the snapshot"
 #define NO_PIXELS "out of memory: no room for the screen's pixels"
 #define NO_JPEG_ROOM "out of memory: no room for the JPEG"
+#define NO_ENCODER_ROOM "out of memory: no room for the JPEG encoder's buffers"
 #define SHOWN_MAX 40  /* text an app supplied, as a warning shows it (apps_task.c's overflow warnings) */
 #define RESULT_SKELETON "{\"ok\":true,\"payload\":}"
 #define UI_TRUNCATED_ROOM 24  /* ,"ui_truncated":NNNNN */
@@ -107,7 +108,10 @@ static size_t block_of(int w, int h, size_t screen, int scale) {
 }
 
 size_t apps_snapshot_block(int side, int scale) {
-    return block_of(side, side, (size_t)side * (size_t)side * 2, scale);
+    /* The drawing's rows as the take lays them out (LVGL's stride for RGB565: arithmetic on the width, no state touched), so the
+     * admission counts the block the take asks for. */
+    const uint32_t stride = side > 0 ? lv_draw_buf_width_to_stride((uint32_t)side, LV_COLOR_FORMAT_RGB565) : 0;
+    return block_of(side, side, (size_t)stride * (size_t)(side > 0 ? side : 0), scale);
 }
 
 size_t apps_snapshot_peak(int scale) {
@@ -140,6 +144,13 @@ static const char *admit_now(const char *id, int scale) {
                  (unsigned)apps_snapshot_peak(scale));
     }
     return refusal;
+}
+
+/* Memory refused the snapshot after its admission (the take's block, or the encoder's buffers): the admission's words now, logged as
+ * any refusal (a hint of scale 2, or to stop the app), or fallback when it would admit the snapshot now. */
+static const char *refused_words(const char *id, int scale, const char *fallback) {
+    const char *words = admit_now(id, scale);
+    return words != NULL ? words : fallback;
 }
 
 void apps_snapshot_take_pending(void) {
@@ -297,8 +308,9 @@ static bool capture(const snap_job_t *job, shot_t *shot, cJSON **r) {
     const bool taken = atomic_load(&s_cap) == CAP_TAKEN;
     atomic_store(&s_cap, CAP_IDLE);
     if (!taken) {
-        *r = apps_result_failure(shot->no_memory ? APPS_ERR_OUT_OF_MEMORY : APPS_ERR_UNAVAILABLE,
-                                 shot->why != NULL ? shot->why : NO_DRAWING);
+        /* No room for the block at the take, up to the screen's deadline after the admission: the admission's words now (fix 1 E). */
+        *r = shot->no_memory ? apps_result_failure(APPS_ERR_OUT_OF_MEMORY, refused_words(job->id, job->scale, NO_PIXELS))
+                             : apps_result_failure(APPS_ERR_UNAVAILABLE, shot->why != NULL ? shot->why : NO_DRAWING);
         return false;
     }
     return true;
@@ -306,6 +318,41 @@ static bool capture(const snap_job_t *job, shot_t *shot, cJSON **r) {
 
 static int pad16(int v) {
     return (v + 15) / 16 * 16;
+}
+
+/*
+ * The encoder's blocks (fix 1 A). While the I/O worker encodes a snapshot (from the first open_encoder to jpeg_enc_close), what the
+ * library allocates through the wrapped allocators on that task is counted with the snapshot's blocks (apps_port_snapshot_adopt):
+ * the app task's wait and its fit see it, and its peak is said in the encode's line. The library's decoder (display.draw_file, on
+ * the Link's task) uses the same allocators: another task's blocks aren't counted.
+ */
+static _Atomic(TaskHandle_t) s_enc_task;
+static size_t s_enc_bytes, s_enc_peak;  /* that task's alone */
+
+static bool encoding_here(void) {
+    const TaskHandle_t t = atomic_load(&s_enc_task);
+    return t != NULL && t == xTaskGetCurrentTaskHandle();
+}
+
+static void encoder_window(bool open) {
+    if (open) {
+        s_enc_bytes = s_enc_peak = 0;
+        atomic_store(&s_enc_task, xTaskGetCurrentTaskHandle());
+        return;
+    }
+    atomic_store(&s_enc_task, NULL);
+    if (s_enc_bytes != 0) {
+        ESP_LOGW(TAG, "snapshot: the JPEG encoder kept %u bytes past its close", (unsigned)s_enc_bytes);  /* still counted */
+    }
+}
+
+static void *encoder_block(void *p) {
+    if (p != NULL && encoding_here()) {
+        apps_port_snapshot_adopt(p);
+        s_enc_bytes += heap_caps_get_allocated_size(p);
+        s_enc_peak = s_enc_bytes > s_enc_peak ? s_enc_bytes : s_enc_peak;
+    }
+    return p;
 }
 
 static jpeg_error_t open_encoder(int w, int h, jpeg_enc_handle_t *enc) {
@@ -332,6 +379,7 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
     shot->px = NULL;  /* the block is this function's from here */
     jpeg_enc_handle_t enc = NULL;
     int fw = w, fh = h;
+    encoder_window(true);
     jpeg_error_t err = open_encoder(fw, fh, &enc);
     if (err != JPEG_ERR_OK && err != JPEG_ERR_NO_MEM && (pad16(w) != w || pad16(h) != h)) {
         fw = pad16(w);  /* D22: a size the encoder refuses, padded with black to the next multiple of 16 */
@@ -339,6 +387,7 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
         err = open_encoder(fw, fh, &enc);
     }
     if (err != JPEG_ERR_OK) {
+        encoder_window(false);
         apps_port_snapshot_free(block);
         snprintf(msg, sizeof msg, "the JPEG encoder refused %dx%d (error %d)", fw, fh, (int)err);
         *r = apps_result_failure(err == JPEG_ERR_NO_MEM ? APPS_ERR_OUT_OF_MEMORY : APPS_ERR_UNAVAILABLE, msg);
@@ -356,6 +405,7 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
     }
     if (in == NULL || (size_t)(out - block) + APPS_SNAPSHOT_JPEG_MAX > shot->block_len) {
         jpeg_enc_close(enc);
+        encoder_window(false);
         if (!in_place) {
             apps_port_snapshot_free(in);
         }
@@ -367,9 +417,17 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
     int len = 0;
     err = jpeg_enc_process(enc, (const uint8_t *)in, (int)in_len, out, APPS_SNAPSHOT_JPEG_MAX, &len);
     const UBaseType_t stack_free = uxTaskGetStackHighWaterMark(NULL);  /* the worker's, with the encoder's frames on it */
+    const size_t psram_encoded = apps_port_psram_free();  /* with every buffer of the encoder's still held */
     jpeg_enc_close(enc);
+    encoder_window(false);
     if (!in_place) {
         apps_port_snapshot_free(in);
+    }
+    if (err == JPEG_ERR_NO_MEM) {
+        /* Its buffers found no room after the admission: out of memory, in the admission's words now (fix 1 A). */
+        apps_port_snapshot_free(block);
+        *r = apps_result_failure(APPS_ERR_OUT_OF_MEMORY, refused_words(job->id, job->scale, NO_ENCODER_ROOM));
+        return false;
     }
     if (err != JPEG_ERR_OK || len <= 0 || len > APPS_SNAPSHOT_JPEG_MAX) {
         apps_port_snapshot_free(block);
@@ -387,11 +445,12 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
     ESP_LOGI(TAG,
              "snapshot %s: %dx%d jpeg %d bytes (q%d%s), drawn in %u ms, encoded in %u ms, answered %u ms after the request; "
              "io stack %u of %u free; DMA free %u before, %u with the encoder open, lowest %u; PSRAM free %u before, %u with the "
-             "encoder open",
+             "encoder open, %u after the encode; encoder peak %u bytes (%u allowed)",
              job->id, w, h, len, APPS_SNAPSHOT_QUALITY, padded, (unsigned)shot->render_ms,
              (unsigned)(apps_port_mono_ms() - began), (unsigned)answered_ms, (unsigned)stack_free, (unsigned)APPS_IO_STACK,
              (unsigned)dma_before, (unsigned)dma_open, (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
-             (unsigned)psram_before, (unsigned)psram_open);
+             (unsigned)psram_before, (unsigned)psram_open, (unsigned)psram_encoded, (unsigned)s_enc_peak,
+             (unsigned)APPS_SNAPSHOT_ENCODER_BYTES);
     *e = (encoded_t){.jpeg = block, .len = len, .w = w, .h = h, .file_w = fw, .file_h = fh};
     return true;
 }
@@ -665,16 +724,17 @@ bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void 
  * on the 1.75C the encoder's 8 KB there took it from 24211 bytes to 16127, under the Link's 16 KB margin, for as long as the encoder
  * was open. The linker sends all four here (components/muse/CMakeLists.txt): PSRAM only, and through the apps' floor (N1), so a
  * PSRAM that is short is the encoder's JPEG_ERR_NO_MEM (the snapshot's out_of_memory), never the Link's margin or the reserve. The
- * library frees all of them with heap_caps_free (jpeg_free and jpeg_free_align), which takes PSRAM blocks too.
+ * library frees all of them through jpeg_free and jpeg_free_align (heap_caps_free), which the linker sends here too, so a snapshot's
+ * encoder blocks are counted from their allocation to their free (encoder_block, above).
  */
 #define CAPS_PSRAM (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 void *__wrap_jpeg_calloc_inner(size_t size) {
-    return apps_port_room(size) ? heap_caps_calloc(1, size, CAPS_PSRAM) : NULL;
+    return encoder_block(apps_port_room(size) ? heap_caps_calloc(1, size, CAPS_PSRAM) : NULL);
 }
 
 void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned) {
-    return apps_port_room(size) ? heap_caps_aligned_calloc((size_t)aligned, 1, size, CAPS_PSRAM) : NULL;
+    return encoder_block(apps_port_room(size) ? heap_caps_aligned_calloc((size_t)aligned, 1, size, CAPS_PSRAM) : NULL);
 }
 
 void *__wrap_jpeg_calloc(size_t size) {
@@ -683,4 +743,20 @@ void *__wrap_jpeg_calloc(size_t size) {
 
 void *__wrap_jpeg_calloc_align(size_t size, int aligned) {
     return __wrap_jpeg_calloc_align_inner(size, aligned);
+}
+
+void __wrap_jpeg_free(void *p) {
+    if (p == NULL) {
+        return;
+    }
+    if (encoding_here()) {
+        const size_t n = heap_caps_get_allocated_size(p);
+        apps_port_snapshot_disown(p);
+        s_enc_bytes = n < s_enc_bytes ? s_enc_bytes - n : 0;
+    }
+    heap_caps_free(p);
+}
+
+void __wrap_jpeg_free_align(void *p) {
+    __wrap_jpeg_free(p);
 }

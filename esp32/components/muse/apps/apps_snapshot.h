@@ -50,8 +50,10 @@
  * (434,320 + 131,072 bytes), at scale 2 the screen's pixels alone (434,312: the half-size picture and the JPEG fit in them once the
  * picture is masked). It is admitted, before anything is drawn, only when free PSRAM and the largest free block each hold the peak
  * above the reserve (apps_snapshot_admit): the encoder's buffers are counted in the block too, as if they came out of it. While
- * the snapshot holds its block, an app task growth the floor refuses waits for it (apps_port.h), so the snapshot never kills the
- * app that runs.
+ * the job encodes, the encoder's buffers count with the block (apps_port_snapshot_adopt: the wrapped allocators and frees), and
+ * the encode's log line says their peak against the allowance. An encoder that finds no room even so is out_of_memory, in the
+ * admission's words then, as is a block the take finds no room for. While the snapshot holds its blocks, an app task growth the
+ * floor refuses waits for them (apps_port.h), so the snapshot doesn't kill the app that runs unless that wait runs out.
  *
  * The handshake (one atomic word, in internal RAM): IDLE, REQUESTED (the job asked), TAKING (the LVGL task is drawing), TAKEN
  * or FAILED (it has answered: the job reads the answer and sets IDLE). At its deadline the job takes a REQUESTED back (IDLE) or,
@@ -97,7 +99,8 @@ void apps_snapshot_mask(const uint16_t *src, int w, int h, int stride_px, int sc
 
 /*
  * The admission (N1, above). apps_snapshot_block is the block a snapshot at scale takes of a side x side screen (the drawing's block:
- * the pixels, and at scale 1 the JPEG's room after them, 16-byte aligned); apps_snapshot_peak adds APPS_SNAPSHOT_ENCODER_BYTES.
+ * the pixels in rows of LVGL's RGB565 stride, as the take lays them out, and at scale 1 the JPEG's room after the picture, 16-byte
+ * aligned); apps_snapshot_peak adds APPS_SNAPSHOT_ENCODER_BYTES.
  * apps_snapshot_admit: NULL when free_bytes and largest (the largest free block) each hold the peak at scale above APPS_RAM_RESERVE
  * for the 1.75C's screen; else the refusal, out_of_memory's words: MUSE_APPS_SNAPSHOT_TRY_SCALE_2 for scale 1 when scale 2 fits,
  * otherwise MUSE_APPS_SNAPSHOT_STOP_APP when an app runs (app_runs) and MUSE_APPS_SNAPSHOT_NO_MEMORY when none does. Any task.
@@ -110,9 +113,13 @@ const char *apps_snapshot_admit(int scale, size_t free_bytes, size_t largest, bo
  * esp_new_jpeg's allocators (jpeg_calloc_inner and jpeg_calloc_align_inner, internal RAM first in the library, and jpeg_calloc and
  * jpeg_calloc_align: its working buffers), which the linker sends here in a build with the apps (components/muse/CMakeLists.txt):
  * zeroed PSRAM, never internal RAM, which is the Link's DMA heap, and through the apps' floor (apps_port_room). NULL when the floor
- * refuses or PSRAM is out (the encoder's JPEG_ERR_NO_MEM). The library frees them with heap_caps_free. Any task.
+ * refuses or PSRAM is out (the encoder's JPEG_ERR_NO_MEM). Its frees (jpeg_free, jpeg_free_align) come here too: heap_caps_free.
+ * While the I/O worker encodes a snapshot, that task's blocks are counted with the snapshot's (apps_port_snapshot_adopt, _disown)
+ * from allocation to free, and their peak is in the encode's log line. Any task.
  */
 void *__wrap_jpeg_calloc_inner(size_t size);
 void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned);
 void *__wrap_jpeg_calloc(size_t size);
 void *__wrap_jpeg_calloc_align(size_t size, int aligned);
+void __wrap_jpeg_free(void *p);
+void __wrap_jpeg_free_align(void *p);

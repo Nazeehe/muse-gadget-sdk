@@ -174,8 +174,16 @@ static size_t psram_free_now = (size_t)3 << 20;
 static size_t psram_largest = (size_t)3 << 20;
 static atomic_int largest_asked;
 
+/* A hook a case can have run inside the free_hook_at-th next read of the free total (counting from 1): another task's change
+ * between two of the port's reads. */
+static int free_hook_at;
+static void (*free_hook)(void);
+
 size_t heap_caps_get_free_size(uint32_t caps) {
     (void)caps;
+    if (free_hook_at > 0 && --free_hook_at == 0 && free_hook != NULL) {
+        free_hook();
+    }
     return psram_free_now;
 }
 
@@ -1263,6 +1271,110 @@ static void the_wait_is_bounded_once_a_snapshot(void) {
           apps_port_snapshot_bytes(), live_blocks() - held);
 }
 
+/* Fix 1 B: the cause of the refusal is the first try's. The floor refused the app's growth, then the snapshot cut its block to the JPEG
+ * before the port looked again (here inside the wait's first read of the free total): the floor passes now, so the app tries again at
+ * once, and doesn't wait for the snapshot's end (its upload). */
+static void the_snapshot_cuts_its_block(void) {
+    struct fake_task *caller = this_task;
+    this_task = &tasks[1];  /* the snapshot's job */
+    void *jpeg = apps_port_snapshot_alloc(5000);
+    apps_port_snapshot_free(snap_block);
+    this_task = caller;
+    CHECK(jpeg != NULL, "the JPEG's block");
+    psram_free_now += snap_size - 5000;
+    snap_block = jpeg;
+    snap_size = 5000;
+}
+
+static void a_floor_refusal_waits_only_until_the_floor_passes(void) {
+    wait_case_begins();
+    int held = live_blocks();
+    psram_free_now = APPS_RAM_RESERVE + 600 * 1024;
+    snapshot_takes(434312);
+    release_at_ms = 1600;  /* the upload's end */
+    free_hook = the_snapshot_cuts_its_block;
+    free_hook_at = 2;  /* the first try's read is the first; the cut comes just after it */
+    char *a = apps_port_realloc(NULL, 200 * 1024);
+    free_hook = NULL;
+    CHECK(a != NULL, "the growth was refused");
+    CHECK(now_us / 1000 == 1000, "it waited for the snapshot's end, until %lld ms", (long long)(now_us / 1000));
+    uint32_t ms = 0;
+    CHECK(apps_port_snapshot_waits(&ms) == 0 && ms == 0, "a wait was counted: %u ms", ms);
+    apps_port_free(a);
+    release_at_ms = 0;
+    snapshot_lets_go();
+    on_delay = NULL;
+    fake_app_task = NULL;
+    psram_free_now = (size_t)3 << 20;
+    CHECK(apps_port_snapshot_bytes() == 0 && live_blocks() == held, "%zu snapshot bytes, %d blocks held", apps_port_snapshot_bytes(),
+          live_blocks() - held);
+}
+
+/* Fix 1 C: blocks the snapshot holds that the port didn't hand out (the JPEG encoder's: apps_port_snapshot_adopt) count with its own,
+ * so a growth that fits only once they are free waits for them too; apps_port_snapshot_disown takes them out again. */
+static void the_encoders_blocks_count_for_the_wait(void) {
+    wait_case_begins();
+    int held = live_blocks();
+    psram_free_now = APPS_RAM_RESERVE + 250 * 1024;  /* after both blocks, 70 KB over the reserve: 200 KB fit only with all 180 back */
+    snapshot_takes(30 * 1024);
+    void *enc = heap_caps_malloc(150 * 1024, MALLOC_CAP_SPIRAM);
+    CHECK(enc != NULL, "the encoder's block");
+    psram_free_now -= 150 * 1024;
+    size_t pixels = apps_port_snapshot_bytes();
+    apps_port_snapshot_adopt(enc);
+    CHECK(apps_port_snapshot_bytes() == pixels + heap_caps_get_allocated_size(enc), "adopted: %zu bytes, not %zu",
+          apps_port_snapshot_bytes(), pixels + heap_caps_get_allocated_size(enc));
+    /* Over the reserve only with the encoder's bytes free: it waits, and gets its block once they and the pixels are. */
+    release_at_ms = INT64_MAX;
+    int before = delays;
+    void *p = apps_port_realloc(NULL, 200 * 1024);
+    CHECK(p == NULL && delays - before == APPS_PORT_SNAPSHOT_WAIT_MS / APPS_PORT_SNAPSHOT_POLL_MS,
+          "with the encoder's bytes it should have waited its bound: %d sleeps", delays - before);
+    apps_port_free(p);
+    apps_port_snapshot_disown(enc);
+    CHECK(apps_port_snapshot_bytes() == pixels, "disowned: %zu bytes, not %zu", apps_port_snapshot_bytes(), pixels);
+    apps_port_snapshot_disown(enc);  /* a mistake: disowned twice. The count stops at 0 rather than wrap. */
+    CHECK(apps_port_snapshot_bytes() == 0, "a second disown left %zu bytes counted", apps_port_snapshot_bytes());
+    apps_port_snapshot_adopt(enc);  /* as it was, so the pixels' free below counts right */
+    apps_port_snapshot_disown(enc);
+    size_t now_counted = apps_port_snapshot_bytes();
+    CHECK(now_counted == 0, "%zu", now_counted);
+    heap_caps_free(enc);
+    psram_free_now += 150 * 1024;
+    release_at_ms = 0;
+    snapshot_lets_go();
+    uint32_t ms;
+    (void)apps_port_snapshot_waits(&ms);
+    on_delay = NULL;
+    fake_app_task = NULL;
+    psram_free_now = (size_t)3 << 20;
+    CHECK(apps_port_snapshot_bytes() == 0 && live_blocks() == held, "%zu snapshot bytes, %d blocks held", apps_port_snapshot_bytes(),
+          live_blocks() - held);
+}
+
+/* Fix 1 D: never a wait under the UI lock: the LVGL task would wait for the app task. The growth is refused at once (and the lock's
+ * breach logged, as for any heap use under it). */
+static void no_wait_under_the_ui_lock(void) {
+    wait_case_begins();
+    int held = live_blocks();
+    psram_free_now = APPS_RAM_RESERVE + 600 * 1024;
+    snapshot_takes(434312);
+    release_at_ms = 1050;
+    apps_port_ui_lock();
+    int before = delays;
+    void *p = apps_port_realloc(NULL, 200 * 1024);
+    CHECK(p == NULL && delays == before, "a growth under the UI lock waited (%d sleeps) or got its block", delays - before);
+    apps_port_ui_unlock();
+    apps_port_free(p);
+    release_at_ms = 0;
+    snapshot_lets_go();
+    on_delay = NULL;
+    fake_app_task = NULL;
+    psram_free_now = (size_t)3 << 20;
+    CHECK(apps_port_snapshot_bytes() == 0 && live_blocks() == held, "%zu snapshot bytes, %d blocks held", apps_port_snapshot_bytes(),
+          live_blocks() - held);
+}
+
 /* The screen is dark when the UI says so, and the port keeps no flag of its own: it is read at each call. */
 static void dark_follows_the_ui(void) {
     ui_is_dark = false;
@@ -2180,6 +2292,9 @@ static const struct {
     {"an_app_that_grows_during_a_snapshot_waits_then_succeeds", an_app_that_grows_during_a_snapshot_waits_then_succeeds},
     {"only_the_app_task_waits_and_only_when_it_helps", only_the_app_task_waits_and_only_when_it_helps},
     {"the_wait_is_bounded_once_a_snapshot", the_wait_is_bounded_once_a_snapshot},
+    {"a_floor_refusal_waits_only_until_the_floor_passes", a_floor_refusal_waits_only_until_the_floor_passes},
+    {"the_encoders_blocks_count_for_the_wait", the_encoders_blocks_count_for_the_wait},
+    {"no_wait_under_the_ui_lock", no_wait_under_the_ui_lock},
     {"dark_follows_the_ui", dark_follows_the_ui},
     {"the_wall_clock_counts_when_the_helper_says", the_wall_clock_counts_when_the_helper_says},
     {"alarms_and_sound_go_to_their_owners", alarms_and_sound_go_to_their_owners},

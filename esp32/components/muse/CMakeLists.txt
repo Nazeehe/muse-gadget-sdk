@@ -220,13 +220,16 @@ if(CONFIG_MUSE_APPS)
     # (the other pair): internal RAM is the Link's DMA heap (the encoder's 8 KB
     # took it under the Link's 16 KB margin). All four allocators go to
     # apps/apps_snapshot.c's, which are PSRAM only and keep the apps' floor
-    # (N1): the library calls them across its own objects, so the linker can
-    # redirect them (WHOLE_ARCHIVE links ours). The wrap is the whole image's:
+    # (N1), and its two frees too, so a snapshot counts the encoder's blocks
+    # from allocation to free: the library calls them across its own objects,
+    # so the linker can redirect them (WHOLE_ARCHIVE links ours). The wrap is the whole image's:
     # the library's JPEG decoder calls the _inner pair, so a decoder user in a
     # build with the apps gets PSRAM buffers under the floor too.
     target_link_libraries(${COMPONENT_LIB} INTERFACE
         "-Wl,--wrap=jpeg_calloc_inner"
         "-Wl,--wrap=jpeg_calloc_align_inner"
         "-Wl,--wrap=jpeg_calloc"
-        "-Wl,--wrap=jpeg_calloc_align")
+        "-Wl,--wrap=jpeg_calloc_align"
+        "-Wl,--wrap=jpeg_free"
+        "-Wl,--wrap=jpeg_free_align")
 endif()

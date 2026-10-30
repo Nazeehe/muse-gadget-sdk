@@ -262,17 +262,19 @@ class MuseAppsWiringTest(unittest.TestCase):
         # esp_new_jpeg asks for its working buffers in internal RAM first, the Link's DMA heap: on the 1.75C the encoder's 8 KB
         # took it from 24211 to 16127 bytes, under the Link's 16 KB margin; its other pair falls back to internal RAM when PSRAM is
         # out. The linker sends all four allocators to apps_snapshot.c's PSRAM ones, which keep the apps' floor (N1), in a build
-        # with the apps (where the library is).
+        # with the apps (where the library is), and its two frees too, so a snapshot counts the encoder's blocks (fix 1 A).
         cmake = (MUSE / "CMakeLists.txt").read_text()
         wrap = re.search(r"^if\(CONFIG_MUSE_APPS\)\n((?:    .*\n|\n)+?)endif\(\)", cmake, re.M)
         self.assertIsNotNone(wrap, "no if(CONFIG_MUSE_APPS) block after idf_component_register in components/muse/CMakeLists.txt")
         self.assertGreater(wrap.start(), cmake.index("idf_component_register("))
         self.assertIn('target_link_libraries(${COMPONENT_LIB} INTERFACE\n'
                       '        "-Wl,--wrap=jpeg_calloc_inner"\n        "-Wl,--wrap=jpeg_calloc_align_inner"\n'
-                      '        "-Wl,--wrap=jpeg_calloc"\n        "-Wl,--wrap=jpeg_calloc_align")', wrap.group(1))
+                      '        "-Wl,--wrap=jpeg_calloc"\n        "-Wl,--wrap=jpeg_calloc_align"\n'
+                      '        "-Wl,--wrap=jpeg_free"\n        "-Wl,--wrap=jpeg_free_align")', wrap.group(1))
         source = (MUSE / "apps/apps_snapshot.c").read_text()
         for wrapper in ("void *__wrap_jpeg_calloc_inner(size_t size) {", "void *__wrap_jpeg_calloc_align_inner(size_t size, int aligned) {",
-                        "void *__wrap_jpeg_calloc(size_t size) {", "void *__wrap_jpeg_calloc_align(size_t size, int aligned) {"):
+                        "void *__wrap_jpeg_calloc(size_t size) {", "void *__wrap_jpeg_calloc_align(size_t size, int aligned) {",
+                        "void __wrap_jpeg_free(void *p) {", "void __wrap_jpeg_free_align(void *p) {"):
             self.assertIn(wrapper, source)
         self.assertNotRegex(source, r"\bjpeg_calloc_align\(", "the masked copy is the port's (the floor's), not the library's")
 

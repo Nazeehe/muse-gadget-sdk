@@ -112,6 +112,15 @@ class AppPortTest(unittest.TestCase):
     def test_the_wait_is_bounded_once_a_snapshot(self):  # 1 s at most, stolen, then refused as ever
         self.run_case("the_wait_is_bounded_once_a_snapshot")
 
+    def test_a_floor_refusal_waits_only_until_the_floor_passes(self):  # fix 1 B: not through the upload
+        self.run_case("a_floor_refusal_waits_only_until_the_floor_passes")
+
+    def test_the_encoders_blocks_count_for_the_wait(self):  # fix 1 C: apps_port_snapshot_adopt / _disown
+        self.run_case("the_encoders_blocks_count_for_the_wait")
+
+    def test_no_wait_under_the_ui_lock(self):  # fix 1 D
+        self.run_case("no_wait_under_the_ui_lock")
+
     def test_the_screen_is_dark_when_the_ui_says_so(self):  # Task 16: timers pause while it is
         self.run_case("dark_follows_the_ui")
 

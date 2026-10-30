@@ -150,6 +150,9 @@ class AppTaskTest(HarnessCase):
     def test_a_run_is_admitted_once_the_app_it_replaces_has_gone(self):  # C1: an update of the running app, admitted after its old copy
         self.run_case("a_run_is_admitted_once_the_app_it_replaces_has_gone")
 
+    def test_the_footprint_has_the_heap_once_start_returns(self):  # fix 1 F: refreshed when start() returns, not at the settle's end
+        self.run_case("the_footprint_has_the_heap_once_start_returns")
+
     def test_the_boot_mount_waits_for_the_links_registration(self):  # I2: the registration's reply wakes the task; starting until mounted
         self.run_case("the_boot_mount_waits_for_the_links_registration")
 

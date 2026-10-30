@@ -313,10 +313,12 @@ void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event);
 #define APPS_TIMER_MIN_MS 40
 #define APPS_TIMER_MAX_MS 86400000  /* a day */
 
-/* The most VM instructions a window of one second may hold and not be hot. The 1.75C's VM runs 2.52 M a second of the cheapest
- * instruction (a loop that only counts, the count hook on: Task 27's bench fixture, 2,521,392 to 2,524,423 over three runs, as
- * Task 16 found), and a window may use 40% of the second: 1,009,163, to 0.1 M. It equals APPS_BUDGET_CALL: one callback of the
- * whole budget in a second is cool, two are hot. */
+/* The most VM instructions a window of one second may hold and not be hot. The 1.75C's VM runs 2.52 M a second of the simplest
+ * counting loop (`for i = 1, n do end`, the count hook on: Task 27's bench fixture, 2,521,392 to 2,524,423 over three runs, as
+ * Task 16 found), and a window may use 40% of the second: 1,009,163, to 0.1 M. It equals APPS_BUDGET_CALL, so one callback of
+ * the whole budget each second sits at the 40% line by count, and two are hot. By time it may be hot already: slower
+ * instructions (table and call work runs about 2.1 M a second) make a whole budget take about 476 ms, over the 400 ms that
+ * APPS_DUTY_BUSY_PCT allows. */
 #define APPS_DUTY_INSTR_PER_S 1000000u
 /* And the most of the second the calls may take (milliseconds in calls, over this percent of 1000, are hot too). */
 #define APPS_DUTY_BUSY_PCT 40

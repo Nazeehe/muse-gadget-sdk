@@ -82,6 +82,16 @@ CALL = header_number("apps_vm.h", "APPS_BUDGET_CALL")
 START = header_number("apps_vm.h", "APPS_BUDGET_START")
 DUTY = header_number("apps_rt.h", "APPS_DUTY_INSTR_PER_S")
 
+# The speed they were set from: VM instructions a second on the Waveshare 1.75C, measured on 2026-10-30 with
+# tests/muse_apps_fixtures/bench. Its `run` message starts a timer.every whose callback runs `for i = 1, n do end` (one VM
+# instruction a turn, with the count hook on) and times itself with time.mono(); a run is 21 callbacks of n = 400,000, and the
+# rate is >app.status's `instructions` after the run less before, over the time spent inside the callbacks (`busy_ms`), so the
+# gaps between ticks don't count. Three runs on one board: 2,524,423, 2,521,392 and 2,522,907 a second; this is their mean.
+# Table and call work (the fixture's `mix`) runs about 2.1 M. Re-measure this way before retuning:
+# test_the_budgets_are_the_measured_ones (test_muse_apps_svc.py) derives CALL, START and DUTY from this number, and the docs'
+# quoted speeds and times come from it (test_muse_apps_link.py).
+MEASURED_RATE = 2_522_907
+
 
 def budget_message(n):
     return f"stopped: ran more than {n} VM instructions in one callback (use timer.every for long work)"

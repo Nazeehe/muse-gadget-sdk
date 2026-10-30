@@ -35,8 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import apps_host
-from test_muse_apps_rt import (BUDGET_CALL, CALL, DUTY, HARNESS_SOURCES, INCLUDES, START, AppHostTestCase, header_number,
-                                rt_harness, unknown_handler)
+from test_muse_apps_rt import (BUDGET_CALL, CALL, DUTY, HARNESS_SOURCES, INCLUDES, MEASURED_RATE, START, AppHostTestCase,
+                                header_number, rt_harness, unknown_handler)
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
@@ -1423,13 +1423,6 @@ class TimeTest(SvcTestCase):
         for line in lines[1:4]:
             self.assertRegex(line, r"^os\.difftime: both arguments must be numbers, got ")
         self.assertEqual(lines[4], "true\tfloat")
-
-
-# The VM's speed on the Waveshare 1.75C, measured by Task 27 on 2026-10-30 (/tmp/muse-apps-log.md, "## Task 27b"; the report is
-# .superpowers/sdd/2026-10-26-muse-gadget-apps/task-27b-report.md): the bench fixture (tests/muse_apps_fixtures/bench) runs
-# `for i = 1, n do end`, one VM instruction a turn, with the count hook on; >app.status's instructions before and after a run of
-# 21 callbacks of 400,000, over the time inside the loops (E13). Three runs: 2,524,423, 2,521,392 and 2,522,907 a second.
-MEASURED_RATE = 2_522_907
 
 
 class BudgetTest(unittest.TestCase):

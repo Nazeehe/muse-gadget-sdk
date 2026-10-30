@@ -40,8 +40,7 @@ from pathlib import Path
 
 import apps_host
 from test_muse_apps_wiring import c_function, open_conditions, strip_c_comments
-from test_muse_apps_rt import header_number
-from test_muse_apps_svc import MEASURED_RATE
+from test_muse_apps_rt import MEASURED_RATE, header_number
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "main"
@@ -364,7 +363,7 @@ class GuideAndSkill(unittest.TestCase):
 
     def test_agents_md_and_kconfig_quote_the_cpu_limits_as_the_firmware_has_them(self):
         # The same numbers in esp32/AGENTS.md's "Muse apps" section and the option's Kconfig help (D12), and the speed they come
-        # from as test_muse_apps_svc.py's MEASURED_RATE has it.
+        # from as test_muse_apps_rt.py's MEASURED_RATE has it.
         call = header_number("apps_vm.h", "APPS_BUDGET_CALL")
         start = header_number("apps_vm.h", "APPS_BUDGET_START")
         duty = header_number("apps_rt.h", "APPS_DUTY_INSTR_PER_S")
@@ -387,6 +386,56 @@ class GuideAndSkill(unittest.TestCase):
                 self.assertIn(sentence, section)
         kconfig = " ".join((MUSE / "Kconfig").read_text().split())
         self.assertIn(f"runs about {rate}", kconfig)
+
+    def test_agents_md_and_kconfig_quote_the_memory_and_storage_limits_as_the_code_has_them(self):
+        # D12 for the code constants esp32/AGENTS.md's "Muse apps" section and the option's Kconfig help quote: the stacks, the
+        # snapshot's admission, the partitions, the launcher's rows, the path limit and the Link's TX margin. The measured
+        # numbers beside them (bytes free, image and RAM costs) are measurements and aren't pinned.
+        def kb(n):
+            self.assertEqual(n % 1024, 0)
+            return n // 1024
+
+        def define_kb(path, name):  # `#define NAME (n * 1024)`
+            match = re.search(rf"^#define\s+{name}\s+\((\d+) \* 1024\)", path.read_text(), re.M)
+            self.assertIsNotNone(match, f"no #define {name} in {path.name}")
+            return int(match.group(1))
+
+        task_stack = header_number("apps_task.c", "APPS_TASK_STACK")
+        io_stack = header_number("apps_io.h", "APPS_IO_STACK")
+        snapshot_mb = define_kb(APPS / "apps_snapshot.h", "APPS_SNAPSHOT_PSRAM_MIN") / 1024
+        tx_margin_kb = define_kb(MAIN / "noise_tunnel_internal.h", "NOISE_TX_DMA_RESERVE_BYTES")
+        rows = header_number("apps_lv.h", "APPS_LV_LAUNCHER_ROWS")
+        path_max = header_number("apps_pkg.h", "APPS_PATH_MAX")
+        table = {}
+        for line in (ROOT / "partitions_muse_apps.csv").read_text().splitlines():
+            cells = [c.strip() for c in line.split(",")]
+            if cells[0] in ("apps", "apps_nvs"):  # the two the overlay adds (offset and size in hex)
+                table[cells[0]] = (int(cells[3], 16), int(cells[4], 16))
+        apps_offset, apps_size = table["apps"]
+        nvs_offset, nvs_size = table["apps_nvs"]
+        self.assertEqual(apps_size % (1024 * 1024), 0)
+        words = {4: "four"}
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        for phrase in (
+                f"lists the {words[rows]} most recently used apps",
+                f"PSRAM holds the app task's {kb(task_stack)} KB stack",
+                f"free of {task_stack:,}",
+                f"the I/O worker's {kb(io_stack)} KB stack",
+                f"of {io_stack:,}, and the LVGL task",
+                f"admitted with {snapshot_mb:g} MB free",
+                f"under the Link's {tx_margin_kb} KB TX margin",
+                f"`apps`, a {apps_size // (1024 * 1024)} MB FAT at `{apps_offset:#X}`".replace("0X", "0x"),
+                f"`apps_nvs`, {kb(nvs_size)} KB at `{nvs_offset:#X}`".replace("0X", "0x"),
+                f"at most {path_max} characters"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, section)
+        kconfig = " ".join((MUSE / "Kconfig").read_text().split())
+        for phrase in (f"and a {kb(task_stack)} KB task stack",
+                       f"taken only with {snapshot_mb:g} MB free",
+                       f"{apps_size // (1024 * 1024)} MB for the apps' files and {kb(nvs_size)} KB for what they save"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, kconfig)
 
     def test_guide_says_what_the_asleep_warning_means(self):
         # Task 26: an install onto a dark screen warns "layout not checked: the screen was asleep", the firmware's MSG_ASLEEP:

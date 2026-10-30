@@ -736,8 +736,9 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   first and wait a second.
 - **Limits:** a callback may run 1,000,000 Lua VM instructions and
   `main.lua`'s top level with `start()` 2,000,000, each in at most 1 s; the
-  1.75C runs about 2.5 M instructions a second of the simplest loop (2.1 M of
-  table and call work), so that is about 0.4 s and 0.8 s.
+  1.75C runs about 2.5 M instructions a second of the simplest loop (and,
+  measured the same way, 2.1 M of table and call work), so that is about
+  0.4 s and 0.8 s.
   `tests/muse_apps_fixtures/bench` measures the speed, and `APPS_BUDGET_*`
   (`apps_vm.h`) and `APPS_DUTY_INSTR_PER_S` (`apps_rt.h`) are set from it. A
   second with more than 1,000,000 instructions or 400 ms of calls is over 40%
@@ -753,11 +754,15 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   bigger (Lua 101 KB, the JPEG encoder 30 KB, FAT 32 KB, the digit fonts
   27 KB) and an idle gadget has about 552 KB less free PSRAM, most of it that
   image, since the board runs code and constant data from PSRAM. Internal RAM
-  is the tight one: about 3.8 KB less free when idle, and its lowest since
-  boot is set while the Link's session comes up, not by apps. The deepest
-  stacks seen: the app task 13,012 bytes free of 57,344, the I/O worker 4,340
-  of 8,192, and the LVGL task 1,240 free after 128 widgets, Settings, the
-  launcher, a crash card, a snapshot and a `display.draw_file`.
+  is the tight one: about 3.8 KB less free when idle. Its lowest since boot
+  falls while the Link's session comes up and registers: the apps' Link
+  commands make the registration bigger (4,482 bytes against 2,669) and their
+  steady cost lowers that floor. On some boots it falls under 10 KB, both
+  internal and DMA-capable, which is under the Link's 16 KB TX margin; that
+  floor is an open item. The deepest stacks seen: the app task 13,012 bytes
+  free of 57,344, the I/O worker 4,340 of 8,192, and the LVGL task 1,240 free
+  after 128 widgets, Settings, the launcher, a crash card, a snapshot and a
+  `display.draw_file`.
 - **Storage:** `partitions_muse_apps.csv` is `partitions_muse.csv` with two
   partitions added and no offset moved: `apps`, a 6 MB FAT at `0x830000` (a
   folder per app), and `apps_nvs`, 64 KB at `0xE30000` (the apps' saved values
@@ -783,9 +788,10 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   string patterns, strict globals and `require` of the app's own files only;
   `setmetatable` refuses `__gc`, and every metatable C hands out is protected.
   Every value is checked before LVGL sees it, since LVGL asserts abort. Paths
-  are `a-z 0-9 _ . / -`, at most 64 characters, with no `..` and no leading
-  `/` or `.`, and the install reads only `workspace/apps/<id>/`, a path the
-  gadget makes. A file's type is its ending (`.lua` source text, `.json` that
+  are `a-z 0-9 _ . / -`, at most 64 characters, in parts split by `/`: no part
+  is empty, starts or ends with `.`, or has two dots in a row (so no `..`, and
+  no leading or trailing `/`), and the install reads only
+  `workspace/apps/<id>/`, a path the gadget makes. A file's type is its ending (`.lua` source text, `.json` that
   must parse, `.bin` an LVGL image whose header is checked), under per-file and
   per-app size limits. Keep these when changing the bindings
   (`apps_*_funcs[]`), the package rules (`apps_pkg.c`) or the install.

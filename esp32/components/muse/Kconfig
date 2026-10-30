@@ -269,10 +269,11 @@ menu "Muse"
         default n
         help
             Apps are small Lua 5.4 programs that Muse writes and installs on
-            the gadget over Home Link. A launcher one swipe from the pocket
-            watch opens them, and each runs in a sandbox with its own memory
-            cap and CPU budget, drawing its own screen. It needs PSRAM and
-            the pocket watch (MUSE_CLOCK), which the launcher hangs off.
+            the gadget over Home Link. A long press on the pocket watch opens
+            a launcher that lists them, and each runs in a sandbox with its
+            own memory cap and CPU budget, drawing its own screen. It needs
+            PSRAM and the pocket watch (MUSE_CLOCK), which the launcher hangs
+            off.
             devices/sdkconfig.muse-apps turns it on:
             MUSE_APPS=1 tools/muse/board.sh build|flash s3
             Costs, measured on the 1.75C against the same build without the

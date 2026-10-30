@@ -87,7 +87,8 @@ void *heap_caps_malloc(size_t size, uint32_t caps);
 void *heap_caps_calloc(size_t n, size_t size, uint32_t caps);
 void *heap_caps_realloc(void *ptr, size_t size, uint32_t caps);  /* apps_port_idf.c's (tests/muse_apps_port_harness.c) */
 void heap_caps_free(void *ptr);
-size_t heap_caps_get_largest_free_block(uint32_t caps);  /* what apps_io_submit no longer asks (R1) */
+size_t heap_caps_get_largest_free_block(uint32_t caps);  /* the port's floor asks (C1); apps_io_submit no longer does (R1) */
+size_t heap_caps_get_allocated_size(void *ptr);          /* the port's floor: what a block has (C1) */
 
 /* ---- FreeRTOS ---- */
 

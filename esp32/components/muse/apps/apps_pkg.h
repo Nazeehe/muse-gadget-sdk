@@ -110,6 +110,25 @@
 #define APPS_IMAGES_TOTAL_MAX (1536 * 1024)
 #define APPS_APP_MAX (2 * 1024 * 1024)
 
+/*
+ * Room for an app (C1). An app's files and its Lua heap (memory_kb) come out of the gadget's free PSRAM, and the apps always
+ * leave APPS_RAM_RESERVE of it to the rest of the gadget: Muse's session (about 430 KB while it is up, about 630 KB at the
+ * peak of a turn), LVGL's working memory, Wi-Fi's and TLS's buffers (PSRAM on the 1.75C) and a snapshot's encoder (about
+ * 460 KB that apps_port_realloc doesn't hand out). LVGL asserts, and so aborts, when it can't allocate. So:
+ * - apps_port_realloc refuses growth that would leave less than APPS_RAM_RESERVE free (apps_port.h);
+ * - an app is admitted only when free PSRAM holds the files still to be read, its heap and the reserve: the store's load
+ *   (apps_store.h), the RAM store's copies (apps_install.h), and every run once the app it replaces has gone (apps_task.h),
+ *   when its files are in PSRAM already.
+ */
+#define APPS_RAM_RESERVE (1024 * 1024)
+#define APPS_MSG_SHORT_OF_MEMORY \
+    "the gadget is short of memory for %s: %u KB free, %u KB needed; restart it or install a smaller app"
+
+/* Whether free_bytes of PSRAM hold `bytes` more for app id and still keep its heap (memory_kb) and APPS_RAM_RESERVE. False,
+ * with APPS_MSG_SHORT_OF_MEMORY in err (free_bytes and the need in KB, the need rounded up; err may be NULL), when they
+ * don't. */
+bool apps_room(size_t free_bytes, const char *id, size_t bytes, unsigned memory_kb, char *err, size_t err_len);
+
 /* What a message says of an id that isn't one, with the id as shown (apps_text_shown): the USB console's and the
  * install pipeline's. */
 #define APPS_MSG_BAD_ID "app id '%s' must match ^[a-z][a-z0-9_]{1,23}$"

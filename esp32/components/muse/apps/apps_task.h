@@ -184,14 +184,15 @@ bool apps_task_compile(const apps_pkg_t *pkg, char *err, size_t err_len);
 
 /*
  * Runs pkg, in front or behind, in place of the current app (which is stopped first), and lets it settle:
- * 1. stops and frees the current app; 2. makes the runtime with memory_kb, the package's images its assets, and
- * main.lua run; 3. calls start(); 4. publishes its table and puts the layer in front (show() follows) or behind;
+ * 1. stops and frees the current app; 2. admits the new one (C1: free PSRAM, the old app gone and pkg's files in it
+ * already, must hold memory_kb and APPS_RAM_RESERVE: apps_room, apps_pkg.h), then makes the runtime with memory_kb, the
+ * package's images its assets, and main.lua run; 3. calls start(); 4. publishes its table and puts the layer in front (show() follows) or behind;
  * 5. runs its events for settle_ms; 6. waits at most APPS_TASK_LAYOUT_MS for a pass of the apply step and adds a
  * warning for each visible widget past the round edge: "label#3 'Time's up' extends 14 px past the round edge" (its
  * text, or its kind when it has none, as messages show text: 40 bytes, control bytes as '?'), or, if no pass came,
  * "layout not checked: the screen was asleep"; 7. fills st (may be NULL).
- * True when the app is running at the end. Otherwise err says why: the runtime's own message (main.lua doesn't
- * compile), "crashed loading main.lua: <first line>", "crashed in start(): <first line>", "crashed: <first line>"
+ * True when the app is running at the end. Otherwise err says why: the admission's refusal (APPS_MSG_SHORT_OF_MEMORY),
+ * the runtime's own message (main.lua doesn't compile), "crashed loading main.lua: <first line>", "crashed in start(): <first line>", "crashed: <first line>"
  * (in the settle), or the waits' (hung, no answer in time, the queue full); st has the record as it is then.
  * pkg is a block of apps_port_realloc, as are its blobs and messages_json, and apps_task_run takes it, whatever
  * happens: it is freed (apps_pkg_free, apps_port_free) when the app ends, or at once when it doesn't run.

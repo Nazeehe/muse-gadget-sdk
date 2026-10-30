@@ -403,6 +403,7 @@ class GuideAndSkill(unittest.TestCase):
         task_stack = header_number("apps_task.c", "APPS_TASK_STACK")
         io_stack = header_number("apps_io.h", "APPS_IO_STACK")
         snapshot_mb = define_kb(APPS / "apps_snapshot.h", "APPS_SNAPSHOT_PSRAM_MIN") / 1024
+        reserve_mb = define_kb(APPS / "apps_pkg.h", "APPS_RAM_RESERVE") / 1024
         tx_margin_kb = define_kb(MAIN / "noise_tunnel_internal.h", "NOISE_TX_DMA_RESERVE_BYTES")
         rows = header_number("apps_lv.h", "APPS_LV_LAUNCHER_ROWS")
         path_max = header_number("apps_pkg.h", "APPS_PATH_MAX")
@@ -424,6 +425,7 @@ class GuideAndSkill(unittest.TestCase):
                 f"the I/O worker's {kb(io_stack)} KB stack",
                 f"of {io_stack:,}, and the LVGL task",
                 f"admitted with {snapshot_mb:g} MB free",
+                f"apps always leave {reserve_mb:g} MB of PSRAM to the rest of the gadget",
                 f"under the Link's {tx_margin_kb} KB TX margin",
                 f"`apps`, a {apps_size // (1024 * 1024)} MB FAT at `{apps_offset:#X}`".replace("0X", "0x"),
                 f"`apps_nvs`, {kb(nvs_size)} KB at `{nvs_offset:#X}`".replace("0X", "0x"),
@@ -433,9 +435,31 @@ class GuideAndSkill(unittest.TestCase):
         kconfig = " ".join((MUSE / "Kconfig").read_text().split())
         for phrase in (f"and a {kb(task_stack)} KB task stack",
                        f"taken only with {snapshot_mb:g} MB free",
+                       f"the apps always leave {reserve_mb:g} MB of it free for the rest of the firmware",
                        f"{apps_size // (1024 * 1024)} MB for the apps' files and {kb(nvs_size)} KB for what they save"):
             with self.subTest(phrase):
                 self.assertIn(phrase, kconfig)
+
+    def test_guide_says_what_room_an_app_has(self):
+        # C1's (d): an app's files and its heap share free PSRAM, less the APPS_RAM_RESERVE the apps leave to the rest of the gadget;
+        # app.api derives that room from free PSRAM (limits.room_kb) rather than quoting it, and the guide says that the largest app
+        # and the largest heap don't both fit with Muse's session up, and that updating the app that runs holds its files twice (D12:
+        # the numbers are the headers').
+        pkg = (APPS / "apps_pkg.h").read_text()
+        app = re.search(r"^#define APPS_APP_MAX \((\d+) \* 1024 \* 1024\)", pkg, re.M)
+        self.assertIsNotNone(app)
+        self.assertRegex(pkg, r"(?m)^#define APPS_RAM_RESERVE \(1024 \* 1024\)", "the reserve the guide's words rest on")
+        heap = re.search(r"config MUSE_APPS_HEAP_MAX_KB\n(?:\s+.*\n)*?\s+default (\d+)", (MUSE / "Kconfig").read_text())
+        self.assertIsNotNone(heap)
+        control = (APPS / "apps_control.c").read_text()
+        self.assertIn('"room_kb"', control)
+        self.assertIn("APPS_RAM_RESERVE", control)
+        guide = " ".join(GUIDE.read_text().split())
+        for sentence in ("`app.api`'s `limits.room_kb` is what an app's files and its `memory_kb` may take together right now",
+                         f"the {app.group(1)} MB of files and a {heap.group(1)} KB heap don't both fit",
+                         "installing the app that runs again needs room for two copies of its files"):
+            with self.subTest(sentence):
+                self.assertIn(sentence, guide)
 
     def test_guide_says_what_the_asleep_warning_means(self):
         # Task 26: an install onto a dark screen warns "layout not checked: the screen was asleep", the firmware's MSG_ASLEEP:

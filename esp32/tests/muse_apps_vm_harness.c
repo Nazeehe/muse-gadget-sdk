@@ -1408,6 +1408,8 @@ static void suggest(void) {
 static char budget_call_msg[160];
 #define WALL_MSG "stopped: one callback ran longer than 1 s"
 #define NOMEM_MSG(kb) "out of memory: this app may use " kb " KB (memory_kb in manifest.json)"
+/* A refusal of the heap's own below the cap (C1): the gadget is short, and the reason ends with the heap's peak, "<n> KB)". */
+#define SHORT_MSG_HEAD "out of memory: the gadget is short of memory (this app's heap had reached "
 
 static const char *call_name(int status) {
     switch (status) {
@@ -1932,7 +1934,9 @@ static void memory_kill(void) {
                   "coroutine.resume(co, table.unpack(args)) survived = true",
                   0, APPS_BUDGET_CALL, err, sizeof err);
     refuse_next = false;
-    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, NOMEM_MSG("256")) == 0, "resume: %s '%s'", call_name(rc), err);
+    char short_msg[160];  /* the allocator's own refusal, below the cap: the gadget is short (C1), not the cap */
+    snprintf(short_msg, sizeof short_msg, SHORT_MSG_HEAD "%zu KB)", apps_vm_mem_peak(vm) / KB);
+    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, short_msg) == 0, "resume: %s '%s'", call_name(rc), err);
     CHECK(apps_vm_mem_refusals(vm) == 1, "resume: %zu refusals", apps_vm_mem_refusals(vm));
     CHECK(raw_global(L, "survived") == LUA_TNIL, "resume: ran on after the refusal");
     lua_settop(L, 0);
@@ -1946,7 +1950,8 @@ static void memory_kill(void) {
     lua_setglobal(L, "shrug_refusal");
     rc = call(vm, "return shrug_refusal()", LUA_MULTRET, APPS_BUDGET_CALL, err, sizeof err);
     refuse_next = false;
-    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, NOMEM_MSG("256")) == 0 && lua_gettop(L) == 0, "shrugged: %s '%s', %d values",
+    snprintf(short_msg, sizeof short_msg, SHORT_MSG_HEAD "%zu KB)", apps_vm_mem_peak(vm) / KB);
+    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, short_msg) == 0 && lua_gettop(L) == 0, "shrugged: %s '%s', %d values",
           call_name(rc), err, lua_gettop(L));
     lua_settop(L, 0);
     apps_vm_free(vm);
@@ -1962,10 +1967,38 @@ static void memory_kill(void) {
     rc = call(vm, "shrug_refusal() local t = {} for i = 1, 5000 do t[i % 8 + 1] = i end survived = true", 0,
               APPS_BUDGET_CALL, err, sizeof err);
     refuse_next = false;
-    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, NOMEM_MSG("256")) == 0 && raw_global(L, "survived") == LUA_TNIL,
+    snprintf(short_msg, sizeof short_msg, SHORT_MSG_HEAD "%zu KB)", apps_vm_mem_peak(vm) / KB);
+    CHECK(rc == APPS_CALL_NOMEM && strcmp(err, short_msg) == 0 && raw_global(L, "survived") == LUA_TNIL,
           "shrug then alloc: %s '%s', survived %s", call_name(rc), err, lua_typename(L, raw_global(L, "survived")));
     lua_settop(L, 0);
     apps_vm_free(vm);
+}
+
+/* C1: a refusal of the heap's own below the cap (apps_port_realloc's floor on the gadget: free PSRAM would go under APPS_RAM_RESERVE) is the
+ * gadget's shortage, not the app's cap, and the reason says so, with what the heap had reached (its peak, in whole KB); a refusal at the cap
+ * keeps NOMEM_MSG. The pending refusal Lua retries counts as the final one it becomes. */
+static void a_refusal_below_the_cap_is_the_gadgets(void) {
+    static const char *const chunks[] = {
+        "local t = {} for i = 1, 1e6 do t[i] = {i} end survived = true",
+        "local s = {} for i = 1, 1e5 do s[i] = tostring(i) .. 'x' end survived = true",
+        "pcall(string.rep, 'x', 1 << 16) local t = {} for i = 1, 1e6 do t[i] = {i} end survived = true",
+    };
+    for (size_t i = 0; i < sizeof chunks / sizeof chunks[0]; i++) {
+        apps_vm_t *vm = new_vm(1024 * KB);
+        lua_State *L = apps_vm_lua(vm);
+        char err[512] = "", want[256];
+        grants_left = 400;
+        int rc = call(vm, chunks[i], 0, APPS_BUDGET_CALL, err, sizeof err);
+        grants_left = -1;
+        snprintf(want, sizeof want, SHORT_MSG_HEAD "%zu KB)", apps_vm_mem_peak(vm) / KB);
+        CHECK(rc == APPS_CALL_NOMEM && strcmp(err, want) == 0, "chunk %zu: %s '%s', not '%s'", i, call_name(rc), err, want);
+        CHECK(apps_vm_mem_peak(vm) < 1024 * KB, "chunk %zu: the heap reached %zu bytes: the refusal wasn't below the cap", i,
+              apps_vm_mem_peak(vm));
+        CHECK(raw_global(L, "survived") == LUA_TNIL, "chunk %zu ran on after the refusal", i);
+        lua_settop(L, 0);
+        apps_vm_free(vm);
+    }
+    expect_nomem("local t = {} for i = 1, 1e7 do t[i] = i end");  /* the cap's, as before */
 }
 
 /* ---- churn (ruling A2) ---- */
@@ -2822,6 +2855,7 @@ int main(int argc, char **argv) {
         {"short_coroutines", short_coroutines},
         {"kill_not_swallowed", kill_not_swallowed},
         {"memory_kill", memory_kill},
+        {"a_refusal_below_the_cap_is_the_gadgets", a_refusal_below_the_cap_is_the_gadgets},
         {"stack_growth_oom", stack_growth_oom},
         {"churn", churn},
         {"external_kill", external_kill},

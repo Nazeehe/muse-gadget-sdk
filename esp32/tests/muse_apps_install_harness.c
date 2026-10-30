@@ -1329,6 +1329,45 @@ static void vm_out_of_memory(void) {
     fflush(stdout);
 }
 
+/* C1's update path: while the app being installed runs, its files are in PSRAM twice until the new copy runs (the old copy goes before the
+ * new one's heap is admitted: apps_task.h). A read the floor refuses then says so, and what to do; with another app running, or none, it
+ * says only that it ran out. Every growth is refused in turn, as in vm_out_of_memory. */
+static void an_update_short_of_memory_says_it_needs_two_copies(void) {
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"lib.lua\"]}");
+    serve_text("main.lua", MAIN);
+    serve_lua("lib.lua", 3500);
+    static const char *const runs[] = {"hello", "other", ""};
+    static const char two[] = "; hello is running, and an update needs room for two copies of it: stop it, then install again";
+    for (size_t i = 0; i < ARRAY_LEN(runs); i++) {
+        snprintf(running_app, sizeof running_app, "%s", runs[i]);
+        port_growths = 0;
+        cJSON *r = apps_install_from_vm("hello", true, &VM, &OPS);
+        cJSON_Delete(r);
+        long total = port_growths;
+        int read_refusals = 0, said_two = 0;
+        for (long k = 0; k < total; k++) {
+            port_refuse = k;
+            r = apps_install_from_vm("hello", true, &VM, &OPS);
+            port_refuse = -1;
+            const cJSON *error = cJSON_GetObjectItemCaseSensitive(r, "error");
+            const char *message = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(error, "message"));
+            const char *code = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(error, "code"));
+            if (message != NULL && strncmp(message, "reading ", 8) == 0 && strstr(message, ": out of memory") != NULL) {
+                read_refusals++;
+                CHECK(code != NULL && strcmp(code, APPS_ERR_OUT_OF_MEMORY) == 0, "%s: the code %s", message, code);
+                const char *tail = strstr(message, two);
+                said_two += tail != NULL && strlen(tail) == strlen(two);
+            }
+            cJSON_Delete(r);
+            CHECK(port_held == 0, "port refusal %ld: %zu bytes held", k, port_held);
+        }
+        CHECK(read_refusals >= 4, "running '%s': %d refused reads", runs[i], read_refusals);
+        CHECK(said_two == (i == 0 ? read_refusals : 0), "running '%s': %d of %d refused reads say the update needs two copies", runs[i],
+              said_two, read_refusals);
+    }
+    running_app[0] = '\0';
+}
+
 /* A package for the store, as an install builds it: every block from apps_port_realloc. */
 static apps_pkg_t *make_pkg(const char *id, const char *name, const char *main_src) {
     apps_pkg_t *p = apps_port_realloc(NULL, sizeof *p);
@@ -1818,6 +1857,7 @@ int main(int argc, char **argv) {
         {"unchanged", unchanged},
         {"vm_refusals", vm_refusals},
         {"vm_out_of_memory", vm_out_of_memory},
+        {"an_update_short_of_memory_says_it_needs_two_copies", an_update_short_of_memory_says_it_needs_two_copies},
         {"ram_store", ram_store},
         {"ram_budget", ram_budget},
         {"results_are_utf8", results_are_utf8},

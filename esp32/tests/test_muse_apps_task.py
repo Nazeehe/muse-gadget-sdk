@@ -127,6 +127,9 @@ class AppTaskTest(HarnessCase):
     def test_a_new_app_is_published_after_the_old_ones_reset(self):  # the reset's invariants
         self.run_case("a_new_run_replaces_the_app")
 
+    def test_a_run_is_admitted_once_the_app_it_replaces_has_gone(self):  # C1: an update of the running app, admitted after its old copy
+        self.run_case("a_run_is_admitted_once_the_app_it_replaces_has_gone")
+
     def test_a_crash_in_start_is_contained(self):  # crash containment follows the teardown order
         self.run_case("a_crash_in_start_is_contained")
 

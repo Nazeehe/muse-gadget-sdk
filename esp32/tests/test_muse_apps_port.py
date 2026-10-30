@@ -97,6 +97,9 @@ class AppPortTest(unittest.TestCase):
     def test_each_kind_of_breach_is_logged_once(self):  # F11
         self.run_case("breach_kinds")
 
+    def test_the_psram_floor_refuses_growth_and_never_a_shrink(self):  # C1: a clean out of memory, never LVGL's abort
+        self.run_case("psram_floor")
+
     def test_the_screen_is_dark_when_the_ui_says_so(self):  # Task 16: timers pause while it is
         self.run_case("dark_follows_the_ui")
 

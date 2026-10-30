@@ -59,6 +59,7 @@
 #define CRASH_LINES 10   /* the log lines a crash's message shows */
 
 #define MSG_NO_MEMORY "out of memory: no room for the install"
+#define MSG_TWO_COPIES "; %s is running, and an update needs room for two copies of it: stop it, then install again"
 #define MSG_TOO_LARGE "%s is larger than %u KB"  /* a file over its kind's limit, whichever source read it */
 
 static const char *TAG = "muse_apps";
@@ -709,6 +710,18 @@ static cJSON *run_pkg(install_t *in, const apps_install_ops_t *ops, const char *
     return r;
 }
 
+/* C1's update path: while the app being installed runs, its files are in PSRAM twice until the new copy runs (the old copy goes
+ * before the new one's heap is admitted: apps_task.h). A read that ran out of memory (code) then says so, and what to do, after
+ * the source's words in raw. */
+static void say_two_copies(const char *id, const char *code, char *raw, size_t raw_len) {
+    char running[APPS_ID_MAX + 1];
+    size_t used = strlen(raw);
+    if (code != NULL && strcmp(code, APPS_ERR_OUT_OF_MEMORY) == 0 && apps_task_running(running, sizeof running) &&
+        strcmp(running, id) == 0 && used < raw_len) {
+        snprintf(raw + used, raw_len - used, MSG_TWO_COPIES, id);
+    }
+}
+
 /* Steps 2 to 7, for apps_install_run. */
 static cJSON *install(install_t *in, const char *id, bool run, const apps_source_t *src, const apps_install_ops_t *ops) {
     const int64_t deadline_us = (apps_port_mono_ms() + APPS_INSTALL_DEADLINE_MS) * 1000;
@@ -717,6 +730,7 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
     size_t len = 0;
     const char *code = NULL;
     if (!src->read(src->ctx, "manifest.json", APPS_MANIFEST_MAX, deadline_us, &data, &len, &code, in->raw, sizeof in->raw)) {
+        say_two_copies(id, code, in->raw, sizeof in->raw);
         return failure(code != NULL ? code : APPS_ERR_READ_FAILED, in->raw);
     }
     if (len > APPS_MANIFEST_MAX) {
@@ -746,6 +760,7 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
         size_t max = apps_file_max(kind);  /* the manifest's parse checked the type: never 0 */
         code = NULL;
         if (!src->read(src->ctx, rel, max, deadline_us, &data, &len, &code, in->raw, sizeof in->raw)) {
+            say_two_copies(id, code, in->raw, sizeof in->raw);
             return failure(code != NULL ? code : APPS_ERR_READ_FAILED, in->raw);
         }
         apps_blob_t *b = &pkg->files[pkg->count++];  /* the package's from here: apps_pkg_free frees it */
@@ -1036,22 +1051,19 @@ static size_t copy_bytes(const apps_pkg_t *pkg, bool with_struct) {
 }
 
 /*
- * Room for a copy of `bytes` for the app id whose heap is memory_kb: free PSRAM after the copy at least memory_kb and
- * APPS_RAM_RESERVE. Short of that, the oldest packages go, one at a time, looking again after each (never id's or the
- * app's that runs). False, with the refusal in err, when it is short still. *dropped counts what went.
+ * Room for a copy of `bytes` for the app id whose heap is memory_kb (apps_room: free PSRAM after the copy at least memory_kb
+ * and APPS_RAM_RESERVE). Short of that, the oldest packages go, one at a time, looking again after each (never id's or the
+ * app's that runs). False, with the refusal in err, when it is short still; err is untouched otherwise. *dropped counts what
+ * went.
  */
 static bool ram_room(const char *id, size_t bytes, unsigned memory_kb, int *dropped, char *err, size_t err_len) {
-    size_t need = bytes + (size_t)memory_kb * 1024 + APPS_RAM_RESERVE;
     for (;;) {
         size_t free_now = apps_port_psram_free();
-        if (free_now >= need) {
+        if (apps_room(free_now, id, bytes, memory_kb, NULL, 0)) {
             return true;
         }
         if (!ram_drop_oldest(id)) {
-            snprintf(err, err_len,
-                     "the gadget is short of memory for %s: %u KB free, %u KB needed; restart it or install a smaller app",
-                     id, (unsigned)(free_now / 1024), (unsigned)((need + 1023) / 1024));
-            return false;
+            return apps_room(free_now, id, bytes, memory_kb, err, err_len);  /* false, with the refusal */
         }
         (*dropped)++;
     }

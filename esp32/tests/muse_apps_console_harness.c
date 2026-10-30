@@ -294,9 +294,11 @@ void apps_port_keep_awake(bool on) {
 
 void apps_port_exit(void) {}
 
-/* The store's room: plenty (tests/test_muse_apps_install.py has the budget). */
+/* The store's room: plenty (tests/test_muse_apps_install.py has the budget), unless a case says otherwise (app.api's room_kb). */
+static size_t psram_free = (size_t)64 << 20;
+
 size_t apps_port_psram_free(void) {
-    return (size_t)64 << 20;
+    return psram_free;
 }
 
 void apps_port_log(const char *app_id, const char *line) {
@@ -2643,6 +2645,25 @@ static void json_object_valid(void) {
     CHECK(!muse_apps_json_object_valid(deep, n, err, sizeof err), "20 levels deep");
 }
 
+/* C1: app.api's limits.room_kb is what an app's files and its heap may take together now: free PSRAM less APPS_RAM_RESERVE, in whole KB,
+ * and 0 when less than the reserve is free. */
+static void api_room_follows_free_psram(void) {
+    const char *code = NULL, *err = NULL;
+    muse_apps_set_vm_ops(&FAKE_VM);
+    static const struct {
+        size_t free;
+        const char *room;
+    } cases[] = {{APPS_RAM_RESERVE + 300 * 1024 + 1023, "300"}, {APPS_RAM_RESERVE, "0"}, {APPS_RAM_RESERVE - 1, "0"}, {0, "0"}};
+    for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
+        psram_free = cases[i].free;
+        CHECK(muse_apps_write_guide(on_done, NULL, &code, &err), "not queued: %s: %s", code, err);
+        run_jobs();
+        CHECK_AT(done_result, "payload.limits.room_kb", cases[i].room);
+        forget_writes();
+    }
+    psram_free = (size_t)64 << 20;
+}
+
 /*
  * app.api (D2, and D3 as the user decided it): one job of the I/O worker writes the guide and the timer example (the firmware's
  * own bytes: EMBED_FILES) to workspace/apps/_guide/ on the VM, logging the DMA RAM's free and lowest marks before and after, and
@@ -2709,6 +2730,7 @@ static void guide_written_or_inline(void) {
     CHECK_AT(done_result, "payload.limits.timers", "16");
     CHECK_AT(done_result, "payload.limits.alarms", "4");
     CHECK_AT(done_result, "payload.limits.store_kb", "16");
+    CHECK_AT(done_result, "payload.limits.room_kb", "64512");
     CHECK_AT(done_result, "payload.storage", "ram");
     CHECK_AT(done_result, "payload.hint", APPS_RAM_HINT);
     CHECK_AT(done_result, "payload.apps", "[{\"id\":\"timer\",\"name\":\"Timer\",\"version\":\"0.3\",\"state\":\"stopped\"},"
@@ -2945,6 +2967,7 @@ int main(int argc, char **argv) {
         {"control_send_deadline", control_send_deadline},
         {"json_object_valid", json_object_valid},
         {"guide_written_or_inline", guide_written_or_inline},
+        {"api_room_follows_free_psram", api_room_follows_free_psram},
         {"the_stage_is_bounded", the_stage_is_bounded},
         {"empty_and_missing_files", empty_and_missing_files},
         {"console_stack", console_stack},

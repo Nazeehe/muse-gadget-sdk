@@ -209,6 +209,18 @@ apps_file_kind_t apps_file_kind(const char *path) {
     return APPS_FILE_BAD;
 }
 
+bool apps_room(size_t free_bytes, const char *id, size_t bytes, unsigned memory_kb, char *err, size_t err_len) {
+    size_t need = bytes + (size_t)memory_kb * 1024 + APPS_RAM_RESERVE;
+    if (free_bytes >= need) {
+        return true;
+    }
+    if (err != NULL && err_len > 0) {
+        snprintf(err, err_len, APPS_MSG_SHORT_OF_MEMORY, id != NULL ? id : "", (unsigned)(free_bytes / 1024),
+                 (unsigned)((need + 1023) / 1024));
+    }
+    return false;
+}
+
 size_t apps_file_max(apps_file_kind_t kind) {
     switch (kind) {
     case APPS_FILE_LUA:

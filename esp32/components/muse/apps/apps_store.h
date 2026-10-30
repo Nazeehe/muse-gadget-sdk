@@ -189,9 +189,11 @@ void apps_store_sync_alarms(const char *id, const apps_store_name_t *names, int 
 /*
  * A fresh deep copy of id's package into pkg (a caller's apps_pkg_t, overwritten), every block of it from apps_port_realloc, for the
  * caller to free (apps_pkg_free with apps_port_free) or to give to apps_task_run, and the app made the most recent (a load is for a run).
- * The manifest's bytes and parse, and every file it lists with its SHA-256. False, with pkg zeroed and why in err: "no such app on the
- * gadget", "storage not ready", the quarantine's refusal, "the stored copy of <id> is damaged (<what>); install it again", "out of
- * memory: no room to load the app", or the RAM store's (RAM: apps_ram_load).
+ * The manifest's bytes and parse, and every file it lists with its SHA-256. FLASH admits the load first (C1, apps_room in apps_pkg.h):
+ * free PSRAM must hold the files (their sizes on the FAT), the heap (none for the app that runs: a launch of it only fronts it) and
+ * APPS_RAM_RESERVE. False, with pkg zeroed and why in err: "no such app on the gadget", "storage not ready", the quarantine's refusal,
+ * the admission's (APPS_MSG_SHORT_OF_MEMORY), "the stored copy of <id> is damaged (<what>); install it again", "out of memory: no room
+ * to load the app", or the RAM store's (RAM: apps_ram_load).
  */
 bool apps_store_load(const char *id, apps_pkg_t *pkg, char *err, size_t n);
 

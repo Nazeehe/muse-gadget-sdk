@@ -420,6 +420,9 @@ class Console(unittest.TestCase):
     def test_guide_written_or_inline(self):  # D2, D3: the firmware's bytes to the VM, or inline when a write is refused
         self.run_case("guide_written_or_inline")
 
+    def test_api_room_follows_free_psram(self):  # C1: limits.room_kb, free PSRAM less the reserve, derived and not quoted
+        self.run_case("api_room_follows_free_psram")
+
     def test_api_fonts_are_the_ui_fonts(self):
         # app.api's "fonts" are the ui module's (apps_ui.c's apps_ui_fonts[]), in its order.
         def names(source, array):

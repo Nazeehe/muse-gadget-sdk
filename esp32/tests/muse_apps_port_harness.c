@@ -36,6 +36,13 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#define usable_size(p) malloc_size(p)
+#else
+#include <malloc.h>
+#define usable_size(p) malloc_usable_size(p)
+#endif
 
 #include "apps_alarm.h"
 #include "apps_echo.h"
@@ -161,9 +168,25 @@ void *heap_caps_malloc(size_t size, uint32_t caps) {
     return block;
 }
 
+/* What the heap says of PSRAM: free and the largest free block, which a case sets; and how often the port asked for the
+ * largest block, which the gadget's heap works out by walking every block. */
+static size_t psram_free_now = (size_t)3 << 20;
+static size_t psram_largest = (size_t)3 << 20;
+static atomic_int largest_asked;
+
 size_t heap_caps_get_free_size(uint32_t caps) {
     (void)caps;
-    return (size_t)3 << 20;
+    return psram_free_now;
+}
+
+size_t heap_caps_get_largest_free_block(uint32_t caps) {
+    (void)caps;
+    atomic_fetch_add(&largest_asked, 1);
+    return psram_largest;
+}
+
+size_t heap_caps_get_allocated_size(void *ptr) {
+    return usable_size(ptr);
 }
 
 void heap_caps_free(void *ptr) {
@@ -922,6 +945,69 @@ static void breach_kinds(void) {
     for (int i = 0; i < 3 && i < n_logged; i++) {
         CHECK(strcmp(logged[i], want[i]) == 0, "log %d: '%s', not '%s'", i, logged[i], want[i]);
     }
+}
+
+/*
+ * C1: the floor. Growth that would leave less than APPS_RAM_RESERVE of PSRAM free is refused (NULL, the block as it was), and
+ * so is a block of APPS_FLOOR_BIG_BLOCK or more that would leave the largest free block under it; a shrink, or growth within
+ * the block it has, never is, however short PSRAM is (vm_alloc takes a refused shrink for running out). A smaller request
+ * never asks for the largest block, which the gadget works out by walking the heap.
+ */
+static void psram_floor(void) {
+    apps_port_init();
+    int held = live_blocks();  /* the echo's queue */
+    psram_free_now = psram_largest = (size_t)3 << 20;
+    char *a = apps_port_realloc(NULL, 1000);
+    CHECK(a != NULL, "a block with room");
+    memset(a, 'x', 1000);
+    size_t have = heap_caps_get_allocated_size(a);
+    psram_free_now = APPS_RAM_RESERVE + 1000;
+    char *b = apps_port_realloc(a, have + 1001);
+    CHECK(b == NULL, "growth of 1001 bytes left less than the reserve");
+    if (b != NULL) {
+        a = b;
+    } else {
+        CHECK(a[0] == 'x' && a[999] == 'x' && heap_caps_get_allocated_size(a) == have, "the refused block is as it was");
+    }
+    b = apps_port_realloc(a, have + 1000);
+    CHECK(b != NULL, "growth down to the reserve itself was refused");
+    a = b != NULL ? b : a;
+    psram_free_now = APPS_RAM_RESERVE + 99;
+    void *refused = apps_port_realloc(NULL, 100);
+    CHECK(refused == NULL, "a new block of 100 bytes left less than the reserve");
+    apps_port_free(refused);
+    void *fits = apps_port_realloc(NULL, 99);
+    CHECK(fits != NULL, "a new block down to the reserve was refused");
+    apps_port_free(fits);
+
+    psram_free_now = psram_largest = 0;
+    b = apps_port_realloc(a, heap_caps_get_allocated_size(a));
+    CHECK(b != NULL, "growth within the block was refused");
+    a = b != NULL ? b : a;
+    b = apps_port_realloc(a, 10);
+    CHECK(b != NULL, "a shrink was refused");
+    a = b != NULL ? b : a;
+    apps_port_free(a);
+
+    psram_free_now = (size_t)3 << 20;
+    psram_largest = APPS_RAM_RESERVE + 64 * 1024 - 1;
+    int asked = atomic_load(&largest_asked);
+    refused = apps_port_realloc(NULL, 64 * 1024);
+    CHECK(refused == NULL, "a block of 64 KB left the largest free block under the reserve");
+    apps_port_free(refused);
+    CHECK(atomic_load(&largest_asked) == asked + 1, "the big block asked for the largest free block once");
+    psram_largest = APPS_RAM_RESERVE + 64 * 1024;
+    void *big = apps_port_realloc(NULL, 64 * 1024);
+    CHECK(big != NULL, "a block of 64 KB that leaves the reserve whole was refused");
+    apps_port_free(big);
+    psram_largest = 0;
+    asked = atomic_load(&largest_asked);
+    void *small = apps_port_realloc(NULL, APPS_FLOOR_BIG_BLOCK - 1);
+    CHECK(small != NULL, "a block under APPS_FLOOR_BIG_BLOCK was held to the largest free block");
+    CHECK(atomic_load(&largest_asked) == asked, "a block under APPS_FLOOR_BIG_BLOCK walked the heap");
+    apps_port_free(small);
+    psram_free_now = psram_largest = (size_t)3 << 20;
+    CHECK(live_blocks() == held, "%d blocks held", live_blocks() - held);
 }
 
 /* The screen is dark when the UI says so, and the port keeps no flag of its own: it is read at each call. */
@@ -1836,6 +1922,7 @@ static const struct {
     {"echo_queue_is_bounded", echo_queue_is_bounded},
     {"echo_drain_holds_the_console", echo_drain_holds_the_console},
     {"breach_kinds", breach_kinds},
+    {"psram_floor", psram_floor},
     {"dark_follows_the_ui", dark_follows_the_ui},
     {"the_wall_clock_counts_when_the_helper_says", the_wall_clock_counts_when_the_helper_says},
     {"alarms_and_sound_go_to_their_owners", alarms_and_sound_go_to_their_owners},

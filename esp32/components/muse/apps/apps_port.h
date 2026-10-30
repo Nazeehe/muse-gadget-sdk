@@ -44,7 +44,13 @@ bool apps_port_dark(void);
 
 /* The apps' heap: PSRAM on the device. realloc(3) for n > 0: ptr NULL allocates, otherwise the block is
  * resized and may move; on failure it returns NULL and leaves ptr as it was. It is never called with
- * n == 0. A block comes back with apps_port_free, never with free(). Any task. */
+ * n == 0. A block comes back with apps_port_free, never with free(). Any task.
+ * The floor (C1, apps_pkg.h's room): on the device a request that grows a block (n above what the block has,
+ * heap_caps_get_allocated_size) fails when it would leave less than APPS_RAM_RESERVE of PSRAM free, and one of
+ * APPS_FLOOR_BIG_BLOCK bytes or more also when the largest free block less n would be under it (the heap works
+ * that out by walking every block, so a smaller request doesn't ask). A shrink, or growth within the block, never
+ * fails. So the apps run out of memory cleanly, and the rest of the gadget never does because of them. */
+#define APPS_FLOOR_BIG_BLOCK (16 * 1024)
 void *apps_port_realloc(void *ptr, size_t n);
 void apps_port_free(void *ptr);  /* NULL is ignored. Any task. */
 

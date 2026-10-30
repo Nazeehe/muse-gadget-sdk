@@ -482,6 +482,14 @@ static bool add_facts(cJSON *p) {
         cJSON_Delete(l);
         return false;
     }
+    /* C1: what an app's files and its heap may take together now, free PSRAM less the reserve the apps leave the gadget
+     * (apps_pkg.h): derived, not quoted, since Muse's session, the app that runs and a snapshot all move it. */
+    size_t free_now = apps_port_psram_free();
+    double room_kb = free_now > APPS_RAM_RESERVE ? (double)((free_now - APPS_RAM_RESERVE) / 1024) : 0;
+    if (l != NULL && cJSON_AddNumberToObject(l, "room_kb", room_kb) == NULL) {
+        cJSON_Delete(l);
+        return false;
+    }
     if (!add_item(p, "limits", l)) {
         return false;
     }

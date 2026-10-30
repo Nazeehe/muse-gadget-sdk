@@ -751,9 +751,13 @@ void apps_port_sound_stop(void) {
     apps_alarm_ring_stop();
 }
 
-/* Free PSRAM, for the RAM store's room (the store class): plenty. */
+/* Free PSRAM: plenty, for the RAM store's room (the store class); or, once a case sets psram_total, that total less what the apps'
+ * heap holds (C1's run admission). */
+static _Atomic size_t psram_total;
+
 size_t apps_port_psram_free(void) {
-    return (size_t)64 << 20;
+    size_t total = atomic_load(&psram_total), held = held_now(&port_held);
+    return total == 0 ? (size_t)64 << 20 : held < total ? total - held : 0;
 }
 
 /* The end of a console reply (apps_port_idf.c's on the gadget). */
@@ -2189,6 +2193,41 @@ static void a_new_run_replaces_the_app(void) {
     ORDERED(from, "reset", "free image one/a.bin");
     ORDERED(from, "log I stop one: replaced, peak ", "log I launch two (256 KB)");
     WAIT(from, "object image two/a.bin");
+}
+
+/* C1: a run is admitted once the app it replaces has gone: free PSRAM (here a total less what the apps' heap holds) must then hold the new
+ * app's heap (memory_kb) and APPS_RAM_RESERVE, its files being in PSRAM already. Short of that the run is refused in the RAM store's words:
+ * nothing of it runs, the record says why, and its package goes at once. */
+static void a_run_is_admitted_once_the_app_it_replaces_has_gone(void) {
+    char err[300], want[200];
+    CHECK(apps_task_run(make_pkg("one", "One", PICTURE, 2), true, 100, NULL, err, sizeof err), "run one: %s", err);
+    WAIT(0, "object image one/a.bin");
+    size_t with_one = held_now(&port_held);
+    apps_pkg_t *two = make_pkg("two", "Two", PICTURE, 2);
+    size_t two_bytes = held_now(&port_held) - with_one;
+    atomic_store(&psram_total, two_bytes + 256 * 1024 + APPS_RAM_RESERVE);  /* short while one runs, exactly enough once it has gone */
+    int from = mark();
+    CHECK(apps_task_run(two, true, 100, NULL, err, sizeof err), "two is admitted once one has gone: %s", err);
+    ORDERED(from, "log I stop one: replaced, peak ", "log I launch two (256 KB)");
+    WAIT(from, "object image two/a.bin");
+    size_t with_two = held_now(&port_held);
+    apps_pkg_t *three = make_pkg("three", "Three", PICTURE, 2);
+    size_t three_bytes = held_now(&port_held) - with_two;
+    atomic_store(&psram_total, three_bytes + 256 * 1024 + APPS_RAM_RESERVE - 1);
+    snprintf(want, sizeof want, "the gadget is short of memory for three: %u KB free, %u KB needed; restart it or install a smaller app",
+             (unsigned)((256 * 1024 + APPS_RAM_RESERVE - 1) / 1024), (unsigned)((256 * 1024 + APPS_RAM_RESERVE) / 1024));
+    apps_status_t *st = new_status();
+    from = mark();
+    CHECK(!apps_task_run(three, true, 100, st, err, sizeof err) && strcmp(err, want) == 0, "short by a byte: '%s'", err);
+    CHECK(st->state == APPS_STATE_STOPPED && strcmp(st->id, "three") == 0 && strcmp(st->last_error, want) == 0, "the record: %s %s '%s'",
+          apps_state_name(st->state), st->id, st->last_error);
+    CHECK(at_from(from, "log I stop two: replaced, peak ") >= 0, "two ended first");
+    WAIT(from, "free pkg three");
+    CHECK(count_from(from, "log W launch three: no app: the gadget is short of memory for three") == 1, "the refusal is logged once");
+    ABSENT(from, "print three");
+    ABSENT(from, "set_ui table#");
+    heap_caps_free(st);
+    atomic_store(&psram_total, 0);
 }
 
 static const char APP_START_CRASH[] =
@@ -6390,6 +6429,7 @@ int main(int argc, char **argv) {
         {"stop_tears_down_in_order", stop_tears_down_in_order},
         {"a_late_reset_parks_the_images", a_late_reset_parks_the_images},
         {"a_new_run_replaces_the_app", a_new_run_replaces_the_app},
+        {"a_run_is_admitted_once_the_app_it_replaces_has_gone", a_run_is_admitted_once_the_app_it_replaces_has_gone},
         {"a_crash_in_start_is_contained", a_crash_in_start_is_contained},
         {"a_crash_in_a_callback_is_contained", a_crash_in_a_callback_is_contained},
         {"a_crash_at_the_top_level_is_contained", a_crash_at_the_top_level_is_contained},

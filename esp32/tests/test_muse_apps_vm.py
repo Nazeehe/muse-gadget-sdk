@@ -163,6 +163,9 @@ class MuseAppsVmTest(unittest.TestCase):
     def test_memory_exhaustion_is_a_kill(self):
         self.run_case("memory_kill", timeout=10)
 
+    def test_a_refusal_below_the_cap_is_the_gadgets(self):  # C1: the floor's refusal says the gadget is short, not "raise memory_kb"
+        self.run_case("a_refusal_below_the_cap_is_the_gadgets", timeout=10)
+
     def test_stack_growth_oom_not_swallowed(self):
         # Regression for the generic-for closing value that swallowed an out-of-memory error
         # through a Lua stack-growth refusal its own retry cleared. Sweeps a cap window.

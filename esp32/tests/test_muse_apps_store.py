@@ -177,6 +177,9 @@ class Store(unittest.TestCase):
     def test_out_of_memory_reading_the_manifest_is_not_damage(self):  # T
         self.run_case("out_of_memory_reading_the_manifest")
 
+    def test_a_load_is_admitted_against_free_psram(self):  # C1: the files, the heap and APPS_RAM_RESERVE, or a clean refusal
+        self.run_case("a_load_is_admitted_against_free_psram")
+
     def test_the_launchers_order_is_the_stores(self):  # P2: installs and launches, across a remount with no clock
         self.run_case("order_follows_installs_and_launches")
 

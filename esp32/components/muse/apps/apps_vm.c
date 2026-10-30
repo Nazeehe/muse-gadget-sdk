@@ -66,6 +66,8 @@ struct apps_vm {
     bool oom_gc_ran;              /* an emergency collection ran since, so a retry may now pass */
     void *oom_ptr;                /* the pending refusal's request */
     size_t oom_osize, oom_nsize;
+    bool oom_short;               /* the final refusal was the heap's own, below the cap: the gadget is short (C1) */
+    bool oom_pending_short;       /* and the pending one's */
 
     /* Only the task running the VM touches these. */
     int depth;                   /* apps_vm_call nesting: 0 between calls */
@@ -188,21 +190,26 @@ static void *vm_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
     }
     bool retry = vm->oom_retry && vm->oom_gc_ran && ptr == vm->oom_ptr && osize == vm->oom_osize &&
                  nsize == vm->oom_nsize;
-    if (vm->oom_retry && !retry && !emergency) {
+    if (vm->oom_retry && !retry && !emergency && !vm->oom) {
         vm->oom = true;  /* the pending refusal was never Lua's identical post-collection retry */
+        vm->oom_short = vm->oom_pending_short;
     }
     if (!emergency) {
         vm->oom_retry = false;
         vm->oom_gc_ran = false;
     }
     void *block = NULL;
-    if (nsize <= old || nsize - old <= vm->cfg.mem_limit - vm->mem_used) {
+    bool within = nsize <= old || nsize - old <= vm->cfg.mem_limit - vm->mem_used;  /* under the cap: a refusal is the heap's */
+    if (within) {
         block = vm->cfg.realloc_fn(ptr, nsize);
     }
     if (block == NULL) {
         vm->mem_refusals++;
         bool final = retry || (vm->L != NULL && G(vm->L)->gcstopem);
         if (final) {
+            if (!vm->oom) {
+                vm->oom_short = within;
+            }
             vm->oom = true;  /* a retry that failed again, or a refusal Lua won't retry */
         } else if (!emergency) {
             vm->oom_retry = true;
@@ -210,6 +217,7 @@ static void *vm_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
             vm->oom_ptr = ptr;
             vm->oom_osize = osize;
             vm->oom_nsize = nsize;
+            vm->oom_pending_short = within;
         }
         return NULL;
     }
@@ -748,11 +756,16 @@ static void kill_over_budget(apps_vm_t *vm) {
 }
 
 /* Out of memory: a refusal no retry answered, or a LUA_ERRMEM, which error() can also raise
- * with Lua's own message (ruling A2, amended). */
+ * with Lua's own message (ruling A2, amended). A refusal of the heap's own below the cap (the
+ * gadget's floor, apps_port.h) is the gadget's shortage, not the app's cap, and says so. */
 static void kill_for_memory(apps_vm_t *vm) {
     if (kill_reason(vm) == NULL) {
-        set_kill(vm, format_reason(vm->nomem_reason, "out of memory: this app may use ",
-                                   (unsigned)(vm->cfg.mem_limit / 1024), " KB (memory_kb in manifest.json)"));
+        bool short_of_memory = vm->oom ? vm->oom_short : vm->oom_retry && vm->oom_pending_short;
+        set_kill(vm, short_of_memory
+                         ? format_reason(vm->nomem_reason, "out of memory: the gadget is short of memory (this app's heap had reached ",
+                                         (unsigned)(vm->mem_peak / 1024), " KB)")
+                         : format_reason(vm->nomem_reason, "out of memory: this app may use ",
+                                         (unsigned)(vm->cfg.mem_limit / 1024), " KB (memory_kb in manifest.json)"));
     }
 }
 

@@ -183,6 +183,9 @@ class Install(unittest.TestCase):
     def test_vm_out_of_memory(self):  # every block refused in turn, the sink's included
         self.run_case("vm_out_of_memory")
 
+    def test_an_update_short_of_memory_says_it_needs_two_copies(self):  # C1: the running app's update holds its files twice
+        self.run_case("an_update_short_of_memory_says_it_needs_two_copies")
+
     def test_the_ram_store(self):  # C4, E26; F1's list, most recent first; the cap drops the oldest
         self.run_case("ram_store")
 

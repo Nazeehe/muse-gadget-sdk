@@ -747,7 +747,13 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
 - **Memory:** PSRAM holds the app task's 56 KB stack, the running app's Lua
   heap (its manifest's `memory_kb`, at most `MUSE_APPS_HEAP_MAX_KB`), the I/O
   worker's 8 KB stack and, while one is taken, a snapshot (admitted with 1.5 MB
-  free; about 0.9 MB used). The stacks can be in PSRAM because the 1.75C's
+  free; about 0.9 MB used). The apps always leave 1 MB of PSRAM to the rest of
+  the gadget (`APPS_RAM_RESERVE`, `apps_pkg.h`): Muse's session takes about
+  430 KB while it is up and about 630 KB at the peak of a turn, and LVGL aborts
+  when it can't allocate. So `apps_port_realloc` refuses growth below it (the
+  app, an install's read or a load ends out of memory, cleanly), a load and
+  every run are admitted only with room for the app's files, its heap and the
+  reserve, and `app.api` gives what is left as `limits.room_kb`. The stacks can be in PSRAM because the 1.75C's
   `CONFIG_SPIRAM_FETCH_INSTRUCTIONS` and `CONFIG_SPIRAM_RODATA` keep the cache
   on while flash is written; `apps_io.c` refuses to build without them.
   Against the same build without the option, the image is 441,064 bytes

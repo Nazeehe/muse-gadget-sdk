@@ -289,8 +289,9 @@ menu "Muse"
               (SPIRAM_XIP_FROM_PSRAM), so the extra flash costs as much PSRAM.
               The rest is 16 KB of static data, the runtime's buffers and a
               56 KB task stack. A running app adds its Lua heap (up
-              to MUSE_APPS_HEAP_MAX_KB), and a snapshot is taken only with
-              1.5 MB free (it used about 0.9 MB).
+              to MUSE_APPS_HEAP_MAX_KB), the apps always leave 1 MB of it
+              free for the rest of the firmware, and a snapshot is taken only
+              with 1.5 MB free (it used about 0.9 MB).
             - Internal RAM: about 3.8 KB less free when idle (27,539 against
               31,379 bytes), 1.9 KB of it DMA-capable.
             - Two flash partitions: 6 MB for the apps' files and 64 KB for

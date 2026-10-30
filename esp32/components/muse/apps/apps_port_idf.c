@@ -108,9 +108,37 @@ bool apps_port_dark(void) {
     return muse_ui_dark();
 }
 
+/*
+ * The floor (C1, apps_port.h): growth that would leave the rest of the gadget less than APPS_RAM_RESERVE of PSRAM is refused,
+ * so an app, a package's read and the install's blocks run out of memory cleanly and LVGL (which asserts) never does because
+ * of them. Free PSRAM is a counter; the largest free block is a walk of the heap under its lock, so only a big request asks,
+ * which is also the only kind that can take a big piece of the largest block. The check and the allocation aren't atomic:
+ * another task's allocation in between can take a little of the reserve, which is why it is a reserve and not an edge.
+ */
+static bool room_to_grow(void *ptr, size_t n) {
+    size_t had = ptr != NULL ? heap_caps_get_allocated_size(ptr) : 0;
+    if (n <= had) {
+        return true;  /* a shrink, or growth within the block: never refused (vm_alloc takes a refused shrink for running out) */
+    }
+    size_t grow = n - had, free_now = heap_caps_get_free_size(MUSE_BIG_CAPS);
+    if (free_now < grow || free_now - grow < APPS_RAM_RESERVE) {
+        return false;
+    }
+    if (n >= APPS_FLOOR_BIG_BLOCK) {
+        size_t largest = heap_caps_get_largest_free_block(MUSE_BIG_CAPS);
+        if (largest < n || largest - n < APPS_RAM_RESERVE) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void *apps_port_realloc(void *ptr, size_t n) {
     if (held_by_me()) {
         breach(BREACH_HEAP, "the heap was used with the lock held");
+    }
+    if (!room_to_grow(ptr, n)) {
+        return NULL;
     }
     return heap_caps_realloc(ptr, n, MUSE_BIG_CAPS);
 }

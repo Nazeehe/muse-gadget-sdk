@@ -984,6 +984,13 @@ static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms, boo
     T.pending = r;
     snprintf(T.what, sizeof T.what, "crashed loading %s", pkg->manifest.main);
     char err[512];
+    /* C1: admitted once the app it replaces has gone (end_app freed its heap and, the reset having run, its files): free PSRAM
+     * must hold the heap and APPS_RAM_RESERVE, the files being in PSRAM already (apps_pkg.h). An update of the app that runs
+     * is admitted here, after its old copy, so its heap isn't counted twice. */
+    if (!apps_room(apps_port_psram_free(), pkg->manifest.id, 0, pkg->manifest.memory_kb, err, sizeof err)) {
+        no_app(err);
+        return;
+    }
     call_begin();
     T.rt = apps_rt_new(pkg, err, sizeof err);
     if (!call_end()) {

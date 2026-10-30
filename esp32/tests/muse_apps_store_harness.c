@@ -2000,6 +2000,44 @@ static void out_of_memory_reading_the_manifest(void) {
     apps_port_free(got);
 }
 
+/* C1: a load from the FAT is admitted only when free PSRAM holds the app's files (their sizes on the FAT) and still keeps its heap
+ * (memory_kb) and APPS_RAM_RESERVE, the RAM store's formula with nothing to drop: short of that it is refused in the RAM store's
+ * words and nothing is held. The app that runs makes no second heap (a launch of it only fronts it, and a run admits its heap again
+ * once the old copy has gone: apps_task.h), so its own load needs room for its files and the reserve alone. */
+static void a_load_is_admitted_against_free_psram(void) {
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    const file_t files[] = {{"main.lua", "-- main\nreturn {}\n"}, {"util.lua", "return 1\n"}};
+    apps_pkg_t *p = make_pkg("timer", "Timer", "1.0.0", 2, files);
+    bool unchanged;
+    char err[256], want[256];
+    CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "commit: %s", err);
+    CHECK(p->manifest.memory_kb == 256, "the default heap: %u KB", p->manifest.memory_kb);
+    free_pkg(p);
+    size_t bytes = strlen(files[0].text) + strlen(files[1].text);
+    size_t need = bytes + 256 * 1024 + APPS_RAM_RESERVE;
+    apps_pkg_t *got = apps_port_realloc(NULL, sizeof *got);
+    long held = blocks_held;
+    psram_free = need - 1;
+    snprintf(want, sizeof want, "the gadget is short of memory for timer: %u KB free, %u KB needed; restart it or install a smaller app",
+             (unsigned)((need - 1) / 1024), (unsigned)((need + 1023) / 1024));
+    CHECK(!apps_store_load("timer", got, err, sizeof err) && strcmp(err, want) == 0, "short by a byte: '%s'", err);
+    CHECK(blocks_held == held, "%ld blocks held after the refusal", blocks_held - held);
+    psram_free = need;
+    CHECK(apps_store_load("timer", got, err, sizeof err), "exactly the room it needs: %s", err);
+    apps_pkg_free(got, apps_port_free);
+    snprintf(running_id, sizeof running_id, "timer");
+    psram_free = bytes + APPS_RAM_RESERVE;
+    CHECK(apps_store_load("timer", got, err, sizeof err), "the app that runs, with room for its files and the reserve: %s", err);
+    apps_pkg_free(got, apps_port_free);
+    psram_free = bytes + APPS_RAM_RESERVE - 1;
+    CHECK(!apps_store_load("timer", got, err, sizeof err) && strstr(err, "the gadget is short of memory for timer: ") == err,
+          "the app that runs, short by a byte: '%s'", err);
+    running_id[0] = '\0';
+    psram_free = (size_t)3 << 20;
+    apps_port_free(got);
+    CHECK(blocks_held == held - 1, "%ld blocks held", blocks_held - held + 1);
+}
+
 /* ---- main ---- */
 
 typedef struct {
@@ -2041,6 +2079,7 @@ static const case_t CASES[] = {
     {"order_follows_installs_and_launches", order_follows_installs_and_launches},
     {"order_waits_for_the_budget", order_waits_for_the_budget},
     {"out_of_memory_reading_the_manifest", out_of_memory_reading_the_manifest},
+    {"a_load_is_admitted_against_free_psram", a_load_is_admitted_against_free_psram},
 };
 
 /* X: whatever a case leaves of the apps' heap besides the RAM store's copies, which the harness frees here, is a leak. */

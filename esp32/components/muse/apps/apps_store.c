@@ -1666,6 +1666,22 @@ static bool load_flash(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
     char dir[PATH_CAP], path[PATH_CAP];
     path_of(dir, id, NULL);
     const apps_manifest_t *m = &pkg->manifest;
+    /* C1: admitted only when free PSRAM holds the files (their sizes on the FAT) and keeps the heap and APPS_RAM_RESERVE
+     * (apps_pkg.h), the RAM store's formula with nothing to drop. The app that runs makes no second heap: a launch of it
+     * only fronts it, and a run of it admits its heap again once the old copy has gone (apps_task.h). A file stat can't
+     * size counts nothing: its read says what is wrong with it. */
+    size_t bytes = 0;
+    for (int i = 0; i < m->file_count; i++) {
+        struct stat st;
+        if (join(path, dir, m->files[i]) && stat(path, &st) == 0 && st.st_size > 0) {
+            bytes += (size_t)st.st_size;
+        }
+    }
+    char running[APPS_ID_MAX + 1];
+    bool runs = apps_task_running(running, sizeof running) && strcmp(running, id) == 0;
+    if (!apps_room(apps_port_psram_free(), id, bytes, runs ? 0 : m->memory_kb, err, n)) {
+        return false;
+    }
     for (int i = 0; i < m->file_count; i++) {
         const char *rel = m->files[i];
         char *data;

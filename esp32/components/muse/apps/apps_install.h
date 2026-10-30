@@ -35,7 +35,9 @@
  *      %s: image: ...                                   a .bin apps_image_check refuses
  *      images add up to more than 1.5 MB
  *    A source that can't read a file says so itself ("reading %s: %s"), and may give the result's code (read_failed
- *    otherwise).
+ *    otherwise). One that ran out of memory (out_of_memory) while the app being installed runs adds "; <id> is running,
+ *    and an update needs room for two copies of it: stop it, then install again" (C1: the old copy goes only when the
+ *    new one runs).
  * 4. ops->compile. Lua's own message ("main.lua:2: unexpected symbol near 'x'") becomes "compile failed: " and
  *    apps_vm_excerpt's text of it for the file it names (the line before, the line and the line after, ">2|" on the
  *    line itself); a message that names none of the package's files is shown as it is, after "compile failed: ".
@@ -195,14 +197,13 @@ cJSON *apps_install_status(const apps_status_t *st);
  * (apps_task_set_list), so the LVGL task never asks the store (X11).
  *
  * Room. Before a copy (a commit's, a load's), free PSRAM (apps_port_psram_free) after it must still hold the app's heap
- * (its memory_kb) and APPS_RAM_RESERVE. Short of that, the store drops its oldest packages, one at a time and looking
- * again after each, never the app that runs (apps_task_running) nor the one being copied, each with one W log line,
- * "ram: dropped <id> to make room"; short still, the copy is refused with "the gadget is short of memory for <id>: <F>
- * KB free, <N> KB needed; restart it or install a smaller app" (F what is free then, N the copy, the heap and the
- * reserve, rounded up). A commit of a new id into a full store drops the oldest the same way.
+ * (its memory_kb) and APPS_RAM_RESERVE (apps_room, apps_pkg.h). Short of that, the store drops its oldest packages, one at
+ * a time and looking again after each, never the app that runs (apps_task_running) nor the one being copied, each with one
+ * W log line, "ram: dropped <id> to make room"; short still, the copy is refused with APPS_MSG_SHORT_OF_MEMORY, "the gadget
+ * is short of memory for <id>: <F> KB free, <N> KB needed; restart it or install a smaller app" (F what is free then, N
+ * the copy, the heap and the reserve, rounded up). A commit of a new id into a full store drops the oldest the same way.
  */
 #define APPS_RAM_APPS 8
-#define APPS_RAM_RESERVE (1024 * 1024)  /* free PSRAM a copy leaves besides the app's heap (memory_kb) */
 
 typedef struct {
     char id[APPS_ID_MAX + 1], name[25], version[24];

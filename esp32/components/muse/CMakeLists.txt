@@ -78,7 +78,8 @@ if(CONFIG_MUSE_ENABLED)
             "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/apps_snapshot.c"
             "apps/apps_result.c" "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
         # What app.api writes to Muse's VM (apps_control.c): the app guide and the timer example.
-        list(APPEND embed "apps/apps_guide.md" "apps/examples/timer/manifest.json" "apps/examples/timer/main.lua")
+        list(APPEND embed "apps/apps_guide.md" "apps/examples/timer/manifest.json" "apps/examples/timer/main.lua"
+            "apps/examples/timer/icon.bin")
     endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
     # avatar when avatar/muse_pixel.c exists here; this avatar/ is gitignored. The

@@ -840,6 +840,21 @@ static void oversize_and_totals(void) {
     serve_text("logo.bin", "GIF89a");
     EXPECT_FAILURE(install("hello", false), APPS_ERR_INVALID_PACKAGE,
                    "logo.bin: image: not an LVGL v9 image file (use LVGLImage.py --ofmt BIN)");
+    /* The manifest's icon has to be square and at most APPS_ICON_MAX_PX, which other images needn't be. */
+    static const struct {
+        unsigned w, h;
+        const char *message;
+    } icons[] = {{120, 100, "icon.bin: icon: 120x100 must be square, at most 160x160"},
+                 {200, 200, "icon.bin: icon: 200x200 must be square, at most 160x160"}};
+    for (size_t i = 0; i < sizeof icons / sizeof icons[0]; i++) {
+        unserve();
+        serve_text("manifest.json",
+                   "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"icon.bin\"],\"icon\":\"icon.bin\"}");
+        serve_text("main.lua", MAIN);
+        serve_image("icon.bin", icons[i].w, icons[i].h, true);
+        EXPECT_FAILURE(install("hello", false), APPS_ERR_INVALID_PACKAGE, icons[i].message);
+    }
+    CHECK(APPS_ICON_MAX_PX == 160, "the messages above say 160");
     CHECK(compiles == 1, "only the 256 KB main.lua was compiled: %d", compiles);
 }
 

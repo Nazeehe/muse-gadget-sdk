@@ -43,6 +43,7 @@
 
 #include "apps_install.h"
 #include "apps_io.h"
+#include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_store.h"
 #include "apps_task.h"
@@ -2687,7 +2688,8 @@ static void guide_written_or_inline(void) {
     muse_apps_set_vm_ops(&FAKE_VM);
     CHECK(!muse_apps_write_guide(NULL, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "no done: %s", code);
     install_two();
-    size_t guide_len, manifest_len, main_len;
+    size_t guide_len, manifest_len, main_len, icon_len;
+    char *icon = apps_file("examples/timer/icon.bin", &icon_len);
     char *guide = apps_file("apps_guide.md", &guide_len);
     char *manifest = apps_file("examples/timer/manifest.json", &manifest_len);
     char *main_lua = apps_file("examples/timer/main.lua", &main_len);
@@ -2700,12 +2702,13 @@ static void guide_written_or_inline(void) {
     size_t lowest = dma_lowest;
     run_jobs();
     CHECK(dones == 1 && done_ctx == &tag, "done once, with its ctx");
-    CHECK(vm_writes == 3, "three files: %d", vm_writes);
+    CHECK(vm_writes == 4, "four files: %d", vm_writes);
     static const char *const paths[] = {"workspace/apps/_guide/README.md", "workspace/apps/_guide/timer/manifest.json",
-                                        "workspace/apps/_guide/timer/main.lua"};
-    const char *const bytes[] = {guide, manifest, main_lua};
-    const size_t lens[] = {guide_len, manifest_len, main_len};
-    for (int i = 0; i < 3; i++) {
+                                        "workspace/apps/_guide/timer/main.lua", "workspace/apps/_guide/timer/icon.bin"};
+    const char *const bytes[] = {guide, manifest, main_lua, icon};
+    const size_t lens[] = {guide_len, manifest_len, main_len, icon_len};
+    CHECK(icon_len == 43212, "the icon is the 120 x 120 RGB565A8 file: %zu bytes", icon_len);
+    for (int i = 0; i < 4; i++) {
         CHECK(strcmp(written[i].path, paths[i]) == 0, "write %d: %s", i, written[i].path);
         CHECK(written[i].len == lens[i] && memcmp(written[i].data, bytes[i], lens[i]) == 0, "write %d: the firmware's bytes of %s", i,
               paths[i]);
@@ -2716,7 +2719,7 @@ static void guide_written_or_inline(void) {
     snprintf(want, sizeof want, "DMA free %zu, lowest %zu", dma_free, lowest);
     const char *at = logged("app.api: writing the guide and the timer to workspace/apps/_guide/");
     CHECK(at != NULL && strstr(at, want) != NULL, "the DMA reading before: %s", at != NULL ? at : last_log);
-    snprintf(want, sizeof want, "DMA free %zu, lowest %zu", dma_free, lowest - 3 * 512);
+    snprintf(want, sizeof want, "DMA free %zu, lowest %zu", dma_free, lowest - 4 * 512);
     at = logged("app.api: the guide is on the VM");
     CHECK(at != NULL && strstr(at, want) != NULL, "the DMA reading after: %s", at != NULL ? at : last_log);
     CHECK_AT(done_result, "ok", "true");
@@ -2761,9 +2764,31 @@ static void guide_written_or_inline(void) {
     const cJSON *files = cJSON_GetObjectItemCaseSensitive(payload, "example_files");
     CHECK(cJSON_IsString(text) && strcmp(text->valuestring, guide) == 0, "the guide inline");
     CHECK(cJSON_GetArraySize(files) == 2 &&
-              strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(files, "manifest.json")), manifest) == 0 &&
               strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(files, "main.lua")), main_lua) == 0,
-          "the timer inline");
+          "the timer inline: two files, main.lua as it is");
+    /* The inline manifest is the embedded one less its icon (no "icon" key, no icon.bin in files), and installs as it is. */
+    const char *inline_manifest = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(files, "manifest.json"));
+    CHECK(inline_manifest != NULL && strstr(inline_manifest, "icon") == NULL, "no icon in the inline manifest: %s",
+          inline_manifest != NULL ? inline_manifest : "(none)");
+    apps_manifest_t *parsed = calloc(1, sizeof *parsed);
+    char parse_err[256];
+    CHECK(inline_manifest != NULL &&
+              apps_manifest_parse(inline_manifest, strlen(inline_manifest), "timer", 1024, parsed, parse_err, sizeof parse_err),
+          "the inline manifest parses: %s", parse_err);
+    CHECK(parsed->icon[0] == '\0' && parsed->file_count == 1 && strcmp(parsed->files[0], "main.lua") == 0 &&
+              parsed->warnings[0] == '\0',
+          "its files are main.lua alone, with no icon and no warning");
+    const cJSON *embedded_doc = cJSON_Parse(manifest);
+    cJSON *inline_doc = cJSON_Parse(inline_manifest);
+    CHECK(embedded_doc != NULL && inline_doc != NULL, "both manifests are JSON");
+    cJSON_DeleteItemFromObjectCaseSensitive((cJSON *)embedded_doc, "icon");
+    cJSON_ReplaceItemInObjectCaseSensitive((cJSON *)embedded_doc, "files", cJSON_CreateArray());
+    CHECK(cJSON_Compare(embedded_doc, inline_doc, true), "the inline manifest is the embedded one and nothing else changed");
+    cJSON_Delete((cJSON *)embedded_doc);
+    cJSON_Delete(inline_doc);
+    apps_manifest_clear(parsed, NULL);
+    free(parsed);
+    free(icon);
     CHECK_AT(done_result, "payload.api", "1");
     CHECK_AT(done_result, "payload.storage", "ram");
     CHECK(logged("app.api: the VM didn't take workspace/apps/_guide/timer/manifest.json: VM answered HTTP 403") != NULL &&

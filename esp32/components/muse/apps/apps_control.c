@@ -81,17 +81,25 @@ extern const uint8_t timer_manifest_start[] __asm__("_binary_manifest_json_start
 extern const uint8_t timer_manifest_end[] __asm__("_binary_manifest_json_end");
 extern const uint8_t timer_main_start[] __asm__("_binary_main_lua_start");
 extern const uint8_t timer_main_end[] __asm__("_binary_main_lua_end");
+extern const uint8_t timer_icon_start[] __asm__("_binary_icon_bin_start");
+extern const uint8_t timer_icon_end[] __asm__("_binary_icon_bin_end");
+
+/* How an inline answer carries a file: the guide as guide_text, text as it is, the timer's manifest without its icon, and
+ * not at all (binary: the upload carries it, the JSON answer can't). */
+typedef enum { GF_GUIDE, GF_TEXT, GF_MANIFEST, GF_BINARY } guide_kind_t;
 
 typedef struct {
     const char *path;  /* on the VM */
-    const char *name;  /* in an inline answer's example_files (NULL: the guide itself) */
+    const char *name;  /* in an inline answer's example_files (unused for the guide and for binary files) */
+    guide_kind_t kind;
     const uint8_t *start, *end;
 } guide_file_t;
 
 static const guide_file_t GUIDE_FILES[] = {
-    {MUSE_APPS_GUIDE_DIR "README.md", NULL, guide_start, guide_end},
-    {MUSE_APPS_GUIDE_DIR "timer/manifest.json", "manifest.json", timer_manifest_start, timer_manifest_end},
-    {MUSE_APPS_GUIDE_DIR "timer/main.lua", "main.lua", timer_main_start, timer_main_end},
+    {MUSE_APPS_GUIDE_DIR "README.md", NULL, GF_GUIDE, guide_start, guide_end},
+    {MUSE_APPS_GUIDE_DIR "timer/manifest.json", "manifest.json", GF_MANIFEST, timer_manifest_start, timer_manifest_end},
+    {MUSE_APPS_GUIDE_DIR "timer/main.lua", "main.lua", GF_TEXT, timer_main_start, timer_main_end},
+    {MUSE_APPS_GUIDE_DIR "timer/icon.bin", NULL, GF_BINARY, timer_icon_start, timer_icon_end},
 };
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
@@ -431,15 +439,51 @@ static char *file_text(const guide_file_t *f) {
     return text;
 }
 
+/* The timer's manifest as an inline answer gives it: the embedded one less its "icon" and the icon's entry in "files", since
+ * the icon goes by upload only and the files of the answer have to install as they are. Compact JSON in a string of its own
+ * (the caller frees it with apps_port_free); NULL without memory. */
+static char *manifest_without_icon(const guide_file_t *f) {
+    char *text = file_text(f);
+    cJSON *doc = text != NULL ? cJSON_Parse(text) : NULL;
+    apps_port_free(text);
+    if (doc == NULL) {
+        return NULL;
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(doc, "icon");
+    cJSON *files = cJSON_GetObjectItemCaseSensitive(doc, "files");
+    const cJSON *icon = cJSON_IsArray(files) ? files->child : NULL;
+    for (int i = 0; icon != NULL; i++, icon = icon->next) {
+        if (cJSON_IsString(icon) && strcmp(icon->valuestring, "icon.bin") == 0) {
+            cJSON_DeleteItemFromArray(files, i);
+            break;
+        }
+    }
+    char *printed = cJSON_PrintUnformatted(doc);
+    cJSON_Delete(doc);
+    if (printed == NULL) {
+        return NULL;
+    }
+    size_t n = strlen(printed);
+    char *out = apps_port_realloc(NULL, n + 1);
+    if (out != NULL) {
+        memcpy(out, printed, n + 1);
+    }
+    cJSON_free(printed);
+    return out;
+}
+
 /* The guide and the timer, inline: guide_text and example_files. */
 static bool add_inline(cJSON *p) {
     cJSON *files = cJSON_AddObjectToObject(p, "example_files");
     bool ok = files != NULL;
     for (size_t i = 0; ok && i < ARRAY_LEN(GUIDE_FILES); i++) {
         const guide_file_t *f = &GUIDE_FILES[i];
-        char *text = file_text(f);
-        ok = text != NULL && (f->name != NULL ? cJSON_AddStringToObject(files, f->name, text)
-                                              : cJSON_AddStringToObject(p, "guide_text", text)) != NULL;
+        if (f->kind == GF_BINARY) {
+            continue;
+        }
+        char *text = f->kind == GF_MANIFEST ? manifest_without_icon(f) : file_text(f);
+        ok = text != NULL && (f->kind == GF_GUIDE ? cJSON_AddStringToObject(p, "guide_text", text)
+                                                  : cJSON_AddStringToObject(files, f->name, text)) != NULL;
         apps_port_free(text);
     }
     return ok;

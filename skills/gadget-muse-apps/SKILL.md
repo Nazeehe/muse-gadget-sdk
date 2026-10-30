@@ -251,7 +251,7 @@ The launcher shows each app by its icon.
 
 ## The loop
 
-1. Call `app.api`. It writes this guide and the timer example to `workspace/apps/_guide/`, and returns what the gadget is: `api`, `screen`, `fonts`, `limits`, `storage` and the installed `apps`. If the VM refuses the files, it returns the guide in `guide_text` and the example in `example_files` instead.
+1. Call `app.api`. It writes this guide and the timer example to `workspace/apps/_guide/`, and returns what the gadget is: `api`, `screen`, `fonts`, `limits`, `storage` and the installed `apps`. If the VM refuses the files, it returns the guide in `guide_text` and the example in `example_files` instead (without its icon: add one of your own).
 2. Write the app on your VM: `workspace/apps/<id>/manifest.json`, `main.lua` and the files it lists. Start from the timer example.
 3. Call `app.install` with the id. The gadget reads the files itself, checks them, compiles, stores and runs the app in front, and returns `ok` with its `state`, `log`, `ui` (every widget with where it was laid out) and `warnings` (unknown keys, widgets past the round edge); or an error with a `code` (invalid_package, read_failed, compile_failed with the lines around the error, crashed with the traceback and the log, busy) and a message that says what to fix.
 4. Fix and install again: an install replaces the app, and its store stays.

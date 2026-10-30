@@ -300,8 +300,9 @@ class GuideAndSkill(unittest.TestCase):
         cmake = (MUSE / "CMakeLists.txt").read_text()
         block = cmake[cmake.index("    if(CONFIG_MUSE_APPS)\n"):]
         block = block[:block.index("    endif()")]
-        files = ["apps/apps_guide.md", "apps/examples/timer/manifest.json", "apps/examples/timer/main.lua"]
-        self.assertIn('list(APPEND embed ' + " ".join(f'"{f}"' for f in files) + ")", block)
+        files = ["apps/apps_guide.md", "apps/examples/timer/manifest.json", "apps/examples/timer/main.lua",
+                 "apps/examples/timer/icon.bin"]
+        self.assertIn('list(APPEND embed ' + " ".join(f'"{f}"' for f in files) + ")", " ".join(block.split()))
         embedded = re.findall(r'list\(APPEND embed ([^)]*)\)', cmake)
         names = [Path(f).name for line in embedded for f in re.findall(r'"([^"]+)"', line)]
         for f in files:
@@ -314,7 +315,7 @@ class GuideAndSkill(unittest.TestCase):
         for f in files:
             self.assertTrue((MUSE / f).is_file(), f)
         self.assertEqual(sorted(p.name for p in TIMER.iterdir()), ["icon.bin", "main.lua", "manifest.json"],
-                         "the timer is two files and its icon (app.api carries only the two: EMBED_FILES)")
+                         "the timer is two files and its icon, all three embedded for app.api")
 
     def test_common_errors_are_the_firmwares_words(self):
         # The guide's "Common errors" quote the gadget's messages, each item "- `<message>`: <the fix>": every piece of each

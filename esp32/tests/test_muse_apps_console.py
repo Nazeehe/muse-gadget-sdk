@@ -49,7 +49,7 @@ SOURCES = [HARNESS, APPS / "apps_console.c", APPS / "apps_install.c", APPS / "ap
 # The files the firmware embeds for app.api (components/muse/CMakeLists.txt's EMBED_FILES), as the symbols IDF makes of their
 # names: _binary_<name>_start and _end.
 EMBEDDED = {"apps_guide_md": APPS / "apps_guide.md", "manifest_json": APPS / "examples/timer/manifest.json",
-            "main_lua": APPS / "examples/timer/main.lua"}
+            "main_lua": APPS / "examples/timer/main.lua", "icon_bin": APPS / "examples/timer/icon.bin"}
 
 # What apps_console.c and muse_apps.h include of ESP-IDF and LVGL, staged as the little they use.
 STAGED = {

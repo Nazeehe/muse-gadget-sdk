@@ -255,11 +255,11 @@ bool muse_apps_json_object_valid(const char *s, size_t len, char *err, size_t er
 /*
  * app.api (D2, and D3 as the user decided it): one job of the I/O worker writes the guide and the timer example that the firmware
  * carries (apps/apps_guide.md and apps/examples/timer/, EMBED_FILES) to MUSE_APPS_GUIDE_DIR on the VM, as README.md,
- * timer/manifest.json and timer/main.lua, through the VM ops' write. It logs the DMA RAM's free and lowest marks before and after
+ * timer/manifest.json, timer/main.lua and timer/icon.bin (the upload carries the binary), through the VM ops' write. It logs the DMA RAM's free and lowest marks before and after
  * the writes (the session's sends need it), and answers {"delivered":"vm","guide","example","api","screen","fonts","limits",
  * "storage"[,"hint"],"apps":[{"id","name","version","state"}]}; limits.room_kb is what an app's files and its heap may take
  * together now, free PSRAM less APPS_RAM_RESERVE (apps/apps_pkg.h), 0 when less is free. When the VM refuses a write (MUSE_APPS_VM_FAILED) the answer is
- * {"delivered":"inline","write_error",...,"guide_text","example_files":{"manifest.json","main.lua"}} instead, with the same facts;
+ * {"delivered":"inline","write_error",...,"guide_text","example_files":{"manifest.json","main.lua"}} instead (the manifest less its icon: the icon isn't carried inline), with the same facts;
  * a write that is busy, out of memory or out of time fails app.api (busy, out_of_memory, unavailable), to be called again, and so
  * does one whose session is gone (MUSE_APPS_VM_DROPPED: unavailable, with no inline answer, which nothing would read). Each way is
  * one log line that names the path and why. Any task; refusals as above, and unavailable when the gadget has no VM ops.

@@ -418,6 +418,26 @@ class AppTaskTest(HarnessCase):
     def test_the_alarms_records_follow_the_table_on_flash(self):  # 1 s after the first mark; nothing in RAM mode
         self.run_case("the_alarms_records_follow_the_table_on_flash")
 
+    # ---- Task 20, fix round 1 ----
+
+    def test_the_store_is_mounted_first_and_ticked_every_round(self):  # V: the first op finds the mount done
+        self.run_case("the_store_is_mounted_first_and_ticked_every_round")
+
+    def test_a_list_change_survives_a_frame_without_the_names(self):  # R
+        self.run_case("a_list_change_survives_a_frame_without_the_names")
+
+    def test_handed_over_records_are_armed_again_when_the_clock_comes(self):  # P1, with the real alarm table
+        self.run_case("handed_over_records_are_armed_again_when_the_clock_comes")
+
+    def test_a_budget_cut_off_drops_the_records(self):  # I: through apps_alarm_take_cancelled
+        self.run_case("a_budget_cut_off_drops_the_records")
+
+    def test_a_save_the_budget_holds_back_is_said_and_written_at_the_end(self):  # P3: once a streak, in the app's log; the end writes
+        self.run_case("a_save_the_budget_holds_back_is_said_and_written_at_the_end")
+
+    def test_each_apps_failure_is_said_in_its_own_log(self):  # K
+        self.run_case("each_apps_failure_is_said_in_its_own_log")
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))
@@ -484,6 +504,9 @@ class AppTaskStoreTest(HarnessCase):
 
     def test_an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends(self):  # "alarm <name> for missing app <id>"
         self.run_case("an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends")
+
+    def test_an_alarm_for_a_quarantined_app_launches_nothing(self):  # W: the refusal is logged, the firing dropped
+        self.run_case("an_alarm_for_a_quarantined_app_launches_nothing")
 
     def test_an_alarm_launch_behind_a_long_job_of_the_worker_is_waited_for(self):  # D: no give-up of a launch the worker has
         self.run_case("an_alarm_launch_behind_a_long_job_is_waited_for")

@@ -283,7 +283,16 @@ static struct {
     bool sound, wake;
     int arms, cancels, asks, lists, stops, chirps;
     apps_alarm_result_t answer;
+    char no_slot[32];  /* a name the table has no slot for: APPS_ALARM_REFUSED, whatever answer says */
 } alarm_calls;
+
+/* Every arming, in order: what the re-arm asked for. */
+static struct {
+    char app[32], name[32];
+    int64_t ms;
+    bool sound, wake;
+} armed_log[16];
+static int n_armed_log;
 
 apps_alarm_result_t apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
     snprintf(alarm_calls.app, sizeof alarm_calls.app, "%s", app);
@@ -292,7 +301,28 @@ apps_alarm_result_t apps_alarm_arm(const char *app, const char *name, int64_t ms
     alarm_calls.sound = sound;
     alarm_calls.wake = wake;
     alarm_calls.arms++;
-    return alarm_calls.answer;
+    if (n_armed_log < (int)(sizeof armed_log / sizeof armed_log[0])) {
+        snprintf(armed_log[n_armed_log].app, sizeof armed_log[0].app, "%s", app);
+        snprintf(armed_log[n_armed_log].name, sizeof armed_log[0].name, "%s", name);
+        armed_log[n_armed_log].ms = ms;
+        armed_log[n_armed_log].sound = sound;
+        armed_log[n_armed_log].wake = wake;
+        n_armed_log++;
+    }
+    return strcmp(name, alarm_calls.no_slot) == 0 ? APPS_ALARM_REFUSED : alarm_calls.answer;
+}
+
+/* The arming of app/name in the log, or NULL. */
+static const char *armed_as(const char *app, const char *name, int64_t *ms, bool *sound, bool *wake) {
+    for (int i = n_armed_log - 1; i >= 0; i--) {
+        if (strcmp(armed_log[i].app, app) == 0 && strcmp(armed_log[i].name, name) == 0) {
+            *ms = armed_log[i].ms;
+            *sound = armed_log[i].sound;
+            *wake = armed_log[i].wake;
+            return armed_log[i].name;
+        }
+    }
+    return NULL;
 }
 
 void apps_alarm_cancel(const char *app, const char *name) {
@@ -322,15 +352,31 @@ void apps_alarm_ring_stop(void) {
     alarm_calls.stops++;
 }
 
-/* What the alarms' records read of an app's alarms (apps_values.c): the case sets them. */
+/* What the alarms' records read of an app's alarms (apps_values.c): the case sets them, for info_app ("" for any app). */
 static apps_alarm_info_t listed_info[APPS_ALARMS_PER_APP];
 static int n_listed_info, info_asks;
+static char info_app[APPS_ID_MAX + 1];
 
 int apps_alarm_list_info(const char *app, apps_alarm_info_t out[APPS_ALARMS_PER_APP]) {
-    (void)app;
     info_asks++;
+    if (info_app[0] != '\0' && strcmp(app, info_app) != 0) {
+        return 0;
+    }
     memcpy(out, listed_info, sizeof listed_info);
     return n_listed_info;
+}
+
+/* The table has these of app now (name, the time left, sound, wake: up to four). */
+static void table_has(const char *app, int n, const char *const *names, const int64_t *left, const bool *sound, const bool *wake) {
+    snprintf(info_app, sizeof info_app, "%s", app);
+    memset(listed_info, 0, sizeof listed_info);
+    for (int i = 0; i < n; i++) {
+        snprintf(listed_info[i].name, sizeof listed_info[i].name, "%s", names[i]);
+        listed_info[i].remaining_ms = left[i];
+        listed_info[i].sound = sound[i];
+        listed_info[i].wake = wake[i];
+    }
+    n_listed_info = n;
 }
 
 /* ---- The store of packages (apps_store.h): the mode that picks the values' backend, and the flash backend, recorded ---- */
@@ -365,16 +411,62 @@ char *apps_store_load_values(const char *id, size_t *len) {
 static struct {
     char app[APPS_ID_MAX + 1];
     apps_store_alarm_t alarms[APPS_ALARMS_PER_APP];
-    int n, calls;
+    char keep[APPS_STORE_RECORDS_MAX][APPS_ALARM_NAME_MAX + 1];
+    int n, n_keep, calls;
     bool epochs;
 } synced;
 
-void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n, bool epochs) {
+void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n, const char (*keep)[APPS_ALARM_NAME_MAX + 1], int n_keep,
+                            bool epochs) {
     snprintf(synced.app, sizeof synced.app, "%s", id);
     memcpy(synced.alarms, alarms, (size_t)n * sizeof *alarms);
     synced.n = n;
+    synced.n_keep = n_keep;
+    if (n_keep > 0) {
+        memcpy(synced.keep, keep, (size_t)n_keep * sizeof *keep);
+    }
     synced.epochs = epochs;
     synced.calls++;
+}
+
+/* Whether the last sync kept name's record as it is. */
+static bool kept(const char *name) {
+    for (int i = 0; i < synced.n_keep; i++) {
+        if (strcmp(synced.keep[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The records the mount handed over (apps_store_take_records): the case's, taken once the mode isn't none. */
+static apps_store_record_t handed[APPS_STORE_RECORDS_MAX];
+static int n_handed;
+static bool handed_taken;
+
+static void hand_over(const char *id, const char *name, int64_t epoch_ms, bool sound, bool wake) {
+    apps_store_record_t *r = &handed[n_handed++];
+    snprintf(r->id, sizeof r->id, "%s", id);
+    snprintf(r->name, sizeof r->name, "%s", name);
+    r->epoch_ms = epoch_ms;
+    r->sound = sound;
+    r->wake = wake;
+}
+
+int apps_store_take_records(apps_store_record_t *out, int max) {
+    if (handed_taken || fake_mode == APPS_STORAGE_NONE) {
+        return 0;
+    }
+    handed_taken = true;
+    int n = n_handed < max ? n_handed : max;
+    memcpy(out, handed, (size_t)n * sizeof *out);
+    return n;
+}
+
+static char removed_app[APPS_ID_MAX + 1];  /* an app removed since the mount: the store doesn't have it */
+
+bool apps_store_has(const char *id) {
+    return strcmp(id, removed_app) != 0;
 }
 
 void muse_voice_request_chirp(void) {
@@ -1190,6 +1282,23 @@ static void store_load_begins_the_call_again(void) {
 
 /* ---- Task 20: the flash backend, its failures, the alarms' records ---- */
 
+/* The time of day in epoch ms, as apps_port_epoch_ms reads it: a case brackets the port's reads with two of these. */
+static int64_t epoch_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* Whether a line the port logged has needle. */
+static bool log_has(const char *needle) {
+    for (int i = 0; i < n_logged; i++) {
+        if (strstr(logged[i], needle) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* On a gadget with the apps partition (the store's mode FLASH) the same ops write and read apps_nvs (apps_store_save_values,
  * apps_store_load_values) instead of the RAM map: in the order of the calls, a load after the save it follows, and nothing kept in RAM. */
 static void values_go_to_apps_nvs_on_flash(void) {
@@ -1242,10 +1351,12 @@ static void a_backend_failure_is_said_once_a_streak(void) {
     n_logged = 0;
 }
 
-/* An arming or a cancel marks the app (apps_port_alarm_arm, apps_port_alarm_cancel); APPS_VALUES_ALARM_DELAY_MS after the first mark a
- * tick reads what the table has of the app and hands the worker one op, which syncs the records: each alarm with the time it fires (the
- * clock now and the time left), or without times when the clock isn't valid. A burst of changes is one op; a refused op is asked again
- * APPS_VALUES_RETRY_MS later; RAM mode drops the marks, with no op. */
+/* An arming or a cancel touches the name and marks the app (apps_port_alarm_arm, apps_port_alarm_cancel); APPS_VALUES_ALARM_DELAY_MS after
+ * the first mark a tick reads what the table has of the app and hands the worker one op, which syncs the records: each alarm with the time
+ * it fires (the clock now and the time left), or without times when the clock isn't valid. A burst of changes is one op; a refused op is
+ * asked again APPS_VALUES_RETRY_MS later; RAM mode drops the marks, with no op. The op is the app task's tick's, after the calls: never
+ * inside one, and never from the esp_timer task (the alarm module's own cancels reach it through apps_alarm_take_cancelled, which the task
+ * harness runs with the real module). */
 static void alarm_records_follow_the_table(void) {
     fake_mode = APPS_STORAGE_FLASH;
     worker_answers = true;
@@ -1262,16 +1373,16 @@ static void alarm_records_follow_the_table(void) {
     (void)apps_port_alarm_arm("timer", "done", 120000, true, true);
     apps_values_tick(10999);
     CHECK(n_pending == 0 && info_asks == 0, "nothing before the delay: %d ops", n_pending);
-    int64_t epoch_now = 0;
-    CHECK(apps_port_epoch_ms(&epoch_now), "the clock is valid");
+    int64_t low = epoch_now_ms();
     apps_values_tick(11000);
+    int64_t high = epoch_now_ms();
     CHECK(n_pending == 1 && info_asks == 1, "one op for the burst: %d ops, %d asks", n_pending, info_asks);
     worker_runs(1);
-    CHECK(synced.calls == 1 && strcmp(synced.app, "timer") == 0 && synced.n == 1 && synced.epochs &&
-              strcmp(synced.alarms[0].name, "done") == 0 && synced.alarms[0].epoch_ms == epoch_now + 120000 && synced.alarms[0].sound &&
-              synced.alarms[0].wake,
-          "synced %s: %d alarms, epochs %d, %s at %lld (now %lld)", synced.app, synced.n, synced.epochs, synced.alarms[0].name,
-          (long long)synced.alarms[0].epoch_ms, (long long)epoch_now);
+    CHECK(synced.calls == 1 && strcmp(synced.app, "timer") == 0 && synced.n == 1 && synced.epochs && synced.n_keep == 0 &&
+              strcmp(synced.alarms[0].name, "done") == 0 && synced.alarms[0].epoch_ms >= low + 120000 &&
+              synced.alarms[0].epoch_ms <= high + 120000 && synced.alarms[0].sound && synced.alarms[0].wake,
+          "synced %s: %d alarms, epochs %d, %s at %lld (the clock %lld to %lld)", synced.app, synced.n, synced.epochs, synced.alarms[0].name,
+          (long long)synced.alarms[0].epoch_ms, (long long)low, (long long)high);
     CHECK(live_blocks() == before, "%d blocks held", live_blocks() - before);
     apps_values_tick(20000);
     CHECK(n_pending == 0, "nothing more without a change");
@@ -1316,6 +1427,219 @@ static void the_ram_map_forgets_a_removed_app(void) {
     expect_load("clock", "{\"b\":2}", "the other's stays");
     apps_values_forget("nobody");
     CHECK(live_blocks() - before == 1, "forgetting an app with nothing changes nothing");
+}
+
+/* K: a failure streak is each app's: clock's first failure is said while timer's streak goes on, and each app once. */
+static void each_apps_failure_is_said(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    worker_answers = true;
+    flash_answer = false;
+    char app[APPS_ID_MAX + 1] = "";
+    CHECK(apps_port_store_save("timer", "{\"a\":1}", 7), "taken");
+    worker_runs(1);
+    CHECK(apps_port_store_save("clock", "{\"b\":1}", 7), "taken");
+    worker_runs(1);
+    CHECK(apps_port_store_save("timer", "{\"a\":2}", 7), "taken");
+    worker_runs(1);
+    CHECK(apps_values_take_failure(app, sizeof app) && strcmp(app, "timer") == 0, "timer's: '%s'", app);
+    CHECK(apps_values_take_failure(app, sizeof app) && strcmp(app, "clock") == 0, "and clock's, while timer's streak goes on: '%s'", app);
+    CHECK(!apps_values_take_failure(app, sizeof app), "each once");
+    flash_answer = true;
+    n_logged = 0;
+}
+
+/* P3: the write budget. A 16,000-byte value changed every 2 s for 30 minutes: the saves take the 48 KB the budget starts with, then one
+ * fits each time it has filled again (about 24 bytes a second), the newest value each time, so apps_nvs sees at most 5 of them (48 KB and
+ * 1800 s of 24 B/s are about 91 KB); the budget's hold is said once; and the app's end writes the last value whatever the budget says. */
+static void the_budget_holds_back_a_big_value(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    enum { LEN = 16000 };
+    char *json = malloc(LEN);
+    CHECK(json != NULL, "no memory");
+    if (json == NULL) {
+        return;
+    }
+    memset(json, 'x', LEN);
+    json[LEN - 2] = '"';
+    json[LEN - 1] = '}';
+    int before = live_blocks();
+    for (int n = 0; n < 900; n++) {
+        int64_t now = 100000 + (int64_t)n * 2000;
+        clock_at_ms(now);
+        apps_values_tick(now);
+        worker_runs(8);
+        char head[16];
+        snprintf(head, sizeof head, "{\"n\":%04d,\"x\":\"", n);
+        memcpy(json, head, strlen(head));
+        CHECK(apps_port_store_save("big", json, LEN), "save %d taken", n);
+        worker_runs(8);
+    }
+    int in_time = flash_saves;
+    CHECK(in_time >= 3 && in_time <= 5, "%d saves in 30 minutes: at most 5", in_time);
+    char app[APPS_ID_MAX + 1] = "";
+    CHECK(apps_values_take_slowdown(app, sizeof app) && strcmp(app, "big") == 0, "the hold is said: '%s'", app);
+    CHECK(!apps_values_take_slowdown(app, sizeof app), "once");
+    CHECK(strncmp(flash_json, "{\"n\":0899,", 10) != 0, "the last value waits: %.12s", flash_json);
+    apps_values_flush("big");
+    worker_runs(8);
+    CHECK(flash_saves == in_time + 1 && strncmp(flash_json, "{\"n\":0899,", 10) == 0, "the end wrote the last value: %d saves, %.12s",
+          flash_saves, flash_json);
+    CHECK(live_blocks() == before, "%d blocks held", live_blocks() - before);
+    free(json);
+}
+
+/* P3: a small value (100 bytes) changed once a minute for 30 minutes is never held back: each save is written as it is made. */
+static void a_small_value_is_never_held_back(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    char json[100];
+    memset(json, 'y', sizeof json);
+    json[sizeof json - 2] = '"';
+    json[sizeof json - 1] = '}';
+    for (int n = 0; n < 30; n++) {
+        int64_t now = 100000 + (int64_t)n * 60000;
+        clock_at_ms(now);
+        apps_values_tick(now);
+        char head[16];
+        snprintf(head, sizeof head, "{\"n\":%02d,\"y\":\"", n);
+        memcpy(json, head, strlen(head));
+        CHECK(apps_port_store_save("small", json, sizeof json), "save %d taken", n);
+        worker_runs(8);
+        CHECK(flash_saves == n + 1, "save %d written as it was made: %d saves", n, flash_saves);
+    }
+    char app[APPS_ID_MAX + 1] = "";
+    CHECK(!apps_values_take_slowdown(app, sizeof app), "never held back: '%s'", app);
+}
+
+/* P1: the records the mount handed over wait for the clock, and an alarm the app arms meanwhile under another name syncs that name alone:
+ * the others' records are kept as they are (keep), never dropped for not being in the table. When the clock comes each untouched record
+ * is armed again for the time it has left, with its sound and wake, and the app's alarm, armed without a clock, gets its record then. */
+static void untouched_records_wait_for_the_clock(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    worker_answers = true;
+    clock_is_set = false;
+    alarm_calls.answer = APPS_ALARM_ARMED;
+    clock_at_ms(10000);
+    int64_t epoch = epoch_now_ms();
+    hand_over("timer", "a", epoch + 60000, true, true);
+    hand_over("timer", "b", epoch + 120000, false, true);
+    int before = live_blocks();
+    static const char *const just_c[] = {"c"};
+    table_has("timer", 1, just_c, (const int64_t[]){30000}, (const bool[]){true}, (const bool[]){false});
+    (void)apps_port_alarm_arm("timer", "c", 30000, true, false);
+    apps_values_tick(10000 + APPS_VALUES_ALARM_DELAY_MS);
+    worker_runs(1);
+    CHECK(synced.calls == 1 && strcmp(synced.app, "timer") == 0 && !synced.epochs && synced.n == 1 && strcmp(synced.alarms[0].name, "c") == 0,
+          "c synced, with no time: %d calls, %d alarms, epochs %d", synced.calls, synced.n, synced.epochs);
+    CHECK(synced.n_keep == 2 && kept("a") && kept("b"), "a's and b's records are kept as they are: %d kept", synced.n_keep);
+    CHECK(alarm_calls.arms == 1, "nothing armed again without the clock: %d armings", alarm_calls.arms);
+    /* The clock comes. */
+    clock_is_set = true;
+    clock_at_ms(20000);
+    int64_t low = epoch_now_ms();
+    apps_values_tick(20000);
+    int64_t high = epoch_now_ms();
+    int64_t ms = 0;
+    bool sound = false, wake = false;
+    CHECK(armed_as("timer", "a", &ms, &sound, &wake) != NULL && ms >= epoch + 60000 - high && ms <= epoch + 60000 - low && sound && wake,
+          "a armed again for what it has left: %lld ms (%lld to %lld), sound %d, wake %d", (long long)ms, (long long)(epoch + 60000 - high),
+          (long long)(epoch + 60000 - low), sound, wake);
+    CHECK(armed_as("timer", "b", &ms, &sound, &wake) != NULL && ms >= epoch + 120000 - high && ms <= epoch + 120000 - low && !sound && wake,
+          "b too: %lld ms, sound %d, wake %d", (long long)ms, sound, wake);
+    CHECK(alarm_calls.arms == 3 && log_has("I muse_apps: store: alarm timer/a armed again: ") &&
+              log_has("I muse_apps: store: alarm timer/b armed again: "),
+          "two re-arms, each with its line: %d armings", alarm_calls.arms);
+    /* c gets its record: its app was synced without the clock while it had an alarm. */
+    static const char *const all[] = {"c", "a", "b"};
+    table_has("timer", 3, all, (const int64_t[]){20000, 50000, 110000}, (const bool[]){true, true, false}, (const bool[]){false, true, true});
+    low = epoch_now_ms();
+    apps_values_tick(20000 + APPS_VALUES_ALARM_DELAY_MS);
+    high = epoch_now_ms();
+    worker_runs(1);
+    CHECK(synced.calls == 2 && synced.epochs && synced.n == 1 && strcmp(synced.alarms[0].name, "c") == 0 &&
+              synced.alarms[0].epoch_ms >= low + 20000 && synced.alarms[0].epoch_ms <= high + 20000 && synced.alarms[0].sound &&
+              !synced.alarms[0].wake,
+          "c's record, with its time: %d calls, epochs %d, %d alarms", synced.calls, synced.epochs, synced.n);
+    CHECK(synced.n_keep == 2 && kept("a") && kept("b"), "a and b, armed again from their records, are kept: %d kept", synced.n_keep);
+    CHECK(live_blocks() == before, "%d blocks held", live_blocks() - before);
+}
+
+/* P1: a name the app touches before the clock comes is the app's from then on: the record the mount handed over for it is neither kept
+ * nor armed again. Armed again by the app without a clock, it is in the sync with no time (its old record goes: apps_store.h), and gets
+ * its new record, with the new deadline, once the clock comes. Cancelled while it waited, its record goes, and nothing arms it. */
+static void a_touched_name_is_not_armed_again(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    worker_answers = true;
+    clock_is_set = false;
+    alarm_calls.answer = APPS_ALARM_ARMED;
+    clock_at_ms(10000);
+    int64_t epoch = epoch_now_ms();
+    hand_over("timer", "a", epoch + 60000, true, true);
+    hand_over("timer", "b", epoch + 90000, true, true);
+    static const char *const just_a[] = {"a"};
+    table_has("timer", 1, just_a, (const int64_t[]){45000}, (const bool[]){true}, (const bool[]){true});
+    (void)apps_port_alarm_arm("timer", "a", 45000, true, true);  /* the app arms a again: a new countdown */
+    apps_port_alarm_cancel("timer", "b");                        /* and cancels b, which waited for the clock */
+    apps_values_tick(10000 + APPS_VALUES_ALARM_DELAY_MS);
+    worker_runs(1);
+    CHECK(synced.calls == 1 && !synced.epochs && synced.n == 1 && strcmp(synced.alarms[0].name, "a") == 0 && synced.n_keep == 0,
+          "a with no time (its old record goes), b in neither (its record goes): %d calls, %d alarms, %d kept", synced.calls, synced.n,
+          synced.n_keep);
+    clock_is_set = true;
+    clock_at_ms(20000);
+    table_has("timer", 1, just_a, (const int64_t[]){35000}, (const bool[]){true}, (const bool[]){true});
+    apps_values_tick(20000);
+    CHECK(alarm_calls.arms == 1 && n_armed_log == 1, "nothing armed again: the app's own arming is the only one: %d", alarm_calls.arms);
+    int64_t low = epoch_now_ms();
+    apps_values_tick(20000 + APPS_VALUES_ALARM_DELAY_MS);
+    int64_t high = epoch_now_ms();
+    worker_runs(1);
+    CHECK(synced.calls == 2 && synced.epochs && synced.n == 1 && strcmp(synced.alarms[0].name, "a") == 0 &&
+              synced.alarms[0].epoch_ms >= low + 35000 && synced.alarms[0].epoch_ms <= high + 35000 && synced.n_keep == 0,
+          "a's new record, with the new deadline: %d calls, epochs %d, %lld (%lld to %lld)", synced.calls, synced.epochs,
+          (long long)synced.alarms[0].epoch_ms, (long long)(low + 35000), (long long)(high + 35000));
+    CHECK(!log_has("armed again"), "no line of a re-arm");
+}
+
+/* P1: a re-arm the alarm table has no memory for is tried again APPS_VALUES_REARM_RETRY_MS later, and its line says so; one it has no slot
+ * for is dropped, record and all (its app is synced, keeping nothing of it), with its line; a time past the week of APPS_ALARM_MAX_MS is
+ * cut to it, and one that is due fires at once (1 ms). A record of an app removed since the mount arms nothing. */
+static void rearm_retries_drops_and_clamps(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    worker_answers = true;
+    clock_is_set = true;
+    clock_at_ms(10000);
+    int64_t epoch = epoch_now_ms();
+    hand_over("timer", "due", epoch - 5000, true, true);
+    hand_over("timer", "far", epoch + 3 * APPS_ALARM_MAX_MS, true, false);
+    hand_over("clock", "full", epoch + 60000, false, true);
+    hand_over("ghost", "boo", epoch + 60000, true, true);
+    snprintf(removed_app, sizeof removed_app, "ghost");
+    snprintf(alarm_calls.no_slot, sizeof alarm_calls.no_slot, "full");
+    alarm_calls.answer = APPS_ALARM_NO_MEMORY;
+    apps_values_tick(10000);
+    CHECK(alarm_calls.arms == 1 && strcmp(armed_log[0].name, "due") == 0, "the first re-arm got no memory, and the rest wait: %d armings",
+          alarm_calls.arms);
+    CHECK(log_has("W muse_apps: store: alarm timer/due: no memory to arm it again; it is tried again in 2 s"), "said, with when");
+    alarm_calls.answer = APPS_ALARM_ARMED;
+    apps_values_tick(10000 + APPS_VALUES_REARM_RETRY_MS - 1);
+    CHECK(alarm_calls.arms == 1, "not before the retry: %d armings", alarm_calls.arms);
+    apps_values_tick(10000 + APPS_VALUES_REARM_RETRY_MS);
+    CHECK(alarm_calls.arms == 4, "due, far and full asked for, boo not: %d armings", alarm_calls.arms);
+    int64_t ms = 0;
+    bool sound = false, wake = false;
+    CHECK(armed_as("timer", "due", &ms, &sound, &wake) != NULL && ms == 1, "a record that is due fires at once: %lld ms", (long long)ms);
+    CHECK(armed_as("timer", "far", &ms, &sound, &wake) != NULL && ms == APPS_ALARM_MAX_MS && sound && !wake, "a far one is cut to the week: %lld",
+          (long long)ms);
+    CHECK(armed_as("ghost", "boo", &ms, &sound, &wake) == NULL, "nothing for an app removed since the mount");
+    CHECK(log_has("W muse_apps: store: alarm clock/full couldn't be armed again (the gadget has no slot for it): dropped"), "the drop is said");
+    table_has("clock", 0, NULL, NULL, NULL, NULL);
+    apps_values_tick(10000 + APPS_VALUES_REARM_RETRY_MS + APPS_VALUES_ALARM_DELAY_MS);
+    worker_runs(1);
+    CHECK(synced.calls == 1 && strcmp(synced.app, "clock") == 0 && synced.n == 0 && synced.n_keep == 0,
+          "clock is synced, keeping nothing of full: its record goes: %d calls, %s, %d alarms, %d kept", synced.calls, synced.app, synced.n,
+          synced.n_keep);
+    apps_values_tick(60000);
+    CHECK(alarm_calls.arms == 4 && synced.calls == 1, "nothing more: %d armings, %d syncs", alarm_calls.arms, synced.calls);
 }
 
 /* sys.battery()'s numbers are muse_state's, a percentage clamped to 0 to 100 and -1 for none. sys.wifi() is connected only when the
@@ -1401,6 +1725,12 @@ static const struct {
     {"a_backend_failure_is_said_once_a_streak", a_backend_failure_is_said_once_a_streak},
     {"alarm_records_follow_the_table", alarm_records_follow_the_table},
     {"the_ram_map_forgets_a_removed_app", the_ram_map_forgets_a_removed_app},
+    {"each_apps_failure_is_said", each_apps_failure_is_said},
+    {"the_budget_holds_back_a_big_value", the_budget_holds_back_a_big_value},
+    {"a_small_value_is_never_held_back", a_small_value_is_never_held_back},
+    {"untouched_records_wait_for_the_clock", untouched_records_wait_for_the_clock},
+    {"a_touched_name_is_not_armed_again", a_touched_name_is_not_armed_again},
+    {"rearm_retries_drops_and_clamps", rearm_retries_drops_and_clamps},
 };
 
 int main(int argc, char **argv) {

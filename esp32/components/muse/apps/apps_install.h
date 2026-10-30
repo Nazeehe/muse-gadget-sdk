@@ -54,8 +54,9 @@
  *      {"ok":true,"payload":{"id","version","storage","files":[{"path","bytes","sha256"}],"state","warnings":[...],
  *       "log":[...],"ui":[...],"mem_kb","peak_kb"}}
  *    with "ui_truncated":N when N widgets aren't in "ui" (apps_ui_dump's and the trim's), "files_truncated":N when
- *    files had to go, "unchanged":true when the store found the package it already had, and "hint":APPS_RAM_HINT when
- *    the storage is "ram" (the gadget has no apps partition: apps_store.h). Without run, "state" is
+ *    files had to go, "unchanged":true when the store found the package it already had, and "hint" when the store has one
+ *    (ops->hint, in RAM mode: APPS_RAM_HINT when the gadget has no apps partition, apps_store.h's APPS_STORE_NO_FAT_HINT
+ *    when it has one that couldn't be mounted). Without run, "state" is
  *    "installed", "warnings" the manifest's, and "log" and "ui" are empty. "ui" is the widget dump (apps_ui.h) as
  *    raw JSON (a cJSON_Raw item). On failure:
  *      {"ok":false,"error":{"code":<one of the codes below>,"message":<the message above>}}
@@ -116,13 +117,15 @@ typedef struct {
  * The steps that need the gadget. compile checks every .lua file and runs nothing (apps_task_compile: Lua's own
  * message on failure). commit keeps a copy of the package in the store (*unchanged true when the store had it already).
  * run takes the package whatever happens, runs it in front and lets it settle for settle_ms, and fills st (C2:
- * apps_task_run(pkg, true, ...)). storage says where the store keeps apps: "ram" or "flash".
+ * apps_task_run(pkg, true, ...)). storage says where the store keeps apps: "ram" or "flash"; hint what a result adds about
+ * that, NULL for nothing (apps_store_hint).
  */
 typedef struct {
     bool (*compile)(const apps_pkg_t *pkg, char *err, size_t n);
     bool (*commit)(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t n);
     bool (*run)(apps_pkg_t *pkg, int settle_ms, apps_status_t *st, char *err, size_t n);
     const char *(*storage)(void);
+    const char *(*hint)(void);
 } apps_install_ops_t;
 
 /* One install at a time, whatever it comes from (the console, Link): false while another holder has it. The holder

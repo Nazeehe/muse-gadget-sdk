@@ -1473,6 +1473,76 @@ static void concurrent_cb(const char *app, const char *name) {
     in_callback = false;
 }
 
+/* ---- The records' side (Task 20): what apps_values reads of an app's alarms, and the apps whose alarms were all cancelled ---- */
+
+/* apps_alarm_list_info, which an alarm's record is made from (its time is the clock's now plus remaining_ms): an app's alarms earliest
+ * first, each with the time it has left and the sound and wake it asked for; a firing that waits to be told is there too, with nothing
+ * left and the sound and wake it fired with. Another app's aren't, and an id that isn't one has none. */
+static void list_info_gives_each_alarm_its_time_and_options(void) {
+    CHECK(arm("aa", "t", 5000, true, false) && arm("aa", "u", 1000, false, true) && arm("bb", "x", 3000, true, true), "arm three");
+    apps_alarm_info_t info[APPS_ALARMS_PER_APP];
+    memset(info, 0, sizeof info);
+    int n = apps_alarm_list_info("aa", info);
+    CHECK(n == 2 && strcmp(info[0].name, "u") == 0 && info[0].remaining_ms == 1000 && !info[0].sound && info[0].wake &&
+              strcmp(info[1].name, "t") == 0 && info[1].remaining_ms == 5000 && info[1].sound && !info[1].wake,
+          "armed: %d, %s %lld %d %d, %s %lld %d %d", n, info[0].name, (long long)info[0].remaining_ms, info[0].sound, info[0].wake,
+          info[1].name, (long long)info[1].remaining_ms, info[1].sound, info[1].wake);
+    advance(1000);  /* u fires, and waits to be told */
+    CHECK(apps_alarm_pending(), "u waits");
+    memset(info, 0, sizeof info);
+    n = apps_alarm_list_info("aa", info);
+    CHECK(n == 2 && strcmp(info[0].name, "u") == 0 && info[0].remaining_ms == 0 && !info[0].sound && info[0].wake &&
+              strcmp(info[1].name, "t") == 0 && info[1].remaining_ms == 4000 && info[1].sound && !info[1].wake,
+          "a firing that waits: %d, %s %lld %d %d, %s %lld %d %d", n, info[0].name, (long long)info[0].remaining_ms, info[0].sound,
+          info[0].wake, info[1].name, (long long)info[1].remaining_ms, info[1].sound, info[1].wake);
+    CHECK(take_all(true) == 1, "u told");
+    n = apps_alarm_list_info("aa", info);
+    CHECK(n == 1 && strcmp(info[0].name, "t") == 0 && info[0].remaining_ms == 4000, "told, it is gone: %d", n);
+    n = apps_alarm_list_info("bb", info);
+    CHECK(n == 1 && strcmp(info[0].name, "x") == 0 && info[0].remaining_ms == 2000 && info[0].sound && info[0].wake, "bb's own: %d", n);
+    CHECK(apps_alarm_list_info("cc", info) == 0 && apps_alarm_list_info("Not an id", info) == 0, "none for another app or a bad id");
+    clear_all();
+}
+
+/* apps_alarm_take_cancelled, which the app task's records follow: the apps whose alarms a cancel of all of them (apps_alarm_cancel_app)
+ * or the budget emptied, each once, in the order they came; a take of fewer leaves the rest for the next; a cancel that found nothing notes
+ * nothing; and between two takes the first APPS_ALARMS_MAX apps are kept. */
+static void the_cancelled_apps_are_handed_over_once(void) {
+    char ids[APPS_ALARMS_MAX][APPS_ID_MAX + 1];
+    CHECK(apps_alarm_take_cancelled(ids, APPS_ALARMS_MAX) == 0, "none yet");
+    CHECK(arm("aa", "t", 5000, false, false) && arm("bb", "t", 5000, false, false) && arm("bb", "u", 6000, false, false), "arm");
+    apps_alarm_cancel_app("bb", "crashed when its alarm launched it");
+    apps_alarm_cancel_app("aa", "was removed");
+    apps_alarm_cancel_app("bb", "again");          /* nothing left to cancel */
+    apps_alarm_cancel_app("zz", "has no alarms");  /* nor here */
+    int n = apps_alarm_take_cancelled(ids, 1);
+    CHECK(n == 1 && strcmp(ids[0], "bb") == 0, "the first, alone: %d %s", n, n > 0 ? ids[0] : "");
+    n = apps_alarm_take_cancelled(ids, APPS_ALARMS_MAX);
+    CHECK(n == 1 && strcmp(ids[0], "aa") == 0, "then the rest: %d %s", n, n > 0 ? ids[0] : "");
+    CHECK(apps_alarm_take_cancelled(ids, APPS_ALARMS_MAX) == 0, "each once");
+    /* The budget's cut-off on the firing path (the esp_timer task) notes the app too. */
+    advance(10000);  /* the log's bucket fills again: the cut-off's line is one of its eight */
+    for (int k = 1; k <= 7; k++) {
+        CHECK(arm("dd", "t", 1, false, false), "arm %d", k);
+        advance(1);
+        (void)take_all(true);
+    }
+    CHECK(count_from(0, "log W alarm: dd fired more than 6 alarms in a minute; its alarms are cancelled") == 1, "the 7th was cut off");
+    n = apps_alarm_take_cancelled(ids, APPS_ALARMS_MAX);
+    CHECK(n == 1 && strcmp(ids[0], "dd") == 0, "the budget's: %d %s", n, n > 0 ? ids[0] : "");
+    /* More apps than the bound between two takes: the first APPS_ALARMS_MAX. */
+    static const char *const apps[] = {"a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9"};
+    _Static_assert(ARRAY_LEN(apps) == APPS_ALARMS_MAX + 1, "one more than the bound");
+    for (size_t i = 0; i < ARRAY_LEN(apps); i++) {
+        CHECK(arm(apps[i], "t", 5000, false, false), "arm %s", apps[i]);
+        apps_alarm_cancel_app(apps[i], "was removed");
+    }
+    n = apps_alarm_take_cancelled(ids, APPS_ALARMS_MAX);
+    CHECK(n == APPS_ALARMS_MAX && strcmp(ids[0], "a1") == 0 && strcmp(ids[APPS_ALARMS_MAX - 1], "a8") == 0, "the first %d: %d",
+          APPS_ALARMS_MAX, n);
+    CHECK(apps_alarm_take_cancelled(ids, APPS_ALARMS_MAX) == 0, "and no more");
+}
+
 /* Three threads arm, cancel, ask, cancel by id, end apps and take at random while the clock jumps on (400 jumps of three seconds, so that the
  * alarms are due in fake time, and each app's budget is a minute of it) and the esp_timer task fires what comes due: no check of what they
  * are given fails (and under AddressSanitizer and UBSan no access is bad), the callback never finds the lock held, no firing is taken twice
@@ -1564,6 +1634,8 @@ int main(int argc, char **argv) {
         {"the_pending_word_follows_the_firings", the_pending_word_follows_the_firings},
         {"a_launch_is_wanted_while_a_firing_it_was_asked_for_waits", a_launch_is_wanted_while_a_firing_it_was_asked_for_waits},
         {"no_memory_for_a_timer_is_told_and_tried_again", no_memory_for_a_timer_is_told_and_tried_again},
+        {"list_info_gives_each_alarm_its_time_and_options", list_info_gives_each_alarm_its_time_and_options},
+        {"the_cancelled_apps_are_handed_over_once", the_cancelled_apps_are_handed_over_once},
         {"the_table_holds_up_to_three_tasks_and_the_esp_timer_task", the_table_holds_up_to_three_tasks_and_the_esp_timer_task},
     };
     if (argc != 2) {

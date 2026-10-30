@@ -152,6 +152,9 @@ class Install(unittest.TestCase):
     def test_read_and_commit_failures(self):
         self.run_case("read_and_commit_failures")
 
+    def test_a_result_says_the_stores_hint(self):  # P7: an unmountable partition's hint, which doesn't say to reflash
+        self.run_case("a_result_says_the_stores_hint")
+
     def test_the_deadline_is_one_absolute_time(self):  # E24, D3
         self.run_case("deadline_is_one_absolute_time")
 

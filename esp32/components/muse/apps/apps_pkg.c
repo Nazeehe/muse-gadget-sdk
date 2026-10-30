@@ -553,6 +553,9 @@ static NOINLINE bool check_files(parse_t *p) {
         if (apps_file_kind(text) == APPS_FILE_BAD) {
             return fail(p, "manifest: files[%d] '%s' has an unsupported type (use .lua, .json or .bin)", index, text);
         }
+        if (strcmp(text, "manifest.json") == 0) {  /* the store keeps it beside the files: a file of that path would replace it */
+            return fail(p, "manifest: files[%d] 'manifest.json' is the manifest itself; don't list it", index);
+        }
         if (is_listed(m, text)) {
             continue;
         }

@@ -528,8 +528,9 @@ static const char *store_storage(void) {
     return apps_storage_name(apps_store_mode());
 }
 
-/* The store keeps the package (apps_store.h): on the apps partition, or in PSRAM on a gadget without one. */
-static const apps_install_ops_t USB_OPS = {apps_task_compile, apps_store_commit, install_run, store_storage};
+/* The store keeps the package (apps_store.h): on the apps partition, or in PSRAM on a gadget without one (or whose partition couldn't be
+ * mounted), which results say with the store's hint. */
+static const apps_install_ops_t USB_OPS = {apps_task_compile, apps_store_commit, install_run, store_storage, apps_store_hint};
 
 static void commit_job(void *arg) {
     job_t *job = arg;
@@ -742,8 +743,8 @@ static void status(const char *args) {
     cJSON_Delete(r);
 }
 
-/* The store's apps, most recent first, each with its manifest's version (apps_store_manifest, D26), and where the store keeps them;
- * in RAM mode with the hint. */
+/* The store's apps, most recent first, each with its manifest's version (apps_store_manifest, D26), and where the store keeps them,
+ * with the store's hint when it has one (apps_store_hint: in RAM mode). */
 typedef struct {
     char ids[APPS_STORE_APPS_MAX][APPS_ID_MAX + 1];
     char names[APPS_STORE_APPS_MAX][25];
@@ -754,10 +755,10 @@ static void list_job(void *arg) {
     (void)arg;
     list_t *l = apps_port_realloc(NULL, sizeof *l);  /* a few KB: never on the worker's stack */
     int n = l != NULL ? apps_store_list(l->ids, l->names, APPS_STORE_APPS_MAX) : 0;
-    apps_storage_t mode = apps_store_mode();
+    const char *hint = apps_store_hint();
     cJSON *r = l != NULL ? cJSON_CreateObject() : NULL;
-    bool ok = r != NULL && cJSON_AddStringToObject(r, "storage", apps_storage_name(mode)) != NULL &&
-              (mode != APPS_STORAGE_RAM || cJSON_AddStringToObject(r, "hint", APPS_RAM_HINT) != NULL);
+    bool ok = r != NULL && cJSON_AddStringToObject(r, "storage", apps_storage_name(apps_store_mode())) != NULL &&
+              (hint == NULL || cJSON_AddStringToObject(r, "hint", hint) != NULL);
     cJSON *apps = ok ? cJSON_AddArrayToObject(r, "apps") : NULL;
     ok = apps != NULL;
     for (int i = 0; ok && i < n; i++) {

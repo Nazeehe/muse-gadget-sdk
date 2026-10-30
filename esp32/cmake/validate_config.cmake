@@ -130,3 +130,26 @@ if(CONFIG_MUSE_APPS AND (CONFIG_MUSE_APPS_HEAP_MAX_KB LESS 256 OR CONFIG_MUSE_AP
     message(FATAL_ERROR
         "CONFIG_MUSE_APPS_HEAP_MAX_KB must be from 256 to 1024 (KB of PSRAM for one app's Lua heap). ${GADGET_CONFIG_REGEN_HINT}")
 endif()
+
+# Muse apps live on the apps partition (partitions_muse_apps.csv). A build dir
+# configured before that table keeps its old one in its own sdkconfig, whose
+# generated values win over the overlay, and its apps are then kept in RAM and
+# lost at every restart, with nothing else in the build to say so. A warning,
+# not an error: the RAM-mode test build pairs the apps with partitions_muse.csv
+# on purpose.
+if(CONFIG_MUSE_APPS)
+    if(IS_ABSOLUTE "${CONFIG_PARTITION_TABLE_FILENAME}")
+        set(MUSE_APPS_TABLE "${CONFIG_PARTITION_TABLE_FILENAME}")
+    else()
+        set(MUSE_APPS_TABLE "${CMAKE_SOURCE_DIR}/${CONFIG_PARTITION_TABLE_FILENAME}")
+    endif()
+    set(MUSE_APPS_TABLE_ROWS "")
+    if(CONFIG_PARTITION_TABLE_CUSTOM AND EXISTS "${MUSE_APPS_TABLE}")
+        file(STRINGS "${MUSE_APPS_TABLE}" MUSE_APPS_TABLE_ROWS REGEX "^[ \t]*apps[ \t]*,")
+    endif()
+    if(NOT MUSE_APPS_TABLE_ROWS)
+        idf_build_get_property(MUSE_APPS_SDKCONFIG SDKCONFIG)
+        message(WARNING
+            "CONFIG_MUSE_APPS with the partition table ${CONFIG_PARTITION_TABLE_FILENAME}, which has no apps partition: this build keeps apps in RAM and loses them at every restart. A build dir configured before the apps table keeps its old one: in ${MUSE_APPS_SDKCONFIG}, set CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions_muse_apps.csv\" and CONFIG_PARTITION_TABLE_FILENAME=\"partitions_muse_apps.csv\", then build and flash over USB.")
+    endif()
+endif()

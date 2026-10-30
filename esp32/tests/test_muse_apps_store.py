@@ -80,8 +80,11 @@ class Store(unittest.TestCase):
     def test_recovery_restores_old_when_app_missing(self):
         self.run_case("recovery_restores_old_when_app_missing")
 
-    def test_recovery_deletes_stray_stage(self):
+    def test_recovery_deletes_stray_stage(self):  # the stage is the app's sibling, .stage-<id> (P4)
         self.run_case("recovery_deletes_stray_stage")
+
+    def test_the_old_layouts_stage_is_deleted(self):  # /apps/.stage/<id>, from before P4: the board has one
+        self.run_case("old_layout_stage_is_deleted")
 
     def test_remove(self):  # the folder and the app's s, a and q keys; refused for the app that runs (D18)
         self.run_case("remove")
@@ -94,6 +97,12 @@ class Store(unittest.TestCase):
 
     def test_values_roundtrip(self):  # s%08x in the "apps" namespace of apps_nvs (D18)
         self.run_case("values_roundtrip")
+
+    def test_values_that_cannot_be_read_are_not_an_empty_store(self):  # D: NULL, so the launch is refused; only a missing key is {}
+        self.run_case("values_that_cannot_be_read_are_not_empty")
+
+    def test_ids_whose_keys_collide_keep_their_keys_apart(self):  # E: timer and zleca55_, both 0x6ad0de1a
+        self.run_case("keys_that_collide_stay_apart")
 
     def test_full_nvs_erases_only_apps_nvs(self):
         self.run_case("full_nvs_erases_only_apps_nvs")
@@ -123,20 +132,26 @@ class Store(unittest.TestCase):
                 expected = "quarantined" if name in CRASH_RESETS else "cleared"
                 self.assertEqual(self.run_case("reset_reason_counts", value).split(), [expected])
 
-    def test_quarantine_refuses_until_reinstalled(self):  # and drops the app's alarms, stored and armed
+    def test_quarantine_refuses_until_reinstalled(self):  # and drops the app's alarms, stored and armed; an unchanged push clears it too
         self.run_case("quarantine_refuses_until_reinstalled")
 
-    def test_rearm_at_mount(self):  # the time left; past due at once; a record of an app that isn't installed is forgotten
-        self.run_case("rearm_at_mount")
+    def test_the_boot_line_says_the_markers_count(self):  # J: as read, before this boot's reset is counted or cleared
+        self.run_case("boot_line_says_the_count")
 
-    def test_rearm_waits_for_the_clock(self):
-        self.run_case("rearm_waits_for_the_clock")
+    def test_the_records_are_handed_to_the_app_task_at_the_mount(self):  # P1, and AA: times outside 2025 to 2100 go
+        self.run_case("records_are_handed_over_at_the_mount")
+
+    def test_a_record_that_cannot_be_read_now_is_kept(self):  # S: only one that was read and is wrong goes
+        self.run_case("a_record_that_cannot_be_read_now_is_kept")
+
+    def test_records_survive_a_list_that_failed(self):  # S: no "not installed" drop without the list
+        self.run_case("records_survive_a_list_that_failed")
 
     def test_alarm_records_round_trip(self):
         self.run_case("alarm_records_round_trip")
 
-    def test_sync_alarms_follows_the_table(self):  # written when new or off by more than 1 s; gone with the alarm; none without a clock
-        self.run_case("sync_alarms_follows_the_table")
+    def test_a_sync_follows_the_touched_names_and_keeps_the_rest(self):  # P1
+        self.run_case("sync_alarms_keeps_untouched_names")
 
     def test_first_mount_formats(self):  # the brief's config, and the log line with the time, the room and apps_nvs's use
         self.run_case("first_mount_formats")
@@ -153,12 +168,23 @@ class Store(unittest.TestCase):
     def test_a_damaged_copy_is_not_loaded(self):
         self.run_case("a_damaged_copy_is_not_loaded")
 
+    def test_out_of_memory_reading_the_manifest_is_not_damage(self):  # T
+        self.run_case("out_of_memory_reading_the_manifest")
+
+    def test_the_launchers_order_is_the_stores(self):  # P2: installs and launches, across a remount with no clock
+        self.run_case("order_follows_installs_and_launches")
+
+    def test_the_orders_write_waits_for_the_budget(self):  # P3
+        self.run_case("order_waits_for_the_budget")
+
     def test_every_case_of_the_harness_is_run_here(self):
+        """X: the cases the harness has and the run_case calls of this file are the same set, both ways."""
         done = apps_host.run(self.harness, "--cases")  # takes no directory
         self.assertEqual(done.returncode, 0, done.stderr)
-        aliases = {"only_a_crash_reset_counts_toward_the_quarantine": "reset_reason_counts"}
-        tested = {aliases.get(name[len("test_"):], name[len("test_"):]) for name in dir(self) if name.startswith("test_")}
-        self.assertEqual(set(done.stdout.split()) - tested, set(), "a case of the harness that no test runs")
+        called = set(re.findall(r'self\.run_case\("([a-z_]+)"', Path(__file__).read_text()))
+        cases = set(done.stdout.split())
+        self.assertEqual(cases - called, set(), "a case of the harness that no test runs")
+        self.assertEqual(called - cases, set(), "a test that runs a case the harness doesn't have")
 
 
 class Partitions(unittest.TestCase):
@@ -193,12 +219,9 @@ class Partitions(unittest.TestCase):
         self.assertIn("Muse apps", text)
         self.assertNotIn("Hatch", text)
 
-    def test_the_overlay_picks_the_table_and_pins_fat_long_names(self):
+    def test_the_overlay_picks_the_table(self):  # its other lines are test_muse_apps_wiring.py's (the ruling's place for them)
         overlay = (ROOT / "devices/sdkconfig.muse-apps").read_text().splitlines()
         self.assertIn('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_apps.csv"', overlay)
-        # The controller's ruling: ids like stopwatch and paths like timer_face.lua aren't 8.3 names.
-        self.assertIn("CONFIG_FATFS_LFN_HEAP=y", overlay)
-        self.assertIn("CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y", overlay)
 
     def test_apps_store_is_in_the_device_build(self):  # X6
         cmake = (ROOT / "components/muse/CMakeLists.txt").read_text()

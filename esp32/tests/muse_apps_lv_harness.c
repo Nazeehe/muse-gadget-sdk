@@ -4127,6 +4127,33 @@ static void launcher_empty_state(void) {
     CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN), "closed");
 }
 
+/* P6, O: until the store is mounted the launcher says "Loading apps..." (APPS_LV_LOADING: three ASCII dots, which the font has), with no
+ * rows and not the empty state; shown again with the list, it has the rows and the text is gone. apps_lv_launcher_shown says whether the
+ * launcher is up: not before it is shown, not after it closes, and not for a crash card. */
+static void launcher_says_loading_then_lists_apps(void) {
+    cards_scene();
+    CHECK(!apps_lv_launcher_shown(), "nothing is shown yet");
+    apps_lv_show_launcher(NULL, NULL, APPS_LV_LOADING, pick);
+    int loading = fake_label("Loading apps...");
+    CHECK(loading > 0, "the loading text\n%s", log_peek());
+    int launcher = fake_parent(loading);
+    CHECK_CARD(launcher);
+    CHECK(fake_children_of(launcher, "obj") == 0 && fake_label("No apps yet. Ask Muse to make one.") < 0, "no rows, and not the empty state");
+    CHECK(!fake_flag(loading, LV_OBJ_FLAG_CLICKABLE), "the text isn't clickable: a tap on it closes the launcher, as the empty state's");
+    CHECK(apps_lv_launcher_shown() && apps_lv_cards_shown(), "the launcher is up");
+    const char *ids[] = {"hello", "timer"};
+    const char *names[] = {"Hello", "Kitchen timer"};
+    apps_lv_show_launcher(ids, names, 2, pick);
+    CHECK(fake_label("Loading apps...") < 0, "the loading text is gone");
+    CHECK(fake_label("Hello") > 0 && fake_label("Kitchen timer") > 0 && fake_children_of(launcher, "obj") == 2, "the list's rows\n%s",
+          log_peek());
+    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && apps_lv_launcher_shown(), "still up");
+    fake_tap(launcher);
+    CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_launcher_shown(), "closed: not shown");
+    apps_lv_show_crash("Hello", "main.lua:1: boom");
+    CHECK(apps_lv_cards_shown() && !apps_lv_launcher_shown(), "a crash card isn't the launcher");
+}
+
 static void launcher_closes_on_a_right_swipe(void) {
     cards_scene();
     const char *ids[] = {"hello"};
@@ -4311,6 +4338,7 @@ int main(int argc, char **argv) {
         {"launcher_lists_apps_and_picks", launcher_lists_apps_and_picks},
         {"launcher_closes_on_a_tap_elsewhere", launcher_closes_on_a_tap_elsewhere},
         {"launcher_empty_state", launcher_empty_state},
+        {"launcher_says_loading_then_lists_apps", launcher_says_loading_then_lists_apps},
         {"launcher_closes_on_a_right_swipe", launcher_closes_on_a_right_swipe},
         {"launcher_ignores_every_other_swipe", launcher_ignores_every_other_swipe},
         {"launcher_rows_are_its_own", launcher_rows_are_its_own},

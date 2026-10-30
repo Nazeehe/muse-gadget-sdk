@@ -543,9 +543,17 @@ void apps_port_init(void) {
     event("port init");
 }
 
+/* The time of day (apps_port_epoch_ms): unknown until a case says the clock is set (wall_valid), then a fixed day plus the monotonic
+ * clock, so that a case that stops that clock knows every epoch the port reads. */
+#define WALL_BASE_MS 1767225600000LL  /* 2026-01-01 */
+static atomic_bool wall_valid;
+
 bool apps_port_epoch_ms(int64_t *out) {
-    (void)out;
-    return false;
+    if (!atomic_load(&wall_valid)) {
+        return false;
+    }
+    *out = WALL_BASE_MS + apps_port_mono_ms();
+    return true;
 }
 
 void apps_port_sha256(const void *data, size_t len, uint8_t out[32]) {
@@ -708,13 +716,13 @@ void muse_voice_request_chirp(void) {
  * harness's: a case that moves it makes the timers come due. */
 apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
     apps_alarm_result_t got = apps_alarm_arm(app, name, ms, sound, wake);
-    apps_values_alarms_changed(app);  /* as apps_port_idf.c: the app's records follow (apps_values.h) */
+    apps_values_alarm_touched(app, name);  /* as apps_port_idf.c: the name's record follows (apps_values.h) */
     return got;
 }
 
 void apps_port_alarm_cancel(const char *app, const char *name) {
     apps_alarm_cancel(app, name);
-    apps_values_alarms_changed(app);
+    apps_values_alarm_touched(app, name);
 }
 
 int64_t apps_port_alarm_remaining(const char *app, const char *name) {
@@ -916,9 +924,54 @@ char *apps_store_load_values(const char *id, size_t *len) {
     return json;
 }
 
-void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n, bool epochs) {
-    event("records %s %d%s%s", id, n, n > 0 ? " " : "", n > 0 ? alarms[0].name : "");
-    (void)epochs;
+/* A sync of the records, as an event: "records <id> <n>", each alarm as <name>@<when>/<s|-><w|-> (when: ms from the worker's now, or - with
+ * no clock), the names kept as they are ("keep a,b" or "keep -"), and "epochs" or "no clock". */
+void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n, const char (*keep)[APPS_ALARM_NAME_MAX + 1], int n_keep,
+                            bool epochs) {
+    char text[480];
+    size_t used = (size_t)snprintf(text, sizeof text, "records %s %d", id, n);
+    int64_t now = WALL_BASE_MS + apps_port_mono_ms();
+    for (int i = 0; i < n && used < sizeof text; i++) {
+        char when[24] = "-";
+        if (epochs) {
+            snprintf(when, sizeof when, "%lld", (long long)(alarms[i].epoch_ms - now));
+        }
+        used += (size_t)snprintf(text + used, sizeof text - used, " %s@%s/%c%c", alarms[i].name, when, alarms[i].sound ? 's' : '-',
+                                 alarms[i].wake ? 'w' : '-');
+    }
+    for (int i = 0; i < n_keep && used < sizeof text; i++) {
+        used += (size_t)snprintf(text + used, sizeof text - used, "%s%s", i == 0 ? " keep " : ",", keep[i]);
+    }
+    if (n_keep == 0 && used < sizeof text) {
+        used += (size_t)snprintf(text + used, sizeof text - used, " keep -");
+    }
+    if (used < sizeof text) {
+        snprintf(text + used, sizeof text - used, epochs ? " epochs" : " no clock");
+    }
+    event("%s", text);
+}
+
+/* The records the mount handed over (apps_store_take_records): the case's, taken once the store's mode isn't none. */
+static apps_store_record_t handed[APPS_STORE_RECORDS_MAX];
+static int n_handed;
+static atomic_bool handed_taken;
+
+static void hand_over(const char *id, const char *name, int64_t epoch_ms, bool sound, bool wake) {
+    apps_store_record_t *r = &handed[n_handed++];
+    snprintf(r->id, sizeof r->id, "%s", id);
+    snprintf(r->name, sizeof r->name, "%s", name);
+    r->epoch_ms = epoch_ms;
+    r->sound = sound;
+    r->wake = wake;
+}
+
+int apps_store_take_records(apps_store_record_t *out, int max) {
+    if (apps_store_mode() == APPS_STORAGE_NONE || atomic_exchange(&handed_taken, true)) {
+        return 0;
+    }
+    int n = n_handed < max ? n_handed : max;
+    memcpy(out, handed, (size_t)n * sizeof *out);
+    return n;
 }
 
 #ifdef HARNESS_CONSOLE
@@ -926,7 +979,14 @@ bool apps_store_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t
     return apps_ram_commit(pkg, unchanged, err, n);
 }
 
+static char quarantined[APPS_ID_MAX + 1];  /* an app the store quarantined: its loads are refused as apps_store.c refuses them */
+
 bool apps_store_load(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
+    if (strcmp(id, quarantined) == 0) {
+        memset(pkg, 0, sizeof *pkg);
+        snprintf(err, n, "%s was running during two restarts in a row; reinstall it to run it again", id);
+        return false;
+    }
     return apps_ram_load(id, pkg, err, n);
 }
 
@@ -951,9 +1011,19 @@ bool apps_store_manifest(const char *id, apps_manifest_t *m) {
 uint32_t apps_store_free_kb(void) {
     return 0;
 }
+
+const char *apps_store_hint(void) {
+    return apps_store_mode() == APPS_STORAGE_RAM ? APPS_RAM_HINT : NULL;
+}
 #else
 void muse_apps_console_tick(int64_t now_ms) {
     (void)now_ms;  /* no console, no stage */
+}
+
+static char removed_app[APPS_ID_MAX + 1];  /* the store has every app but this one */
+
+bool apps_store_has(const char *id) {
+    return strcmp(id, removed_app) != 0;
 }
 #endif
 
@@ -1206,13 +1276,14 @@ struct fake_mutex {
     pthread_cond_t cv;
     bool held;
     pthread_t holder;
-    int number;  /* in the order made: muse_apps_start makes the record's (1), the requests' (2), the names' (3), then
-                  * the I/O worker's (4) */
+    int number;  /* in the order made: muse_apps_start makes the record's (1), the requests' (2), the names' (3), the
+                  * I/O worker's (4), then the values' (5) */
 };
 _Static_assert(sizeof(struct fake_mutex) <= sizeof(StaticSemaphore_t), "a fake mutex fits in its buffer");
 
-enum { MUTEX_RECORD = 1, MUTEX_REQUESTS = 2, MUTEX_NAMES = 3, MUTEX_IO = 4 };
+enum { MUTEX_RECORD = 1, MUTEX_REQUESTS = 2, MUTEX_NAMES = 3, MUTEX_IO = 4, MUTEX_VALUES = 5 };
 static atomic_int n_mutexes;
+static struct fake_mutex *_Atomic mutexes_made[32];  /* by number: a case can hold one as another task would */
 
 SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer) {
     struct fake_mutex *m = (struct fake_mutex *)(void *)buffer->opaque;
@@ -1220,6 +1291,9 @@ SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *buffer) {
     pthread_cond_init(&m->cv, NULL);
     m->held = false;
     m->number = atomic_fetch_add(&n_mutexes, 1) + 1;
+    if (m->number < (int)ARRAY_LEN(mutexes_made)) {
+        atomic_store(&mutexes_made[m->number], m);
+    }
     return m;
 }
 
@@ -1583,6 +1657,7 @@ void apps_lv_hide_cards(void) {
 }
 
 bool apps_lv_launcher_shown(void) {
+    lvgl_only("apps_lv_launcher_shown");
     return lv_launcher;
 }
 
@@ -1858,6 +1933,14 @@ static bool stop_app(char *err, size_t err_len) {
 
 /* What muse_ui does at boot: the layer under the display lock, the frame timer, then the app task. */
 static size_t caps_after_start;
+
+/* What a case needs before the app task starts. The records the mount hands over are taken at the first round that finds the store
+ * mounted, so a case that hands some over starts with the mount still to run. */
+static void preboot(const char *name) {
+    if (strcmp(name, "handed_over_records_are_armed_again_when_the_clock_comes") == 0) {
+        atomic_store(&store_mode, APPS_STORAGE_NONE);
+    }
+}
 
 static void boot(void) {
     building = true;
@@ -5099,6 +5182,196 @@ static void the_alarms_records_follow_the_table_on_flash(void) {
     clock_go();
 }
 
+/* ---- Task 20, fix round 1 ---- */
+
+/* V: the worker mounts the store before it runs anything of the boot's (apps_io_set_first): the first op it runs finds the mount done. And
+ * the app task's rounds tick the store (its mount's retries, the order's write): from its start, and again at every round. */
+static atomic_int mounts_seen_by_op = -1;
+
+static void mount_seen_op(void *arg) {
+    (void)arg;
+    atomic_store(&mounts_seen_by_op, atomic_load(&store_mounts));
+    event("op saw the mount");
+}
+
+static void the_store_is_mounted_first_and_ticked_every_round(void) {
+    int ticks = atomic_load(&store_ticks);
+    CHECK(ticks >= 1, "the task's start ticked the store: %d ticks", ticks);
+    ROUNDS();
+    int later = atomic_load(&store_ticks);
+    CHECK(later > ticks, "a round ticks it again: %d, then %d", ticks, later);
+    ROUNDS();
+    CHECK(atomic_load(&store_ticks) > later, "and the next: %d, then %d", later, atomic_load(&store_ticks));
+    apps_io_register_op_task();
+    int from = mark();
+    CHECK(atomic_load(&store_mounts) == 0, "no worker yet, no mount: %d", atomic_load(&store_mounts));
+    CHECK(apps_io_submit_op(mount_seen_op, NULL), "the boot's first op");
+    WAIT(from, "op saw the mount");
+    CHECK(atomic_load(&mounts_seen_by_op) == 1, "the op ran after the mount: it saw %d mounts", atomic_load(&mounts_seen_by_op));
+    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+}
+
+/* R: a list that comes while the launcher is up is shown, even when the frame that first looks can't have the names (another task holds
+ * them past its short try): the change is taken only with the names, so a later frame shows it. */
+static void a_list_change_survives_a_frame_without_the_names(void) {
+    static const apps_listed_t one[] = {{"hello", "Hello"}};
+    static const apps_listed_t two[] = {{"timer", "Timer"}, {"hello", "Hello"}};
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    apps_task_set_list(one, 1);
+    int from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 1 hello:Hello");
+    pause_lvgl();
+    from = mark();
+    apps_task_set_list(two, 2);  /* the mount's end, an install: the change is flagged, and no frame has looked */
+    struct fake_mutex *names = atomic_load(&mutexes_made[MUTEX_NAMES]);
+    CHECK(names != NULL && xSemaphoreTake(names, portMAX_DELAY) == pdTRUE, "the case holds the names, as a task on the other core would");
+    atomic_store(&lvgl_paused, false);
+    WAIT_FRAMES(3);  /* frames that look for the names, and can't have them */
+    ABSENT(from, "launcher");
+    xSemaphoreGive(names);
+    WAIT(from, "launcher 2 timer:Timer hello:Hello");
+    WAIT_FRAMES(3);
+    CHECK(count_from(from, "launcher ") == 1, "shown once: %d", count_from(from, "launcher "));
+}
+
+/* P1 with the real alarm table: the records the mount handed over wait for the clock. The app's own arming of one of their names (start()
+ * arms t) makes it the app's: its old record goes at the sync, with no time, and the other's is kept. When the clock comes the untouched
+ * record is armed again for the time it has left, t is not, and t gets its new record with its own deadline. The mount runs after the task
+ * has started (preboot leaves the store's mode none), as on the gadget. */
+static void handed_over_records_are_armed_again_when_the_clock_comes(void) {
+    char err[300];
+    clock_stop_at(apps_port_mono_ms());
+    int64_t wall = WALL_BASE_MS + apps_port_mono_ms();
+    hand_over("alarmy", "wake", wall + 600000, true, true);
+    hand_over("alarmy", "t", wall + 900000, false, false);
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);  /* the mount has run: the next round takes the records */
+    int from = mark();
+    CHECK(apps_task_run(alarmy(), false, 0, NULL, err, sizeof err), "run: %s", err);  /* start() arms t, 5000 ms ahead */
+    WAIT(from, "print alarmy start");
+    WAIT(from, "log I store: 2 alarm records wait for the clock");
+    clock_jump(APPS_VALUES_ALARM_DELAY_MS);
+    ROUNDS();
+    worker_sync();
+    CHECK(count_from(from, "records alarmy 1 t@-/sw keep wake no clock") == 1 && count_from(from, "records") == 1,
+          "t synced with no time (its old record goes), wake kept: %d syncs", count_from(from, "records"));
+    CHECK(apps_alarm_remaining("alarmy", "wake") == -1, "nothing armed again without the clock");
+    from = mark();
+    atomic_store(&wall_valid, true);  /* the clock comes */
+    ROUNDS();
+    WAIT(from, "log I store: alarm alarmy/wake armed again: 599000 ms left");
+    CHECK(apps_alarm_remaining("alarmy", "wake") == 599000, "wake armed again for the time it has left: %lld",
+          (long long)apps_alarm_remaining("alarmy", "wake"));
+    CHECK(apps_alarm_remaining("alarmy", "t") == 4000, "t is the app's: %lld", (long long)apps_alarm_remaining("alarmy", "t"));
+    ABSENT(from, "log I store: alarm alarmy/t armed again");
+    clock_jump(APPS_VALUES_ALARM_DELAY_MS);
+    ROUNDS();
+    worker_sync();
+    CHECK(count_from(from, "records alarmy 1 t@3000/sw keep wake epochs") == 1 && count_from(from, "records") == 1,
+          "t's new record, with its own deadline, wake kept: %d syncs", count_from(from, "records"));
+    clock_go();
+}
+
+/* I: the budget's cut-off on the firing path (the esp_timer task) cancels every alarm of the app, and the records follow through
+ * apps_alarm_take_cancelled, on the app task's round: t, the app's only alarm, whose record was written, has none after its 7th firing in
+ * the minute is cut off, though nothing else marked the app since (and the cut-off left it no slot to count). */
+static void a_budget_cut_off_drops_the_records(void) {
+    char err[300];
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    atomic_store(&wall_valid, true);
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    CHECK(apps_task_run(alarmy(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print alarmy start");
+    for (int k = 1; k <= 6; k++) {  /* six firings of t within the minute, each told */
+        tell_alarmy("arm", "{\"name\":\"t\",\"ms\":1000}");
+        clock_jump(1000);
+        fake_esp_timer_sync();
+        wait_event_at(__LINE__, from, "print alarmy rang t", 5000);
+        from = mark();
+    }
+    tell_alarmy("arm", "{\"name\":\"t\",\"ms\":3000}");
+    clock_jump(APPS_VALUES_ALARM_DELAY_MS);
+    ROUNDS();
+    worker_sync();
+    WAIT(from, "records alarmy 1 t@2000/sw keep - epochs");  /* t's record, from the arming */
+    from = mark();
+    clock_jump(2000);  /* t's 7th firing in the minute: the budget cancels it */
+    fake_esp_timer_sync();
+    WAIT(from, "log W alarm: alarmy fired more than 6 alarms in a minute; its alarms are cancelled");
+    clock_jump(APPS_VALUES_ALARM_DELAY_MS);
+    ROUNDS();
+    worker_sync();
+    CHECK(count_from(from, "records alarmy 0 keep - epochs") == 1, "the records go, from the cut-off alone: %d",
+          count_from(from, "records alarmy 0"));
+    ABSENT(from, "print alarmy rang");
+    tell_alarmy("stop", "{}");
+    clock_go();
+}
+
+/* P3: a save the write budget can't take waits, and is said once a streak, in the app's log and the gadget's; the app's end writes the
+ * newest value whatever the budget says. */
+static void a_save_the_budget_holds_back_is_said_and_written_at_the_end(void) {
+    char err[300];
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    clock_stop_at(apps_port_mono_ms());
+    (void)apps_values_budget_take(APPS_VALUES_BUDGET_BYTES + 100000, true);  /* others' saves have spent it, and more */
+    int from = mark();
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print stored runs nil");
+    clock_jump(2000);  /* start()'s change is due */
+    ROUNDS();
+    WAIT(from, "log W stored: " APPS_VALUES_SLOWER);
+    WAIT(from, "print stored " APPS_VALUES_SLOWER);
+    say("stored", "set", "{\"k\":\"a\",\"v\":1}");
+    clock_jump(2000);
+    ROUNDS();
+    worker_sync();
+    ABSENT(from, "flash save stored");
+    CHECK(count_from(from, "log W stored: " APPS_VALUES_SLOWER) == 1 && count_from(from, "print stored " APPS_VALUES_SLOWER) == 1,
+          "said once a streak: %d, %d", count_from(from, "log W stored: " APPS_VALUES_SLOWER),
+          count_from(from, "print stored " APPS_VALUES_SLOWER));
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    worker_sync();
+    int at = at_from(from, "flash save stored ");
+    CHECK(at >= 0 && count_from(from, "flash save stored ") == 1, "the end wrote it, once");
+    if (at >= 0) {
+        pthread_mutex_lock(&events_mu);
+        bool newest = strstr(events[at], "\"a\":1") != NULL && strstr(events[at], "\"runs\":1") != NULL;
+        pthread_mutex_unlock(&events_mu);
+        CHECK(newest, "the newest value");
+    }
+    clock_go();
+}
+
+/* K: the failure streak is each app's: the second app's first failure is said, in its own log, while the first's streak goes on. */
+static void each_apps_failure_is_said_in_its_own_log(void) {
+    char err[300];
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    atomic_store(&flash_refuses, true);
+    clock_stop_at(apps_port_mono_ms());
+    int from = mark();
+    CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run: %s", err);
+    WAIT(from, "print stored runs nil");
+    clock_jump(2000);
+    ROUNDS();
+    worker_sync();
+    ROUNDS();
+    WAIT(from, "print stored " APPS_VALUES_FULL);
+    apps_pkg_t *other = with_perms(make_pkg("other", "Other", STORED, 1), APPS_PERM_STORE);
+    CHECK(apps_task_run(other, false, 0, NULL, err, sizeof err), "run the other: %s", err);  /* stored's streak goes on: its stop failed too */
+    WAIT(from, "print other runs nil");
+    clock_jump(2000);
+    ROUNDS();
+    worker_sync();
+    ROUNDS();
+    WAIT(from, "log W other: " APPS_VALUES_FULL);
+    WAIT(from, "print other " APPS_VALUES_FULL);
+    CHECK(count_from(from, "log W stored: " APPS_VALUES_FULL) == 1, "stored's said once: %d", count_from(from, "log W stored: " APPS_VALUES_FULL));
+    atomic_store(&flash_refuses, false);
+    clock_go();
+}
+
 #ifdef HARNESS_CONSOLE
 /* ---- The cases that need the console's launch job and the RAM store (HARNESS_CONSOLE) ---- */
 
@@ -5368,6 +5641,27 @@ static void an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends(void) {
     FIFO_SYNC();
     CHECK(count_from(from, "chirp") == chirps && chirps == 1, "no chirp after the drop: %d", count_from(from, "chirp"));
     CHECK(count_from(from, "log W alarm t for missing app ghost") == 1, "said once");
+    clock_go();
+}
+
+/* W: an alarm of an app the store quarantined: its launch is refused with the quarantine's words, its firing is dropped, and nothing of the
+ * app runs. */
+static void an_alarm_for_a_quarantined_app_launches_nothing(void) {
+    clock_stop_at(apps_port_mono_ms());
+    store(alarmy());
+    snprintf(quarantined, sizeof quarantined, "alarmy");
+    CHECK(apps_alarm_arm("alarmy", "t", 1000, true, true) == APPS_ALARM_ARMED, "arm");
+    int from = mark();
+    clock_jump(1000);
+    fake_esp_timer_sync();
+    WAIT(from, "log W launch alarmy: alarmy was running during two restarts in a row; reinstall it to run it again");
+    WAIT(from, "log W alarm t: alarmy did not start: dropped");
+    ORDERED(from, "log W launch alarmy: alarmy was running", "log W alarm t: alarmy did not start: dropped");
+    FIFO_SYNC();
+    ABSENT(from, "print alarmy start");
+    CHECK(!apps_alarm_pending() && apps_alarm_remaining("alarmy", "t") == -1, "dropped, and out of the table");
+    quarantined[0] = '\0';
+    on_worker(empty_store_job, NULL);
     clock_go();
 }
 
@@ -6017,6 +6311,12 @@ int main(int argc, char **argv) {
         {"the_brief_names_the_loaded_app", the_brief_names_the_loaded_app},
         {"a_full_apps_nvs_is_said_once_a_streak", a_full_apps_nvs_is_said_once_a_streak},
         {"the_alarms_records_follow_the_table_on_flash", the_alarms_records_follow_the_table_on_flash},
+        {"the_store_is_mounted_first_and_ticked_every_round", the_store_is_mounted_first_and_ticked_every_round},
+        {"a_list_change_survives_a_frame_without_the_names", a_list_change_survives_a_frame_without_the_names},
+        {"handed_over_records_are_armed_again_when_the_clock_comes", handed_over_records_are_armed_again_when_the_clock_comes},
+        {"a_budget_cut_off_drops_the_records", a_budget_cut_off_drops_the_records},
+        {"a_save_the_budget_holds_back_is_said_and_written_at_the_end", a_save_the_budget_holds_back_is_said_and_written_at_the_end},
+        {"each_apps_failure_is_said_in_its_own_log", each_apps_failure_is_said_in_its_own_log},
 #ifdef HARNESS_CONSOLE
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},
@@ -6026,6 +6326,7 @@ int main(int argc, char **argv) {
         {"an_alarm_starts_a_stopped_app_and_calls_it_after_start", an_alarm_starts_a_stopped_app_and_calls_it_after_start},
         {"an_alarm_replaces_the_app_that_runs_with_its_own", an_alarm_replaces_the_app_that_runs_with_its_own},
         {"an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends", an_alarm_for_a_missing_app_is_dropped_and_its_ring_ends},
+        {"an_alarm_for_a_quarantined_app_launches_nothing", an_alarm_for_a_quarantined_app_launches_nothing},
         {"an_alarm_launch_behind_a_long_job_is_waited_for", an_alarm_launch_behind_a_long_job_is_waited_for},
         {"an_unreported_alarm_launch_is_given_up_and_runs_nothing", an_unreported_alarm_launch_is_given_up_and_runs_nothing},
         {"an_alarm_cancelled_while_its_launch_waits_launches_nothing", an_alarm_cancelled_while_its_launch_waits_launches_nothing},
@@ -6052,6 +6353,7 @@ int main(int argc, char **argv) {
     }
     for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
         if (strcmp(argv[1], cases[i].name) == 0) {
+            preboot(argv[1]);
             boot();
             cases[i].run();
             finish();

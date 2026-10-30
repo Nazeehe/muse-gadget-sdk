@@ -171,6 +171,14 @@ class AlarmTest(unittest.TestCase):
     def test_a_retry_started_behind_an_arming_does_not_lose_the_arming(self):
         self.run_case("a_retry_started_behind_an_arming_does_not_lose_it")
 
+    # ---- The records' side (Task 20, I) ----
+
+    def test_list_info_gives_each_alarm_its_time_and_options(self):  # a waiting firing too: what a record is made from
+        self.run_case("list_info_gives_each_alarm_its_time_and_options")
+
+    def test_the_cancelled_apps_are_handed_over_once(self):  # apps_alarm_cancel_app and the budget's cut-off, for the records
+        self.run_case("the_cancelled_apps_are_handed_over_once")
+
     def test_the_table_holds_up_to_three_tasks_and_the_esp_timer_task(self):
         self.run_case("the_table_holds_up_to_three_tasks_and_the_esp_timer_task")
 

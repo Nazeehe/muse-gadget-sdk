@@ -472,6 +472,14 @@ class MuseAppsPkgTest(unittest.TestCase):
         self.refused(doc(files='["a.lua.txt"]'), file_type_msg(0, "a.lua.txt"))
         self.refused(doc(files='["a/b.png"]'), file_type_msg(0, "a/b.png"))
 
+    def test_the_manifest_is_not_one_of_the_files(self):
+        # H: a listed manifest.json would be written over the manifest, with bytes only checked to be JSON.
+        self.refused(doc(files='["manifest.json"]'),
+                     "manifest: files[0] 'manifest.json' is the manifest itself; don't list it")
+        self.refused(doc(files='["a.lua","manifest.json"]'),
+                     "manifest: files[1] 'manifest.json' is the manifest itself; don't list it")
+        self.ok(doc(files='["data/manifest.json"]'))  # another folder's is a file like any other
+
     def test_files_must_be_a_list(self):
         for wrong in ['"util.lua"', "{}", '{"a":"b.lua"}', "1", "null", "true"]:
             with self.subTest(files=wrong):

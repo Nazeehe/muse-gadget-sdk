@@ -14,9 +14,10 @@
 
 # Muse apps (small Lua programs), loaded after the board's own overlay:
 #   MUSE_APPS=1 tools/muse/board.sh build|flash s3
-# For the Waveshare S3 1.75C: the launcher hangs off the pocket watch
-# (CONFIG_MUSE_CLOCK), which the other boards' overlays don't turn on, and
-# without it Kconfig drops this option.
+# Only for the Waveshare S3 1.75C, and board.sh refuses MUSE_APPS=1 for any
+# other board: the launcher hangs off the pocket watch (CONFIG_MUSE_CLOCK),
+# which only its overlay turns on, and while Kconfig drops this option without
+# it, the partition table and the FAT lines below would still apply.
 CONFIG_MUSE_APPS=y
 
 # The apps' storage: partitions_muse.csv plus the FAT for the apps and their own

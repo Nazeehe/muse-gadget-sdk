@@ -381,9 +381,25 @@ static bool fake_compile(const apps_pkg_t *pkg, char *err, size_t n) {
     return compile_raw == NULL;
 }
 
+/* The bytes the source gave for path, or NULL. */
+static const uint8_t *served(const char *path, size_t *len) {
+    for (int i = 0; i < n_files; i++) {
+        if (strcmp(files[i].path, path) == 0) {
+            *len = files[i].len;
+            return files[i].data;
+        }
+    }
+    return NULL;
+}
+
 static bool fake_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t n) {
     commits++;
     CHECK(pkg != NULL && pkg->count > 0, "commit of a package");
+    /* The flash store keeps manifest.json as it came (apps_store.h): the pipeline hands the commit the very bytes the source gave. */
+    size_t len = 0;
+    const uint8_t *manifest = served("manifest.json", &len);
+    CHECK(pkg->manifest_json != NULL && manifest != NULL && pkg->manifest_len == len && memcmp(pkg->manifest_json, manifest, len) == 0,
+          "the commit has manifest.json's bytes as served: %zu of %zu", pkg->manifest_json != NULL ? pkg->manifest_len : 0, len);
     *unchanged = commit_unchanged;
     snprintf(err, n, "%s", commit_ok ? "" : commit_err);
     return commit_ok;
@@ -391,6 +407,7 @@ static bool fake_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_
 
 static bool fake_run(apps_pkg_t *pkg, int settle_ms, apps_status_t *st, char *err, size_t n) {
     runs++;
+    CHECK(pkg->manifest_json == NULL && pkg->manifest_len == 0, "manifest.json's bytes are freed before the run: the commit had them");
     run_settle = settle_ms;
     snprintf(run_main, sizeof run_main, "%s", pkg->manifest.main);
     memcpy(st, &run_record, sizeof *st);
@@ -400,15 +417,21 @@ static bool fake_run(apps_pkg_t *pkg, int settle_ms, apps_status_t *st, char *er
     return run_ok;
 }
 
-/* Where the fake store keeps apps: "ram" (no apps partition: results add the hint), or "flash". */
+/* Where the fake store keeps apps: "ram" (no apps partition: results add the hint), or "flash"; and the store's hint, in RAM mode the
+ * reflash hint unless a case gives another (store_hint: P7's, for a partition that couldn't be mounted). */
 static const char *storage_name = "ram";
+static const char *store_hint;
 #define HINT ",\"hint\":\"" APPS_RAM_HINT "\""
 
 static const char *fake_storage(void) {
     return storage_name;
 }
 
-static const apps_install_ops_t OPS = {fake_compile, fake_commit, fake_run, fake_storage};
+static const char *fake_hint(void) {
+    return strcmp(storage_name, "ram") != 0 ? NULL : store_hint != NULL ? store_hint : APPS_RAM_HINT;
+}
+
+static const apps_install_ops_t OPS = {fake_compile, fake_commit, fake_run, fake_storage, fake_hint};
 
 /* ---- Results ---- */
 
@@ -886,6 +909,19 @@ static void success_payload(void) {
               strstr(got, "hint") == NULL,
           "%s", got);
     storage_name = "ram";
+}
+
+/* P7: the hint a result adds is the store's (ops->hint): a partition that is there and couldn't be mounted has its own, which doesn't say
+ * to reflash (a reflash wouldn't help). */
+static void a_result_says_the_stores_hint(void) {
+    serve_hello();
+    store_hint = "the gadget couldn't open its app storage; restart it to try again";
+    const char *got = install("hello", false);
+    CHECK(strstr(got, "\"storage\":\"ram\"") != NULL &&
+              strstr(got, ",\"hint\":\"the gadget couldn't open its app storage; restart it to try again\"}}") != NULL &&
+              strstr(got, "reflash") == NULL,
+          "%s", got);
+    store_hint = NULL;
 }
 
 static void read_and_commit_failures(void) {
@@ -1393,6 +1429,7 @@ int main(int argc, char **argv) {
         {"busy", busy},
         {"success_payload", success_payload},
         {"read_and_commit_failures", read_and_commit_failures},
+        {"a_result_says_the_stores_hint", a_result_says_the_stores_hint},
         {"deadline_is_one_absolute_time", deadline_is_one_absolute_time},
         {"ram_store", ram_store},
         {"ram_budget", ram_budget},

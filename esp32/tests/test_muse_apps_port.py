@@ -35,8 +35,8 @@ APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_port_harness.c"
 
-FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/queue.h", "freertos/semphr.h", "freertos/task.h", "esp_err.h", "esp_heap_caps.h",
-                "esp_log.h", "esp_timer.h"]
+FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/queue.h", "freertos/semphr.h", "freertos/task.h", "esp_attr.h", "esp_err.h",
+                "esp_heap_caps.h", "esp_log.h", "esp_timer.h"]
 PSA = """#pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -155,11 +155,42 @@ class AppPortTest(unittest.TestCase):
     def test_a_backend_failure_is_said_once_a_streak(self):  # the ruling: logged once per streak, not retried every 2 s
         self.run_case("a_backend_failure_is_said_once_a_streak")
 
-    def test_alarm_records_follow_the_table(self):  # the ruling: queued, done after the call, and never from the esp_timer task
+    def test_alarm_records_follow_the_table(self):  # the ruling: queued on the app task's tick, after the call
         self.run_case("alarm_records_follow_the_table")
 
     def test_the_ram_map_forgets_a_removed_app(self):
         self.run_case("the_ram_map_forgets_a_removed_app")
+
+    # ---- Task 20, fix round 1 ----
+
+    def test_each_apps_failure_is_said(self):  # K: a streak per app
+        self.run_case("each_apps_failure_is_said")
+
+    def test_the_budget_holds_back_a_big_value(self):  # P3: at most 5 saves in 30 min, said once, the end writes the last
+        self.run_case("the_budget_holds_back_a_big_value")
+
+    def test_a_small_value_is_never_held_back(self):  # P3
+        self.run_case("a_small_value_is_never_held_back")
+
+    def test_untouched_records_wait_for_the_clock(self):  # P1: kept, then armed again for the time left
+        self.run_case("untouched_records_wait_for_the_clock")
+
+    def test_a_touched_name_is_not_armed_again(self):  # P1: the app's choice wins; its new deadline once the clock comes
+        self.run_case("a_touched_name_is_not_armed_again")
+
+    def test_a_rearm_retries_drops_and_clamps(self):  # P1: no memory, no slot, the week, a due one, a removed app
+        self.run_case("rearm_retries_drops_and_clamps")
+
+    def test_the_values_tables_are_in_psram(self):  # the gadget's internal RAM is what the I/O worker's stack is made from
+        source = (APPS / "apps_values.c").read_text()
+        self.assertIn('#include "esp_attr.h"', source)
+        for name in ("s_failing", "s_failed", "s_slow", "s_slow_new", "s_marked", "s_recs", "s_unclocked"):
+            with self.subTest(name):
+                self.assertRegex(source, rf"(?m)^static EXT_RAM_BSS_ATTR [^\n]*\b{name}\[", f"{name}: plain memory of tasks, PSRAM")
+        for name in ("s_lock_buf", "s_lock"):
+            with self.subTest(name):
+                self.assertRegex(source, rf"(?m)^static [^\n]*\b{name};", name)
+                self.assertNotRegex(source, rf"(?m)^static [^\n]*EXT_RAM_BSS_ATTR[^\n]*\b{name};", f"{name}: the lock stays internal")
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

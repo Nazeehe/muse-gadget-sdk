@@ -126,13 +126,13 @@ void apps_port_sound_stop(void);
 /*
  * The store of an app (the `store` module), which the runtime caches and saves (apps_rt.h): one JSON object an app, of at most 16 KB,
  * written by the runtime and read back by it, whole. The device keeps the objects behind the I/O worker (X11: no flash or NVS from
- * a task with a PSRAM stack, reads included), in a map in PSRAM until Task 20 gives them flash (they survive an app's restart, not
- * the gadget's); apphost keeps them in the process.
+ * a task with a PSRAM stack, reads included), in apps_values.c (apps_values.h): on a gadget with the apps partition they are in
+ * apps_nvs, where they survive the gadget's restart, are written within a write budget and are deleted with their app; on one without
+ * it, in a map in PSRAM, where they survive an app's restart, not the gadget's. apphost keeps them in the process.
  *
- * The RAM map (apps_store_ram.c) holds at most 16 apps, and a save for a 17th drops the values of the app saved longest ago, with one
- * log line that names it. That is a bound against growth that has no limit, for a map that is never cleaned (the values of an app that was
- * removed stay until the gadget restarts); it is a RAM-only bound, and Task 20's flash backend does not inherit it: it deletes an app's
- * values when the app is removed, and drops no other app's.
+ * The RAM map holds at most 16 apps (APPS_VALUES_RAM_APPS), and a save for a 17th drops the values of the app saved longest ago, with one
+ * log line that names it: a bound against growth that has no limit, which only the RAM map has. Either backend deletes an app's values
+ * when the app is removed, and drops no other app's.
  */
 
 /* How long a load waits for the worker at most. The app task's call is watched for APPS_TASK_HUNG_MS (3 s), and the load is made inside

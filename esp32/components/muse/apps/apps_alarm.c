@@ -563,6 +563,7 @@ static void fire_cb(void *arg) {
     bool sound = s->sound, wake = s->wake;
     if (budget_over_locked(app, now_us)) {
         (void)cancel_app_locked(app);
+        note_cancelled_locked(app);  /* this alarm went too, though its slot was freed above: its record goes with the others' */
         journal_locked('W', true, "alarm: %s fired more than %d alarms in a minute; its alarms are cancelled", app, APPS_ALARM_BUDGET);
         ring_orphaned_locked("alarms cancelled");
         unlock();

@@ -297,6 +297,9 @@ class HarnessTest(unittest.TestCase):
     def test_the_launcher_with_no_apps(self):  # C12: the empty-state text closes it too
         self.run_case("launcher_empty_state")
 
+    def test_the_launcher_says_loading_until_the_list_comes(self):  # P6, O: "Loading apps...", then the rows; launcher_shown
+        self.run_case("launcher_says_loading_then_lists_apps")
+
     def test_a_right_swipe_closes_the_launcher(self):  # C12
         self.run_case("launcher_closes_on_a_right_swipe")
 

@@ -440,6 +440,14 @@ uint32_t apps_store_free_kb(void) {
     return store_free_kb;
 }
 
+/* What results and app.list add about where apps are kept: in RAM mode the reflash hint of a gadget without the partition, unless the case
+ * gives the store another (store_hint: P7's, for a partition that couldn't be mounted). */
+static const char *store_hint;
+
+const char *apps_store_hint(void) {
+    return store_mode != APPS_STORAGE_RAM ? NULL : store_hint != NULL ? store_hint : APPS_RAM_HINT;
+}
+
 /* ---- The fakes: the stage's lock (a FreeRTOS mutex) ---- */
 
 /* This harness has one thread, the serial task's and the app task's both: a take that would wait finds a holder that can never give it
@@ -1378,6 +1386,18 @@ static void list_shows_installed_apps(void) {
     EXPECT("@app.err {\"op\":\"list\",\"message\":\"usage: app.list\"}\n");
 }
 
+/* P7: a partition that is there and couldn't be mounted keeps the apps in RAM for the boot, and app.list says the store's own hint for
+ * that, which doesn't say to reflash (a reflash wouldn't help). */
+static void list_says_the_stores_hint(void) {
+    store_mode = APPS_STORAGE_RAM;
+    store_hint = "the gadget couldn't open its app storage; restart it to try again";
+    CHECK(line("app.list"), "list");
+    run_jobs();
+    EXPECT("@app {\"op\":\"list\",\"storage\":\"ram\",\"hint\":\"the gadget couldn't open its app storage; restart it to try again\","
+           "\"apps\":[]}\n");
+    store_hint = NULL;
+}
+
 /* device.health's "apps" (muse_apps_health): the record's few words and the store's mode and room. resident is null with no app loaded. */
 static void health_says_the_app_and_the_store(void) {
     static const struct {
@@ -1691,6 +1711,7 @@ int main(int argc, char **argv) {
         {"launch_for_alarms_tells_the_app_task_what_came_of_it", launch_for_alarms_tells_the_app_task_what_came_of_it},
         {"status_prints_the_record", status_prints_the_record},
         {"list_shows_installed_apps", list_shows_installed_apps},
+        {"list_says_the_stores_hint", list_says_the_stores_hint},
         {"health_says_the_app_and_the_store", health_says_the_app_and_the_store},
         {"an_idle_stage_is_freed", an_idle_stage_is_freed},
         {"send_returns_the_reply", send_returns_the_reply},

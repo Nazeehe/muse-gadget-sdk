@@ -305,6 +305,7 @@ typedef struct {
     const apps_status_t *st;     /* the record (a result without run: NULL) */
     /* a result's */
     const char *id, *version, *storage;
+    const char *hint;            /* what the store adds about where it keeps apps, or NULL */
     const file_info_t *files;
     int n_files;
     bool unchanged;
@@ -436,8 +437,8 @@ static bool add_payload(cJSON *p, const view_t *v) {
     if (ok && v->unchanged) {
         ok = cJSON_AddTrueToObject(p, "unchanged") != NULL;
     }
-    if (ok && strcmp(v->storage, "ram") == 0) {
-        ok = cJSON_AddStringToObject(p, "hint", APPS_RAM_HINT) != NULL;
+    if (ok && v->hint != NULL) {
+        ok = cJSON_AddStringToObject(p, "hint", v->hint) != NULL;
     }
     return ok;
 }
@@ -675,6 +676,7 @@ static cJSON *success(const install_t *in, const apps_install_ops_t *ops, const 
         .id = in->id,
         .version = in->version,
         .storage = ops->storage != NULL ? ops->storage() : "ram",
+        .hint = ops->hint != NULL ? ops->hint() : NULL,
         .files = in->files,
         .n_files = in->n_files,
         .unchanged = unchanged,

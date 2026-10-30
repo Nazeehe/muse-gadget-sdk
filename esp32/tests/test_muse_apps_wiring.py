@@ -231,6 +231,11 @@ class MuseAppsWiringTest(unittest.TestCase):
 
         overlay = ROOT / "devices/sdkconfig.muse-apps"
         self.assertIn("CONFIG_MUSE_APPS=y", overlay.read_text())
+        # The FAT's long names (ids like stopwatch, paths like timer_face.lua), their buffers on the heap and in PSRAM (the
+        # 2026-10-27 ruling's place for these two).
+        lines = overlay.read_text().splitlines()
+        self.assertIn("CONFIG_FATFS_LFN_HEAP=y", lines)
+        self.assertIn("CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y", lines)
         # Nothing else turns it on, the 1.75C's overlay included.
         for other in [*(ROOT / "devices").glob("sdkconfig.*"), *ROOT.glob("sdkconfig.defaults*")]:
             if other != overlay:
@@ -259,6 +264,24 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertEqual(sorted(on_disk - listed), [], "apps/ sources that CMakeLists.txt doesn't build")
         self.assertEqual(sorted(listed - on_disk), [], "CMakeLists.txt lists sources that don't exist")
         self.assertIn("apps/apps_lv.c", listed)
+
+    def test_board_sh_refuses_the_apps_for_any_board_but_the_175c(self):  # G
+        # The overlay's table and FAT lines apply on any board it is loaded on, apps or not: board.sh refuses the flag for every
+        # other board, with one line, before it activates ESP-IDF or touches a build dir. The environment has no ESP-IDF, so a
+        # board.sh that went past the guard would stop at "idf.py not found" (or mosaico's utils) and never build.
+        board = ROOT / "tools/muse/board.sh"
+        with tempfile.TemporaryDirectory() as home:
+            env = {"HOME": home, "PATH": "/usr/bin:/bin", "MUSE_APPS": "1"}
+            for name in ("s3n", "sticks3", "plus2", "mosaico"):
+                with self.subTest(name):
+                    done = subprocess.run(["bash", str(board), "build", name], env=env, capture_output=True, text=True,
+                                          timeout=60)
+                    self.assertNotEqual(done.returncode, 0)
+                    self.assertEqual((done.stdout + done.stderr).strip(), "MUSE_APPS=1 is only for the 1.75C (s3)")
+            # The 1.75C passes the guard (and stops at the missing ESP-IDF here).
+            done = subprocess.run(["bash", str(board), "build", "s3"], env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotIn("is only for the 1.75C", done.stdout + done.stderr)
+            self.assertIn("idf.py not found", done.stdout + done.stderr)
 
     def test_board_sh_and_ci(self):
         board = (ROOT / "tools/muse/board.sh").read_text()
@@ -445,6 +468,37 @@ class MuseAppsWiringTest(unittest.TestCase):
                     else:
                         self.assertNotEqual(done.returncode, 0)
                         self.assertIn("CONFIG_MUSE_APPS", done.stderr)
+
+    def test_validate_config_warns_of_an_apps_build_without_the_apps_table(self):  # Y
+        if shutil.which("cmake") is None:
+            self.skipTest("cmake not available")
+        validate = (ROOT / "cmake/validate_config.cmake").read_text()
+        start = validate.index("if(CONFIG_MUSE_APPS)\n")
+        block = validate[start:validate.index("\nendif()", start) + len("\nendif()")]
+        # (CONFIG_MUSE_APPS, the table's file, warned). The table is read where ESP-IDF reads it, from the project's folder.
+        cases = (("ON", "partitions_muse.csv", True), ("ON", "partitions_muse_apps.csv", False),
+                 ("OFF", "partitions_muse.csv", False), ("ON", "partitions_muse_8mb.csv", True))
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "warn.cmake"
+            for apps, table, warned in cases:
+                with self.subTest(apps=apps, table=table):
+                    script.write_text(
+                        f"set(CONFIG_MUSE_APPS {apps})\nset(CONFIG_PARTITION_TABLE_CUSTOM ON)\n"
+                        f'set(CONFIG_PARTITION_TABLE_FILENAME "{table}")\n'
+                        "function(idf_build_get_property var name)\n"
+                        '    set(${var} "/work/build-muse-waveshare-s3-175c-apps/sdkconfig" PARENT_SCOPE)\n'
+                        "endfunction()\n" + block)
+                    done = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, cwd=ROOT)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    said = " ".join(done.stderr.split())  # CMake wraps a message's lines
+                    if not warned:
+                        self.assertEqual(said, "")
+                        continue
+                    self.assertIn("CMake Warning", said)
+                    self.assertIn(f"CONFIG_MUSE_APPS with the partition table {table}, which has no apps partition", said)
+                    self.assertIn("/work/build-muse-waveshare-s3-175c-apps/sdkconfig", said)
+                    self.assertIn('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_apps.csv" and '
+                                  'CONFIG_PARTITION_TABLE_FILENAME="partitions_muse_apps.csv"', said)
 
     # ---- Task 12: the app task, the device port and the UI hooks ----
 
@@ -756,12 +810,16 @@ class MuseAppsWiringTest(unittest.TestCase):
         task = strip_c_comments((MUSE / "apps/apps_task.c").read_text())
         self.assertRegex(c_function(task, "esp_err_t muse_apps_start(void)"),
                          r"apps_io_init\(\);\s*apps_io_set_first\(apps_store_mount_once\);")
-        # The port marks an app whose alarms change, after the change: its records follow (apps_values.h).
+        # The port says which name an app touched, after the arming or the cancel: its record follows, and a record the mount
+        # handed over for that name is armed again no more (apps_values.h, P1).
         port = strip_c_comments((MUSE / "apps/apps_port_idf.c").read_text())
         self.assertRegex(c_function(port, "apps_alarm_result_t apps_port_alarm_arm("),
-                         r"apps_alarm_arm\([^;]*;\s*apps_values_alarms_changed\(app\);")
+                         r"apps_alarm_arm\([^;]*;\s*apps_values_alarm_touched\(app, name\);")
         self.assertRegex(c_function(port, "void apps_port_alarm_cancel("),
-                         r"apps_alarm_cancel\(app, name\);\s*apps_values_alarms_changed\(app\);")
+                         r"apps_alarm_cancel\(app, name\);\s*apps_values_alarm_touched\(app, name\);")
+        # The lock of the write budget and of the failures' notices is made before anything that takes it runs.
+        self.assertRegex(c_function(task, "esp_err_t muse_apps_start(void)"),
+                         r"apps_values_init\(\);[\s\S]*xTaskCreatePinnedToCoreWithCaps\(apps_task,")
         # device.health's "apps" and the heartbeat's " apps=<resident>/<state> lua=<KB>K": only in a build with the apps.
         health = (ROOT / "main/noise_control.cpp").read_text()
         for needle in ('#include "muse_apps.h"', "muse_apps_health()", 'cJSON_AddItemToObject(health, "apps", apps);'):

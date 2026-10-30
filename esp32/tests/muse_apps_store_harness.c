@@ -151,12 +151,17 @@ bool apps_port_epoch_ms(int64_t *out) {
     return true;
 }
 
-/* ---- The apps' heap, counted (apps_port_sha256 is tools/muse/apphost/sha256.c's) ---- */
+/* ---- The apps' heap, counted (apps_port_sha256 is tools/muse/apphost/sha256.c's), and refused when a case says so ---- */
 
 static long blocks_held;
 static size_t psram_free = (size_t)3 << 20;
+static int alloc_fail_in = -1;  /* the new block this many allocations from now is refused (0: the next); -1 none */
+static bool alloc_refuse_all;   /* every new block is refused */
 
 void *apps_port_realloc(void *ptr, size_t n) {
+    if (ptr == NULL && (alloc_refuse_all || (alloc_fail_in >= 0 && alloc_fail_in-- == 0))) {
+        return NULL;
+    }
     void *block = realloc(ptr, n);
     if (ptr == NULL && block != NULL) {
         blocks_held++;
@@ -244,6 +249,8 @@ typedef struct {
 
 static nvs_item_t nvs_items[NVS_ITEMS];
 static size_t nvs_capacity = 60000;  /* the bytes a partition's blobs may take, with 32 a key, before it is full */
+static char nvs_fail_key[16];        /* a read of this key fails with nvs_fail_err (an error that passes: the blob is there) */
+static esp_err_t nvs_fail_err = ESP_FAIL;
 static esp_err_t init_answers[4];
 static int n_init_answers, init_calls, erase_calls, opens, commits, blob_writes;
 static char erased[4][17], opened_part[17], opened_ns[16];
@@ -367,6 +374,9 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *value, 
 
 esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *out_value, size_t *length) {
     (void)handle;
+    if (nvs_fail_key[0] != '\0' && strcmp(key, nvs_fail_key) == 0) {
+        return nvs_fail_err;
+    }
     nvs_item_t *it = nvs_find(opened_part, opened_ns, key);
     if (it == NULL) {
         return ESP_ERR_NVS_NOT_FOUND;
@@ -500,23 +510,57 @@ static uint32_t crc32_of(const char *s) {
     return ~crc;
 }
 
-static void key_of(char out[16], char kind, const char *id, const char *name) {
+/* The key of probe k (0 for the CRC-32's own, then +1, +2, ...: apps_store.h's probes). */
+static void key_at(char out[16], char kind, const char *id, const char *name, unsigned k) {
     char what[64];
     snprintf(what, sizeof what, name != NULL ? "%s/%s" : "%s", id, name);
-    snprintf(out, 16, "%c%08x", kind, (unsigned)crc32_of(what));
+    snprintf(out, 16, "%c%08x", kind, (unsigned)(crc32_of(what) + k));
 }
 
+static void key_of(char out[16], char kind, const char *id, const char *name) {
+    key_at(out, kind, id, name, 0);
+}
+
+/* Whether the blob of an item is (id[, name])'s: the id and a NUL first, and for a record the name in its field. */
+static bool item_is(const nvs_item_t *it, char kind, const char *id, const char *name) {
+    size_t n = strlen(id);
+    if (it->len <= n || memcmp(it->blob, id, n) != 0 || it->blob[n] != '\0') {
+        return false;
+    }
+    return kind != 'a' || (it->len > APPS_ID_MAX + 1 + strlen(name) && strcmp((const char *)it->blob + APPS_ID_MAX + 1, name) == 0);
+}
+
+/* The item of (kind, id[, name]): the first of its probes whose blob is its own (NULL when none is). */
 static const nvs_item_t *apps_key(char kind, const char *id, const char *name) {
-    char key[16];
-    key_of(key, kind, id, name);
-    return nvs_find("apps_nvs", "apps", key);
+    for (unsigned k = 0; k < 8; k++) {
+        char key[16];
+        key_at(key, kind, id, name, k);
+        const nvs_item_t *it = nvs_find("apps_nvs", "apps", key);
+        if (it != NULL && item_is(it, kind, id, name)) {
+            return it;
+        }
+    }
+    return NULL;
+}
+
+/* The probe its own key is at, or -1. */
+static int apps_key_probe(char kind, const char *id, const char *name) {
+    const nvs_item_t *it = apps_key(kind, id, name);
+    for (unsigned k = 0; it != NULL && k < 8; k++) {
+        char key[16];
+        key_at(key, kind, id, name, k);
+        if (strcmp(it->key, key) == 0) {
+            return (int)k;
+        }
+    }
+    return -1;
 }
 
 /* An alarm's record as the brief has it: the id and the name (each NUL-padded to its field), the flags (bit 0 sound, bit 1
  * wake), then the epoch ms, little-endian. */
 #define RECORD_LEN (APPS_ID_MAX + 1 + APPS_ALARM_NAME_MAX + 1 + 1 + 8)
 
-static void put_record(const char *id, const char *name, int64_t epoch_ms, bool sound, bool wake) {
+static void put_record_at(unsigned k, const char *id, const char *name, int64_t epoch_ms, bool sound, bool wake) {
     uint8_t rec[RECORD_LEN] = {0};
     memcpy(rec, id, strlen(id));
     memcpy(rec + APPS_ID_MAX + 1, name, strlen(name));
@@ -525,8 +569,12 @@ static void put_record(const char *id, const char *name, int64_t epoch_ms, bool 
         rec[RECORD_LEN - 8 + i] = (uint8_t)((uint64_t)epoch_ms >> (8 * i));
     }
     char key[16];
-    key_of(key, 'a', id, name);
+    key_at(key, 'a', id, name, k);
     CHECK(nvs_put_raw("apps_nvs", "apps", key, rec, sizeof rec) == ESP_OK, "a record");
+}
+
+static void put_record(const char *id, const char *name, int64_t epoch_ms, bool sound, bool wake) {
+    put_record_at(0, id, name, epoch_ms, sound, wake);
 }
 
 static void put_values(const char *id, const char *json) {
@@ -679,7 +727,7 @@ bool apps_task_running(char *id, size_t cap) {
     return running_id[0] != '\0';
 }
 
-/* ---- The values' RAM map (apps_values.h): what the store asks of it when an app goes ---- */
+/* ---- apps_values.h: the RAM map, asked to forget an app that goes, and the write budget, which a case can say is spent ---- */
 
 static char forgotten[APPS_ID_MAX + 1];
 
@@ -687,50 +735,43 @@ void apps_values_forget(const char *app) {
     snprintf(forgotten, sizeof forgotten, "%s", app);
 }
 
-/* ---- The system's alarms ---- */
+static bool budget_spent;     /* nothing fits until a case says otherwise */
+static int budget_takes, budget_forced;
+static uint32_t budget_bytes;  /* what was taken */
 
-typedef struct {
-    char app[APPS_ID_MAX + 1], name[APPS_ALARM_NAME_MAX + 1];
-    int64_t ms;
-    bool sound, wake;
-} armed_t;
-
-static armed_t arms[16];
-static int n_arms;
-static char already_armed[64];  /* "app/name" of an alarm the app armed itself this boot: apps_alarm_remaining says so */
-static char cancelled_app[APPS_ID_MAX + 1];
-static apps_alarm_result_t arm_answer = APPS_ALARM_ARMED;
-
-apps_alarm_result_t apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
-    if (n_arms < 16) {
-        armed_t *a = &arms[n_arms++];
-        snprintf(a->app, sizeof a->app, "%s", app);
-        snprintf(a->name, sizeof a->name, "%s", name);
-        a->ms = ms;
-        a->sound = sound;
-        a->wake = wake;
+bool apps_values_budget_take(uint32_t bytes, bool force) {
+    budget_takes++;
+    if (budget_spent && !force) {
+        return false;
     }
-    return arm_answer;
+    budget_forced += force ? 1 : 0;
+    budget_bytes += bytes;
+    return true;
 }
 
-int64_t apps_alarm_remaining(const char *app, const char *name) {
-    char what[64];
-    snprintf(what, sizeof what, "%s/%s", app, name);
-    return strcmp(what, already_armed) == 0 ? 5000 : -1;
+int64_t apps_values_budget_wait_ms(uint32_t bytes) {
+    (void)bytes;
+    return budget_spent ? 60000 : 0;
+}
+
+/* ---- The system's alarms: the store cancels an app's (a remove, a quarantine) and arms none (the app task re-arms the records) ---- */
+
+static int n_arms;
+static char cancelled_app[APPS_ID_MAX + 1];
+
+apps_alarm_result_t apps_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    (void)app;
+    (void)name;
+    (void)ms;
+    (void)sound;
+    (void)wake;
+    n_arms++;
+    return APPS_ALARM_ARMED;
 }
 
 void apps_alarm_cancel_app(const char *app, const char *why) {
     (void)why;
     snprintf(cancelled_app, sizeof cancelled_app, "%s", app);
-}
-
-static const armed_t *armed_as(const char *app, const char *name) {
-    for (int i = 0; i < n_arms; i++) {
-        if (strcmp(arms[i].app, app) == 0 && strcmp(arms[i].name, name) == 0) {
-            return &arms[i];
-        }
-    }
-    return NULL;
 }
 
 /* ---- The I/O worker: jobs wait here for the case to run them ---- */
@@ -890,7 +931,8 @@ static void commit_creates_and_replaces(void) {
     CHECK(manifest != NULL && strlen(manifest) == p->manifest_len && memcmp(manifest, p->manifest_json, p->manifest_len) == 0,
           "manifest.json is the bytes installed: '%s'", manifest != NULL ? manifest : "(none)");
     free(manifest);
-    CHECK(!exists("apps_fs/.old-timer") && !exists("apps_fs/.stage/timer"), "nothing is left of the commit but the app");
+    CHECK(!exists("apps_fs/.old-timer") && !exists("apps_fs/.stage-timer") && !exists("apps_fs/.stage"),
+          "nothing is left of the commit but the app");
     char ids[4][APPS_ID_MAX + 1], names[4][25];
     CHECK(list_ids(ids, names, 4) == 1 && strcmp(ids[0], "timer") == 0 && strcmp(names[0], "Timer") == 0, "listed");
     CHECK(apps_store_has("timer") && !apps_store_has("clock"), "has");
@@ -902,7 +944,7 @@ static void commit_creates_and_replaces(void) {
     CHECK(apps_store_commit(p, &unchanged, err, sizeof err) && !unchanged, "commit v2: %s", err);
     CHECK(file_is("apps_fs/timer/main.lua", "-- v2\n"), "v2's main.lua");
     CHECK(!exists("apps_fs/timer/util.lua") && !exists("apps_fs/timer/lib"), "v1's other files went with its folder");
-    CHECK(!exists("apps_fs/.old-timer") && !exists("apps_fs/.stage/timer"), "the old copy is deleted");
+    CHECK(!exists("apps_fs/.old-timer") && !exists("apps_fs/.stage-timer"), "the old copy is deleted");
     CHECK(list_ids(ids, names, 4) == 1 && strcmp(names[0], "Timer Two") == 0, "the list has the new name: %s", names[0]);
 
     apps_pkg_t *got = apps_port_realloc(NULL, sizeof *got);
@@ -920,13 +962,13 @@ static void commit_creates_and_replaces(void) {
 }
 
 /* Power lost after the old copy was moved aside and before the stage took its place: the old copy comes back, and the stage
- * goes (an install whose end isn't known is no install). */
+ * goes (an install whose end isn't known is no install). The stage is the app's sibling, .stage-<id> (P4). */
 static void recovery_restores_old_when_app_missing(void) {
     put_app("apps_fs/.old-timer", "timer", "Timer", "-- old\n");
-    put_app("apps_fs/.stage/timer", "timer", "Timer", "-- new\n");
+    put_app("apps_fs/.stage-timer", "timer", "Timer", "-- new\n");
     CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
     CHECK(file_is("apps_fs/timer/main.lua", "-- old\n"), "the old copy is back");
-    CHECK(!exists("apps_fs/.old-timer") && !exists("apps_fs/.stage/timer"), "and nothing else is left");
+    CHECK(!exists("apps_fs/.old-timer") && !exists("apps_fs/.stage-timer"), "and nothing else is left");
     CHECK(apps_store_has("timer"), "listed");
     CHECK(logged_has("store: restored timer from an interrupted install"), "said");
 }
@@ -935,15 +977,38 @@ static void recovery_restores_old_when_app_missing(void) {
  * lost after the stage took its place, or while the old copy was being deleted) all go; the app stays as it is. */
 static void recovery_deletes_stray_stage(void) {
     put_app("apps_fs/timer", "timer", "Timer", "-- current\n");
-    spit("apps_fs/.stage/timer/manifest.json", "{\"id\":");
-    spit("apps_fs/.stage/other/lib/x.lua", "x");
+    spit("apps_fs/.stage-timer/manifest.json", "{\"id\":");
+    spit("apps_fs/.stage-other/lib/x.lua", "x");
     put_app("apps_fs/.old-timer", "timer", "Timer", "-- previous\n");
     CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
     CHECK(file_is("apps_fs/timer/main.lua", "-- current\n"), "the app is as it was");
-    CHECK(!exists("apps_fs/.stage/timer") && !exists("apps_fs/.stage/other") && !exists("apps_fs/.old-timer"), "strays gone");
+    CHECK(!exists("apps_fs/.stage-timer") && !exists("apps_fs/.stage-other") && !exists("apps_fs/.old-timer"), "strays gone");
+    CHECK(logged_has("store: removed the unfinished install of timer") && logged_has("store: removed the unfinished install of other"),
+          "each stage is said");
     char ids[4][APPS_ID_MAX + 1], names[4][25];
     CHECK(list_ids(ids, names, 4) == 1, "one app");
     CHECK(logged_has("store: removed a stray copy of timer"), "the old copy is said");
+}
+
+/* The stage of the layout before P4, /apps/.stage/<id> (the board has one), is a leftover like any other: it goes at the mount, all of
+ * it, and the app stays. */
+static void old_layout_stage_is_deleted(void) {
+    put_app("apps_fs/timer", "timer", "Timer", "-- current\n");
+    put_app("apps_fs/.stage/timer", "timer", "Timer", "-- half\n");
+    spit("apps_fs/.stage/clock/lib/deep.lua", "x");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    CHECK(!exists("apps_fs/.stage"), "the old stage's folder went, with all it had");
+    CHECK(file_is("apps_fs/timer/main.lua", "-- current\n") && apps_store_has("timer") && !apps_store_has("clock"), "the app stays");
+    CHECK(logged_has("store: removed the unfinished install of timer") && logged_has("store: removed the unfinished install of clock") &&
+              logged_has("store: removed the .stage folder of an earlier layout"),
+          "said");
+    /* The board's: an empty .stage, as a whole commit of that layout left it. */
+    CHECK(mkdir("apps_fs/.stage", 0755) == 0, "an empty old stage");
+    n_logged = 0;
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    CHECK(!exists("apps_fs/.stage") && logged_has("store: removed the .stage folder of an earlier layout") &&
+              !logged_has("unfinished install"),
+          "it goes too, with its one line");
 }
 
 /* A remove takes the folder and every key of the app (values, alarm records, quarantine), and nothing of another app's; it is
@@ -966,21 +1031,25 @@ static void remove_app(void) {
     CHECK(!apps_store_remove("timer", err, sizeof err) && strcmp(err, "timer is running; stop it first") == 0, "refused: '%s'", err);
     CHECK(exists("apps_fs/timer/main.lua") && apps_key('s', "timer", NULL) != NULL, "and nothing went");
     running_id[0] = '\0';
+    cancelled_app[0] = '\0';
     CHECK(apps_store_remove("timer", err, sizeof err), "remove: %s", err);
     CHECK(!exists("apps_fs/timer"), "the folder went");
+    CHECK(strcmp(cancelled_app, "timer") == 0, "its armed alarms are cancelled: '%s'", cancelled_app);
     CHECK(apps_key('s', "timer", NULL) == NULL && apps_key('a', "timer", "done") == NULL && apps_key('q', "timer", NULL) == NULL,
           "its keys went");
     CHECK(apps_key('s', "clock", NULL) != NULL && apps_key('a', "clock", "tick") != NULL && exists("apps_fs/clock/main.lua"),
           "the other app's stay");
     CHECK(!apps_store_has("timer") && apps_store_has("clock") && listed_n == 1 && strcmp(listed[0].id, "clock") == 0,
           "the list and the launcher's");
+    const nvs_item_t *order = nvs_find("apps_nvs", "apps", "order");
+    CHECK(order != NULL && order->len == 6 && memcmp(order->blob, "clock\0", 6) == 0, "and its place in the order went");
     CHECK(!apps_store_remove("timer", err, sizeof err) && strcmp(err, "no such app on the gadget") == 0, "again: '%s'", err);
     free_pkg(timer);
     free_pkg(clock);
 }
 
-/* The list reads each folder's manifest.json: its name, most recently installed first; a folder that isn't an app is left out
- * (and left alone). */
+/* The list reads each folder's manifest.json: its name; with no order kept yet (P2) the apps go by id, whatever times the folders
+ * have (FAT's come from a clock that may not be set). A folder that isn't an app is left out (and left alone). */
 static void list_reads_names(void) {
     put_app("apps_fs/alpha", "alpha", "Alpha", "-- a\n");
     put_app("apps_fs/beta", "beta", "Beta", "-- b\n");
@@ -994,11 +1063,11 @@ static void list_reads_names(void) {
     char ids[8][APPS_ID_MAX + 1], names[8][25];
     int n = list_ids(ids, names, 8);
     CHECK(n == 2, "two apps, not %d", n);
-    CHECK(n == 2 && strcmp(ids[0], "beta") == 0 && strcmp(names[0], "Beta") == 0 && strcmp(ids[1], "alpha") == 0 &&
-              strcmp(names[1], "Alpha") == 0,
-          "beta (newer) first, with the manifests' names");
+    CHECK(n == 2 && strcmp(ids[0], "alpha") == 0 && strcmp(names[0], "Alpha") == 0 && strcmp(ids[1], "beta") == 0 &&
+              strcmp(names[1], "Beta") == 0,
+          "by id (beta's folder is newer), with the manifests' names");
     CHECK(list_ids(ids, names, 1) == 1, "max is kept");
-    CHECK(listed_n == 2 && strcmp(listed[0].id, "beta") == 0 && strcmp(listed[1].name, "Alpha") == 0, "the launcher's list");
+    CHECK(listed_n == 2 && strcmp(listed[0].id, "alpha") == 0 && strcmp(listed[1].name, "Beta") == 0, "the launcher's list");
     apps_manifest_t *m = apps_port_realloc(NULL, sizeof *m);
     CHECK(apps_store_manifest("alpha", m) && strcmp(m->name, "Alpha") == 0 && strcmp(m->version, "1.0.0") == 0, "manifest");
     apps_manifest_clear(m, apps_port_free);
@@ -1017,7 +1086,7 @@ static void unchanged_skips_commit(void) {
     CHECK(apps_store_commit(p, &unchanged, err, sizeof err) && !unchanged, "the first commit: %s", err);
     spit("apps_fs/timer/.kept", "a replace would take this");
     CHECK(apps_store_commit(p, &unchanged, err, sizeof err) && unchanged, "the same again: unchanged");
-    CHECK(exists("apps_fs/timer/.kept") && !exists("apps_fs/.stage/timer"), "the folder wasn't touched");
+    CHECK(exists("apps_fs/timer/.kept") && !exists("apps_fs/.stage-timer"), "the folder wasn't touched");
     free_pkg(p);
     const file_t changed[] = {{"main.lua", "-- y\n"}, {"data.json", "{\"a\":1}"}};
     p = make_pkg("timer", "Timer", "1.0.0", 2, changed);
@@ -1056,17 +1125,126 @@ static void values_roundtrip(void) {
     json = apps_store_load_values("timer", &len);
     CHECK(json != NULL && strcmp(json, "{}") == 0, "and reads back as {}");
     apps_port_free(json);
-    put_values("timer", "{\"b\":2}");
     char key[16];
     key_of(key, 's', "timer", NULL);
     CHECK(nvs_put_raw("apps_nvs", "apps", key, "other\0{\"b\":2}", 13) == ESP_OK, "another id under timer's key");
     json = apps_store_load_values("timer", &len);
-    CHECK(json != NULL && strcmp(json, "{}") == 0 && logged_has("store: the values under timer's key are another app's"),
-          "a key whose id isn't the app's is not its values");
+    CHECK(json != NULL && strcmp(json, "{}") == 0, "a key whose blob isn't the app's is not its values: it has none");
     apps_port_free(json);
+    CHECK(apps_store_save_values("timer", "{\"c\":3}", 7) && apps_key_probe('s', "timer", NULL) == 1,
+          "a save takes the next key, and leaves the other's (E): probe %d", apps_key_probe('s', "timer", NULL));
+    const nvs_item_t *other = nvs_find("apps_nvs", "apps", key);
+    CHECK(other != NULL && other->len == 13 && memcmp(other->blob, "other\0", 6) == 0, "the other's blob is as it was");
     CHECK(apps_store_save_values("ghost", "{\"c\":3}", 7) && apps_key('s', "ghost", NULL) == NULL,
           "an app that isn't installed has no values written: the save is moot (it was removed), not a failure");
     CHECK(blocks_held == held, "%ld blocks held", blocks_held - held);
+}
+
+/* D: values that are there and can't be read now aren't an empty store, which the app's first save would write over: the load gives
+ * NULL (the launch is refused, to be tried again), and the blob stays. Only a key that isn't there is "{}". */
+static void values_that_cannot_be_read_are_not_empty(void) {
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    const file_t files[] = {{"main.lua", "-- main\n"}};
+    apps_pkg_t *p = make_pkg("timer", "Timer", "1", 1, files);
+    bool unchanged;
+    char err[256];
+    CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "%s", err);
+    free_pkg(p);
+    size_t len = 99;
+    char *json = apps_store_load_values("timer", &len);
+    CHECK(json != NULL && len == 2 && strcmp(json, "{}") == 0, "nothing saved: {}");
+    apps_port_free(json);
+    CHECK(apps_store_save_values("timer", "{\"a\":1}", 7), "save");
+    long held = blocks_held;
+    alloc_fail_in = 0;  /* the blob's block */
+    json = apps_store_load_values("timer", &len);
+    alloc_fail_in = -1;
+    CHECK(json == NULL && len == 0, "no memory for the blob: NULL, not {}");
+    apps_port_free(json);
+    CHECK(blocks_held == held, "%ld blocks held after it", blocks_held - held);
+    key_of(nvs_fail_key, 's', "timer", NULL);
+    json = apps_store_load_values("timer", &len);
+    CHECK(json == NULL && len == 0, "an error of apps_nvs: NULL, not {}");
+    apps_port_free(json);
+    nvs_fail_key[0] = '\0';
+    const nvs_item_t *item = apps_key('s', "timer", NULL);
+    CHECK(item != NULL && item->len == 13 && memcmp(item->blob, "timer\0{\"a\":1}", 13) == 0, "the blob is there still");
+    json = apps_store_load_values("timer", &len);
+    CHECK(json != NULL && strcmp(json, "{\"a\":1}") == 0, "and reads once it can: %s", json != NULL ? json : "NULL");
+    apps_port_free(json);
+}
+
+/* E: two ids whose CRC-32s are one (zlib's: "timer" and "zleca55_" are both 0x6ad0de1a, and so is every key that adds the same to
+ * them, "timer/done" and "zleca55_/done") keep their values, quarantines and records apart: each finds its own key among the probes,
+ * a new one takes the first that is free, and removing one leaves the other's. */
+static void keys_that_collide_stay_apart(void) {
+    char k0[16], k1[16];
+    key_of(k0, 's', "timer", NULL);
+    key_of(k1, 's', "zleca55_", NULL);
+    CHECK(strcmp(k0, "s6ad0de1a") == 0 && strcmp(k1, "s6ad0de1a") == 0, "the known answer, and the collision: %s %s", k0, k1);
+    clock_set = true;
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    const file_t files[] = {{"main.lua", "-- main\n"}};
+    apps_pkg_t *timer = make_pkg("timer", "Timer", "1", 1, files), *z = make_pkg("zleca55_", "Z", "1", 1, files);
+    bool unchanged;
+    char err[256];
+    CHECK(apps_store_commit(timer, &unchanged, err, sizeof err) && apps_store_commit(z, &unchanged, err, sizeof err), "%s", err);
+    CHECK(apps_store_save_values("timer", "{\"t\":1}", 7) && apps_store_save_values("zleca55_", "{\"z\":2}", 7), "values");
+    CHECK(apps_key_probe('s', "timer", NULL) == 0 && apps_key_probe('s', "zleca55_", NULL) == 1, "two keys: %d %d",
+          apps_key_probe('s', "timer", NULL), apps_key_probe('s', "zleca55_", NULL));
+    size_t len;
+    char *a = apps_store_load_values("timer", &len), *b = apps_store_load_values("zleca55_", &len);
+    CHECK(a != NULL && b != NULL && strcmp(a, "{\"t\":1}") == 0 && strcmp(b, "{\"z\":2}") == 0, "each reads its own: %s %s",
+          a != NULL ? a : "NULL", b != NULL ? b : "NULL");
+    apps_port_free(a);
+    apps_port_free(b);
+    CHECK(apps_store_save_values("zleca55_", "{}", 2) && apps_key('s', "zleca55_", NULL) == NULL && apps_key('s', "timer", NULL) != NULL,
+          "an empty store erases its own key only");
+    CHECK(apps_store_save_values("zleca55_", "{\"z\":3}", 7) && apps_key_probe('s', "zleca55_", NULL) == 1, "and saves to it again");
+    CHECK(apps_store_save_alarm("timer", "done", epoch_now + 1000, true, true) &&
+              apps_store_save_alarm("zleca55_", "done", epoch_now + 2000, false, true),
+          "two records under one CRC-32");
+    CHECK(apps_key_probe('a', "timer", "done") == 0 && apps_key_probe('a', "zleca55_", "done") == 1, "two keys for them too");
+    apps_store_drop_alarm("zleca55_", "done");
+    CHECK(apps_key('a', "zleca55_", "done") == NULL && apps_key('a', "timer", "done") != NULL, "a drop takes its own");
+    CHECK(apps_store_save_alarm("zleca55_", "done", epoch_now + 2000, false, true), "again");
+    /* The quarantine: zleca55_ is quarantined at a boot, then timer (its q key is put where a quarantine of it would go: the next
+     * probe); each load is refused for itself, and a reinstall of one clears its own. */
+    apps_marker_t *m = apps_store_marker();
+    memset(m, 0, sizeof *m);
+    char q[APPS_ID_MAX + 1];
+    apps_marker_launch(m, "zleca55_");
+    (void)apps_marker_boot(m, q);
+    apps_marker_launch(m, "zleca55_");
+    reset_reason = ESP_RST_PANIC;
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    CHECK(apps_key_probe('q', "zleca55_", NULL) == 0, "zleca55_'s quarantine: %d", apps_key_probe('q', "zleca55_", NULL));
+    CHECK(apps_key('a', "zleca55_", "done") == NULL && apps_key('a', "timer", "done") != NULL,
+          "the quarantine dropped its own records only");
+    key_at(k1, 'q', "timer", NULL, 1);
+    CHECK(nvs_put_raw("apps_nvs", "apps", k1, "timer", 6) == ESP_OK, "timer's quarantine, at the next probe");
+    CHECK(apps_key_probe('q', "timer", NULL) == 1, "two quarantines under one CRC-32");
+    CHECK(apps_store_commit(z, &unchanged, err, sizeof err) && unchanged, "a reinstall of zleca55_: %s", err);
+    CHECK(apps_key('q', "zleca55_", NULL) == NULL && apps_key('q', "timer", NULL) != NULL, "clears its own quarantine");
+    apps_pkg_t *got = apps_port_realloc(NULL, sizeof *got);
+    bool loaded = apps_store_load("timer", got, err, sizeof err);
+    CHECK(!loaded && strstr(err, "timer was running during two restarts") != NULL, "timer is still quarantined: '%s'", err);
+    if (loaded) {
+        apps_pkg_free(got, apps_port_free);
+    }
+    CHECK(apps_store_load("zleca55_", got, err, sizeof err), "zleca55_ loads: %s", err);
+    apps_pkg_free(got, apps_port_free);
+    apps_port_free(got);
+    /* Removing timer takes its keys, and none of zleca55_'s, which are found past the hole it leaves. */
+    CHECK(apps_store_remove("timer", err, sizeof err), "remove: %s", err);
+    CHECK(apps_key('s', "timer", NULL) == NULL && apps_key('q', "timer", NULL) == NULL && apps_key('a', "timer", "done") == NULL,
+          "timer's keys went");
+    CHECK(apps_key('s', "zleca55_", NULL) != NULL, "zleca55_'s values stayed");
+    char *zj = apps_store_load_values("zleca55_", &len);
+    CHECK(zj != NULL && strcmp(zj, "{\"z\":3}") == 0, "and read past the free key before them: %s", zj != NULL ? zj : "NULL");
+    apps_port_free(zj);
+    free_pkg(timer);
+    free_pkg(z);
 }
 
 /* apps_nvs that is full, or of another version, is erased, and only it: the pairing's nvs is never touched. */
@@ -1112,6 +1290,8 @@ static void ram_mode_when_partition_missing(void) {
     CHECK(strcmp(apps_storage_name(apps_store_mode()), "ram") == 0, "named ram");
     CHECK(mounts == 0 && init_calls == 0 && opens == 0, "no FAT mount, no apps_nvs");
     CHECK(logged_has("reflash over USB once to keep apps"), "the hint is in the log");
+    CHECK(apps_store_hint() != NULL && strcmp(apps_store_hint(), APPS_RAM_HINT) == 0, "and the store's: '%s'",
+          apps_store_hint() != NULL ? apps_store_hint() : "NULL");
     CHECK(listed_n == 0 && list_publishes >= 1, "the launcher is told: no apps");
     const file_t files[] = {{"main.lua", "-- main\n"}};
     apps_pkg_t *p = make_pkg("timer", "Timer", "3.0", 1, files);
@@ -1131,8 +1311,10 @@ static void ram_mode_when_partition_missing(void) {
     apps_manifest_clear(m, apps_port_free);
     apps_port_free(m);
     CHECK(apps_store_free_kb() == (uint32_t)(psram_free / 1024), "the room is PSRAM's: %u KB", (unsigned)apps_store_free_kb());
+    cancelled_app[0] = '\0';
     CHECK(apps_store_remove("timer", err, sizeof err) && ram_removes == 1 && strcmp(forgotten, "timer") == 0,
           "a remove takes the package and its values: %s", err);
+    CHECK(strcmp(cancelled_app, "timer") == 0, "and cancels its armed alarms: '%s'", cancelled_app);
     CHECK(list_ids(ids, names, 4) == 0, "and the list");
     free_pkg(p);
 }
@@ -1225,9 +1407,40 @@ static void reset_reason_counts(int reason) {
         apps_pkg_free(got, apps_port_free);
     }
     apps_port_free(got);
+    CHECK(loads || strcmp(err, "timer was running during two restarts in a row; reinstall it to run it again") == 0,
+          "a load that fails is the quarantine's: '%s'", err);
     printf("%s\n", loads ? "cleared" : "quarantined");
     CHECK(logged_count("boot: reset reason ") == 1, "one boot line");
     CHECK(!loads || (m->running == 0 && m->resets == 0), "a reset that isn't a crash is a clean stop");
+}
+
+/* J: the boot's line has the marker's id and its count as read, before this boot's reset is counted or cleared: a crash that left the
+ * count at 1 shows on the next line, even when that reset clears it. */
+static void boot_line_says_the_count(void) {
+    put_app("apps_fs/timer", "timer", "Timer", "-- main\n");
+    apps_marker_t *m = apps_store_marker();
+    memset(m, 0, sizeof *m);
+    static const struct {
+        esp_reset_reason_t why;
+        const char *line;
+    } boots[] = {
+        {ESP_RST_PANIC, "boot: reset reason panic; app marker timer, resets 0, was running during a crash reset"},
+        {ESP_RST_USB, "boot: reset reason usb; app marker timer, resets 1, was running, not a crash: cleared"},
+        {ESP_RST_PANIC, "boot: reset reason panic; app marker timer, resets 0, was running during a crash reset"},
+        {ESP_RST_TASK_WDT,
+         "boot: reset reason task_wdt; app marker timer, resets 1, was running during 2 crash resets in a row: quarantined"},
+    };
+    for (size_t i = 0; i < sizeof boots / sizeof boots[0]; i++) {
+        apps_marker_launch(m, "timer");
+        reset_reason = boots[i].why;
+        n_logged = 0;
+        CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+        CHECK(logged_count(boots[i].line) == 1 && logged_count("boot: reset reason ") == 1, "boot %zu: '%s'", i, boots[i].line);
+    }
+    n_logged = 0;
+    reset_reason = ESP_RST_SW;
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    CHECK(logged_has("boot: reset reason sw; app marker timer, resets 0, nothing was running"), "nothing ran: the count read is 0");
 }
 
 /* A quarantined app: its alarm records go (stored and armed), its load is refused with the message, until a reinstall. */
@@ -1248,61 +1461,118 @@ static void quarantine_refuses_until_reinstalled(void) {
     CHECK(logged_has("boot: reset reason panic") && logged_has("timer") && logged_has("quarantined"), "the boot line says so");
     CHECK(apps_key('q', "timer", NULL) != NULL, "the quarantine is kept in apps_nvs");
     CHECK(apps_key('a', "timer", "done") == NULL && strcmp(cancelled_app, "timer") == 0, "its alarms go, stored and armed");
-    CHECK(armed_as("timer", "done") == NULL, "and aren't armed again");
-    CHECK(armed_as("clock", "tick") != NULL, "another app's are");
+    CHECK(apps_key('a', "clock", "tick") != NULL, "another app's record stays");
     apps_pkg_t *got = apps_port_realloc(NULL, sizeof *got);
     CHECK(!apps_store_load("timer", got, err, sizeof err) &&
               strcmp(err, "timer was running during two restarts in a row; reinstall it to run it again") == 0,
           "refused: '%s'", err);
     CHECK(apps_store_has("timer"), "still listed");
+    apps_store_record_t recs[APPS_STORE_RECORDS_MAX];
+    int n = apps_store_take_records(recs, APPS_STORE_RECORDS_MAX);
+    CHECK(n == 1 && strcmp(recs[0].id, "clock") == 0, "only the other app's record is handed over to be armed again: %d", n);
     const file_t files[] = {{"main.lua", "-- main\n"}};
     apps_pkg_t *p = make_pkg("timer", "Timer", "1", 1, files);
     bool unchanged;
-    CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "a reinstall: %s", err);
+    CHECK(apps_store_commit(p, &unchanged, err, sizeof err) && !unchanged, "a reinstall: %s", err);
     CHECK(apps_key('q', "timer", NULL) == NULL, "clears it");
+    CHECK(apps_store_load("timer", got, err, sizeof err), "and it loads: %s", err);
+    apps_pkg_free(got, apps_port_free);
+    /* The same files pushed again, the likeliest answer to the refusal, are an unchanged commit: that clears it too (W). */
+    char key[16];
+    key_of(key, 'q', "timer", NULL);
+    CHECK(nvs_put_raw("apps_nvs", "apps", key, "timer", 6) == ESP_OK, "quarantined again");
+    CHECK(!apps_store_load("timer", got, err, sizeof err), "refused");
+    CHECK(apps_store_commit(p, &unchanged, err, sizeof err) && unchanged, "the same package again: unchanged: %s", err);
+    CHECK(apps_key('q', "timer", NULL) == NULL && logged_has("store: timer was reinstalled: its quarantine is over"), "clears it");
     CHECK(apps_store_load("timer", got, err, sizeof err), "and it loads: %s", err);
     apps_pkg_free(got, apps_port_free);
     apps_port_free(got);
     free_pkg(p);
 }
 
-/* The alarms' records, re-armed at the mount when the clock is valid: the time left, a record past due at once (1 ms), and the
- * record of an app that isn't installed forgotten. */
-static void rearm_at_mount(void) {
-    clock_set = true;
+/* The record of an alarm as the mount hands it over, or NULL. */
+static const apps_store_record_t *record_in(const apps_store_record_t *recs, int n, const char *id, const char *name) {
+    for (int i = 0; i < n; i++) {
+        if (strcmp(recs[i].id, id) == 0 && strcmp(recs[i].name, name) == 0) {
+            return &recs[i];
+        }
+    }
+    return NULL;
+}
+
+/* P1: the mount reads the records and hands them to the app task, which arms them again (the store arms nothing, clock or none): each
+ * with its time and options. A record of an app that isn't installed goes; so does one whose time isn't a record's (AA: before 2025, after
+ * 2100, or the bytes of INT64_MIN, which the arithmetic would overflow on). The first take has them, the next none. */
+static void records_are_handed_over_at_the_mount(void) {
     put_app("apps_fs/timer", "timer", "Timer", "-- main\n");
     put_record("timer", "done", epoch_now + 60000, true, true);
     put_record("timer", "late", epoch_now - 5000, false, true);
     put_record("ghost", "boo", epoch_now + 1000, true, true);
-    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
-    const armed_t *done = armed_as("timer", "done"), *late = armed_as("timer", "late");
-    CHECK(done != NULL && done->ms == 60000 && done->sound && done->wake, "done: the time left");
-    CHECK(late != NULL && late->ms == 1 && !late->sound && late->wake, "late: past due, so at once");
-    CHECK(armed_as("ghost", "boo") == NULL && apps_key('a', "ghost", "boo") == NULL, "an app that isn't installed: forgotten");
-    CHECK(apps_key('a', "timer", "done") != NULL, "a re-armed alarm keeps its record (the app task drops it when it is told)");
+    put_record("timer", "old", 1700000000000LL, true, true);    /* 2023 */
+    put_record("timer", "far", 4200000000000LL, true, true);    /* 2103 */
+    put_record("timer", "min", INT64_MIN, true, true);          /* 00 .. 80 */
+    apps_store_record_t recs[APPS_STORE_RECORDS_MAX];
+    CHECK(apps_store_take_records(recs, APPS_STORE_RECORDS_MAX) == 0, "before the mount: none");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash, with no valid clock");
+    CHECK(n_arms == 0, "the store arms nothing: the app task does");
+    int n = apps_store_take_records(recs, APPS_STORE_RECORDS_MAX);
+    CHECK(n == 2, "two records handed over: %d", n);
+    const apps_store_record_t *done = record_in(recs, n, "timer", "done"), *late = record_in(recs, n, "timer", "late");
+    CHECK(done != NULL && done->epoch_ms == epoch_now + 60000 && done->sound && done->wake, "done, as kept");
+    CHECK(late != NULL && late->epoch_ms == epoch_now - 5000 && !late->sound && late->wake, "late, as kept (past due: the app task's)");
+    CHECK(apps_key('a', "ghost", "boo") == NULL, "an app that isn't installed: its record went");
+    CHECK(apps_key('a', "timer", "old") == NULL && apps_key('a', "timer", "far") == NULL && apps_key('a', "timer", "min") == NULL,
+          "records whose times aren't records' went");
+    CHECK(apps_key('a', "timer", "done") != NULL && apps_key('a', "timer", "late") != NULL, "the others stay, for the app task");
+    CHECK(apps_store_take_records(recs, APPS_STORE_RECORDS_MAX) == 0, "taken once");
 }
 
-/* With no valid clock at the mount the records wait; the first tick that sees the clock submits the re-arm, once. An alarm the app
- * armed meanwhile is left as the app armed it. */
-static void rearm_waits_for_the_clock(void) {
+/* S: a record that can't be read for now (an error of apps_nvs) stays as it is and isn't handed over; one that was read and isn't a
+ * record (its length), or isn't under one of its own keys, goes. */
+static void a_record_that_cannot_be_read_now_is_kept(void) {
+    put_app("apps_fs/timer", "timer", "Timer", "-- main\n");
+    put_record("timer", "busy", epoch_now + 60000, true, true);
+    put_record("timer", "fine", epoch_now + 60000, true, true);
+    char key[16];
+    key_of(key, 'a', "timer", "short");
+    CHECK(nvs_put_raw("apps_nvs", "apps", key, "timer\0short", 12) == ESP_OK, "a blob that isn't a record");
+    uint8_t rec[RECORD_LEN] = {0};
+    memcpy(rec, "timer", 5);
+    memcpy(rec + APPS_ID_MAX + 1, "elsewhere", 9);
+    rec[APPS_ID_MAX + 1 + APPS_ALARM_NAME_MAX + 1] = 3;
+    for (int i = 0; i < 8; i++) {
+        rec[RECORD_LEN - 8 + i] = (uint8_t)((uint64_t)(epoch_now + 60000) >> (8 * i));
+    }
+    CHECK(nvs_put_raw("apps_nvs", "apps", "a00000001", rec, sizeof rec) == ESP_OK, "a record under a key that isn't its own");
+    key_of(nvs_fail_key, 'a', "timer", "busy");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    nvs_fail_key[0] = '\0';
+    apps_store_record_t recs[APPS_STORE_RECORDS_MAX];
+    int n = apps_store_take_records(recs, APPS_STORE_RECORDS_MAX);
+    CHECK(n == 1 && strcmp(recs[0].name, "fine") == 0, "the one that could be read is handed over: %d", n);
+    CHECK(apps_key('a', "timer", "busy") != NULL, "the one that couldn't be read now stays");
+    CHECK(nvs_find("apps_nvs", "apps", key) == NULL, "the blob that isn't a record went");
+    CHECK(nvs_find("apps_nvs", "apps", "a00000001") == NULL, "and the record under another's key");
+}
+
+/* S: when the list couldn't be read (no memory at the mount), no record is dropped as an app's that isn't installed: they all wait for
+ * a mount that can tell. */
+static void records_survive_a_list_that_failed(void) {
     put_app("apps_fs/timer", "timer", "Timer", "-- main\n");
     put_record("timer", "done", epoch_now + 60000, true, true);
-    put_record("timer", "mine", epoch_now + 90000, true, true);
+    put_record("ghost", "boo", epoch_now + 60000, true, true);
+    alloc_refuse_all = true;  /* the apps' heap has nothing for the mount: the list's blocks among the rest */
     CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
-    CHECK(n_arms == 0 && logged_has("store: alarms wait for the clock"), "nothing armed without the clock");
-    apps_store_tick(mono_ms);
-    CHECK(n_jobs == 0, "no clock yet: no job");
-    snprintf(already_armed, sizeof already_armed, "timer/mine");
-    clock_set = true;
-    epoch_now += 30000;
-    apps_store_tick(mono_ms + 1000);
-    CHECK(n_jobs == 1, "the clock is set: the re-arm job");
-    run_jobs();
-    const armed_t *done = armed_as("timer", "done");
-    CHECK(done != NULL && done->ms == 30000, "done: what is left of it now");
-    CHECK(armed_as("timer", "mine") == NULL, "an alarm the app armed itself is left alone");
-    apps_store_tick(mono_ms + 2000);
-    CHECK(n_jobs == 0, "once");
+    alloc_refuse_all = false;
+    CHECK(logged_has("store: out of memory: the list of apps wasn't read"), "said");
+    CHECK(apps_key('a', "timer", "done") != NULL && apps_key('a', "ghost", "boo") != NULL, "every record stays");
+    apps_store_record_t got[APPS_STORE_RECORDS_MAX];
+    int handed = apps_store_take_records(got, APPS_STORE_RECORDS_MAX);
+    CHECK(handed == 0, "none is handed over to be armed again (its launch wouldn't find the app, and its record would go): %d", handed);
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "a mount that reads the list");
+    handed = apps_store_take_records(got, APPS_STORE_RECORDS_MAX);
+    CHECK(handed == 1 && strcmp(got[0].id, "timer") == 0 && apps_key('a', "ghost", "boo") == NULL && apps_key('a', "timer", "done") != NULL,
+          "hands timer's over, and drops ghost's: %d", handed);
 }
 
 /* A record is written as the brief has it (the reader above reads it back), dropped by name, or all of an app's at once. */
@@ -1336,6 +1606,15 @@ static void alarm_records_round_trip(void) {
     CHECK(apps_key('a', "timer", "a") == NULL && apps_key('a', "timer", "b") == NULL, "all of the app's at once");
     CHECK(apps_store_save_alarm("ghost", "x", epoch_now + 1, true, true) && apps_key('a', "ghost", "x") == NULL,
           "an app that isn't installed has no records: moot, not a failure");
+    /* E: a key another's record holds is left to it; this one's record takes the next, and is found and dropped there. */
+    char key[16];
+    key_of(key, 'a', "timer", "done");
+    put_record_at(0, "zleca55_", "done", epoch_now + 5, true, true);  /* "zleca55_/done" has timer/done's CRC-32 */
+    CHECK(apps_store_save_alarm("timer", "done", epoch_now + 30000, true, false) && apps_key_probe('a', "timer", "done") == 1, "the next key");
+    const nvs_item_t *theirs = nvs_find("apps_nvs", "apps", key);
+    CHECK(theirs != NULL && strcmp((const char *)theirs->blob, "zleca55_") == 0, "the other's record stays");
+    apps_store_drop_alarm("timer", "done");
+    CHECK(apps_key('a', "timer", "done") == NULL && nvs_find("apps_nvs", "apps", key) != NULL, "a drop takes its own only");
 }
 
 /* A record's time and flags (bit 0 sound, bit 1 wake); -1 for no record. */
@@ -1356,10 +1635,12 @@ static int record_flags(const char *id, const char *name) {
     return rec != NULL && rec->len == RECORD_LEN ? rec->blob[APPS_ID_MAX + 1 + APPS_ALARM_NAME_MAX + 1] : -1;
 }
 
-/* The records follow the alarm table (apps_store_sync_alarms: apps_values.c's op, on the worker): an alarm with no record, or whose record
- * is more than EPOCH_SLACK_MS off or has other options, is written; one within it isn't written again; the record of a name the app no
- * longer has goes; another app's records stay. Without a valid clock nothing is written, and only the records of names that are gone go. */
-static void sync_alarms_follows_the_table(void) {
+/* P1: a sync (apps_store_sync_alarms: apps_values.c's op, on the worker) makes an app's records follow its alarms, except for the names
+ * to keep, whose records nothing touched since the boot (they wait for the re-arm, or were armed again): those are never written or
+ * dropped. Of an alarm, with a valid clock, a record that is new, more than EPOCH_SLACK_MS off or with other options is written and one
+ * within it isn't written again; without a valid clock its old record goes (the app armed it again, and its time isn't known). The record
+ * of a name in neither (cancelled, told, given up on) goes. Another app's records stay. */
+static void sync_alarms_keeps_untouched_names(void) {
     clock_set = true;
     CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
     const file_t files[] = {{"main.lua", "-- main\n"}};
@@ -1371,31 +1652,37 @@ static void sync_alarms_follows_the_table(void) {
         CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "%s", err);
         free_pkg(p);
     }
+    budget_takes = budget_forced = 0;  /* the commits' orders took theirs (not forced): from here, the records' */
     CHECK(apps_store_save_alarm("other", "x", epoch_now + 5000, true, true), "another app's record");
-    apps_store_alarm_t a[2] = {{"t", epoch_now + 60000, true, true}, {"u", epoch_now + 90000, false, true}};
-    apps_store_sync_alarms("timer", a, 2, true);
-    CHECK(record_epoch("timer", "t") == epoch_now + 60000 && record_flags("timer", "t") == 3, "t written");
-    CHECK(record_epoch("timer", "u") == epoch_now + 90000 && record_flags("timer", "u") == 2, "u written");
+    CHECK(apps_store_save_alarm("timer", "a", epoch_now + 10000, true, true) && apps_store_save_alarm("timer", "b", epoch_now + 20000, true, true),
+          "a and b, handed over at a mount and not armed yet");
+    static const char keep_ab[][APPS_ALARM_NAME_MAX + 1] = {"a", "b"};
     int writes = blob_writes;
-    a[0].epoch_ms += 700;  /* within the slack: the same alarm, its time left read a little later */
-    apps_store_sync_alarms("timer", a, 2, true);
-    CHECK(blob_writes == writes, "nothing written again: %d writes", blob_writes - writes);
-    a[1].sound = true;  /* other options */
-    apps_store_sync_alarms("timer", a, 2, true);
-    CHECK(blob_writes == writes + 1 && record_flags("timer", "u") == 3, "u written again, with its sound: %d writes", blob_writes - writes);
-    a[0].epoch_ms += 5000;  /* armed again, further out */
-    apps_store_sync_alarms("timer", a, 2, true);
-    CHECK(record_epoch("timer", "t") == epoch_now + 65700, "t written again: %lld", (long long)record_epoch("timer", "t"));
-    apps_store_sync_alarms("timer", &a[1], 1, true);  /* t was told */
-    CHECK(apps_key('a', "timer", "t") == NULL && record_epoch("timer", "u") == epoch_now + 90000, "t's record went, u's stayed");
+    apps_store_alarm_t c[1] = {{"c", 0, true, true}};  /* the app armed c with no clock */
+    apps_store_sync_alarms("timer", c, 1, keep_ab, 2, false);
+    CHECK(record_epoch("timer", "a") == epoch_now + 10000 && record_epoch("timer", "b") == epoch_now + 20000, "a and b stay");
+    CHECK(apps_key('a', "timer", "c") == NULL && blob_writes == writes, "c gets none (its time isn't known), nothing is written");
+    /* The app armed a itself, still with no clock: a's old record goes, b's stays. */
+    apps_store_alarm_t a_new[1] = {{"a", 0, true, true}};
+    apps_store_sync_alarms("timer", a_new, 1, &keep_ab[1], 1, false);
+    CHECK(apps_key('a', "timer", "a") == NULL && record_epoch("timer", "b") == epoch_now + 20000, "a's old record went, b's stayed");
+    /* The clock: a's new deadline is written. */
+    a_new[0].epoch_ms = epoch_now + 90000;
+    apps_store_sync_alarms("timer", a_new, 1, &keep_ab[1], 1, true);
+    CHECK(record_epoch("timer", "a") == epoch_now + 90000 && record_flags("timer", "a") == 3, "a: its new deadline");
     writes = blob_writes;
-    apps_store_alarm_t later[2] = {{"u", 0, true, true}, {"v", 0, true, true}};  /* no clock: no times */
-    apps_store_sync_alarms("timer", later, 2, false);
-    CHECK(record_epoch("timer", "u") == epoch_now + 90000 && apps_key('a', "timer", "v") == NULL && blob_writes == writes,
-          "no clock: u's record stays as it was, v gets none (its time isn't known), nothing is written");
-    apps_store_sync_alarms("timer", NULL, 0, false);
-    CHECK(apps_key('a', "timer", "u") == NULL && blob_writes == writes, "no alarms: u's record went");
+    a_new[0].epoch_ms += 700;  /* within the slack: the same alarm, its time left read a little later */
+    apps_store_sync_alarms("timer", a_new, 1, &keep_ab[1], 1, true);
+    CHECK(blob_writes == writes, "nothing written again: %d writes", blob_writes - writes);
+    a_new[0].sound = false;  /* other options */
+    apps_store_sync_alarms("timer", a_new, 1, &keep_ab[1], 1, true);
+    CHECK(blob_writes == writes + 1 && record_flags("timer", "a") == 2, "a written again, without sound: %d writes", blob_writes - writes);
+    /* b was cancelled by the app (touched, so no longer kept), and a was told: both go. */
+    apps_store_sync_alarms("timer", NULL, 0, NULL, 0, true);
+    CHECK(apps_key('a', "timer", "a") == NULL && apps_key('a', "timer", "b") == NULL, "a's and b's records went");
     CHECK(record_epoch("other", "x") == epoch_now + 5000, "another app's record stays");
+    CHECK(budget_takes > 0 && budget_forced == budget_takes, "each record written takes its cost, as the app task checked: %d of %d forced",
+          budget_forced, budget_takes);
 }
 
 /* The first mount of a partition with no file system formats it (format_if_mount_failed, 4 files, units of 4 KB), and the log
@@ -1421,11 +1708,17 @@ static void a_second_mount_is_not_new(void) {
     CHECK(logged_has("store: flash: mounted") && !logged_has("a new file system"), "not new");
 }
 
-/* A partition that can't be mounted even by formatting it leaves the store in RAM mode, and says why. */
+/* P7: a partition that can't be mounted even by formatting it leaves the store in RAM mode for this boot, with a line and a hint of its
+ * own: a reflash wouldn't help, a restart may. */
 static void an_unmountable_partition_is_ram_mode(void) {
     mount_answer = ESP_ERR_NO_MEM;
+    CHECK(apps_store_hint() == NULL, "no hint before the mount");
     CHECK(apps_store_mount() == APPS_STORAGE_RAM, "RAM mode");
-    CHECK(logged_has("the apps partition can't be mounted") && init_calls == 0, "said, and apps_nvs left alone");
+    CHECK(logged_has("store: the apps partition couldn't be mounted: apps are kept in RAM until the gadget restarts") && init_calls == 0,
+          "said, and apps_nvs left alone");
+    CHECK(!logged_has("reflash"), "no reflash advice");
+    CHECK(apps_store_hint() != NULL && strcmp(apps_store_hint(), "the gadget couldn't open its app storage; restart it to try again") == 0,
+          "its hint: '%s'", apps_store_hint() != NULL ? apps_store_hint() : "NULL");
 }
 
 /* A commit that doesn't fit is refused before anything is written; one whose writing fails leaves the old copy as it was. */
@@ -1442,12 +1735,13 @@ static void a_commit_that_cant_be_written_leaves_the_app(void) {
     p = make_pkg("timer", "Timer", "2", 1, v2);
     CHECK(!apps_store_commit(p, &unchanged, err, sizeof err) && strstr(err, "not enough room on the gadget for timer") != NULL,
           "refused: '%s'", err);
-    CHECK(file_is("apps_fs/timer/main.lua", "-- v1\n") && !exists("apps_fs/.stage/timer"), "v1 stays, nothing written");
+    CHECK(file_is("apps_fs/timer/main.lua", "-- v1\n") && !exists("apps_fs/.stage-timer"), "v1 stays, nothing written");
     fat_free_bytes = (uint64_t)6 << 20;
-    CHECK(rmdir("apps_fs/.stage") == 0, "the stage's folder, empty after v1's commit: %s", strerror(errno));
-    spit("apps_fs/.stage", "a file where the stage's folder goes");
-    CHECK(!apps_store_commit(p, &unchanged, err, sizeof err) && strstr(err, "couldn't write") != NULL, "a failed write: '%s'", err);
-    CHECK(file_is("apps_fs/timer/main.lua", "-- v1\n") && !exists("apps_fs/.old-timer"), "v1 stays");
+    CHECK(chmod("apps_fs", 0555) == 0, "the partition can't be written: %s", strerror(errno));
+    bool failed = !apps_store_commit(p, &unchanged, err, sizeof err);
+    CHECK(chmod("apps_fs", 0777) == 0, "%s", strerror(errno));
+    CHECK(failed && strstr(err, "couldn't write timer to the gadget's storage") != NULL, "a failed write: '%s'", err);
+    CHECK(file_is("apps_fs/timer/main.lua", "-- v1\n") && !exists("apps_fs/.old-timer") && !exists("apps_fs/.stage-timer"), "v1 stays");
     free_pkg(p);
 }
 
@@ -1467,6 +1761,115 @@ static void a_damaged_copy_is_not_loaded(void) {
     apps_port_free(got);
 }
 
+/* The ids of the list, joined by spaces. */
+static const char *list_text(void) {
+    static char text[256];
+    char ids[APPS_STORE_APPS_MAX][APPS_ID_MAX + 1], names[APPS_STORE_APPS_MAX][25];
+    int n = list_ids(ids, names, APPS_STORE_APPS_MAX);
+    text[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        snprintf(text + strlen(text), sizeof text - strlen(text), "%s%s", i > 0 ? " " : "", ids[i]);
+    }
+    return text;
+}
+
+/* The order blob as text (its NULs as spaces), or "(none)". */
+static const char *order_text(void) {
+    static char text[256];
+    const nvs_item_t *it = nvs_find("apps_nvs", "apps", "order");
+    if (it == NULL) {
+        return "(none)";
+    }
+    size_t n = it->len < sizeof text - 1 ? it->len : sizeof text - 1;
+    for (size_t i = 0; i < n; i++) {
+        text[i] = it->blob[i] == '\0' ? ' ' : (char)it->blob[i];
+    }
+    text[n] = '\0';
+    return text;
+}
+
+static void commit_app(const char *id) {
+    const file_t files[] = {{"main.lua", "-- main\n"}};
+    apps_pkg_t *p = make_pkg(id, id, "1", 1, files);
+    bool unchanged;
+    char err[256];
+    CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "commit %s: %s", id, err);
+    free_pkg(p);
+}
+
+static void load_app(const char *id) {
+    apps_pkg_t *got = apps_port_realloc(NULL, sizeof *got);
+    char err[256];
+    CHECK(apps_store_load(id, got, err, sizeof err), "load %s: %s", id, err);
+    apps_pkg_free(got, apps_port_free);
+    apps_port_free(got);
+}
+
+/* P2: the launcher's order is the store's, kept in apps_nvs ("order"), not the folders' times: an install (changed or unchanged) and a
+ * launch (a load for a run) make the app the first, and each writes the order; a remount reads it, with no valid clock. An id the order
+ * names with no folder is left out, and a folder it doesn't name goes after the rest, by id. */
+static void order_follows_installs_and_launches(void) {
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    commit_app("aa");
+    commit_app("bb");
+    commit_app("cc");
+    CHECK(strcmp(list_text(), "cc bb aa") == 0, "installs: '%s'", list_text());
+    CHECK(strcmp(order_text(), "cc bb aa ") == 0, "the order is written: '%s'", order_text());
+    load_app("aa");
+    CHECK(strcmp(list_text(), "aa cc bb") == 0, "a launch makes it the first: '%s'", list_text());
+    CHECK(listed_n == 3 && strcmp(listed[0].id, "aa") == 0 && strcmp(listed[2].id, "bb") == 0, "and the launcher has it");
+    commit_app("bb");  /* the same package: unchanged */
+    CHECK(strcmp(list_text(), "bb aa cc") == 0 && strcmp(order_text(), "bb aa cc ") == 0, "an unchanged reinstall too: '%s' '%s'",
+          list_text(), order_text());
+    CHECK(!clock_set, "no valid clock");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "remount");
+    CHECK(strcmp(list_text(), "bb aa cc") == 0, "a remount keeps it: '%s'", list_text());
+    put_app("apps_fs/zz", "zz", "Zz", "-- z\n");
+    put_app("apps_fs/ab", "ab", "Ab", "-- ab\n");
+    char rm[] = "rm -rf apps_fs/aa";
+    CHECK(system(rm) == 0, "aa's folder goes behind the store's back");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "remount");
+    CHECK(strcmp(list_text(), "bb cc ab zz") == 0, "aa left out; ab and zz after the rest, by id: '%s'", list_text());
+    commit_app("zz");
+    CHECK(strcmp(order_text(), "zz bb cc ab ") == 0, "the next write has the order as it is now: '%s'", order_text());
+}
+
+/* P3: the order's write takes its cost from the budget; when it doesn't fit, the list and the launcher change at once and the write
+ * waits, and the app task's tick asks the worker for it once it fits. */
+static void order_waits_for_the_budget(void) {
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    commit_app("aa");
+    CHECK(strcmp(order_text(), "aa ") == 0, "written: '%s'", order_text());
+    CHECK(budget_takes >= 1 && budget_bytes >= 3 + 32, "its cost taken: %u bytes", (unsigned)budget_bytes);
+    budget_spent = true;
+    commit_app("bb");
+    CHECK(strcmp(list_text(), "bb aa") == 0 && listed_n == 2 && strcmp(listed[0].id, "bb") == 0, "the list has it at once");
+    CHECK(strcmp(order_text(), "aa ") == 0, "the write waits: '%s'", order_text());
+    apps_store_tick(mono_ms);
+    CHECK(n_jobs == 0, "the tick asks for nothing while it doesn't fit");
+    budget_spent = false;
+    apps_store_tick(mono_ms + 1000);
+    CHECK(n_jobs == 1, "it fits: the tick asks the worker for it");
+    run_jobs();
+    CHECK(strcmp(order_text(), "bb aa ") == 0, "written: '%s'", order_text());
+    apps_store_tick(mono_ms + 5000);
+    CHECK(n_jobs == 0, "once");
+}
+
+/* T: no memory for the stored manifest is no damage: the load says so, as it does for a file, and doesn't say to install it again. */
+static void out_of_memory_reading_the_manifest(void) {
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    commit_app("timer");
+    apps_pkg_t *got = apps_port_realloc(NULL, sizeof *got);
+    char err[256];
+    long held = blocks_held;
+    alloc_fail_in = 0;
+    CHECK(!apps_store_load("timer", got, err, sizeof err) && strcmp(err, "out of memory: no room to load the app") == 0, "'%s'", err);
+    alloc_fail_in = -1;
+    CHECK(blocks_held == held, "nothing held");
+    apps_port_free(got);
+}
+
 /* ---- main ---- */
 
 typedef struct {
@@ -1478,10 +1881,13 @@ static const case_t CASES[] = {
     {"commit_creates_and_replaces", commit_creates_and_replaces},
     {"recovery_restores_old_when_app_missing", recovery_restores_old_when_app_missing},
     {"recovery_deletes_stray_stage", recovery_deletes_stray_stage},
+    {"old_layout_stage_is_deleted", old_layout_stage_is_deleted},
     {"remove", remove_app},
     {"list_reads_names", list_reads_names},
     {"unchanged_skips_commit", unchanged_skips_commit},
     {"values_roundtrip", values_roundtrip},
+    {"values_that_cannot_be_read_are_not_empty", values_that_cannot_be_read_are_not_empty},
+    {"keys_that_collide_stay_apart", keys_that_collide_stay_apart},
     {"full_nvs_erases_only_apps_nvs", full_nvs_erases_only_apps_nvs},
     {"new_nvs_version_erases_only_apps_nvs", new_nvs_version_erases_only_apps_nvs},
     {"ram_mode_when_partition_missing", ram_mode_when_partition_missing},
@@ -1489,16 +1895,28 @@ static const case_t CASES[] = {
     {"list_before_mount_is_empty", list_before_mount_is_empty},
     {"a_refused_mount_is_asked_again_later", a_refused_mount_is_asked_again_later},
     {"quarantine_refuses_until_reinstalled", quarantine_refuses_until_reinstalled},
-    {"rearm_at_mount", rearm_at_mount},
-    {"rearm_waits_for_the_clock", rearm_waits_for_the_clock},
+    {"boot_line_says_the_count", boot_line_says_the_count},
+    {"records_are_handed_over_at_the_mount", records_are_handed_over_at_the_mount},
+    {"a_record_that_cannot_be_read_now_is_kept", a_record_that_cannot_be_read_now_is_kept},
+    {"records_survive_a_list_that_failed", records_survive_a_list_that_failed},
     {"alarm_records_round_trip", alarm_records_round_trip},
-    {"sync_alarms_follows_the_table", sync_alarms_follows_the_table},
+    {"sync_alarms_keeps_untouched_names", sync_alarms_keeps_untouched_names},
     {"first_mount_formats", first_mount_formats},
     {"a_second_mount_is_not_new", a_second_mount_is_not_new},
     {"an_unmountable_partition_is_ram_mode", an_unmountable_partition_is_ram_mode},
     {"a_commit_that_cant_be_written_leaves_the_app", a_commit_that_cant_be_written_leaves_the_app},
     {"a_damaged_copy_is_not_loaded", a_damaged_copy_is_not_loaded},
+    {"order_follows_installs_and_launches", order_follows_installs_and_launches},
+    {"order_waits_for_the_budget", order_waits_for_the_budget},
+    {"out_of_memory_reading_the_manifest", out_of_memory_reading_the_manifest},
 };
+
+/* X: whatever a case leaves of the apps' heap besides the RAM store's copies, which the harness frees here, is a leak. */
+static void ram_clear(void) {
+    while (ram_n > 0) {
+        free_pkg(ram_kept[--ram_n]);
+    }
+}
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--cases") == 0) {
@@ -1512,6 +1930,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <case> <dir> [arg]\n", argv[0]);
         return 2;
     }
+    long held = blocks_held;
     if (strcmp(argv[1], "reset_reason_counts") == 0 && argc == 4) {
         reset_reason_counts(atoi(argv[3]));
     } else {
@@ -1525,6 +1944,8 @@ int main(int argc, char **argv) {
         }
         c->fn();
     }
+    ram_clear();
+    CHECK(blocks_held == held, "%ld blocks of the apps' heap still held at the case's end", blocks_held - held);
     if (failures > 0) {
         dump_log();
         return 1;

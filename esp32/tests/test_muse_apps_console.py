@@ -338,6 +338,9 @@ class Console(unittest.TestCase):
     def test_list_shows_installed_apps(self):
         self.run_case("list_shows_installed_apps")
 
+    def test_list_says_the_stores_hint(self):  # P7: an unmountable partition's hint, which doesn't say to reflash
+        self.run_case("list_says_the_stores_hint")
+
     def test_health_says_the_app_and_the_store(self):  # device.health's "apps": resident null with none loaded; the store's mode and room
         self.run_case("health_says_the_app_and_the_store")
 

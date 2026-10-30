@@ -95,10 +95,13 @@
  *
  * The store (apps_store.h). The task submits the mount job as it starts, and housekeeping asks again every APPS_STORE_RETRY_MS while
  * the worker refuses it (the worker's first step mounts too: apps_io_set_first). Housekeeping also offers the values' saves that wait
- * and brings the alarms' records in line (apps_values_tick): an arming or a cancel marks its app in the port, a firing that is told or
- * given up on here, and a cancel of all of an app's alarms (the budget's, a crash's) through apps_alarm_take_cancelled. A failure of the
- * values' backend is said once per streak, in the app's log if it runs. The quarantine's marker (apps_store_marker) is marked at every
- * launch (begin_app) and cleared at every end that isn't a reset (end_app, no_app).
+ * and brings the alarms' records in line (apps_values_tick): the names an app touched are its records' to follow (an arming or a
+ * cancel in the port, a firing that is told or given up on here, and a cancel of all of an app's alarms, the budget's, a crash's or a
+ * remove's, through apps_alarm_take_cancelled), and the records the mount handed over whose names nothing touched are armed again
+ * there. An app's end writes the save of it that waits (apps_values_flush), whatever the write budget says. A failure of the values'
+ * backend, and a budget that begins to hold an app's saves back, are each said once per streak, in the app's log if it runs. The
+ * quarantine's marker (apps_store_marker) is marked at every launch (begin_app) and cleared at every end that isn't a reset (end_app,
+ * no_app).
  */
 
 static const char *TAG = "muse_apps";
@@ -756,6 +759,7 @@ static void end_app(end_t how) {
     set_running(false);  /* the launcher lists it still while the store has it */
     apps_rt_free(T.rt);  /* saves the store if a change is left in it (stop() has saved it when the app stopped) */
     T.rt = NULL;
+    apps_values_flush(s_rec->st.id);  /* its last save is written now, even over the write budget (apps_values.h) */
     T.exit_asked = T.keep_awake = false;
     uint32_t reset;
     if (T.was_published) {
@@ -1138,7 +1142,7 @@ static void tell_alarm(const apps_alarm_fired_t *f) {
     if (!apps_alarm_take(f, true)) {
         return;  /* cancelled, replaced or given up on since it was copied: nothing to tell */
     }
-    apps_values_alarms_changed(f->app);  /* its record follows: dropped, unless the name is armed again */
+    apps_values_alarm_touched(f->app, f->name);  /* its record follows: dropped, unless the name is armed again */
     request_front(true);
     call_begin();
     (void)apps_rt_alarm(T.rt, f->name);
@@ -1167,7 +1171,7 @@ static void drop_alarms(const char *app, uint32_t upto, drop_t why) {
         if (strcmp(due[i].app, app) != 0 || gen_after(due[i].gen, upto) || !apps_alarm_take(&due[i], false)) {
             continue;
         }
-        apps_values_alarms_changed(app);
+        apps_values_alarm_touched(app, due[i].name);
         switch (why) {
         case DROP_MISSING:
             ESP_LOGW(TAG, "alarm %s for missing app %s", due[i].name, app);
@@ -1298,6 +1302,15 @@ static void on_alarm_fired(const char *app, const char *name) {
     }
 }
 
+/* A notice of the store about app (APPS_VALUES_FULL, APPS_VALUES_SLOWER), once per streak: in the gadget's log, and in the app's
+ * log too if it runs. */
+static void say_for_app(const char *app, const char *what) {
+    ESP_LOGW(TAG, "%s: %s", app, what);
+    if (T.rt != NULL && !T.abandoned && strcmp(s_rec->st.id, app) == 0) {
+        apps_rt_note(T.rt, what);
+    }
+}
+
 /* Every round of the loop, whatever woke it. */
 static void housekeeping(void) {
     if (atomic_load(&s_rec->hung)) {
@@ -1319,18 +1332,18 @@ static void housekeeping(void) {
     char ids[APPS_ALARMS_MAX][APPS_ID_MAX + 1];
     int cancelled = apps_alarm_take_cancelled(ids, APPS_ALARMS_MAX);
     for (int i = 0; i < cancelled; i++) {
-        apps_values_alarms_changed(ids[i]);  /* the budget's or a crash's cancel of all its alarms: their records go */
+        apps_values_alarm_touched(ids[i], NULL);  /* the budget's, a crash's or a remove's cancel of all its alarms: their records go */
     }
     int64_t now = apps_port_mono_ms();
-    apps_values_tick(now);  /* the saves the worker hasn't taken yet, with or without an app, and the alarms' records (apps_values.h) */
-    apps_store_tick(now);   /* the mount, until the worker has taken it; the records' re-arm, once the clock is valid */
+    apps_values_tick(now);  /* the saves that wait, with or without an app, the alarms' records and their re-arm (apps_values.h) */
+    apps_store_tick(now);   /* the mount, until the worker has taken it; the launcher's order, once the write budget has room */
     muse_apps_console_tick(now);  /* a stage the console was sent and that waits for no commit any more goes */
-    char failed[APPS_ID_MAX + 1];
-    if (apps_values_take_failure(failed, sizeof failed)) {
-        ESP_LOGW(TAG, "%s: %s", failed, APPS_VALUES_FULL);
-        if (T.rt != NULL && !T.abandoned && strcmp(s_rec->st.id, failed) == 0) {
-            apps_rt_note(T.rt, APPS_VALUES_FULL);  /* in its log too, once a streak */
-        }
+    char id[APPS_ID_MAX + 1];
+    while (apps_values_take_failure(id, sizeof id)) {
+        say_for_app(id, APPS_VALUES_FULL);
+    }
+    while (apps_values_take_slowdown(id, sizeof id)) {
+        say_for_app(id, APPS_VALUES_SLOWER);
     }
     drain_logs();
 }
@@ -1585,14 +1598,15 @@ static void show_cards(void) {
             apps_lv_show_crash(L.hung_name, NULL);
         }
     }
-    /* The store's list changed while the launcher shows (the mount's end, an install): it is shown again, with the new rows. */
-    bool launcher = atomic_load(&s_launcher_wanted) || (atomic_exchange(&s_list_changed, false) && apps_lv_launcher_shown());
     bool card = false;
     int rows = 0;
     char name[25] = "", line[FIRST_LINE_MAX] = "";
     if (!names_take(NAMES_LOCK_MS)) {
-        return;  /* next frame */
+        return;  /* next frame, which finds what this one would have (the list's change too: it is taken below) */
     }
+    /* The store's list changed while the launcher shows (the mount's end, an install): it is shown again, with the new rows. */
+    bool changed = atomic_exchange(&s_list_changed, false);
+    bool launcher = atomic_load(&s_launcher_wanted) || (changed && apps_lv_launcher_shown());
     if (s_rec->names.card && reset_ran(s_rec->names.card_after)) {
         card = true;
         s_rec->names.card = false;
@@ -2098,6 +2112,7 @@ esp_err_t muse_apps_start(void) {
     s_names_lock = xSemaphoreCreateMutexStatic(&s_names_lock_buf);
     apps_io_init();
     apps_io_set_first(apps_store_mount_once);  /* the worker mounts the store before its first job or op (apps_store.h) */
+    apps_values_init();  /* the lock of the write budget and of the failures' notices, before the worker or this task runs */
     if (!console_added) {
         /* Even if the task can't be made below: the console then says that Muse apps aren't running. */
         muse_input_add_console_hook(muse_apps_console);

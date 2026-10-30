@@ -25,7 +25,8 @@
 # MUSE_VIDEO=1 adds devices/sdkconfig.muse-video (the phone camera over
 # Wi-Fi, on boards whose panel driver has draw_frame) in build-muse-<profile>-video/.
 # MUSE_APPS=1 adds devices/sdkconfig.muse-apps (Lua apps, on the 1.75C: s3)
-# in build-muse-<profile>-apps/.
+# in build-muse-<profile>-apps/; any other board is refused (its table and
+# FAT lines would apply there, with no apps to use them).
 # mosaico (Espressif ESP-Mosaico, ESP32-S31) builds with ESP-IDF master
 # (IDF_EXPORT_S31) and Espressif's esp-mosaico-utils (MOSAICO_UTILS), and
 # flashes through the board's Vibe Mode firmware with their mosaico.py: an
@@ -65,6 +66,9 @@ case $board in
     ai-passport) profile=ai-passport;      target=esp32c3 ;;
     *) echo "unknown board $board"; exit 2 ;;
 esac
+if [ -n "${MUSE_APPS:-}" ] && [ "$board" != s3 ]; then
+    echo "MUSE_APPS=1 is only for the 1.75C (s3)" >&2; exit 2
+fi
 baud=${baud:-460800}
 if [ "$target" = esp32s31 ]; then
     # The S31 isn't in v6.0.1: Espressif's ESP-Mosaico pins master at 7b9cc1ac.

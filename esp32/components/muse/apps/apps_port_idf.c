@@ -19,8 +19,9 @@
  * "@app.log <id> <line>", at most 1,024 bytes of them a second, queued in the call and printed after it; the UI lock is
  * a static FreeRTOS mutex that muse_apps_start() makes (apps_port_init); the system's alarms are apps_alarm.c's, and a chirp
  * is the voice task's. An app's store is apps_values.c's (apps_values.h): apps_nvs on a gadget with the apps partition, a map in PSRAM
- * otherwise, behind the I/O worker; an alarm that is armed or cancelled marks its app for its records (apps_values_alarms_changed); sys's
- * battery and Wi-Fi are muse_state's and muse_wifi's, and its show, keep_awake and exit are the app task's (apps_task.h).
+ * otherwise, behind the I/O worker; an alarm that is armed or cancelled is a name its app touched, for its record
+ * (apps_values_alarm_touched); sys's battery and Wi-Fi are muse_state's and muse_wifi's, and its show, keep_awake and exit are the app
+ * task's (apps_task.h).
  *
  * The UI lock keeps the host runner's contract (tools/muse/apphost/apphost_port.c): it is never taken twice by one
  * task, given back only by its holder, and nothing uses the heap while it is held. The host aborts on a breach; here a
@@ -245,17 +246,18 @@ void apps_port_ui_unlock(void) {
 }
 
 /* The alarms and the sound: apps_alarm.c keeps the first (its table, its timers and its ring), the voice task plays the second. An arming
- * or a cancel marks the app, and its records follow at a tick of the app task after the call (apps_values.h): nothing here waits. */
+ * or a cancel touches the name (apps_values.h): its record follows at a tick of the app task after the call, and a record the mount handed
+ * over for it is armed again no more (the app's choice wins). Nothing here waits. */
 
 apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
     apps_alarm_result_t got = apps_alarm_arm(app, name, ms, sound, wake);
-    apps_values_alarms_changed(app);  /* a refusal can have dropped a replaced arming too (apps_alarm.h) */
+    apps_values_alarm_touched(app, name);  /* a refusal can have dropped a replaced arming too (apps_alarm.h) */
     return got;
 }
 
 void apps_port_alarm_cancel(const char *app, const char *name) {
     apps_alarm_cancel(app, name);
-    apps_values_alarms_changed(app);
+    apps_values_alarm_touched(app, name);
 }
 
 int64_t apps_port_alarm_remaining(const char *app, const char *name) {

@@ -15,7 +15,8 @@
 """Link's app.* commands (main/apps_link.c, CONFIG_MUSE_APPS): Muse's way to the gadget's apps.
 
 tests/muse_apps_link_harness.c compiles the whole of apps_link.c with the real cJSON against fakes of the apps
-(muse_apps_install, muse_apps_write_guide, app.control's calls, muse_apps_id_valid, muse_apps_set_vm_ops), the session
+(muse_apps_install, muse_apps_send, muse_apps_write_guide, app.control's calls, muse_apps_id_valid,
+muse_apps_json_object_valid, muse_apps_set_vm_ops), the session
 (noise_ctrl_send_command_result), the VM file reader and writer (vm_file.h) and the PSRAM heap: link.register's entries and
 their size, the install, app.api and app.control handlers (never waiting, a request copied and freed once the result is
 sent, also when the session has ended; app.control's actions checked as typed), and vm_file behind the apps' VM ops. The
@@ -60,7 +61,6 @@ API_DESCRIPTION = ("Call before writing an app. Writes the gadget app guide and 
                    "this VM and returns the API level, screen, fonts, limits, storage and installed apps.")
 CONTROL_DESCRIPTION = ("Manage gadget apps. action: list, status, logs, launch, stop, remove or snapshot; id for all but list. "
                        "status and logs return state, errors with traceback, the last 50 log lines, memory and CPU.")
-# Task 24's entry, built now (D11) so that the budget counts it; Task 24 advertises it with its handler.
 SEND_DESCRIPTION = ("Send an event to a gadget app (its manifest's messages list them). Starts the app if needed. show=true "
                     "brings it to the front once this turn ends. Returns the app's reply.")
 
@@ -107,29 +107,24 @@ class LinkCommands(unittest.TestCase):
         return done.stdout
 
     def test_register_entries_fit_budget(self):
-        # D11: all four of the apps' entries, app.send's (Task 24's) included, against the budget; the headroom rule leaves
-        # app.control unadvertised when they don't fit (it still dispatches, and app.api's payload names it).
+        # D11, re-asserted by Task 24: all four of the apps' entries, app.send's included, are advertised, and fit the budget (the
+        # headroom rule would leave app.control out when they didn't; it still dispatches, and app.api's payload names it).
         stdout = self.run_case("register_entries")
         printed = {}
         for line in stdout.splitlines():
             tag, _, text = line.partition(" ")
-            if tag in ("@register", "@all"):
+            if tag == "@register":
                 self.assertNotIn(tag, printed, stdout)
                 printed[tag] = text
-        self.assertEqual(sorted(printed), ["@all", "@register"], stdout)
-        everything = json.loads(printed["@all"])
+        self.assertEqual(sorted(printed), ["@register"], stdout)
+        everything = json.loads(printed["@register"])
         self.assertEqual(sorted(everything), ["app.api", "app.control", "app.install", "app.send"])
-        size = len(printed["@all"].encode())
+        size = len(printed["@register"].encode())
         sizes = ", ".join(f"{name} {len(json.dumps({name: entry}, separators=(',', ':')).encode()) - 2}"
                           for name, entry in sorted(everything.items()))
-        fits = size <= APPS_REGISTER_BUDGET
-        print(f"link.register: the four apps' entries are {size} of {APPS_REGISTER_BUDGET} bytes ({sizes}); app.control "
-              f"{'advertised' if fits else 'left unadvertised (headroom rule)'}", file=sys.stderr, flush=True)
-        advertised = json.loads(printed["@register"])
-        self.assertEqual(sorted(advertised), ["app.api", "app.control", "app.install"] if fits else ["app.api", "app.install"])
-        self.assertLessEqual(len(printed["@register"].encode()), APPS_REGISTER_BUDGET)
-        for name, entry in advertised.items():
-            self.assertEqual(entry, everything[name], name)
+        print(f"link.register: the four apps' entries are {size} of {APPS_REGISTER_BUDGET} bytes ({sizes}); all advertised",
+              file=sys.stderr, flush=True)
+        self.assertLessEqual(size, APPS_REGISTER_BUDGET)
         self.assertEqual(everything["app.install"], {
             "description": INSTALL_DESCRIPTION,
             "required": {"id": {"type": "string", "description": "App id: lowercase, the folder name."}},
@@ -155,7 +150,7 @@ class LinkCommands(unittest.TestCase):
                 for param, spec in entry[kind].items():
                     with self.subTest(name, param=param):
                         self.assertTrue(spec.get("description"), "Muse reads every parameter's description")
-        self.assertNotRegex(printed["@all"], re.compile("hatch", re.I), "say Muse, never Hatch")
+        self.assertNotRegex(printed["@register"], re.compile("hatch", re.I), "say Muse, never Hatch")
 
     def test_install_handler_copies_request(self):  # and frees it once the result is sent, sent or dropped
         self.run_case("install_handler")
@@ -166,6 +161,15 @@ class LinkCommands(unittest.TestCase):
 
     def test_api_is_async_and_frees_its_context(self):  # D2: _async, the request copied, freed once done has sent
         self.run_case("api_handler")
+
+    def test_send_data_forms(self):  # D25: an object printed compact, a JSON string as it is; objects only, 4096 bytes at most
+        self.run_case("send_data_forms")
+
+    def test_send_done_frees_context(self):  # the request copied, freed once done has sent: also for an ended session
+        self.run_case("send_done_frees_context")
+
+    def test_send_failures_pass_through(self):  # D25: not installed and no reply, from a fake muse_apps_send, sent whole
+        self.run_case("send_failures_pass_through")
 
     def test_vm_ops_put_vm_file_behind_the_apps(self):  # D3: the deadline forwarded; vm_file's answers as the apps' codes
         self.run_case("vm_ops_are_vm_file")

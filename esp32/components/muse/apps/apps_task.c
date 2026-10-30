@@ -133,9 +133,9 @@ static const char *TAG = "muse_apps";
 
 #define NO_WARNED ((size_t)-1)
 
-#define MSG_HUNG "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"
-#define MSG_BUSY "the app task is busy; try again"
-#define MSG_DOWN "Muse apps aren't running"
+#define MSG_HUNG APPS_TASK_MSG_HUNG
+#define MSG_BUSY APPS_TASK_MSG_BUSY
+#define MSG_DOWN APPS_TASK_MSG_DOWN
 #define MSG_SELF "the app task can't wait for itself"
 #define MSG_ASLEEP "layout not checked: the screen was asleep"
 #define MSG_EXITED "the app exited (sys.exit)"
@@ -1752,7 +1752,7 @@ static bool await(req_t *r, int64_t until, int ms, char *err, size_t err_len) {
         }
         if (late) {
             char text[64];
-            snprintf(text, sizeof text, "the app task didn't answer within %d ms", ms);
+            snprintf(text, sizeof text, APPS_TASK_MSG_NO_ANSWER " %d ms", ms);
             put_text(err, err_len, text);
             return false;
         }
@@ -1761,7 +1761,7 @@ static bool await(req_t *r, int64_t until, int ms, char *err, size_t err_len) {
     }
 }
 
-static bool run_request(apps_pkg_t *pkg, bool front, bool by_id, uint32_t alarm_upto, int settle_ms, apps_status_t *st,
+static bool run_request(apps_pkg_t *pkg, bool front, bool by_id, uint32_t alarm_upto, int settle_ms, int extra_ms, apps_status_t *st,
                         char *err, size_t err_len) {
     put_text(err, err_len, "");
     if (pkg == NULL) {
@@ -1789,7 +1789,7 @@ static bool run_request(apps_pkg_t *pkg, bool front, bool by_id, uint32_t alarm_
     r->st = st;
     r->err = err;
     r->err_len = err_len;
-    int wait_ms = r->settle_ms + APPS_TASK_RUN_EXTRA_MS;
+    int wait_ms = r->settle_ms + extra_ms;
     int64_t until = apps_port_mono_ms() + wait_ms;
     const char *busy = post_req(APPS_EV_RUN, r, until);
     if (busy != NULL) {
@@ -1810,15 +1810,19 @@ static bool run_request(apps_pkg_t *pkg, bool front, bool by_id, uint32_t alarm_
 }
 
 bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
-    return run_request(pkg, front, false, 0, settle_ms, st, err, err_len);
+    return run_request(pkg, front, false, 0, settle_ms, APPS_TASK_RUN_EXTRA_MS, st, err, err_len);
 }
 
 bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
-    return run_request(pkg, front, true, 0, settle_ms, st, err, err_len);
+    return run_request(pkg, front, true, 0, settle_ms, APPS_TASK_RUN_EXTRA_MS, st, err, err_len);
 }
 
 bool apps_task_run_for_alarm(apps_pkg_t *pkg, uint32_t upto, apps_status_t *st, char *err, size_t err_len) {
-    return run_request(pkg, true, true, upto, 0, st, err, err_len);
+    return run_request(pkg, true, true, upto, 0, APPS_TASK_RUN_EXTRA_MS, st, err, err_len);
+}
+
+bool apps_task_run_for_send(apps_pkg_t *pkg, char *err, size_t err_len) {
+    return run_request(pkg, false, true, 0, 0, APPS_TASK_SEND_LAUNCH_MS, NULL, err, err_len);
 }
 
 void apps_task_alarm_launch_result(uint32_t upto, apps_alarm_launch_t outcome) {

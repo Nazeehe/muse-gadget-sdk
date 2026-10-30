@@ -22,6 +22,7 @@
 #include "apps_alarm.h"
 #include "apps_install.h"
 #include "apps_io.h"
+#include "apps_json.h"
 #include "apps_port.h"
 #include "apps_rt.h"
 #include "apps_store.h"
@@ -652,6 +653,193 @@ bool muse_apps_stop(const char *id, muse_apps_done_cb done, void *ctx, const cha
 
 bool muse_apps_remove(const char *id, muse_apps_done_cb done, void *ctx, const char **code, const char **err) {
     return queue_job(DO_REMOVE, id, NULL, done, ctx, code, err);
+}
+
+/* ---- app.send (Task 24) ---- */
+
+bool muse_apps_json_object_valid(const char *s, size_t len, char *err, size_t err_len) {
+    if (!apps_json_validate(s, len, err, err_len)) {
+        return false;
+    }
+    size_t at = 0;
+    while (at < len && (s[at] == ' ' || s[at] == '\t' || s[at] == '\n' || s[at] == '\r')) {
+        at++;
+    }
+    if (at == len || s[at] != '{') {  /* one valid value: its first character says what it is */
+        snprintf(err, err_len, "the top level must be an object");
+        return false;
+    }
+    return true;
+}
+
+/* A queued app.send: what the job needs, event and data after the struct in the same block (data "" for none). */
+typedef struct {
+    char id[APPS_ID_MAX + 1];
+    bool show;
+    muse_apps_done_cb done;
+    void *ctx;
+    const char *event, *data;
+} send_job_t;
+
+/* What the app task said of a message that got no reply (apps_task_message's err), as a result's code and message. A handler's own
+ * error is not any of the app task's words, so it is app_error and goes as it is. */
+static cJSON *send_failure(const char *why) {
+    size_t n = strlen(why);
+    if (strncmp(why, APPS_TASK_MSG_NO_ANSWER, sizeof APPS_TASK_MSG_NO_ANSWER - 1) == 0) {
+        return failure("timed_out", MUSE_APPS_SEND_NO_REPLY);
+    }
+    if (strcmp(why, APPS_TASK_MSG_BUSY) == 0) {
+        return failure(APPS_ERR_BUSY, why);
+    }
+    if (strcmp(why, APPS_TASK_MSG_HUNG) == 0 || strcmp(why, APPS_TASK_MSG_DOWN) == 0) {
+        return failure(APPS_ERR_UNAVAILABLE, why);
+    }
+    static const char NOT_RUNNING[] = " isn't running";
+    if (n > sizeof NOT_RUNNING - 1 && strcmp(why + n - (sizeof NOT_RUNNING - 1), NOT_RUNNING) == 0) {
+        return failure(APPS_ERR_NOT_RUNNING, why);
+    }
+    return refusal("app_error", why);
+}
+
+/* The launch an app.send needs when id isn't the app that runs: the store's copy of id, run behind. The refusal as a result, or NULL
+ * once it runs. The launch has its own bound (APPS_TASK_SEND_LAUNCH_MS: 3 s for the load and start(), no settle), apart from the reply's, which
+ * only starts once the message is in the app task's queue. */
+static cJSON *send_launch(const char *id) {
+    cJSON *r = NULL;
+    if (!installed(id, &r)) {
+        return r;
+    }
+    apps_pkg_t *pkg = apps_port_realloc(NULL, sizeof *pkg);
+    if (pkg == NULL) {
+        return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room to load the app");
+    }
+    char why[256];
+    if (!apps_store_load(id, pkg, why, sizeof why)) {  /* the quarantine, a damaged copy, no room; the load is the order's bump */
+        apps_port_free(pkg);
+        return refusal(APPS_ERR_UNAVAILABLE, why);
+    }
+    if (!apps_task_run_for_send(pkg, why, sizeof why)) {  /* behind, no settle; it takes the copy */
+        char msg[sizeof why + APPS_ID_MAX + 32];
+        snprintf(msg, sizeof msg, "'%s' didn't start: %s", id, why);
+        return failure(strncmp(why, "crashed", 7) == 0 ? APPS_ERR_CRASHED : APPS_ERR_NOT_RUNNING, msg);
+    }
+    return NULL;
+}
+
+/* On the worker: the message, after the launch it needs, as a result. */
+static cJSON *send_result(const send_job_t *job) {
+    char running[APPS_ID_MAX + 1];
+    if (!apps_task_running(running, sizeof running) || strcmp(running, job->id) != 0) {
+        cJSON *r = send_launch(job->id);
+        if (r != NULL) {
+            return r;
+        }
+    }
+    char *why = apps_port_realloc(NULL, APPS_ERROR_MAX);
+    if (why == NULL) {
+        return failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the message");
+    }
+    char *reply = apps_task_message(job->id, job->event, job->data[0] != '\0' ? job->data : NULL, job->show,
+                                    MUSE_APPS_SEND_REPLY_MS, why, APPS_ERROR_MAX);
+    cJSON *r;
+    if (reply == NULL) {
+        r = send_failure(why);
+    } else {
+        /* The handler's value is JSON text (apps_rt_message encoded it); a reply that somehow isn't goes as a string. */
+        cJSON *value = cJSON_Parse(reply);
+        if (value == NULL) {
+            value = cJSON_CreateString(reply);
+        }
+        cJSON *p = value != NULL ? cJSON_CreateObject() : NULL;
+        if (p != NULL && add_item(p, "reply", value)) {
+            r = success(p);
+        } else {
+            if (p == NULL) {
+                cJSON_Delete(value);
+            }
+            cJSON_Delete(p);
+            r = NULL;
+        }
+    }
+    apps_port_free(reply);
+    apps_port_free(why);
+    return r;
+}
+
+/* in, cut to 64 bytes with control bytes as '?', for the log (the event and data are Muse's text). */
+static void log_text(const char *in, char *out, size_t out_len) {
+    size_t n = 0;
+    for (; in[n] != '\0' && n < 64 && n + 1 < out_len; n++) {
+        out[n] = (unsigned char)in[n] < 0x20 || in[n] == 0x7f ? '?' : in[n];
+    }
+    out[n] = '\0';
+}
+
+static void send_run(void *arg) {
+    send_job_t *job = arg;
+    char event[72], data[72];
+    log_text(job->event, event, sizeof event);
+    log_text(job->data, data, sizeof data);
+    ESP_LOGI(TAG, "app.send %s %s%s%s", job->id, event, data[0] != '\0' ? " " : "", data);
+    cJSON *r = send_result(job);
+    if (r != NULL && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok"))) {
+        ESP_LOGI(TAG, "app.send %s %s: %s", job->id, event,
+                 cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(r, "error"), "code")));
+    }
+    job->done(job->ctx, r != NULL ? r : failure(APPS_ERR_OUT_OF_MEMORY, NO_ROOM_RESULT));
+    apps_port_free(job);
+}
+
+bool muse_apps_send(const char *id, const char *event, const char *data_json, bool show, muse_apps_done_cb done, void *ctx,
+                    const char **code, const char **err) {
+    const char *unused;
+    code = code != NULL ? code : &unused;
+    err = err != NULL ? err : &unused;
+    *code = APPS_ERR_INVALID_PARAMS;
+    if (done == NULL) {
+        *err = "no callback for the result";
+        return false;
+    }
+    if (id == NULL || !apps_id_valid(id)) {
+        *err = "app id must match ^[a-z][a-z0-9_]{1,23}$";
+        return false;
+    }
+    if (event == NULL || event[0] == '\0') {
+        *err = "event is required";
+        return false;
+    }
+    size_t event_len = strlen(event), data_len = data_json != NULL ? strlen(data_json) : 0;
+    if (data_len > MUSE_APPS_SEND_DATA_MAX) {
+        *err = "data is larger than 4 KB";
+        return false;
+    }
+    send_job_t *job = apps_port_realloc(NULL, sizeof *job + event_len + 1 + data_len + 1);
+    if (job == NULL) {
+        *code = APPS_ERR_OUT_OF_MEMORY;
+        *err = "out of memory: no room for the command";
+        return false;
+    }
+    memset(job, 0, sizeof *job);
+    char *at = (char *)(job + 1);
+    memcpy(at, event, event_len + 1);
+    job->event = at;
+    at += event_len + 1;
+    if (data_len > 0) {
+        memcpy(at, data_json, data_len);
+    }
+    at[data_len] = '\0';
+    job->data = at;
+    snprintf(job->id, sizeof job->id, "%s", id);
+    job->show = show;
+    job->done = done;
+    job->ctx = ctx;
+    if (!apps_io_submit(send_run, job)) {  /* it says why, in one log line */
+        apps_port_free(job);
+        *code = APPS_ERR_OUT_OF_MEMORY;
+        *err = APPS_IO_REFUSED;
+        return false;
+    }
+    return true;
 }
 
 bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code, const char **err) {

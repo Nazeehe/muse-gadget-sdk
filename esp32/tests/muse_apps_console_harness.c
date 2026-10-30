@@ -638,6 +638,14 @@ static int runs_by_id;
 
 bool apps_task_run(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len);
 
+/* app.send's launch: counted apart, run behind with no settle (the bound it asks for is apps_task.c's). */
+static int send_launches;
+
+bool apps_task_run_for_send(apps_pkg_t *pkg, char *err, size_t err_len) {
+    send_launches++;
+    return apps_task_run(pkg, false, 0, NULL, err, err_len);
+}
+
 bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status_t *st, char *err, size_t err_len) {
     runs_by_id++;
     return apps_task_run(pkg, front, settle_ms, st, err, err_len);
@@ -2248,6 +2256,217 @@ static void control_launch_stop_remove(void) {
 }
 
 /*
+ * app.send's job (Task 24), on the I/O worker: the message goes to the app that runs, at once; to any other installed app it goes
+ * after the store's copy is loaded and run behind (apps_task_run_by_id, no settle: the launch has its own bound), which makes it the
+ * most recent. The reply is the payload's "reply" (the handler's JSON as it is, null for none); show goes to apps_task_message, with
+ * the 5 s reply bound. What can't be done is a result with a code: not installed (MUSE_APPS_NOT_FOUND), the store's refusals
+ * (unavailable), a launch that failed (crashed, not_running), no reply (timed_out, MUSE_APPS_SEND_NO_REPLY), the handler's own error
+ * as it is (app_error), the app task's refusals. Refused at once: a bad id, no done, no event, too much data, no memory.
+ */
+static void control_send(void) {
+    install_two();
+    const char *code = NULL, *err = NULL;
+    int tag;
+    /* The app that runs: the message, and nothing launched. */
+    snprintf(running_app, sizeof running_app, "timer");
+    message_reply = "{\"state\":\"running\",\"remaining\":300}";
+    CHECK(muse_apps_send("timer", "start", "{\"seconds\":300}", false, on_done, &tag, &code, &err), "not queued: %s: %s", code, err);
+    CHECK(n_jobs == 1 && dones == 0 && messages == 0, "queued, nothing run before the worker");
+    run_jobs();
+    CHECK(dones == 1 && done_ctx == &tag, "done once, with its ctx");
+    CHECK(runs_by_id == 0 && messages == 1, "no launch: %d runs, %d messages", runs_by_id, messages);
+    CHECK(strcmp(message_id, "timer") == 0 && strcmp(message_event, "start") == 0 && !message_data_null &&
+              strcmp(message_data, "{\"seconds\":300}") == 0 && !message_show && message_timeout == MUSE_APPS_SEND_REPLY_MS,
+          "message %s %s %s show %d timeout %d", message_id, message_event, message_data, message_show, message_timeout);
+    EXPECT_RESULT(done_result, "{\"ok\":true,\"payload\":{\"reply\":{\"state\":\"running\",\"remaining\":300}}}");
+    done_result = NULL;
+    CHECK(logged("I muse_apps: app.send timer start {\"seconds\":300}") != NULL, "the job logs its event and data: '%s'", last_log);
+    /* show, no data, and a handler that returned nothing. */
+    message_reply = "null";
+    CHECK(muse_apps_send("timer", "status", NULL, true, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK(message_show && message_data_null && message_timeout == 5000, "show, no data");
+    EXPECT_RESULT(done_result, "{\"ok\":true,\"payload\":{\"reply\":null}}");
+    done_result = NULL;
+
+    /* An installed app that isn't running: loaded, run behind with no settle, and then sent to. */
+    running_app[0] = '\0';
+    message_reply = "{\"state\":\"running\",\"remaining\":300}";
+    int before_runs = runs_by_id, before_messages = messages, before_sends = send_launches;
+    CHECK(muse_apps_send("hello", "start", "{\"seconds\":300}", true, on_done, &tag, &code, &err), "queued");
+    run_jobs();
+    CHECK(send_launches == before_sends + 1 && runs_by_id == before_runs && strcmp(run_id, "hello") == 0 && !run_front && run_settle == 0,
+          "hello launched by app.send's launch, behind with no settle: %d, front %d, settle %d", send_launches, run_front, run_settle);
+    CHECK(messages == before_messages + 1 && strcmp(message_id, "hello") == 0 && message_show, "then the message, with show");
+    CHECK_AT(done_result, "ok", "true");
+    CHECK_AT(done_result, "payload.reply.state", "running");
+    char ids[2][APPS_ID_MAX + 1], names[2][25];
+    CHECK(apps_store_list(ids, names, 2) == 2 && strcmp(ids[0], "hello") == 0, "the load made hello the most recent: %s", ids[0]);
+    cJSON_Delete(done_result);
+    done_result = NULL;
+
+    /* Not installed: the exact words, and nothing launched or sent. */
+    before_runs = send_launches;
+    before_messages = messages;
+    CHECK(muse_apps_send("nosuch", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "error.code", "not_found");
+    CHECK_AT(done_result, "error.message", NOT_FOUND("nosuch"));
+    CHECK(logged("I muse_apps: app.send nosuch start: not_found") != NULL, "a refusal logs its code: '%s'", last_log);
+    CHECK(send_launches == before_runs && messages == before_messages, "nothing launched, nothing sent");
+    /* No store yet; the store's refusal (the quarantine). */
+    store_mode = APPS_STORAGE_NONE;
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    store_mode = APPS_STORAGE_RAM;
+    CHECK_AT(done_result, "error.code", "unavailable");
+    CHECK_AT(done_result, "error.message", "storage not ready");
+    store_load_refusal = "timer was running during two restarts in a row; reinstall it to run it again";
+    CHECK(muse_apps_send("timer", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    store_load_refusal = NULL;
+    CHECK_AT(done_result, "error.code", "unavailable");
+    CHECK_AT(done_result, "error.message", "timer was running during two restarts in a row; reinstall it to run it again");
+    CHECK(send_launches == before_runs && messages == before_messages, "a quarantined app isn't launched or sent to");
+
+    /* The app crashes in start() on its launch: no message goes. */
+    run_ok = false;
+    snprintf(run_err, sizeof run_err, "crashed in start(): main.lua:2: boom");
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "error.code", "crashed");
+    CHECK_AT(done_result, "error.message", "'hello' didn't start: crashed in start(): main.lua:2: boom");
+    snprintf(run_err, sizeof run_err, "main.lua:3: unexpected symbol near 'x'");
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    run_ok = true;
+    CHECK_AT(done_result, "error.code", "not_running");
+    CHECK_AT(done_result, "error.message", "'hello' didn't start: main.lua:3: unexpected symbol near 'x'");
+    CHECK(messages == before_messages, "no message to an app that didn't start");
+
+    /* The message's failures. The handler's text is as it is, and the app keeps running. */
+    static const struct {
+        const char *text, *code, *message;
+    } failures[] = {
+        {"main.lua:142: unknown event 'nope'; use start, pause", "app_error", "main.lua:142: unknown event 'nope'; use start, pause"},
+        {"main.lua:7: boom\nstack traceback:\n\tmain.lua:7: in function 'message'", "app_error",
+         "main.lua:7: boom\\nstack traceback:\\n\\tmain.lua:7: in function 'message'"},
+        {"data: unexpected character", "app_error", "data: unexpected character"},
+        {"the app task didn't answer within 5000 ms", "timed_out", MUSE_APPS_SEND_NO_REPLY},
+        {"hello isn't running", "not_running", "hello isn't running"},
+        {"the app task is busy; try again", "busy", "the app task is busy; try again"},
+        {"the app stopped responding; no app can run until its stuck call returns or the gadget restarts", "unavailable",
+         "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"},
+        {"Muse apps aren't running", "unavailable", "Muse apps aren't running"},
+        {"out of memory: no room for the request", "out_of_memory", "out of memory: no room for the request"},
+    };
+    snprintf(running_app, sizeof running_app, "hello");
+    message_reply = NULL;
+    for (size_t i = 0; i < ARRAY_LEN(failures); i++) {
+        message_err = failures[i].text;
+        CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+        run_jobs();
+        CHECK_AT(done_result, "ok", "false");
+        CHECK(strcmp(at_path(done_result, "error.code"), failures[i].code) == 0, "'%s' is %s, not %s", failures[i].text,
+              at_path(done_result, "error.code"), failures[i].code);
+        char want[400];
+        snprintf(want, sizeof want, "{\"ok\":false,\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}", failures[i].code, failures[i].message);
+        EXPECT_RESULT(done_result, want);
+        done_result = NULL;
+    }
+    message_reply = "{}";
+    message_err = "";
+    running_app[0] = '\0';
+
+    /* A reply that isn't JSON text is still sent: as a string. */
+    snprintf(running_app, sizeof running_app, "hello");
+    message_reply = "not json";
+    CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    EXPECT_RESULT(done_result, "{\"ok\":true,\"payload\":{\"reply\":\"not json\"}}");
+    done_result = NULL;
+    message_reply = "{}";
+    running_app[0] = '\0';
+
+    /* No memory for the result, whichever allocation of it fails: done is still called, once, with the result or the lack of memory
+     * (NULL when there is none for even that; Link's done says so), and nothing is left held (the harness checks at its end). */
+    snprintf(running_app, sizeof running_app, "hello");
+    message_reply = "{\"state\":\"running\"}";
+    for (long refused = 0; refused < 8; refused++) {
+        int calls = dones;
+        CHECK(muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err), "queued");
+        cjson_refuse = refused;
+        run_jobs();
+        cjson_refuse = -1;
+        CHECK(dones == calls + 1, "done called once (allocation %ld refused)", refused);
+        const char *ok = at_path(done_result, "ok");
+        CHECK(done_result == NULL || strcmp(ok, "true") == 0 ||
+                  strcmp(at_path(done_result, "error.code"), "out_of_memory") == 0,
+              "a result or the lack of memory (allocation %ld refused)", refused);
+    }
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    message_reply = "{}";
+    running_app[0] = '\0';
+
+    /* Refused at once: nothing queued and done never called. */
+    int calls = dones;
+    CHECK(!muse_apps_send("Bad", "start", NULL, false, on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "a bad id");
+    CHECK(!muse_apps_send(NULL, "start", NULL, false, on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "no id");
+    CHECK(!muse_apps_send("hello", "", NULL, false, on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "no event");
+    CHECK(!muse_apps_send("hello", NULL, NULL, false, on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "null event");
+    CHECK(!muse_apps_send("hello", "start", NULL, false, NULL, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "no done");
+    char *big = malloc(MUSE_APPS_SEND_DATA_MAX + 2);
+    CHECK(big != NULL, "no memory");
+    memset(big, ' ', MUSE_APPS_SEND_DATA_MAX + 1);
+    big[MUSE_APPS_SEND_DATA_MAX + 1] = '\0';
+    CHECK(!muse_apps_send("hello", "start", big, false, on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0 &&
+              strcmp(err, "data is larger than 4 KB") == 0,
+          "4097 bytes of data: %s", err);
+    free(big);
+    submit_refuses = true;
+    CHECK(!muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err) && strcmp(code, "out_of_memory") == 0 &&
+              strcmp(err, APPS_IO_REFUSED) == 0,
+          "the worker refused: %s: %s", code, err);
+    submit_refuses = false;
+    port_refuse = 0;
+    CHECK(!muse_apps_send("hello", "start", NULL, false, on_done, NULL, &code, &err) && strcmp(code, "out_of_memory") == 0, "no memory");
+    port_refuse = -1;
+    CHECK(n_jobs == 0 && dones == calls, "nothing queued, done never called");
+}
+
+/* The wrapper main/ validates data through: one JSON value, an object at the top (D25). */
+static void json_object_valid(void) {
+    char err[96];
+    static const char *const objects[] = {"{}", "{\"seconds\":300}", " \t\r\n{\"a\":[1,{\"b\":null}]}\n ", "{\"a\":\"\\u00e9\"}"};
+    for (size_t i = 0; i < ARRAY_LEN(objects); i++) {
+        CHECK(muse_apps_json_object_valid(objects[i], strlen(objects[i]), err, sizeof err), "'%s': %s", objects[i], err);
+    }
+    static const char *const refused[] = {"", " ", "[1,2]", "[]", "5", "true", "null", "\"x\"", "{", "{\"a\":}", "{} {}", "{}x", "{'a':1}",
+                                          "{\"a\":1,}", "[{\"a\":1}]"};
+    for (size_t i = 0; i < ARRAY_LEN(refused); i++) {
+        err[0] = '\0';
+        CHECK(!muse_apps_json_object_valid(refused[i], strlen(refused[i]), err, sizeof err), "'%s' isn't an object", refused[i]);
+        CHECK(err[0] != '\0', "'%s' says why", refused[i]);
+    }
+    /* Only len bytes are read: an object followed by more. */
+    CHECK(muse_apps_json_object_valid("{}x", 2, err, sizeof err), "two bytes of '{}x'");
+    CHECK(!muse_apps_json_object_valid("{}x", 3, err, sizeof err), "three");
+    /* Nesting over the decoder's depth (16) is refused, as the app would refuse it. */
+    char deep[256];
+    size_t n = 0;
+    for (int i = 0; i < 20; i++) {
+        n += (size_t)snprintf(deep + n, sizeof deep - n, "{\"a\":");
+    }
+    n += (size_t)snprintf(deep + n, sizeof deep - n, "1");
+    for (int i = 0; i < 20 && n + 1 < sizeof deep; i++) {
+        deep[n++] = '}';
+    }
+    deep[n] = '\0';
+    CHECK(!muse_apps_json_object_valid(deep, n, err, sizeof err), "20 levels deep");
+}
+
+/*
  * app.api (D2, and D3 as the user decided it): one job of the I/O worker writes the guide and the timer example (the firmware's
  * own bytes: EMBED_FILES) to workspace/apps/_guide/ on the VM, logging the DMA RAM's free and lowest marks before and after, and
  * answers with the paths and what the gadget is: api, screen, fonts, limits, storage and the installed apps. When the VM refuses a
@@ -2545,6 +2764,8 @@ int main(int argc, char **argv) {
         {"control_list_and_status", control_list_and_status},
         {"control_list_waits_at_most_500_ms", control_list_waits_at_most_500_ms},
         {"control_launch_stop_remove", control_launch_stop_remove},
+        {"control_send", control_send},
+        {"json_object_valid", json_object_valid},
         {"guide_written_or_inline", guide_written_or_inline},
         {"the_stage_is_bounded", the_stage_is_bounded},
         {"empty_and_missing_files", empty_and_missing_files},

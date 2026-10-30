@@ -189,6 +189,37 @@ bool muse_apps_stop(const char *id, muse_apps_done_cb done, void *ctx, const cha
 bool muse_apps_remove(const char *id, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
 
 /*
+ * Link's app.send (Task 24): message(event, data) to the app id, starting it first when it isn't the one that runs. Queued on the I/O worker
+ * (the store is the worker's: X11), so the Noise session's task never waits, and answered once through done, as muse_apps_install is: true
+ * once queued, and done then runs exactly once, on the worker; false, with nothing queued and done never called, and *code and *err
+ * (literals) saying why: invalid_params (not an app id, an empty event, data over MUSE_APPS_SEND_DATA_MAX bytes, no done) or
+ * out_of_memory (no memory for the job, or the worker can't take it now). data_json is JSON text, NULL for none; id, event and
+ * data_json are copied. With show, the app is brought to the front once the message has been answered, after the voice turn if one is on
+ * (request_front: C11).
+ *
+ * The job, on the worker. When id isn't the app that runs: the store must have it (not_found, MUSE_APPS_NOT_FOUND; "storage not ready" is
+ * unavailable), its copy loads (the quarantine and a damaged copy are unavailable, and the load makes it the most recent) and runs behind,
+ * through apps_task_run_for_send (a failure to start is crashed or not_running, "'<id>' didn't start: <why>"). That launch has its own
+ * bound, APPS_TASK_SEND_LAUNCH_MS (3 s, with no settle), and the reply's MUSE_APPS_SEND_REPLY_MS counts from the message's delivery to the
+ * app (the app task's queue), so a launch that is needed doesn't eat it. Then apps_task_message. The result is
+ *   {"ok":true,"payload":{"reply":<the handler's return value as JSON, null for none>}}
+ * or {"ok":false,"error":{"code","message"}} with the handler's error() text as it is (code app_error: the app keeps running, or it is
+ * the crash record when the handler was killed), MUSE_APPS_SEND_NO_REPLY (timed_out), "<id> isn't running" (not_running), or the app
+ * task's own refusals (busy, unavailable, out_of_memory).
+ */
+#define MUSE_APPS_SEND_DATA_MAX 4096                /* data's bytes, as JSON text */
+#define MUSE_APPS_SEND_REPLY_MS 5000                /* the app's time to reply, from the message's delivery */
+#define MUSE_APPS_SEND_NO_REPLY "the app didn't reply within 5 s"
+bool muse_apps_send(const char *id, const char *event, const char *data_json, bool show, muse_apps_done_cb done, void *ctx,
+                    const char **code, const char **err);
+
+/*
+ * Whether s[0, len) is one JSON value (apps_json_validate: depth at most 16) with an object at its top level, for main/, which never
+ * includes apps_json.h. Else false with err (err_len bytes) saying why. Any task; it allocates nothing.
+ */
+bool muse_apps_json_object_valid(const char *s, size_t len, char *err, size_t err_len);
+
+/*
  * app.api (D2, and D3 as the user decided it): one job of the I/O worker writes the guide and the timer example that the firmware
  * carries (apps/apps_guide.md and apps/examples/timer/, EMBED_FILES) to MUSE_APPS_GUIDE_DIR on the VM, as README.md,
  * timer/manifest.json and timer/main.lua, through the VM ops' write. It logs the DMA RAM's free and lowest marks before and after

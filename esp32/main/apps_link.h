@@ -37,19 +37,16 @@ extern "C" {
 void apps_link_init(void);
 
 // Adds the app.* commands to link.register's commands_v2 object: app.api,
-// app.install and app.control (when the headroom rule lets it be advertised).
+// app.install, app.send and app.control (when the headroom rule lets it be
+// advertised).
 void apps_link_register(cJSON *commands);
-
-// app.send's entry (Task 24 advertises it with its handler), built now so that
-// the register's budget counts it (D11).
-void apps_link_register_send(cJSON *commands);
 
 // Whether command is one of these.
 bool apps_link_handles(const char *command);
 
 // on_ws_command() for these, on the Noise session's task: it never waits long.
-// An install, app.api and app.control's launch, stop and remove are queued and
-// answer {"_async": true}, and the result follows through
+// An install, app.api, app.send and app.control's launch, stop and remove are
+// queued and answer {"_async": true}, and the result follows through
 // noise_ctrl_send_command_result(), once; app.control's list, status and logs
 // answer at once (a wait of at most MUSE_APPS_CONTROL_WAIT_MS for the apps' I/O
 // worker); a refusal is the reply.

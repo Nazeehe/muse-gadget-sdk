@@ -408,6 +408,23 @@ class Console(unittest.TestCase):
     def test_control_launch_stop_remove(self):  # D20: queued, done once; the store's refusals as codes
         self.run_case("control_launch_stop_remove")
 
+    def test_control_send(self):  # Task 24: the resident app at once, a stored one launched behind first, the failures with codes
+        self.run_case("control_send")
+
+    def test_send_launch_bound_leaves_margin(self):  # the launch (3 s) and the reply (5 s) end 2 s under the VM's 10 s
+        task = (APPS / "apps_task.h").read_text()
+        launch = int(re.search(r"#define APPS_TASK_SEND_LAUNCH_MS (\d+)", task).group(1))
+        muse = (ROOT / "components/muse/muse_apps.h").read_text()
+        reply = int(re.search(r"#define MUSE_APPS_SEND_REPLY_MS (\d+)", muse).group(1))
+        link = (ROOT / "main/apps_link.c").read_text()
+        vm_wait = int(re.search(r"#define SEND_TIMEOUT_MS (\d+)", link).group(1))
+        self.assertEqual((launch, reply, vm_wait), (3000, 5000, 10000))
+        self.assertLessEqual(launch + reply + 2000, vm_wait)
+        self.assertIn("APPS_TASK_SEND_LAUNCH_MS, NULL, err, err_len", (APPS / "apps_task.c").read_text())
+
+    def test_json_object_valid(self):  # D25: the wrapper main/ validates app.send's data through
+        self.run_case("json_object_valid")
+
     def test_guide_written_or_inline(self):  # D2, D3: the firmware's bytes to the VM, or inline when a write is refused
         self.run_case("guide_written_or_inline")
 

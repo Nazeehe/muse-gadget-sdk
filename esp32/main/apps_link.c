@@ -36,9 +36,10 @@
 // worker; the job's done sends the result once and frees the request, whatever
 // became of the session meanwhile (noise_ctrl_send_command_result drops a
 // result of a session that has ended). app.api (the guide's writes, which only
-// this task can pump) and app.control's launch, stop and remove go the same
-// way; app.control's list, status and logs answer at once, after a wait for the
-// worker of at most MUSE_APPS_CONTROL_WAIT_MS (D20).
+// this task can pump), app.send (the launch an app may need, and the app's
+// reply, awaited for at most 5 s) and app.control's launch, stop and remove go
+// the same way; app.control's list, status and logs answer at once, after a
+// wait for the worker of at most MUSE_APPS_CONTROL_WAIT_MS (D20).
 //
 // The VM's files. The apps read Muse's VM through muse_apps_vm_ops_t, which this
 // file puts vm_file behind: a read opens the one reader for the install, with
@@ -49,14 +50,14 @@
 #define INSTALL_TIMEOUT_MS 120000  // the VM's wait for app.install's result: over the gadget's 90 s deadline and a run's settle
 #define API_TIMEOUT_MS 30000       // app.api's: the guide's writes (MUSE_APPS_GUIDE_WRITE_MS) and the answer
 #define CONTROL_TIMEOUT_MS 30000   // app.control's: a launch's load, run and settle
-#define SEND_TIMEOUT_MS 10000      // app.send's (Task 24): the app's 5 s and the round trip
+#define SEND_TIMEOUT_MS 10000      // app.send's: the app's reply bound (5 s, MUSE_APPS_SEND_REPLY_MS) and the round trip
 #define REQUEST_ID_MAX 64
 
 // The headroom rule (D11): link.register carries the apps' entries in at most
 // 4499 bytes (APPS_REGISTER_BUDGET). All four, app.send's included, measure
-// well under it (tests/test_muse_apps_link.py prints the size), so app.control
-// is advertised. Were they over, this would be 0: app.control would still
-// dispatch, and app.api's payload would name it ("control").
+// well under it (tests/test_muse_apps_link.py asserts it and prints the size),
+// so app.control is advertised. Were they over, this would be 0: app.control
+// would still dispatch, and app.api's payload would name it ("control").
 #define ADVERTISE_CONTROL 1
 
 // app.control's actions, as typed.
@@ -144,6 +145,18 @@ static void add_command(cJSON *commands, const char *name, const char *descripti
     cJSON_AddItemToObject(commands, name, c);
 }
 
+static void register_send(cJSON *commands) {
+    cJSON *required = cJSON_CreateObject(), *optional = cJSON_CreateObject();
+    cJSON_AddItemToObject(required, "id", param("string", "App id."));
+    cJSON_AddItemToObject(required, "event", param("string", "One of the app's messages (app.control list shows them)."));
+    cJSON_AddItemToObject(optional, "data", param("object", "The event's data, e.g. {\"seconds\":300}."));
+    cJSON_AddItemToObject(optional, "show", param("boolean", "Bring the app to the front once this turn ends."));
+    add_command(commands, "app.send",
+                "Send an event to a gadget app (its manifest's messages list them). Starts the app if needed. show=true "
+                "brings it to the front once this turn ends. Returns the app's reply.",
+                required, optional, SEND_TIMEOUT_MS);
+}
+
 void apps_link_register(cJSON *commands) {
     add_command(commands, "app.api",
                 "Call before writing an app. Writes the gadget app guide and a timer example to workspace/apps/_guide/ on "
@@ -167,18 +180,7 @@ void apps_link_register(cJSON *commands) {
                     "status and logs return state, errors with traceback, the last 50 log lines, memory and CPU.",
                     required, optional, CONTROL_TIMEOUT_MS);
     }
-}
-
-void apps_link_register_send(cJSON *commands) {
-    cJSON *required = cJSON_CreateObject(), *optional = cJSON_CreateObject();
-    cJSON_AddItemToObject(required, "id", param("string", "App id."));
-    cJSON_AddItemToObject(required, "event", param("string", "One of the app's messages (app.control list shows them)."));
-    cJSON_AddItemToObject(optional, "data", param("object", "The event's data, e.g. {\"seconds\":300}."));
-    cJSON_AddItemToObject(optional, "show", param("boolean", "Bring the app to the front once this turn ends."));
-    add_command(commands, "app.send",
-                "Send an event to a gadget app (its manifest's messages list them). Starts the app if needed. show=true "
-                "brings it to the front once this turn ends. Returns the app's reply.",
-                required, optional, SEND_TIMEOUT_MS);
+    register_send(commands);
 }
 
 // ---- The commands ----
@@ -285,6 +287,83 @@ static cJSON *api_command(const char *request_id, noise_ctrl_session_generation_
     return async_reply();
 }
 
+// app.send's text for data (D25) and its limit, MUSE_APPS_SEND_DATA_MAX.
+#define SEND_DATA_INVALID "data must be JSON (an object like {\"seconds\":300})"
+#define SEND_DATA_LARGE "data is larger than 4 KB"
+
+// data as the JSON text the app is sent: an object is printed compact, a string is the text as it is. Either must be at most
+// MUSE_APPS_SEND_DATA_MAX bytes (checked first: nothing larger is parsed) and one JSON value whose top level is an object. A
+// text here is *owned (cJSON_free it) for an object and the string's own otherwise. Returns NULL with *refusal the reply when it
+// can't be; *text stays NULL for no data (absent or null).
+static const char *send_data_json(const cJSON *data, char **owned, cJSON **refusal) {
+    *owned = NULL;
+    if (!data || cJSON_IsNull(data)) return NULL;
+    const char *text;
+    if (cJSON_IsObject(data)) {
+        *owned = cJSON_PrintUnformatted(data);
+        if (!*owned) {
+            *refusal = error_result("out_of_memory", "out of memory: no room for the data");
+            return NULL;
+        }
+        text = *owned;
+    } else if (cJSON_IsString(data) && data->valuestring) {
+        text = data->valuestring;
+    } else {  // an array, a number, a boolean: not an object
+        *refusal = error_result("invalid_params", SEND_DATA_INVALID);
+        return NULL;
+    }
+    size_t len = strlen(text);
+    char detail[96];  // why the wrapper refused it: the message is the same whichever way
+    if (len > MUSE_APPS_SEND_DATA_MAX) {
+        *refusal = error_result("invalid_params", SEND_DATA_LARGE);
+    } else if (!muse_apps_json_object_valid(text, len, detail, sizeof(detail))) {
+        *refusal = error_result("invalid_params", SEND_DATA_INVALID);
+    }
+    if (*refusal) {
+        cJSON_free(*owned);
+        *owned = NULL;
+        return NULL;
+    }
+    return text;
+}
+
+// app.send's.
+static void send_done(void *ctx, cJSON *result) {
+    finish_request(ctx, result, "out of memory: no room for the result");
+}
+
+// app.send: id and event required; data an object or JSON text (send_data_json); show a boolean. The job (muse_apps_send) starts
+// the app if it isn't running and waits for the reply on the I/O worker, so this answers {"_async": true}.
+static cJSON *send_command(cJSON *params, const char *request_id, noise_ctrl_session_generation_t session_generation) {
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(params, "id");
+    if (!cJSON_IsString(id) || !id->valuestring || !id->valuestring[0]) return error_result("missing_param", "id is required");
+    char msg[128];
+    if (!muse_apps_id_valid(id->valuestring, msg, sizeof(msg))) return error_result("invalid_params", msg);
+    cJSON *event = cJSON_GetObjectItemCaseSensitive(params, "event");
+    if (!cJSON_IsString(event) || !event->valuestring || !event->valuestring[0]) {
+        return error_result("missing_param", "event is required");
+    }
+    cJSON *show = cJSON_GetObjectItemCaseSensitive(params, "show");
+    if (show && !cJSON_IsBool(show)) return error_result("invalid_params", "show must be true or false");
+    cJSON *refusal = NULL;
+    char *owned = NULL;
+    const char *data = send_data_json(cJSON_GetObjectItemCaseSensitive(params, "data"), &owned, &refusal);
+    if (refusal) return refusal;
+    request_t *req = new_request(request_id, session_generation, &refusal);
+    if (!req) {
+        cJSON_free(owned);
+        return refusal;
+    }
+    const char *code = "out_of_memory", *err = "failed to send the event";
+    bool queued = muse_apps_send(id->valuestring, event->valuestring, data, cJSON_IsTrue(show), send_done, req, &code, &err);
+    cJSON_free(owned);  // muse_apps_send copied what it needs
+    if (!queued) {
+        heap_caps_free(req);
+        return error_result(code, err);
+    }
+    return async_reply();
+}
+
 // A synchronous action's answer (muse_apps_list, muse_apps_status), or the lack of memory for one.
 static cJSON *answer(cJSON *result) {
     return result ? result : error_result("out_of_memory", "out of memory: no room for the answer");
@@ -332,7 +411,7 @@ static cJSON *control_command(cJSON *params, const char *request_id,
 
 bool apps_link_handles(const char *command) {
     return command && (strcmp(command, "app.install") == 0 || strcmp(command, "app.api") == 0 ||
-                       strcmp(command, "app.control") == 0);
+                       strcmp(command, "app.control") == 0 || strcmp(command, "app.send") == 0);
 }
 
 cJSON *apps_link_handle(const char *command, cJSON *params, const char *request_id,
@@ -345,6 +424,9 @@ cJSON *apps_link_handle(const char *command, cJSON *params, const char *request_
     }
     if (command && strcmp(command, "app.control") == 0) {
         return control_command(params, request_id, session_generation);
+    }
+    if (command && strcmp(command, "app.send") == 0) {
+        return send_command(params, request_id, session_generation);
     }
     return error_result("unsupported", "unknown app command");
 }

@@ -103,8 +103,15 @@
 #include "apps_pkg.h"
 #include "apps_rt.h"
 
+/* The refusals every call returns, and the wait's: as text, in err. Link's app.send (apps_control.c) tells them from a handler's error. */
+#define APPS_TASK_MSG_HUNG "the app stopped responding; no app can run until its stuck call returns or the gadget restarts"
+#define APPS_TASK_MSG_BUSY "the app task is busy; try again"
+#define APPS_TASK_MSG_DOWN "Muse apps aren't running"
+#define APPS_TASK_MSG_NO_ANSWER "the app task didn't answer within"  /* then " <N> ms" */
+
 /* The bounds of the waits. */
 #define APPS_TASK_RUN_EXTRA_MS 7000  /* a run waits settle_ms and this */
+#define APPS_TASK_SEND_LAUNCH_MS 3000  /* app.send's launch of a stored app: store load is the worker's, this is the load and start() (about 750 ms of instructions); with the 5 s reply it stays 2 s under the VM's 10 s */
 #define APPS_TASK_WAIT_MS 2000       /* compile and stop */
 #define APPS_TASK_HUNG_MS 3000       /* a call that has run longer is hung (strictly longer) */
 #define APPS_TASK_RESET_MS 500       /* the app task's wait for the LVGL task's reset */
@@ -210,6 +217,12 @@ bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status
 void apps_task_launch(const char *id, bool front);
 
 /*
+ * apps_task_run_by_id for Link's app.send (apps_control.c, on the I/O worker): behind, no settle, and the wait is at most
+ * APPS_TASK_SEND_LAUNCH_MS instead of APPS_TASK_RUN_EXTRA_MS. Otherwise as apps_task_run_by_id (pkg is taken whatever happens).
+ */
+bool apps_task_run_for_send(apps_pkg_t *pkg, char *err, size_t err_len);
+
+/*
  * apps_task_run_by_id for a launch for an app's alarms (the I/O worker's, apps_console.c), with no settle and in front: upto is the
  * launch's identity, the gen of the last firing of the app that it was asked for (apps_alarm_wanted). When no firing of the app up
  * to it waits any more, nothing is replaced and nothing runs: false, with APPS_TASK_ALARM_GONE in err, which is no failure to
@@ -278,8 +291,8 @@ void apps_task_set_list(const apps_listed_t *apps, int n);
 bool apps_task_running(char *id, size_t cap);
 
 /*
- * Sends message(event, data_json) to the app id, which must be the one running (Task 24 adds starting a stored app
- * that isn't), and returns its reply: JSON text in a block of apps_port_realloc that the caller frees with
+ * Sends message(event, data_json) to the app id, which must be the one running (Link's app.send starts a stored app that
+ * isn't first: muse_apps_send, apps_control.c, on the I/O worker), and returns its reply: JSON text in a block of apps_port_realloc that the caller frees with
  * apps_port_free ("null" when the handler returned nothing). data_json is JSON text, or NULL or "" for nil. With show,
  * a message that succeeded asks for the layer in front (after the voice turn, if one is on). Waits at most timeout_ms
  * (APPS_TASK_WAIT_MS when it is 0 or less), for room in the queue and the answer together.

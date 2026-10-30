@@ -222,6 +222,39 @@ bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code,
     return async_call("guide", NULL, done, ctx, code, err);
 }
 
+/* app.send's call (Task 24): kept like the other asynchronous ones, with what the handler made of the parameters. */
+static char send_event[300];
+static char send_data[8192];
+static bool send_data_null, send_show;
+
+bool muse_apps_send(const char *id, const char *event, const char *data_json, bool show, muse_apps_done_cb done, void *ctx,
+                    const char **code, const char **err) {
+    snprintf(send_event, sizeof send_event, "%s", event != NULL ? event : "(null)");
+    snprintf(send_data, sizeof send_data, "%s", data_json != NULL ? data_json : "");
+    send_data_null = data_json == NULL;
+    send_show = show;
+    return async_call("send", id, done, ctx, code, err);
+}
+
+/* The wrapper over apps_json_validate (muse_apps.h): one JSON value, and an object. The real one is apps_control.c's. */
+static int object_checks;
+
+bool muse_apps_json_object_valid(const char *s, size_t len, char *err, size_t err_len) {
+    object_checks++;
+    char *copy = malloc(len + 1);
+    CHECK(copy != NULL, "no memory");
+    memcpy(copy, s, len);
+    copy[len] = '\0';
+    cJSON *v = cJSON_ParseWithOpts(copy, NULL, true);  /* nothing after the value */
+    free(copy);
+    bool ok = cJSON_IsObject(v);
+    cJSON_Delete(v);
+    if (!ok) {
+        snprintf(err, err_len, "%s", v == NULL ? "not JSON" : "the top level must be an object");
+    }
+    return ok;
+}
+
 /* ---- The session ---- */
 
 static int sends;
@@ -389,27 +422,21 @@ static void print_commands(const char *tag, cJSON *commands) {
 }
 
 /* The app.* entries of link.register's commands_v2, printed for the Python test, which checks them against the budget:
- * "@register", what is advertised, and "@all", that and app.send's entry (D11: built now, advertised with its handler in
- * Task 24), all four of the apps' entries. */
+ * "@register", what is advertised, which since Task 24 is all four of the apps' entries (D11), app.send's included. */
 static void register_entries(void) {
     cJSON *commands = cJSON_CreateObject();
     CHECK(commands != NULL, "no memory");
     apps_link_register(commands);
     print_commands("register", commands);
-    cJSON *all = cJSON_CreateObject();
-    CHECK(all != NULL, "no memory");
-    apps_link_register(all);
-    apps_link_register_send(all);
-    print_commands("all", all);
 }
 
-/* Which commands are this file's: app.install, app.api and app.control, and nothing it doesn't handle (app.send's handler
- * is Task 24's). */
+/* Which commands are this file's: app.install, app.api, app.control and app.send, and nothing it doesn't handle. */
 static void handles(void) {
     CHECK(apps_link_handles("app.install"), "app.install");
     CHECK(apps_link_handles("app.api"), "app.api");
     CHECK(apps_link_handles("app.control"), "app.control");
-    static const char *const others[] = {"app.send", "app.", "app", "device.health", "ble.state", "app.install ",
+    CHECK(apps_link_handles("app.send"), "app.send");
+    static const char *const others[] = {"app.Send", "app.sends", "app.send ", "app.", "app", "device.health", "ble.state", "app.install ",
                                          "app.API", "app.controls", ""};
     for (size_t i = 0; i < ARRAY_LEN(others); i++) {
         CHECK(!apps_link_handles(others[i]), "'%s' isn't one of this file's", others[i]);
@@ -693,6 +720,282 @@ static void api_handler(void) {
     CHECK(guides == calls && psram_blocks == 0, "nothing queued, nothing held");
 }
 
+#define EXPECT_SEND(params, request_id, want) expect_reply_at(__LINE__, "app.send", (params), (request_id), (want))
+#define DATA_INVALID \
+    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"data must be JSON (an object like {\\\"seconds\\\":300})\"}}"
+#define DATA_LARGE "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"data is larger than 4 KB\"}}"
+
+/* {"id":"timer","event":"start","data":<data_json>} with data_json a JSON text of its own (the caller frees it). */
+static char *send_params(const char *data_json) {
+    size_t n = strlen(data_json) + 64;
+    char *p = malloc(n);
+    CHECK(p != NULL, "no memory");
+    snprintf(p, n, "{\"id\":\"timer\",\"event\":\"start\",\"data\":%s}", data_json);
+    return p;
+}
+
+/* A JSON string whose value is the text s ("{\"a\":\"xxx\"}" as the text of an object): s escaped between quotes. */
+static char *quoted(const char *s) {
+    size_t n = strlen(s) * 2 + 3;
+    char *q = malloc(n);
+    CHECK(q != NULL, "no memory");
+    size_t o = 0;
+    q[o++] = '"';
+    for (; *s != '\0'; s++) {
+        if (*s == '"' || *s == '\\') {
+            q[o++] = '\\';
+        }
+        q[o++] = *s;
+    }
+    q[o++] = '"';
+    q[o] = '\0';
+    return q;
+}
+
+/* An object text of exactly n bytes: {"a":"xxx...x"}. */
+static char *object_of(size_t n) {
+    CHECK(n >= 8, "too small");
+    char *t = malloc(n + 1);
+    CHECK(t != NULL, "no memory");
+    memset(t, 'x', n);
+    memcpy(t, "{\"a\":\"", 6);
+    t[n - 2] = '"';
+    t[n - 1] = '}';
+    t[n] = '\0';
+    return t;
+}
+
+/* A refused call: the reply is want, nothing was queued and nothing is held. */
+static void send_refused_at(int line, const char *params, const char *want) {
+    int calls = asyncs;
+    expect_reply_at(line, "app.send", params, "r1", want);
+    if (asyncs != calls || psram_blocks != 0) {
+        fail_at(line, "a refused call queued something (%s): %d calls, %d blocks", params, asyncs - calls, psram_blocks);
+    }
+}
+#define SEND_REFUSED(params, want) send_refused_at(__LINE__, (params), (want))
+
+/*
+ * app.send's parameters (Task 24, D25), on the Noise session's task. data is accepted as an object (printed compact) or as a
+ * string of JSON text (used as it is); either must be at most 4096 bytes and one JSON value whose top level is an object
+ * (muse_apps_json_object_valid, the wrapper main/ is given: it never includes apps_json.h), or the call is refused before
+ * anything is queued. The size is checked before the text is parsed. data may be left out (the app gets nil), and so may show.
+ * id and event are required; the id is an app id.
+ */
+static void send_data_forms(void) {
+    /* An object goes through cJSON_PrintUnformatted. */
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\",\"data\":{\"seconds\":300}}", "r1", ASYNC);
+    CHECK(asyncs == 1 && strcmp(async_what, "send") == 0 && strcmp(async_id, "timer") == 0, "send to timer: %s %s", async_what,
+          async_id);
+    CHECK(strcmp(send_event, "start") == 0 && strcmp(send_data, "{\"seconds\":300}") == 0 && !send_data_null && !send_show,
+          "event %s, data %s, show %d", send_event, send_data, send_show);
+    FINISH_ASYNC("r1");
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\",\"data\":{ \"seconds\" : 300 , \"label\" : [1, {\"a\":null}] }}", "r2", ASYNC);
+    CHECK(strcmp(send_data, "{\"seconds\":300,\"label\":[1,{\"a\":null}]}") == 0, "compact: %s", send_data);
+    FINISH_ASYNC("r2");
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\",\"data\":{}}", "r3", ASYNC);
+    CHECK(strcmp(send_data, "{}") == 0 && !send_data_null, "an empty object is data: %s", send_data);
+    FINISH_ASYNC("r3");
+
+    /* A string is used as it is, spaces and all. */
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\",\"data\":\"{\\\"seconds\\\":300}\"}", "r4", ASYNC);
+    CHECK(strcmp(send_data, "{\"seconds\":300}") == 0 && !send_data_null, "a string: %s", send_data);
+    FINISH_ASYNC("r4");
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\",\"data\":\" {\\\"seconds\\\": 300}\\n\"}", "r5", ASYNC);
+    CHECK(strcmp(send_data, " {\"seconds\": 300}\n") == 0, "as it is: '%s'", send_data);
+    FINISH_ASYNC("r5");
+
+    /* No data, or null: the app gets nil. */
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"status\"}", "r6", ASYNC);
+    CHECK(send_data_null && strcmp(send_event, "status") == 0, "no data");
+    FINISH_ASYNC("r6");
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"status\",\"data\":null}", "r7", ASYNC);
+    CHECK(send_data_null, "null data is none");
+    FINISH_ASYNC("r7");
+
+    /* Not JSON, or not an object: refused, in one set of words. */
+    int checks = object_checks;
+    static const char *const invalid[] = {
+        "\"nope\"", "\"\"", "\"{\\\"seconds\\\":\"", "\"{'seconds':300}\"", "\"{\\\"a\\\":1} {\\\"b\\\":2}\"",
+        "\"[1,2]\"", "\"5\"", "\"true\"", "\"null\"", "\"\\\"x\\\"\"",  /* strings holding another JSON value, or none */
+        "[1,2]", "[]", "[{\"seconds\":300}]",                              /* a top-level array, as an object-form value */
+        "5", "true", "false", "7.5",                                       /* a value that is neither */
+    };
+    for (size_t i = 0; i < ARRAY_LEN(invalid); i++) {
+        char *params = send_params(invalid[i]);
+        send_refused_at(__LINE__, params, DATA_INVALID);
+        free(params);
+    }
+    CHECK(object_checks > checks, "the wrapper was asked");
+
+    /* The size: 4096 bytes are taken, 4097 are not, and the size is checked before the text is read. */
+    char *text = object_of(4096), *q = quoted(text);
+    char *params = send_params(q);
+    free(q);
+    expect_reply_at(__LINE__, "app.send", params, "r8", ASYNC);
+    free(params);
+    CHECK(strlen(send_data) == 4096 && strcmp(send_data, text) == 0, "4096 bytes through: %zu", strlen(send_data));
+    FINISH_ASYNC("r8");
+    free(text);
+    text = object_of(4097);
+    q = quoted(text);
+    params = send_params(q);
+    free(q);
+    SEND_REFUSED(params, DATA_LARGE);
+    free(params);
+    free(text);
+    text = object_of(5000);
+    q = quoted(text);
+    params = send_params(q);
+    free(q);
+    SEND_REFUSED(params, DATA_LARGE);
+    free(params);
+    free(text);
+    /* 5000 bytes that aren't JSON: larger, not invalid. As an object, printed, the same. */
+    char *junk = malloc(5001);
+    CHECK(junk != NULL, "no memory");
+    memset(junk, 'z', 5000);
+    junk[5000] = '\0';
+    q = quoted(junk);
+    params = send_params(q);
+    free(q);
+    SEND_REFUSED(params, DATA_LARGE);
+    free(params);
+    size_t big = strlen("{\"id\":\"timer\",\"event\":\"start\",\"data\":{\"a\":\"\"}}") + 5000 + 1;
+    params = malloc(big);
+    CHECK(params != NULL, "no memory");
+    snprintf(params, big, "{\"id\":\"timer\",\"event\":\"start\",\"data\":{\"a\":\"%s\"}}", junk);
+    SEND_REFUSED(params, DATA_LARGE);
+    free(params);
+    free(junk);
+    char *edge = object_of(4096);  /* an object printed at 4096 passes, too */
+    size_t n = strlen(edge) + 64;
+    params = malloc(n);
+    CHECK(params != NULL, "no memory");
+    snprintf(params, n, "{\"id\":\"timer\",\"event\":\"start\",\"data\":%s}", edge);
+    expect_reply_at(__LINE__, "app.send", params, "r9", ASYNC);
+    CHECK(strlen(send_data) == 4096, "an object of 4096 printed bytes: %zu", strlen(send_data));
+    FINISH_ASYNC("r9");
+    free(params);
+    free(edge);
+
+    /* show. */
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\",\"show\":true}", "r10", ASYNC);
+    CHECK(send_show, "show true");
+    FINISH_ASYNC("r10");
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\",\"show\":false,\"data\":{\"seconds\":5}}", "r11", ASYNC);
+    CHECK(!send_show, "show false");
+    FINISH_ASYNC("r11");
+    SEND_REFUSED("{\"id\":\"timer\",\"event\":\"start\",\"show\":\"yes\"}",
+                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"show must be true or false\"}}");
+    SEND_REFUSED("{\"id\":\"timer\",\"event\":\"start\",\"show\":1}",
+                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"show must be true or false\"}}");
+
+    /* id and event. */
+    static const char *const no_id[] = {"{\"event\":\"start\"}", "{\"id\":\"\",\"event\":\"start\"}", "{\"id\":5,\"event\":\"start\"}"};
+    for (size_t i = 0; i < ARRAY_LEN(no_id); i++) {
+        SEND_REFUSED(no_id[i], "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"id is required\"}}");
+    }
+    static const char *const no_event[] = {"{\"id\":\"timer\"}", "{\"id\":\"timer\",\"event\":\"\"}", "{\"id\":\"timer\",\"event\":7}",
+                                           "{\"id\":\"timer\",\"event\":null}"};
+    for (size_t i = 0; i < ARRAY_LEN(no_event); i++) {
+        SEND_REFUSED(no_event[i], "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"event is required\"}}");
+    }
+    SEND_REFUSED("{\"id\":\"Timer\",\"event\":\"start\"}",
+                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"app id 'Timer' must match "
+                 "^[a-z][a-z0-9_]{1,23}$\"}}");
+    expect_reply_at(__LINE__, "app.send", NULL, "r1",
+                    "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"id is required\"}}");
+    expect_reply_at(__LINE__, "app.send", "{\"id\":\"timer\",\"event\":\"start\"}", NULL,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"request_id is invalid\"}}");
+    psram_refuses = true;
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\"}", "r1",
+                "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"failed to allocate\"}}");
+    psram_refuses = false;
+
+    /* The call's own refusals are the reply, with their codes, and the request goes. */
+    static const struct {
+        const char *code, *message;
+    } refusals[] = {
+        {"invalid_params", "app id must match ^[a-z][a-z0-9_]{1,23}$"},
+        {"out_of_memory", "the I/O worker can't take it now (out of memory); try again in a few seconds"},
+        {"unavailable", "Muse apps aren't running"},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(refusals); i++) {
+        async_ok = false;
+        async_code = refusals[i].code;
+        async_err = refusals[i].message;
+        char want[256];
+        snprintf(want, sizeof want, "{\"ok\":false,\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}", refusals[i].code,
+                 refusals[i].message);
+        EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\",\"data\":{\"seconds\":1}}", "r1", want);
+        async_ok = true;
+    }
+    CHECK(psram_blocks == 0, "nothing held");
+}
+
+/*
+ * app.send's result (Task 24): the handler's request is a copy of request_id and the session's generation, in PSRAM, which
+ * the caller may free at once; done sends the result once and frees the request, whether the session is still there or has
+ * ended, and says so when there was no memory for a result.
+ */
+static void send_done_frees_context(void) {
+    char request[64];
+    snprintf(request, sizeof request, "send-0001");
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\",\"data\":{\"seconds\":300}}", request, ASYNC);
+    memset(request, 'x', sizeof request - 1);
+    CHECK(psram_caps & MALLOC_CAP_SPIRAM && psram_blocks == 1 && sends == 0, "a request of its own, in PSRAM, nothing sent yet");
+    async_done(async_ctx, cJSON_Parse("{\"ok\":true,\"payload\":{\"reply\":{\"state\":\"running\",\"remaining\":300}}}"));
+    CHECK(sends == 1 && sent_generation == 7 && strcmp(sent_request, "send-0001") == 0, "sent once, as send-0001 of session 7: %s",
+          sent_request);
+    CHECK(strcmp(sent_result, "{\"ok\":true,\"payload\":{\"reply\":{\"state\":\"running\",\"remaining\":300}}}") == 0, "%s",
+          sent_result);
+    CHECK(psram_blocks == 0, "the request freed");
+    /* The session ended before the reply. */
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\"}", "send-0002", ASYNC);
+    session_ended = true;
+    async_done(async_ctx, cJSON_Parse("{\"ok\":true,\"payload\":{\"reply\":null}}"));
+    session_ended = false;
+    CHECK(sends == 2 && psram_blocks == 0, "handed to the send once, the request freed: %d sends, %d blocks", sends, psram_blocks);
+    /* No memory for a result. */
+    EXPECT_SEND("{\"id\":\"timer\",\"event\":\"start\"}", "send-0003", ASYNC);
+    async_done(async_ctx, NULL);
+    CHECK(sends == 3 && strcmp(sent_request, "send-0003") == 0 &&
+              strcmp(sent_result, "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"out of memory: no room for "
+                                  "the result\"}}") == 0,
+          "%s", sent_result);
+    CHECK(psram_blocks == 0, "the request freed");
+}
+
+/*
+ * What app.send answers when the app can't be sent to (D25): the not-installed and the no-reply results, which the apps' job
+ * makes and this file passes on as they are, whole; the reply's own errors too (a handler's error text, the app task's
+ * refusals). A fake muse_apps_send gives each in turn.
+ */
+static void send_failures_pass_through(void) {
+    char not_found[160];
+    snprintf(not_found, sizeof not_found, MUSE_APPS_NOT_FOUND, "nosuch");
+    static const struct {
+        const char *code, *message;
+    } results[] = {
+        {"not_found", NULL},  /* MUSE_APPS_NOT_FOUND for nosuch, below */
+        {"timed_out", "the app didn't reply within 5 s"},
+        {"app_error", "main.lua:142: unknown event 'nope'; use start, pause, resume, reset or status"},
+        {"crashed", "'timer' didn't start: crashed in start(): main.lua:2: boom"},
+        {"unavailable", "hello was running during two restarts in a row; reinstall it to run it again"},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(results); i++) {
+        const char *message = results[i].message != NULL ? results[i].message : not_found;
+        EXPECT_SEND("{\"id\":\"nosuch\",\"event\":\"start\",\"data\":{\"seconds\":300}}", "r1", ASYNC);
+        char text[400];
+        snprintf(text, sizeof text, "{\"ok\":false,\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}", results[i].code, message);
+        async_done(async_ctx, cJSON_Parse(text));
+        CHECK(sends == (int)i + 1 && strcmp(sent_result, text) == 0, "sent as it is: %s", sent_result);
+        CHECK(psram_blocks == 0, "the request freed");
+    }
+    CHECK(strcmp(not_found, "no app 'nosuch' on this gadget (app.control list shows the installed ones)") == 0, "%s", not_found);
+}
+
 /* The sink the adapter's reads are given here: it keeps what it gets. */
 static char sunk[256];
 static size_t sunk_len;
@@ -840,6 +1143,9 @@ int main(int argc, char **argv) {
         {"install_handler", install_handler},
         {"control_handler", control_handler},
         {"api_handler", api_handler},
+        {"send_data_forms", send_data_forms},
+        {"send_done_frees_context", send_done_frees_context},
+        {"send_failures_pass_through", send_failures_pass_through},
         {"vm_ops_are_vm_file", vm_ops_are_vm_file},
     };
     if (argc != 2) {

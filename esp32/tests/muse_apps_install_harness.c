@@ -20,7 +20,9 @@
  * muse_apps_install_harness <case>, one case per test in tests/test_muse_apps_install.py; it exits 0 when the case
  * holds, and otherwise prints why.
  *
- * The source is a fake that serves files from a table and records every read (its path, its limit, its deadline); the
+ * The source is a fake that serves files from a table and records every read (its path, its limit, its deadline), and so
+ * is the VM (Task 22): a fake muse_apps_vm_ops_t over the same table, which records the paths it is asked for and hands each
+ * file to the sink in pieces, and can fail a file partway, move the clock, or ignore max as a careless reader would; the
  * ops are fakes that record what they were given and answer what the case set (compile returns only Lua's raw message,
  * as C17 has it; run fills the status record from the case's and frees the package, as apps_task_run does). Every
  * result is printed as "@result <json>" for the Python test, which checks each is valid JSON (strict UTF-8) within 6144
@@ -42,6 +44,7 @@
 #include "apps_json.h"
 #include "apps_port.h"
 #include "cJSON.h"
+#include "muse_apps.h"
 #include "muse_apps_exact_stack.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
@@ -77,6 +80,7 @@ typedef union {
 } block_t;
 
 static size_t port_held;
+static size_t port_peak;      /* the most port_held has been since a case set it */
 static long port_refuse = -1; /* refuse the growth request this many from now (0: the next); -1: never */
 static long port_growths;     /* growth requests since the count was zeroed */
 
@@ -96,6 +100,7 @@ void *apps_port_realloc(void *ptr, size_t n) {
     }
     nb->size = n;
     port_held = port_held - old + n;
+    port_peak = port_held > port_peak ? port_held : port_peak;
     return nb + 1;
 }
 
@@ -236,7 +241,7 @@ void apps_task_set_list(const apps_listed_t *apps, int n) {
 
 /* ---- The log: the store's lines, kept ---- */
 
-static char logged[16][200];
+static char logged[64][200];
 static int n_logged;
 
 void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
@@ -315,6 +320,8 @@ static void serve_text(const char *path, const char *text) {
     serve(path, text, strlen(text));
 }
 
+static void vm_reset(void);
+
 static void unserve(void) {
     for (int i = 0; i < n_files; i++) {
         free(files[i].data);
@@ -323,11 +330,13 @@ static void unserve(void) {
     reads[0] = '\0';
     n_reads = 0;
     fail_path = fail_why = NULL;
+    vm_reset();
 }
 
 static bool fake_read(void *ctx, const char *rel, size_t max, int64_t deadline_us, uint8_t **data, size_t *len,
-                      char *err, size_t err_len) {
+                      const char **code, char *err, size_t err_len) {
     CHECK(ctx == (void *)&files, "the source's ctx");
+    CHECK(code != NULL && *code == NULL, "the pipeline asks for a code, and has none yet");
     size_t used = strlen(reads);
     snprintf(reads + used, sizeof reads - used, "%s ", rel);
     if (n_reads < (int)ARRAY_LEN(read_max)) {
@@ -358,6 +367,100 @@ static bool fake_read(void *ctx, const char *rel, size_t max, int64_t deadline_u
 
 static const apps_source_t SOURCE = {fake_read, &files, "usb"};
 
+/* ---- The VM (Task 22): muse_apps_vm_ops_t over the same table ---- */
+
+#define VM_DIR "workspace/apps/"
+
+static char vm_paths[4096]; /* the paths the VM was asked for, in order, each followed by ' ' */
+static size_t vm_max[64];
+static int64_t vm_deadline[64];
+static int n_vm_reads;
+static int vm_step_ms;             /* each read moves the clock this far, before it hands anything over */
+static size_t vm_piece = 1000;     /* the bytes of each piece the sink gets */
+static const char *vm_fail_rel;    /* a read of this file fails, once vm_fail_after bytes of it went to the sink, */
+static size_t vm_fail_after;
+static int vm_fail_ms;             /* after the clock moves this far (a deadline that passes partway through a file), */
+static const char *vm_fail_code;   /* with this code (MUSE_APPS_VM_*) */
+static const char *vm_fail_why;    /* and these words */
+static bool vm_ignore_max;         /* the whole file goes to the sink whatever max is, as a careless reader would do */
+
+static bool fake_vm_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                         int64_t deadline_us, const char **code, char *err, size_t err_len) {
+    CHECK(path != NULL && sink != NULL && code != NULL && err != NULL && err_len > 0, "a read with all its arguments");
+    size_t used = strlen(vm_paths);
+    snprintf(vm_paths + used, sizeof vm_paths - used, "%s ", path);
+    if (n_vm_reads < (int)ARRAY_LEN(vm_max)) {
+        vm_max[n_vm_reads] = max;
+        vm_deadline[n_vm_reads] = deadline_us;
+    }
+    n_vm_reads++;
+    fake_ms += vm_step_ms;
+    /* Only the app's own folder: workspace/apps/<id>/<rel>. */
+    CHECK(strncmp(path, VM_DIR, strlen(VM_DIR)) == 0 && strchr(path + strlen(VM_DIR), '/') != NULL, "a path in an app's folder: %s",
+          path);
+    const char *rel = strchr(path + strlen(VM_DIR), '/') + 1;
+    size_t len = 0;
+    const uint8_t *data = NULL;
+    for (int i = 0; i < n_files; i++) {
+        if (strcmp(files[i].path, rel) == 0) {
+            data = files[i].data;
+            len = files[i].len;
+        }
+    }
+    bool fails = vm_fail_rel != NULL && strcmp(rel, vm_fail_rel) == 0;
+    if (data == NULL && !fails) {
+        *code = MUSE_APPS_VM_FAILED;
+        snprintf(err, err_len, "VM answered HTTP 404");
+        return false;
+    }
+    size_t at = 0, end = fails && vm_fail_after < len ? vm_fail_after : len;
+    while (at < end) {
+        size_t n = end - at < vm_piece ? end - at : vm_piece;
+        if (!vm_ignore_max && at + n > max) {  /* vm_file_read_all's check, before the sink sees the piece */
+            *code = MUSE_APPS_VM_TOO_LARGE;
+            snprintf(err, err_len, "larger than %zu bytes", max);
+            return false;
+        }
+        if (!sink(user, data + at, n)) {
+            *code = MUSE_APPS_VM_FAILED;  /* vm_file says a sink's stop as "larger than <max> bytes" */
+            snprintf(err, err_len, "larger than %zu bytes", max);
+            return false;
+        }
+        at += n;
+    }
+    if (fails) {
+        fake_ms += vm_fail_ms;
+        *code = vm_fail_code;
+        snprintf(err, err_len, "%s", vm_fail_why);
+        return false;
+    }
+    return true;
+}
+
+static bool fake_vm_write(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
+                          size_t err_len) {
+    (void)path;
+    (void)data;
+    (void)len;
+    (void)deadline_us;
+    *code = MUSE_APPS_VM_FAILED;
+    snprintf(err, err_len, "an install never writes");
+    fail_at(__LINE__, "an install wrote to the VM");
+}
+
+static const muse_apps_vm_ops_t VM = {fake_vm_read, fake_vm_write};
+
+static void vm_reset(void) {
+    vm_paths[0] = '\0';
+    n_vm_reads = 0;
+    vm_step_ms = 0;
+    vm_piece = 1000;
+    vm_fail_rel = vm_fail_code = vm_fail_why = NULL;
+    vm_fail_after = 0;
+    vm_fail_ms = 0;
+    vm_ignore_max = false;
+}
+
 /* ---- The ops ---- */
 
 static int compiles, commits, runs, run_settle;
@@ -374,6 +477,8 @@ static bool fake_compile(const apps_pkg_t *pkg, char *err, size_t n) {
     compiles++;
     compiled_paths[0] = '\0';
     for (int i = 0; i < pkg->count; i++) {
+        CHECK(pkg->files[i].data != NULL, "%s has no block (a source never gives NULL: an empty file is a block of one byte)",
+              pkg->files[i].path);
         size_t used = strlen(compiled_paths);
         snprintf(compiled_paths + used, sizeof compiled_paths - used, "%s ", pkg->files[i].path);
     }
@@ -454,6 +559,11 @@ static const char *show(cJSON *r) {
 
 static const char *install(const char *id, bool run) {
     return show(apps_install_run(id, run, &SOURCE, &OPS));
+}
+
+/* An install from the VM (Task 22's app.install), as the I/O worker's job runs it. */
+static const char *vm_install(const char *id, bool run) {
+    return show(apps_install_from_vm(id, run, &VM, &OPS));
 }
 
 /* The result failed with code and exactly message. */
@@ -955,6 +1065,259 @@ static void deadline_is_one_absolute_time(void) {
     }
 }
 
+/* ---- Installs from the VM (Task 22's app.install) ---- */
+
+/* A Lua file of exactly n bytes (n >= 3): one comment line. */
+static void serve_lua(const char *path, size_t n) {
+    char *text = malloc(n);
+    CHECK(text != NULL, "no memory");
+    memset(text, 'x', n);
+    text[0] = text[1] = '-';
+    text[n - 1] = '\n';
+    serve(path, text, n);
+    free(text);
+}
+
+/* D9: the paths are made on the gadget, "workspace/apps/" + id + "/" + a path the manifest's parse passed (app.install never takes
+ * one), manifest.json first and then the package's files, main first, each with its kind's limit. Each file read is logged with its
+ * bytes and its time, and the install once, with how it ended, the files read and its time (D10). */
+static void vm_paths_built_on_device(void) {
+    static const char TIMER[] = "{\"id\":\"timer\",\"name\":\"Timer\",\"version\":\"1.0.0\",\"api\":1,\"files\":[]}";
+    serve_text("manifest.json", TIMER);
+    serve_text("main.lua", MAIN);
+    vm_step_ms = 7;
+    int from = n_logged;
+    const char *got = vm_install("timer", false);
+    static const char HEAD[] = "{\"ok\":true,\"payload\":{\"id\":\"timer\",\"version\":\"1.0.0\",\"storage\":\"ram\",";
+    CHECK(strncmp(got, HEAD, strlen(HEAD)) == 0, "%s", got);
+    CHECK(strcmp(vm_paths, "workspace/apps/timer/manifest.json workspace/apps/timer/main.lua ") == 0, "the VM was asked for %s",
+          vm_paths);
+    CHECK(n_vm_reads == 2 && vm_max[0] == APPS_MANIFEST_MAX && vm_max[1] == apps_file_max(APPS_FILE_LUA), "limits %zu %zu",
+          vm_max[0], vm_max[1]);
+    CHECK(n_reads == 0, "the USB source isn't asked");
+    CHECK(compiles == 1 && commits == 1 && runs == 0, "compiled and kept, not run");
+    char line[200];
+    snprintf(line, sizeof line, "I muse_apps: install timer from vm: manifest.json %zu bytes in 7 ms", strlen(TIMER));
+    CHECK(logged_count(from, line) == 1, "no line\n%s", line);
+    snprintf(line, sizeof line, "I muse_apps: install timer from vm: main.lua %zu bytes in 7 ms", strlen(MAIN));
+    CHECK(logged_count(from, line) == 1, "no line\n%s", line);
+    CHECK(logged_count(from, "I muse_apps: install timer from vm done: ok (2 files, 14 ms)") == 1, "no summary line");
+    CHECK(n_logged == from + 3, "three lines: %d", n_logged - from);
+
+    /* Another main, files in folders, each kind: in the manifest's order after main, under the app's own folder. */
+    unserve();
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"main\":\"app.lua\",\"files\":[\"lib/util.lua\","
+                                "\"data.json\",\"img/logo.bin\"]}");
+    serve_text("app.lua", MAIN);
+    serve_text("lib/util.lua", "return {}\n");
+    serve_text("data.json", "[1]");
+    serve_image("img/logo.bin", 4, 4, false);
+    from = n_logged;
+    got = vm_install("hello", true);
+    CHECK(strncmp(got, "{\"ok\":true,", 11) == 0 && runs == 1, "%s", got);
+    CHECK(strcmp(vm_paths, "workspace/apps/hello/manifest.json workspace/apps/hello/app.lua workspace/apps/hello/lib/util.lua "
+                           "workspace/apps/hello/data.json workspace/apps/hello/img/logo.bin ") == 0,
+          "the VM was asked for %s", vm_paths);
+    CHECK(vm_max[2] == apps_file_max(APPS_FILE_LUA) && vm_max[3] == apps_file_max(APPS_FILE_JSON) &&
+              vm_max[4] == apps_file_max(APPS_FILE_IMAGE),
+          "limits %zu %zu %zu", vm_max[2], vm_max[3], vm_max[4]);
+    CHECK(logged_count(from, "I muse_apps: install hello from vm done: ok (5 files, 0 ms)") == 1, "no summary line");
+
+    /* Not an app id: nothing is asked of the VM, and the id is shown as typed text is in the line. */
+    from = n_logged;
+    EXPECT_FAILURE(vm_install("Timer\x01", true), APPS_ERR_INVALID_PARAMS, "app id 'Timer?' must match ^[a-z][a-z0-9_]{1,23}$");
+    CHECK(n_vm_reads == 5, "nothing more asked of the VM: %d", n_vm_reads);
+    CHECK(logged_count(from, "W muse_apps: install Timer? from vm done: failed (0 files, 0 ms)") == 1, "no summary line");
+
+    /* No VM to read: unavailable, and nothing else is tried. */
+    static const muse_apps_vm_ops_t NO_READ = {NULL, fake_vm_write};
+    EXPECT_FAILURE(show(apps_install_from_vm("hello", true, NULL, &OPS)), APPS_ERR_UNAVAILABLE, "the gadget can't read files on the VM");
+    EXPECT_FAILURE(show(apps_install_from_vm("hello", true, &NO_READ, &OPS)), APPS_ERR_UNAVAILABLE,
+                   "the gadget can't read files on the VM");
+    CHECK(n_vm_reads == 5 && compiles == 2, "nothing tried");
+}
+
+/* D3, E24: one absolute deadline, APPS_INSTALL_DEADLINE_MS from the install's start, passed to every read. A file whose read would
+ * start at it or after isn't asked for; a read the deadline ends partway (the reader says it timed out, or anything else once it has
+ * passed) ends the install. Either way nothing is compiled, kept or run. */
+static void deadline(void) {
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"a.lua\",\"b.lua\"]}");
+    serve_text("main.lua", MAIN);
+    serve_text("a.lua", "return 1\n");
+    serve_text("b.lua", "return 2\n");
+    fake_ms = 7000;
+    vm_step_ms = 30000; /* each read takes 30 s of the clock */
+    int from = n_logged;
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_READ_FAILED, "install timed out after 90 s (reading b.lua)");
+    CHECK(n_vm_reads == 3, "b.lua, due at the deadline, isn't asked for: %s", vm_paths);
+    for (int i = 0; i < 3; i++) {
+        CHECK(vm_deadline[i] == (int64_t)(7000 + APPS_INSTALL_DEADLINE_MS) * 1000, "read %d's deadline: %lld", i,
+              (long long)vm_deadline[i]);
+    }
+    CHECK(compiles == 0 && commits == 0 && runs == 0, "nothing compiled, kept or run");
+    CHECK(logged_count(from, "W muse_apps: install hello from vm done: failed (3 files, 90000 ms)") == 1, "no summary line");
+
+    /* The deadline passes partway through main.lua, 2,000 of its 5,000 bytes in. */
+    unserve();
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1}");
+    serve_lua("main.lua", 5000);
+    fake_ms = 7000;
+    vm_fail_rel = "main.lua";
+    vm_fail_after = 2000;
+    vm_fail_ms = 91000;
+    vm_fail_code = MUSE_APPS_VM_TIMED_OUT;
+    vm_fail_why = "download timed out";
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_READ_FAILED, "install timed out after 90 s (reading main.lua)");
+    CHECK(vm_deadline[1] == (int64_t)(7000 + APPS_INSTALL_DEADLINE_MS) * 1000, "main.lua's deadline: %lld",
+          (long long)vm_deadline[1]);
+    /* Past the deadline, whatever the reader says (a request it couldn't send then), it is the install's time that ran out. */
+    fake_ms = 7000;
+    vm_fail_code = MUSE_APPS_VM_FAILED;
+    vm_fail_why = "could not send the request to the VM";
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_READ_FAILED, "install timed out after 90 s (reading main.lua)");
+    /* Before it, the reader's words stand; but a reader that says its deadline came is the install's timeout, whatever this clock
+     * says (the reader's clock is the one that decided). */
+    fake_ms = 7000;
+    vm_fail_ms = 1000;
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_READ_FAILED, "reading main.lua: could not send the request to the VM");
+    fake_ms = 7000;
+    vm_fail_code = MUSE_APPS_VM_TIMED_OUT;
+    vm_fail_why = "download timed out";
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_READ_FAILED, "install timed out after 90 s (reading main.lua)");
+    CHECK(compiles == 0 && commits == 0 && runs == 0, "nothing compiled, kept or run");
+}
+
+/* A session that drops mid-install, before the commit: the read in flight fails with the reader's words, whether it had begun to
+ * come or not, and nothing is compiled, kept or run, or held. The same install goes through once the session is back. */
+static void session_drop_commits_nothing(void) {
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"lib.lua\"]}");
+    serve_text("main.lua", MAIN);
+    serve_lua("lib.lua", 5000);
+    vm_fail_code = MUSE_APPS_VM_FAILED;
+    vm_fail_why = "the VM connection dropped";
+    static const char *const at[] = {"manifest.json", "main.lua", "lib.lua"};
+    for (int i = 0; i < 3; i++) {
+        vm_fail_rel = at[i];
+        vm_fail_after = i == 2 ? 3000 : 0; /* lib.lua drops 3,000 bytes in */
+        char want[100];
+        snprintf(want, sizeof want, "reading %s: the VM connection dropped", at[i]);
+        EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_READ_FAILED, want);
+        CHECK(compiles == 0 && commits == 0 && runs == 0, "a drop at %s: nothing compiled, kept or run", at[i]);
+        CHECK(port_held == 0, "a drop at %s: %zu bytes still held", at[i], port_held);
+    }
+    vm_fail_rel = NULL;
+    const char *got = vm_install("hello", true);
+    CHECK(strncmp(got, "{\"ok\":true,", 11) == 0 && compiles == 1 && commits == 1 && runs == 1, "%s", got);
+}
+
+/* The store already had the package (byte for byte): it is read and handed over all the same, and the result says so, with or
+ * without run (a run runs it again), on flash and in RAM (with the store's hint). A USB install says it the same way. */
+static void unchanged(void) {
+    serve_hello();
+    commit_unchanged = true;
+    storage_name = "flash";
+    const char *got = vm_install("hello", false);
+    CHECK(strstr(got, "\"state\":\"installed\"") != NULL && strstr(got, "\"peak_kb\":0,\"unchanged\":true}}") != NULL, "%s", got);
+    got = vm_install("hello", true);
+    CHECK(strstr(got, "\"state\":\"running\"") != NULL && strstr(got, "\"peak_kb\":24,\"unchanged\":true}}") != NULL, "%s", got);
+    CHECK(commits == 2 && runs == 1 && n_vm_reads == 4, "read and handed over each time: %d commits, %d reads", commits, n_vm_reads);
+    got = install("hello", true);
+    CHECK(strstr(got, "\"peak_kb\":24,\"unchanged\":true}}") != NULL, "%s", got);
+    storage_name = "ram";
+    got = vm_install("hello", true);
+    CHECK(strstr(got, "\"peak_kb\":24,\"unchanged\":true" HINT "}}") != NULL, "%s", got);
+    commit_unchanged = false;
+    got = vm_install("hello", true);
+    CHECK(strstr(got, "unchanged") == NULL && strstr(got, "\"peak_kb\":24" HINT "}}") != NULL, "%s", got);
+}
+
+/* What else the VM's reads can say. A reader someone else has (a display.draw_file) is busy, in the reader's own words, at the first
+ * file or a later one; no memory for the reader is out_of_memory; a file over its kind's limit, which the reader stops at (or a
+ * careless reader hands over whole, which the install stops at), is the pipeline's own refusal, without the install ever holding more
+ * than the limit of it; a file the manifest lists that isn't on the VM is the VM's answer. Nothing is kept for any. An empty file is
+ * a file. */
+static void vm_refusals(void) {
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"lib.lua\"]}");
+    serve_text("main.lua", MAIN);
+    serve_text("lib.lua", "return {}\n");
+    vm_fail_code = MUSE_APPS_VM_BUSY;
+    vm_fail_why = "the VM file reader is busy (an image download)";
+    vm_fail_rel = "manifest.json";
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_BUSY, "the VM file reader is busy (an image download)");
+    vm_fail_rel = "lib.lua";
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_BUSY, "the VM file reader is busy (an image download)");
+    vm_fail_code = MUSE_APPS_VM_OUT_OF_MEMORY;
+    vm_fail_why = "the gadget is short of memory for the VM reader right now; try again in a few seconds";
+    vm_fail_rel = "manifest.json";
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_OUT_OF_MEMORY,
+                   "reading manifest.json: the gadget is short of memory for the VM reader right now; try again in a few seconds");
+    vm_fail_rel = NULL;
+    CHECK(compiles == 0 && commits == 0, "nothing compiled or kept");
+
+    unserve();
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1}");
+    serve_lua("main.lua", 256 * KB + 1);
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_INVALID_PACKAGE, "main.lua is larger than 256 KB");
+    /* A careless reader hands over a 600 KB main.lua whole: the install keeps no more than the limit of it. */
+    unserve();
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1}");
+    serve_lua("main.lua", 600 * KB);
+    vm_ignore_max = true;
+    port_peak = port_held;
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_INVALID_PACKAGE, "main.lua is larger than 256 KB");
+    CHECK(port_peak <= 256 * KB + 64 * KB, "the install held %zu bytes for a file of 600 KB", port_peak);
+    unserve();
+    serve_lua("manifest.json", APPS_MANIFEST_MAX + 1);
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_INVALID_PACKAGE, "manifest.json is larger than 8 KB");
+    vm_ignore_max = false;
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_INVALID_PACKAGE, "manifest.json is larger than 8 KB");
+    CHECK(compiles == 0 && commits == 0, "nothing compiled or kept");
+
+    unserve();
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"empty.lua\",\"lib.lua\"]}");
+    serve_text("main.lua", MAIN);
+    serve_text("empty.lua", "");
+    EXPECT_FAILURE(vm_install("hello", true), APPS_ERR_READ_FAILED, "reading lib.lua: VM answered HTTP 404");
+    CHECK(compiles == 0 && commits == 0, "nothing compiled or kept");
+    serve_text("lib.lua", "return {}\n");
+    const char *got = vm_install("hello", false);
+    CHECK(strstr(got, "{\"path\":\"empty.lua\",\"bytes\":0,\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}") !=
+              NULL,
+          "%s", got);
+}
+
+/* Every block an install from the VM asks the port for, refused in turn (the source's and the sink's among them): a result that
+ * prints in APPS_RESULT_MAX bytes or none, and nothing held after. */
+static void vm_out_of_memory(void) {
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"lib.lua\"]}");
+    serve_text("main.lua", MAIN);
+    serve_lua("lib.lua", 3500);
+    port_growths = 0;
+    cJSON *r = apps_install_from_vm("hello", true, &VM, &OPS);
+    CHECK(r != NULL && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok")), "the install without refusals");
+    cJSON_Delete(r);
+    long total = port_growths;
+    CHECK(total > 8, "%ld growth requests", total);
+    int sink_refused = 0;
+    for (long k = 0; k < total; k++) {
+        port_refuse = k;
+        r = apps_install_from_vm("hello", true, &VM, &OPS);
+        port_refuse = -1;
+        if (r != NULL) {
+            char *text = cJSON_PrintUnformatted(r);
+            CHECK(text != NULL && strlen(text) <= APPS_RESULT_MAX, "refusal %ld: %zu bytes", k, text ? strlen(text) : 0);
+            sink_refused += strstr(text, "\"message\":\"reading lib.lua: out of memory\"") != NULL;
+            printf("@result %s\n", text);
+            cJSON_free(text);
+            cJSON_Delete(r);
+        }
+        CHECK(port_held == 0, "port refusal %ld: %zu bytes held", k, port_held);
+        CHECK(cjson_held == 0, "port refusal %ld: %zu bytes of cJSON held", k, cjson_held);
+    }
+    CHECK(sink_refused >= 4, "lib.lua's pieces refused in turn say so: %d", sink_refused);
+    fflush(stdout);
+}
+
 /* A package for the store, as an install builds it: every block from apps_port_realloc. */
 static apps_pkg_t *make_pkg(const char *id, const char *name, const char *main_src) {
     apps_pkg_t *p = apps_port_realloc(NULL, sizeof *p);
@@ -1374,11 +1737,11 @@ static void out_of_memory(void) {
 #define WORKER_STACK 6144
 
 static cJSON *stack_result;
-static bool stack_run;
+static bool stack_run, stack_vm;
 
 static void install_on_the_stack(void *arg) {
     (void)arg;
-    stack_result = apps_install_run("hello", stack_run, &SOURCE, &OPS);
+    stack_result = stack_vm ? apps_install_from_vm("hello", stack_run, &VM, &OPS) : apps_install_run("hello", stack_run, &SOURCE, &OPS);
 }
 
 static size_t on_worker_stack(const char *what, bool run) {
@@ -1410,6 +1773,13 @@ static void install_stack(void) {
     compile_raw = "main.lua:2: unexpected symbol near '='";
     on_worker_stack("compile", false);
     CHECK(strstr(last, "compile failed: main.lua:2:") != NULL, "%.200s", last);
+    /* Task 22: the same success, its files read from the VM through the sink. */
+    compile_raw = NULL;
+    run_ok = true;
+    run_record.state = APPS_STATE_RUNNING;
+    stack_vm = true;
+    on_worker_stack("vm", true);
+    CHECK(strncmp(last, "{\"ok\":true,", 11) == 0, "%.200s", last);
 }
 
 int main(int argc, char **argv) {
@@ -1431,6 +1801,12 @@ int main(int argc, char **argv) {
         {"read_and_commit_failures", read_and_commit_failures},
         {"a_result_says_the_stores_hint", a_result_says_the_stores_hint},
         {"deadline_is_one_absolute_time", deadline_is_one_absolute_time},
+        {"vm_paths_built_on_device", vm_paths_built_on_device},
+        {"deadline", deadline},
+        {"session_drop_commits_nothing", session_drop_commits_nothing},
+        {"unchanged", unchanged},
+        {"vm_refusals", vm_refusals},
+        {"vm_out_of_memory", vm_out_of_memory},
         {"ram_store", ram_store},
         {"ram_budget", ram_budget},
         {"results_are_utf8", results_are_utf8},

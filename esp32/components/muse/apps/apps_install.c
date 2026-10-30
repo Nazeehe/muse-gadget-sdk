@@ -26,6 +26,7 @@
 #include "apps_json.h"
 #include "apps_port.h"
 #include "esp_log.h"
+#include "muse_apps.h"
 #include "sdkconfig.h"
 
 /*
@@ -43,6 +44,9 @@
  * (a status) the end of last_error. Each round drops at least what its excess costs, as cJSON prints it, so it takes a
  * round or two, and at least one item a round, so it ends.
  *
+ * The VM's files (Task 22). An install from the VM is the same pipeline over a source that reads each file through the VM's
+ * ops into a block that grows as the file comes, from a path it makes itself: the install's own state, on the heap.
+ *
  * The RAM store. Its packages are kept most recent first (a commit or a load moves one to the front), and every change
  * gives the launcher the new list (apps_task_set_list). A copy, at a commit or a load, leaves free PSRAM for the app's
  * heap and APPS_RAM_RESERVE: short of that, the oldest packages go one at a time, looking again after each, never the
@@ -54,6 +58,7 @@
 #define CRASH_LINES 10   /* the log lines a crash's message shows */
 
 #define MSG_NO_MEMORY "out of memory: no room for the install"
+#define MSG_TOO_LARGE "%s is larger than %u KB"  /* a file over its kind's limit, whichever source read it */
 
 static const char *TAG = "muse_apps";
 
@@ -688,8 +693,8 @@ static cJSON *success(const install_t *in, const apps_install_ops_t *ops, const 
     return r != NULL ? r : failure(APPS_ERR_OUT_OF_MEMORY, "out of memory: no room for the result");
 }
 
-/* Step 6 and the result: ops->run takes in->pkg. */
-static cJSON *run_pkg(install_t *in, const apps_install_ops_t *ops, const char *prefix) {
+/* Step 6 and the result: ops->run takes in->pkg. unchanged is the store's word on the package (an install's). */
+static cJSON *run_pkg(install_t *in, const apps_install_ops_t *ops, const char *prefix, bool unchanged) {
     apps_status_t *st = apps_port_realloc(NULL, sizeof *st);
     if (st == NULL) {
         free_pkg(in->pkg);
@@ -703,7 +708,7 @@ static cJSON *run_pkg(install_t *in, const apps_install_ops_t *ops, const char *
     in->pkg = NULL;
     in->raw[0] = '\0';
     bool ran = ops->run(pkg, APPS_SETTLE_MS, st, in->raw, sizeof in->raw);
-    cJSON *r = ran ? success(in, ops, st, false) : run_failure(in, st, prefix);
+    cJSON *r = ran ? success(in, ops, st, unchanged) : run_failure(in, st, prefix);
     apps_port_free(st);
     return r;
 }
@@ -714,12 +719,13 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
     apps_pkg_t *pkg = in->pkg;
     uint8_t *data = NULL;
     size_t len = 0;
-    if (!src->read(src->ctx, "manifest.json", APPS_MANIFEST_MAX, deadline_us, &data, &len, in->raw, sizeof in->raw)) {
-        return failure(APPS_ERR_READ_FAILED, in->raw);
+    const char *code = NULL;
+    if (!src->read(src->ctx, "manifest.json", APPS_MANIFEST_MAX, deadline_us, &data, &len, &code, in->raw, sizeof in->raw)) {
+        return failure(code != NULL ? code : APPS_ERR_READ_FAILED, in->raw);
     }
     if (len > APPS_MANIFEST_MAX) {
         apps_port_free(data);
-        return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE, "manifest.json is larger than %u KB",
+        return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE, MSG_TOO_LARGE, "manifest.json",
                         (unsigned)(APPS_MANIFEST_MAX / 1024));
     }
     bool ok = apps_manifest_parse((const char *)data, len, id, CONFIG_MUSE_APPS_HEAP_MAX_KB, &pkg->manifest, in->raw,
@@ -742,16 +748,16 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
         }
         apps_file_kind_t kind = apps_file_kind(rel);
         size_t max = apps_file_max(kind);  /* the manifest's parse checked the type: never 0 */
-        if (!src->read(src->ctx, rel, max, deadline_us, &data, &len, in->raw, sizeof in->raw)) {
-            return failure(APPS_ERR_READ_FAILED, in->raw);
+        code = NULL;
+        if (!src->read(src->ctx, rel, max, deadline_us, &data, &len, &code, in->raw, sizeof in->raw)) {
+            return failure(code != NULL ? code : APPS_ERR_READ_FAILED, in->raw);
         }
         apps_blob_t *b = &pkg->files[pkg->count++];  /* the package's from here: apps_pkg_free frees it */
         put_text(b->path, sizeof b->path, rel);
         b->data = data;
         b->len = len;
         if (len > max) {
-            return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE, "%s is larger than %u KB", rel,
-                            (unsigned)(max / 1024));
+            return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE, MSG_TOO_LARGE, rel, (unsigned)(max / 1024));
         }
         app_bytes += len;
         if (app_bytes > APPS_APP_MAX) {
@@ -788,7 +794,7 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
     pkg->manifest_json = NULL;
     pkg->manifest_len = 0;
     keep_infos(in, pkg);
-    return run ? run_pkg(in, ops, "installed but ") : success(in, ops, NULL, unchanged);
+    return run ? run_pkg(in, ops, "installed but ", unchanged) : success(in, ops, NULL, unchanged);
 }
 
 cJSON *apps_install_run(const char *id, bool run, const apps_source_t *src, const apps_install_ops_t *ops) {
@@ -822,8 +828,134 @@ cJSON *apps_install_launch(apps_pkg_t *pkg, const apps_install_ops_t *ops) {
     memset(in, 0, sizeof *in);
     keep_infos(in, pkg);
     in->pkg = pkg;
-    cJSON *r = run_pkg(in, ops, "");
+    cJSON *r = run_pkg(in, ops, "", false);
     apps_port_free(in);
+    return r;
+}
+
+/* ---- The VM's files (Task 22) ---- */
+
+/* An install from the VM: its source's state, on the heap (the worker's stack is small). */
+typedef struct {
+    const struct muse_apps_vm_ops *vm;
+    char id[APPS_ID_MAX + 1];
+    char path[sizeof APPS_VM_DIR + APPS_ID_MAX + 1 + APPS_PATH_MAX + 1];  /* workspace/apps/<id>/<rel> */
+    char why[RAW_MAX];   /* what the reader said */
+    unsigned files;      /* the files read whole */
+    /* the file being read: */
+    uint8_t *data;       /* len bytes of apps_port_realloc, NULL for none yet */
+    size_t len, max;
+    bool over, no_memory;
+} vm_source_t;
+
+/* The reader's sink: each piece goes on the end of the file's block, which grows to hold it; a piece that would take the file
+ * past its limit stops the read, and so does no memory for the block. */
+static bool vm_sink(void *user, const uint8_t *d, size_t n) {
+    vm_source_t *vs = user;
+    if (n == 0) {
+        return true;
+    }
+    if (n > vs->max - vs->len) {
+        vs->over = true;
+        return false;
+    }
+    uint8_t *grown = apps_port_realloc(vs->data, vs->len + n);
+    if (grown == NULL) {
+        vs->no_memory = true;
+        return false;
+    }
+    memcpy(grown + vs->len, d, n);
+    vs->data = grown;
+    vs->len += n;
+    return true;
+}
+
+/* The deadline has come (the reader's own check is the same: now >= deadline). */
+static bool vm_past(int64_t deadline_us) {
+    return apps_port_mono_ms() * 1000 >= deadline_us;
+}
+
+/* The source's read (apps_install.h): rel of the app's folder on the VM, through vm->read. */
+static bool vm_read(void *ctx, const char *rel, size_t max, int64_t deadline_us, uint8_t **data, size_t *len,
+                    const char **code, char *err, size_t err_len) {
+    vm_source_t *vs = ctx;
+    if (vm_past(deadline_us)) {
+        snprintf(err, err_len, "install timed out after %u s (reading %s)", (unsigned)(APPS_INSTALL_DEADLINE_MS / 1000), rel);
+        return false;
+    }
+    snprintf(vs->path, sizeof vs->path, "%s%s/%s", APPS_VM_DIR, vs->id, rel);  /* a valid id and path: always fits */
+    vs->data = NULL;
+    vs->len = 0;
+    vs->max = max;
+    vs->over = vs->no_memory = false;
+    vs->why[0] = '\0';
+    const char *why_code = MUSE_APPS_VM_FAILED;
+    int64_t started = apps_port_mono_ms();
+    bool ok = vs->vm->read(vs->path, max, vm_sink, vs, deadline_us, &why_code, vs->why, sizeof vs->why);
+    if (ok && vs->data == NULL) {
+        vs->data = apps_port_realloc(NULL, 1);  /* an empty file is a block of one byte */
+        vs->no_memory = vs->data == NULL;
+        ok = !vs->no_memory;
+    }
+    if (!ok) {
+        apps_port_free(vs->data);
+        vs->data = NULL;
+        why_code = why_code != NULL ? why_code : MUSE_APPS_VM_FAILED;
+        if (vs->over || strcmp(why_code, MUSE_APPS_VM_TOO_LARGE) == 0) {
+            *code = APPS_ERR_INVALID_PACKAGE;
+            snprintf(err, err_len, MSG_TOO_LARGE, rel, (unsigned)(max / 1024));
+        } else if (vs->no_memory) {
+            *code = APPS_ERR_OUT_OF_MEMORY;
+            snprintf(err, err_len, "reading %s: out of memory", rel);
+        } else if (strcmp(why_code, MUSE_APPS_VM_TIMED_OUT) == 0 || vm_past(deadline_us)) {
+            snprintf(err, err_len, "install timed out after %u s (reading %s)", (unsigned)(APPS_INSTALL_DEADLINE_MS / 1000), rel);
+        } else if (strcmp(why_code, MUSE_APPS_VM_BUSY) == 0) {
+            *code = APPS_ERR_BUSY;  /* in the reader's words, which say who has it */
+            snprintf(err, err_len, "%s", vs->why);
+        } else {
+            *code = strcmp(why_code, MUSE_APPS_VM_OUT_OF_MEMORY) == 0 ? APPS_ERR_OUT_OF_MEMORY : NULL;
+            snprintf(err, err_len, "reading %s: %s", rel, vs->why);
+        }
+        return false;
+    }
+    vs->files++;
+    ESP_LOGI(TAG, "install %s from vm: %s %u bytes in %u ms", vs->id, rel, (unsigned)vs->len,
+             (unsigned)(apps_port_mono_ms() - started));
+    *data = vs->data;
+    *len = vs->len;
+    vs->data = NULL;
+    return true;
+}
+
+cJSON *apps_install_from_vm(const char *id, bool run, const struct muse_apps_vm_ops *vm, const apps_install_ops_t *ops) {
+    int64_t started = apps_port_mono_ms();
+    vm_source_t *vs = apps_port_realloc(NULL, sizeof *vs);
+    cJSON *r = NULL;
+    unsigned files = 0;
+    if (vm == NULL || vm->read == NULL) {
+        r = failure(APPS_ERR_UNAVAILABLE, "the gadget can't read files on the VM");
+    } else if (vs == NULL) {
+        r = failure(APPS_ERR_OUT_OF_MEMORY, MSG_NO_MEMORY);
+    } else {
+        memset(vs, 0, sizeof *vs);
+        vs->vm = vm;
+        if (id != NULL && apps_id_valid(id)) {
+            put_text(vs->id, sizeof vs->id, id);
+        }
+        apps_source_t src = {vm_read, vs, "vm"};
+        r = apps_install_run(id, run, &src, ops);  /* a bad id is refused before any read */
+        files = vs->files;
+    }
+    apps_port_free(vs);
+    char shown[APPS_SHOWN_MAX + 4];
+    const char *text = id != NULL ? id : "";
+    apps_text_shown(text, strlen(text), APPS_SHOWN_MAX, shown);
+    unsigned ms = (unsigned)(apps_port_mono_ms() - started);
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "ok"))) {
+        ESP_LOGI(TAG, "install %s from vm done: ok (%u files, %u ms)", shown, files, ms);
+    } else {
+        ESP_LOGW(TAG, "install %s from vm done: failed (%u files, %u ms)", shown, files, ms);
+    }
     return r;
 }
 

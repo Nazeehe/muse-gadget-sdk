@@ -100,6 +100,11 @@ if(CONFIG_MUSE_ENABLED)
     list(APPEND GADGET_SRCS "muse_glue.c")
 endif()
 
+# Muse's apps: the app.* Link commands (components/muse/muse_apps.h).
+if(CONFIG_MUSE_APPS)
+    list(APPEND GADGET_SRCS "apps_link.c")
+endif()
+
 if(CONFIG_HOMEHUB_LED_BACKEND_DEVKIT_GPIO27 OR CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING OR CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE)
     list(APPEND GADGET_REQUIRES led_strip)
 endif()

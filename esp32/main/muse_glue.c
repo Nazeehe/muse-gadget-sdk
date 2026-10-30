@@ -48,6 +48,9 @@
 #if CONFIG_MUSE_REALTIME_VOICE
 #include "muse_voice_call.h"
 #endif
+#if CONFIG_MUSE_APPS
+#include "apps_link.h"
+#endif
 
 static const char *TAG = "link.muse";
 
@@ -649,6 +652,9 @@ void muse_glue_start(void) {
     muse_input_power_init();
     s_ready = xEventGroupCreate();
     muse_link_register(&s_ops);
+#if CONFIG_MUSE_APPS
+    apps_link_init();  // the apps read Muse's VM through vm_file
+#endif
     muse_input_add_console_hook(sdk_token_console_command);
     muse_ble_set_name(identity_ble_name());
     ble_companion_t companion = {

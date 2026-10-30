@@ -52,6 +52,7 @@ extern "C" {
 }
 #endif
 #if CONFIG_MUSE_APPS
+#include "apps_link.h"
 #include "muse_apps.h"
 #endif
 }
@@ -1556,6 +1557,10 @@ static char *build_register_json(void) {
 
 #if CONFIG_HOMEHUB_BLE_COMMANDS
     ble_commands_register(commands);
+#endif
+#if CONFIG_MUSE_APPS
+    // Muse's apps: app.install (main/apps_link.c).
+    apps_link_register(commands);
 #endif
 
     cJSON_AddItemToObject(params, "commands_v2", commands);

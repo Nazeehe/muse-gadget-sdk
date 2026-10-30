@@ -49,6 +49,10 @@
  * runs the app where it was asked to, with no settle, by id (apps_task_run_by_id: an app of that id that runs by then
  * is fronted, not started again), and prints nothing. app.launch runs the store's copy afresh, as an install's run.
  *
+ * Link's app.install (muse_apps_install, Task 22) is a job of the same worker: the install from the VM (apps_install_from_vm)
+ * with the same ops as a commit, under the same hold (one install at a time, from the console or Link), its result handed to
+ * the caller's done, which owns it. The session's task only queues it.
+ *
  * Replies. Every one is one line: "@app.ack <path> <seq>", "@app {...}" or "@app.err {...}", the JSON made by cJSON
  * (texts travel escaped, tracebacks included) and written with one printf, so that no log line splits it, then
  * pushed out to the host (apps_port_console_flush: a line that ends on a 64-byte USB packet would otherwise wait for
@@ -378,9 +382,10 @@ static size_t grown_cap(stage_t *stage, const staged_t *f, size_t len, size_t ma
 /* The source of a commit's job (apps_install.h): a file's bytes leave the stage for the pipeline, fitted to their
  * length. */
 static bool stage_read(void *ctx, const char *rel, size_t max, int64_t deadline_us, uint8_t **data, size_t *len,
-                       char *err, size_t err_len) {
+                       const char **code, char *err, size_t err_len) {
     (void)max;
     (void)deadline_us;  /* the bytes are here already */
+    (void)code;         /* a read that fails is read_failed */
     staged_t *f = find_file(ctx, rel);
     if (f == NULL || (f->data == NULL && f->len > 0)) {
         snprintf(err, err_len, "reading %s: it wasn't sent (app.put)", rel);
@@ -529,13 +534,13 @@ static const char *store_storage(void) {
 }
 
 /* The store keeps the package (apps_store.h): on the apps partition, or in PSRAM on a gadget without one (or whose partition couldn't be
- * mounted), which results say with the store's hint. */
-static const apps_install_ops_t USB_OPS = {apps_task_compile, apps_store_commit, install_run, store_storage, apps_store_hint};
+ * mounted), which results say with the store's hint. A commit's, a launch's and Link's install's. */
+static const apps_install_ops_t INSTALL_OPS = {apps_task_compile, apps_store_commit, install_run, store_storage, apps_store_hint};
 
 static void commit_job(void *arg) {
     job_t *job = arg;
     apps_source_t src = {stage_read, job->stage, "usb"};
-    cJSON *r = apps_install_run(job->id, job->run, &src, &USB_OPS);
+    cJSON *r = apps_install_run(job->id, job->run, &src, &INSTALL_OPS);
     stage_free(job->stage);
     apps_install_end();  /* before the result: a commit sent once it is read isn't busy */
     print_result("commit", job->id, r);
@@ -616,7 +621,7 @@ static void launch_job(void *arg) {
     snprintf(job->why, sizeof job->why, "out of memory: no room to load the app");
     if (pkg != NULL && apps_store_load(job->id, pkg, job->why, sizeof job->why)) {
         if (job->print) {
-            cJSON *r = apps_install_launch(pkg, &USB_OPS);  /* it takes the copy: the app task frees it */
+            cJSON *r = apps_install_launch(pkg, &INSTALL_OPS);  /* it takes the copy: the app task frees it */
             print_result("launch", job->id, r);
             cJSON_Delete(r);
         } else if (job->alarm_upto != 0) {
@@ -703,6 +708,89 @@ bool muse_apps_launch(const char *id, bool front) {
 
 bool muse_apps_launch_alarm(const char *id, uint32_t upto) {
     return upto != 0 && queue_launch(id, true, upto);
+}
+
+/* ---- Link's app.install (Task 22) ---- */
+
+static _Atomic(const muse_apps_vm_ops_t *) s_vm_ops;  /* the VM's files (main/apps_link.c), or NULL */
+
+/* An install from the VM: what the job needs, in PSRAM. */
+typedef struct {
+    char id[APPS_ID_MAX + 1];
+    bool run;
+    const muse_apps_vm_ops_t *vm;
+    muse_apps_done_cb done;
+    void *ctx;
+} vm_job_t;
+
+void muse_apps_set_vm_ops(const muse_apps_vm_ops_t *ops) {
+    atomic_store(&s_vm_ops, ops);
+}
+
+bool muse_apps_id_valid(const char *id, char *err, size_t err_len) {
+    const char *text = id != NULL ? id : "";
+    if (apps_id_valid(text)) {
+        return true;
+    }
+    char shown[APPS_SHOWN_MAX + 4];
+    apps_text_shown(text, strlen(text), APPS_SHOWN_MAX, shown);
+    if (err != NULL && err_len > 0) {
+        snprintf(err, err_len, APPS_MSG_BAD_ID, shown);
+    }
+    return false;
+}
+
+/* The install, then the hold let go, then the result to its caller (so an install it asks for once it has read the result isn't
+ * busy). */
+static void vm_install_job(void *arg) {
+    vm_job_t *job = arg;
+    cJSON *r = apps_install_from_vm(job->id, job->run, job->vm, &INSTALL_OPS);
+    apps_install_end();
+    job->done(job->ctx, r);
+    apps_port_free(job);
+}
+
+bool muse_apps_install(const char *id, bool run, muse_apps_done_cb done, void *ctx, const char **code, const char **err) {
+    const char *unused;
+    code = code != NULL ? code : &unused;
+    err = err != NULL ? err : &unused;
+    const muse_apps_vm_ops_t *vm = atomic_load(&s_vm_ops);
+    if (id == NULL || !apps_id_valid(id) || done == NULL) {
+        *code = APPS_ERR_INVALID_PARAMS;
+        *err = done == NULL ? "no callback for the install's result" : "app id must match ^[a-z][a-z0-9_]{1,23}$";
+        return false;
+    }
+    if (vm == NULL || vm->read == NULL) {
+        *code = APPS_ERR_UNAVAILABLE;
+        *err = "the gadget can't read files on the VM";
+        return false;
+    }
+    if (!apps_install_try_begin()) {
+        *code = APPS_ERR_BUSY;
+        *err = APPS_INSTALL_BUSY;
+        return false;
+    }
+    vm_job_t *job = apps_port_realloc(NULL, sizeof *job);
+    if (job == NULL) {
+        apps_install_end();
+        *code = APPS_ERR_OUT_OF_MEMORY;
+        *err = "out of memory: no room for the install";
+        return false;
+    }
+    memset(job, 0, sizeof *job);
+    snprintf(job->id, sizeof job->id, "%s", id);
+    job->run = run;
+    job->vm = vm;
+    job->done = done;
+    job->ctx = ctx;
+    if (!apps_io_submit(vm_install_job, job)) {  /* it says why, in one log line */
+        apps_port_free(job);
+        apps_install_end();
+        *code = APPS_ERR_OUT_OF_MEMORY;
+        *err = APPS_IO_REFUSED;
+        return false;
+    }
+    return true;
 }
 
 static bool no_args(const char *op, const char *args) {

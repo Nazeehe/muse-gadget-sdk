@@ -83,6 +83,7 @@
 #include "muse_glue.h"
 #include "muse_input.h"
 #if CONFIG_MUSE_APPS
+#include "apps_link.h"
 #include "muse_apps.h"
 #endif
 // Muse joins Wi-Fi from its own settings, before or without pairing.
@@ -1870,6 +1871,12 @@ static cJSON *on_ws_command(
 #if CONFIG_HOMEHUB_BLE_COMMANDS
     if (ble_commands_handles(command)) {
         return ble_commands_handle(command, params, request_id, session_generation);
+    }
+#endif
+#if CONFIG_MUSE_APPS
+    // Muse's apps (main/apps_link.c): app.install.
+    if (apps_link_handles(command)) {
+        return apps_link_handle(command, params, request_id, session_generation);
     }
 #endif
     if (strcmp(command, "device.list_vms") == 0) {

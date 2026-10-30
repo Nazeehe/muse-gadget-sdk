@@ -1572,6 +1572,172 @@ static void a_repeated_commit_is_busy(void) {
     apps_install_end();
 }
 
+/* ---- Link's app.install (Task 22): muse_apps_install, its job and its refusals ---- */
+
+/* The VM's files: hello's two, as Muse would have written them to workspace/apps/hello/. */
+static int vm_reads;
+
+static bool fake_vm_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                         int64_t deadline_us, const char **code, char *err, size_t err_len) {
+    (void)max;
+    (void)deadline_us;
+    vm_reads++;
+    const char *text = strcmp(path, "workspace/apps/hello/manifest.json") == 0 ? MANIFEST_HELLO
+                       : strcmp(path, "workspace/apps/hello/main.lua") == 0    ? MAIN_HELLO
+                                                                               : NULL;
+    if (text == NULL) {
+        *code = MUSE_APPS_VM_FAILED;
+        snprintf(err, err_len, "VM answered HTTP 404");
+        return false;
+    }
+    return sink(user, (const uint8_t *)text, strlen(text));
+}
+
+static bool fake_vm_write(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
+                          size_t err_len) {
+    (void)path;
+    (void)data;
+    (void)len;
+    (void)deadline_us;
+    *code = MUSE_APPS_VM_FAILED;
+    snprintf(err, err_len, "an install never writes");
+    fail_at(__LINE__, "an install wrote to the VM");
+}
+
+static const muse_apps_vm_ops_t FAKE_VM = {fake_vm_read, fake_vm_write};
+
+/* The done callback: how often it ran, with what, and whether the install's hold was let go before it. */
+static int dones;
+static void *done_ctx;
+static cJSON *done_result;
+static bool done_held;
+
+static void on_done(void *ctx, cJSON *result) {
+    dones++;
+    done_ctx = ctx;
+    cJSON_Delete(done_result);
+    done_result = result;
+    done_held = !apps_install_try_begin();
+    if (!done_held) {
+        apps_install_end();
+    }
+}
+
+/* The result the callback was given: ok, and a string at payload.key or error.key. */
+static const char *done_text(const char *object, const char *key) {
+    return cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(done_result, object), key));
+}
+
+/* app.install's job: queued from the Noise session's task without waiting, run on the I/O worker as one job, which reads
+ * workspace/apps/<id>/ through the VM's ops, keeps the app (the RAM store) and runs it in front with the settle, lets the hold go,
+ * and calls done once with the result, which done owns. */
+static void a_link_install_is_one_job(void) {
+    muse_apps_set_vm_ops(&FAKE_VM);
+    int tag;
+    const char *code = NULL, *err = NULL;
+    CHECK(muse_apps_install("hello", true, on_done, &tag, &code, &err), "not queued: %s: %s", code, err);
+    CHECK(n_jobs == 1 && dones == 0 && vm_reads == 0, "one job, not run yet: %d jobs, %d dones", n_jobs, dones);
+    run_jobs();
+    CHECK(dones == 1 && done_ctx == &tag && vm_reads == 2, "done once, with its ctx: %d dones, %d reads", dones, vm_reads);
+    CHECK(!done_held, "the hold was let go before done");
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(done_result, "ok")), "not ok: %s", done_text("error", "message"));
+    CHECK(strcmp(done_text("payload", "id"), "hello") == 0 && strcmp(done_text("payload", "storage"), "ram") == 0 &&
+              strcmp(done_text("payload", "state"), "running") == 0 &&
+              strcmp(done_text("payload", "hint"), APPS_RAM_HINT) == 0,
+          "the payload");
+    CHECK(compiles == 1 && runs == 1 && run_front && run_settle == APPS_SETTLE_MS && strcmp(run_id, "hello") == 0,
+          "compiled, then run in front with the settle");
+    CHECK(apps_ram_has("hello"), "kept in the store");
+    CHECK(strstr(last_log, "install hello from vm done: ok (2 files, ") != NULL, "the last line: %s", last_log);
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    /* Without run: kept, not run. */
+    CHECK(muse_apps_install("hello", false, on_done, NULL, &code, &err), "not queued: %s: %s", code, err);
+    run_jobs();
+    CHECK(dones == 2 && runs == 1 && strcmp(done_text("payload", "state"), "installed") == 0, "installed, not run");
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    /* A file that isn't on the VM: the result says so, through done all the same. */
+    muse_apps_set_vm_ops(&FAKE_VM);
+    CHECK(muse_apps_install("nope", true, on_done, NULL, &code, &err), "not queued: %s: %s", code, err);
+    run_jobs();
+    CHECK(dones == 3 && strcmp(done_text("error", "code"), "read_failed") == 0 &&
+              strcmp(done_text("error", "message"), "reading manifest.json: VM answered HTTP 404") == 0,
+          "the failure");
+    CHECK(strstr(last_log, "install nope from vm done: failed (0 files, ") != NULL, "the last line: %s", last_log);
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    (void)take_output();  /* nothing: a Link install prints no reply on the console */
+}
+
+/* D14: one install at a time, whatever it comes from. A second app.install while one is queued or running is busy, at once; so is
+ * the console's commit while a Link install runs, and a Link install while a commit's job runs. Neither refusal touches the other's
+ * job, and once both are done an install is taken again. */
+static void a_second_install_is_busy(void) {
+    muse_apps_set_vm_ops(&FAKE_VM);
+    const char *code = NULL, *err = NULL;
+    CHECK(muse_apps_install("hello", true, on_done, NULL, &code, &err), "not queued: %s: %s", code, err);
+    code = err = NULL;
+    CHECK(!muse_apps_install("hello", true, on_done, NULL, &code, &err), "a second install was queued");
+    CHECK(code != NULL && strcmp(code, "busy") == 0 && err != NULL && strcmp(err, APPS_INSTALL_BUSY) == 0, "%s: %s", code, err);
+    stage_hello();
+    (void)take_output();
+    CHECK(line("app.commit hello run"), "commit");
+    EXPECT("@app.err {\"op\":\"commit\",\"id\":\"hello\",\"message\":\"busy: another install is running\"}\n");
+    CHECK(n_jobs == 1, "only the first install's job: %d", n_jobs);
+    run_jobs();
+    CHECK(dones == 1 && runs == 1, "the first install ran, once: %d dones, %d runs", dones, runs);
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    /* The console's commit (its stage is still there) waits for the worker: a Link install is busy meanwhile. */
+    CHECK(line("app.commit hello run"), "commit");
+    EXPECT("");
+    code = err = NULL;
+    CHECK(!muse_apps_install("hello", true, on_done, NULL, &code, &err), "an install was queued behind a commit");
+    CHECK(code != NULL && strcmp(code, "busy") == 0 && strcmp(err, APPS_INSTALL_BUSY) == 0, "%s: %s", code, err);
+    run_jobs();
+    EXPECT_LINE("@app {\"op\":\"commit\",\"ok\":true,\"payload\":{\"id\":\"hello\"", NULL);
+    CHECK(dones == 1 && runs == 2, "the commit ran, and no Link install: %d dones, %d runs", dones, runs);
+    CHECK(muse_apps_install("hello", false, on_done, NULL, &code, &err), "not taken after both: %s: %s", code, err);
+    run_jobs();
+    CHECK(dones == 2, "done: %d", dones);
+    cJSON_Delete(done_result);
+    done_result = NULL;
+}
+
+/* What muse_apps_install refuses, at once and with nothing queued, done never called and the hold let go: no VM ops (unavailable),
+ * not an app id or no done (invalid_params), no memory for the job or a worker that can't take it (out_of_memory). And the id's
+ * message the handler says, as an install says it. */
+static void link_install_refusals(void) {
+    const char *code = NULL, *err = NULL;
+    muse_apps_set_vm_ops(NULL);
+    CHECK(!muse_apps_install("hello", true, on_done, NULL, &code, &err) && strcmp(code, "unavailable") == 0, "no VM: %s: %s", code,
+          err);
+    muse_apps_set_vm_ops(&FAKE_VM);
+    CHECK(!muse_apps_install("Hello", true, on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "a bad id: %s", code);
+    CHECK(!muse_apps_install(NULL, true, on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "no id: %s", code);
+    CHECK(!muse_apps_install("hello", true, NULL, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "no done: %s", code);
+    submit_refuses = true;
+    CHECK(!muse_apps_install("hello", true, on_done, NULL, &code, &err) && strcmp(code, "out_of_memory") == 0 &&
+              strcmp(err, APPS_IO_REFUSED) == 0,
+          "the worker refused: %s: %s", code, err);
+    submit_refuses = false;
+    port_refuse = 0;
+    CHECK(!muse_apps_install("hello", true, on_done, NULL, &code, &err) && strcmp(code, "out_of_memory") == 0 &&
+              strcmp(err, "out of memory: no room for the install") == 0,
+          "no memory for the job: %s: %s", code, err);
+    port_refuse = -1;
+    CHECK(n_jobs == 0 && dones == 0 && vm_reads == 0, "nothing queued, done never called");
+    CHECK(apps_install_try_begin(), "the hold was let go");
+    apps_install_end();
+    char msg[160];
+    CHECK(muse_apps_id_valid("timer", msg, sizeof msg), "timer is an id");
+    CHECK(!muse_apps_id_valid("Timer\x01", msg, sizeof msg) && strcmp(msg, "app id 'Timer?' must match ^[a-z][a-z0-9_]{1,23}$") == 0,
+          "%s", msg);
+    CHECK(!muse_apps_id_valid(NULL, msg, sizeof msg) && strcmp(msg, "app id '' must match ^[a-z][a-z0-9_]{1,23}$") == 0, "%s", msg);
+    CHECK(!muse_apps_id_valid("x", msg, 8) && strcmp(msg, "app id ") == 0, "cut to its room: '%s'", msg);
+}
+
 /* F6: the stage holds what was put and a small slack beyond it (with its own block, under 64 KB), so at most 2 MB and
  * 64 KB whatever the files' sizes: checked after every piece. The reviewer's in-limit set, five 257 KB images and five
  * 129 KB modules (1.88 MB) put in 576-byte pieces, made 3.75 MB of blocks when each grew by doubling up to its kind's
@@ -1718,6 +1884,9 @@ int main(int argc, char **argv) {
         {"foreign_and_unknown_lines", foreign_and_unknown_lines},
         {"stage_out_of_memory", stage_out_of_memory},
         {"a_repeated_commit_is_busy", a_repeated_commit_is_busy},
+        {"a_link_install_is_one_job", a_link_install_is_one_job},
+        {"a_second_install_is_busy", a_second_install_is_busy},
+        {"link_install_refusals", link_install_refusals},
         {"the_stage_is_bounded", the_stage_is_bounded},
         {"empty_and_missing_files", empty_and_missing_files},
         {"console_stack", console_stack},

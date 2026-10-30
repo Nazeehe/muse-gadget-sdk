@@ -17,10 +17,10 @@
 #pragma once
 
 /*
- * The one install pipeline of Muse apps, whatever the files come from: the USB console's stage (apps_console.c) now,
- * the VM from Task 22. Portable C: the files come in through a source, and the steps that need the app task and the
- * store through ops, so the host tests run it with fakes. It runs on the I/O worker (apps_io.h), whose stack is 6 KB:
- * everything big is on the heap (apps_port_realloc: PSRAM on the gadget).
+ * The one install pipeline of Muse apps, whatever the files come from: the USB console's stage (apps_console.c), and
+ * Muse's VM (apps_install_from_vm, below: Link's app.install). Portable C: the files come in through a source, and the
+ * steps that need the app task and the store through ops, so the host tests run it with fakes. It runs on the I/O worker
+ * (apps_io.h), whose stack is 8 KB: everything big is on the heap (apps_port_realloc: PSRAM on the gadget).
  *
  * apps_install_run(id, run, src, ops), in order; the first step that fails ends it, and the result says why:
  * 1. id is an app id, or "app id '%s' must match ^[a-z][a-z0-9_]{1,23}$".
@@ -34,7 +34,8 @@
  *      %s: <apps_json_validate's message>               a .json that isn't JSON
  *      %s: image: ...                                   a .bin apps_image_check refuses
  *      images add up to more than 1.5 MB
- *    A source that can't read a file says so itself: "reading %s: %s".
+ *    A source that can't read a file says so itself ("reading %s: %s"), and may give the result's code (read_failed
+ *    otherwise).
  * 4. ops->compile. Lua's own message ("main.lua:2: unexpected symbol near 'x'") becomes "compile failed: " and
  *    apps_vm_excerpt's text of it for the file it names (the line before, the line and the line after, ">2|" on the
  *    line itself); a message that names none of the package's files is shown as it is, after "compile failed: ".
@@ -90,7 +91,8 @@
 #define APPS_ERR_CRASHED "crashed"                  /* step 6: a crash */
 #define APPS_ERR_NOT_RUNNING "not_running"          /* step 6: anything else */
 #define APPS_ERR_OUT_OF_MEMORY "out_of_memory"      /* the pipeline's own blocks */
-#define APPS_ERR_BUSY "busy"                        /* apps_install_try_begin, for its callers */
+#define APPS_ERR_BUSY "busy"                        /* apps_install_try_begin, for its callers; a VM reader someone has */
+#define APPS_ERR_UNAVAILABLE "unavailable"          /* for callers: what the gadget can't do now (no VM ops) */
 
 /* What a caller answers when apps_install_try_begin says no. */
 #define APPS_INSTALL_BUSY "busy: another install is running"
@@ -104,11 +106,12 @@
  * success (an empty file is a block of one byte). It needs to read no more than max + 1 bytes: a file longer than max
  * may come back with more than max bytes, and the pipeline refuses it. It gives up at deadline_us, an absolute time in
  * microseconds of apps_port_mono_ms's clock. False, with nothing to free, when it can't: err says why, as
- * "reading <rel>: <why>". origin names the source in the callers' log lines: "usb" or "vm".
+ * "reading <rel>: <why>", and *code (NULL when it is called) may say the result's code, read_failed when it stays NULL.
+ * origin names the source in the callers' log lines: "usb" or "vm".
  */
 typedef struct {
-    bool (*read)(void *ctx, const char *rel, size_t max, int64_t deadline_us, uint8_t **data, size_t *len, char *err,
-                 size_t err_len);
+    bool (*read)(void *ctx, const char *rel, size_t max, int64_t deadline_us, uint8_t **data, size_t *len,
+                 const char **code, char *err, size_t err_len);
     void *ctx;
     const char *origin;
 } apps_source_t;
@@ -135,6 +138,27 @@ void apps_install_end(void);
 
 /* The pipeline above. NULL only when there is no memory for even the result. */
 cJSON *apps_install_run(const char *id, bool run, const apps_source_t *src, const apps_install_ops_t *ops);
+
+/*
+ * An install from Muse's VM (Task 22's app.install), for the I/O worker's job: apps_install_run(id, run, <the VM>, ops),
+ * whose source reads each file of the app through vm->read (muse_apps.h) from "workspace/apps/<id>/<rel>", a path made
+ * here from the id and a path the manifest's parse passed, into a block of apps_port_realloc that grows as the file comes,
+ * never past the file's limit. What a read that fails gives the result:
+ *   install timed out after 90 s (reading <rel>)    read_failed: the reader said its deadline came, or the install's
+ *                                                   deadline (APPS_INSTALL_DEADLINE_MS) had passed when the read failed
+ *                                                   or was due to start (a read is never started after it)
+ *   <the reader's words>                            busy: someone else has the reader (a display.draw_file)
+ *   reading <rel>: <the reader's words>             out_of_memory (the reader's no memory, or the block's), or read_failed
+ *   <rel> is larger than <N> KB                     invalid_package: more than the file's limit came, as the pipeline says
+ * Logged (tag muse_apps): each file read, "install <id> from vm: <rel> <bytes> bytes in <ms> ms", and the install once it has
+ * ended, "install <id> from vm done: ok|failed (<files> files, <ms> ms)", the files the ones read whole (manifest.json among
+ * them) and the time the whole install's (compile, commit and run included). NULL only when there is no memory for even the
+ * result.
+ */
+#define APPS_VM_DIR "workspace/apps/"  /* where Muse writes an app's folder on its VM, relative to its home */
+
+struct muse_apps_vm_ops;
+cJSON *apps_install_from_vm(const char *id, bool run, const struct muse_apps_vm_ops *vm, const apps_install_ops_t *ops);
 
 /*
  * Runs an installed package (R13.5's >app.launch): ops->run takes pkg and runs it in front with APPS_SETTLE_MS, and the

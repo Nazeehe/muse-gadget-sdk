@@ -82,6 +82,63 @@ bool muse_apps_launch(const char *id, bool front);
  */
 bool muse_apps_launch_alarm(const char *id, uint32_t upto);
 
+/* cJSON's struct, declared here so that this header needs none of cJSON's. */
+struct cJSON;
+
+/*
+ * Files on Muse's VM, for the apps (Task 22): main/apps_link.c puts vm_file (main/vm_file.h) behind these and hands them over
+ * with muse_apps_set_vm_ops (apps_link_init), so that nothing here needs main/. A path is relative to the user's home on the VM,
+ * as vm_file takes it. deadline_us is absolute, in esp_timer_get_time()'s microseconds (apps_port_mono_ms's clock, times 1000),
+ * and bounds the whole call. Both wait for the VM, whose answers only the Noise session's task delivers: never call them on it.
+ *
+ * read hands the file to sink a piece at a time (a piece is valid only during the call; sink returns false to stop the read),
+ * and is true once the whole file has gone to the sink. max bounds the file: no piece takes it past max, and a longer file
+ * fails with MUSE_APPS_VM_TOO_LARGE. write writes len bytes of data as the whole file, made or replaced (POST /fs/upload).
+ * Either is false with *code one of the MUSE_APPS_VM_ codes and err (err_len bytes) saying why in the reader's or the
+ * writer's words.
+ */
+#define MUSE_APPS_VM_BUSY "busy"                    /* someone else has the reader (a display.draw_file), or the writer */
+#define MUSE_APPS_VM_OUT_OF_MEMORY "out_of_memory"  /* no memory for the request now: try again later */
+#define MUSE_APPS_VM_TIMED_OUT "timed_out"          /* deadline_us came first */
+#define MUSE_APPS_VM_TOO_LARGE "too_large"          /* read: the file is longer than max */
+#define MUSE_APPS_VM_FAILED "failed"                /* anything else: the VM's answer, a dropped session, a bad path */
+
+typedef struct muse_apps_vm_ops {
+    bool (*read)(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                 int64_t deadline_us, const char **code, char *err, size_t err_len);
+    bool (*write)(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
+                  size_t err_len);
+} muse_apps_vm_ops_t;
+
+/* The VM's files from now on (NULL: none). ops is kept, not copied: a static table. Any task, before or after muse_apps_start. */
+void muse_apps_set_vm_ops(const muse_apps_vm_ops_t *ops);
+
+/* What the apps' asynchronous calls answer, once, on the I/O worker: a command's result, {"ok":true,"payload":{...}} or
+ * {"ok":false,"error":{"code","message"}}, whose ownership passes to the callback (cJSON_Delete it, or hand it on); NULL only
+ * when there was no memory for even that. */
+typedef void (*muse_apps_done_cb)(void *ctx, struct cJSON *result);
+
+/* Whether id is an app id (^[a-z][a-z0-9_]{1,23}$), any task. If not, err (err_len bytes) says so as an install does: "app id
+ * '<id>' must match ^[a-z][a-z0-9_]{1,23}$", the id shown as typed text is (a control character as '?', cut at 64 bytes with
+ * "..."). 128 bytes always hold it. */
+bool muse_apps_id_valid(const char *id, char *err, size_t err_len);
+
+/*
+ * Link's app.install: installs the app in workspace/apps/<id>/ on Muse's VM. One job of the I/O worker reads manifest.json and
+ * the files it lists through the VM's ops (each path made on the gadget: app.install never takes one), then checks, compiles,
+ * stores and, with run, runs it in front, as the USB console's commit does (apps_install.h: the result is apps_install_run's,
+ * with "storage" and the store's "hint"). Any task, the Noise session's included: it never waits.
+ *
+ * True once the job is queued: done(ctx, result) then runs exactly once, on the I/O worker, after the install has let its hold
+ * go (so a next install once the result is read isn't busy). False, with nothing queued and done never called, and *code and
+ * *err (literals) saying why (D14's codes):
+ *   invalid_params   id is not an app id, or done is NULL
+ *   unavailable      the gadget has no VM ops (muse_apps_set_vm_ops)
+ *   busy             another install runs, this one's or the USB console's: "busy: another install is running"
+ *   out_of_memory    no memory for the job, or the I/O worker can't take it now ("... try again in a few seconds")
+ */
+bool muse_apps_install(const char *id, bool run, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
+
 /* Makes the app layer on screen (apps_lv_build) and takes its touches and swipes. In build_overlays(), after the
  * page dots and before the downloaded image, under the display lock and before the frame timer exists. */
 void muse_apps_ui_build(lv_obj_t *screen);
@@ -116,9 +173,8 @@ bool muse_apps_covering(void);
  * "lua_kb":N,"peak_kb":N,"storage":"flash"|"ram"|"none","storage_free_kb":N}. resident is the app that is loaded (running, or
  * stuck in a call), null otherwise; state and peak_kb are the app task's record (the last app's, once it has ended), lua_kb its Lua
  * heap now (0 with none loaded); storage is the store's mode ("none" until the mount has run, with storage_free_kb 0). The caller
- * owns the object (cJSON_Delete); NULL without memory. cJSON's struct, declared here so that this header needs none of cJSON's.
+ * owns the object (cJSON_Delete); NULL without memory.
  */
-struct cJSON;
 struct cJSON *muse_apps_health(void);
 
 /* The heartbeat's " apps=<resident>/<state> lua=<KB>K" (main/app.c), any task: resident, state and lua_kb as above (resident "" for

@@ -359,6 +359,15 @@ class Console(unittest.TestCase):
     def test_a_repeated_commit_is_busy(self):  # F5: the hold first, then the stage
         self.run_case("a_repeated_commit_is_busy")
 
+    def test_a_link_install_is_one_job(self):  # Task 22: app.install's job on the worker, done once with the result
+        self.run_case("a_link_install_is_one_job")
+
+    def test_a_second_install_is_busy(self):  # D14: busy at once, from Link and from USB, both ways
+        self.run_case("a_second_install_is_busy")
+
+    def test_link_install_refusals(self):  # unavailable, invalid_params, out_of_memory; the id's message
+        self.run_case("link_install_refusals")
+
     def test_the_stage_is_bounded(self):  # F6: what was put and a small slack, whatever the files
         self.run_case("the_stage_is_bounded")
 

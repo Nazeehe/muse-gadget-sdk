@@ -16,7 +16,9 @@
 
 tests/muse_apps_install_harness.c runs the real pipeline with the real cJSON, package rules (apps_pkg, apps_json) and
 apps_vm_excerpt (apps_vm and Lua), a fake source that serves files from a table and records every read, and fake ops
-(compile, commit, run) that record what they were given. Every result the harness prints is checked here to be valid
+(compile, commit, run) that record what they were given. An install from the VM (Task 22's app.install,
+apps_install_from_vm) runs the same pipeline over a fake muse_apps_vm_ops_t serving the same table: the paths it is asked
+for, the deadline, a session that drops, a reader that is someone else's, and the log lines. Every result the harness prints is checked here to be valid
 JSON within APPS_RESULT_MAX bytes, its bytes decoded strictly as UTF-8 (R13.3: a reply is text). The stack case runs
 apps_install_run on exactly the I/O worker's 6,144 bytes (R13.7), in a build without the sanitizers. Needs the cJSON
 sources: CJSON_SOURCE_DIR (~/.cache/muse-cjson), or an IDF build's managed_components.
@@ -42,7 +44,10 @@ SOURCES = [HARNESS, APPS / "apps_install.c", APPS / "apps_pkg.c", APPS / "apps_j
            APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_svc.c",
            ROOT / "tools/muse/apphost/sha256.c"]
 SDKCONFIG = "#pragma once\n#define CONFIG_MUSE_APPS 1\n#define CONFIG_MUSE_APPS_HEAP_MAX_KB 1024\n"
-# The store logs what it drops (ESP_LOGW): the harness keeps each line.
+# What muse_apps.h (the VM's ops, for apps_install_from_vm) includes of ESP-IDF and LVGL, as the little it uses.
+ESP_ERR = "#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_ERR_NO_MEM 0x101\n"
+LVGL = "#pragma once\ntypedef struct lv_obj lv_obj_t;\n"
+# The store logs what it drops (ESP_LOGW), and an install from the VM each file and its end: the harness keeps each line.
 ESP_LOG = ("#pragma once\n"
            "void fake_esp_log(char level, const char *tag, const char *fmt, ...) __attribute__((format(printf, 3, 4)));\n"
            "#define ESP_LOGE(tag, ...) fake_esp_log('E', tag, __VA_ARGS__)\n"
@@ -62,6 +67,8 @@ class Install(unittest.TestCase):
         staged.mkdir()
         (staged / "sdkconfig.h").write_text(SDKCONFIG)
         (staged / "esp_log.h").write_text(ESP_LOG)
+        (staged / "esp_err.h").write_text(ESP_ERR)
+        (staged / "lvgl.h").write_text(LVGL)
         cls.includes = [apps_host.LUA_SRC, APPS, MUSE, staged, TESTS, apps_host.CJSON_DIR]
         cls.harness = apps_host.build("muse_apps_install_harness", [*SOURCES, *apps_host.lua_sources()], tmp.name,
                                       include_dirs=cls.includes, objects=[cjson])
@@ -158,6 +165,24 @@ class Install(unittest.TestCase):
     def test_the_deadline_is_one_absolute_time(self):  # E24, D3
         self.run_case("deadline_is_one_absolute_time")
 
+    def test_vm_paths_built_on_device(self):  # D9: workspace/apps/<id>/<rel>, made here; D10's lines
+        self.run_case("vm_paths_built_on_device")
+
+    def test_deadline(self):  # D3, E24: the clock past 90 s, and a deadline that passes partway through a file
+        self.run_case("deadline")
+
+    def test_session_drop_commits_nothing(self):
+        self.run_case("session_drop_commits_nothing")
+
+    def test_unchanged(self):  # with and without run, on flash and in RAM
+        self.run_case("unchanged")
+
+    def test_vm_refusals(self):  # a reader that is someone else's (busy), no memory, too large, a file that isn't there
+        self.run_case("vm_refusals")
+
+    def test_vm_out_of_memory(self):  # every block refused in turn, the sink's included
+        self.run_case("vm_out_of_memory")
+
     def test_the_ram_store(self):  # C4, E26; F1's list, most recent first; the cap drops the oldest
         self.run_case("ram_store")
 
@@ -183,11 +208,11 @@ class Install(unittest.TestCase):
     def test_out_of_memory_anywhere(self):
         self.run_case("out_of_memory")
 
-    def test_install_stack(self):  # R13.7: the pipeline on exactly the I/O worker's 6,144 bytes
+    def test_install_stack(self):  # R13.7: the pipeline on exactly 6,144 bytes (the worker has 8,192 since X18), from the VM too
         harness = apps_host.build("muse_apps_install_stack", [*SOURCES, *apps_host.lua_sources()], self.tmp,
                                   include_dirs=self.includes, objects=[apps_host.cjson_object()], sanitize=False)
         _, stacks = self.run_case("install_stack", harness=harness)
-        self.assertEqual([s["case"] for s in stacks], ["success", "crash", "compile"])
+        self.assertEqual([s["case"] for s in stacks], ["success", "crash", "compile", "vm"])
         for s in stacks:
             print(f"install_stack: {s['case']} used {s['used']} of {s['of']} bytes (host frames)", file=sys.stderr,
                   flush=True)

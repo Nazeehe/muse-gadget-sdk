@@ -1642,8 +1642,12 @@ static uint32_t expected_sum(int scale) {
 static void admission_before_drawing(void) {
     CHECK(apps_snapshot_block(466, 1) == 434320 + APPS_SNAPSHOT_JPEG_MAX, "scale 1's block: %zu", apps_snapshot_block(466, 1));
     CHECK(apps_snapshot_block(466, 2) == 434312, "scale 2's block: %zu", apps_snapshot_block(466, 2));
-    CHECK(apps_snapshot_peak(1) == apps_snapshot_block(466, 1) + APPS_SNAPSHOT_ENCODER_BYTES &&
-              apps_snapshot_peak(2) == apps_snapshot_block(466, 2) + APPS_SNAPSHOT_ENCODER_BYTES,
+    CHECK(apps_snapshot_encoder_bytes(1) == APPS_SNAPSHOT_ENCODER_BYTES_1 && apps_snapshot_encoder_bytes(2) == APPS_SNAPSHOT_ENCODER_BYTES_2,
+          "the encoder's allowances: %zu, %zu", apps_snapshot_encoder_bytes(1), apps_snapshot_encoder_bytes(2));
+    CHECK(APPS_SNAPSHOT_ENCODER_BYTES_1 == 64 * 1024 && APPS_SNAPSHOT_ENCODER_BYTES_2 == 40 * 1024,
+          "the allowances the board's measurement set (55,208 and 32,168 bytes at their peak, about a fifth kept over)");
+    CHECK(apps_snapshot_peak(1) == apps_snapshot_block(466, 1) + APPS_SNAPSHOT_ENCODER_BYTES_1 &&
+              apps_snapshot_peak(2) == apps_snapshot_block(466, 2) + APPS_SNAPSHOT_ENCODER_BYTES_2,
           "the peaks: %zu, %zu", apps_snapshot_peak(1), apps_snapshot_peak(2));
     const size_t need1 = APPS_RAM_RESERVE + apps_snapshot_peak(1), need2 = APPS_RAM_RESERVE + apps_snapshot_peak(2);
     const char *c, *e;
@@ -1775,7 +1779,7 @@ static void the_encoders_blocks_count_with_the_snapshot(void) {
         CHECK(enc_counted_then == apps_snapshot_block(466, scale) + 6000 + 16 + 20000, "scale %d: %zu counted with all three held", scale,
               enc_counted_then);
         snprintf(want, sizeof want, "PSRAM free 4194304 before, 4194304 with the encoder open, 4194304 after the encode; encoder peak "
-                 "26016 bytes (%u allowed)\n", (unsigned)APPS_SNAPSHOT_ENCODER_BYTES);
+                 "26016 bytes (%u allowed)\n", (unsigned)apps_snapshot_encoder_bytes(scale));
         CHECK(logged_has(want), "scale %d: the encode's line:\n%s", scale, logged);
         EXPECT_CLEAN();
     }

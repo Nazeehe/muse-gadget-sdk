@@ -50,7 +50,7 @@ bool apps_port_dark(void);
  * APPS_FLOOR_BIG_BLOCK bytes or more also when the largest free block less n would be under it (the heap works
  * that out by walking every block, so a smaller request doesn't ask). A shrink, or growth within the block, never
  * fails. So the apps run out of memory cleanly, and the rest of the gadget never does because of them.
- * A snapshot never kills the app that runs (N1): on the device, a growth of the app task's (apps_task_current) that the floor or
+ * A snapshot doesn't kill the app that runs (N1): on the device, a growth of the app task's (apps_task_current) that the floor or
  * the heap refuses while a snapshot holds blocks (apps_port_snapshot_alloc, and the encoder's: apps_port_snapshot_adopt), and that
  * would fit were they free, waits: after the floor's refusal until the floor passes, after the heap's until the snapshot lets go of
  * some of what it held, polling every APPS_PORT_SNAPSHOT_POLL_MS for at most APPS_PORT_SNAPSHOT_WAIT_MS in all during one snapshot,

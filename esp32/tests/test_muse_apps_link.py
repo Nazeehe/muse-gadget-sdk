@@ -462,7 +462,8 @@ class GuideAndSkill(unittest.TestCase):
         # allowance and the app task's wait for it.
         side = header_number("apps_snapshot.h", "APPS_SNAPSHOT_SIDE")
         jpeg_max = define_kb(APPS / "apps_snapshot.h", "APPS_SNAPSHOT_JPEG_MAX") * 1024
-        encoder_kb = define_kb(APPS / "apps_snapshot.h", "APPS_SNAPSHOT_ENCODER_BYTES")
+        encoder1_kb = define_kb(APPS / "apps_snapshot.h", "APPS_SNAPSHOT_ENCODER_BYTES_1")
+        encoder2_kb = define_kb(APPS / "apps_snapshot.h", "APPS_SNAPSHOT_ENCODER_BYTES_2")
         screen = side * side * 2
         block1 = max(screen, (screen + 15) // 16 * 16 + jpeg_max)
         half = (side // 2) * (side // 2) * 2
@@ -488,7 +489,7 @@ class GuideAndSkill(unittest.TestCase):
                 f"free of {task_stack:,}",
                 f"the I/O worker's {kb(io_stack)} KB stack",
                 f"of {io_stack:,}, and the LVGL task",
-                f"JPEG's room: {block1:,} bytes at scale 1 and {block2:,} at scale 2, with {encoder_kb} KB",
+                f"JPEG's room: {block1:,} bytes at scale 1 and {block2:,} at scale 2, with {encoder1_kb} KB and {encoder2_kb} KB",
                 f"waits for the snapshot, up to {wait_s:g} s",
                 f"apps always leave {reserve_mb:g} MB of PSRAM to the rest of the gadget",
                 f"under the Link's {tx_margin_kb} KB TX margin",
@@ -499,8 +500,8 @@ class GuideAndSkill(unittest.TestCase):
                 self.assertIn(phrase, section)
         kconfig = " ".join((MUSE / "Kconfig").read_text().split())
         for phrase in (f"and a {kb(task_stack)} KB task stack",
-                       f"block of {block1:,} bytes (scale 1) or {block2:,} (scale 2), taken only with that, {encoder_kb * 1024:,} "
-                       f"bytes for the encoder and the {reserve_mb:g} MB free",
+                       f"block of {block1:,} bytes (scale 1) or {block2:,} (scale 2), taken only with that, {encoder1_kb * 1024:,} "
+                       f"or {encoder2_kb * 1024:,} bytes for the encoder and the {reserve_mb:g} MB free",
                        f"the apps always leave {reserve_mb:g} MB of it free for the rest of the firmware",
                        f"{apps_size // (1024 * 1024)} MB for the apps' files and {kb(nvs_size)} KB for what they save"):
             with self.subTest(phrase):

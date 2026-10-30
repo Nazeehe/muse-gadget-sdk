@@ -72,7 +72,11 @@
 
 #define APPS_SNAPSHOT_JPEG_MAX (128 * 1024)    /* the encoder's output, PSRAM */
 #define APPS_SNAPSHOT_SIDE 466                 /* the 1.75C's screen, as the admission counts it (the drawing takes the screen's size) */
-#define APPS_SNAPSHOT_ENCODER_BYTES (32 * 1024)  /* what the admission allows for the encoder's own buffers */
+/* What the admission allows for the encoder's own buffers (apps_snapshot_encoder_bytes): their peak, from the encode's log line on the
+ * 1.75C, is 55,208 bytes at scale 1 and 32,168 at scale 2 (its state grows with the picture's width), and the allowances keep about a
+ * fifth more than that. */
+#define APPS_SNAPSHOT_ENCODER_BYTES_1 (64 * 1024)
+#define APPS_SNAPSHOT_ENCODER_BYTES_2 (40 * 1024)
 #define APPS_SNAPSHOT_QUALITY 80
 #define APPS_SNAPSHOT_MIN_LEFT_MS 8000         /* a job that starts with less of its deadline left does nothing: busy */
 #define APPS_SNAPSHOT_RENDER_MS 2000           /* a drawing begun before the screen's deadline is waited for this much longer */
@@ -100,12 +104,14 @@ void apps_snapshot_mask(const uint16_t *src, int w, int h, int stride_px, int sc
 /*
  * The admission (N1, above). apps_snapshot_block is the block a snapshot at scale takes of a side x side screen (the drawing's block:
  * the pixels in rows of LVGL's RGB565 stride, as the take lays them out, and at scale 1 the JPEG's room after the picture, 16-byte
- * aligned); apps_snapshot_peak adds APPS_SNAPSHOT_ENCODER_BYTES.
+ * aligned); apps_snapshot_encoder_bytes is the allowance for the encoder's buffers at scale (APPS_SNAPSHOT_ENCODER_BYTES_1 or _2),
+ * and apps_snapshot_peak is the two together.
  * apps_snapshot_admit: NULL when free_bytes and largest (the largest free block) each hold the peak at scale above APPS_RAM_RESERVE
  * for the 1.75C's screen; else the refusal, out_of_memory's words: MUSE_APPS_SNAPSHOT_TRY_SCALE_2 for scale 1 when scale 2 fits,
  * otherwise MUSE_APPS_SNAPSHOT_STOP_APP when an app runs (app_runs) and MUSE_APPS_SNAPSHOT_NO_MEMORY when none does. Any task.
  */
 size_t apps_snapshot_block(int side, int scale);
+size_t apps_snapshot_encoder_bytes(int scale);
 size_t apps_snapshot_peak(int scale);
 const char *apps_snapshot_admit(int scale, size_t free_bytes, size_t largest, bool app_runs);
 

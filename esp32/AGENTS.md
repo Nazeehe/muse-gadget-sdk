@@ -773,13 +773,16 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   Every run is admitted once more, after the app it replaces has gone, with
   room for its heap and the reserve. A snapshot is one block through
   the same floor (the screen's pixels, the picture masked in place and the
-  JPEG's room: 565,392 bytes at scale 1 and 434,312 at scale 2, with 32 KB
-  allowed for the encoder's own buffers, also floored). It is admitted, before
-  anything is drawn, only when free PSRAM and the largest free block each hold
-  that above the reserve, and refused otherwise with `out_of_memory` (scale 2
-  suggested when it fits). An app task allocation the floor refuses while a
-  snapshot holds its block waits for the snapshot, up to 1 s, then is tried
-  once more, so a snapshot never kills the app that runs. The stacks can be in PSRAM because the 1.75C's
+  JPEG's room: 565,392 bytes at scale 1 and 434,312 at scale 2, with 64 KB and
+  40 KB allowed for the encoder's own buffers, also floored and counted with the
+  block; the encode's log line says their peak, measured at 55,208 and 32,168
+  bytes). It is admitted, before anything is drawn, only when free PSRAM and the
+  largest free block each hold that above the reserve, and refused otherwise
+  with `out_of_memory` (scale 2 suggested when it fits). An app task allocation
+  the floor refuses while a snapshot holds its blocks waits for the snapshot,
+  up to 1 s, then is tried once more. Measured, a snapshot holds its block for
+  about 0.2 s (drawn and encoded) before cutting it to the JPEG, so a snapshot
+  doesn't kill the app that runs. The stacks can be in PSRAM because the 1.75C's
   `CONFIG_SPIRAM_FETCH_INSTRUCTIONS` and `CONFIG_SPIRAM_RODATA` keep the cache
   on while flash is written; `apps_io.c` refuses to build without them.
   Against the same build without the option, the image is 441,064 bytes

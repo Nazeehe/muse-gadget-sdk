@@ -114,8 +114,12 @@ size_t apps_snapshot_block(int side, int scale) {
     return block_of(side, side, (size_t)stride * (size_t)(side > 0 ? side : 0), scale);
 }
 
+size_t apps_snapshot_encoder_bytes(int scale) {
+    return scale == 2 ? APPS_SNAPSHOT_ENCODER_BYTES_2 : APPS_SNAPSHOT_ENCODER_BYTES_1;
+}
+
 size_t apps_snapshot_peak(int scale) {
-    return apps_snapshot_block(APPS_SNAPSHOT_SIDE, scale) + APPS_SNAPSHOT_ENCODER_BYTES;
+    return apps_snapshot_block(APPS_SNAPSHOT_SIDE, scale) + apps_snapshot_encoder_bytes(scale);
 }
 
 static bool fits(int scale, size_t free_bytes, size_t largest) {
@@ -450,7 +454,7 @@ static bool encode(const snap_job_t *job, shot_t *shot, uint32_t answered_ms, en
              (unsigned)(apps_port_mono_ms() - began), (unsigned)answered_ms, (unsigned)stack_free, (unsigned)APPS_IO_STACK,
              (unsigned)dma_before, (unsigned)dma_open, (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
              (unsigned)psram_before, (unsigned)psram_open, (unsigned)psram_encoded, (unsigned)s_enc_peak,
-             (unsigned)APPS_SNAPSHOT_ENCODER_BYTES);
+             (unsigned)apps_snapshot_encoder_bytes(job->scale));
     *e = (encoded_t){.jpeg = block, .len = len, .w = w, .h = h, .file_w = fw, .file_h = fh};
     return true;
 }

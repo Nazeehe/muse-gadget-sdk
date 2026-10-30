@@ -727,6 +727,10 @@ void muse_apps_set_vm_ops(const muse_apps_vm_ops_t *ops) {
     atomic_store(&s_vm_ops, ops);
 }
 
+const muse_apps_vm_ops_t *muse_apps_vm_ops(void) {
+    return atomic_load(&s_vm_ops);
+}
+
 bool muse_apps_id_valid(const char *id, char *err, size_t err_len) {
     const char *text = id != NULL ? id : "";
     if (apps_id_valid(text)) {

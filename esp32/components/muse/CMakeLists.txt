@@ -69,11 +69,15 @@ if(CONFIG_MUSE_ENABLED)
         # the system's alarms and their ring, the I/O worker, the apps' values behind it (apps_values.c: apps_nvs
         # or a map in RAM) and the store of the packages (apps_store.c: the FAT partition "apps" and apps_nvs, or
         # RAM when the table has no apps partition), the install pipeline and its RAM store, the USB console's
-        # >app.* lines, and the big digit fonts (apps/fonts/, made by tools/muse/gen_app_fonts.sh).
+        # >app.* lines, Link's app.control and app.api, and the big digit fonts (apps/fonts/, made by
+        # tools/muse/gen_app_fonts.sh).
         list(APPEND srcs "apps/apps_vm.c" "apps/apps_suggest.c" "apps/apps_json.c" "apps/apps_pkg.c"
             "apps/apps_rt.c" "apps/apps_svc.c" "apps/apps_ui.c" "apps/apps_lv.c" "apps/apps_task.c"
             "apps/apps_port_idf.c" "apps/apps_alarm.c" "apps/apps_io.c" "apps/apps_values.c" "apps/apps_store.c"
-            "apps/apps_install.c" "apps/apps_console.c" "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
+            "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/fonts/apps_digits_48.c"
+            "apps/fonts/apps_digits_96.c")
+        # What app.api writes to Muse's VM (apps_control.c): the app guide and the timer example.
+        list(APPEND embed "apps/apps_guide.md" "apps/examples/timer/manifest.json" "apps/examples/timer/main.lua")
     endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
     # avatar when avatar/muse_pixel.c exists here; this avatar/ is gitignored. The

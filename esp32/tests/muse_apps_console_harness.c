@@ -17,7 +17,8 @@
 /*
  * The USB console's ">app.*" protocol (apps_console.c), run for real on the host: muse_apps_console as muse_input's
  * hook calls it, with the real install pipeline and RAM store (apps_install.c, apps_pkg.c, apps_json.c, apps_vm.c and
- * the real cJSON) under it. Usage: muse_apps_console_harness <case>, one case per test in
+ * the real cJSON) under it; and Link's app.control and app.api (apps_control.c) over the same fakes, the guide and the
+ * timer embedded as the firmware embeds them. Usage: muse_apps_console_harness <case>, one case per test in
  * tests/test_muse_apps_console.py; it exits 0 when the case holds, and otherwise prints why.
  *
  * Fakes: apps_io_submit keeps the jobs and the case runs them (the I/O worker); the app task's calls (compile, run,
@@ -46,7 +47,9 @@
 #include "apps_store.h"
 #include "apps_task.h"
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "muse_apps.h"
 #include "muse_apps_exact_stack.h"
 
@@ -325,9 +328,10 @@ void apps_port_ui_unlock(void) {}
 
 /* apps_port_sha256 is tools/muse/apphost/sha256.c's. */
 
-/* The console's log lines go to stderr; the last one and their count are kept for the cases. */
+/* The console's log lines go to stderr; the last one and their count are kept for the cases, and the last 32 lines. */
 static char last_log[300];
 static int logs;
+static char log_ring[32][300];
 
 void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
     va_list ap;
@@ -336,7 +340,66 @@ void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
     vsnprintf(last_log + n, sizeof last_log - (size_t)n, fmt, ap);
     va_end(ap);
     fprintf(stderr, "%s\n", last_log);
+    memcpy(log_ring[logs % 32], last_log, sizeof last_log);
     logs++;
+}
+
+/* The line of the last 32 logged that holds text, or NULL. */
+static const char *logged(const char *text) {
+    for (int i = logs - 1; i >= 0 && i >= logs - 32; i--) {
+        if (strstr(log_ring[i % 32], text) != NULL) {
+            return log_ring[i % 32];
+        }
+    }
+    return NULL;
+}
+
+/* The internal RAM heap (esp_heap_caps.h): the blocks a synchronous wait of app.control takes for its one atomic (counted,
+ * and refused when a case says so), and the DMA RAM the guide's writes log. */
+static int internal_blocks;
+static bool internal_refuses;
+static size_t dma_free = 24315, dma_lowest = 12731;
+
+void *heap_caps_malloc(size_t size, uint32_t caps) {
+    CHECK(caps & MALLOC_CAP_INTERNAL, "only internal blocks here: caps 0x%x", (unsigned)caps);
+    if (internal_refuses) {
+        return NULL;
+    }
+    void *p = malloc(size);
+    internal_blocks += p != NULL;
+    return p;
+}
+
+void heap_caps_free(void *ptr) {
+    if (ptr != NULL) {
+        internal_blocks--;
+        free(ptr);
+    }
+}
+
+size_t heap_caps_get_free_size(uint32_t caps) {
+    CHECK(caps == MALLOC_CAP_DMA, "the DMA RAM: caps 0x%x", (unsigned)caps);
+    return dma_free;
+}
+
+size_t heap_caps_get_minimum_free_size(uint32_t caps) {
+    CHECK(caps == MALLOC_CAP_DMA, "the DMA RAM: caps 0x%x", (unsigned)caps);
+    return dma_lowest;
+}
+
+/* vTaskDelay: the clock moves on by the ticks (10 ms each), and the worker runs what waits while the caller sleeps, unless a
+ * case holds it in a long job (worker_busy). */
+static bool worker_busy;
+static int delays;
+static void run_jobs(void);
+
+void vTaskDelay(TickType_t ticks) {
+    CHECK(ticks > 0, "a delay of no ticks spins");
+    delays++;
+    fake_ms += (int64_t)ticks * 10;
+    if (!worker_busy) {
+        run_jobs();
+    }
 }
 
 /* cJSON's allocations, counted. */
@@ -414,8 +477,39 @@ bool apps_store_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t
     return apps_ram_commit(pkg, unchanged, err, n);
 }
 
+/* A refusal of the store's load, as a case sets it (the quarantine's, a damaged copy's), or NULL. */
+static const char *store_load_refusal;
+
 bool apps_store_load(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
+    if (store_load_refusal != NULL) {
+        memset(pkg, 0, sizeof *pkg);
+        snprintf(err, n, "%s", store_load_refusal);
+        return false;
+    }
     return apps_ram_load(id, pkg, err, n);
+}
+
+/* apps_store_remove over the RAM store, with apps_store.c's refusals: not ready, the app that runs, none of that id. */
+static int removes;
+bool apps_task_running(char *id, size_t cap);
+
+bool apps_store_remove(const char *id, char *err, size_t n) {
+    removes++;
+    char running[APPS_ID_MAX + 1];
+    if (store_mode == APPS_STORAGE_NONE) {
+        snprintf(err, n, "storage not ready");
+        return false;
+    }
+    if (apps_task_running(running, sizeof running) && strcmp(running, id) == 0) {
+        snprintf(err, n, "%s is running; stop it first", id);
+        return false;
+    }
+    if (!apps_ram_remove(id)) {
+        snprintf(err, n, "no such app on the gadget");
+        return false;
+    }
+    snprintf(err, n, "%s", "");
+    return true;
 }
 
 bool apps_store_has(const char *id) {
@@ -640,9 +734,12 @@ void apps_task_set_list(const apps_listed_t *apps, int n) {
     }
 }
 
+/* The app that runs, as a case sets it ("" for none). */
+static char running_app[APPS_ID_MAX + 1];
+
 bool apps_task_running(char *id, size_t cap) {
-    snprintf(id, cap, "%s", "");
-    return false;
+    snprintf(id, cap, "%s", running_app);
+    return running_app[0] != '\0';
 }
 
 void apps_task_status(apps_status_t *st) {
@@ -791,11 +888,23 @@ static void install_hello(void) {
 
 /* ---- The end of every case ---- */
 
+static cJSON *done_result;  /* the done callback's (below) */
+static void forget_writes(void);
+
 /* Nothing held once whatever is staged has gone through a commit and the RAM store is empty. */
 static void finish(void) {
     submit_refuses = false;
     port_refuse = -1;
+    worker_busy = false;
+    internal_refuses = false;
+    store_load_refusal = NULL;
+    store_mode = APPS_STORAGE_RAM;
+    running_app[0] = '\0';
     run_jobs();
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    forget_writes();
+    CHECK(internal_blocks == 0, "%d blocks of internal RAM still held", internal_blocks);
     /* A stage for an id of its own (a new id drops the old stage), then a commit, whose job frees it. */
     CHECK(put("zz_end", "manifest.json", 0, "{}", 2), "the last put");
     CHECK(line("app.commit zz_end"), "the last commit");
@@ -1593,15 +1702,43 @@ static bool fake_vm_read(const char *path, size_t max, bool (*sink)(void *user, 
     return sink(user, (const uint8_t *)text, strlen(text));
 }
 
+/* The VM's writes (app.api's guide): each one's path, bytes and deadline kept; the write numbered write_fails_at (from 1)
+ * fails with write_code and write_why, and every one after it succeeds. A write lowers the DMA RAM's lowest mark, as the
+ * session's copies of its sends can. */
+static int vm_writes, write_fails_at;
+static const char *write_code = MUSE_APPS_VM_FAILED, *write_why = "VM answered HTTP 403: route not allowed for this credential's scopes";
+static struct {
+    char path[96];
+    char *data;
+    size_t len;
+    int64_t deadline_us;
+} written[8];
+
 static bool fake_vm_write(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
                           size_t err_len) {
-    (void)path;
-    (void)data;
-    (void)len;
-    (void)deadline_us;
-    *code = MUSE_APPS_VM_FAILED;
-    snprintf(err, err_len, "an install never writes");
-    fail_at(__LINE__, "an install wrote to the VM");
+    int i = vm_writes++;
+    CHECK(i < (int)ARRAY_LEN(written), "too many writes");
+    snprintf(written[i].path, sizeof written[i].path, "%s", path);
+    written[i].data = malloc(len + 1);
+    CHECK(written[i].data != NULL, "no memory");
+    memcpy(written[i].data, data, len);
+    written[i].data[len] = '\0';
+    written[i].len = len;
+    written[i].deadline_us = deadline_us;
+    dma_lowest -= 512;
+    if (i + 1 == write_fails_at) {
+        *code = write_code;
+        snprintf(err, err_len, "%s", write_why);
+        return false;
+    }
+    return true;
+}
+
+static void forget_writes(void) {
+    for (int i = 0; i < vm_writes; i++) {
+        free(written[i].data);
+    }
+    vm_writes = 0;
 }
 
 static const muse_apps_vm_ops_t FAKE_VM = {fake_vm_read, fake_vm_write};
@@ -1638,7 +1775,8 @@ static void a_link_install_is_one_job(void) {
     CHECK(muse_apps_install("hello", true, on_done, &tag, &code, &err), "not queued: %s: %s", code, err);
     CHECK(n_jobs == 1 && dones == 0 && vm_reads == 0, "one job, not run yet: %d jobs, %d dones", n_jobs, dones);
     run_jobs();
-    CHECK(dones == 1 && done_ctx == &tag && vm_reads == 2, "done once, with its ctx: %d dones, %d reads", dones, vm_reads);
+    CHECK(dones == 1 && done_ctx == &tag && vm_reads == 2 && vm_writes == 0, "done once, with its ctx: %d dones, %d reads, %d writes",
+          dones, vm_reads, vm_writes);
     CHECK(!done_held, "the hold was let go before done");
     CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(done_result, "ok")), "not ok: %s", done_text("error", "message"));
     CHECK(strcmp(done_text("payload", "id"), "hello") == 0 && strcmp(done_text("payload", "storage"), "ram") == 0 &&
@@ -1736,6 +1874,499 @@ static void link_install_refusals(void) {
           "%s", msg);
     CHECK(!muse_apps_id_valid(NULL, msg, sizeof msg) && strcmp(msg, "app id '' must match ^[a-z][a-z0-9_]{1,23}$") == 0, "%s", msg);
     CHECK(!muse_apps_id_valid("x", msg, 8) && strcmp(msg, "app id ") == 0, "cut to its room: '%s'", msg);
+}
+
+/* ---- Link's app.control and app.api (Task 23): apps_control.c ---- */
+
+/* r printed and deleted: the text, which the caller frees. */
+static char *result_text(cJSON *r) {
+    CHECK(r != NULL, "no result");
+    char *text = cJSON_PrintUnformatted(r);
+    CHECK(text != NULL, "no memory to print");
+    char *copy = strdup(text);
+    cJSON_free(text);
+    cJSON_Delete(r);
+    return copy;
+}
+
+/* r (deleted here) prints as want. */
+static void expect_result_at(int line, cJSON *r, const char *want) {
+    char *got = result_text(r);
+    if (strcmp(got, want) != 0) {
+        fail_at(line, "the result was\n%s\ninstead of\n%s", got, want);
+    }
+    free(got);
+}
+#define EXPECT_RESULT(r, want) expect_result_at(__LINE__, (r), (want))
+
+/* What r has at the path a.b ("payload.state"), as text: a string as it is, anything else as it prints; "(none)" when there is
+ * nothing there. */
+static const char *at_path(const cJSON *r, const char *path) {
+    static char out[512];
+    char key[64];
+    const cJSON *at = r;
+    for (const char *p = path; at != NULL && *p != '\0';) {
+        size_t n = strcspn(p, ".");
+        snprintf(key, sizeof key, "%.*s", (int)n, p);
+        at = cJSON_GetObjectItemCaseSensitive(at, key);
+        p += n + (p[n] == '.');
+    }
+    if (at == NULL) {
+        return "(none)";
+    }
+    if (cJSON_IsString(at)) {
+        snprintf(out, sizeof out, "%s", at->valuestring);
+    } else {
+        char *text = cJSON_PrintUnformatted(at);
+        snprintf(out, sizeof out, "%s", text != NULL ? text : "?");
+        cJSON_free(text);
+    }
+    return out;
+}
+#define CHECK_AT(r, path, want) \
+    CHECK(strcmp(at_path((r), (path)), (want)) == 0, "%s is %s, not %s", (path), at_path((r), (path)), (want))
+
+/* payload.apps[i] of a list's result. */
+static const cJSON *listed_app(const cJSON *r, int i) {
+    return cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(r, "payload"), "apps"), i);
+}
+
+/* A file of components/muse/apps/ as it is on disk (the caller frees it), and its length. */
+static char *apps_file(const char *rel, size_t *len) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", APPS_SOURCE_DIR, rel);
+    FILE *f = fopen(path, "rb");
+    CHECK(f != NULL, "can't open %s", path);
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *text = malloc((size_t)n + 1);
+    CHECK(text != NULL && fread(text, 1, (size_t)n, f) == (size_t)n, "can't read %s", path);
+    fclose(f);
+    text[n] = '\0';
+    *len = (size_t)n;
+    return text;
+}
+
+#define NOT_FOUND(id) "no app '" id "' on this gadget (app.control list shows the installed ones)"
+#define CONTROL_BUSY "the gadget is busy with another app job (an install, a launch or the guide); try again in a few seconds"
+
+static const char MANIFEST_TIMER[] = "{\"id\":\"timer\",\"name\":\"Timer\",\"version\":\"0.3\",\"api\":1,\"messages\":{"
+                                     "\"start\": \"Start a countdown.\", \"status\": \"Replies {state, remaining}.\"}}";
+
+/* hello, then timer (with its messages), installed in the RAM store: lists have timer first, the most recent. */
+static void install_two(void) {
+    install_hello();
+    put_text("timer", "manifest.json", MANIFEST_TIMER);
+    put_text("timer", "main.lua", "return {}\n");
+    CHECK(line("app.commit timer"), "commit");
+    run_jobs();
+    (void)take_output();
+}
+
+/* The record says hello crashed, with lines lines in its log ("line 00", ...). */
+static void record_hello_crashed(int lines) {
+    memset(&status_record, 0, sizeof status_record);
+    status_record.state = APPS_STATE_CRASHED;
+    snprintf(status_record.id, sizeof status_record.id, "hello");
+    snprintf(status_record.name, sizeof status_record.name, "Hello");
+    snprintf(status_record.version, sizeof status_record.version, "1.0.0");
+    snprintf(status_record.last_error, sizeof status_record.last_error,
+             "main.lua:1: boom\nstack traceback:\n\tmain.lua:1: in main chunk");
+    snprintf(status_record.ui_dump, sizeof status_record.ui_dump, "[]");
+    size_t at = 0;
+    for (int i = 0; i < lines; i++) {
+        at += (size_t)snprintf(status_record.log_tail + at, sizeof status_record.log_tail - at, "%sline %02d", i > 0 ? "\n" : "",
+                               i);
+    }
+    status_record.limit_kb = 256;
+}
+
+/*
+ * app.control list, status and logs: synchronous on the caller's task, each a job of the I/O worker (the store is the worker's,
+ * X11) that the caller waits for. list is the store's apps, most recent first, each with its version, its state (the record's
+ * for the record's app, stopped for the rest), its last error and its messages. status is the record's (apps_install_status)
+ * for the record's app, and a stopped one by its manifest for any other, with the store's storage and hint, its log the last 50
+ * lines (D26); logs is those lines alone. An id the gadget doesn't have is not_found; one that can't be an id is refused at once.
+ */
+static void control_list_and_status(void) {
+    int before = delays;
+    EXPECT_RESULT(muse_apps_list(), "{\"ok\":true,\"payload\":{\"apps\":[]}}");
+    CHECK(n_jobs == 0 && delays > before, "the list was the worker's job, waited for");
+    install_two();
+    record_hello_crashed(3);
+    EXPECT_RESULT(muse_apps_list(),
+                  "{\"ok\":true,\"payload\":{\"apps\":[{\"id\":\"timer\",\"name\":\"Timer\",\"version\":\"0.3\",\"state\":\"stopped\","
+                  "\"last_error\":\"\",\"messages\":{\"start\":\"Start a countdown.\",\"status\":\"Replies {state, remaining}.\"}},"
+                  "{\"id\":\"hello\",\"name\":\"Hello\",\"version\":\"1.0.0\",\"state\":\"crashed\",\"last_error\":\"main.lua:1: "
+                  "boom\\nstack traceback:\\n\\tmain.lua:1: in main chunk\",\"messages\":{}}]}}");
+    /* A hung app is hung. */
+    status_record.state = APPS_STATE_HUNG;
+    cJSON *r = muse_apps_list();
+    CHECK(strcmp(at_path(listed_app(r, 1), "state"), "hung") == 0 && strcmp(at_path(listed_app(r, 0), "state"), "stopped") == 0,
+          "hello hung, timer stopped");
+    cJSON_Delete(r);
+    status_record.state = APPS_STATE_CRASHED;
+
+    /* status: the record's app, with the store's words. */
+    r = muse_apps_status("hello", false);
+    CHECK_AT(r, "ok", "true");
+    CHECK_AT(r, "payload.state", "crashed");
+    CHECK_AT(r, "payload.id", "hello");
+    CHECK_AT(r, "payload.version", "1.0.0");
+    CHECK_AT(r, "payload.last_error", "main.lua:1: boom\nstack traceback:\n\tmain.lua:1: in main chunk");
+    CHECK_AT(r, "payload.log", "[\"line 00\",\"line 01\",\"line 02\"]");
+    CHECK_AT(r, "payload.limit_kb", "256");
+    CHECK_AT(r, "payload.cpu_pct", "0");
+    CHECK_AT(r, "payload.storage", "ram");
+    CHECK_AT(r, "payload.hint", APPS_RAM_HINT);
+    cJSON_Delete(r);
+    /* An installed app that isn't the record's: stopped, by its manifest, with nothing else to say. */
+    r = muse_apps_status("timer", false);
+    CHECK_AT(r, "payload.state", "stopped");
+    CHECK_AT(r, "payload.id", "timer");
+    CHECK_AT(r, "payload.name", "Timer");
+    CHECK_AT(r, "payload.version", "0.3");
+    CHECK_AT(r, "payload.front", "false");
+    CHECK_AT(r, "payload.last_error", "");
+    CHECK_AT(r, "payload.log", "[]");
+    CHECK_AT(r, "payload.ui", "[]");
+    CHECK_AT(r, "payload.limit_kb", "256");
+    cJSON_Delete(r);
+    store_mode = APPS_STORAGE_FLASH;
+    r = muse_apps_status("timer", false);
+    CHECK_AT(r, "payload.storage", "flash");
+    CHECK_AT(r, "payload.hint", "(none)");
+    cJSON_Delete(r);
+    store_mode = APPS_STORAGE_RAM;
+    /* Ids the gadget doesn't have, and ids that can't be. */
+    EXPECT_RESULT(muse_apps_status("nosuch", false),
+                  "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"" NOT_FOUND("nosuch") "\"}}");
+    EXPECT_RESULT(muse_apps_status("nosuch", true),
+                  "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"" NOT_FOUND("nosuch") "\"}}");
+    EXPECT_RESULT(muse_apps_status("Bad", false), "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"app id 'Bad' "
+                                                  "must match ^[a-z][a-z0-9_]{1,23}$\"}}");
+    EXPECT_RESULT(muse_apps_status(NULL, false), "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"app id '' "
+                                                 "must match ^[a-z][a-z0-9_]{1,23}$\"}}");
+    store_mode = APPS_STORAGE_NONE;
+    EXPECT_RESULT(muse_apps_status("hello", false),
+                  "{\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"storage not ready\"}}");
+    store_mode = APPS_STORAGE_RAM;
+
+    /* The last 50 lines, in status and in logs (D26), of a log of 60. */
+    record_hello_crashed(60);
+    char want[1200];
+    size_t at = (size_t)snprintf(want, sizeof want, "{\"ok\":true,\"payload\":{\"id\":\"hello\",\"log\":[");
+    for (int i = 10; i < 60; i++) {
+        at += (size_t)snprintf(want + at, sizeof want - at, "%s\"line %02d\"", i > 10 ? "," : "", i);
+    }
+    snprintf(want + at, sizeof want - at, "]}}");
+    EXPECT_RESULT(muse_apps_status("hello", true), want);
+    r = muse_apps_status("hello", false);
+    const cJSON *log = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(r, "payload"), "log");
+    CHECK(cJSON_GetArraySize(log) == 50 && strcmp(cJSON_GetArrayItem(log, 0)->valuestring, "line 10") == 0 &&
+              strcmp(cJSON_GetArrayItem(log, 49)->valuestring, "line 59") == 0,
+          "status: the last 50 lines");
+    cJSON_Delete(r);
+    EXPECT_RESULT(muse_apps_status("timer", true), "{\"ok\":true,\"payload\":{\"id\":\"timer\",\"log\":[]}}");
+    CHECK(n_jobs == 0 && internal_blocks == 0, "nothing left waiting");
+    memset(&status_record, 0, sizeof status_record);
+}
+
+/*
+ * A synchronous wait is bounded (D20: MUSE_APPS_CONTROL_WAIT_MS, 500): with the worker held in a long job, list says busy once
+ * the wait is over, and the job, when it runs, finds nobody waiting and frees what it made and its request (its one block of
+ * internal RAM, for the atomic). A worker that can't take the job, and no memory for the request, refuse at once.
+ */
+static void control_list_waits_at_most_500_ms(void) {
+    install_hello();
+    size_t held = port_held, cjson = cjson_held;
+    int blocks = internal_blocks;
+    worker_busy = true;
+    int64_t t0 = fake_ms;
+    EXPECT_RESULT(muse_apps_list(), "{\"ok\":false,\"error\":{\"code\":\"busy\",\"message\":\"" CONTROL_BUSY "\"}}");
+    CHECK(fake_ms - t0 >= MUSE_APPS_CONTROL_WAIT_MS && fake_ms - t0 <= MUSE_APPS_CONTROL_WAIT_MS + 10, "waited %lld ms",
+          (long long)(fake_ms - t0));
+    CHECK(n_jobs == 1 && internal_blocks == blocks + 1, "the job waits still, with its request");
+    t0 = fake_ms;
+    EXPECT_RESULT(muse_apps_status("hello", true), "{\"ok\":false,\"error\":{\"code\":\"busy\",\"message\":\"" CONTROL_BUSY "\"}}");
+    CHECK(fake_ms - t0 == MUSE_APPS_CONTROL_WAIT_MS && n_jobs == 2, "status waits as long: %lld ms", (long long)(fake_ms - t0));
+    worker_busy = false;
+    run_jobs();
+    CHECK(internal_blocks == blocks && port_held == held && cjson_held == cjson, "the late jobs freed everything: %d blocks, %zu, %zu",
+          internal_blocks - blocks, port_held - held, cjson_held - cjson);
+    /* Refused at once. */
+    submit_refuses = true;
+    t0 = fake_ms;
+    EXPECT_RESULT(muse_apps_list(), "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"" APPS_IO_REFUSED "\"}}");
+    submit_refuses = false;
+    internal_refuses = true;
+    EXPECT_RESULT(muse_apps_status("hello", false), "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"out of "
+                                                    "memory: no room for the request\"}}");
+    internal_refuses = false;
+    CHECK(fake_ms == t0 && n_jobs == 0 && internal_blocks == blocks, "no wait, nothing queued, nothing held");
+}
+
+/*
+ * launch, stop and remove: queued like an install (D20), done once on the worker. launch loads the store's copy and runs it by id
+ * in front with the settle (an app of that id that runs is fronted, not started again: apps_task_run_by_id), and answers the
+ * status; a store that refuses the load (the quarantine) says why, and a run that crashed says so as a launch does (apps_install.h).
+ * stop stops the app if it is the one that runs, and answers {} either way; remove is the store's (Task 20), which refuses the app
+ * that runs.
+ */
+static void control_launch_stop_remove(void) {
+    install_two();
+    const char *code = NULL, *err = NULL;
+    int tag;
+    /* launch */
+    CHECK(muse_apps_launch_async("hello", on_done, &tag, &code, &err), "not queued: %s: %s", code, err);
+    CHECK(n_jobs == 1 && dones == 0, "queued, not run");
+    memset(&status_record, 0, sizeof status_record);
+    status_record.state = APPS_STATE_RUNNING;
+    snprintf(status_record.id, sizeof status_record.id, "hello");
+    snprintf(status_record.ui_dump, sizeof status_record.ui_dump, "[]");
+    status_record.front = true;
+    run_jobs();
+    CHECK(dones == 1 && done_ctx == &tag, "done once, with its ctx");
+    CHECK(runs_by_id == 1 && run_front && run_settle == APPS_SETTLE_MS && strcmp(run_id, "hello") == 0, "run by id, in front, settled");
+    CHECK_AT(done_result, "ok", "true");
+    CHECK_AT(done_result, "payload.state", "running");
+    CHECK_AT(done_result, "payload.id", "hello");
+    CHECK_AT(done_result, "payload.front", "true");
+    CHECK_AT(done_result, "payload.storage", "ram");
+    CHECK_AT(done_result, "payload.hint", APPS_RAM_HINT);
+    /* Not on the gadget; refused by the store (the quarantine); crashed in start(); no store yet. */
+    CHECK(muse_apps_launch_async("nosuch", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "error.code", "not_found");
+    CHECK_AT(done_result, "error.message", NOT_FOUND("nosuch"));
+    store_load_refusal = "hello was running during two restarts in a row; reinstall it to run it again";
+    CHECK(muse_apps_launch_async("hello", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    store_load_refusal = NULL;
+    CHECK_AT(done_result, "error.code", "unavailable");
+    CHECK_AT(done_result, "error.message", "hello was running during two restarts in a row; reinstall it to run it again");
+    run_ok = false;
+    snprintf(run_err, sizeof run_err, "crashed in start(): main.lua:2: boom");
+    run_error_record = "main.lua:2: boom\nstack traceback:\n\tmain.lua:2: in function 'start'";
+    CHECK(muse_apps_launch_async("hello", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    run_ok = true;
+    run_error_record = "";
+    static const char crashed[] = "crashed in start(): main.lua:2: boom\nstack traceback:\n\tmain.lua:2: in function 'start'\nlog:\n";
+    CHECK_AT(done_result, "error.code", "crashed");
+    CHECK(strncmp(at_path(done_result, "error.message"), crashed, strlen(crashed)) == 0,
+          "a launch's words, with no \"installed but\": %s", at_path(done_result, "error.message"));
+    store_mode = APPS_STORAGE_NONE;
+    CHECK(muse_apps_launch_async("hello", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    store_mode = APPS_STORAGE_RAM;
+    CHECK_AT(done_result, "error.code", "unavailable");
+    CHECK_AT(done_result, "error.message", "storage not ready");
+    CHECK(runs_by_id == 2, "two runs: the first launch and the crash");
+
+    /* stop: the app that runs, if it is that one. */
+    snprintf(running_app, sizeof running_app, "hello");
+    int before = stops;
+    CHECK(muse_apps_stop("hello", on_done, NULL, &code, &err), "queued");
+    CHECK(stops == before, "nothing stopped before the worker runs it");
+    run_jobs();
+    CHECK(stops == before + 1, "stopped");
+    EXPECT_RESULT(done_result, "{\"ok\":true,\"payload\":{}}");
+    done_result = NULL;
+    CHECK(muse_apps_stop("timer", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK(stops == before + 1, "timer doesn't run: nothing stopped");
+    EXPECT_RESULT(done_result, "{\"ok\":true,\"payload\":{}}");
+    done_result = NULL;
+    stop_ok = false;
+    stop_err = "the app stopped responding; no app can run until its stuck call returns or the gadget restarts";
+    CHECK(muse_apps_stop("hello", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    stop_ok = true;
+    CHECK_AT(done_result, "error.code", "busy");
+    CHECK_AT(done_result, "error.message",
+             "the app stopped responding; no app can run until its stuck call returns or the gadget restarts");
+
+    /* remove: not the app that runs; then timer goes; then it isn't there; then no store. */
+    CHECK(muse_apps_remove("hello", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "error.code", "busy");
+    CHECK_AT(done_result, "error.message", "hello is running; stop it first");
+    CHECK(apps_ram_has("hello"), "hello stays");
+    running_app[0] = '\0';
+    CHECK(muse_apps_remove("timer", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    EXPECT_RESULT(done_result, "{\"ok\":true,\"payload\":{\"removed\":\"timer\"}}");
+    done_result = NULL;
+    CHECK(!apps_ram_has("timer") && apps_ram_has("hello"), "timer removed, hello kept");
+    CHECK(muse_apps_remove("timer", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "error.code", "not_found");
+    CHECK_AT(done_result, "error.message", NOT_FOUND("timer"));
+    store_mode = APPS_STORAGE_NONE;
+    CHECK(muse_apps_remove("hello", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    store_mode = APPS_STORAGE_RAM;
+    CHECK_AT(done_result, "error.code", "unavailable");
+    CHECK_AT(done_result, "error.message", "storage not ready");
+    cJSON_Delete(done_result);
+    done_result = NULL;
+
+    /* Refused at once, nothing queued and done never called. */
+    int calls = dones;
+    CHECK(!muse_apps_launch_async("Bad", on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0 &&
+              strcmp(err, "app id must match ^[a-z][a-z0-9_]{1,23}$") == 0,
+          "a bad id: %s: %s", code, err);
+    CHECK(!muse_apps_remove("hello", NULL, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "no done: %s", code);
+    CHECK(!muse_apps_stop(NULL, on_done, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "no id: %s", code);
+    submit_refuses = true;
+    CHECK(!muse_apps_launch_async("hello", on_done, NULL, &code, &err) && strcmp(code, "out_of_memory") == 0 &&
+              strcmp(err, APPS_IO_REFUSED) == 0,
+          "the worker refused: %s: %s", code, err);
+    submit_refuses = false;
+    port_refuse = 0;
+    CHECK(!muse_apps_remove("hello", on_done, NULL, &code, &err) && strcmp(code, "out_of_memory") == 0, "no memory: %s", code);
+    port_refuse = -1;
+    CHECK(n_jobs == 0 && dones == calls, "nothing queued, done never called");
+    memset(&status_record, 0, sizeof status_record);
+}
+
+/*
+ * app.api (D2, and D3 as the user decided it): one job of the I/O worker writes the guide and the timer example (the firmware's
+ * own bytes: EMBED_FILES) to workspace/apps/_guide/ on the VM, logging the DMA RAM's free and lowest marks before and after, and
+ * answers with the paths and what the gadget is: api, screen, fonts, limits, storage and the installed apps. When the VM refuses a
+ * write, the answer carries the guide and the example inline instead, and says why; a write that fails otherwise (busy, out of
+ * memory, timed out) fails app.api with a code, to be asked again.
+ */
+static void guide_written_or_inline(void) {
+    const char *code = NULL, *err = NULL;
+    muse_apps_set_vm_ops(NULL);
+    CHECK(!muse_apps_write_guide(on_done, NULL, &code, &err) && strcmp(code, "unavailable") == 0 &&
+              strcmp(err, "the gadget can't write files on the VM") == 0,
+          "no VM: %s: %s", code, err);
+    muse_apps_set_vm_ops(&FAKE_VM);
+    CHECK(!muse_apps_write_guide(NULL, NULL, &code, &err) && strcmp(code, "invalid_params") == 0, "no done: %s", code);
+    install_two();
+    size_t guide_len, manifest_len, main_len;
+    char *guide = apps_file("apps_guide.md", &guide_len);
+    char *manifest = apps_file("examples/timer/manifest.json", &manifest_len);
+    char *main_lua = apps_file("examples/timer/main.lua", &main_len);
+
+    /* Written. */
+    int tag;
+    CHECK(muse_apps_write_guide(on_done, &tag, &code, &err), "not queued: %s: %s", code, err);
+    CHECK(n_jobs == 1 && vm_writes == 0, "queued, nothing written yet");
+    int64_t started = fake_ms;
+    size_t lowest = dma_lowest;
+    run_jobs();
+    CHECK(dones == 1 && done_ctx == &tag, "done once, with its ctx");
+    CHECK(vm_writes == 3, "three files: %d", vm_writes);
+    static const char *const paths[] = {"workspace/apps/_guide/README.md", "workspace/apps/_guide/timer/manifest.json",
+                                        "workspace/apps/_guide/timer/main.lua"};
+    const char *const bytes[] = {guide, manifest, main_lua};
+    const size_t lens[] = {guide_len, manifest_len, main_len};
+    for (int i = 0; i < 3; i++) {
+        CHECK(strcmp(written[i].path, paths[i]) == 0, "write %d: %s", i, written[i].path);
+        CHECK(written[i].len == lens[i] && memcmp(written[i].data, bytes[i], lens[i]) == 0, "write %d: the firmware's bytes of %s", i,
+              paths[i]);
+        CHECK(written[i].deadline_us > started * 1000 && written[i].deadline_us <= (started + MUSE_APPS_GUIDE_WRITE_MS) * 1000,
+              "write %d: the deadline %lld", i, (long long)written[i].deadline_us);
+    }
+    char want[160];
+    snprintf(want, sizeof want, "DMA free %zu, lowest %zu", dma_free, lowest);
+    const char *at = logged("app.api: writing the guide and the timer to workspace/apps/_guide/");
+    CHECK(at != NULL && strstr(at, want) != NULL, "the DMA reading before: %s", at != NULL ? at : last_log);
+    snprintf(want, sizeof want, "DMA free %zu, lowest %zu", dma_free, lowest - 3 * 512);
+    at = logged("app.api: the guide is on the VM");
+    CHECK(at != NULL && strstr(at, want) != NULL, "the DMA reading after: %s", at != NULL ? at : last_log);
+    CHECK_AT(done_result, "ok", "true");
+    CHECK_AT(done_result, "payload.delivered", "vm");
+    CHECK_AT(done_result, "payload.guide", "workspace/apps/_guide/README.md");
+    CHECK_AT(done_result, "payload.example", "workspace/apps/_guide/timer/");
+    CHECK_AT(done_result, "payload.api", "1");
+    CHECK_AT(done_result, "payload.screen", "{\"w\":466,\"h\":466,\"round\":true,\"safe\":330}");
+    CHECK_AT(done_result, "payload.fonts", "[\"sans14\",\"sans16\",\"sans20\",\"sans28\",\"mono8\",\"mono16\",\"digits48\",\"digits96\"]");
+    CHECK_AT(done_result, "payload.limits.files", "32");
+    CHECK_AT(done_result, "payload.limits.lua_kb", "256");
+    CHECK_AT(done_result, "payload.limits.json_kb", "32");
+    CHECK_AT(done_result, "payload.limits.image_kb", "512");
+    CHECK_AT(done_result, "payload.limits.images_kb", "1536");
+    CHECK_AT(done_result, "payload.limits.app_kb", "2048");
+    CHECK_AT(done_result, "payload.limits.memory_kb", "{\"min\":64,\"default\":256,\"max\":1024}");
+    CHECK_AT(done_result, "payload.limits.widgets", "128");
+    CHECK_AT(done_result, "payload.limits.timers", "16");
+    CHECK_AT(done_result, "payload.limits.alarms", "4");
+    CHECK_AT(done_result, "payload.limits.store_kb", "16");
+    CHECK_AT(done_result, "payload.storage", "ram");
+    CHECK_AT(done_result, "payload.hint", APPS_RAM_HINT);
+    CHECK_AT(done_result, "payload.apps", "[{\"id\":\"timer\",\"name\":\"Timer\",\"version\":\"0.3\",\"state\":\"stopped\"},"
+                                          "{\"id\":\"hello\",\"name\":\"Hello\",\"version\":\"1.0.0\",\"state\":\"stopped\"}]");
+    CHECK_AT(done_result, "payload.guide_text", "(none)");
+    CHECK_AT(done_result, "payload.write_error", "(none)");
+    forget_writes();
+
+    /* The VM refuses the second file: inline, and why. */
+    write_fails_at = 2;
+    CHECK(muse_apps_write_guide(on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK(vm_writes == 2, "nothing written after the refusal: %d", vm_writes);
+    CHECK_AT(done_result, "ok", "true");
+    CHECK_AT(done_result, "payload.delivered", "inline");
+    CHECK_AT(done_result, "payload.write_error", "VM answered HTTP 403: route not allowed for this credential's scopes");
+    CHECK_AT(done_result, "payload.guide", "(none)");
+    CHECK_AT(done_result, "payload.example", "(none)");
+    const cJSON *payload = cJSON_GetObjectItemCaseSensitive(done_result, "payload");
+    const cJSON *text = cJSON_GetObjectItemCaseSensitive(payload, "guide_text");
+    const cJSON *files = cJSON_GetObjectItemCaseSensitive(payload, "example_files");
+    CHECK(cJSON_IsString(text) && strcmp(text->valuestring, guide) == 0, "the guide inline");
+    CHECK(cJSON_GetArraySize(files) == 2 &&
+              strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(files, "manifest.json")), manifest) == 0 &&
+              strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(files, "main.lua")), main_lua) == 0,
+          "the timer inline");
+    CHECK_AT(done_result, "payload.api", "1");
+    CHECK_AT(done_result, "payload.storage", "ram");
+    CHECK(logged("app.api: the VM refused workspace/apps/_guide/timer/manifest.json") != NULL, "the refusal's line: %s", last_log);
+    forget_writes();
+
+    /* Busy, out of memory, timed out: app.api fails with a code, and says to call it again. */
+    static const struct {
+        const char *code, *why, *want_code;
+    } failures[] = {
+        {MUSE_APPS_VM_BUSY, "the VM file writer is busy", "busy"},
+        {MUSE_APPS_VM_OUT_OF_MEMORY, "out of memory", "out_of_memory"},
+        {MUSE_APPS_VM_TIMED_OUT, "write timed out", "unavailable"},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(failures); i++) {
+        write_fails_at = 1;
+        write_code = failures[i].code;
+        write_why = failures[i].why;
+        CHECK(muse_apps_write_guide(on_done, NULL, &code, &err), "queued");
+        run_jobs();
+        CHECK(vm_writes == 1, "one write tried: %d", vm_writes);
+        CHECK_AT(done_result, "error.code", failures[i].want_code);
+        char message[160];
+        snprintf(message, sizeof message, "couldn't write the guide to the VM: %s; call app.api again", failures[i].why);
+        CHECK_AT(done_result, "error.message", message);
+        forget_writes();
+    }
+    write_fails_at = 0;
+    write_code = MUSE_APPS_VM_FAILED;
+    write_why = "VM answered HTTP 403: route not allowed for this credential's scopes";
+    /* Refused at once. */
+    submit_refuses = true;
+    CHECK(!muse_apps_write_guide(on_done, NULL, &code, &err) && strcmp(code, "out_of_memory") == 0 && strcmp(err, APPS_IO_REFUSED) == 0,
+          "the worker refused: %s: %s", code, err);
+    submit_refuses = false;
+    port_refuse = 0;
+    CHECK(!muse_apps_write_guide(on_done, NULL, &code, &err) && strcmp(code, "out_of_memory") == 0, "no memory: %s", code);
+    port_refuse = -1;
+    CHECK(n_jobs == 0 && vm_writes == 0, "nothing queued");
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    free(guide);
+    free(manifest);
+    free(main_lua);
 }
 
 /* F6: the stage holds what was put and a small slack beyond it (with its own block, under 64 KB), so at most 2 MB and
@@ -1887,6 +2518,10 @@ int main(int argc, char **argv) {
         {"a_link_install_is_one_job", a_link_install_is_one_job},
         {"a_second_install_is_busy", a_second_install_is_busy},
         {"link_install_refusals", link_install_refusals},
+        {"control_list_and_status", control_list_and_status},
+        {"control_list_waits_at_most_500_ms", control_list_waits_at_most_500_ms},
+        {"control_launch_stop_remove", control_launch_stop_remove},
+        {"guide_written_or_inline", guide_written_or_inline},
         {"the_stage_is_bounded", the_stage_is_bounded},
         {"empty_and_missing_files", empty_and_missing_files},
         {"console_stack", console_stack},

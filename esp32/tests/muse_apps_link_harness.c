@@ -19,11 +19,11 @@
  * muse_apps_link_harness <case>, one case per test in tests/test_muse_apps_link.py; it exits 0 when the case holds, and
  * otherwise prints why.
  *
- * Fakes: the apps (muse_apps_install records what it was given and answers what the case set; muse_apps_id_valid checks
- * the id's pattern and words a refusal as the real one does), the session (noise_ctrl_send_command_result records the
- * result and frees it, or only frees it, as it does for a session that has ended), the VM file reader and writer
- * (vm_file.h's calls, scripted), the clock, and the PSRAM heap the handler's request context comes from (counted).
- * cJSON's allocations are counted too: each case ends with nothing held.
+ * Fakes: the apps (muse_apps_install, muse_apps_write_guide and app.control's calls record what they were given and answer
+ * what the case set; muse_apps_id_valid checks the id's pattern and words a refusal as the real one does), the session
+ * (noise_ctrl_send_command_result records the result and frees it, or only frees it, as it does for a session that has
+ * ended), the VM file reader and writer (vm_file.h's calls, scripted), the clock, and the PSRAM heap the handler's request
+ * context comes from (counted). cJSON's allocations are counted too: each case ends with nothing held.
  */
 
 #include <limits.h>
@@ -163,6 +163,63 @@ bool muse_apps_install(const char *id, bool run, muse_apps_done_cb done, void *c
         *err = install_err;
     }
     return install_ok;
+}
+
+/* app.control's and app.api's calls. The synchronous two answer the result a case set (NULL for none: no memory); the
+ * asynchronous ones keep their done and ctx, as the install does, and answer what the case set. */
+static int lists, statuses, guides;
+static char status_id[64];
+static bool status_logs;
+static const char *list_result = "{\"ok\":true,\"payload\":{\"apps\":[]}}";
+static const char *status_result = "{\"ok\":true,\"payload\":{\"state\":\"running\"}}";
+
+struct cJSON *muse_apps_list(void) {
+    lists++;
+    return list_result != NULL ? cJSON_Parse(list_result) : NULL;
+}
+
+struct cJSON *muse_apps_status(const char *id, bool logs) {
+    statuses++;
+    snprintf(status_id, sizeof status_id, "%s", id != NULL ? id : "(null)");
+    status_logs = logs;
+    return status_result != NULL ? cJSON_Parse(status_result) : NULL;
+}
+
+static int asyncs;                 /* launch, stop, remove and the guide, together */
+static char async_what[16], async_id[64];
+static muse_apps_done_cb async_done;
+static void *async_ctx;
+static bool async_ok = true;
+static const char *async_code = "busy", *async_err = "the I/O worker is busy";
+
+static bool async_call(const char *what, const char *id, muse_apps_done_cb done, void *ctx, const char **code, const char **err) {
+    asyncs++;
+    snprintf(async_what, sizeof async_what, "%s", what);
+    snprintf(async_id, sizeof async_id, "%s", id != NULL ? id : "(null)");
+    async_done = done;
+    async_ctx = ctx;
+    if (!async_ok) {
+        *code = async_code;
+        *err = async_err;
+    }
+    return async_ok;
+}
+
+bool muse_apps_launch_async(const char *id, muse_apps_done_cb done, void *ctx, const char **code, const char **err) {
+    return async_call("launch", id, done, ctx, code, err);
+}
+
+bool muse_apps_stop(const char *id, muse_apps_done_cb done, void *ctx, const char **code, const char **err) {
+    return async_call("stop", id, done, ctx, code, err);
+}
+
+bool muse_apps_remove(const char *id, muse_apps_done_cb done, void *ctx, const char **code, const char **err) {
+    return async_call("remove", id, done, ctx, code, err);
+}
+
+bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code, const char **err) {
+    guides++;
+    return async_call("guide", NULL, done, ctx, code, err);
 }
 
 /* ---- The session ---- */
@@ -305,40 +362,57 @@ static char *printed(cJSON *r) {
     return copy;
 }
 
-/* The handler's reply to params (a JSON text, or NULL for none) is exactly want. */
-static void expect_reply_at(int line, const char *params_json, const char *request_id, const char *want) {
+/* The handler's reply to command with params (a JSON text, or NULL for none) is exactly want. */
+static void expect_reply_at(int line, const char *command, const char *params_json, const char *request_id, const char *want) {
     cJSON *params = params_json != NULL ? cJSON_Parse(params_json) : NULL;
     CHECK(params_json == NULL || params != NULL, "the case's params: %s", params_json);
-    char *got = printed(apps_link_handle("app.install", params, request_id, 7));
+    char *got = printed(apps_link_handle(command, params, request_id, 7));
     cJSON_Delete(params);
     if (strcmp(got, want) != 0) {
-        fail_at(line, "app.install %s replied\n%s\ninstead of\n%s", params_json ? params_json : "(no params)", got, want);
+        fail_at(line, "%s %s replied\n%s\ninstead of\n%s", command, params_json ? params_json : "(no params)", got, want);
     }
     free(got);
 }
-#define EXPECT_REPLY(params, request_id, want) expect_reply_at(__LINE__, (params), (request_id), (want))
+#define EXPECT_REPLY(params, request_id, want) expect_reply_at(__LINE__, "app.install", (params), (request_id), (want))
+#define EXPECT_CONTROL(params, want) expect_reply_at(__LINE__, "app.control", (params), "r1", (want))
+#define EXPECT_API(params, request_id, want) expect_reply_at(__LINE__, "app.api", (params), (request_id), (want))
 
 /* ---- The cases ---- */
 
-/* The app.* entries of link.register's commands_v2: printed for the Python test, which checks them against the budget. */
-static void register_entries(void) {
-    cJSON *commands = cJSON_CreateObject();
-    CHECK(commands != NULL, "no memory");
-    apps_link_register(commands);
+/* commands printed as "@<tag> <json>", then freed. */
+static void print_commands(const char *tag, cJSON *commands) {
     char *text = cJSON_PrintUnformatted(commands);
     CHECK(text != NULL, "no memory to print");
-    printf("@register %s\n", text);
+    printf("@%s %s\n", tag, text);
     cJSON_free(text);
     cJSON_Delete(commands);
 }
 
-/* Which commands are this file's: app.install, and nothing it doesn't handle. */
+/* The app.* entries of link.register's commands_v2, printed for the Python test, which checks them against the budget:
+ * "@register", what is advertised, and "@all", that and app.send's entry (D11: built now, advertised with its handler in
+ * Task 24), all four of the apps' entries. */
+static void register_entries(void) {
+    cJSON *commands = cJSON_CreateObject();
+    CHECK(commands != NULL, "no memory");
+    apps_link_register(commands);
+    print_commands("register", commands);
+    cJSON *all = cJSON_CreateObject();
+    CHECK(all != NULL, "no memory");
+    apps_link_register(all);
+    apps_link_register_send(all);
+    print_commands("all", all);
+}
+
+/* Which commands are this file's: app.install, app.api and app.control, and nothing it doesn't handle (app.send's handler
+ * is Task 24's). */
 static void handles(void) {
     CHECK(apps_link_handles("app.install"), "app.install");
-    static const char *const others[] = {"app.api", "app.control", "app.send", "app.", "app", "device.health", "ble.state",
-                                         "app.install ", ""};
+    CHECK(apps_link_handles("app.api"), "app.api");
+    CHECK(apps_link_handles("app.control"), "app.control");
+    static const char *const others[] = {"app.send", "app.", "app", "device.health", "ble.state", "app.install ",
+                                         "app.API", "app.controls", ""};
     for (size_t i = 0; i < ARRAY_LEN(others); i++) {
-        CHECK(!apps_link_handles(others[i]), "'%s' isn't app.install's", others[i]);
+        CHECK(!apps_link_handles(others[i]), "'%s' isn't one of this file's", others[i]);
     }
     CHECK(!apps_link_handles(NULL), "no command");
     char *got = printed(apps_link_handle("app.nope", NULL, "r1", 7));
@@ -422,6 +496,201 @@ static void install_handler(void) {
                  "{\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"the gadget can't read files on the VM\"}}");
     install_ok = true;
     CHECK(installs == 5 && sends == 3 && psram_blocks == 0, "refused twice, nothing sent, nothing held");
+}
+
+#define ACTIONS "list, status, logs, launch, stop, remove, snapshot"
+#define ASYNC "{\"_async\":true}"
+
+/* Done for the asynchronous call the case just started: the result is sent once, as request rid of session 7, and the
+ * request is freed. */
+static void finish_async_at(int line, const char *rid) {
+    CHECK(async_done != NULL && async_ctx != NULL && psram_blocks == 1, "a request of its own, waiting for done (line %d)", line);
+    int before = sends;
+    async_done(async_ctx, cJSON_Parse("{\"ok\":true,\"payload\":{}}"));
+    async_done = NULL;
+    async_ctx = NULL;
+    if (sends != before + 1 || sent_generation != 7 || strcmp(sent_request, rid) != 0 ||
+        strcmp(sent_result, "{\"ok\":true,\"payload\":{}}") != 0) {
+        fail_at(line, "sent %d results, as %s of session %u: %s", sends - before, sent_request, (unsigned)sent_generation,
+                sent_result);
+    }
+    CHECK(psram_blocks == 0, "the request freed (line %d)", line);
+}
+#define FINISH_ASYNC(rid) finish_async_at(__LINE__, (rid))
+
+/*
+ * app.control's parser, on the Noise session's task: action is one of the seven, as typed; id is an app id for all but
+ * list. list, status and logs answer at once with what muse_apps_list and muse_apps_status gave (status false, logs true);
+ * launch, stop and remove are queued like an install, {"_async":true}, their request copied and freed once done has sent
+ * the result; snapshot is refused until Task 25 (D27). A refusal of a call is the reply, with its code, and frees the
+ * request.
+ */
+static void control_handler(void) {
+    /* The action. */
+    EXPECT_CONTROL(NULL, "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"action is required: one of " ACTIONS
+                         "\"}}");
+    EXPECT_CONTROL("{}", "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"action is required: one of " ACTIONS
+                         "\"}}");
+    EXPECT_CONTROL("{\"action\":null}", "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"action is required: "
+                                        "one of " ACTIONS "\"}}");
+    static const char *const bad_actions[] = {"{\"action\":\"nope\"}", "{\"action\":\"List\"}", "{\"action\":\"list \"}",
+                                              "{\"action\":\"\"}", "{\"action\":5}", "{\"action\":[\"list\"]}",
+                                              "{\"action\":\"send\"}", "{\"action\":\"install\"}"};
+    for (size_t i = 0; i < ARRAY_LEN(bad_actions); i++) {
+        EXPECT_CONTROL(bad_actions[i], "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"action must be one of "
+                                       ACTIONS "\"}}");
+    }
+    /* The id, for every action but list. */
+    static const char *const needs_id[] = {"status", "logs", "launch", "stop", "remove", "snapshot"};
+    for (size_t i = 0; i < ARRAY_LEN(needs_id); i++) {
+        char params[96], want[160];
+        snprintf(params, sizeof params, "{\"action\":\"%s\"}", needs_id[i]);
+        snprintf(want, sizeof want, "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"id is required for %s\"}}",
+                 needs_id[i]);
+        EXPECT_CONTROL(params, want);
+        snprintf(params, sizeof params, "{\"action\":\"%s\",\"id\":\"\"}", needs_id[i]);
+        EXPECT_CONTROL(params, want);
+        snprintf(params, sizeof params, "{\"action\":\"%s\",\"id\":7}", needs_id[i]);
+        EXPECT_CONTROL(params, "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"id must be a string\"}}");
+        snprintf(params, sizeof params, "{\"action\":\"%s\",\"id\":\"Timer\"}", needs_id[i]);
+        EXPECT_CONTROL(params, "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"app id 'Timer' must match "
+                               "^[a-z][a-z0-9_]{1,23}$\"}}");
+    }
+    CHECK(lists == 0 && statuses == 0 && asyncs == 0 && psram_blocks == 0, "nothing called, nothing held");
+
+    /* list, status and logs: what the apps gave, as it is. list takes no id, and an id given is ignored. */
+    EXPECT_CONTROL("{\"action\":\"list\"}", "{\"ok\":true,\"payload\":{\"apps\":[]}}");
+    EXPECT_CONTROL("{\"action\":\"list\",\"id\":\"Not An Id\"}", "{\"ok\":true,\"payload\":{\"apps\":[]}}");
+    CHECK(lists == 2, "listed twice: %d", lists);
+    EXPECT_CONTROL("{\"action\":\"status\",\"id\":\"timer\"}", "{\"ok\":true,\"payload\":{\"state\":\"running\"}}");
+    CHECK(statuses == 1 && strcmp(status_id, "timer") == 0 && !status_logs, "status of timer, without logs");
+    EXPECT_CONTROL("{\"action\":\"logs\",\"id\":\"hello\"}", "{\"ok\":true,\"payload\":{\"state\":\"running\"}}");
+    CHECK(statuses == 2 && strcmp(status_id, "hello") == 0 && status_logs, "logs of hello");
+    list_result = NULL;
+    status_result = NULL;
+    EXPECT_CONTROL("{\"action\":\"list\"}", "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"out of memory: "
+                                            "no room for the answer\"}}");
+    EXPECT_CONTROL("{\"action\":\"status\",\"id\":\"timer\"}", "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":"
+                                                             "\"out of memory: no room for the answer\"}}");
+    list_result = "{\"ok\":true,\"payload\":{\"apps\":[]}}";
+    status_result = "{\"ok\":true,\"payload\":{\"state\":\"running\"}}";
+    CHECK(psram_blocks == 0 && sends == 0, "nothing held, nothing sent: the reply is the answer");
+
+    /* launch, stop and remove: queued, and done sends the result once. */
+    static const char *const queued[] = {"launch", "stop", "remove"};
+    for (size_t i = 0; i < ARRAY_LEN(queued); i++) {
+        char params[96], request[16];
+        snprintf(params, sizeof params, "{\"action\":\"%s\",\"id\":\"timer\"}", queued[i]);
+        snprintf(request, sizeof request, "req-%zu", i);
+        char rid[16];
+        memcpy(rid, request, sizeof rid);
+        expect_reply_at(__LINE__, "app.control", params, request, ASYNC);
+        memset(request, 'x', sizeof request - 1);  /* the request is a copy */
+        CHECK(strcmp(async_what, queued[i]) == 0 && strcmp(async_id, "timer") == 0, "%s of %s", async_what, async_id);
+        CHECK(psram_caps & MALLOC_CAP_SPIRAM, "the request is in PSRAM: caps 0x%x", (unsigned)psram_caps);
+        FINISH_ASYNC(rid);
+    }
+    /* The session ended before the result: freed all the same. */
+    EXPECT_CONTROL("{\"action\":\"remove\",\"id\":\"hello\"}", ASYNC);
+    session_ended = true;
+    int before = sends;
+    async_done(async_ctx, NULL);
+    session_ended = false;
+    CHECK(sends == before + 1 && psram_blocks == 0, "handed to the send once, and the request freed");
+    /* No memory for the result: done sends one that says so. */
+    EXPECT_CONTROL("{\"action\":\"stop\",\"id\":\"hello\"}", ASYNC);
+    async_done(async_ctx, NULL);
+    CHECK(strcmp(sent_result, "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"out of memory: no room for the "
+                              "result\"}}") == 0 && psram_blocks == 0, "%s", sent_result);
+    /* A refusal is the reply, with its code, and the request goes. */
+    async_ok = false;
+    async_code = "not_found";
+    async_err = "no such app on the gadget";
+    EXPECT_CONTROL("{\"action\":\"launch\",\"id\":\"nosuch\"}",
+                   "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no such app on the gadget\"}}");
+    async_ok = true;
+    CHECK(psram_blocks == 0, "the refused request freed");
+    /* Without a request id, or one too long, or no memory for the request: refused before anything is queued. */
+    int calls = asyncs;
+    expect_reply_at(__LINE__, "app.control", "{\"action\":\"launch\",\"id\":\"timer\"}", NULL,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"request_id is invalid\"}}");
+    char long_id[80];
+    memset(long_id, 'r', 64);
+    long_id[64] = '\0';
+    expect_reply_at(__LINE__, "app.control", "{\"action\":\"stop\",\"id\":\"timer\"}", long_id,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"request_id is invalid\"}}");
+    psram_refuses = true;
+    EXPECT_CONTROL("{\"action\":\"remove\",\"id\":\"timer\"}",
+                   "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"failed to allocate\"}}");
+    psram_refuses = false;
+    CHECK(asyncs == calls && psram_blocks == 0, "none of them queued");
+
+    /* snapshot: not in this firmware (D27). */
+    EXPECT_CONTROL("{\"action\":\"snapshot\",\"id\":\"timer\"}",
+                   "{\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"snapshots arrive in a later firmware\"}}");
+    CHECK(asyncs == calls && psram_blocks == 0 && installs == 0, "nothing queued for a snapshot");
+}
+
+/* Whether link.register advertises app.control (the headroom rule: tests/test_muse_apps_link.py measures it). */
+static bool control_advertised(void) {
+    cJSON *commands = cJSON_CreateObject();
+    CHECK(commands != NULL, "no memory");
+    apps_link_register(commands);
+    bool there = cJSON_GetObjectItemCaseSensitive(commands, "app.control") != NULL;
+    cJSON_Delete(commands);
+    return there;
+}
+
+/*
+ * app.api (D2): no params; the handler copies request_id and session_generation into a request of its own and returns
+ * {"_async":true}, never waiting for the guide's writes, which only the session's task can pump; done sends the result once
+ * and frees the request, also when the session has ended. The payload names app.control only when link.register leaves it
+ * out (the headroom rule). A refusal is the reply and frees the request.
+ */
+static void api_handler(void) {
+    char request[64];
+    snprintf(request, sizeof request, "api-1");
+    EXPECT_API(NULL, request, ASYNC);
+    memset(request, 'x', sizeof request - 1);
+    CHECK(guides == 1 && strcmp(async_what, "guide") == 0, "the guide's writes queued");
+    CHECK(psram_caps & MALLOC_CAP_SPIRAM, "the request is in PSRAM: caps 0x%x", (unsigned)psram_caps);
+    CHECK(sends == 0, "nothing sent before done");
+    int before = sends;
+    async_done(async_ctx, cJSON_Parse("{\"ok\":true,\"payload\":{\"api\":1}}"));
+    CHECK(sends == before + 1 && sent_generation == 7 && strcmp(sent_request, "api-1") == 0, "sent once as api-1: %s",
+          sent_request);
+    const char *want = control_advertised() ? "{\"ok\":true,\"payload\":{\"api\":1}}"
+                                            : "{\"ok\":true,\"payload\":{\"api\":1,\"control\":\"app.control {action, id}\"}}";
+    CHECK(strcmp(sent_result, want) == 0, "%s instead of %s", sent_result, want);
+    CHECK(psram_blocks == 0, "the request freed");
+    /* Params are ignored: app.api has none. */
+    EXPECT_API("{\"id\":\"timer\"}", "api-2", ASYNC);
+    async_done(async_ctx, cJSON_Parse("{\"ok\":false,\"error\":{\"code\":\"busy\",\"message\":\"the VM file writer is busy\"}}"));
+    CHECK(strcmp(sent_result, "{\"ok\":false,\"error\":{\"code\":\"busy\",\"message\":\"the VM file writer is busy\"}}") == 0,
+          "a failure is sent as it is: %s", sent_result);
+    /* No memory for the result; an ended session. */
+    EXPECT_API(NULL, "api-3", ASYNC);
+    async_done(async_ctx, NULL);
+    CHECK(strcmp(sent_result, "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"out of memory: no room for the "
+                              "result\"}}") == 0, "%s", sent_result);
+    EXPECT_API(NULL, "api-4", ASYNC);
+    session_ended = true;
+    async_done(async_ctx, cJSON_Parse("{\"ok\":true,\"payload\":{\"api\":1}}"));
+    session_ended = false;
+    CHECK(psram_blocks == 0, "every request freed");
+    /* Refused: no VM ops, a worker that can't take it; no request id; no memory for the request. */
+    async_ok = false;
+    async_code = "unavailable";
+    async_err = "the gadget can't write files on the VM";
+    EXPECT_API(NULL, "api-5", "{\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"the gadget can't write files on the "
+                              "VM\"}}");
+    async_ok = true;
+    int calls = guides;
+    EXPECT_API(NULL, NULL, "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"request_id is invalid\"}}");
+    psram_refuses = true;
+    EXPECT_API(NULL, "api-6", "{\"ok\":false,\"error\":{\"code\":\"out_of_memory\",\"message\":\"failed to allocate\"}}");
+    psram_refuses = false;
+    CHECK(guides == calls && psram_blocks == 0, "nothing queued, nothing held");
 }
 
 /* The sink the adapter's reads are given here: it keeps what it gets. */
@@ -563,6 +832,8 @@ int main(int argc, char **argv) {
         {"register_entries", register_entries},
         {"handles", handles},
         {"install_handler", install_handler},
+        {"control_handler", control_handler},
+        {"api_handler", api_handler},
         {"vm_ops_are_vm_file", vm_ops_are_vm_file},
     };
     if (argc != 2) {

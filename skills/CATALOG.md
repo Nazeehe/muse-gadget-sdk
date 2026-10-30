@@ -1,11 +1,15 @@
 # Skill Catalog
 
-43 active skills: 42 device/family skills and one shared Google Cast skill.
+44 active skills: 42 device/family skills, one shared Google Cast skill and one for Muse gadget apps.
 Use the matching device skill for model compatibility, setup, safety and supported operations.
 
 ## Shared protocol
 
 - [Google Cast](gadget-google-cast/SKILL.md) — media, volume and existing speaker groups.
+
+## Muse gadget apps
+
+- [Muse gadget apps](gadget-muse-apps/SKILL.md) — write, install and manage apps on the gadget's round screen.
 
 ## Lights and plugs
 

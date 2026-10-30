@@ -113,6 +113,9 @@ typedef struct muse_apps_vm_ops {
 /* The VM's files from now on (NULL: none). ops is kept, not copied: a static table. Any task, before or after muse_apps_start. */
 void muse_apps_set_vm_ops(const muse_apps_vm_ops_t *ops);
 
+/* The VM's files as last set (NULL: none). Any task. */
+const muse_apps_vm_ops_t *muse_apps_vm_ops(void);
+
 /* What the apps' asynchronous calls answer, once, on the I/O worker: a command's result, {"ok":true,"payload":{...}} or
  * {"ok":false,"error":{"code","message"}}, whose ownership passes to the callback (cJSON_Delete it, or hand it on); NULL only
  * when there was no memory for even that. */
@@ -138,6 +141,63 @@ bool muse_apps_id_valid(const char *id, char *err, size_t err_len);
  *   out_of_memory    no memory for the job, or the I/O worker can't take it now ("... try again in a few seconds")
  */
 bool muse_apps_install(const char *id, bool run, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
+
+/*
+ * Link's app.control and app.api (apps_control.c; main/apps_link.c has the commands). Any task, the Noise session's included,
+ * which they never hold for long: list and status wait for one job of the I/O worker (the store is the worker's: X11) for at most
+ * MUSE_APPS_CONTROL_WAIT_MS, and the others queue theirs and return.
+ *
+ * Results are a command's: {"ok":true,"payload":{...}} or {"ok":false,"error":{"code","message"}}. The codes are D14's
+ * (invalid_params, not_found, busy, unavailable, out_of_memory) and a launch's own (apps_install.h: crashed, not_running). An id
+ * the gadget hasn't installed is not_found, MUSE_APPS_NOT_FOUND, and a store that isn't mounted yet is unavailable, "storage not
+ * ready". The caller owns a result (cJSON_Delete); NULL only when there was no memory for even a refusal.
+ */
+#define MUSE_APPS_CONTROL_WAIT_MS 500   /* list and status: the most they wait for the worker, then busy */
+#define MUSE_APPS_LOG_LINES 50          /* the log's last lines that status and logs show (D26) */
+#define MUSE_APPS_GUIDE_WRITE_MS 20000  /* app.api: the guide's writes end by then (the VM waits 30 s for the result) */
+#define MUSE_APPS_GUIDE_DIR "workspace/apps/_guide/"
+#define MUSE_APPS_NOT_FOUND "no app '%s' on this gadget (app.control list shows the installed ones)"
+
+/* {"apps":[{"id","name","version","state","last_error","messages":{...}}]}, in the store's order (most recent first). state and
+ * last_error are the app task's record for the record's app (the last one that ran), "stopped" and "" for the others; messages
+ * are the manifest's, {} for none. Busy when the worker hasn't answered within MUSE_APPS_CONTROL_WAIT_MS (an install holds it,
+ * say): the job, when it runs, frees what it made. */
+struct cJSON *muse_apps_list(void);
+
+/* The installed app id: apps_install_status's fields (state, id, name, version, front, last_error with its traceback, warnings,
+ * log, ui, instructions, mem_kb, peak_kb, limit_kb, worst_dispatch_ms, cpu_pct, dropped_events, stack_free, widgets) and
+ * "storage" with the store's "hint". For the record's app they are the record's; for any other, a stopped app as its manifest
+ * has it (name, version, limit_kb) and nothing else. The log is its last MUSE_APPS_LOG_LINES lines; with logs the payload is
+ * {"id","log"} alone. Waits as muse_apps_list does. */
+struct cJSON *muse_apps_status(const char *id, bool logs);
+
+/*
+ * launch, stop and remove, queued on the I/O worker (D20) and answered once through done, as muse_apps_install is: true once
+ * queued, and done then runs exactly once, on the worker; false, with nothing queued and done never called, and *code and *err
+ * (literals) saying why: invalid_params (not an app id, no done) or out_of_memory (no memory for the job, or the worker can't
+ * take it now).
+ *   launch  runs the store's copy of id in front by id, with APPS_SETTLE_MS (apps_task_run_by_id: an app of that id that runs is
+ *           fronted, not started again). The result is muse_apps_status's for it, or the launch's failure (apps_install_launch's
+ *           crashed or not_running), not_found, or the store's refusal as unavailable (the quarantine, a damaged copy, no room).
+ *   stop    stops the app if id is the one that runs (apps_task_stop): {} either way, or busy with the app task's words.
+ *   remove  apps_store_remove: the app's files, values, alarms and quarantine go. {"removed":id}, or busy for the app that runs,
+ *           not_found or unavailable.
+ */
+bool muse_apps_launch_async(const char *id, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
+bool muse_apps_stop(const char *id, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
+bool muse_apps_remove(const char *id, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
+
+/*
+ * app.api (D2, and D3 as the user decided it): one job of the I/O worker writes the guide and the timer example that the firmware
+ * carries (apps/apps_guide.md and apps/examples/timer/, EMBED_FILES) to MUSE_APPS_GUIDE_DIR on the VM, as README.md,
+ * timer/manifest.json and timer/main.lua, through the VM ops' write. It logs the DMA RAM's free and lowest marks before and after
+ * the writes (the session's sends need it), and answers {"delivered":"vm","guide","example","api","screen","fonts","limits",
+ * "storage"[,"hint"],"apps":[{"id","name","version","state"}]}. When the VM refuses a write (MUSE_APPS_VM_FAILED) the answer is
+ * {"delivered":"inline","write_error",...,"guide_text","example_files":{"manifest.json","main.lua"}} instead, with the same facts;
+ * a write that is busy, out of memory or out of time fails app.api (busy, out_of_memory, unavailable), to be called again. Any
+ * task; refusals as above, and unavailable when the gadget has no VM ops.
+ */
+bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code, const char **err);
 
 /* Makes the app layer on screen (apps_lv_build) and takes its touches and swipes. In build_overlays(), after the
  * page dots and before the downloaded image, under the display lock and before the frame timer exists. */

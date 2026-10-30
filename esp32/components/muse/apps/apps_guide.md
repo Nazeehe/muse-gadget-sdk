@@ -24,6 +24,7 @@ manifest.json, a JSON object of at most 8 KB:
 - `api` (required): `1`, a JSON integer (`1.0` isn't one).
 - `main` (optional): the main `.lua` file, `"main.lua"` if left out.
 - `files` (optional): every other file, like `["util.lua", "assets/bell.bin"]`: modules for `require`, `.json` data and images.
+- `icon` (optional): one of `files`, a square `.bin` image at most 160 x 160 (120 x 120 looks best), shown in the launcher. See Icons.
 - `permissions` (optional): any of `sound` (for `sound.chirp`), `alarm` (the `alarm` module), `store` (the `store` module) and `keep_awake` (for `sys.keep_awake`). `net`, `secrets` and `muse` aren't available in this firmware yet.
 - `memory_kb` (optional): the Lua heap, a whole number from 64 to 1024; 256 if left out.
 - `messages` (optional): up to 16 event names, each with a description under 200 characters: the events Muse may send with `app.send`. Describe the data each takes and what it replies.
@@ -216,6 +217,16 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 - An image is at most 466 x 466 px and 512 KB, and an app's images 1.5 MB together.
 - `scale` is a percentage: a scaled image's box is the scaled size. A w and h you give a scaled image are its box: the picture is centred in it and can spill past it. A scaled picture lands within 1 px of its box (2 px for an odd size at 400%), and a side that scales to under about 1 px draws nothing.
 
+## Icons
+
+The launcher shows each app by its icon.
+
+- Make one with every app: a `.bin` image the manifest names with `icon` and lists in `files`, square and at most 160 x 160 px (120 x 120 looks best).
+- Draw one bold, simple shape that reads at a small size, on a transparent background.
+- Convert it like any other image, with `--cf RGB565A8` (see Images).
+- An app without an icon shows as a coloured circle with the first letter of its name.
+- When the user asks for "an icon for X", reinstall X with one: draw it, convert it, add `"icon"` and the file to the manifest, and install X again.
+
 ## The loop
 
 1. Call `app.api`. It writes this guide and the timer example to `workspace/apps/_guide/`, and returns what the gadget is: `api`, `screen`, `fonts`, `limits`, `storage` and the installed `apps`. If the VM refuses the files, it returns the guide in `guide_text` and the example in `example_files` instead.
@@ -250,6 +261,9 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `manifest: id '<id>' must match ^[a-z][a-z0-9_]{1,23}$ and the folder name '<folder>'`: make the id lower case and the same as the folder's name.
 - `manifest: name must be 1 to 24 characters`: give a short `name`.
 - `manifest: files[<n>] '<path>' has an unsupported type (use .lua, .json or .bin)`: convert the file (images with LVGLImage.py), or leave it out.
+- `manifest: icon '<path>' is not one of the app's files`: list the icon's file in `files`, or fix the path in `icon`.
+- `manifest: icon '<path>' must be a .bin image`: name a `.bin` made with LVGLImage.py (see Icons).
+- `icon: <w>x<h> must be square, at most 160x160`: redraw the icon square and at most 160 x 160 px (120 x 120), and convert it again.
 - `manifest: unknown permission '<name>' (valid: sound, alarm, store, keep_awake)`: use one of those.
 - `manifest: permission '<name>' is not available in this firmware yet (api 1)`: do without it.
 - `manifest: memory_kb must be a whole number from 64 to <max>`: pick a whole number in range, or leave it out (256).

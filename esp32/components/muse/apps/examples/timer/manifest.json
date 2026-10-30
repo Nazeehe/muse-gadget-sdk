@@ -4,7 +4,8 @@
   "version": "1.0.0",
   "api": 1,
   "main": "main.lua",
-  "files": [],
+  "files": ["icon.bin"],
+  "icon": "icon.bin",
   "permissions": ["sound", "alarm", "store"],
   "memory_kb": 128,
   "messages": {

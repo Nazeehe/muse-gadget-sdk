@@ -323,6 +323,13 @@ static void check_manifest(const apps_manifest_t *m, const char *folder, int hea
             CHECK(m->files[i][0] == '\0', "files[%d] '%s' is past file_count %u", i, m->files[i], m->file_count);
         }
     }
+    if (m->icon[0] != '\0') {
+        bool listed = false;
+        for (int i = 0; i < m->file_count; i++) {
+            listed = listed || strcmp(m->files[i], m->icon) == 0;
+        }
+        CHECK(listed && apps_file_kind(m->icon) == APPS_FILE_IMAGE, "icon '%s' isn't a listed .bin", m->icon);
+    }
     CHECK((m->perms & ~15u) == 0, "perms 0x%x", m->perms);
     int max_kb = heap_kb > 1024 ? 1024 : heap_kb;
     if (max_kb < 64) {
@@ -382,6 +389,8 @@ static void print_manifest(const apps_manifest_t *m) {
     }
     fputs(",\"warnings\":", stdout);
     put_json_string(m->warnings);
+    fputs(",\"icon\":", stdout);
+    put_json_string(m->icon);
     puts("}");
 }
 
@@ -468,6 +477,31 @@ static void run_image(int argc, char **argv) {
     } else {
         CHECK(w == 0 && h == 0, "%ux%u after an image that failed", w, h);
         CHECK(strncmp(err, "image: ", 7) == 0, "err '%s'", err);
+        CHECK(json_text_ok(err), "err isn't valid text");
+        fputs("{\"ok\":false,\"error\":", stdout);
+        put_json_string(err);
+        puts("}");
+    }
+}
+
+/* icon <file> */
+static void run_icon(int argc, char **argv) {
+    if (argc < 3) {
+        fputs("usage: icon <file>\n", stderr);
+        exit(2);
+    }
+    size_t len;
+    char *raw = read_file(argv[2], &len);
+    const uint8_t *data = (const uint8_t *)exact_copy(raw, len);
+    free(raw);
+    char err[256];
+    memset(err, 'x', sizeof err);
+    bool ok = apps_icon_check(data, len, err, sizeof err);
+    CHECK(apps_icon_check(data, len, NULL, 0) == ok, "the verdict changes without an err");
+    if (ok) {
+        CHECK(err[0] == '\0', "err '%s' after an icon that passed", err);
+        puts("{\"ok\":true}");
+    } else {
         CHECK(json_text_ok(err), "err isn't valid text");
         fputs("{\"ok\":false,\"error\":", stdout);
         put_json_string(err);
@@ -1413,6 +1447,8 @@ int main(int argc, char **argv) {
         run_check(argc, argv);
     } else if (strcmp(argv[1], "image") == 0) {
         run_image(argc, argv);
+    } else if (strcmp(argv[1], "icon") == 0) {
+        run_icon(argc, argv);
     } else {
         size_t i = 0;
         while (i < sizeof cases / sizeof cases[0] && strcmp(argv[1], cases[i].name) != 0) {

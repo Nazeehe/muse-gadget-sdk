@@ -70,6 +70,9 @@
  *   manifest: files[%d] '%s' is not an allowed path (a-z 0-9 _ . / -, no '..', at most 64 characters)
  *   manifest: files[%d] '%s' has an unsupported type (use .lua, .json or .bin)
  *   manifest: more than 32 files                                           (main and the rest, no repeats)
+ *   manifest: icon '%s' is not an allowed path (a-z 0-9 _ . / -, no '..', at most 64 characters)
+ *   manifest: icon '%s' must be a .bin image
+ *   manifest: icon '%s' is not one of the app's files
  *   manifest: permissions must be a list, like ["sound"] (valid: sound, alarm, store, keep_awake)
  *   manifest: permission '%s' is not available in this firmware yet (api 1)       (net, secrets, muse)
  *   manifest: unknown permission '%s' (valid: sound, alarm, store, keep_awake)
@@ -77,7 +80,7 @@
  *   manifest: messages must map event names to descriptions (at most 16, each under 200 characters)
  *   manifest: out of memory                                                (messages_json didn't fit)
  * files[%d] counts the manifest's own list from 0. The first problem in the order id, name, version, api,
- * main, files, permissions, memory_kb, messages is the one reported, and a required key that is missing
+ * main, files, icon, permissions, memory_kb, messages is the one reported, and a required key that is missing
  * only after every key that is there has passed.
  * A warning, for a key that isn't one of those: "unknown key '%s' ignored", with " (did you mean '%s'?)" when
  * a manifest key is near (apps_suggest), the key shown as apps_text_shown shows text from outside (a control
@@ -87,7 +90,7 @@
  * aren't supported", "image: flags 0x%04x aren't supported (only premultiplied alpha)", "image: %ux%u has no
  * pixels", "image: %ux%u is larger than the 466x466 screen", "image: colour format 0x%02x isn't RGB565,
  * RGB565A8 or A8", "image: stride %u is too small for a row of %u pixels (%u bytes needed)" and "image: size %u
- * doesn't match its header (%u expected)".
+ * doesn't match its header (%u expected)". An icon's, past those: "icon: %ux%u must be square, at most 160x160".
  *
  * Memory. A parsed manifest owns one block, messages_json: the "messages" object as written, less the
  * whitespace outside its strings. It is in PSRAM on the device (the muse overlay keeps small mallocs in
@@ -109,6 +112,11 @@
 #define APPS_IMAGE_MAX (512 * 1024)
 #define APPS_IMAGES_TOTAL_MAX (1536 * 1024)
 #define APPS_APP_MAX (2 * 1024 * 1024)
+
+/* The launcher's icon (a manifest's "icon"): a square .bin image of at most APPS_ICON_MAX_PX each way. APPS_ICON_MAX_BYTES
+ * is the largest such file: the 12-byte LVGL v9 header and an RGB565A8 image's 3 bytes a pixel. */
+#define APPS_ICON_MAX_PX 160
+#define APPS_ICON_MAX_BYTES (12 + APPS_ICON_MAX_PX * APPS_ICON_MAX_PX * 3)
 
 /*
  * Room for an app (C1). An app's files and its Lua heap (memory_kb) come out of the gadget's free PSRAM, and the apps always
@@ -154,6 +162,11 @@ bool apps_room_beside(size_t free_bytes, const char *id, size_t bytes, unsigned 
  * install pipeline's. */
 #define APPS_MSG_BAD_ID "app id '%s' must match ^[a-z][a-z0-9_]{1,23}$"
 
+/* An icon's: the manifest's (%s is the icon as written) and apps_icon_check's (the image's width and height). */
+#define APPS_MSG_ICON_NOT_LISTED "manifest: icon '%s' is not one of the app's files"
+#define APPS_MSG_ICON_NOT_IMAGE "manifest: icon '%s' must be a .bin image"
+#define APPS_MSG_ICON_SIZE "icon: %ux%u must be square, at most %dx%d"
+
 enum { APPS_PERM_SOUND = 1, APPS_PERM_ALARM = 2, APPS_PERM_STORE = 4, APPS_PERM_KEEP_AWAKE = 8 };
 
 typedef enum { APPS_FILE_LUA, APPS_FILE_JSON, APPS_FILE_IMAGE, APPS_FILE_BAD } apps_file_kind_t;
@@ -165,6 +178,7 @@ typedef struct {
     uint16_t memory_kb;
     char *messages_json;  /* compact "messages" object or NULL; apps_manifest_clear frees */
     char warnings[512];   /* "; "-joined */
+    char icon[APPS_PATH_MAX + 1];  /* the launcher's icon: one of files, a .bin; empty when there is none */
 } apps_manifest_t;
 
 /* One file of a package: its path, its bytes (a block that apps_pkg_free frees with the same free_fn as the
@@ -296,3 +310,10 @@ bool apps_pkg_check_source(int index, const char *path, const uint8_t *data, siz
  * data[len] is read.
  */
 bool apps_image_check(const uint8_t *data, size_t len, uint16_t *w, uint16_t *h, char *err, size_t err_len);
+
+/*
+ * Whether data[0, len) is an icon: an image apps_image_check passes (its message, if not) that is square and at most
+ * APPS_ICON_MAX_PX each way, otherwise APPS_MSG_ICON_SIZE in err. err may be NULL. The one rule for the install pipeline
+ * and apphost's check, which apply it to the manifest's icon file.
+ */
+bool apps_icon_check(const uint8_t *data, size_t len, char *err, size_t err_len);

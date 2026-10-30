@@ -313,7 +313,8 @@ class GuideAndSkill(unittest.TestCase):
                 self.assertIn(f'__asm__("{symbol}_{end}")', control)
         for f in files:
             self.assertTrue((MUSE / f).is_file(), f)
-        self.assertEqual(sorted(p.name for p in TIMER.iterdir()), ["main.lua", "manifest.json"], "the timer is two files")
+        self.assertEqual(sorted(p.name for p in TIMER.iterdir()), ["icon.bin", "main.lua", "manifest.json"],
+                         "the timer is two files and its icon (app.api carries only the two: EMBED_FILES)")
 
     def test_common_errors_are_the_firmwares_words(self):
         # The guide's "Common errors" quote the gadget's messages, each item "- `<message>`: <the fix>": every piece of each
@@ -506,6 +507,22 @@ class GuideAndSkill(unittest.TestCase):
                        f"{apps_size // (1024 * 1024)} MB for the apps' files and {kb(nvs_size)} KB for what they save"):
             with self.subTest(phrase):
                 self.assertIn(phrase, kconfig)
+
+    def test_guide_icon_numbers_are_the_headers(self):
+        # D12: the icon's size limit is APPS_ICON_MAX_PX, and its largest file is the LVGL header and that square of RGB565A8.
+        px = header_number("apps_pkg.h", "APPS_ICON_MAX_PX")
+        pkg = (APPS / "apps_pkg.h").read_text()
+        self.assertIn("#define APPS_ICON_MAX_BYTES (12 + APPS_ICON_MAX_PX * APPS_ICON_MAX_PX * 3)", pkg)
+        guide = " ".join(GUIDE.read_text().split())
+        for phrase in (f"a square `.bin` image at most {px} x {px} (120 x 120 looks best), shown in the launcher",
+                       f"square and at most {px} x {px} px (120 x 120 looks best)",
+                       f"`icon: <w>x<h> must be square, at most {px}x{px}`",
+                       "`manifest: icon '<path>' is not one of the app's files`",
+                       "`manifest: icon '<path>' must be a .bin image`",
+                       "a coloured circle with the first letter of its name", "reinstall X with one", "--cf RGB565A8"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, guide)
+        self.assertEqual(guide.count("## Icons"), 1)
 
     def test_guide_says_what_room_an_app_has(self):
         # C1's (d): an app's files and its heap share free PSRAM, less the APPS_RAM_RESERVE the apps leave to the rest of the gadget;

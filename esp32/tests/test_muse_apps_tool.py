@@ -33,6 +33,7 @@ import re
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -242,6 +243,11 @@ class Gadget:
         return [(0.001, line) for line in self.echo] + \
             [(self.commit_delay, "@app " + json.dumps({"op": "commit", **result}, separators=(",", ":"),
                                                      ensure_ascii=False))]
+
+
+def rgb565a8(w, h):
+    """An LVGL v9 RGB565A8 .bin of w x h pixels, all zero."""
+    return struct.pack("<BBHHHHH", 0x19, 0x14, 0, w, h, w * 2, 0) + bytes(w * 2 * h + w * h)
 
 
 def make_package(root, app_id="demo", main="return {}\n", files=None, manifest=None):
@@ -2213,6 +2219,8 @@ class CheckTest(unittest.TestCase):
         # is missing, or not a file at all, or outside the folder, is the tool's to say before it starts apphost, as push's.)
         for files, manifest, words in (({"d.json": "{\"a\":}"}, None, "d.json: unexpected '}' at byte 6"),
                                        ({"i.bin": b"not an image"}, None, "i.bin: image: not an LVGL v9 image file"),
+                                       ({"icon.bin": rgb565a8(120, 100)}, {"icon": "icon.bin"},
+                                        "icon.bin: icon: 120x100 must be square, at most 160x160"),
                                        (None, {"api": 2}, "manifest: this gadget supports api 1")):
             with self.subTest(words):
                 folder, _ = self.make("return {}", files=files, manifest=manifest)

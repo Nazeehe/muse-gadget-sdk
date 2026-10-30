@@ -325,10 +325,10 @@ size_t apps_text_clean(char *s, size_t n, bool keep_newline) {
 /* ==== The manifest ==== */
 
 /* The keys the manifest reads, in the order apps_pkg.h checks them (and the candidates of "did you mean"). */
-enum { K_ID, K_NAME, K_VERSION, K_API, K_MAIN, K_FILES, K_PERMISSIONS, K_MEMORY_KB, K_MESSAGES, K_COUNT };
+enum { K_ID, K_NAME, K_VERSION, K_API, K_MAIN, K_FILES, K_PERMISSIONS, K_MEMORY_KB, K_MESSAGES, K_ICON, K_COUNT };
 
 static const char *const k_names[K_COUNT] = {"id",   "name",        "version",   "api",     "main",
-                                             "files", "permissions", "memory_kb", "messages"};
+                                             "files", "permissions", "memory_kb", "messages", "icon"};
 
 static const struct {
     const char *name;
@@ -602,6 +602,28 @@ static NOINLINE bool check_files(parse_t *p) {
     return r.err[0] == '\0' || reader_error(p, &r);
 }
 
+/* icon: one of the files, and a .bin. The image itself is checked with the package's files (apps_icon_check). */
+static NOINLINE bool check_icon(parse_t *p) {
+    slice_t v = p->val[K_ICON];
+    if (v.p == NULL) {
+        return true;
+    }
+    char text[TEXT_MAX];
+    bool read = decode_string(v, text, sizeof text);
+    echo_t shown;
+    if (!read || !apps_path_valid(text)) {
+        return fail(p, "manifest: icon '%s' is not an allowed path " PATH_RULE, quote(&shown, v, text, read));
+    }
+    if (apps_file_kind(text) != APPS_FILE_IMAGE) {
+        return fail(p, APPS_MSG_ICON_NOT_IMAGE, text);
+    }
+    if (!is_listed(p->m, text)) {
+        return fail(p, APPS_MSG_ICON_NOT_LISTED, text);
+    }
+    copy_text(p->m->icon, sizeof p->m->icon, text);
+    return true;
+}
+
 static NOINLINE bool check_permissions(parse_t *p) {
     slice_t v = p->val[K_PERMISSIONS];
     if (v.p == NULL) {
@@ -728,7 +750,7 @@ static bool validate(parse_t *p) {
     if (v[K_API].p != NULL && !check_api(p)) {
         return false;
     }
-    return check_main(p) && check_files(p) && check_permissions(p) && check_memory(p) && check_messages(p) &&
+    return check_main(p) && check_files(p) && check_icon(p) && check_permissions(p) && check_memory(p) && check_messages(p) &&
            check_required(p);
 }
 
@@ -914,6 +936,17 @@ bool apps_image_check(const uint8_t *data, size_t len, uint16_t *w, uint16_t *h,
     }
     if (h != NULL) {
         *h = (uint16_t)ih;
+    }
+    return true;
+}
+
+bool apps_icon_check(const uint8_t *data, size_t len, char *err, size_t err_len) {
+    uint16_t w, h;
+    if (!apps_image_check(data, len, &w, &h, err, err_len)) {
+        return false;
+    }
+    if (w != h || w > APPS_ICON_MAX_PX) {
+        return failf(err, err_len, APPS_MSG_ICON_SIZE, (unsigned)w, (unsigned)h, APPS_ICON_MAX_PX, APPS_ICON_MAX_PX);
     }
     return true;
 }

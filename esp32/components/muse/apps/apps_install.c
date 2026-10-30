@@ -786,7 +786,9 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
             if (image_bytes > APPS_IMAGES_TOTAL_MAX) {
                 return failure(APPS_ERR_INVALID_PACKAGE, "images add up to more than 1.5 MB");
             }
-            if (!apps_image_check(data, len, NULL, NULL, in->raw, sizeof in->raw)) {
+            bool icon = strcmp(rel, m->icon) == 0;  /* the launcher's icon: square and small as well */
+            if (!(icon ? apps_icon_check(data, len, in->raw, sizeof in->raw)
+                       : apps_image_check(data, len, NULL, NULL, in->raw, sizeof in->raw))) {
                 return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE, "%s: %s", rel, in->raw);
             }
         }

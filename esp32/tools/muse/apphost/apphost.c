@@ -426,7 +426,8 @@ static bool load_package(const char *folder, const char *id, apps_pkg_t *pkg, ch
                 snprintf(err, err_len, "images add up to more than 1.5 MB");
                 goto fail;
             }
-            if (!apps_image_check(data, len, NULL, NULL, why, sizeof why)) {
+            bool icon = strcmp(rel, pkg->manifest.icon) == 0;  /* the launcher's icon: square and small as well */
+            if (!(icon ? apps_icon_check(data, len, why, sizeof why) : apps_image_check(data, len, NULL, NULL, why, sizeof why))) {
                 snprintf(err, err_len, "%s: %s", rel, why);
                 goto fail;
             }

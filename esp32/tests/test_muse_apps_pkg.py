@@ -101,6 +101,18 @@ def memory_msg(top):
     return f"manifest: memory_kb must be a whole number from 64 to {top}"
 
 
+def icon_not_listed_msg(path):
+    return f"manifest: icon '{path}' is not one of the app's files"
+
+
+def icon_not_image_msg(path):
+    return f"manifest: icon '{path}' must be a .bin image"
+
+
+def icon_size_msg(w, h):
+    return f"icon: {w}x{h} must be square, at most 160x160"
+
+
 def image_big_msg(w, h):
     return f"image: {w}x{h} is larger than the 466x466 screen"
 
@@ -217,6 +229,11 @@ class MuseAppsPkgTest(unittest.TestCase):
         done = self.run_harness("image", self.put_file(data))
         return json.loads(done.stdout)
 
+    def icon(self, data) -> dict:
+        """What apps_icon_check says of data: apps_image_check's verdict, then the icon's own size rule."""
+        done = self.run_harness("icon", self.put_file(data))
+        return json.loads(done.stdout)
+
     def refused_image(self, data, message):
         self.assertEqual(self.image(data), {"ok": False, "error": message})
 
@@ -277,7 +294,47 @@ class MuseAppsPkgTest(unittest.TestCase):
         result = self.ok(doc())
         self.assertEqual(result, {"ok": True, "id": "timer", "name": "Timer", "version": "", "main": "main.lua",
                                   "files": ["main.lua"], "perms": 0, "memory_kb": 256, "messages_json": None,
-                                  "warnings": ""})
+                                  "warnings": "", "icon": ""})
+
+    def test_icon_absent_is_fine(self):
+        result = self.ok(doc(files='["util.lua"]'))
+        self.assertEqual((result["icon"], result["warnings"]), ("", ""))
+
+    def test_icon_is_read(self):
+        result = self.ok(doc(files='["util.lua","icon.bin"]', icon='"icon.bin"'))
+        self.assertEqual((result["icon"], result["warnings"]), ("icon.bin", ""))
+        self.assertEqual(self.ok(doc(files='["assets/a.bin"]', icon='"assets/a.bin"'))["icon"], "assets/a.bin")
+
+    def test_icon_must_be_a_listed_file(self):
+        self.refused(doc(files='["util.lua"]', icon='"x.bin"'), icon_not_listed_msg("x.bin"))
+        self.refused(doc(icon='"x.bin"'), icon_not_listed_msg("x.bin"))
+
+    def test_icon_must_be_an_image(self):
+        self.refused(doc(files='["util.lua"]', icon='"util.lua"'), icon_not_image_msg("util.lua"))
+        self.refused(doc(files='["a.json"]', icon='"a.json"'), icon_not_image_msg("a.json"))
+
+    def test_icon_must_be_an_allowed_path(self):
+        for raw, shown in [('"../x.bin"', "../x.bin"), ('"X.bin"', "X.bin"), ('""', ""), ("7", "7"), ("null", "null")]:
+            with self.subTest(icon=raw):
+                self.refused(doc(files='["x.bin"]', icon=raw), f"manifest: icon '{shown}' is not an allowed path {PATH_RULE}")
+
+    def test_icon_must_be_square_and_small(self):
+        self.assertEqual(self.icon(lvgl_image(w=120, h=120, cf=0x14)), {"ok": True})
+        self.assertEqual(self.icon(lvgl_image(w=160, h=160, cf=0x14)), {"ok": True})
+        self.assertEqual(self.icon(lvgl_image(w=1, h=1, cf=0x14)), {"ok": True})
+        for w, h in [(120, 100), (100, 120), (200, 200), (161, 161), (160, 159)]:
+            with self.subTest(w=w, h=h):
+                self.assertEqual(self.icon(lvgl_image(w=w, h=h, cf=0x14)),
+                                 {"ok": False, "error": icon_size_msg(w, h)})
+
+    def test_icon_bad_header_uses_image_errors(self):
+        self.assertEqual(self.icon(b"\x89PNG\r\n\x1a\n" + bytes(40)), {"ok": False, "error": IMAGE_NOT_LVGL_MSG})
+        self.assertEqual(self.icon(lvgl_image(w=120, h=120, cf=0x14, drop=1)),
+                         {"ok": False, "error": image_size_msg(43211, 43212)})
+        self.assertEqual(self.icon(lvgl_image(w=467, h=467))["error"], image_big_msg(467, 467))
+
+    def test_icon_max_bytes_is_the_header_and_a_160_square_of_rgb565a8(self):
+        self.assertEqual(len(lvgl_image(w=160, h=160, cf=0x14)), 12 + 160 * 160 * 3)
 
     def test_main_listed_twice_is_deduplicated(self):
         # main, whether it is named or left to its default, is the first file and not listed again.

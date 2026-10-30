@@ -116,7 +116,7 @@ class TimerTest(AppHostTestCase):
         manifest = json.loads((TIMER / "manifest.json").read_text())
         self.assertEqual((manifest["id"], manifest["name"], manifest["api"], manifest["main"]),
                          ("timer", "Timer", 1, "main.lua"))
-        self.assertEqual(manifest["files"], [])                                  # no image, no module
+        self.assertEqual((manifest["files"], manifest["icon"]), (["icon.bin"], "icon.bin"))   # its icon, no module
         self.assertEqual(manifest["permissions"], ["sound", "alarm", "store"])
         messages = manifest["messages"]
         self.assertEqual(list(messages), ["start", "pause", "resume", "reset", "status"])
@@ -538,7 +538,8 @@ class TimerTest(AppHostTestCase):
         """The timer with `record` (a Lua expression) saved under its key before the app's own code runs: the store is keyed by the app's
         id and outlives a reinstall, so a package of this id may have left anything there."""
         manifest = json.loads((TIMER / "manifest.json").read_text())
-        folder = self.make_app("timer", f'store.set("timer", {record})\n' + (TIMER / "main.lua").read_text(), manifest=manifest)
+        folder = self.make_app("timer", f'store.set("timer", {record})\n' + (TIMER / "main.lua").read_text(),
+                               files={"icon.bin": (TIMER / "icon.bin").read_bytes()}, manifest=manifest)
         return self.host(folder, script=list(script))
 
     def test_a_stored_record_that_is_not_the_timers_is_not_trusted(self):

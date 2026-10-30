@@ -50,8 +50,9 @@
  *
  * The RAM store. Its packages are kept most recent first (a commit or a load moves one to the front), and every change
  * gives the launcher the new list (apps_task_set_list). A copy, at a commit or a load, leaves free PSRAM for the app's
- * heap and APPS_RAM_RESERVE: short of that, the oldest packages go one at a time, looking again after each, never the
- * app that runs (apps_task_running) nor the one being copied.
+ * heap and APPS_RAM_RESERVE (a load beside another app that is loaded counts what that app's end frees: apps_room_beside, N3):
+ * short of that, the oldest packages go one at a time, looking again after each, never the app that runs (apps_task_running)
+ * nor the one being copied.
  */
 
 #define MSG_MAX 4096     /* a result's message: a crash's error and traceback with the last lines of its log */
@@ -1052,18 +1053,19 @@ static size_t copy_bytes(const apps_pkg_t *pkg, bool with_struct) {
 
 /*
  * Room for a copy of `bytes` for the app id whose heap is memory_kb (apps_room: free PSRAM after the copy at least memory_kb
- * and APPS_RAM_RESERVE). Short of that, the oldest packages go, one at a time, looking again after each (never id's or the
- * app's that runs). False, with the refusal in err, when it is short still; err is untouched otherwise. *dropped counts what
- * went.
+ * and APPS_RAM_RESERVE; beside another app that is loaded, other, whose end frees other_frees: apps_room_beside's two checks,
+ * N3). Short of that, the oldest packages go, one at a time, looking again after each (never id's or the app's that runs).
+ * False, with the refusal in err, when it is short still; err is untouched otherwise. *dropped counts what went.
  */
-static bool ram_room(const char *id, size_t bytes, unsigned memory_kb, int *dropped, char *err, size_t err_len) {
+static bool ram_room(const char *id, size_t bytes, unsigned memory_kb, const char *other, size_t other_frees, int *dropped, char *err,
+                     size_t err_len) {
     for (;;) {
         size_t free_now = apps_port_psram_free();
-        if (apps_room(free_now, id, bytes, memory_kb, NULL, 0)) {
+        if (apps_room_beside(free_now, id, bytes, memory_kb, other, other_frees, NULL, 0)) {
             return true;
         }
         if (!ram_drop_oldest(id)) {
-            return apps_room(free_now, id, bytes, memory_kb, err, err_len);  /* false, with the refusal */
+            return apps_room_beside(free_now, id, bytes, memory_kb, other, other_frees, err, err_len);  /* false, with the refusal */
         }
         (*dropped)++;
     }
@@ -1103,8 +1105,13 @@ bool apps_ram_load(const char *id, apps_pkg_t *out, char *err, size_t err_len) {
         snprintf(err, err_len, "no such app on the gadget");
         return false;
     }
+    /* Beside another app that is loaded, what its end frees counts for the heap (N3), and it runs on when the load is refused. */
+    char other[APPS_ID_MAX + 1];
+    size_t frees = 0;
+    bool beside = apps_task_footprint(other, sizeof other, &frees) && strcmp(other, id) != 0;
     int dropped = 0;
-    bool room = ram_room(id, copy_bytes(s_ram[i], false), s_ram[i]->manifest.memory_kb, &dropped, err, err_len);
+    bool room = ram_room(id, copy_bytes(s_ram[i], false), s_ram[i]->manifest.memory_kb, beside ? other : NULL, frees, &dropped, err,
+                         err_len);
     i = ram_find(id);  /* it stays, a little nearer the front */
     bool ok = room && pkg_copy(s_ram[i], out);
     if (room && !ok) {
@@ -1176,7 +1183,7 @@ bool apps_ram_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t e
         dropped++;
     }
     apps_pkg_t *copy = NULL;
-    bool ok = ram_room(id, copy_bytes(pkg, true), pkg->manifest.memory_kb, &dropped, err, err_len);
+    bool ok = ram_room(id, copy_bytes(pkg, true), pkg->manifest.memory_kb, NULL, 0, &dropped, err, err_len);
     if (ok) {
         copy = apps_port_realloc(NULL, sizeof *copy);
         ok = copy != NULL && pkg_copy(pkg, copy);

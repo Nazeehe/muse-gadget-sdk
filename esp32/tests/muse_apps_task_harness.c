@@ -6486,6 +6486,69 @@ static void an_alarm_launch_of_an_app_that_exits_in_start_is_given_up(void) {
     on_worker(empty_store_job, NULL);
 }
 
+
+/* A big Lua heap: a 400 KB string it keeps (and, until a collection, the buffer it was made in). */
+static const char APP_BIG[] =
+    "local app = {}\n"
+    "local hold\n"
+    "function app.start() hold = string.rep('x', 400 * 1024) ui.label{text = 'Big'} end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+
+/* The text of event i. */
+static void event_text(int i, char *out, size_t cap) {
+    pthread_mutex_lock(&events_mu);
+    snprintf(out, cap, "%s", events[i]);
+    pthread_mutex_unlock(&events_mu);
+}
+
+/* N3: a launch beside a big app counts what the big app's end frees (its Lua heap as the VM counts it, and its package): hello, short of
+ * its heap while big runs and with room once big has gone, is loaded, replaces big and runs. huge, whose heap doesn't fit even once big
+ * has gone, is refused up front, in words that say so, and big runs on. */
+static void a_launch_beside_a_big_app_counts_what_its_end_frees(void) {
+    char err[300], text[400], running[APPS_ID_MAX + 1];
+    const file_t big_files[] = {LUA("main.lua", APP_BIG)};
+    store(make_pkg("hello", "Hello", HELLO, 1));
+    apps_pkg_t *huge = make_pkg("huge", "Huge", HELLO, 1);
+    huge->manifest.memory_kb = 4096;
+    store(huge);
+    apps_pkg_t *big = make_pkg("big", "Big", big_files, 1);
+    big->manifest.memory_kb = 1024;
+    CHECK(apps_task_run(big, true, 50, NULL, err, sizeof err), "run big: %s", err);
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    CHECK(st->mem_kb >= 400, "big's heap: %u KB", (unsigned)st->mem_kb);
+    /* 200 KB short of hello's copy, heap and reserve while big runs; big's end frees more than that. */
+    size_t need = (sizeof APP_HELLO - 1) + 256 * 1024 + APPS_RAM_RESERVE;
+    atomic_store(&psram_total, held_now(&port_held) + need - 200 * 1024);
+    int from = mark();
+    launch("hello", true);
+    WAIT(from, "log I stop big: replaced, peak ");
+    WAIT(from, "log I launch hello (256 KB)");
+    WAIT(from, "print hello start");
+    ABSENT(from, "log W launch hello");
+    /* huge beside big: short even once big has gone. */
+    atomic_store(&psram_total, 0);
+    big = make_pkg("big", "Big", big_files, 1);
+    big->manifest.memory_kb = 1024;
+    CHECK(apps_task_run(big, true, 50, NULL, err, sizeof err), "run big again: %s", err);
+    atomic_store(&psram_total, held_now(&port_held) + need - 200 * 1024);
+    from = mark();
+    launch("huge", true);
+    int i = WAIT(from, "log W launch huge: the gadget is short of memory for huge: ");
+    event_text(i, text, sizeof text);
+    CHECK(strstr(text, " KB free once big ends, ") != NULL && strstr(text, " KB needed; restart the gadget or install a smaller app") != NULL,
+          "the refusal: %s", text);
+    ROUNDS();
+    CHECK(apps_task_running(running, sizeof running) && strcmp(running, "big") == 0, "big runs on: '%s'", running);
+    ABSENT(from, "log I stop big");
+    ABSENT(from, "log I launch huge");
+    atomic_store(&psram_total, 0);
+    heap_caps_free(st);
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    on_worker(empty_store_job, NULL);
+}
+
 #endif
 
 int main(int argc, char **argv) {
@@ -6628,6 +6691,7 @@ int main(int argc, char **argv) {
         {"a_launch_given_up_at_the_backstop_lets_the_next_apps_be_asked_for_in_the_same_round", a_launch_given_up_at_the_backstop_lets_the_next_apps_be_asked_for_in_the_same_round},
         {"a_launch_of_a_store_app_does_not_wait_for_its_own_load", a_launch_of_a_store_app_does_not_wait_for_its_own_load},
         {"an_alarm_launch_of_an_app_that_exits_in_start_is_given_up", an_alarm_launch_of_an_app_that_exits_in_start_is_given_up},
+        {"a_launch_beside_a_big_app_counts_what_its_end_frees", a_launch_beside_a_big_app_counts_what_its_end_frees},
 #endif
     };
     if (argc != 2) {

@@ -119,16 +119,36 @@
  * - apps_port_realloc refuses growth that would leave less than APPS_RAM_RESERVE free (apps_port.h);
  * - an app is admitted only when free PSRAM holds the files still to be read, its heap and the reserve: the store's load
  *   (apps_store.h), the RAM store's copies (apps_install.h), and every run once the app it replaces has gone (apps_task.h),
- *   when its files are in PSRAM already.
+ *   when its files are in PSRAM already;
+ * - a load beside another app that is loaded (N3: apps_room_beside) is admitted twice before that app is touched: its files
+ *   and the reserve must fit now, and its files, its heap and the reserve once the other has gone. The run's admission
+ *   above stays the last word.
  */
 #define APPS_RAM_RESERVE (1024 * 1024)
 #define APPS_MSG_SHORT_OF_MEMORY \
     "the gadget is short of memory for %s: %u KB free, %u KB needed; restart it or install a smaller app"
+#define APPS_MSG_SHORT_ONCE_ENDED \
+    "the gadget is short of memory for %s: %u KB free once %s ends, %u KB needed; restart the gadget or install a smaller app"
+#define APPS_MSG_SHORT_BESIDE \
+    "the gadget is short of memory to load %s while %s runs: %u KB free, %u KB needed; stop %s, then launch %s"
 
 /* Whether free_bytes of PSRAM hold `bytes` more for app id and still keep its heap (memory_kb) and APPS_RAM_RESERVE. False,
  * with APPS_MSG_SHORT_OF_MEMORY in err (free_bytes and the need in KB, the need rounded up; err may be NULL), when they
  * don't. */
 bool apps_room(size_t free_bytes, const char *id, size_t bytes, unsigned memory_kb, char *err, size_t err_len);
+
+/*
+ * N3: apps_room for a load of app id beside another app (other) that is loaded, whose end frees other_frees bytes (its Lua heap
+ * as the VM counts it, and its package: apps_task_footprint). Two checks, so that a launch that can't work is refused while the
+ * other runs on:
+ * - (b) once the other has gone: free_bytes + other_frees hold `bytes`, the heap (memory_kb) and APPS_RAM_RESERVE; short of that,
+ *   APPS_MSG_SHORT_ONCE_ENDED (what is free then, and the need);
+ * - (a) now: free_bytes hold `bytes` and APPS_RAM_RESERVE; short of that, APPS_MSG_SHORT_BESIDE (what is free, and the need).
+ * (b) is said when both fail: stopping the other wouldn't help. KB as apps_room's (free rounded down, the need up); err may be NULL.
+ * With no other (NULL or ""), it is apps_room.
+ */
+bool apps_room_beside(size_t free_bytes, const char *id, size_t bytes, unsigned memory_kb, const char *other, size_t other_frees,
+                      char *err, size_t err_len);
 
 /* What a message says of an id that isn't one, with the id as shown (apps_text_shown): the USB console's and the
  * install pipeline's. */

@@ -602,6 +602,9 @@ class AppTaskStoreTest(HarnessCase):
     def test_an_alarm_launch_of_an_app_that_exits_in_start_is_given_up(self):  # no relaunch for ever, as for a crash in start()
         self.run_case("an_alarm_launch_of_an_app_that_exits_in_start_is_given_up")
 
+    def test_a_launch_beside_a_big_app_counts_what_its_end_frees(self):  # N3: admitted against big's heap and package; huge refused up front
+        self.run_case("a_launch_beside_a_big_app_counts_what_its_end_frees")
+
 
 if __name__ == "__main__":
     unittest.main()

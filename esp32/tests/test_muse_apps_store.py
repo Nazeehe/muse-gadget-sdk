@@ -180,6 +180,9 @@ class Store(unittest.TestCase):
     def test_a_load_is_admitted_against_free_psram(self):  # C1: the files, the heap and APPS_RAM_RESERVE, or a clean refusal
         self.run_case("a_load_is_admitted_against_free_psram")
 
+    def test_a_load_beside_another_app_counts_what_its_end_frees(self):  # N3: (a) now, (b) once it ends, the other left running
+        self.run_case("a_load_beside_another_app_counts_what_its_end_frees")
+
     def test_the_launchers_order_is_the_stores(self):  # P2: installs and launches, across a remount with no clock
         self.run_case("order_follows_installs_and_launches")
 

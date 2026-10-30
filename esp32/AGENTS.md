@@ -751,9 +751,14 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   `apps_pkg.h`): Muse's session takes about 430 KB while it is up and about
   630 KB at the peak of a turn, and LVGL aborts when it can't allocate. So
   `apps_port_realloc` refuses growth below it (the app, an install's read or a
-  load ends out of memory, cleanly), a load and every run are admitted only
-  with room for the app's files, its heap and the reserve, and `app.api` gives
-  what is left as `limits.room_kb`. A snapshot is one block through
+  load ends out of memory, cleanly), and `app.api` gives what is left as
+  `limits.room_kb`. A launch is admitted twice before the app that runs is
+  touched: its files and the reserve must fit in free PSRAM now, and its
+  files, its heap and the reserve once the app that runs has ended (counting
+  what that end frees: its Lua heap as the VM counts it and its package). A
+  launch short of either is refused and the app that runs keeps running.
+  Every run is admitted once more, after the app it replaces has gone, with
+  room for its heap and the reserve. A snapshot is one block through
   the same floor (the screen's pixels, the picture masked in place and the
   JPEG's room: 565,392 bytes at scale 1 and 434,312 at scale 2, with 32 KB
   allowed for the encoder's own buffers, also floored). It is admitted, before

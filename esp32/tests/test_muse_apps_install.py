@@ -192,6 +192,9 @@ class Install(unittest.TestCase):
     def test_the_ram_budget(self):  # F2: memory_kb + 1 MiB free after a copy; the oldest go first, never the running app
         self.run_case("ram_budget")
 
+    def test_a_ram_load_beside_another_app_counts_what_its_end_frees(self):  # N3: (a) now, (b) once it ends; drops only when short
+        self.run_case("a_ram_load_beside_another_app_counts_what_its_end_frees")
+
     def test_results_are_utf8(self):  # T2: a compile error quoting bytes that aren't UTF-8; a long cut between characters
         results, _ = self.run_case("results_are_utf8")  # every result decoded strictly (run_case)
         self.assertIn("local caf? = = 1 -- ?", results[0]["error"]["message"])

@@ -765,6 +765,16 @@ bool apps_task_running(char *id, size_t cap) {
     return running_id[0] != '\0';
 }
 
+/* The app that is loaded and what its end frees (apps_task_footprint): a case sets them; "" for none. */
+static char footprint_id[APPS_ID_MAX + 1];
+static size_t footprint_bytes;
+
+bool apps_task_footprint(char *id, size_t cap, size_t *bytes) {
+    snprintf(id, cap, "%s", footprint_id);
+    *bytes = footprint_id[0] != '\0' ? footprint_bytes : 0;
+    return footprint_id[0] != '\0';
+}
+
 /* ---- apps_values.h: the RAM map, asked to forget an app that goes, and the write budget, which a case can say is spent ---- */
 
 static char forgotten[APPS_ID_MAX + 1];
@@ -2038,6 +2048,77 @@ static void a_load_is_admitted_against_free_psram(void) {
     CHECK(blocks_held == held - 1, "%ld blocks held", blocks_held - held + 1);
 }
 
+/* N3: a load beside another app that is loaded is admitted twice, and the other is left alone: (a) free PSRAM now holds the files
+ * and APPS_RAM_RESERVE; (b) free PSRAM now and what the other's end frees (its Lua heap and package: apps_task_footprint) hold the
+ * files, the heap and the reserve. Short of (b) even its end leaves no room, and the refusal says so; short of (a) alone the other
+ * must stop first, and the refusal says that. With no word from the app task, the load is admitted as it was (C1). The app's own
+ * load (the same id) is unchanged. */
+static void a_load_beside_another_app_counts_what_its_end_frees(void) {
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    const file_t files[] = {{"main.lua", "-- main\nreturn {}\n"}, {"util.lua", "return 1\n"}};
+    apps_pkg_t *p = make_pkg("timer", "Timer", "1.0.0", 2, files);
+    bool unchanged;
+    char err[300], want[300];
+    CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "commit: %s", err);
+    free_pkg(p);
+    size_t bytes = strlen(files[0].text) + strlen(files[1].text), heap = 256 * 1024;
+    size_t load = bytes + APPS_RAM_RESERVE, run = bytes + heap + APPS_RAM_RESERVE;
+    apps_pkg_t *got = apps_port_realloc(NULL, sizeof *got);
+    long held = blocks_held;
+    snprintf(running_id, sizeof running_id, "big");
+    snprintf(footprint_id, sizeof footprint_id, "big");
+    /* Short of the heap now, which big's end frees. */
+    footprint_bytes = (size_t)1300 * 1024;
+    psram_free = load + 10 * 1024;
+    CHECK(apps_store_load("timer", got, err, sizeof err), "beside big, which frees 1300 KB: %s", err);
+    apps_pkg_free(got, apps_port_free);
+    /* Exactly enough, both ways. */
+    psram_free = load;
+    footprint_bytes = heap;
+    CHECK(apps_store_load("timer", got, err, sizeof err), "exactly the room, now and once big ends: %s", err);
+    apps_pkg_free(got, apps_port_free);
+    /* (b): a byte short once big ends. */
+    footprint_bytes = heap - 1;
+    snprintf(want, sizeof want, "the gadget is short of memory for timer: %u KB free once big ends, %u KB needed; restart the gadget or "
+             "install a smaller app", (unsigned)((run - 1) / 1024), (unsigned)((run + 1023) / 1024));
+    CHECK(!apps_store_load("timer", got, err, sizeof err) && strcmp(err, want) == 0, "short by a byte once big ends: '%s'", err);
+    CHECK(blocks_held == held, "%ld blocks held after the refusal", blocks_held - held);
+    /* (a): a byte short now, with room once big ends. */
+    footprint_bytes = (size_t)2 << 20;
+    psram_free = load - 1;
+    snprintf(want, sizeof want, "the gadget is short of memory to load timer while big runs: %u KB free, %u KB needed; stop big, then "
+             "launch timer", (unsigned)((load - 1) / 1024), (unsigned)((load + 1023) / 1024));
+    CHECK(!apps_store_load("timer", got, err, sizeof err) && strcmp(err, want) == 0, "short by a byte now: '%s'", err);
+    CHECK(blocks_held == held, "%ld blocks held after the refusal", blocks_held - held);
+    /* Both short: (b) says it, as stopping big wouldn't help. */
+    psram_free = load - 1;
+    footprint_bytes = 0;
+    CHECK(!apps_store_load("timer", got, err, sizeof err) && strstr(err, " KB free once big ends, ") != NULL, "both short: '%s'", err);
+    /* No word from the app task: C1's formula, as before. */
+    footprint_id[0] = '\0';
+    psram_free = run - 1;
+    CHECK(!apps_store_load("timer", got, err, sizeof err) && strstr(err, "the gadget is short of memory for timer: ") == err &&
+              strstr(err, "once") == NULL, "nothing loaded: '%s'", err);
+    psram_free = run;
+    CHECK(apps_store_load("timer", got, err, sizeof err), "nothing loaded, the room: %s", err);
+    apps_pkg_free(got, apps_port_free);
+    /* The same id: its files and the reserve, whatever it frees. */
+    snprintf(running_id, sizeof running_id, "timer");
+    snprintf(footprint_id, sizeof footprint_id, "timer");
+    footprint_bytes = (size_t)2 << 20;
+    psram_free = load - 1;
+    CHECK(!apps_store_load("timer", got, err, sizeof err) && strstr(err, "the gadget is short of memory for timer: ") == err,
+          "the app that runs, short by a byte: '%s'", err);
+    psram_free = load;
+    CHECK(apps_store_load("timer", got, err, sizeof err), "the app that runs: %s", err);
+    apps_pkg_free(got, apps_port_free);
+    running_id[0] = footprint_id[0] = '\0';
+    footprint_bytes = 0;
+    psram_free = (size_t)3 << 20;
+    apps_port_free(got);
+    CHECK(blocks_held == held - 1, "%ld blocks held", blocks_held - held + 1);
+}
+
 /* ---- main ---- */
 
 typedef struct {
@@ -2080,6 +2161,7 @@ static const case_t CASES[] = {
     {"order_waits_for_the_budget", order_waits_for_the_budget},
     {"out_of_memory_reading_the_manifest", out_of_memory_reading_the_manifest},
     {"a_load_is_admitted_against_free_psram", a_load_is_admitted_against_free_psram},
+    {"a_load_beside_another_app_counts_what_its_end_frees", a_load_beside_another_app_counts_what_its_end_frees},
 };
 
 /* X: whatever a case leaves of the apps' heap besides the RAM store's copies, which the harness frees here, is a leak. */

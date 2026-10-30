@@ -293,6 +293,13 @@ void apps_task_set_list(const apps_listed_t *apps, int n);
  * names lock (held only for copies). The store never drops it. */
 bool apps_task_running(char *id, size_t cap);
 
+/* N3: the app that is loaded (from its launch to its end, as apps_task_brief's) and what its end frees, for a load beside it
+ * (apps_room_beside): id into id (cap bytes), and into *bytes its Lua heap as the VM counted it at the record's last refresh
+ * (apps_vm_mem_used: after its run settled, then at most once a second) and its package's blocks (its files, manifest.json's
+ * bytes, its messages and the apps_pkg_t). True when one is loaded; false, with "" and 0, when none is, the task isn't up or the
+ * record stays busy for STATUS_LOCK_MS. Any task: the record's lock, held only for copies. */
+bool apps_task_footprint(char *id, size_t cap, size_t *bytes);
+
 /*
  * Sends message(event, data_json) to the app id, which must be the one running (Link's app.send starts a stored app that
  * isn't first: muse_apps_send, apps_control.c, on the I/O worker), and returns its reply: JSON text in a block of apps_port_realloc that the caller frees with

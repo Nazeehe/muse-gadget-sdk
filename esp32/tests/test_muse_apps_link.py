@@ -348,6 +348,23 @@ class GuideAndSkill(unittest.TestCase):
         self.assertIn("it is refused before anything is drawn (`out_of_memory`), and a full-size one says when `scale: 2` would fit",
                       guide)
 
+    def test_guide_says_what_to_do_when_a_launch_has_no_room_beside_the_app_that_runs(self):
+        # N3: a launch beside another app is refused up front when it can't fit even once that app ends, or when its files don't fit
+        # beside it now. The guide's Common errors quote both as apps_pkg.h has them (%s an <id>, %u an <n>), with what to do, and
+        # its memory paragraph says that the app that runs is left running.
+        header = (APPS / "apps_pkg.h").read_text()
+        section = " ".join(guide_section(GUIDE.read_text(), "Common errors").split())
+        for name, fix in (("APPS_MSG_SHORT_ONCE_ENDED", "lower `memory_kb` or the images. The app that runs keeps running."),
+                          ("APPS_MSG_SHORT_BESIDE", "stop it with `app.control`, then launch the app again")):
+            with self.subTest(name):
+                match = re.search(rf'^#define {name} (?:\\\n\s*)?"([^"]+)"', header, re.M)
+                self.assertIsNotNone(match, f"no #define {name} in apps_pkg.h")
+                quoted = match.group(1).replace("%s", "<id>").replace("%u", "<n>")
+                self.assertRegex(section, rf"- `{re.escape(quoted)}`: [^`]*{re.escape(fix)}")
+        guide = " ".join(GUIDE.read_text().split())
+        self.assertIn("A launch while another app runs counts what that app frees when it ends: it is refused up front, with the app that "
+                      "runs left running, when it wouldn't fit even then, or when its files don't fit beside that app now.", guide)
+
     def test_guide_quotes_the_cpu_limits_as_the_firmware_has_them(self):
         # Task 27 set the budgets from the board's measured speed (D12: a test pins each number the guide quotes; the skill
         # holds the guide verbatim). Each sentence with its numbers made from the headers, with thousands separators.

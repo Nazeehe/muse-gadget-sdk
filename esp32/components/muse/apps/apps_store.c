@@ -1668,8 +1668,9 @@ static bool load_flash(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
     const apps_manifest_t *m = &pkg->manifest;
     /* C1: admitted only when free PSRAM holds the files (their sizes on the FAT) and keeps the heap and APPS_RAM_RESERVE
      * (apps_pkg.h), the RAM store's formula with nothing to drop. The app that runs makes no second heap: a launch of it
-     * only fronts it, and a run of it admits its heap again once the old copy has gone (apps_task.h). A file stat can't
-     * size counts nothing: its read says what is wrong with it. */
+     * only fronts it, and a run of it admits its heap again once the old copy has gone (apps_task.h). Beside another app
+     * that is loaded, what that app's end frees counts for the heap (N3: apps_room_beside, apps_task_footprint), and the
+     * other runs on when the load is refused. A file stat can't size counts nothing: its read says what is wrong with it. */
     size_t bytes = 0;
     for (int i = 0; i < m->file_count; i++) {
         struct stat st;
@@ -1677,9 +1678,13 @@ static bool load_flash(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
             bytes += (size_t)st.st_size;
         }
     }
-    char running[APPS_ID_MAX + 1];
+    char running[APPS_ID_MAX + 1], other[APPS_ID_MAX + 1];
+    size_t frees = 0;
     bool runs = apps_task_running(running, sizeof running) && strcmp(running, id) == 0;
-    if (!apps_room(apps_port_psram_free(), id, bytes, runs ? 0 : m->memory_kb, err, n)) {
+    bool beside = !runs && apps_task_footprint(other, sizeof other, &frees) && strcmp(other, id) != 0;
+    bool room = runs ? apps_room(apps_port_psram_free(), id, bytes, 0, err, n)
+                     : apps_room_beside(apps_port_psram_free(), id, bytes, m->memory_kb, beside ? other : NULL, frees, err, n);
+    if (!room) {
         return false;
     }
     for (int i = 0; i < m->file_count; i++) {

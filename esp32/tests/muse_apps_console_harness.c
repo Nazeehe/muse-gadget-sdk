@@ -764,6 +764,13 @@ bool apps_task_running(char *id, size_t cap) {
     return running_app[0] != '\0';
 }
 
+/* What the loaded app's end frees (apps_task_footprint): nothing is said, so a load is admitted by C1's formula. */
+bool apps_task_footprint(char *id, size_t cap, size_t *bytes) {
+    snprintf(id, cap, "%s", "");
+    *bytes = 0;
+    return false;
+}
+
 void apps_task_status(apps_status_t *st) {
     memcpy(st, &status_record, sizeof *st);
 }

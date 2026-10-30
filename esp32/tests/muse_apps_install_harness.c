@@ -227,6 +227,16 @@ bool apps_task_running(char *id, size_t cap) {
     return running_app[0] != '\0';
 }
 
+/* The app that is loaded and what its end frees (apps_task_footprint): a case sets them; "" for none. */
+static char footprint_app[APPS_ID_MAX + 1];
+static size_t footprint_frees;
+
+bool apps_task_footprint(char *id, size_t cap, size_t *bytes) {
+    snprintf(id, cap, "%s", footprint_app);
+    *bytes = footprint_app[0] != '\0' ? footprint_frees : 0;
+    return footprint_app[0] != '\0';
+}
+
 static char listed[1024]; /* the launcher's list as the store last gave it: "id:name id:name ..." */
 static int listings;
 
@@ -1620,6 +1630,58 @@ static void ram_budget(void) {
     psram_total = (size_t)1 << 30;
 }
 
+/* N3: the RAM store's load beside another app that is loaded counts what that app's end frees (apps_task_footprint): (a) free PSRAM
+ * after the copy holds APPS_RAM_RESERVE, (b) with what the other's end frees it holds the heap too. Room that way drops nothing; short of
+ * it the oldest packages go as before, never the app that runs; short still, the refusal says which check failed and what to do. */
+static void a_ram_load_beside_another_app_counts_what_its_end_frees(void) {
+    char err[300], want[300];
+    commit_pkg(make_big("big", 200 * KB));
+    commit_pkg(make_big("old", 100 * KB));
+    commit_pkg(make_big("small", 20 * KB));
+    apps_pkg_t *p = make_big("small", 20 * KB);
+    size_t need = need_of(p, false), heap = (size_t)p->manifest.memory_kb * 1024;
+    free_pkg(p);
+    snprintf(running_app, sizeof running_app, "big");
+    snprintf(footprint_app, sizeof footprint_app, "big");
+    apps_pkg_t *copy = apps_port_realloc(NULL, sizeof *copy);
+    CHECK(copy != NULL, "no memory");
+    /* Short of small's heap now, which big's end frees: loaded, and nothing dropped. */
+    footprint_frees = 600 * KB;
+    psram_total = port_held + need - 100 * KB;
+    int from = n_logged;
+    CHECK(apps_ram_load("small", copy, err, sizeof err), "beside big: %s", err);
+    CHECK(n_logged == from, "nothing dropped: %d lines", n_logged - from);
+    apps_pkg_free(copy, apps_port_free);
+    /* Short once big ends too: old goes, and then it fits. */
+    footprint_frees = 50 * KB;
+    psram_total = port_held + need - 100 * KB;
+    from = n_logged;
+    CHECK(apps_ram_load("small", copy, err, sizeof err), "once old went: %s", err);
+    CHECK(logged_count(from, "W muse_apps: ram: dropped old to make room") == 1 && n_logged == from + 1, "old went: %d lines",
+          n_logged - from);
+    apps_pkg_free(copy, apps_port_free);
+    /* Nothing left to drop but big, which runs: refused up front, and big is kept. */
+    footprint_frees = 0;
+    psram_total = port_held + need - 1;
+    CHECK(!apps_ram_load("small", copy, err, sizeof err) && copy->count == 0, "small was loaded");
+    snprintf(want, sizeof want, "the gadget is short of memory for small: %zu KB free once big ends, %zu KB needed; restart the gadget or "
+             "install a smaller app", apps_port_psram_free() / 1024, (need + 1023) / 1024);
+    CHECK(strcmp(err, want) == 0, "the refusal: %s\ninstead of %s", err, want);
+    CHECK(apps_ram_has("big") && apps_ram_has("small"), "big and small are kept");
+    /* Room once big ends, not now: big must stop first. */
+    footprint_frees = (size_t)2 << 20;
+    psram_total = port_held + need - heap - 1;
+    CHECK(!apps_ram_load("small", copy, err, sizeof err) && copy->count == 0, "small was loaded");
+    snprintf(want, sizeof want, "the gadget is short of memory to load small while big runs: %zu KB free, %zu KB needed; stop big, then "
+             "launch small", apps_port_psram_free() / 1024, (need - heap + 1023) / 1024);
+    CHECK(strcmp(err, want) == 0, "the refusal: %s\ninstead of %s", err, want);
+    running_app[0] = footprint_app[0] = '\0';
+    footprint_frees = 0;
+    psram_total = (size_t)1 << 30;
+    apps_port_free(copy);
+    CHECK(apps_ram_remove("big") && apps_ram_remove("small"), "the store emptied");
+}
+
 /* Whether s is valid UTF-8, and (printed JSON, which escapes them) with no raw control byte unless controls. */
 static bool utf8_ok(const char *s, bool controls) {
     const unsigned char *p = (const unsigned char *)s, *end = p + strlen(s);
@@ -1860,6 +1922,7 @@ int main(int argc, char **argv) {
         {"an_update_short_of_memory_says_it_needs_two_copies", an_update_short_of_memory_says_it_needs_two_copies},
         {"ram_store", ram_store},
         {"ram_budget", ram_budget},
+        {"a_ram_load_beside_another_app_counts_what_its_end_frees", a_ram_load_beside_another_app_counts_what_its_end_frees},
         {"results_are_utf8", results_are_utf8},
         {"status_json", status_json},
         {"out_of_memory", out_of_memory},

@@ -221,6 +221,29 @@ bool apps_room(size_t free_bytes, const char *id, size_t bytes, unsigned memory_
     return false;
 }
 
+bool apps_room_beside(size_t free_bytes, const char *id, size_t bytes, unsigned memory_kb, const char *other, size_t other_frees,
+                      char *err, size_t err_len) {
+    if (other == NULL || other[0] == '\0') {
+        return apps_room(free_bytes, id, bytes, memory_kb, err, err_len);
+    }
+    id = id != NULL ? id : "";
+    size_t load = bytes + APPS_RAM_RESERVE, run = load + (size_t)memory_kb * 1024;
+    size_t after = other_frees > SIZE_MAX - free_bytes ? SIZE_MAX : free_bytes + other_frees;
+    bool fits_after = after >= run, fits_now = free_bytes >= load;
+    if (fits_after && fits_now) {
+        return true;
+    }
+    if (err != NULL && err_len > 0) {
+        if (!fits_after) {
+            snprintf(err, err_len, APPS_MSG_SHORT_ONCE_ENDED, id, (unsigned)(after / 1024), other, (unsigned)((run + 1023) / 1024));
+        } else {
+            snprintf(err, err_len, APPS_MSG_SHORT_BESIDE, id, other, (unsigned)(free_bytes / 1024), (unsigned)((load + 1023) / 1024),
+                     other, id);
+        }
+    }
+    return false;
+}
+
 size_t apps_file_max(apps_file_kind_t kind) {
     switch (kind) {
     case APPS_FILE_LUA:

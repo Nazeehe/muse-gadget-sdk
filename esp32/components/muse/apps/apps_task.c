@@ -192,6 +192,8 @@ typedef struct {
     /* Under s_rec_lock; the app task, its only writer, reads them without it. */
     apps_status_t st;
     bool loaded;               /* an app is loaded: apps_task_status reads dropped_events live */
+    size_t heap_bytes;         /* its Lua heap at the last refresh (apps_vm_mem_used), and its package's blocks (N3) */
+    size_t pkg_bytes;
     uint32_t dropped_base;     /* dropped when it was launched */
     /* Under s_names_lock. */
     struct {
@@ -472,6 +474,7 @@ static void refresh_record(void) {
     }
     if (rec_take(LOCK_MS)) {
         fill_status(&s_rec->st);
+        s_rec->heap_bytes = apps_vm_mem_used(apps_rt_vm(T.rt));
         rec_give();
     }
     T.dirty = false;
@@ -836,6 +839,19 @@ static bool call_end(void) {
 
 /* ---- A run ---- */
 
+/* The blocks of a package that its app's end frees (N3: apps_task_footprint): its files (one byte for an empty one), manifest.json's
+ * bytes, its messages and the apps_pkg_t. */
+static size_t pkg_bytes(const apps_pkg_t *pkg) {
+    size_t n = sizeof *pkg + pkg->manifest_len;
+    if (pkg->manifest.messages_json != NULL) {
+        n += strlen(pkg->manifest.messages_json) + 1;
+    }
+    for (int i = 0; i < pkg->count && i < APPS_MAX_FILES; i++) {
+        n += pkg->files[i].len > 0 ? pkg->files[i].len : 1;
+    }
+    return n;
+}
+
 static void begin_app(apps_pkg_t *pkg) {
     const apps_manifest_t *m = &pkg->manifest;
     T.pkg = pkg;
@@ -857,6 +873,8 @@ static void begin_app(apps_pkg_t *pkg) {
         s_rec->st.limit_kb = m->memory_kb;
         s_rec->st.state = APPS_STATE_STOPPED;
         s_rec->loaded = true;
+        s_rec->heap_bytes = 0;
+        s_rec->pkg_bytes = pkg_bytes(pkg);
         s_rec->dropped_base = atomic_load(&s_rec->dropped);
         rec_give();
     }
@@ -1962,6 +1980,21 @@ bool apps_task_running(char *id, size_t cap) {
         names_give();
     }
     return running;
+}
+
+bool apps_task_footprint(char *id, size_t cap, size_t *bytes) {
+    put_text(id, cap, "");
+    *bytes = 0;
+    bool loaded = false;
+    if (atomic_load(&s_up) && rec_take(STATUS_LOCK_MS)) {
+        loaded = s_rec->loaded;
+        if (loaded) {
+            put_text(id, cap, s_rec->st.id);
+            *bytes = s_rec->heap_bytes + s_rec->pkg_bytes;
+        }
+        rec_give();
+    }
+    return loaded;
 }
 
 void apps_task_launch(const char *id, bool front) {

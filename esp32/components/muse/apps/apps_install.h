@@ -202,6 +202,9 @@ cJSON *apps_install_status(const apps_status_t *st);
  * W log line, "ram: dropped <id> to make room"; short still, the copy is refused with APPS_MSG_SHORT_OF_MEMORY, "the gadget
  * is short of memory for <id>: <F> KB free, <N> KB needed; restart it or install a smaller app" (F what is free then, N
  * the copy, the heap and the reserve, rounded up). A commit of a new id into a full store drops the oldest the same way.
+ * A load beside another app that is loaded (N3) is admitted by apps_room_beside instead, with what that app's end frees
+ * (apps_task_footprint): the copy and the reserve now, and the copy, the heap and the reserve once it has gone, the drops
+ * as above; short still, APPS_MSG_SHORT_ONCE_ENDED or APPS_MSG_SHORT_BESIDE, and the other runs on.
  */
 #define APPS_RAM_APPS 8
 

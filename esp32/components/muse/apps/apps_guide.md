@@ -29,7 +29,7 @@ manifest.json, a JSON object of at most 8 KB:
 
 Any other key is ignored with a warning. Limits: 32 files; 256 KB for a `.lua` file, 32 KB for a `.json` file, 512 KB for an image and 1.5 MB for all the images; 2 MB for the whole app. A running app has at most 128 widgets, 16 timers, 4 alarms (8 on the gadget) and 16 KB in its store. `app.api` returns these numbers as `limits`.
 
-An app's files and its Lua heap share the gadget's memory, and the gadget keeps a reserve of it for itself: `app.api`'s `limits.room_kb` is what an app's files and its `memory_kb` may take together right now. With Muse's session up, the 2 MB of files and a 1024 KB heap don't both fit. While an app runs its memory is taken, so installing the app that runs again needs room for two copies of its files until the new one starts: stop it first when `room_kb` is short.
+An app's files and its Lua heap share the gadget's memory, and the gadget keeps a reserve of it for itself: `app.api`'s `limits.room_kb` is what an app's files and its `memory_kb` may take together right now. With Muse's session up, the 2 MB of files and a 1024 KB heap don't both fit. While an app runs its memory is taken, so installing the app that runs again needs room for two copies of its files until the new one starts: stop it first when `room_kb` is short. A launch while another app runs counts what that app frees when it ends: it is refused up front, with the app that runs left running, when it wouldn't fit even then, or when its files don't fit beside that app now.
 
 The timer example's manifest, shortened:
 
@@ -304,6 +304,8 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `not enough room on the gadget for <id>: <n> KB free, <n> KB needed; remove an app you don't use`: remove an app with `app.control`.
 - `the gadget keeps at most 32 apps; remove one first`: remove an app with `app.control`.
 - `the gadget is short of memory for <id>: <n> KB free, <n> KB needed; restart it or install a smaller app`: lower `memory_kb` or the images, or stop the app that runs first.
+- `the gadget is short of memory for <id>: <n> KB free once <id> ends, <n> KB needed; restart the gadget or install a smaller app`: even with the app that runs stopped there isn't room: lower `memory_kb` or the images. The app that runs keeps running.
+- `the gadget is short of memory to load <id> while <id> runs: <n> KB free, <n> KB needed; stop <id>, then launch <id>`: there is room once the app that runs has stopped: stop it with `app.control`, then launch the app again.
 - `reading <file>: out of memory; <id> is running, and an update needs room for two copies of it: stop it, then install again`: stop the app with `app.control`, then install it again.
 - `the app stopped responding; no app can run until its stuck call returns or the gadget restarts`: a hung call; ask the user to restart the gadget.
 - `the app task is busy; try again`: try again in a moment.

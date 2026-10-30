@@ -157,8 +157,12 @@ static long blocks_held;
 static size_t psram_free = (size_t)3 << 20;
 static int alloc_fail_in = -1;  /* the new block this many allocations from now is refused (0: the next); -1 none */
 static bool alloc_refuse_all;   /* every new block is refused */
+static size_t alloc_refuse_size; /* a new block of exactly this many bytes is refused (0: none) */
 
 void *apps_port_realloc(void *ptr, size_t n) {
+    if (ptr == NULL && alloc_refuse_size != 0 && n == alloc_refuse_size) {
+        return NULL;
+    }
     if (ptr == NULL && (alloc_refuse_all || (alloc_fail_in >= 0 && alloc_fail_in-- == 0))) {
         return NULL;
     }
@@ -1158,6 +1162,28 @@ static void put_app_icon(const char *dir, const char *id, const char *name, cons
     spit(path, json);
     snprintf(path, sizeof path, "%s/main.lua", dir);
     spit(path, "-- main\n");
+}
+
+/* The launcher's list is built in a PSRAM block, not on the worker's small stack: refused, nothing is published (one W line) and the
+ * next change of the store publishes it all. */
+static void a_refused_list_block_publishes_nothing(void) {
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    commit_app("aa");
+    int before = list_publishes;
+    long held = blocks_held;
+    alloc_refuse_size = APPS_TASK_LIST_MAX * sizeof(apps_listed_t);
+    int from = n_logged;
+    commit_app("bb");
+    alloc_refuse_size = 0;
+    int said = 0;
+    for (int i = from; i < n_logged; i++) {
+        said += strstr(logged[i], "W muse_apps: store: the launcher's list wasn't published: out of memory") != NULL;
+    }
+    CHECK(list_publishes == before && listed_n == 1, "nothing published: %d, %d apps", list_publishes - before, listed_n);
+    CHECK(said == 1, "one W line: %d", said);
+    CHECK(blocks_held == held, "nothing held");
+    commit_app("cc");
+    CHECK(list_publishes == before + 1 && listed_n == 3, "the next change publishes every app: %d", listed_n);
 }
 
 /* The launcher's list carries each app's icon path: the manifest's, or "" for an app with none. */
@@ -2190,6 +2216,7 @@ static const case_t CASES[] = {
     {"list_reads_names", list_reads_names},
     {"list_carries_icon_paths", list_carries_icon_paths},
     {"list_has_every_app", list_has_every_app},
+    {"a_refused_list_block_publishes_nothing", a_refused_list_block_publishes_nothing},
     {"unordered_tail_is_alphabetical_by_name", unordered_tail_is_alphabetical_by_name},
     {"unchanged_skips_commit", unchanged_skips_commit},
     {"values_roundtrip", values_roundtrip},

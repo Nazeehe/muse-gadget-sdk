@@ -435,7 +435,13 @@ uint32_t apps_store_free_kb(void) {
 
 /* The launcher's list (apps_task.h): the cache, every app (APPS_TASK_LIST_MAX is the store's most). */
 static void publish(void) {
-    apps_listed_t listed[APPS_TASK_LIST_MAX];
+    /* 32 entries are 3.7 KB: a PSRAM block, since the I/O worker's stack is 8 KB. Refused: nothing is published, and the next change of
+     * the store publishes the whole list. */
+    apps_listed_t *listed = apps_port_realloc(NULL, APPS_TASK_LIST_MAX * sizeof *listed);
+    if (listed == NULL) {
+        ESP_LOGW(TAG, "store: the launcher's list wasn't published: out of memory");
+        return;
+    }
     lock();
     int n = s_list_n < APPS_TASK_LIST_MAX ? s_list_n : APPS_TASK_LIST_MAX;
     for (int i = 0; i < n; i++) {
@@ -445,6 +451,7 @@ static void publish(void) {
     }
     unlock();
     apps_task_set_list(listed, n);
+    apps_port_free(listed);
 }
 
 /* RAM mode: the cache is the RAM store's list, read again after each of its changes (the RAM store gives the launcher its own). */

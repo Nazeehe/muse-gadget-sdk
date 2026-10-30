@@ -98,6 +98,9 @@ class Store(unittest.TestCase):
     def test_list_has_every_app(self):  # twelve, where the launcher's list once stopped at eight
         self.run_case("list_has_every_app")
 
+    def test_a_refused_list_block_publishes_nothing(self):  # the list is built in PSRAM, not on the worker's stack
+        self.run_case("a_refused_list_block_publishes_nothing")
+
     def test_unordered_tail_is_alphabetical_by_name(self):  # after the order's ids: by name, case-insensitively, ties by id
         self.run_case("unordered_tail_is_alphabetical_by_name")
 

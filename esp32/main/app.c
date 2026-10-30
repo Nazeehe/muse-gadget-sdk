@@ -1874,7 +1874,7 @@ static cJSON *on_ws_command(
     }
 #endif
 #if CONFIG_MUSE_APPS
-    // Muse's apps (main/apps_link.c): app.install.
+    // Muse's apps (main/apps_link.c): app.api, app.install and app.control.
     if (apps_link_handles(command)) {
         return apps_link_handle(command, params, request_id, session_generation);
     }

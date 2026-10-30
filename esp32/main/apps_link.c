@@ -67,6 +67,12 @@ static const char *const ACTIONS[] = {"list", "status", "logs", "launch", "stop"
 // What the reader's "out_of_memory" means for the one who asked.
 #define READER_NO_MEMORY "the gadget is short of memory for the VM reader right now; try again in a few seconds"
 
+// vm_file's words (vm_file.h) for a session that is gone: the request wasn't sent, or the connection dropped. Nothing will
+// read an answer then (MUSE_APPS_VM_DROPPED).
+static bool session_gone(const char *why) {
+    return strcmp(why, "the VM connection dropped") == 0 || strcmp(why, "could not send the request to the VM") == 0;
+}
+
 // ---- The VM's files, behind muse_apps_vm_ops_t ----
 
 static bool vm_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
@@ -83,11 +89,12 @@ static bool vm_read(const char *path, size_t max, bool (*sink)(void *user, const
     bool ok = vm_file_read_all(f, max, sink, user, deadline_us);
     if (!ok) {
         // vm_file says a sink's stop as "larger than <max>" too: only more than max having come is too large.
-        *code = vm_file_timed_out(f)      ? MUSE_APPS_VM_TIMED_OUT
-                : vm_file_bytes(f) > max ? MUSE_APPS_VM_TOO_LARGE
-                                         : MUSE_APPS_VM_FAILED;
         const char *why = vm_file_error(f, err, err_len);  // a literal, or err written
         if (why != err) snprintf(err, err_len, "%s", why);
+        *code = vm_file_timed_out(f)      ? MUSE_APPS_VM_TIMED_OUT
+                : vm_file_bytes(f) > max ? MUSE_APPS_VM_TOO_LARGE
+                : session_gone(err)      ? MUSE_APPS_VM_DROPPED
+                                         : MUSE_APPS_VM_FAILED;
     }
     vm_file_close(f);
     return ok;
@@ -106,6 +113,7 @@ static bool vm_write(const char *path, const void *data, size_t len, int64_t dea
     *code = strcmp(err, "write timed out") == 0             ? MUSE_APPS_VM_TIMED_OUT
             : strcmp(err, "the VM file writer is busy") == 0 ? MUSE_APPS_VM_BUSY
             : strcmp(err, "out of memory") == 0              ? MUSE_APPS_VM_OUT_OF_MEMORY
+            : session_gone(err)                              ? MUSE_APPS_VM_DROPPED
                                                              : MUSE_APPS_VM_FAILED;
     return false;
 }
@@ -214,12 +222,18 @@ static cJSON *async_reply(void) {
     return async;
 }
 
-// The done of app.control's queued actions (muse_apps.h), on the I/O worker: the result once, then the request goes.
-static void command_done(void *ctx, cJSON *result) {
+// A queued command's done (muse_apps.h), on the I/O worker: the result once (no_room when there was no memory for one), then
+// the request goes.
+static void finish_request(void *ctx, cJSON *result, const char *no_room) {
     request_t *req = ctx;
-    if (!result) result = error_result("out_of_memory", "out of memory: no room for the result");
+    if (!result) result = error_result("out_of_memory", no_room);
     noise_ctrl_send_command_result(req->session_generation, req->request_id, result);  // it owns the result
     heap_caps_free(req);
+}
+
+// app.control's queued actions.
+static void command_done(void *ctx, cJSON *result) {
+    finish_request(ctx, result, "out of memory: no room for the result");
 }
 
 // app.api's done: as command_done, and a payload that names app.control when link.register leaves it out.
@@ -231,12 +245,9 @@ static void api_done(void *ctx, cJSON *result) {
     command_done(ctx, result);
 }
 
-// The install's done (muse_apps.h), on the I/O worker: the result once, then the request goes.
+// app.install's.
 static void install_done(void *ctx, cJSON *result) {
-    request_t *req = ctx;
-    if (!result) result = error_result("out_of_memory", "out of memory: no room for the install's result");
-    noise_ctrl_send_command_result(req->session_generation, req->request_id, result);  // it owns the result
-    heap_caps_free(req);
+    finish_request(ctx, result, "out of memory: no room for the install's result");
 }
 
 static cJSON *install_command(cJSON *params, const char *request_id,

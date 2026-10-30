@@ -114,6 +114,7 @@
 #define APPS_STORE_EPOCH_MIN 1735689600000LL  /* 2025-01-01: a record's time before this, or */
 #define APPS_STORE_EPOCH_MAX 4102444800000LL  /* after 2100-01-01, isn't a record's */
 #define APPS_STORE_NO_FAT_HINT "the gadget couldn't open its app storage; restart it to try again"
+#define APPS_STORE_NO_SUCH_APP "no such app on the gadget"  /* a remove's or a load's refusal of an id it has no folder for */
 
 typedef enum { APPS_STORAGE_NONE, APPS_STORAGE_RAM, APPS_STORAGE_FLASH } apps_storage_t;
 
@@ -139,7 +140,7 @@ void apps_store_mount_once(void);
 bool apps_store_commit(const apps_pkg_t *pkg, bool *unchanged, char *err, size_t n);
 
 /* Deletes the app id: its folder (or its RAM copy and RAM values), its values, its alarms' records, its quarantine and its place in
- * the order, and cancels its armed alarms. False with why in err: "<id> is running; stop it first", "no such app on the gadget",
+ * the order, and cancels its armed alarms. False with why in err: "<id> is running; stop it first", APPS_STORE_NO_SUCH_APP,
  * "storage not ready" or "couldn't remove <id>: <what>". */
 bool apps_store_remove(const char *id, char *err, size_t n);
 
@@ -213,6 +214,12 @@ apps_storage_t apps_store_mode(void);
 /* What results and app.list add about where apps are kept: NULL on flash and before the mount; in RAM mode APPS_RAM_HINT when the
  * table has no apps partition, APPS_STORE_NO_FAT_HINT when it has one that couldn't be mounted. */
 const char *apps_store_hint(void);
+
+/* apps_storage_name(apps_store_mode()), as a function: apps_install_ops_t.storage for the store's callers (a commit, a launch, Link's
+ * install and app.control's launch). Any task. */
+static inline const char *apps_store_storage(void) {
+    return apps_storage_name(apps_store_mode());
+}
 
 /* The room left: FLASH the FAT's free space as of the last change, RAM the apps' heap's free PSRAM, 0 before the mount. */
 uint32_t apps_store_free_kb(void);

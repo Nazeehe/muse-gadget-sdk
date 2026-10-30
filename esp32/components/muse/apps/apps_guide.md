@@ -9,7 +9,7 @@ This guide is for Muse, writing apps for a Muse gadget with a round screen. It c
 - The user opens apps from the launcher (a long press on the watch face; it lists the four most recently used). A right swipe puts the app behind, where it keeps running. A voice turn puts the app behind too, and brings it back when the turn ends. An alarm brings its app to the front, and starts it first if it isn't running.
 - Installed apps are kept in the gadget's flash and outlive a restart. A gadget without the apps partition keeps them in RAM until it restarts: results then say `"storage":"ram"` with a hint.
 - An app can't hang or crash the gadget. Each callback has a budget of Lua VM instructions (2,000,000; 5,000,000 for main.lua's top level and `start()`) and 1 s of time, the Lua heap is capped at the manifest's `memory_kb`, and an app that uses more than 40% of the CPU for 5 s is stopped. A call that hasn't returned after 3 s marks the app hung, and the gadget says so on screen.
-- The Lua is sandboxed. It has the base library, `coroutine`, `table`, `string`, `math` and `utf8`, and the gadget's modules below. There is no `io`, `debug`, `load`, `dofile` or `collectgarbage`, and `require` loads only the app's own files. `string.match`, `string.gmatch` and `string.gsub` raise an error (patterns can run without bound); `string.find` searches plain text only. Globals are strict: reading one that was never set is an error, with a suggestion when a name is close. `setmetatable` refuses a metatable with `__gc`, and to-be-closed variables (`local x <close> = ...`) are not available.
+- The Lua is sandboxed. It has the base library, `coroutine`, `table`, `string`, `math` and `utf8`, and the gadget's modules below. There is no `io`, `debug`, `load`, `dofile` or `collectgarbage`, and `require` loads only the app's own files. `string.match`, `string.gmatch` and `string.gsub` raise an error (patterns can run without bound); `string.find` searches plain text only. Globals are strict: reading one that was never set is an error, with a suggestion when a name is close. Declare everything `local`: a global set to nil is gone, and reading it again is that error. `setmetatable` refuses a metatable with `__gc`, and to-be-closed variables (`local x <close> = ...`) are not available.
 
 ## Files and the manifest
 
@@ -82,9 +82,9 @@ return app
 
 - `ui.label{...}`: a line or block of text. Returns the widget.
 - `ui.button{...}`: a button with text on it; give it a "tap" handler.
-- `ui.box{...}`: a rectangle with a background, corners and a border, and the parent of the widgets made with `parent = box` (boxes nest at most 4 deep).
-- `ui.arc{...}`: a ring, or part of one, filled from start_angle by value between min and max.
-- `ui.bar{...}`: a straight progress bar, value between min and max.
+- `ui.box{...}`: a rectangle with a background, corners and a border, and the parent of the widgets made with `parent = box` (boxes nest at most 4 deep). A box without `bg` (or a `border`) is invisible: it has no background until you give it one.
+- `ui.arc{...}`: a ring, or part of one, filled from start_angle by value between min and max. Give it `w` and `h`: without them it draws nothing.
+- `ui.bar{...}`: a straight progress bar, value between min and max. Give it `w` and `h`: without them it draws nothing.
 - `ui.image{...}`: one of the app's images (`src`, a path of the manifest's files).
 - `ui.bg(color)`: the screen's background colour (black at first).
 - `ui.clear()`: removes every widget.
@@ -101,13 +101,15 @@ return app
 The values:
 
 - `align` is one of center, top, bottom, left, right, top_left, top_right, bottom_left, bottom_right (default center), and `x`, `y` are offsets from that point in the parent.
-- `w` and `h` are 1 to 466; leave them out and the widget sizes to its content. `hidden` and `wrap` are booleans (`wrap` breaks a label's text at its `w`). `opacity` is 0 to 100.
+- `w` and `h` are 1 to 466. Leave them out and the widget sizes to its content: a label to its text, an image to its picture, and a button with no `w` and `h` is only as big as its text, with no padding. An arc or a bar has no content of its own, so without `w` and `h` it draws nothing, with no error or warning. `w:get("w")` and `w:get("h")` are nil while the widget sizes to its content: `get` reads what the app set, not the laid-out size (an install's `ui` has that).
+- `hidden` and `wrap` are booleans (`wrap` breaks a label's text at its `w`). `opacity` is 0 to 100.
 - `text` is a string (or a number) of at most 256 bytes of UTF-8. `font` is one of sans14, sans16, sans20 (the default), sans28, mono8, mono16, digits48 and digits96; the two digit fonts hold only `0-9 : . - + %` and the space. `text_align` is left, center (the default) or right.
 - Colours (`color`, `bg`, `border_color`, `track_color`) are `"#rgb"`, `"#rrggbb"` or `0xRRGGBB`; `bg` also takes `"none"`. Text and arcs default to white, button backgrounds and tracks to `"#262626"`.
 - `radius` is 0 to 233, or `"circle"`. `border` is 0 to 20. `thickness` (of an arc) is 1 to 64, 12 by default.
 - `min`, `max` and `value` default to 0, 100 and 0, with min less than max; value is kept between them. `start_angle` and `end_angle` are clock degrees, 0 to 360: 0 is 12 o'clock, and they go clockwise.
-- `parent` is a box, and can be given only when the widget is made. `scale` is a percentage, 10 to 400.
-- Numbers are rounded and clamped to these ranges. A value of the wrong type is an error; so is an unknown property or name, and that error lists the valid ones.
+- `parent` is a box, and can be given only when the widget is made. Widgets inside a box lay out in its content area: a border moves them in by its width, and LVGL clips what sticks out of the box. A box may have three boxes above it; a label, button, arc, bar or image may go in the fourth. `scale` is a percentage, 10 to 400.
+- Numbers are rounded (halves away from zero) and clamped to these ranges, and an infinity is clamped too; NaN is an error. A value of the wrong type is an error; so is an unknown property or name, and that error lists the valid ones.
+- A widget's handle is the same object for as long as the app holds it, so it can be a table key, and a handler gets the very handle the app holds. `tostring(w)` is like `label#3` (`label#3 (deleted)` once it is gone), and `getmetatable(w)` is the string `muse.widget`.
 
 Touches. A tap is heard as press, release, tap, in that order; a long press as press, long_press, release, with no tap. A right swipe that begins on a widget puts the app behind: the widget hears press, then release, and no tap. A left swipe that begins on a widget is heard as press, release, tap. A widget that is deleted, or cleared with `ui.clear()`, while it is pressed never hears its release.
 
@@ -143,7 +145,18 @@ These need the `alarm` permission. An alarm belongs to the gadget, not to the ap
 - `alarm.remaining(name)`: the milliseconds left, rounded up: 0 when it has fired and `alarm(name)` hasn't run yet, nil when there is no such alarm.
 - `alarm.list()`: `{{name = "t", remaining = 4200}, ...}`, the earliest first.
 
-At most 4 alarms an app and 8 on the gadget. Alarms outlive a restart of the gadget: they are armed again once the gadget has set its clock, and until then `alarm.remaining` is nil. An alarm armed before the clock was set doesn't outlive a restart.
+At most 4 alarms an app and 8 on the gadget. One app's alarms may fire at most 6 times in a minute: when they fire more than 6 times within a minute, all of its alarms are cancelled, with no event to tell it (the gadget's log says `alarm: <id> fired more than 6 alarms in a minute; its alarms are cancelled`). Use `timer.every` for anything that repeats, and alarms for rare set times.
+
+An alarm outlives a restart of the gadget once the gadget has stored it, about a second after it is armed; one armed before the gadget has set its clock is kept once the clock is set. After a restart the stored alarms come back once the gadget has set its clock, and until then `alarm.remaining` is nil for them; an app that arms or cancels one of those names first has its way. On a gadget that keeps its apps in RAM, no alarm outlives a restart.
+
+What an app that uses alarms must guard against (the timer example shows the first five):
+
+- `alarm.after` refuses 0 ms: arm a time you saved with `math.max(1, ms)`.
+- An alarm that has fired and whose `alarm(name)` hasn't run yet reads 0 from `alarm.remaining(name)`, and one that is gone (delivered, cancelled, or cancelled by the limit above) reads nil: 0 and nil both mean it has ended. A countdown whose alarm reads nil has ended, even if `alarm(name)` never came.
+- Arm first, then change your state: `local ok, why = pcall(alarm.after, name, ms, opts)`, the pcall of `alarm.after` itself so that `why` is the gadget's words. When it refuses (no free slot, no memory), leave the state, the store and the screen as they were, and show why.
+- In `alarm(name)`, check `alarm.remaining(name)`: a name armed again before the firing was delivered is still counting.
+- The ring is the gadget's, and `sound.stop()` ends any app's ring: call it only when the ring is your alarm's (it reads 0, or `alarm(name)` has just run).
+- An app that an alarm started and that crashes in `start()` or `alarm()` loses all of its alarms.
 
 ### sound
 
@@ -158,7 +171,7 @@ These need the `store` permission. The values are the app's own, kept by id: the
 - `store.set(key, value)`: keeps a copy of value: anything `json.encode` takes. nil removes the key.
 - `store.remove(key)`: removes it.
 
-A key is a string of 1 to 32 characters; all the values together may take 16 KB as JSON. The store is saved 2 s after the last change (10 s at the latest, however often the app writes) and when the app ends. On flash, saves can come less often when the app writes a lot, to spare the flash.
+A key is a string of 1 to 32 characters; a value may be nested 16 levels deep, and all the values together may take 16 KB as JSON. The store's cache lives outside the Lua heap: it doesn't count against `memory_kb` or show in `sys.mem()`. The store is saved 2 s after the last change (10 s at the latest, however often the app writes) and when the app ends, so a restart loses at most the last 10 s of changes (2 s for an app that pauses between writes). On flash, saves can come less often when the app writes a lot, to spare the flash.
 
 ### sys
 
@@ -182,7 +195,7 @@ The rest of Lua's `string`, `table`, `math` and `utf8` libraries is there, with 
 ## Patterns
 
 - Elapsed time: keep `local started = time.mono()` and show `time.mono() - started`. Never count the runs of `timer.every`: none run while the screen is dark.
-- Anything at a set time is an alarm, not a timer: alarms fire while the screen sleeps, while the app isn't running and after a restart. Read the time left with `alarm.remaining`, as the timer example does.
+- Anything at a set time is an alarm, not a timer: alarms fire while the screen sleeps, while the app isn't running and after a restart. Read the time left with `alarm.remaining`, as the timer example does. Keep alarms for rare set times: one that repeats every few seconds runs into the alarm section's limit, so tick with `timer.every`.
 - Keep state in the store: `store.set` as it changes, and read it back in `start()`. A stop, a crash, a restart or a reinstall starts the app from `main.lua` again; only the store and the alarms remain. Check what you read: the store outlives a reinstall, so it may hold what an older version wrote.
 - Lay out with `align = "center"` and x, y offsets inside `ui.SAFE`. Place things on a ring with `ui.polar`, and make an edge ring with an arc of `w = 440, h = 440`. Install results warn of any widget that goes past the round edge.
 - Tick only while shown: start `timer.every` when the app is shown (in `start()` and in `show()`) and cancel it in `hide()`, as the timer example's `ticking()` does. An app behind needs no redraws.
@@ -220,6 +233,7 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 
 - The manifest's `messages` list the events the app takes and describe their data and replies. Muse sees them in `app.control list`, and sends one with `app.send` (`id`, `event`, optional `data`, an object, and `show`).
 - The gadget calls `message(event, data)`, with data as a Lua value (a table for an object; nil for none). What it returns, as JSON, is the reply (null for nothing). `error("...")` makes the reply that error, and the app keeps running.
+- Check data before you use it: `type(data) == "table"` first (indexing anything else is an error), and note that `math.tointeger` also takes numeric strings like `"90"`.
 - `sys.show()` inside `message()` brings the app to the front; `show = true` in `app.send` does the same once the voice turn ends.
 - A message has the budget of any callback (2,000,000 instructions, 1 s): do the work, store what changed, reply.
 
@@ -243,7 +257,7 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `images add up to more than 1.5 MB`: use fewer or smaller images.
 - `files[<n>] <path> is a compiled chunk: install Lua source text`: install the `.lua` source, not luac's output.
 - `compile failed: <file>:<line>: <Lua's message>`: a syntax error; the result shows the line and the lines around it.
-- `installed but crashed in start(): <error>`: `start()` raised an error; read the traceback and the log, fix and install again.
+- `crashed in start(): <error>`: `start()` raised an error (an install's result says `installed but ` first); read the traceback and the log, fix and install again.
 - `install timed out after 90 s (reading <path>)`: the VM was slow or the session dropped; call `app.install` again.
 - `busy: another install is running`: wait for it to finish, then install again.
 - `image: not an LVGL v9 image file (use LVGLImage.py --ofmt BIN)`: convert the picture with LVGLImage.py.
@@ -265,12 +279,17 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `ui: no more than 128 widgets per app`: reuse widgets with `w:set{...}` rather than making new ones.
 - `widget was deleted`: a handle of a widget that `w:delete()` or `ui.clear()` removed; make it again.
 - `<kind>#<n> '<text>' extends <n> px past the round edge`: a warning: move the widget in, or make it smaller.
-- `ui.image: src '<path>' is not one of this app's images (manifest.json "files")`: list the `.bin` in `files`.
-- `alarm: add "alarm" to "permissions" in manifest.json`: add the permission; `store` and `sound` say so the same way.
+- `ui.<kind>: src '<path>' is not one of this app's images (manifest.json "files")`: list the `.bin` in `files`.
+- `ui.<kind>: boxes nest at most 4 deep`: flatten the layout; a label, button, arc, bar or image may still go in the fourth box.
+- `<module>: add "<permission>" to "permissions" in manifest.json`: add the permission (`alarm`, `store`, `sound` or `keep_awake`).
 - `alarm: no more than 4 alarms per app`: cancel one first, or reuse its name.
 - `alarm: the gadget has no free alarm slots (8 in all); cancel one`: other apps hold the rest: cancel one of this app's, or try later.
+- `alarm: the gadget is short of memory; try again`: try again later; leave the state as it was meanwhile.
+- `alarm.after: ms must be a whole number from 1 to 604800000`: arm a time you saved with `math.max(1, ms)`.
+- `alarm: <id> fired more than 6 alarms in a minute; its alarms are cancelled`: in the gadget's log, with every alarm of the app gone; use `timer.every` for repeats, and treat an alarm that reads nil as ended.
 - `timer: no more than 16 timers per app`: cancel timers you no longer need; one `timer.every` can drive several things.
 - `store: more than 16 KB stored; remove keys you don't need`: store less.
+- `store.set: nested deeper than 16`: flatten the value.
 - `store: the gadget's app storage is full; values weren't saved`: store less, or remove apps you don't use.
 - `store: saving less often to spare the gadget's flash`: a log line, not an error: write the store less often.
 - `sys.show: allowed only in message() or alarm(), or within 10 s of a tap`: call it from those, or after a tap.

@@ -28,6 +28,7 @@ verbatim, under the repo's six skill headings (D21). Needs the cJSON sources: CJ
 IDF build's managed_components.
 """
 
+import codecs
 import json
 import re
 import subprocess
@@ -183,6 +184,27 @@ def guide_body(text):
     return rest.lstrip("\n")
 
 
+def c_literals(source):
+    """The string literals of a C source, as the compiler has them: comments and character literals left out, adjacent
+    literals joined, escapes decoded (UTF-8 bytes as text)."""
+    literals, run, end = [], None, 0
+    for m in re.finditer(r'"((?:\\.|[^"\\\n])*)"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', source, re.S):
+        if m.group(1) is None:
+            continue  # a comment or a character literal
+        text = codecs.escape_decode(m.group(1).encode())[0].decode("utf-8", "replace")
+        between = re.sub(r"/\*.*?\*/|//[^\n]*", "", source[end:m.start()], flags=re.S)
+        if run is not None and between.strip() == "":
+            run += text
+        else:
+            if run is not None:
+                literals.append(run)
+            run = text
+        end = m.end()
+    if run is not None:
+        literals.append(run)
+    return literals
+
+
 def c_table(source, name):
     """The quoted names of a C array `name[] = {...};` (a luaL_Reg table's or a list of strings), in order."""
     match = re.search(rf"\b{name}\[\]\s*=\s*\{{(.*?)\}};", source, re.S)
@@ -291,10 +313,13 @@ class GuideAndSkill(unittest.TestCase):
     def test_common_errors_are_the_firmwares_words(self):
         # The guide's "Common errors" quote the gadget's messages, each item "- `<message>`: <the fix>": every piece of each
         # message between its <placeholders>, "..." and numbers (which the code may spell through a macro), and between the
-        # prefixes the code puts in front (": "), is text of the apps' sources, so a paraphrase fails.
-        sources = "".join(p.read_text() for p in [*sorted(APPS.glob("*.[ch]")), MAIN / "apps_link.c", MAIN / "vm_file.c",
-                                                  MAIN / "vm_file.h"])
-        corpus = sources.replace('\\"', '"').replace("\\\\", "\\").replace("\\xE2\\x80\\xA6", "…")
+        # prefixes the code puts in front (": "), is inside one string literal of the apps' sources (comments don't count),
+        # so a paraphrase fails.
+        literals = [text for p in [*sorted(APPS.glob("*.[ch]")), MAIN / "apps_link.c", MAIN / "vm_file.c", MAIN / "vm_file.h"]
+                    for text in c_literals(p.read_text())]
+        self.assertIn("busy: another install is running", literals)  # a #define's
+        self.assertNotIn("The one install pipeline of Muse apps", "\n".join(literals))  # a comment's
+        corpus = "\n".join(literals)
         section = guide_section(GUIDE.read_text(), "Common errors")
         quoted = re.findall(r"^- `([^`\n]+)`", section, re.M)
         self.assertGreater(len(quoted), 30, "the section quotes too few messages")
@@ -305,8 +330,63 @@ class GuideAndSkill(unittest.TestCase):
                     with self.subTest(message, piece=piece):
                         self.assertIn(piece, corpus, "not the firmware's words")
 
+    def test_guide_states_the_layout_and_alarm_facts(self):
+        # Facts an app goes wrong without, with no error to tell it (fix round 1, A and B), each still true of the code and said
+        # in the guide in words a reader finds: the guide's text for each must match every pattern of its fact.
+        lv = (APPS / "apps_lv.c").read_text()
+        ui = (APPS / "apps_ui.c").read_text()
+        alarm = (APPS / "apps_alarm.h").read_text()
+        rt = (APPS / "apps_rt.h").read_text()
+        # The code that makes them true.
+        self.assertIn("w->w < 0 ? LV_SIZE_CONTENT : w->w", lv)  # no w or h: the size of the content, which an arc or bar hasn't
+        self.assertIn("w->bg = APPS_COLOR_NONE;", ui)  # a box's background is none until the app gives one
+        self.assertIn("must be a number, got NaN", c_function(ui, "static void read_number("))  # and an infinity clamps
+        self.assertRegex(c_function(ui, "static int w_get("),  # the declared w and h, not the laid-out size
+                         r"v < 0 && \(p == P_W \|\| p == P_H\)\) \{\s*/\* sizes to content \*/\s*lua_pushnil\(L\);")
+        self.assertRegex(alarm, r"#define APPS_ALARM_BUDGET 6\b")
+        self.assertRegex(alarm, r"#define APPS_ALARM_BUDGET_MS 60000\b")
+        self.assertRegex((APPS / "apps_ui.h").read_text(), r"#define APPS_UI_BOX_DEPTH_MAX 4\b")
+        self.assertRegex(rt, r"#define APPS_STORE_MAX_WAIT_MS 10000\b")
+        self.assertRegex(rt, r"#define APPS_STORE_FLUSH_MS 2000\b")
+        guide = " ".join(GUIDE.read_text().split())  # one line: a fact may wrap
+        facts = {
+            "an arc or a bar with no w and h draws nothing": [r"[Aa]n arc or a bar has no content of its own", r"draws nothing"],
+            "a box without bg is invisible": [r"[Aa] box without `bg` \(or a `border`\) is invisible"],
+            "a button with no w and h is as small as its text": [r"button with no `w` and `h` is only as big as its text"],
+            "a box's border moves its children": [r"border moves them in"],
+            "a box clips its children": [r"clips what sticks out of the box"],
+            "boxes nest 4 deep, a box counting itself": [r"boxes nest at most 4 deep", r"may go in the fourth"],
+            "w:get gives nil for a w or h that sizes to content": [
+                r"`w:get\(\"w\"\)` and `w:get\(\"h\"\)` are nil while the widget sizes to its content"],
+            "a NaN property is an error, an infinity clamps": [r"NaN is an error", r"an infinity is clamped"],
+            "the alarm firing limit": [r"more than 6 times within a minute", r"all of its alarms are cancelled",
+                                       r"`timer\.every` for anything that repeats"],
+            "alarm.after refuses 0": [r"`math\.max\(1, ms\)`"],
+            "a fired alarm that isn't told yet reads 0": [r"0 and nil both mean it has ended"],
+            "an alarm armed before the clock is set is kept once the clock is set": [
+                r"armed before the gadget has set its clock is kept once the clock is set"],
+            "sound.stop ends any app's ring": [r"`sound\.stop\(\)` ends any app's ring"],
+            "globals: use local": [r"[Dd]eclare everything `local`"],
+            "the store's cache is outside memory_kb": [r"outside the Lua heap"],
+            "a restart loses at most the last 10 s of store changes": [r"loses at most the last 10 s"],
+        }
+        for fact, patterns in facts.items():
+            for pattern in patterns:
+                with self.subTest(fact, pattern=pattern):
+                    self.assertRegex(guide, pattern, f"the guide doesn't say: {fact}")
+
 
 class LinkWiring(unittest.TestCase):
+    def test_adapter_reads_vm_files_own_words(self):
+        # The adapter tells a dropped session, a timeout, a busy writer and a lack of memory by vm_file's texts: each it
+        # compares against must be one of vm_file.c's literals, or the code falls back to "failed" (and the guide goes inline).
+        link = (MAIN / "apps_link.c").read_text()
+        words = re.findall(r'strcmp\((?:err|why), "([^"]+)"\) == 0', link)
+        for word in ("the VM connection dropped", "could not send the request to the VM", "write timed out"):
+            self.assertIn(word, words)
+        literals = set(c_literals((MAIN / "vm_file.c").read_text()))
+        self.assertEqual([w for w in words if w not in literals], [])
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))

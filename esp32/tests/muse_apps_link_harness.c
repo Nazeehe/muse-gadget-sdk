@@ -767,7 +767,11 @@ static void vm_ops_are_vm_file(void) {
     read_fails = true;
     read_error = "the VM connection dropped";
     CHECK(!vm_read("workspace/apps/hello/main.lua", 100, 1, &code, err, sizeof err), "a drop");
-    CHECK(strcmp(code, MUSE_APPS_VM_FAILED) == 0 && strcmp(err, "the VM connection dropped") == 0, "%s: %s", code, err);
+    CHECK(strcmp(code, MUSE_APPS_VM_DROPPED) == 0 && strcmp(err, "the VM connection dropped") == 0, "%s: %s", code, err);
+    read_error = "could not send the request to the VM";
+    CHECK(!vm_read("workspace/apps/hello/main.lua", 100, 1, &code, err, sizeof err), "not sent");
+    CHECK(strcmp(code, MUSE_APPS_VM_DROPPED) == 0 && strcmp(err, "could not send the request to the VM") == 0, "%s: %s", code,
+          err);
     error_in_msg = true;
     read_error = "VM answered HTTP 404";
     CHECK(!vm_read("workspace/apps/hello/main.lua", 100, 1, &code, err, sizeof err), "a 404");
@@ -791,7 +795,7 @@ static void vm_ops_are_vm_file(void) {
     CHECK(strcmp(code, MUSE_APPS_VM_FAILED) == 0, "%s: %s", code, err);
     sink_stops = false;
     error_in_msg = false;
-    CHECK(closes == 6 && open_now == 0, "every read closed: %d", closes);
+    CHECK(closes == 7 && open_now == 0, "every read closed: %d", closes);
 
     /* write: the time left to the deadline, in ms. */
     now_us = 5000000;
@@ -812,7 +816,9 @@ static void vm_ops_are_vm_file(void) {
         {"the VM file writer is busy", MUSE_APPS_VM_BUSY},
         {"out of memory", MUSE_APPS_VM_OUT_OF_MEMORY},
         {"VM answered HTTP 403: route not allowed", MUSE_APPS_VM_FAILED},
-        {"the VM connection dropped", MUSE_APPS_VM_FAILED},
+        {"the VM wrote 2 of 3 bytes", MUSE_APPS_VM_FAILED},
+        {"the VM connection dropped", MUSE_APPS_VM_DROPPED},
+        {"could not send the request to the VM", MUSE_APPS_VM_DROPPED},
     };
     for (size_t i = 0; i < ARRAY_LEN(failures); i++) {
         write_error = failures[i].error;

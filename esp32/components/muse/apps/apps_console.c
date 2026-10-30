@@ -529,13 +529,10 @@ static bool install_run(apps_pkg_t *p, int settle_ms, apps_status_t *st, char *e
     return apps_task_run(p, true, settle_ms, st, err, n);  /* C2: an install with a run fronts the app */
 }
 
-static const char *store_storage(void) {
-    return apps_storage_name(apps_store_mode());
-}
-
 /* The store keeps the package (apps_store.h): on the apps partition, or in PSRAM on a gadget without one (or whose partition couldn't be
  * mounted), which results say with the store's hint. A commit's, a launch's and Link's install's. */
-static const apps_install_ops_t INSTALL_OPS = {apps_task_compile, apps_store_commit, install_run, store_storage, apps_store_hint};
+static const apps_install_ops_t INSTALL_OPS = {apps_task_compile, apps_store_commit, install_run, apps_store_storage,
+                                               apps_store_hint};
 
 static void commit_job(void *arg) {
     job_t *job = arg;
@@ -849,7 +846,7 @@ static void list_job(void *arg) {
     int n = l != NULL ? apps_store_list(l->ids, l->names, APPS_STORE_APPS_MAX) : 0;
     const char *hint = apps_store_hint();
     cJSON *r = l != NULL ? cJSON_CreateObject() : NULL;
-    bool ok = r != NULL && cJSON_AddStringToObject(r, "storage", apps_storage_name(apps_store_mode())) != NULL &&
+    bool ok = r != NULL && cJSON_AddStringToObject(r, "storage", apps_store_storage()) != NULL &&
               (hint == NULL || cJSON_AddStringToObject(r, "hint", hint) != NULL);
     cJSON *apps = ok ? cJSON_AddArrayToObject(r, "apps") : NULL;
     ok = apps != NULL;

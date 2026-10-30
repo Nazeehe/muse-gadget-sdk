@@ -138,7 +138,9 @@ static cJSON *not_found(const char *id) {
     return failure(CODE_NOT_FOUND, msg);
 }
 
-/* A refusal in the store's or the app task's words: out_of_memory for a lack of memory, else code. */
+/* A refusal in the store's or the app task's words: out_of_memory for a lack of memory, else code. They give their refusals as
+ * text only, with no code, and their lack-of-memory texts vary ("out of memory: no room to load the app", "... for the request"),
+ * so this one reads the start of the text. */
 static cJSON *refusal(const char *code, const char *why) {
     return failure(strncmp(why, "out of memory", 13) == 0 ? APPS_ERR_OUT_OF_MEMORY : code, why);
 }
@@ -206,7 +208,7 @@ static cJSON *status_payload(apps_status_t *st, bool logs) {
     }
     cJSON *s = apps_install_status(st);
     const char *hint = apps_store_hint();
-    if (s == NULL || cJSON_AddStringToObject(s, "storage", apps_storage_name(apps_store_mode())) == NULL ||
+    if (s == NULL || cJSON_AddStringToObject(s, "storage", apps_store_storage()) == NULL ||
         (hint != NULL && cJSON_AddStringToObject(s, "hint", hint) == NULL)) {
         cJSON_Delete(s);
         return NULL;
@@ -381,12 +383,8 @@ static bool run_in_front(apps_pkg_t *pkg, int settle_ms, apps_status_t *st, char
     return apps_task_run_by_id(pkg, true, settle_ms, st, err, n);
 }
 
-static const char *store_storage(void) {
-    return apps_storage_name(apps_store_mode());
-}
-
 /* A launch runs the store's copy and nothing else of the pipeline (apps_install_launch). */
-static const apps_install_ops_t LAUNCH_OPS = {NULL, NULL, run_in_front, store_storage, apps_store_hint};
+static const apps_install_ops_t LAUNCH_OPS = {NULL, NULL, run_in_front, apps_store_storage, apps_store_hint};
 
 static cJSON *launch_result(const char *id) {
     cJSON *r = NULL;
@@ -425,9 +423,10 @@ static cJSON *stop_result(const char *id) {
     return success(cJSON_CreateObject());
 }
 
+/* The store's remove, which can also take a folder it doesn't list (its manifest.json damaged). Its refusals: not mounted,
+ * the app that runs, no folder of that id (APPS_STORE_NO_SUCH_APP: not_found), or the file system's (unavailable). */
 static cJSON *remove_result(const char *id) {
     char running[APPS_ID_MAX + 1], why[192];
-    bool had = apps_store_has(id);
     if (apps_store_remove(id, why, sizeof why)) {
         cJSON *p = cJSON_CreateObject();
         if (p == NULL || cJSON_AddStringToObject(p, "removed", id) == NULL) {
@@ -442,7 +441,7 @@ static cJSON *remove_result(const char *id) {
     if (apps_task_running(running, sizeof running) && strcmp(running, id) == 0) {
         return failure(APPS_ERR_BUSY, why);
     }
-    return had ? refusal(APPS_ERR_UNAVAILABLE, why) : not_found(id);
+    return strcmp(why, APPS_STORE_NO_SUCH_APP) == 0 ? not_found(id) : refusal(APPS_ERR_UNAVAILABLE, why);
 }
 
 /* ---- The guide (the worker's side) ---- */
@@ -518,7 +517,7 @@ static bool add_facts(cJSON *p) {
         return false;
     }
     const char *hint = apps_store_hint();
-    if (cJSON_AddStringToObject(p, "storage", apps_storage_name(apps_store_mode())) == NULL ||
+    if (cJSON_AddStringToObject(p, "storage", apps_store_storage()) == NULL ||
         (hint != NULL && cJSON_AddStringToObject(p, "hint", hint) == NULL)) {
         return false;
     }
@@ -553,9 +552,11 @@ static cJSON *guide_result(const muse_apps_vm_ops_t *vm) {
     if (written) {
         snprintf(more, sizeof more, ", %u bytes in %u ms", (unsigned)bytes, (unsigned)(apps_port_mono_ms() - started));
         log_dma("the guide is on the VM", more);
-    } else if (code == NULL || strcmp(code, MUSE_APPS_VM_FAILED) == 0) {  /* refused (D3): the answer carries the files */
+    } else if (code == NULL || strcmp(code, MUSE_APPS_VM_FAILED) == 0) {
+        /* The VM answered and didn't take the file (D3: a refusal): the answer carries the files instead. A session that is
+         * gone (MUSE_APPS_VM_DROPPED) is a failure below: nothing would read an answer, so none is made of the guide. */
         snprintf(more, sizeof more, " %s: %s; the guide goes inline", GUIDE_FILES[done].path, why);
-        log_dma("the VM refused", more);
+        log_dma("the VM didn't take", more);
     } else {
         snprintf(more, sizeof more, " %s: %s", GUIDE_FILES[done].path, why);
         log_dma("couldn't write", more);

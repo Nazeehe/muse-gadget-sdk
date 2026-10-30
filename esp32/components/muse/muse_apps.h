@@ -101,7 +101,8 @@ struct cJSON;
 #define MUSE_APPS_VM_OUT_OF_MEMORY "out_of_memory"  /* no memory for the request now: try again later */
 #define MUSE_APPS_VM_TIMED_OUT "timed_out"          /* deadline_us came first */
 #define MUSE_APPS_VM_TOO_LARGE "too_large"          /* read: the file is longer than max */
-#define MUSE_APPS_VM_FAILED "failed"                /* anything else: the VM's answer, a dropped session, a bad path */
+#define MUSE_APPS_VM_DROPPED "dropped"              /* the session is gone: the request wasn't sent, or the connection dropped */
+#define MUSE_APPS_VM_FAILED "failed"                /* anything else: the VM's answer (a refusal), a bad path */
 
 typedef struct muse_apps_vm_ops {
     bool (*read)(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
@@ -194,8 +195,9 @@ bool muse_apps_remove(const char *id, muse_apps_done_cb done, void *ctx, const c
  * the writes (the session's sends need it), and answers {"delivered":"vm","guide","example","api","screen","fonts","limits",
  * "storage"[,"hint"],"apps":[{"id","name","version","state"}]}. When the VM refuses a write (MUSE_APPS_VM_FAILED) the answer is
  * {"delivered":"inline","write_error",...,"guide_text","example_files":{"manifest.json","main.lua"}} instead, with the same facts;
- * a write that is busy, out of memory or out of time fails app.api (busy, out_of_memory, unavailable), to be called again. Any
- * task; refusals as above, and unavailable when the gadget has no VM ops.
+ * a write that is busy, out of memory or out of time fails app.api (busy, out_of_memory, unavailable), to be called again, and so
+ * does one whose session is gone (MUSE_APPS_VM_DROPPED: unavailable, with no inline answer, which nothing would read). Each way is
+ * one log line that names the path and why. Any task; refusals as above, and unavailable when the gadget has no VM ops.
  */
 bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code, const char **err);
 

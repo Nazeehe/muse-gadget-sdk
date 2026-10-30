@@ -1588,7 +1588,7 @@ bool apps_store_remove(const char *id, char *err, size_t n) {
     }
     /* A folder that isn't listed (its manifest.json is damaged) can go too: it is the store's, and it takes room. */
     if (id == NULL || !apps_id_valid(id) || !(installed(id) || (mode == APPS_STORAGE_FLASH && is_dir(app)))) {
-        put_err(err, n, "no such app on the gadget");
+        put_err(err, n, APPS_STORE_NO_SUCH_APP);
         return false;
     }
     if (mode == APPS_STORAGE_RAM) {
@@ -1598,7 +1598,7 @@ bool apps_store_remove(const char *id, char *err, size_t n) {
         apps_alarm_cancel_app(id, "was removed");
         cache_ram();
         if (!ok) {
-            put_err(err, n, "no such app on the gadget");
+            put_err(err, n, APPS_STORE_NO_SUCH_APP);
         }
         return ok;
     }
@@ -1643,7 +1643,7 @@ static bool rehome_messages(apps_manifest_t *m) {
 
 static bool load_flash(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
     if (!apps_id_valid(id) || !installed(id)) {
-        put_err(err, n, "no such app on the gadget");
+        put_err(err, n, APPS_STORE_NO_SUCH_APP);
         return false;
     }
     if (quarantined(id)) {

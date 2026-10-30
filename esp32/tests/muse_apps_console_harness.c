@@ -489,13 +489,19 @@ bool apps_store_load(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
     return apps_ram_load(id, pkg, err, n);
 }
 
-/* apps_store_remove over the RAM store, with apps_store.c's refusals: not ready, the app that runs, none of that id. */
+/* apps_store_remove over the RAM store, with apps_store.c's refusals: not ready, the app that runs, none of that id; or the
+ * refusal a case sets (remove_refusal: a damaged folder the file system won't let go of). */
 static int removes;
+static const char *remove_refusal;
 bool apps_task_running(char *id, size_t cap);
 
 bool apps_store_remove(const char *id, char *err, size_t n) {
     removes++;
     char running[APPS_ID_MAX + 1];
+    if (remove_refusal != NULL) {
+        snprintf(err, n, "%s", remove_refusal);
+        return false;
+    }
     if (store_mode == APPS_STORAGE_NONE) {
         snprintf(err, n, "storage not ready");
         return false;
@@ -505,7 +511,7 @@ bool apps_store_remove(const char *id, char *err, size_t n) {
         return false;
     }
     if (!apps_ram_remove(id)) {
-        snprintf(err, n, "no such app on the gadget");
+        snprintf(err, n, "%s", APPS_STORE_NO_SUCH_APP);
         return false;
     }
     snprintf(err, n, "%s", "");
@@ -2210,6 +2216,15 @@ static void control_launch_stop_remove(void) {
     store_mode = APPS_STORAGE_RAM;
     CHECK_AT(done_result, "error.code", "unavailable");
     CHECK_AT(done_result, "error.message", "storage not ready");
+    /* A folder the store doesn't list (its manifest.json is damaged) can still be removed; one whose remove fails is the
+     * store's refusal, unavailable, not not_found. */
+    remove_refusal = "couldn't remove ghost: I/O error";
+    CHECK(muse_apps_remove("ghost", on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    remove_refusal = NULL;
+    CHECK(!apps_ram_has("ghost"), "ghost isn't listed");
+    CHECK_AT(done_result, "error.code", "unavailable");
+    CHECK_AT(done_result, "error.message", "couldn't remove ghost: I/O error");
     cJSON_Delete(done_result);
     done_result = NULL;
 
@@ -2326,21 +2341,27 @@ static void guide_written_or_inline(void) {
           "the timer inline");
     CHECK_AT(done_result, "payload.api", "1");
     CHECK_AT(done_result, "payload.storage", "ram");
-    CHECK(logged("app.api: the VM refused workspace/apps/_guide/timer/manifest.json") != NULL, "the refusal's line: %s", last_log);
+    CHECK(logged("app.api: the VM didn't take workspace/apps/_guide/timer/manifest.json: VM answered HTTP 403") != NULL &&
+              strstr(logged("app.api: the VM didn't take"), "; the guide goes inline (DMA free ") != NULL,
+          "the refusal's line: %s", last_log);
     forget_writes();
 
-    /* Busy, out of memory, timed out: app.api fails with a code, and says to call it again. */
+    /* Busy, out of memory, timed out, and a session that is gone (nothing will read an answer, so no inline payload is made
+     * for it): app.api fails with a code, says to call it again, and the log line names why. */
     static const struct {
         const char *code, *why, *want_code;
     } failures[] = {
         {MUSE_APPS_VM_BUSY, "the VM file writer is busy", "busy"},
         {MUSE_APPS_VM_OUT_OF_MEMORY, "out of memory", "out_of_memory"},
         {MUSE_APPS_VM_TIMED_OUT, "write timed out", "unavailable"},
+        {MUSE_APPS_VM_DROPPED, "the VM connection dropped", "unavailable"},
+        {MUSE_APPS_VM_DROPPED, "could not send the request to the VM", "unavailable"},
     };
     for (size_t i = 0; i < ARRAY_LEN(failures); i++) {
         write_fails_at = 1;
         write_code = failures[i].code;
         write_why = failures[i].why;
+        int lines = logs;
         CHECK(muse_apps_write_guide(on_done, NULL, &code, &err), "queued");
         run_jobs();
         CHECK(vm_writes == 1, "one write tried: %d", vm_writes);
@@ -2348,6 +2369,9 @@ static void guide_written_or_inline(void) {
         char message[160];
         snprintf(message, sizeof message, "couldn't write the guide to the VM: %s; call app.api again", failures[i].why);
         CHECK_AT(done_result, "error.message", message);
+        CHECK_AT(done_result, "payload", "(none)");
+        snprintf(message, sizeof message, "app.api: couldn't write workspace/apps/_guide/README.md: %s (DMA free ", failures[i].why);
+        CHECK(logged(message) != NULL && logs == lines + 2, "the failure's line: %s", last_log);
         forget_writes();
     }
     write_fails_at = 0;

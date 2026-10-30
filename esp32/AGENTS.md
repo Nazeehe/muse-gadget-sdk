@@ -586,17 +586,26 @@ call's `POST /voice/realtime` and `POST /voice/end-call`:
   existing path rules; nothing confines it to a workspace folder.
   `vm_file_open`, `vm_file_read` and `vm_file_read_all` read this way (one
   reader across the firmware), for `display.draw_file` and the apps' installs.
+  `vm_file_open` refuses a path that is absolute or has a `..` folder
+  (`vm_file_open: bad path`, as `vm_file_write` does); `display.draw_file`
+  drops leading slashes first, as it always has.
 - `POST /fs/upload`: write a file, as `multipart/form-data` in one streamed
   request (`Content-Type: multipart/form-data; boundary=<b>`). The text parts
   come first, in this order: `path` (relative to the user's home, as above),
   `overwrite` (`true`) and `create_parent` (`true`). Then the `file` part
   (`filename` is the path's last name, `Content-Type:
-  application/octet-stream`) with the raw bytes: send them in pieces of at most
-  4 KB, and end the body with the closing boundary. The VM writes a temporary
-  file and renames it into place, so a file is replaced whole, and there is no
-  append. A 2xx reply is JSON with `bytes_written`: compare it with what you
-  sent. The boundary must not appear in the path or the file. `vm_file_write()`
-  in `main/vm_file.h` does all of this.
+  application/octet-stream`) with the raw bytes: send them in pieces of 8 KB
+  (4 KB on a Muse board without PSRAM), and end the body with the closing
+  boundary. Pieces of that size matter: the session copies every send with
+  `malloc`, and with `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` (Muse boards) a
+  copy of 4 KB or less is internal RAM, which on the S3 is the DMA RAM the
+  Link's TX needs 16 KB of free, and up to 16 KB of sends are queued at a time;
+  a larger piece's copy is in PSRAM. The VM writes a temporary file and renames
+  it into place, so a file is replaced whole, and there is no append. A 2xx
+  reply is JSON with `bytes_written`: compare it with what you sent; a refusal
+  is `{"ok":false,"error":{"message":...}}` or the text of a gateway. The
+  boundary must not appear in the path or the file. `vm_file_write()` in
+  `main/vm_file.h` does all of this.
 - `POST /fs/read` and `POST /fs/write` are the owner's routes, not a gadget's:
   its credentials get HTTP 403, `route not allowed for this credential's
   scopes`. Read with `/fs/raw` and write with `/fs/upload`.
@@ -609,14 +618,26 @@ Keep within the session's bounds:
 - Send a body in pieces of at most 8 KB (4 KB on Muse boards without PSRAM,
   2 KB on the Cardputer ADV and AI Passport): a larger piece ends that request.
   Queued body bytes are capped at 16 KB with PSRAM and 4 KB without, and
-  `noise_ctrl_req_send()` waits up to `wait_ms` for room.
-- Each response frame has to fit the session's inbound buffer (12 KB, 17 KB on
-  Muse boards without PSRAM). A larger one ends the whole session, which
-  reconnects, and the request with `NOISE_CTRL_REQ_TOO_LARGE`. Ask for
-  responses that stay under it: read large files in parts.
+  `noise_ctrl_req_send()` waits up to `wait_ms` for room. Each send is copied
+  with `malloc`: on Muse boards a copy of 4 KB or less is internal (DMA) RAM, so
+  prefer the largest piece.
+- `noise_ctrl_req_cancel()` waits 100 ms for room in the session's queue and
+  then gives up silently. A request whose body never ended (an upload you give
+  up on) keeps one of the 3 streams until that cancel is queued, so use
+  `noise_ctrl_req_cancel_wait()`, which says whether it was, and ask again.
+- Each response frame has to fit the session's inbound buffer: 64 KB with
+  PSRAM, 17 KB on Muse boards without it, 12 KB on other boards without it. A
+  larger one ends the whole session, which reconnects, and the request with
+  `NOISE_CTRL_REQ_TOO_LARGE`. The frame carries the response's head too, so ask
+  for bodies of at most `noise_ctrl_req_max_body()` bytes (63,488 with PSRAM, as
+  on the 1.75C; 15,360 on Muse boards without it; 10,240 on the others), as
+  `vm_file` does with its ranges: read large files in parts.
 - The callback runs on the session task: copy what you need and return. Do
   slow work, and any request that depends on its result, in a task of your
-  own, as `on_ws_command()`'s asynchronous commands do.
+  own, as `on_ws_command()`'s asynchronous commands do. That includes waiting
+  for a reply: `vm_file_read()`, `vm_file_read_all()` and `vm_file_write()` wait
+  for answers that only the session task delivers, so they must never run on it
+  (`vm_file_open()` and `vm_file_close()` wait for nothing and can).
 
 ## Video from a phone
 

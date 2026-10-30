@@ -22,6 +22,7 @@
 #if CONFIG_HOMEHUB_DAEMON_REQUESTS
 
 #include <ctype.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -218,10 +219,9 @@ static void vm_range_failed(vm_file_t *f, const vm_reply_t *r) {
     f->failed = true;
 }
 
-// GET /fs/raw/ and the path, without its leading slashes, percent-encoded
-// but for its slashes. NULL if out of memory.
+// GET /fs/raw/ and the path, percent-encoded but for its slashes (vm_file_open
+// has refused an absolute one). NULL if out of memory.
 static char *vm_request_path(const char *path) {
-    while (*path == '/') path++;
     size_t prefix = strlen(VM_PATH_PREFIX);
     char *out = malloc(prefix + strlen(path) * 3 + 1);
     if (!out) return NULL;
@@ -284,6 +284,18 @@ static const char *busy_message(const char *owner) {
     return "the VM file reader is busy";
 }
 
+// Not absolute, and no ".." folder in it: the VM may allow more, this is for the caller's
+// mistakes. A ".." inside a name is a name.
+static bool path_stays_inside(const char *path) {
+    if (path[0] == '/') return false;
+    for (const char *segment = path;;) {
+        size_t n = strcspn(segment, "/");
+        if (n == 2 && segment[0] == '.' && segment[1] == '.') return false;
+        if (!segment[n]) return true;
+        segment += n + 1;
+    }
+}
+
 // The handle of the open reader, or false for NULL, a closed reader and
 // anything else.
 static bool is_open(const vm_file_t *f) {
@@ -295,9 +307,14 @@ vm_file_t *vm_file_open(const char *path, size_t keep, const char *owner,
     const char *unused;
     if (!code) code = &unused;
     if (!message) message = &unused;
-    if (!path || !path[strspn(path, "/")]) {
+    if (!path || !path[0]) {
         *code = "invalid_params";
         *message = "path names no file";
+        return NULL;
+    }
+    if (!path_stays_inside(path)) {
+        *code = "invalid_params";
+        *message = "vm_file_open: bad path";
         return NULL;
     }
     if (!owner) owner = "";
@@ -386,8 +403,8 @@ bool vm_file_read_all(vm_file_t *f, size_t max, vm_file_sink_t sink, void *user,
 
 // What a request that didn't end in a usable reply tells the user.
 // `timeout_text` is what the deadline reads as, for the caller's kind of work, and `words`
-// (or NULL) the VM's own for an HTTP status, which follow it if they fit. msg is written
-// for the one text that has a number in it.
+// (or NULL) the VM's own for an HTTP status, which follow it, cut to the room there is. msg is
+// written for the one text that has a number in it.
 static const char *reply_failure(bool not_sent, bool timed_out, bool too_large, int status,
                                  const char *timeout_text, const char *words, char *msg,
                                  size_t msg_len) {
@@ -397,8 +414,9 @@ static const char *reply_failure(bool not_sent, bool timed_out, bool too_large, 
     if (status == NOISE_CTRL_REQ_TOO_LARGE) return "the VM sent a frame too large for this board";
     if (status < 0) return "the VM connection dropped";
     if (!msg || !msg_len) return "the VM answered with an error";
-    int n = words ? snprintf(msg, msg_len, "VM answered HTTP %d: %s", status, words) : -1;
-    if (n < 0 || (size_t)n >= msg_len) snprintf(msg, msg_len, "VM answered HTTP %d", status);
+    int n = snprintf(msg, msg_len, "VM answered HTTP %d", status);
+    // Then ": " and the words, cut to the room there is: with no room for a character of them, not at all.
+    if (words && n > 0 && (size_t)n + 4 <= msg_len) snprintf(msg + n, msg_len - (size_t)n, ": %s", words);
     return msg;
 }
 
@@ -440,6 +458,13 @@ void vm_file_close(vm_file_t *f) {
 // ---- Writing a file ----------------------------------------------------------
 
 #define WR_PATH "/fs/upload"
+// The head of the form is one send of at most this many bytes, whatever the size of the pieces after it.
+#define WR_HEAD_MAX 4096
+// How long a cancel that the session's queue had no room for is asked for again, and how long each try waits.
+#define WR_CANCEL_US 1000000
+#define WR_CANCEL_TRY_MS 100
+// What is kept of the start of the VM's reply: for the log, and for the words of an error.
+#define WR_TEXT_BYTES 256
 // The boundary of a form: "muse" and 128 random bits in hex. The path and the data
 // are checked for it, and if either holds it another is made.
 #define WR_BOUNDARY_PREFIX "muse"
@@ -456,7 +481,7 @@ static struct {
     uint32_t gen;
     int status;          // HTTP status, or a noise_ctrl_req_cb failure below 0
     size_t seen;         // reply body bytes
-    char text[128];      // the start of them, the printable part
+    char text[WR_TEXT_BYTES];   // the start of them, the printable part
     size_t kept;
     uint64_t written;    // the number after "bytes_written":
     uint8_t scan;        // where wr_scan is in finding it
@@ -579,6 +604,20 @@ static bool wr_send(int64_t id, const void *bytes, size_t len, bool last, int64_
     return true;
 }
 
+// Gives up on a request that isn't over. A request whose body never ended holds one of the session's
+// three request streams until the VM gives up on it or the session ends, so a cancel that the session's
+// queue had no room for is not let go of: noise_ctrl_req_cancel_wait says so, and it is asked for again
+// for up to a second, with one line in the log if the session still would not take it.
+// (Ending the body instead, with the closing boundary, would tell the VM the file is whole, and it
+// would put the part that was sent in place of the file.)
+static void wr_abandon(int64_t id) {
+    int64_t until = esp_timer_get_time() + WR_CANCEL_US;
+    do {
+        if (noise_ctrl_req_cancel_wait(id, WR_CANCEL_TRY_MS)) return;
+    } while (esp_timer_get_time() < until);
+    ESP_LOGW(TAG, "write: the session would not take the cancel; the request's stream stays until the VM or the session ends it");
+}
+
 // POSTs the form as one request and waits for the whole reply or the deadline. The request
 // is a stream: `head`, the file in pieces of VM_FILE_WRITE_PIECE_BYTES, then `tail`. Each
 // send waits for room in the session's queue, within the call's time; if the VM answers
@@ -630,7 +669,7 @@ static void wr_upload(const char *content_type, const char *head, size_t head_le
     memcpy(out->text, s_wr.text, sizeof(out->text));
     xSemaphoreGive(s_wr.lock);
     out->not_sent = out->not_sent || !id;
-    if (id && !out->complete) noise_ctrl_req_cancel(id);
+    if (id && !out->complete) wr_abandon(id);
 }
 
 // ---- The form
@@ -695,32 +734,165 @@ static void make_boundary(char *out) {
              (unsigned)c, (unsigned)d);
 }
 
-// Not absolute, and no ".." folder in it: the VM may allow more, this is for the caller's
-// mistakes. A ".." inside a name is a name.
-static bool path_stays_inside(const char *path) {
-    if (path[0] == '/') return false;
-    for (const char *segment = path;;) {
-        size_t n = strcspn(segment, "/");
-        if (n == 2 && segment[0] == '.' && segment[1] == '.') return false;
-        if (!segment[n]) return true;
-        segment += n + 1;
-    }
-}
-
 static bool write_failed(char *err, size_t err_len, const char *why) {
     if (err && err_len) snprintf(err, err_len, "%s", why);
     return false;
 }
 
-// The VM's own words after a refusal, if the whole reply was kept: its text with the
-// white space at the ends cut off. NULL if there is none, or only the start of it.
-static const char *reply_words(wr_reply_t *r) {
-    if (r->seen != r->kept) return NULL;
-    char *t = r->text;
-    while (*t == ' ') t++;
-    size_t n = strlen(t);
-    while (n && t[n - 1] == ' ') t[--n] = '\0';
-    return n ? t : NULL;
+// ---- The VM's words when it refuses
+//
+// The reply to a refusal is the VM's JSON error, {"ok":false,"error":{"message":...}}, or the text of
+// a gateway in front of it. What a caller shows of it is the message in the first, and the text of
+// the second. The start of the reply is kept as it came (wr_on_frame), printable, and read here: a
+// reader of JSON that takes it a character at a time, with no allocation, over text that may end
+// anywhere.
+
+typedef struct {
+    const char *p, *end;
+} cursor_t;
+
+static void skip_spaces(cursor_t *c) {
+    while (c->p < c->end && *c->p == ' ') c->p++;
+}
+
+static int hex_digit(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+// Reads the JSON string at the cursor, which is at its opening quote, into `out` as far as it fits
+// (NULL to skip it): its escapes decoded, a line break or tab as a space, and what isn't printable
+// ASCII as '?'. The cursor ends after the closing quote. False if the text ends first, and `out`
+// holds what there was.
+static bool read_string(cursor_t *c, char *out, size_t out_len) {
+    size_t n = 0;
+    bool closed = false;
+    c->p++;
+    while (c->p < c->end) {
+        char ch = *c->p++;
+        if (ch == '"') {
+            closed = true;
+            break;
+        }
+        if (ch == '\\') {
+            if (c->p == c->end) break;
+            ch = *c->p++;
+            if (ch == 'n' || ch == 't' || ch == 'r' || ch == 'b' || ch == 'f') {
+                ch = ' ';
+            } else if (ch == 'u') {
+                int value = 0, digits = 0;
+                while (digits < 4 && c->p < c->end && hex_digit(*c->p) >= 0) {
+                    value = value * 16 + hex_digit(*c->p++);
+                    digits++;
+                }
+                ch = digits == 4 && value >= 0x20 && value < 0x7f ? (char)value : '?';
+            }   // after any other backslash, the character itself: \" \\ \/
+        }
+        if (out && n + 1 < out_len) out[n++] = ch;
+    }
+    if (out && out_len) out[n] = '\0';
+    return closed;
+}
+
+// Skips the value at the cursor: a string, an object or array (to its end, counting the ones inside
+// and not fooled by braces in strings), or a number or a word. False if the text ends inside it.
+static bool skip_value(cursor_t *c) {
+    skip_spaces(c);
+    if (c->p >= c->end) return false;
+    if (*c->p == '"') return read_string(c, NULL, 0);
+    if (*c->p == '{' || *c->p == '[') {
+        for (int depth = 0; c->p < c->end;) {
+            char ch = *c->p;
+            if (ch == '"') {
+                if (!read_string(c, NULL, 0)) return false;
+                continue;
+            }
+            c->p++;
+            if (ch == '{' || ch == '[') depth++;
+            else if ((ch == '}' || ch == ']') && --depth == 0) return true;
+        }
+        return false;
+    }
+    while (c->p < c->end && *c->p != ',' && *c->p != '}' && *c->p != ']') c->p++;
+    return c->p < c->end;
+}
+
+// At the start of a member of an object: reads its key into `key`, cut to what fits, so a key that
+// is longer than the one looked for can't be taken for it, and leaves the cursor at its value. False
+// if there is no member: the object ends, or the text ends or isn't an object's.
+static bool next_member(cursor_t *c, char *key, size_t key_len) {
+    skip_spaces(c);
+    if (c->p >= c->end || *c->p != '"' || !read_string(c, key, key_len)) return false;
+    skip_spaces(c);
+    if (c->p >= c->end || *c->p != ':') return false;
+    c->p++;
+    skip_spaces(c);
+    return c->p < c->end;
+}
+
+// After the value of a member: true if another member follows.
+static bool more_members(cursor_t *c) {
+    skip_spaces(c);
+    if (c->p >= c->end || *c->p != ',') return false;
+    c->p++;
+    return true;
+}
+
+// Cuts the spaces off the ends of `s`, in place. True if something is left.
+static bool trim_words(char *s) {
+    char *start = s + strspn(s, " ");
+    size_t n = strlen(start);
+    while (n && start[n - 1] == ' ') n--;
+    memmove(s, start, n);
+    s[n] = '\0';
+    return n != 0;
+}
+
+// The "message" of the object at the cursor (at its `{`) when it is a string with something in it:
+// copied to `out`. `cut` says the reply went on past the text, so a string the text ends inside is
+// taken as far as it goes; in a reply that was whole it is broken, and is not.
+static bool message_of(cursor_t *c, bool cut, char *out, size_t out_len) {
+    char key[9];
+    if (*c->p != '{') return false;
+    c->p++;
+    while (next_member(c, key, sizeof(key))) {
+        if (strcmp(key, "message") == 0) {
+            if (*c->p != '"') return false;
+            bool closed = read_string(c, out, out_len);
+            return (closed || cut) && trim_words(out);
+        }
+        if (!skip_value(c) || !more_members(c)) return false;
+    }
+    return false;
+}
+
+// The message of the error of a JSON reply: {"ok":false,"error":{"message":"..."}}, whichever
+// way round its members come. Only the "error" of the reply itself counts, and the first.
+static bool error_message(const char *text, size_t n, bool cut, char *out, size_t out_len) {
+    cursor_t c = {text, text + n};
+    char key[9];
+    skip_spaces(&c);
+    if (c.p >= c.end || *c.p != '{') return false;
+    c.p++;
+    while (next_member(&c, key, sizeof(key))) {
+        if (strcmp(key, "error") == 0) return message_of(&c, cut, out, out_len);
+        if (!skip_value(&c) || !more_members(&c)) return false;
+    }
+    return false;
+}
+
+// What an error says of a refusal, in `out`: the message of the VM's JSON error if that is what the
+// reply is, and otherwise the text of the reply, however much of it was kept, without the white
+// space at its ends. NULL if there is nothing. The caller cuts it to the room it has.
+static const char *reply_words(const wr_reply_t *r, char *out, size_t out_len) {
+    bool cut = r->seen > r->kept;
+    if (error_message(r->text, r->kept, cut, out, out_len)) return out;
+    size_t n = r->kept < out_len - 1 ? r->kept : out_len - 1;
+    memcpy(out, r->text, n);
+    out[n] = '\0';
+    return trim_words(out) ? out : NULL;
 }
 
 static bool write_all(const char *path, const uint8_t *data, size_t len, int timeout_ms,
@@ -729,14 +901,14 @@ static bool write_all(const char *path, const uint8_t *data, size_t len, int tim
     const char *name = strrchr(path, '/');
     name = name ? name + 1 : path;
 
-    // The head of the form goes in one send, so it has to fit in one: 4096 bytes, which a
-    // Muse board's session takes. A boundary of the right length stands in for the real one.
+    // The head of the form goes in one send, so it has to fit in one: 4096 bytes, which every
+    // board's session takes. A boundary of the right length stands in for the real one.
     char boundary[WR_BOUNDARY_CHARS + 1];
     memset(boundary, 'x', WR_BOUNDARY_CHARS);
     boundary[WR_BOUNDARY_CHARS] = '\0';
     emit_t size = {NULL, 0};
     emit_head(&size, boundary, path, name);
-    if (size.n > VM_FILE_WRITE_PIECE_BYTES) return write_failed(err, err_len, "path is too long");
+    if (size.n > WR_HEAD_MAX) return write_failed(err, err_len, "path is too long");
     if (esp_timer_get_time() >= deadline_us) return write_failed(err, err_len, "write timed out");
     if (!s_wr.lock && !(s_wr.lock = xSemaphoreCreateMutex())) {
         return write_failed(err, err_len, "out of memory");
@@ -768,15 +940,16 @@ static bool write_all(const char *path, const uint8_t *data, size_t len, int tim
     bool answered = reply.complete && reply.status >= 200 && reply.status < 300;
     bool ok = false;
     if (!answered) {
-        ESP_LOGW(TAG, "write: status %d, %u reply bytes: %s", reply.status, (unsigned)reply.seen, reply.text);
+        ESP_LOGW(TAG, "write: status %d, %u reply bytes: %.127s", reply.status, (unsigned)reply.seen, reply.text);
+        char words[WR_TEXT_BYTES];
         const char *why = reply_failure(reply.not_sent, reply.timed_out, false, reply.status,
-                                        "write timed out", reply_words(&reply), err, err_len);
+                                        "write timed out", reply_words(&reply, words, sizeof(words)), err, err_len);
         if (why != err) write_failed(err, err_len, why);
     } else if (!reply.have_written) {
         write_failed(err, err_len, "the VM didn't say how many bytes it wrote");
     } else if (reply.written != len) {
         if (err && err_len) {
-            snprintf(err, err_len, "the VM wrote %u of %u bytes", (unsigned)reply.written, (unsigned)len);
+            snprintf(err, err_len, "the VM wrote %" PRIu64 " of %" PRIu64 " bytes", reply.written, (uint64_t)len);
         }
     } else {
         ok = true;

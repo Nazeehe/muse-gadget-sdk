@@ -278,6 +278,31 @@ int main() {
     respond(u, 200, "{}", true);
     assert(s_events.size() == 2 && s_events[1].ctx == &b && s_events[1].status == 200);
 
+    // A cancel that is told to wait says whether the queue took it. With no room it did not, and the
+    // request keeps its stream; once the queue drains it does. An id that isn't a request's has nothing to
+    // cancel, which is not a cancel that was lost.
+    fresh();
+    int64_t k = noise_ctrl_req_open("POST", "/fs/upload", nullptr, false, on_event, &a);
+    pump_all();
+    s_headroom = false;   // what is queued stays queued
+    for (int i = 0; i < REQ_QUEUE_LEN; i++) assert(noise_ctrl_req_send(k, "x", 1, false, 0));
+    assert(uxQueueMessagesWaiting(s_req_q) == REQ_QUEUE_LEN);
+    assert(!noise_ctrl_req_cancel_wait(k, 0));
+    assert(uxQueueMessagesWaiting(s_req_q) == REQ_QUEUE_LEN);
+    assert(req_find(k));   // the stream is still there
+    s_headroom = true;
+    pump_all();
+    assert(noise_ctrl_req_cancel_wait(k, 0));
+    size_t before_reset = s_wire.size();
+    pump_all();
+    assert(s_wire.size() > before_reset);   // the reset went out
+    assert(!req_find(k));
+    respond(k, 200, "{}", true);
+    assert(s_events.empty());   // nothing for the cancelled one
+    assert(noise_ctrl_req_cancel_wait(1, 0));
+    assert(noise_ctrl_req_cancel_wait(0, 0));
+    assert(uxQueueMessagesWaiting(s_req_q) == 0);
+
     // A session that can no longer send: the open fails, and only that request ends.
     fresh();
     poison_noise_session();

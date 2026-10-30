@@ -130,6 +130,13 @@ bool noise_ctrl_req_send(int64_t id, const void *data, size_t len,
 // Cancels the request. Until the session task gets to the cancel, the callback
 // may still run, even with -1 if the session ends, so ctx must stay valid.
 void noise_ctrl_req_cancel(int64_t id);
+// The same, but it waits up to wait_ms for room in the session's queue (the one above
+// waits 100 ms) and says whether the cancel was queued: false if there was no room in
+// that time. A cancel that is lost leaves the request's stream open, one of the 3, until
+// the VM ends it or the session does, so a caller that gives up on a request whose body
+// never ended (an upload) asks again. True too if there is nothing to cancel: an id
+// that isn't a request's, or no session ever started.
+bool noise_ctrl_req_cancel_wait(int64_t id, int wait_ms);
 // The daemon may send a reply body in one frame, and a frame larger than this
 // board's buffers ends the session (NOISE_CTRL_REQ_TOO_LARGE). A request whose
 // reply could be larger should bound it to this many bytes, e.g. with Range.

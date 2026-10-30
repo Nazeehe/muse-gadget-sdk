@@ -2659,10 +2659,14 @@ extern "C" bool noise_ctrl_req_send(int64_t id, const void *data, size_t len,
     return true;
 }
 
-extern "C" void noise_ctrl_req_cancel(int64_t id) {
-    if (!s_req_q || id < REQ_STREAM_BASE) return;
+extern "C" bool noise_ctrl_req_cancel_wait(int64_t id, int wait_ms) {
+    if (!s_req_q || id < REQ_STREAM_BASE) return true;
     req_op op = {req_op_kind::Cancel, false, id, nullptr, 0, nullptr, nullptr};
-    req_put(op, pdMS_TO_TICKS(100));
+    return req_put(op, wait_ms > 0 ? pdMS_TO_TICKS(wait_ms) : 0);
+}
+
+extern "C" void noise_ctrl_req_cancel(int64_t id) {
+    noise_ctrl_req_cancel_wait(id, 100);
 }
 
 // What a reply frame leaves for its body in SVC_FRAME_SCRATCH, after the

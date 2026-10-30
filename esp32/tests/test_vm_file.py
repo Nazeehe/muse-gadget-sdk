@@ -51,8 +51,11 @@ ESP_RANDOM = "#pragma once\n#include <stdint.h>\nuint32_t esp_random(void);\n"
 TASK = '#pragma once\n#include "{fake}"\nunsigned uxTaskGetStackHighWaterMark(TaskHandle_t task);\n'
 # The allocator hooks of image_fetch's wrapper: malloc, free and the others go to the harness's counting ones.
 WRAPPER = '#include "image_fetch_alloc.h"\n#include "{source}"\n'
-PIECE = 4096
-SEND_MAX = 8192     # what the session takes in one send
+PIECE = 8192            # the file's pieces on a board with PSRAM, the most its session takes in one send
+PIECE_NO_PSRAM = 4096   # and on a Muse board without it
+HEAD_MAX = 4096         # the head of the form is one send of at most this, whatever the pieces
+SEND_MAX = PIECE        # what the session takes in one send
+RESERVE = 16 * 1024     # NOISE_TX_DMA_RESERVE_BYTES: the DMA RAM the Link's TX needs free
 
 
 def pat(i: int) -> int:
@@ -287,6 +290,14 @@ class VmFileTest(unittest.TestCase):
     def test_request_path_is_encoded(self):
         self.run_case("request_path_is_encoded")
 
+    def test_open_refuses_a_bad_path(self):
+        # The writer's rule, for the reader too: not absolute, no ".." folder. A ".." inside a name is a name.
+        out = self.run_case("open_bad_path")
+        self.assertEqual(out.all("refused"), ["/etc/passwd", "/", "///x", "/workspace/a.txt", "..", "../x", "a/..",
+                                              "a/../b", "a/b/../../c", "x/y/.."])
+        self.assertEqual(out.all("allowed"), ["a..b", "..a", "a/..b/c", "a/b..", ".hidden", "a/./b", "a//b", "...",
+                                              "a/.../b"])
+
     # ---- The writer ----
 
     def test_write_upload_multipart(self):
@@ -304,13 +315,14 @@ class VmFileTest(unittest.TestCase):
         self.assertEqual(up.parts[3].content_type, "application/octet-stream")
         self.assertEqual(up.parts[3].length, 10000)          # its bytes are compared with the data in C
         self.assertIsNone(up.malformed)
-        # What went out: the head of the form, the file in pieces of at most 4096 bytes, the closing boundary.
-        self.assertEqual(up.head, form_head(up.boundary, path, "ü.lua"))
-        self.assertEqual(up.sends[0], len(up.head.encode()))
-        self.assertEqual(up.sends[1:-1], [4096, 4096, 1808])
-        self.assertEqual(up.tail, f"\r\n--{up.boundary}--\r\n")
-        self.assertEqual(up.sends[-1], len(up.tail))
-        self.assertTrue(all(size <= SEND_MAX for size in up.sends), up.sends)
+        # What went out: the head of the form alone as the first send, the file in pieces of 8192 bytes and
+        # what is left, the closing boundary alone as the last. Each is checked against what the form
+        # needs, worked out here, and not against what was printed of the sends.
+        head = form_head(up.boundary, path, "ü.lua")
+        closing = f"\r\n--{up.boundary}--\r\n"
+        self.assertEqual(up.head, head)
+        self.assertEqual(up.tail, closing)
+        self.assertEqual(up.sends, [len(head.encode()), 8192, 1808, len(closing)])
         self.assertEqual(up.end_at, len(up.sends) - 1)        # end_body on the last send, and no other
         self.assertEqual(up.late, 0)
 
@@ -324,13 +336,16 @@ class VmFileTest(unittest.TestCase):
     def test_write_short_count(self):
         # The write is only done when the VM says it wrote every byte.
         out = self.run_case("write_short_count")
-        self.assertEqual(out.one("short"), "the VM wrote 9999 of 10000 bytes|5|0|0")
-        self.assertEqual(out.one("long"), "the VM wrote 10001 of 10000 bytes|5|0|0")
-        self.assertEqual(out.one("short_busy"), "the VM wrote 9997 of 10000 bytes|5|0|0")
-        self.assertEqual(out.one("none"), "the VM didn't say how many bytes it wrote|5|0|0")
-        self.assertEqual(out.one("string"), "the VM didn't say how many bytes it wrote|5|0|0")
+        self.assertEqual(out.one("short"), "the VM wrote 9999 of 10000 bytes|4|0|0")
+        self.assertEqual(out.one("long"), "the VM wrote 10001 of 10000 bytes|4|0|0")
+        self.assertEqual(out.one("short_busy"), "the VM wrote 9997 of 10000 bytes|4|0|0")
+        self.assertEqual(out.one("none"), "the VM didn't say how many bytes it wrote|4|0|0")
+        self.assertEqual(out.one("string"), "the VM didn't say how many bytes it wrote|4|0|0")
         self.assertEqual(out.one("counted"), "12")      # three wordings, each in frames of 0, 1, 3 and 7 bytes
-        self.assertEqual(out.one("huge"), "the VM wrote 4294967295 of 10000 bytes|5|0|0")   # too many digits for a number
+        # Too many digits for a number is the most a number holds, and a count past 32 bits is shown whole: the
+        # VM's own number, not the low bits of it (this one's are the 10000 that were written).
+        self.assertEqual(out.one("huge"), "the VM wrote 18446744073709551615 of 10000 bytes|4|0|0")
+        self.assertEqual(out.one("wide"), "the VM wrote 4294977296 of 10000 bytes|4|0|0")
 
     def test_write_bad_path(self):
         out = self.run_case("write_bad_path")
@@ -355,9 +370,9 @@ class VmFileTest(unittest.TestCase):
         self.assertEqual(up.head, form_head(up.boundary, path, name))
         self.assertIsNone(up.malformed)
 
-    def test_write_zero_4096_and_4097_bytes(self):
-        out = self.run_case("write_zero_4096_4097")
-        for size in (0, 1, 4095, 4096, 4097, 8192, 8193):
+    def test_write_around_the_piece_size(self):
+        out = self.run_case("write_around_the_piece_size")
+        for size in (0, 1, 4096, 4097, 8191, 8192, 8193, 16384, 16385):
             with self.subTest(size=size):
                 up = out.upload(str(size))
                 pieces = [PIECE] * (size // PIECE) + ([size % PIECE] if size % PIECE else [])
@@ -370,24 +385,27 @@ class VmFileTest(unittest.TestCase):
 
     def test_write_http_error(self):
         out = self.run_case("write_http_error")
-        # The whole upload went out, and the VM said no; its words follow the status when they fit.
-        self.assertEqual(out.one("e500"), "VM answered HTTP 500: boom|5|0|0")
+        # The whole upload went out, and the VM said no; its words follow the status.
+        self.assertEqual(out.one("e500"), "VM answered HTTP 500: boom|4|0|0")
         # It said no after the head: nothing more is sent, and there is nothing to cancel.
         self.assertEqual(out.one("e403"),
                          "VM answered HTTP 403: route not allowed for this credential's scopes|1|0|0")
-        self.assertEqual(out.one("e404"), 'VM answered HTTP 404: {"ok":false,"error":{"code":"not_found",'
-                                          '"message":"path not found"}}|5|0|0')
-        self.assertEqual(out.one("e_long"), "VM answered HTTP 500|5|0|0")      # too long for the room there is
-        self.assertEqual(out.one("e_kept"), "VM answered HTTP 500")            # more than the writer keeps
-        self.assertEqual(out.one("e_clean"), "VM answered HTTP 500: bad path ? ??|5|0|0")   # only what prints, trimmed
-        self.assertEqual(out.one("e_empty"), "VM answered HTTP 500|5|0|0")
-        self.assertEqual(out.one("e302"), "VM answered HTTP 302|5|0|0")
+        # The VM's JSON error is its message, and not the envelope it comes in.
+        self.assertEqual(out.one("e404"), "VM answered HTTP 404: path not found|4|0|0")
+        # Words longer than the room there is are cut to it: 100 characters in 95, 22 of which are the status; and
+        # so are those of a reply longer than the writer keeps.
+        digits = "0123456789" * 10
+        self.assertEqual(out.one("e_long"), ("VM answered HTTP 500: " + digits)[:95] + "|4|0|0")
+        self.assertEqual(out.one("e_kept"), ("VM answered HTTP 500: " + "0123456789" * 30)[:255])
+        self.assertEqual(out.one("e_clean"), "VM answered HTTP 500: bad path ? ??|4|0|0")   # only what prints, trimmed
+        self.assertEqual(out.one("e_empty"), "VM answered HTTP 500|4|0|0")
+        self.assertEqual(out.one("e302"), "VM answered HTTP 302|4|0|0")
         self.assertEqual(out.one("e204"), "the VM didn't say how many bytes it wrote|3|0|0")   # a 2xx is not enough
 
     def test_write_session_drop(self):
         out = self.run_case("write_session_drop")
         self.assertEqual(out.one("drop"), "the VM connection dropped|2|0|1")        # no send after it, and a cancel
-        self.assertEqual(out.one("drop_late"), "the VM connection dropped|5|0|1")
+        self.assertEqual(out.one("drop_late"), "the VM connection dropped|4|0|1")
         self.assertEqual(out.one("down"), "could not send the request to the VM 0 0")
         self.assertEqual(out.one("queue"), "could not send the request to the VM|2|0|1")        # the request is cancelled
         self.assertEqual(out.one("queue_first"), "could not send the request to the VM|0|0|1")
@@ -445,13 +463,102 @@ class VmFileTest(unittest.TestCase):
         self.assertEqual(out.one("alloc"), "out of memory 0")
         self.run_case("write_memory", board="nopsram")
 
+    def test_a_long_write_keeps_off_the_dma_ram(self):
+        # 100,000 bytes: 12 pieces of 8192 and a last of 1696 between the head and the tail. The session copies
+        # each send with malloc, and a copy of 4096 bytes or less is internal RAM, which on the S3 is DMA RAM.
+        # The pieces are larger, so their copies are in PSRAM, and what the write holds of internal RAM stays
+        # small: the harness checks as it goes that an idle 1.75C's 24 KB of DMA RAM never falls under the
+        # Link's 16 KB margin.
+        out = self.run_case("write_peak_internal")
+        up = out.upload("up")
+        self.assertEqual(up.sends[1:-1], [PIECE] * 12 + [100000 - 12 * PIECE])
+        self.assertEqual(up.parts[3].length, 100000)
+        self.assertLess(int(out.one("peak")), 9 * 1024)
+        # Without PSRAM everything is internal anyway, and the queue takes one piece at a time.
+        out = self.run_case("write_peak_internal", board="nopsram")
+        self.assertEqual(out.upload("up").sends[1:-1], [PIECE_NO_PSRAM] * 24 + [100000 - 24 * PIECE_NO_PSRAM])
+
+    def test_a_read_can_open_while_a_write_streams(self):
+        # The first time the writer waits for room the session's queue is full, the worst moment for the DMA
+        # RAM: an idle 1.75C has 24 KB, and an install needs 20.7 KB of it to open.
+        out = self.run_case("read_opens_while_a_write_streams")
+        self.assertEqual(out.one("open"), "1||")      # admitted: no code, no message
+
+    def test_write_error_message(self):
+        out = self.run_case("write_error_message")
+        got = dict(line.split("\t", 1) for line in out.all("msg"))
+        head = "VM answered HTTP "
+        want = {
+            # The VM's JSON error is its message, whichever way round it is written, however it is broken into
+            # frames, with its escapes and its white space.
+            "envelope": head + "404: path not found",
+            "frames": head + "404: path not found",
+            "reordered": head + "403: folder is read-only",
+            "escapes": head + "400: can't write \"a b\" (\\x /y) A? !",
+            "pretty": head + "400: no such folder",
+            # Only the error of the reply counts.
+            "decoy_object": head + "400: real",
+            "decoy_string": head + "400: yes",
+            "deep_message": head + "400: shallow",
+            "array_skipped": head + "400: real",
+            "braces_in_strings": head + "400: real",
+            # Malformed JSON is shown as text: it is not read into a message.
+            "no_colon": head + '500: {"error" {"message":"oops"}}',
+            "no_comma": head + '500: {"a":"x" "error":{"message":"oops"}}',
+            "first_error_only": head + '500: {"error":{"code":"x"},"error":{"message":"second"}}',
+            "error_not_object": head + '500: {"error":"message":"oops"}',
+            "first_error_flat": head + '500: {"error":"flat","error":{"message":"second"}}',
+            # A \u escape is four hex digits, either case; fewer is not a character.
+            "escape_upper": head + "400: JJ?",
+            "escape_short": head + "400: x?zz",
+            # A key is the one looked for only if it is that and no more.
+            "prefix_key": head + "400: right",
+            "prefix_message": head + "400: right",
+            "long_key": head + "400: right",
+            # What isn't that envelope with a message in it is shown as text.
+            "flat": head + '500: {"ok":false,"error":"flat string"}',
+            "no_message": head + '500: {"ok":false,"error":{"code":"x"}}',
+            "empty_message": head + '500: {"ok":false,"error":{"message":""}}',
+            "blank_message": head + '500: {"error":{"message":"   "}}',
+            "message_object": head + '500: {"error":{"message":{"a":1}}}',
+            "bad_value": head + '500: {"error":{"message":xy"later"}}',
+            "plain": head + "403: route not allowed for this credential's scopes",
+            "broken": head + '500: {"error":{"message":"cut',
+            # The room the caller has: the words are cut to it, and the status is there whole or not at all.
+            "room_28": head + "404: path n",
+            "room_23": head + "404",
+            "room_24": head + "404: p",
+            # A reply longer than the writer keeps (255 bytes): its start, cut to the room, not dropped.
+            "long_text": (head + "500: " + "0123456789" * 30)[:95],
+            # The message is in what is kept of a long reply, or it isn't, or what is kept cuts it; or it is
+            # longer than the room.
+            "long_envelope": head + "500: deep in the reply",
+            "far_message": (head + '500: {"ok":false,"trace":"' + "x" * 300)[:95],
+            "cut_message": head + "500: " + "y" * 12,
+            "long_message": (head + "500: " + "y" * 150)[:95],
+        }
+        self.assertEqual(got, want)
+
+    def test_write_cancel_is_retried(self):
+        out = self.run_case("write_cancel_is_retried")
+        # No room for the cancel once: asked again, the second taken (the first waited 100 ms for room, after the
+        # 200 ms of the write), and nothing to say of it.
+        self.assertEqual(out.one("once"), "write timed out|2|1|300000|0")
+        # No room ever: ten tries of 100 ms, then it gives up and says so once, and the write still says why it
+        # failed.
+        self.assertEqual(out.one("never"), "write timed out|10|0|1200000|1")
+        # A session that dropped the request is asked once.
+        self.assertEqual(out.one("dropped"), "the VM connection dropped|1|1")
+
     def test_the_writer_takes_both_kinds_of_board(self):
-        # Nothing in the writer depends on PSRAM, except where its buffer goes, and no send is over what a
-        # board without it takes (the harness refuses a send of more than 4096 bytes there).
+        # A Muse board without PSRAM takes 4096 in a send, and the writer sends no more than that there (the
+        # harness refuses a send of more than 4096 bytes on it); with PSRAM it sends 8192.
         out = self.run_case("write_upload_multipart", "a.txt", board="nopsram")
         up = out.upload("up")
-        self.assertEqual(up.sends[1:-1], [4096, 4096, 1808])
-        self.assertTrue(all(size <= PIECE for size in up.sends), up.sends)
+        self.assertEqual(up.sends[1:-1], [PIECE_NO_PSRAM, PIECE_NO_PSRAM, 1808])
+        self.assertTrue(all(size <= PIECE_NO_PSRAM for size in up.sends), up.sends)
+        out = self.run_case("write_upload_multipart", "a.txt", board="psram")
+        self.assertEqual(out.upload("up").sends[1:-1], [PIECE, 1808])
 
     # ---- With image_fetch.c ----
 
@@ -483,6 +590,14 @@ class VmFileTest(unittest.TestCase):
         out = self.run_case("image_needs_a_block_for_its_drawing", board="image")
         # On a wide screen four rows (8000 bytes) are larger than the stack (6144): they decide.
         self.assertEqual(out.all("wide"), ["7999 0 out_of_memory | failed to allocate", "8000 1  | "])
+
+    def test_a_download_keeps_accepting_a_leading_slash(self):
+        # draw_file's path may start with a slash, as it always has; the reader itself refuses an absolute path,
+        # so the download drops the slashes first. A ".." folder is refused with the reader's words.
+        out = self.run_case("image_leading_slash", board="image")
+        self.assertEqual(out.one("slash"), "/fs/raw/pic.raw 5")
+        self.assertEqual(out.one("dots"), "invalid_params | vm_file_open: bad path | 0")
+        self.assertEqual(out.one("none"), "invalid_params | path names no file")
 
     def test_a_download_whose_task_will_not_start_frees_the_reader(self):
         out = self.run_case("image_task_that_will_not_start", board="image")

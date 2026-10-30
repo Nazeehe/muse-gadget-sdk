@@ -18,12 +18,16 @@ import os
 import shutil
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# The harness is a short program; one that spins in a poll loop of the code it runs (vm_file.c's) would
+# hang the suite without this.
+RUN_TIMEOUT_S = 60
 
 
 def _cc_command() -> list[str]:
@@ -33,9 +37,12 @@ def _cc_command() -> list[str]:
     return cmd
 
 
-def _sanitizer_flags(cc: list[str], tmp: Path) -> list[str]:
+def _sanitizer_flags(cc: list[str], tmp: Path) -> tuple[list[str], bool]:
+    """(flags, leak checks work): ASan and UBSan if this compiler can build and run them, and then whether
+    LeakSanitizer can too. The leak check is a second question, as in apps_host: macOS aborts on
+    detect_leaks=1, which used to turn the sanitizers off here altogether."""
     probe = tmp / "asan_probe"
-    flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+    flags = ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined", "-fno-omit-frame-pointer"]
     proc = subprocess.run(
         [
             *cc,
@@ -52,14 +59,20 @@ def _sanitizer_flags(cc: list[str], tmp: Path) -> list[str]:
         stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:
-        return []
-    run = subprocess.run(
-        [str(probe)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1"},
-    )
-    return flags if run.returncode == 0 else []
+        return [], False
+
+    def runs(options: str) -> bool:
+        done = subprocess.run(
+            [str(probe)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "ASAN_OPTIONS": options},
+        )
+        return done.returncode == 0
+
+    if not runs("detect_leaks=0:abort_on_error=1"):
+        return [], False
+    return flags, runs("detect_leaks=1:abort_on_error=1")
 
 
 class LinkImageFetchHarnessTest(unittest.TestCase):
@@ -74,7 +87,7 @@ class LinkImageFetchHarnessTest(unittest.TestCase):
                 f'#include "{ROOT / "main" / "image_fetch.c"}"\n'
             )
             # The reader of files on the VM, built the same way. Its writer is
-            # never called here; these two are all it needs that the harness
+            # never called here; these are all it needs that the harness
             # doesn't have.
             (tmp / "esp_random.h").write_text(
                 "#pragma once\n#include <stdint.h>\nuint32_t esp_random(void);\n"
@@ -88,15 +101,20 @@ class LinkImageFetchHarnessTest(unittest.TestCase):
                 "    (void)id; (void)data; (void)len; (void)end_body; (void)wait_ms;\n"
                 "    return false;\n"
                 "}\n"
+                "bool noise_ctrl_req_cancel_wait(int64_t id, int wait_ms) {\n"
+                "    (void)id; (void)wait_ms;\n"
+                "    return true;\n"
+                "}\n"
                 "uint32_t esp_random(void) { return 0; }\n"
             )
-            sanitizer_flags = _sanitizer_flags(cc, tmp)
+            sanitizer_flags, leak_checks = _sanitizer_flags(cc, tmp)
             compile_cmd = [
                 *cc,
                 "-std=c11",
                 "-D_GNU_SOURCE",
                 "-Wall",
                 "-Wextra",
+                "-Werror",
                 # The fake ESP_LOG macros drop their arguments.
                 "-Wno-unused-parameter",
                 "-Wno-unused-variable",
@@ -136,16 +154,24 @@ class LinkImageFetchHarnessTest(unittest.TestCase):
 
             env = os.environ.copy()
             if sanitizer_flags:
-                env["ASAN_OPTIONS"] = "detect_leaks=1:abort_on_error=1"
+                env["ASAN_OPTIONS"] = f"detect_leaks={int(leak_checks)}:abort_on_error=1"
                 env["UBSAN_OPTIONS"] = "halt_on_error=1"
-            run_proc = subprocess.run(
-                [str(binary)],
-                cwd=ROOT,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-            )
+            state = ("OFF (this compiler can't run ASan and UBSan)" if not sanitizer_flags
+                     else "ASan+UBSan, leak checks on" if leak_checks
+                     else "ASan+UBSan, no leak checks (LeakSanitizer isn't available here)")
+            print(f"link_image_fetch: spiram={int(spiram)}: sanitizers {state}", file=sys.stderr, flush=True)
+            try:
+                run_proc = subprocess.run(
+                    [str(binary)],
+                    cwd=ROOT,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    timeout=RUN_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail(f"the harness ran for more than {RUN_TIMEOUT_S} s: a loop that never ends")
             self.assertEqual(
                 run_proc.returncode,
                 0,

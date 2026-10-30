@@ -26,6 +26,13 @@
 // turn (g_turn_hook) to do something while a request is out, as another task
 // would.
 //
+// The session's queue of sends is modelled as the real one is, for what it costs
+// the heap: noise_ctrl_req_send copies each send with malloc before it waits for
+// room, so a copy of 4096 bytes or less is internal RAM (Muse boards set
+// CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096), which on the S3 is the DMA RAM the
+// Noise session's TX needs 16 KB of, and a larger one is PSRAM. The session task
+// sends one queued operation a turn and frees its copy.
+//
 // Built with WITH_IMAGE_FETCH it also runs image_fetch.c, over the same daemon
 // and the fakes of link_image_fetch_harness.c, for the cases where the two
 // meet: who holds the reader, and what a download reads when its range fails.
@@ -34,8 +41,12 @@
 // prints @-lines for tests/test_vm_file.py to check what it can't from here, and
 // exits 0, or says what failed and exits 1. vm_file.c is built with its
 // allocations going through the counting allocator below (image_fetch_alloc.h),
-// so every case ends by checking that nothing is left.
+// so every case ends by checking that nothing is left. A case that reads depends
+// on the reader alone, and one that writes on the writer alone: finish() checks
+// the reader is free and makes no write, finish_write() checks the writer is free
+// and opens no reader, so a fault in one doesn't turn the other's cases red.
 
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -69,6 +80,12 @@
 // The most one send can carry: a larger one can't be framed, and ends the request
 // on the real session (4 KB where Muse has no PSRAM, 8 KB with it).
 #define SEND_LIMIT (CONFIG_SPIRAM ? 8192 : 4096)
+// The session copies each send with malloc: up to this size the copy is internal
+// RAM (devices/sdkconfig.muse), above it PSRAM. Its queue holds REQ_QUEUE_LEN
+// operations and REQ_QUEUE_BYTES of body bytes (noise_control.cpp).
+#define ALWAYS_INTERNAL_BYTES 4096
+#define REQ_QUEUE_LEN 6
+#define REQ_QUEUE_BYTES (CONFIG_SPIRAM ? 16384 : 4096)
 // What the VM says when it turns an upload away.
 #define REPLY_REFUSED "route not allowed for this credential's scopes"
 #define REPLY_NOT_FOUND "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"path not found\"}}"
@@ -106,10 +123,14 @@ static struct {
     void *ptr;
     size_t size;
     bool external;
+    bool session;           // the session's copy of a send, not an allocation of the code under test
 } g_allocations[MAX_ALLOCATIONS];
 static size_t g_internal_used, g_external_used;
+static size_t g_own_internal_used, g_peak_own_internal;   // the internal RAM that vm_file.c itself holds
+static bool g_session_copy;             // set while the fake session copies a send
 static size_t g_internal_free, g_dma_free, g_largest_block;
 static size_t g_min_dma_free;
+static size_t g_peak_internal;          // the most internal RAM the allocations held at once
 static unsigned g_alloc_calls, g_fail_alloc;
 static size_t g_alloc_limit;            // larger heap_caps_malloc calls fail; 0 for none
 static size_t g_pressure_after_body;    // DMA RAM another task takes once the buffer is allocated
@@ -136,8 +157,17 @@ static void *image_alloc(size_t size, bool external) {
         g_allocations[i].ptr = ptr;
         g_allocations[i].size = cost;
         g_allocations[i].external = external;
-        if (external) g_external_used += cost;
-        else g_internal_used += cost;
+        g_allocations[i].session = g_session_copy;
+        if (external) {
+            g_external_used += cost;
+        } else {
+            g_internal_used += cost;
+            if (g_internal_used > g_peak_internal) g_peak_internal = g_internal_used;
+            if (!g_session_copy) {
+                g_own_internal_used += cost;
+                if (g_own_internal_used > g_peak_own_internal) g_peak_own_internal = g_own_internal_used;
+            }
+        }
         record_dma();
         return ptr;
     }
@@ -166,8 +196,12 @@ void image_test_free(void *ptr) {
     if (!ptr) return;
     for (size_t i = 0; i < MAX_ALLOCATIONS; i++) {
         if (g_allocations[i].ptr != ptr) continue;
-        if (g_allocations[i].external) g_external_used -= g_allocations[i].size;
-        else g_internal_used -= g_allocations[i].size;
+        if (g_allocations[i].external) {
+            g_external_used -= g_allocations[i].size;
+        } else {
+            g_internal_used -= g_allocations[i].size;
+            if (!g_allocations[i].session) g_own_internal_used -= g_allocations[i].size;
+        }
         g_allocations[i].ptr = NULL;
         free(ptr);
         return;
@@ -247,11 +281,16 @@ void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
     va_end(ap);
 }
 
-static bool log_has(const char *text) {
+static unsigned log_count(const char *text) {
+    unsigned n = 0;
     for (unsigned i = 0; i < 32 && i < g_log_lines; i++) {
-        if (strstr(g_log[i], text)) return true;
+        if (strstr(g_log[i], text)) n++;
     }
-    return false;
+    return n;
+}
+
+static bool log_has(const char *text) {
+    return log_count(text) != 0;
 }
 
 // The writer's boundary comes from four words of this: a sequence, so a case knows the boundaries to come.
@@ -272,7 +311,8 @@ static request_t g_get, g_post;
 static int64_t g_next_id;
 static bool g_connected;        // false: the session refuses requests
 static size_t g_max_body;       // noise_ctrl_req_max_body()
-static int g_cancels;
+static int g_cancels;           // cancels the session took
+static int g_cancel_waits;      // calls of noise_ctrl_req_cancel_wait, taken or not
 static void (*g_turn_hook)(void);
 
 // The file, and how the daemon serves it.
@@ -320,6 +360,8 @@ static struct {
     int drop_after_sends;               // the session ends after this many sends; 0 never
     int send_fails_at;                  // this send, counted from the first of the write, won't queue; -1 never
     int64_t send_cost_us;               // what each send takes of the clock
+    int cancel_refusals;                // cancels the session's queue has no room for before it takes one; -1 always
+    uint64_t count_override;            // the count a 200 reports, if not 0, in place of what was written
 } g_cfg;
 
 typedef struct {
@@ -466,31 +508,31 @@ static void parse_upload(void) {
 }
 
 // What a 200 says: the number of bytes the daemon wrote, worded as the case wants.
-static void make_reply(char *out, size_t out_len, size_t count) {
+static void make_reply(char *out, size_t out_len, uint64_t count) {
     switch (g_cfg.style) {
     case REPLY_COUNT:
-        snprintf(out, out_len, "{\"ok\":true,\"bytes_written\":%zu}", count);
+        snprintf(out, out_len, "{\"ok\":true,\"bytes_written\":%" PRIu64 "}", count);
         break;
     case REPLY_BUSY:
         snprintf(out, out_len,
                  "{\"ok\": true, \"path\": \"a.txt\", \"note\": \"\\\"bytes_written\\\": 7\", "
-                 "\"bytes_written\" : %zu , \"mode\": \"replace\"}",
+                 "\"bytes_written\" : %" PRIu64 " , \"mode\": \"replace\"}",
                  count);
         break;
     case REPLY_NO_COUNT:
         snprintf(out, out_len, "{\"ok\":true}");
         break;
     case REPLY_COUNT_STRING:
-        snprintf(out, out_len, "{\"ok\":true,\"bytes_written\":\"%zu\"}", count);
+        snprintf(out, out_len, "{\"ok\":true,\"bytes_written\":\"%" PRIu64 "\"}", count);
         break;
     case REPLY_COUNT_LAST:
-        snprintf(out, out_len, "{\"bytes_written\":%zu", count);
+        snprintf(out, out_len, "{\"bytes_written\":%" PRIu64, count);
         break;
     case REPLY_STUTTER:
-        snprintf(out, out_len, "{\"bytes\"bytes_written\":%zu}", count);
+        snprintf(out, out_len, "{\"bytes\"bytes_written\":%" PRIu64 "}", count);
         break;
     case REPLY_HUGE:
-        snprintf(out, out_len, "{\"bytes_written\":%zu99999999999999999999999}", count);
+        snprintf(out, out_len, "{\"bytes_written\":%" PRIu64 "99999999999999999999999}", count);
         break;
     }
 }
@@ -531,7 +573,8 @@ static void answer_upload(void) {
         if (strcmp(g_up.parts[i].name, "file") == 0) count = g_up.parts[i].len;
     }
     char reply[256];
-    make_reply(reply, sizeof(reply), (size_t)((long)count + g_cfg.delta));
+    make_reply(reply, sizeof(reply),
+               g_cfg.count_override ? g_cfg.count_override : (uint64_t)((long)count + g_cfg.delta));
     deliver(200, reply);
 }
 
@@ -555,13 +598,37 @@ static bool stream_turn(void) {
     return false;
 }
 
+// The session's queue of sends. Each send is a copy the session holds until its task has sent it,
+// one operation a turn; only the copies are kept here, for what they cost the heap: the daemon
+// reads a send's bytes when it is made.
+static struct {
+    void *copy;
+    size_t len;
+} g_wire[REQ_QUEUE_LEN];
+static int g_wire_n;
+static size_t g_wire_bytes;
+
+static void wire_turn(void) {
+    if (!g_wire_n) return;
+    image_test_free(g_wire[0].copy);
+    g_wire_bytes -= g_wire[0].len;
+    memmove(g_wire, g_wire + 1, (size_t)(--g_wire_n) * sizeof(g_wire[0]));
+}
+
+// The session sends, or drops, whatever is left of the queue.
+static void wire_flush(void) {
+    while (g_wire_n) wire_turn();
+}
+
 static void reset_world(void) {
+    wire_flush();
     CHECK(g_lock_depth == 0, "a reply lock is still held");
     CHECK(!g_internal_used && !g_external_used, "leaked %zu internal / %zu external bytes",
           g_internal_used, g_external_used);
     g_internal_free = g_dma_free = 200000;
     g_largest_block = 100000;
     g_min_dma_free = 200000;
+    g_peak_internal = g_peak_own_internal = 0;
     g_alloc_calls = g_fail_alloc = 0;
     g_alloc_limit = 0;
     g_pressure_after_body = g_internal_pressure_after_body = g_body_bytes = 0;
@@ -569,7 +636,7 @@ static void reset_world(void) {
     g_now_us = 1000000;
     g_connected = true;
     g_max_body = MAX_BODY;
-    g_cancels = 0;
+    g_cancels = g_cancel_waits = 0;
     g_turn_hook = NULL;
     memset(&g_get, 0, sizeof(g_get));
     memset(&g_post, 0, sizeof(g_post));
@@ -693,6 +760,30 @@ bool noise_ctrl_req_send(int64_t id, const void *data, size_t len, bool end_body
         g_up.late_sends++;
         return true;
     }
+    // The session copies the bytes first, with malloc: internal RAM up to ALWAYS_INTERNAL_BYTES, PSRAM
+    // above it. Then it waits for room: bytes, and an operation of the queue's REQ_QUEUE_LEN.
+    g_session_copy = true;
+    void *copy = image_alloc(len ? len : 1, len > ALWAYS_INTERNAL_BYTES);
+    g_session_copy = false;
+    if (!copy) return false;
+    if (len) memcpy(copy, data, len);
+    int64_t until = g_now_us + (int64_t)wait_ms * 1000;
+    while ((g_wire_bytes > 0 && g_wire_bytes + len > REQ_QUEUE_BYTES) || g_wire_n == REQ_QUEUE_LEN) {
+        if (until - g_now_us <= 0) {
+            image_test_free(copy);
+            return false;
+        }
+        vTaskDelay(5);          // a turn of the session task, which sends one
+    }
+    if (!g_post.active) {       // answered or cancelled while it waited
+        image_test_free(copy);
+        g_up.late_sends++;
+        return true;
+    }
+    g_wire[g_wire_n].copy = copy;
+    g_wire[g_wire_n].len = len;
+    g_wire_n++;
+    g_wire_bytes += len;
     CHECK(g_up.sends < MAX_SENDS, "too many sends");
     g_up.body = realloc(g_up.body, g_up.len + len + 1);
     CHECK(g_up.body, "realloc");
@@ -716,6 +807,21 @@ void noise_ctrl_req_cancel(int64_t id) {
     g_cancels++;
     if (id == g_get.id) g_get.active = false;
     if (id == g_post.id) g_post.active = false;
+    wire_flush();               // the session sends or drops what is still queued, and resets the stream
+}
+
+// The cancel that says whether the session took it: not when its queue has no room within wait_ms.
+bool noise_ctrl_req_cancel_wait(int64_t id, int wait_ms) {
+    CHECK(wait_ms > 0, "a cancel wait of %d ms", wait_ms);
+    CHECK(id == g_get.id || id == g_post.id, "cancelled stream %lld, which isn't open", (long long)id);
+    CHECK(++g_cancel_waits <= 50, "a cancel asked for %d times: it is not given up on", g_cancel_waits);
+    if (g_cfg.cancel_refusals) {
+        if (g_cfg.cancel_refusals > 0) g_cfg.cancel_refusals--;
+        g_now_us += (int64_t)wait_ms * 1000;    // it waited for room, and there was none
+        return false;
+    }
+    noise_ctrl_req_cancel(id);
+    return true;
 }
 
 static void get_turn(void) {
@@ -766,6 +872,7 @@ static void session_turn(void) {
     void (*hook)(void) = g_turn_hook;
     g_turn_hook = NULL;
     if (hook) hook();
+    wire_turn();
     get_turn();
     post_turn();
 }
@@ -807,9 +914,8 @@ static void expect_refusal(const char *path, size_t keep, const char *owner, con
           message ? message : "(null)", want_message);
 }
 
-// What a case's end checks: nothing is left of the reader, in the heap or in
-// the lock, and the writer is free too.
-static void finish(void) {
+// The memory and the lock a case leaves back as it found them.
+static void check_nothing_left(void) {
     g_fail_alloc = 0;
     g_alloc_limit = 0;
     g_fail_mutex = false;
@@ -819,8 +925,22 @@ static void finish(void) {
     CHECK(g_lock_depth == 0, "a reply lock is still held");
     CHECK(!g_internal_used && !g_external_used, "left %zu internal / %zu external bytes",
           g_internal_used, g_external_used);
+}
+
+// What the end of a case that reads checks: nothing is left of the reader, in the heap or in the lock,
+// and the reader is free again. It makes no write, and nothing a case that reads does depends on one.
+static void finish(void) {
+    check_nothing_left();
+    CHECK(!g_posts, "a case that reads made %d write requests", g_posts);
     vm_file_t *f = open_ok("after.bin", 0, VM_FILE_OWNER_IMAGE);   // the reader is free
     vm_file_close(f);
+}
+
+// What the end of a case that writes checks: the session has sent what it was given, nothing is left
+// of the writer, and the writer is free again: a write of one byte goes through. It opens no reader.
+static void finish_write(void) {
+    wire_flush();
+    check_nothing_left();
     char err[96];
     g_connected = true;
     reset_cfg();
@@ -828,6 +948,7 @@ static void finish(void) {
     int posts = g_posts;
     CHECK(vm_file_write("after.bin", "x", 1, 1000, err, sizeof(err)), "the writer is stuck: %s", err);
     CHECK(g_posts == posts + 1, "a write of one byte took %d requests", g_posts - posts);
+    wire_flush();
     CHECK(!g_internal_used && !g_external_used, "the writer left %zu bytes", g_internal_used);
 }
 
@@ -904,7 +1025,7 @@ static void fill(size_t n) {
 
 static void case_read_all_streams_ranges_to_sink(void) {
     reset_vm(40 * 1024);
-    vm_file_t *f = open_ok("/pics/big.bin", 0, VM_FILE_OWNER_IMAGE);
+    vm_file_t *f = open_ok("pics/big.bin", 0, VM_FILE_OWNER_IMAGE);
     CHECK(g_gets == 0, "opening a reader must send nothing: %d requests", g_gets);
     CHECK(vm_file_chunk(f) == MAX_BODY, "chunk %zu", vm_file_chunk(f));
     sink_t s = {0};
@@ -992,7 +1113,7 @@ static void case_second_reader_is_busy(void) {
     f = open_ok("a.bin", 0, VM_FILE_OWNER_INSTALL);
     expect_refusal("b.bin", 0, VM_FILE_OWNER_IMAGE, "busy",
                    "the VM file reader is busy (an app install)");
-    expect_refusal("/", 0, VM_FILE_OWNER_IMAGE, "invalid_params", "path names no file");
+    expect_refusal("", 0, VM_FILE_OWNER_IMAGE, "invalid_params", "path names no file");
     // Another owner is reported without a name, and nothing else is different.
     vm_file_close(f);
     f = open_ok("a.bin", 0, "something else");
@@ -1330,11 +1451,12 @@ static void case_open_refusals(void) {
     finish();
 #endif
 
-    // An empty path, or one of slashes, names no file, and holds nothing.
+    // An empty path names no file, and a path of slashes is absolute (case open_bad_path has the rest):
+    // neither holds anything.
     reset_vm(100);
     expect_refusal("", 0, VM_FILE_OWNER_IMAGE, "invalid_params", "path names no file");
-    expect_refusal("///", 0, VM_FILE_OWNER_IMAGE, "invalid_params", "path names no file");
     expect_refusal(NULL, 0, VM_FILE_OWNER_IMAGE, "invalid_params", "path names no file");
+    expect_refusal("///", 0, VM_FILE_OWNER_IMAGE, "invalid_params", "vm_file_open: bad path");
     CHECK(!g_alloc_calls, "an empty path allocated");
     finish();
 }
@@ -1423,9 +1545,8 @@ static void case_request_path_is_encoded(void) {
         const char *path;
         const char *request;
     } cases[] = {
-        {"/home/me/pics/a b%.raw", "/fs/raw/home/me/pics/a%20b%25.raw"},
+        {"home/me/pics/a b%.raw", "/fs/raw/home/me/pics/a%20b%25.raw"},
         {"workspace/apps/hello/main.lua", "/fs/raw/workspace/apps/hello/main.lua"},
-        {"///x/y", "/fs/raw/x/y"},
         {"a-b_c.d~e/f", "/fs/raw/a-b_c.d~e/f"},
         {"q?x=1&y#z", "/fs/raw/q%3Fx%3D1%26y%23z"},
         {"caf\xc3\xa9", "/fs/raw/caf%C3%A9"},
@@ -1451,6 +1572,37 @@ static void case_request_path_is_encoded(void) {
     CHECK(vm_file_read(f, buf, sizeof(buf), deadline()) == 10, "long path: %s", error_of(f));
     vm_file_close(f);
     finish();
+}
+
+// A path that isn't the user's own folder's, as the writer refuses it: absolute, or with a ".." folder. A
+// ".." inside a name is a name, and "." and an empty folder go to the VM as they are.
+static void case_open_bad_path(void) {
+    static const char *const refused[] = {"/etc/passwd", "/", "///x", "/workspace/a.txt", "..", "../x", "a/..",
+                                          "a/../b", "a/b/../../c", "x/y/.."};
+    static const char *const allowed[] = {"a..b", "..a", "a/..b/c", "a/b..", ".hidden", "a/./b", "a//b", "...",
+                                          "a/.../b"};
+    reset_vm(10);
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        expect_refusal(refused[i], 0, VM_FILE_OWNER_INSTALL, "invalid_params", "vm_file_open: bad path");
+        printf("@refused %s\n", refused[i]);
+    }
+    CHECK(!g_alloc_calls && !g_gets, "a refused path allocated or sent something");
+    // The check comes before the reader is taken, so a busy one says the path is bad.
+    vm_file_t *held = open_ok("held.bin", 0, VM_FILE_OWNER_IMAGE);
+    expect_refusal("../x", 0, VM_FILE_OWNER_INSTALL, "invalid_params", "vm_file_open: bad path");
+    vm_file_close(held);
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        reset_vm(10);
+        vm_file_t *f = open_ok(allowed[i], 0, VM_FILE_OWNER_INSTALL);
+        uint8_t buf[10];
+        CHECK(vm_file_read(f, buf, sizeof(buf), deadline()) == 10, "%s: %s", allowed[i], error_of(f));
+        char want[64];
+        snprintf(want, sizeof(want), "/fs/raw/%s", allowed[i]);
+        CHECK(strcmp(g_get_path, want) == 0, "'%s' asked for %s", allowed[i], g_get_path);
+        vm_file_close(f);
+        printf("@allowed %s\n", allowed[i]);
+        finish();
+    }
 }
 
 // ---- Writing cases -----------------------------------------------------------
@@ -1501,11 +1653,12 @@ static void case_write_upload_multipart(int argc, char **argv) {
     CHECK(g_cancels == 0, "a finished write needs no cancel");
     check_file(g_data, 10000);
     print_upload("up");
-    finish();
+    finish_write();
 }
 
-static void case_write_zero_4096_4097(void) {
-    static const size_t sizes[] = {0, 1, 4095, 4096, 4097, 8192, 8193};
+// Around the size of a piece, and of two: where a piece ends the file, and where it doesn't.
+static void case_write_around_the_piece_size(void) {
+    static const size_t sizes[] = {0, 1, 4096, 4097, 8191, 8192, 8193, 16384, 16385};
     for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
         reset_vm(0);
         fill(sizes[i]);
@@ -1516,7 +1669,7 @@ static void case_write_zero_4096_4097(void) {
         char label[16];
         snprintf(label, sizeof(label), "%zu", sizes[i]);
         print_upload(label);
-        finish();
+        finish_write();
     }
 }
 
@@ -1528,7 +1681,7 @@ static void case_write_http_error(void) {
     g_cfg.reply = "boom";
     CHECK(!write_ten_thousand(err, sizeof(err)), "an HTTP 500 must fail the write");
     SUMMARY("e500", err);
-    finish();
+    finish_write();
 
     // Turned away after the first send: the rest is not sent.
     reset_vm(0);
@@ -1539,7 +1692,7 @@ static void case_write_http_error(void) {
     SUMMARY("e403", err);
     CHECK(log_has("403"), "the refusal isn't logged");
     CHECK(log_has(REPLY_REFUSED), "the VM's own words aren't logged");
-    finish();
+    finish_write();
 
     // The VM's error as it words it for a missing folder.
     reset_vm(0);
@@ -1547,24 +1700,26 @@ static void case_write_http_error(void) {
     g_cfg.reply = REPLY_NOT_FOUND;
     CHECK(!write_ten_thousand(err, sizeof(err)), "an HTTP 404 must fail the write");
     SUMMARY("e404", err);
-    finish();
+    finish_write();
 
-    // Words that don't fit are left out, and so are words the writer kept only the start of.
+    // Words that don't fit are cut to the room there is, and so is the start of a reply longer than the
+    // writer keeps.
     reset_vm(0);
     g_cfg.status[0] = 500;
     g_cfg.reply = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
     CHECK(!write_ten_thousand(err, sizeof(err)), "an HTTP 500 must fail the write");
     SUMMARY("e_long", err);
-    finish();
+    finish_write();
     {
-        char wide[256];
+        char wide[256], reply[301];
+        for (size_t i = 0; i < 300; i++) reply[i] = (char)('0' + i % 10);
+        reply[300] = '\0';
         reset_vm(0);
         g_cfg.status[0] = 500;
-        g_cfg.reply = "01234567890123456789012345678901234567890123456789012345678901234567890123456789"
-                      "01234567890123456789012345678901234567890123456789012345678901234567890123456789";
+        g_cfg.reply = reply;
         CHECK(!write_ten_thousand(wide, sizeof(wide)), "an HTTP 500 must fail the write");
-        printf("@e_kept %s\n", wide);    // 160 bytes of words, of which the writer keeps 127
-        finish();
+        printf("@e_kept %s\n", wide);    // 300 bytes of words, of which the writer keeps 255
+        finish_write();
     }
 
     // What isn't printable is not passed on: white space is a space, the rest a question mark, and the
@@ -1575,26 +1730,26 @@ static void case_write_http_error(void) {
     CHECK(!write_ten_thousand(err, sizeof(err)), "an HTTP 500 must fail the write");
     SUMMARY("e_clean", err);
     CHECK(!log_has("workspace/apps"), "the path is in the log");
-    finish();
+    finish_write();
 
     // No words: the status alone. A redirect isn't success.
     reset_vm(0);
     g_cfg.status[0] = 500;
     CHECK(!write_ten_thousand(err, sizeof(err)), "an HTTP 500 must fail the write");
     SUMMARY("e_empty", err);
-    finish();
+    finish_write();
     reset_vm(0);
     g_cfg.status[0] = 302;
     CHECK(!write_ten_thousand(err, sizeof(err)), "a 302 must fail the write");
     SUMMARY("e302", err);
-    finish();
+    finish_write();
 
     // A 2xx with no count is not a write that was counted.
     reset_vm(0);
     g_cfg.status[0] = 204;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 1000, err, sizeof(err)), "a 204 says nothing of the count");
     SUMMARY("e204", err);
-    finish();
+    finish_write();
 }
 
 static void case_write_session_drop(void) {
@@ -1604,41 +1759,41 @@ static void case_write_session_drop(void) {
     g_cfg.drop_after_sends = 2;
     CHECK(!write_ten_thousand(err, sizeof(err)), "a dropped session must fail the write");
     SUMMARY("drop", err);
-    finish();
+    finish_write();
 
     // It ends once the whole body is out, before the answer.
     reset_vm(0);
     g_cfg.action[0] = POST_DROP;
     CHECK(!write_ten_thousand(err, sizeof(err)), "a dropped session must fail the write");
     SUMMARY("drop_late", err);
-    finish();
+    finish_write();
 
     // The session is gone when the write starts, and when a send can't be queued.
     reset_vm(0);
     g_connected = false;
     CHECK(!write_ten_thousand(err, sizeof(err)), "no session");
     printf("@down %s %d %d\n", err, g_posts, g_cancels);
-    finish();
+    finish_write();
 
     reset_vm(0);
-    g_cfg.send_fails_at = 2;    // the third: the first piece of the file
+    g_cfg.send_fails_at = 2;    // the third: the last piece of the file
     CHECK(!write_ten_thousand(err, sizeof(err)), "a send that can't be queued");
     SUMMARY("queue", err);
-    finish();
+    finish_write();
 
     // The head of the form can't be queued either.
     reset_vm(0);
     g_cfg.send_fails_at = 0;
     CHECK(!write_ten_thousand(err, sizeof(err)), "a send that can't be queued");
     SUMMARY("queue_first", err);
-    finish();
+    finish_write();
 
     // A reply the board can't take ends the session: the VM's frame was too large.
     reset_vm(0);
     g_cfg.status[0] = NOISE_CTRL_REQ_TOO_LARGE;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 1000, err, sizeof(err)), "too large");
     printf("@large %s\n", err);
-    finish();
+    finish_write();
 }
 
 static void case_write_timeout(void) {
@@ -1649,7 +1804,7 @@ static void case_write_timeout(void) {
     int64_t start = g_now_us;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 1000, err, sizeof(err)), "must time out");
     printf("@stall %s %d %d %lld\n", err, g_posts, g_cancels, (long long)(g_now_us - start));
-    finish();
+    finish_write();
 
     // The time is for the whole call, sending included: a session that takes 400 ms a send
     // has taken three of them when the second piece is out, and the third is never sent.
@@ -1661,7 +1816,7 @@ static void case_write_timeout(void) {
     printf("@slow %s|%d|%d|%d|%lld|", err, g_up.sends, g_up.late_sends, g_cancels, (long long)(g_now_us - start));
     for (int i = 0; i < g_up.sends; i++) printf(i ? ",%d" : "%d", g_up.wait_ms[i]);   // the time left for each
     putchar('\n');
-    finish();
+    finish_write();
 
     // A send that waited for room until the time ran out is a timeout, not a refusal; one that
     // failed at once is a refusal.
@@ -1670,27 +1825,27 @@ static void case_write_timeout(void) {
     g_cfg.send_fails_at = 0;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 1000, err, sizeof(err)), "the head is never queued");
     printf("@waited %s|%d|%d\n", err, g_up.sends, g_cancels);
-    finish();
+    finish_write();
     reset_vm(0);
     g_cfg.send_cost_us = 1000;
     g_cfg.send_fails_at = 0;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 1000, err, sizeof(err)), "the head is refused");
     printf("@quick %s|%d|%d\n", err, g_up.sends, g_cancels);
-    finish();
+    finish_write();
 
     // An answer that takes 400 ms, in time and not.
     reset_vm(0);
     g_cfg.delay_turns = 20;     // 20 turns of 20 ms
     fill(10000);
     CHECK(vm_file_write(FILE_PATH, g_data, 10000, 2000, err, sizeof(err)), "in time: %s", err);
-    finish();
+    finish_write();
     reset_vm(0);
     g_cfg.delay_turns = 60;
     fill(10000);
     start = g_now_us;
     CHECK(!vm_file_write(FILE_PATH, g_data, 10000, 1000, err, sizeof(err)), "the answer is too late");
     printf("@total %s %d %d %lld\n", err, g_posts, g_cancels, (long long)(g_now_us - start));
-    finish();
+    finish_write();
 
     // No time at all: nothing is sent.
     reset_vm(0);
@@ -1699,7 +1854,7 @@ static void case_write_timeout(void) {
     reset_vm(0);
     CHECK(!vm_file_write(FILE_PATH, "x", 1, -5, err, sizeof(err)), "negative time");
     printf("@negative %s %d\n", err, g_posts);
-    finish();
+    finish_write();
 }
 
 // The VM's answer has to be whole: a head that is never followed by the rest
@@ -1710,7 +1865,7 @@ static void case_write_waits_for_the_whole_reply(void) {
     g_cfg.action[0] = POST_HEAD_ONLY;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 1000, err, sizeof(err)), "must wait for the end");
     printf("@head %s %d %d\n", err, g_posts, g_cancels);
-    finish();
+    finish_write();
 }
 
 static void write_again(void) {
@@ -1727,7 +1882,7 @@ static void case_write_one_at_a_time(void) {
     CHECK(vm_file_write(FILE_PATH, "x", 1, 1000, err, sizeof(err)), "first: %s", err);
     CHECK(g_posts == 1, "the second write sent %d requests", g_posts - 1);
     printf("@first %d\n", g_posts);
-    finish();
+    finish_write();
 }
 
 static void write_during_read(void) {
@@ -1748,7 +1903,9 @@ static void case_reader_and_writer_are_independent(void) {
     print_sink(&s);
     printf("@posts %d\n", g_posts);
     vm_file_close(f);
-    finish();
+    // The one case that depends on both: each is free again.
+    vm_file_close(open_ok("after.bin", 0, VM_FILE_OWNER_IMAGE));
+    finish_write();
 }
 
 // The answer of a request the writer gave up on, which says the next write worked.
@@ -1764,6 +1921,7 @@ static void case_write_late_frames_are_dropped(void) {
     reset_vm(0);
     g_cfg.action[0] = POST_STALL;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 200, err, sizeof(err)), "must time out");
+    CHECK(g_post.cb, "the first write opened no request");
     g_late_cb = g_post.cb;
     g_late_ctx = g_post.ctx;
     g_cfg.action[1] = POST_STALL;
@@ -1775,20 +1933,22 @@ static void case_write_late_frames_are_dropped(void) {
     g_late_cb(g_late_ctx, 200, (const uint8_t *)LATE_REPLY, strlen(LATE_REPLY), true);
     g_cfg.action[2] = POST_STALL;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 200, err, sizeof(err)), "must time out");
-    finish();
+    finish_write();
 }
 
 // The head of the form is one send, so it has to fit in one: 4096 bytes, which every board's
-// session takes. The path is in it twice when it is a bare name, and once, with the name,
-// when it has folders.
+// session takes, whatever the size of the pieces after it. The path is in it twice when it is a
+// bare name, and once, with the name, when it has folders.
+#define HEAD_LIMIT 4096
+
 static void case_write_path_limits(void) {
     char err[96];
     reset_vm(0);
     CHECK(vm_file_write("a", "x", 1, 5000, err, sizeof(err)), "calibration: %s", err);
     size_t overhead = g_up.send_len[0] - 2;     // the head without the path, and the name, which are one byte each
-    finish();
+    finish_write();
     static char path[5000];
-    for (size_t head = VM_FILE_WRITE_PIECE_BYTES; head <= VM_FILE_WRITE_PIECE_BYTES + 1; head++) {
+    for (size_t head = HEAD_LIMIT; head <= HEAD_LIMIT + 1; head++) {
         // folders, a slash, and a file name of 100 characters, which the head holds twice
         size_t folders = head - overhead - 1 - 200;
         memset(path, 'd', folders);
@@ -1799,7 +1959,7 @@ static void case_write_path_limits(void) {
         bool ok = vm_file_write(path, "x", 1, 5000, err, sizeof(err));
         printf("@limit %zu %d %s %d %zu\n", head, ok, ok ? "-" : err, g_posts, g_up.sends ? g_up.send_len[0] : 0);
         if (ok) check_file((const uint8_t *)"x", 1);
-        finish();
+        finish_write();
     }
 }
 
@@ -1812,7 +1972,7 @@ static void case_write_filename_is_escaped(void) {
     CHECK(vm_file_write(path, "x", 1, 5000, err, sizeof(err)), "write: %s", err);
     check_file((const uint8_t *)"x", 1);
     print_upload("name");
-    finish();
+    finish_write();
 }
 
 static void case_write_bad_path(void) {
@@ -1837,7 +1997,7 @@ static void case_write_bad_path(void) {
         printf("@allowed %s\n", allowed[i]);
     }
     CHECK(g_posts == (int)(sizeof(allowed) / sizeof(allowed[0])), "%d requests", g_posts);
-    finish();
+    finish_write();
 }
 
 static void case_write_short_count(void) {
@@ -1847,24 +2007,24 @@ static void case_write_short_count(void) {
     g_cfg.delta = -1;
     CHECK(!write_ten_thousand(err, sizeof(err)), "a short count must fail the write");
     SUMMARY("short", err);
-    finish();
+    finish_write();
     reset_vm(0);
     g_cfg.delta = 1;
     CHECK(!write_ten_thousand(err, sizeof(err)), "a long count must fail the write");
     SUMMARY("long", err);
-    finish();
+    finish_write();
 
     // A 200 that doesn't say, or says it in a string, has not said.
     reset_vm(0);
     g_cfg.style = REPLY_NO_COUNT;
     CHECK(!write_ten_thousand(err, sizeof(err)), "no count must fail the write");
     SUMMARY("none", err);
-    finish();
+    finish_write();
     reset_vm(0);
     g_cfg.style = REPLY_COUNT_STRING;
     CHECK(!write_ten_thousand(err, sizeof(err)), "a count in a string must fail the write");
     SUMMARY("string", err);
-    finish();
+    finish_write();
 
     // The count is found wherever the reply's frames break it, among other fields, with
     // white space around it, after the key's text in a string, and as the end of the reply.
@@ -1877,7 +2037,7 @@ static void case_write_short_count(void) {
             g_cfg.frame_bytes = frames[i];
             CHECK(write_ten_thousand(err, sizeof(err)), "reply style %d in frames of %zu: %s", (int)styles[s],
                   frames[i], err);
-            finish();
+            finish_write();
         }
     }
     printf("@counted %zu\n", sizeof(styles) / sizeof(styles[0]) * sizeof(frames) / sizeof(frames[0]));
@@ -1887,12 +2047,19 @@ static void case_write_short_count(void) {
     reset_vm(0);
     g_cfg.style = REPLY_STUTTER;
     CHECK(write_ten_thousand(err, sizeof(err)), "the key after a false start: %s", err);
-    finish();
+    finish_write();
     reset_vm(0);
     g_cfg.style = REPLY_HUGE;
     CHECK(!write_ten_thousand(err, sizeof(err)), "a count of 28 digits is not 10000");
     SUMMARY("huge", err);
-    finish();
+    finish_write();
+
+    // A count past 32 bits is shown whole: this one's low 32 bits are what was written.
+    reset_vm(0);
+    g_cfg.count_override = 4294967296ULL + 10000;
+    CHECK(!write_ten_thousand(err, sizeof(err)), "a count of 2^32 + 10000 is not 10000");
+    SUMMARY("wide", err);
+    finish_write();
 
     // And a wrong count is wrong in any of them.
     reset_vm(0);
@@ -1901,12 +2068,12 @@ static void case_write_short_count(void) {
     g_cfg.delta = -3;
     CHECK(!write_ten_thousand(err, sizeof(err)), "a short count in pieces");
     SUMMARY("short_busy", err);
-    finish();
+    finish_write();
 
     // No bytes is a count of none.
     reset_vm(0);
     CHECK(vm_file_write(FILE_PATH, NULL, 0, 1000, err, sizeof(err)), "an empty file: %s", err);
-    finish();
+    finish_write();
 }
 
 static void case_write_boundary_collision(void) {
@@ -1955,7 +2122,7 @@ static void case_write_boundary_collision(void) {
     int posts = g_posts;
     CHECK(!vm_file_write("a.txt", data, sizeof(data), 5000, err, sizeof(err)), "four collisions");
     printf("@exhausted %s|%d|%u\n", err, g_posts - posts, g_random_calls);
-    finish();
+    finish_write();
 }
 
 static void case_write_arguments(void) {
@@ -1988,7 +2155,7 @@ static void case_write_arguments(void) {
     char small[8];
     CHECK(!vm_file_write("f", "x", 1, 1000, small, sizeof(small)), "an error with little room to say it");
     printf("@small %s\n", small);
-    finish();
+    finish_write();
 }
 
 static void case_write_memory(void) {
@@ -1998,21 +2165,192 @@ static void case_write_memory(void) {
     g_fail_mutex = true;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 1000, err, sizeof(err)), "no lock");
     printf("@lock %s %d\n", err, g_posts);
-    finish();
+    finish_write();
     // The buffer for the head of the form.
     reset_vm(0);
     g_fail_alloc = 1;
     CHECK(!vm_file_write(FILE_PATH, "x", 1, 1000, err, sizeof(err)), "no buffer");
     printf("@alloc %s %d\n", err, g_posts);
-    finish();
-    // The buffer is in PSRAM where there is some: it takes nothing the session needs.
+    finish_write();
+    // The writer's own buffer is in PSRAM where there is some: it asks of internal RAM nothing for itself.
+    // What the write asks of it is the session's copies of what it sends of 4096 bytes or less: the head
+    // of the form, the last piece, the tail. (case write_peak_internal has a write long enough to fill
+    // the session's queue.)
     reset_vm(0);
     fill(10000);
     CHECK(vm_file_write(FILE_PATH, g_data, 10000, 10000, err, sizeof(err)), "write: %s", err);
 #if CONFIG_SPIRAM
-    CHECK(g_min_dma_free == 200000, "the writer used %zu bytes of DMA RAM", 200000 - g_min_dma_free);
+    CHECK(g_peak_own_internal == 0, "the writer took %zu bytes of internal RAM for itself", g_peak_own_internal);
+    CHECK(g_peak_internal < 4096, "a write of 10000 bytes held %zu bytes of internal RAM", g_peak_internal);
 #endif
-    finish();
+    finish_write();
+}
+
+// A long write is a stream of sends that the session copies and queues, 16 KB at a time. On a Muse
+// board a copy of 4096 bytes or less is internal RAM, which on the S3 is DMA RAM, and the Noise
+// session's TX needs 16 KB of it free: an idle 1.75C has about 24 KB. The pieces of the file are
+// larger than that, so their copies are PSRAM.
+static uint8_t g_big[100000];
+
+static void fill_big(void) {
+    for (size_t i = 0; i < sizeof(g_big); i++) g_big[i] = pat(i);
+}
+
+static void case_write_peak_internal(void) {
+    char err[96];
+    reset_vm(0);
+    g_dma_free = g_internal_free = 24 * 1024;       // an idle 1.75C with the Link up
+    fill_big();
+    CHECK(vm_file_write(FILE_PATH, g_big, sizeof(g_big), 20000, err, sizeof(err)), "write: %s", err);
+    check_file(g_big, sizeof(g_big));
+    printf("@peak %zu\n", g_peak_internal);
+#if CONFIG_SPIRAM
+    CHECK(g_min_dma_free >= NOISE_TX_DMA_RESERVE_BYTES,
+          "the write's queued copies left %zu bytes of DMA RAM, under the Noise margin of %u",
+          g_min_dma_free, (unsigned)NOISE_TX_DMA_RESERVE_BYTES);
+#endif
+    print_upload("up");
+    finish_write();
+}
+
+static void open_while_streaming(void) {
+    const char *code = NULL, *message = NULL;
+    vm_file_t *f = vm_file_open("workspace/apps/x/main.lua", 0, VM_FILE_OWNER_INSTALL, &code, &message);
+    printf("@open %d|%s|%s\n", f != NULL, code ? code : "", message ? message : "");
+    if (f) vm_file_close(f);
+}
+
+// What the writer takes of the DMA RAM is what a read, a draw_file or an install is refused for while
+// it streams: the first time it waits for room the session's queue is full, which is the worst moment.
+static void case_read_opens_while_a_write_streams(void) {
+    char err[96];
+    reset_vm(0);
+    g_dma_free = g_internal_free = 24 * 1024;
+    fill_big();
+    g_turn_hook = open_while_streaming;
+    CHECK(vm_file_write(FILE_PATH, g_big, sizeof(g_big), 20000, err, sizeof(err)), "write: %s", err);
+    finish_write();
+}
+
+// ---- More writing cases ------------------------------------------------------
+
+// What a refusal says: the VM's own words after the status. `reply` is what the VM answers with, `err_len`
+// the room the caller has, and `log_text` (if any) what the log must hold of the reply.
+static void error_shape(const char *label, int status, const char *reply, size_t err_len, size_t frame_bytes,
+                        const char *log_text) {
+    char err[256];
+    CHECK(err_len <= sizeof(err), "a caller with room for %zu bytes", err_len);
+    reset_vm(0);
+    g_cfg.status[0] = status;
+    g_cfg.reply = reply;
+    g_cfg.frame_bytes = frame_bytes;
+    CHECK(!write_ten_thousand(err, err_len), "an HTTP %d must fail the write", status);
+    printf("@msg %s\t%s\n", label, err);
+    if (log_text) CHECK(log_has(log_text), "the VM's reply isn't in the log: %s", log_text);
+    finish_write();
+}
+
+// The words after the status are the "message" of the VM's JSON error, {"ok":false,"error":{"message":..}},
+// when that is what the reply is. Any other reply is shown as text, cut to what the caller has room for.
+static void case_write_error_message(void) {
+    static char text[1024], pad_x[301], pad_y[301];
+    memset(pad_x, 'x', 300);
+    memset(pad_y, 'y', 300);
+    // The envelope, in one frame and in frames of a byte, and in the other shapes it comes in.
+    error_shape("envelope", 404, REPLY_NOT_FOUND, 96, 0, "\"message\":\"path not found\"");
+    error_shape("frames", 404, REPLY_NOT_FOUND, 96, 1, NULL);
+    error_shape("reordered", 403, "{\"error\":{\"message\":\"folder is read-only\",\"code\":\"ro\"},\"ok\":false}", 96, 0, NULL);
+    error_shape("escapes", 400,
+                "{\"ok\":false,\"error\":{\"message\":\"can't write \\\"a b\\\"\\t(\\\\x \\/y) \\u0041\\u00e9\\n!\"}}",
+                96, 0, NULL);
+    error_shape("pretty", 400,
+                "{\r\n  \"ok\": false,\r\n  \"error\": {\r\n    \"code\": \"bad_path\",\r\n"
+                "    \"message\": \"no such folder\"\r\n  }\r\n}\r\n",
+                96, 0, NULL);
+    // Only the error of the reply is looked at: another "error" or "message" is not it.
+    error_shape("decoy_object", 400, "{\"note\":{\"error\":{\"message\":\"decoy\"}},\"error\":{\"message\":\"real\"}}", 96, 0, NULL);
+    error_shape("decoy_string", 400,
+                "{\"a\":\"{\\\"error\\\":{\\\"message\\\":\\\"no\\\"}}\",\"error\":{\"message\":\"yes\"}}", 96, 0, NULL);
+    error_shape("deep_message", 400, "{\"error\":{\"inner\":{\"message\":\"deep\"},\"message\":\"shallow\"}}", 96, 0, NULL);
+    // What is skipped on the way to the error is skipped whole: an array, and a string with braces in it.
+    error_shape("array_skipped", 400, "{\"trace\":[1,[2],\"x]\"],\"error\":{\"message\":\"real\"}}", 96, 0, NULL);
+    error_shape("braces_in_strings", 400, "{\"note\":{\"k\":\"a\\\"}]\"},\"error\":{\"message\":\"real\"}}", 96, 0, NULL);
+    // Malformed JSON is not read into a message: a member needs its colon, members a comma between them,
+    // the reply's own "error" is the first one, and it is an object.
+    error_shape("no_colon", 500, "{\"error\" {\"message\":\"oops\"}}", 96, 0, NULL);
+    error_shape("no_comma", 500, "{\"a\":\"x\" \"error\":{\"message\":\"oops\"}}", 96, 0, NULL);
+    error_shape("first_error_only", 500, "{\"error\":{\"code\":\"x\"},\"error\":{\"message\":\"second\"}}", 96, 0, NULL);
+    error_shape("error_not_object", 500, "{\"error\":\"message\":\"oops\"}", 96, 0, NULL);
+    error_shape("first_error_flat", 500, "{\"error\":\"flat\",\"error\":{\"message\":\"second\"}}", 96, 0, NULL);
+    // A \u escape takes four hex digits, of either case, to be a character; fewer is not one.
+    error_shape("escape_upper", 400, "{\"error\":{\"message\":\"\\u004A\\u004a\\u00E9\"}}", 96, 0, NULL);
+    error_shape("escape_short", 400, "{\"error\":{\"message\":\"x\\u41zz\"}}", 96, 0, NULL);
+    // A key is the one looked for only if it is that and no more.
+    error_shape("prefix_key", 400, "{\"errors\":{\"message\":\"wrong\"},\"error\":{\"message\":\"right\"}}", 96, 0, NULL);
+    error_shape("prefix_message", 400, "{\"error\":{\"messages\":\"wrong\",\"message\":\"right\"}}", 96, 0, NULL);
+    error_shape("long_key", 400, "{\"error\":{\"messagex\":\"wrong\",\"message\":\"right\"}}", 96, 0, NULL);
+    // Anything that isn't that envelope with a message in it: the text of the reply.
+    error_shape("flat", 500, "{\"ok\":false,\"error\":\"flat string\"}", 96, 0, NULL);
+    error_shape("no_message", 500, "{\"ok\":false,\"error\":{\"code\":\"x\"}}", 96, 0, NULL);
+    error_shape("empty_message", 500, "{\"ok\":false,\"error\":{\"message\":\"\"}}", 96, 0, NULL);
+    error_shape("blank_message", 500, "{\"error\":{\"message\":\"   \"}}", 96, 0, NULL);
+    error_shape("message_object", 500, "{\"error\":{\"message\":{\"a\":1}}}", 96, 0, NULL);
+    error_shape("bad_value", 500, "{\"error\":{\"message\":xy\"later\"}}", 96, 0, NULL);
+    error_shape("plain", 403, REPLY_REFUSED, 96, 0, REPLY_REFUSED);
+    error_shape("broken", 500, "{\"error\":{\"message\":\"cut", 96, 0, NULL);
+    // The room the caller has: the words are cut to it, and the status is whole or not there to cut.
+    error_shape("room_28", 404, REPLY_NOT_FOUND, 29, 0, NULL);
+    error_shape("room_23", 404, REPLY_NOT_FOUND, 23, 0, NULL);
+    error_shape("room_24", 404, REPLY_NOT_FOUND, 24, 0, NULL);
+    // A reply longer than the writer keeps: its start is shown, cut to the room, not dropped.
+    for (size_t i = 0; i < 300; i++) text[i] = (char)('0' + i % 10);
+    text[300] = '\0';
+    error_shape("long_text", 500, text, 96, 0, NULL);
+    // A message that is within what is kept of a long reply, one that is not, one that is cut by it, and one
+    // longer than the caller has room for.
+    snprintf(text, sizeof(text), "{\"ok\":false,\"trace\":\"%.150s\",\"error\":{\"message\":\"deep in the reply\"},\"more\":\"%.150s\"}",
+             pad_x, pad_y);
+    error_shape("long_envelope", 500, text, 96, 0, NULL);
+    snprintf(text, sizeof(text), "{\"ok\":false,\"trace\":\"%.300s\",\"error\":{\"message\":\"far\"}}", pad_x);
+    error_shape("far_message", 500, text, 96, 0, NULL);
+    snprintf(text, sizeof(text), "{\"ok\":false,\"trace\":\"%.200s\",\"error\":{\"message\":\"%.100s\"}}", pad_x, pad_y);
+    error_shape("cut_message", 500, text, 96, 0, NULL);
+    snprintf(text, sizeof(text), "{\"error\":{\"message\":\"%.150s\"}}", pad_y);
+    error_shape("long_message", 500, text, 96, 0, NULL);
+}
+
+// An upload given up on leaves its stream open on the session, which has three, until the VM or the session
+// ends it, so the cancel is asked again if the session's queue had no room for it, for up to a second.
+static void case_write_cancel_is_retried(void) {
+    char err[96];
+    // No room once: it is asked for again, and the second is taken.
+    reset_vm(0);
+    g_cfg.action[0] = POST_STALL;
+    g_cfg.cancel_refusals = 1;
+    int64_t start = g_now_us;
+    CHECK(!vm_file_write(FILE_PATH, "x", 1, 200, err, sizeof(err)), "must time out");
+    printf("@once %s|%d|%d|%lld|%u\n", err, g_cancel_waits, g_cancels, (long long)(g_now_us - start),
+           log_count("would not take the cancel"));
+    CHECK(!g_post.active, "the request is still open");
+    finish_write();
+
+    // Never any room: it stops after a second, says so once, and the write still says why it failed.
+    reset_vm(0);
+    g_cfg.action[0] = POST_STALL;
+    g_cfg.cancel_refusals = -1;
+    start = g_now_us;
+    CHECK(!vm_file_write(FILE_PATH, "x", 1, 200, err, sizeof(err)), "must time out");
+    printf("@never %s|%d|%d|%lld|%u\n", err, g_cancel_waits, g_cancels, (long long)(g_now_us - start),
+           log_count("would not take the cancel"));
+    g_post.active = false;      // the VM gives up on it, or the session ends
+    finish_write();
+
+    // A session that drops the request mid-body asks no more than once either.
+    reset_vm(0);
+    g_cfg.drop_after_sends = 2;
+    CHECK(!write_ten_thousand(err, sizeof(err)), "a dropped session must fail the write");
+    printf("@dropped %s|%d|%d\n", err, g_cancel_waits, g_cancels);
+    finish_write();
 }
 
 #if WITH_IMAGE_FETCH
@@ -2276,6 +2614,26 @@ static void case_image_needs_a_block_for_its_drawing(void) {
     }
 }
 
+// draw_file's path may start with a slash, as it always has: the route is relative to the user's home
+// either way, so the download drops them before it opens the reader, which refuses an absolute path.
+// A ".." folder is refused, with the reader's words, and nothing is sent.
+static void case_image_leading_slash(void) {
+    const char *code = NULL, *message = NULL;
+    reset_image(5 * ROW_BYTES);
+    CHECK(draw_vm("/pic.raw", &code, &message), "a path with a leading slash: %s", message);
+    CHECK(g_result.ok && g_rows_drawn == 5, "the picture: %s", g_message);
+    printf("@slash %s %d\n", g_get_path, g_rows_drawn);
+    finish();
+
+    reset_image(5 * ROW_BYTES);
+    CHECK(!draw_vm("a/../pic.raw", &code, &message), "a .. folder");
+    printf("@dots %s | %s | %d\n", code, message, g_gets);
+    CHECK(draw_vm("//pic.raw", &code, &message), "refused, the download's flag and the reader are free: %s", message);
+    CHECK(!draw_vm("///", &code, &message), "slashes only");
+    printf("@none %s | %s\n", code, message);
+    finish();
+}
+
 static void case_image_task_that_will_not_start(void) {
     reset_image(5 * ROW_BYTES);
     g_fail_task = true;
@@ -2317,8 +2675,9 @@ static const test_case_t cases[] = {
     CASE(open_counts_keep),
     CASE(open_chunk_under_pressure),
     CASE(request_path_is_encoded),
+    CASE(open_bad_path),
     CASE_PATH(write_upload_multipart),
-    CASE(write_zero_4096_4097),
+    CASE(write_around_the_piece_size),
     CASE(write_http_error),
     CASE(write_session_drop),
     CASE(write_timeout),
@@ -2333,6 +2692,10 @@ static const test_case_t cases[] = {
     CASE(write_boundary_collision),
     CASE(write_arguments),
     CASE(write_memory),
+    CASE(write_peak_internal),
+    CASE(read_opens_while_a_write_streams),
+    CASE(write_error_message),
+    CASE(write_cancel_is_retried),
 #if WITH_IMAGE_FETCH
     CASE(image_refused_while_an_install_reads),
     CASE(install_refused_while_an_image_downloads),
@@ -2340,6 +2703,7 @@ static const test_case_t cases[] = {
     CASE(image_needs_a_block_for_its_stack),
     CASE(image_needs_a_block_for_its_drawing),
     CASE(image_task_that_will_not_start),
+    CASE(image_leading_slash),
 #endif
 };
 

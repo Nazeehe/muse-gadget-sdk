@@ -458,8 +458,11 @@ static bool start(const char *target, bool vm, int row, image_fetch_done_cb done
         return false;
     }
     bool https = !vm && strncasecmp(target, "https://", 8) == 0;
+    const char *name = target;
     if (vm) {
-        const char *name = target + strspn(target, "/");
+        // A path may start with slashes, as it always has: the route is relative to the user's
+        // home either way, and the reader refuses an absolute path (and a ".." folder).
+        name += strspn(name, "/");
         if (!*name) {
             *code = "invalid_params";
             *message = "path names no file";
@@ -504,7 +507,7 @@ static bool start(const char *target, bool vm, int row, image_fetch_done_cb done
         // Noise session's margin and the request, and says why in code and
         // message if it can't open: out of memory, or busy with an app install.
         size_t draw = vm_draw_bytes(width);
-        f->file = vm_file_open(target, stack + draw, VM_FILE_OWNER_IMAGE, code, message);
+        f->file = vm_file_open(name, stack + draw, VM_FILE_OWNER_IMAGE, code, message);
         if (!f->file) {
             free(f);
             atomic_store(&s_busy, false);

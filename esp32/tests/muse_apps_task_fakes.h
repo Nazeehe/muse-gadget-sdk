@@ -87,7 +87,7 @@ void *heap_caps_malloc(size_t size, uint32_t caps);
 void *heap_caps_calloc(size_t n, size_t size, uint32_t caps);
 void *heap_caps_realloc(void *ptr, size_t size, uint32_t caps);  /* apps_port_idf.c's (tests/muse_apps_port_harness.c) */
 void heap_caps_free(void *ptr);
-size_t heap_caps_get_largest_free_block(uint32_t caps);  /* apps_io_submit's admission */
+size_t heap_caps_get_largest_free_block(uint32_t caps);  /* what apps_io_submit no longer asks (R1) */
 
 /* ---- FreeRTOS ---- */
 
@@ -102,11 +102,6 @@ typedef struct fake_mutex *SemaphoreHandle_t;
 typedef struct {
     _Alignas(16) unsigned char opaque[512];
 } StaticSemaphore_t;
-/* A task's TCB, as FreeRTOS sizes it (apps_io.c counts it in the worker's admission): 100 bytes on the S3, read from the
- * firmware's ELF (sizeof(StaticTask_t) and sizeof(TCB_t) in gdb), so that the host's sums are the board's. */
-typedef struct {
-    _Alignas(4) unsigned char opaque[100];
-} StaticTask_t;
 
 #define pdFALSE 0
 #define pdTRUE 1
@@ -129,9 +124,12 @@ UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task);
 BaseType_t xTaskCreatePinnedToCoreWithCaps(TaskFunction_t code, const char *const name, const uint32_t stack, void *const arg,
                                            UBaseType_t priority, TaskHandle_t *const created, const BaseType_t core,
                                            UBaseType_t caps);
-BaseType_t xTaskCreatePinnedToCore(TaskFunction_t code, const char *const name, const uint32_t stack, void *const arg,
-                                   UBaseType_t priority, TaskHandle_t *const created, const BaseType_t core);
-void vTaskDelete(TaskHandle_t task);
+/* The I/O worker's end (apps_io.c): it suspends itself, and the task that makes the next worker deletes it once eTaskGetState
+ * says it is suspended. */
+typedef enum { eRunning = 0, eReady, eBlocked, eSuspended, eDeleted, eInvalid } eTaskState;
+eTaskState eTaskGetState(TaskHandle_t task);
+void vTaskSuspend(TaskHandle_t task);
+void vTaskDeleteWithCaps(TaskHandle_t task);
 
 QueueHandle_t xQueueCreateWithCaps(UBaseType_t length, UBaseType_t item_size, UBaseType_t caps);
 void vQueueDeleteWithCaps(QueueHandle_t queue);

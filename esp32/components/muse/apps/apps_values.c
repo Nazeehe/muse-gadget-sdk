@@ -18,6 +18,7 @@
 #include "apps_values.h"
 
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -61,15 +62,17 @@
  * streak. A budget that holds a save back is said once per streak too, all on the app task: s_slow has the apps whose saves it holds back,
  * s_slow_new the ones not said yet, and a save that fits at once ends the app's streak.
  *
- * The alarms' records (P1): s_marked, the apps whose records are due a sync, and s_recs, the records the mount handed over, each waiting
- * to be armed again, armed again, or done with (its name touched, its app gone, the table full): the app task's alone. A tick
- * APPS_VALUES_ALARM_DELAY_MS after the first mark reads each marked app's alarms and queues an op that hands them, with the names of its
- * records that nothing touched (to keep), to apps_store_sync_alarms. The re-arm and the app's own alarm calls are both the app task's, so
- * the app's choice always wins.
+ * The alarms' records (P1): s_marked, each app's touched names that wait for their sync (each with its time), or all of them; s_recs, the
+ * records the mount handed over, each waiting to be armed again, armed again, or done with (its name touched, its app gone, the table
+ * full); s_unclocked, the names synced armed with no clock: the app task's alone. When an app's names are due, the tick reads the app's
+ * alarms and queues an op that hands those names, each with what the table has of it, to apps_store_sync_alarms, which touches no other
+ * record. Two notes come from other tasks, under the lock: s_waits, the worker's records that the budget couldn't take, which are synced
+ * again once it can, and s_forgotten, the apps the store removed or quarantined, whose handed-over records are forgotten at the round's
+ * start, before the re-arm looks. The re-arm and the app's own alarm calls are both the app task's, so the app's choice always wins.
  *
- * The tables of apps (s_failing, s_failed, s_slow, s_slow_new, s_marked, s_recs, s_unclocked; about 3 KB) are in PSRAM (EXT_RAM_BSS_ATTR,
- * as the store's are): plain memory that only tasks touch, never an atomic, kept out of the internal RAM the worker's stack is made from.
- * The lock stays internal.
+ * The tables of apps (s_failing, s_failed, s_slow, s_slow_new, s_marked, s_recs, s_unclocked, s_waits, s_forgotten; about 8.5 KB) are in
+ * PSRAM (EXT_RAM_BSS_ATTR, as the store's are): plain memory that only tasks touch, never an atomic, kept out of the internal RAM the Link
+ * needs. The lock stays internal.
  */
 
 static const char *TAG = "muse_apps";
@@ -84,7 +87,7 @@ typedef struct store_node {
     struct store_node *next;
     uint32_t seq;                       /* the order of the saves, for the oldest */
     size_t len;
-    bool paid;                          /* its cost is taken from the budget (or it needs none: RAM) */
+    bool held;                          /* it waits for the budget (else, while it waits, for the worker): a newer save waits with it */
     bool forced;                        /* an app's end's: written whatever the budget says */
     char app[APPS_ID_MAX + 1];
     char json[];                        /* len bytes, then a NUL */
@@ -159,6 +162,14 @@ bool apps_values_budget_take(uint32_t bytes, bool force) {
     }
     unlock();
     return fits;
+}
+
+/* bytes given back to the budget: a write it was charged for that the worker never had (#4). Never past full. */
+static void budget_give(uint32_t bytes) {
+    lock();
+    int64_t held = budget_now_locked() + (int64_t)bytes * UNITS_PER_BYTE;
+    s_budget = held > BUDGET_FULL ? BUDGET_FULL : held;
+    unlock();
 }
 
 int64_t apps_values_budget_wait_ms(uint32_t bytes) {
@@ -296,6 +307,20 @@ static char *copy_of(const char *json, size_t len) {
 static uint32_t node_cost(const store_node_t *n) {
     bool empty = n->len == 2 && memcmp(n->json, "{}", 2) == 0;
     return empty ? 0 : (uint32_t)(strlen(n->app) + 1 + n->len + APPS_VALUES_ENTRY_COST);
+}
+
+/* n's cost, taken for the write the worker is about to be handed (on flash; RAM costs nothing): false when it doesn't fit, which a
+ * forced one always does. A save is charged only for the worker's having it: one the worker refuses is refunded (#4). */
+static bool charge(const store_node_t *n, bool flash) {
+    uint32_t cost = node_cost(n);
+    return !flash || cost == 0 || apps_values_budget_take(cost, n->forced);
+}
+
+static void refund(const store_node_t *n, bool flash) {
+    uint32_t cost = node_cost(n);
+    if (flash && cost > 0) {
+        budget_give(cost);
+    }
 }
 
 static int slow_find(const char *app) {
@@ -442,30 +467,29 @@ bool apps_values_save(const char *app, const char *json, size_t len) {
     n->next = NULL;
     n->seq = 0;
     n->len = len;
-    n->paid = n->forced = false;
+    n->held = n->forced = false;
     snprintf(n->app, sizeof n->app, "%s", app);
     memcpy(n->json, json, len);
     n->json[len] = '\0';
     bool flash = apps_store_mode() == APPS_STORAGE_FLASH;
     int at = pending_of(app);
-    bool held_back = flash && at >= 0 && !s_pending[at]->paid && !s_pending[at]->forced;
+    bool held_back = flash && at >= 0 && s_pending[at]->held;
     if (at >= 0) {
-        apps_port_free(s_pending[at]);  /* this is the newer: a save that waited is of no use to anyone now */
+        apps_port_free(s_pending[at]);  /* this is the newer: a save that waited (never charged: #4) is of no use to anyone now */
         s_pending[at] = NULL;
     }
-    uint32_t cost = node_cost(n);
-    if (!flash || cost == 0) {
-        n->paid = true;
-    } else if (!held_back && apps_values_budget_take(cost, false)) {
-        n->paid = true;
-        slow_end(app);
-    } else {
+    if (held_back || !charge(n, flash)) {
+        n->held = true;
         slow_begin(app);  /* the budget holds it back: it waits for the tick, in the place of the app's save that waited */
         return keep(n, false);
+    }
+    if (flash && node_cost(n) > 0) {
+        slow_end(app);  /* it fit at once */
     }
     if (apps_io_submit_op(store_put_op, n)) {
         return true;
     }
+    refund(n, flash);  /* the worker refused it: it pays when it is handed over, once (#4) */
     return keep(n, true);
 }
 
@@ -475,24 +499,39 @@ void apps_values_flush(const char *app) {
         return;
     }
     store_node_t *n = s_pending[at];
-    if (!n->paid) {
-        (void)apps_values_budget_take(node_cost(n), true);  /* an app's end writes over the budget, which fills from below zero */
-        n->paid = true;
-    }
-    n->forced = true;
+    bool flash = apps_store_mode() == APPS_STORAGE_FLASH;
+    n->forced = true;  /* an app's end writes over the budget, which fills from below zero */
+    n->held = false;
+    (void)charge(n, flash);
     if (apps_io_submit_op(store_put_op, n)) {
         s_pending[at] = NULL;  /* the worker's: n isn't touched again */
-    }  /* else the worker refused it: the tick offers it again, paid */
+        return;
+    }
+    refund(n, flash);  /* the worker refused it: the tick offers it again, forced */
 }
 
 /* ---- The alarms' records ---- */
 
+/* An app's names that wait for their sync: each with its own time (a burst shares the first's, a record that waits for the budget has its
+ * own), or every name of the app (all). The app task's alone. */
+typedef struct {
+    char name[APPS_ALARM_NAME_MAX + 1];
+    int64_t due;                        /* when its sync is queued */
+} touched_t;
+
 typedef struct {
     char app[APPS_ID_MAX + 1];
-    int n, n_keep;
-    bool epochs;                        /* the clock was valid: each alarm's epoch_ms is when it fires */
-    apps_store_alarm_t alarms[APPS_ALARMS_PER_APP];
-    char keep[APPS_STORE_RECORDS_MAX][APPS_ALARM_NAME_MAX + 1];
+    bool all;                           /* every name: the system cancelled them all, or the app touched more than names[] holds */
+    int64_t all_due;
+    int n;
+    touched_t names[APPS_STORE_SYNC_MAX];
+} marked_t;
+
+typedef struct {
+    char app[APPS_ID_MAX + 1];
+    bool all;
+    int n;
+    apps_store_name_t names[APPS_STORE_SYNC_MAX];
 } sync_t;
 
 enum { REC_WAITING, REC_ARMED, REC_DONE };
@@ -502,41 +541,89 @@ typedef struct {
     uint8_t state;                      /* waiting to be armed again, armed again, or done with (touched, its app gone, refused) */
 } handed_t;
 
-static EXT_RAM_BSS_ATTR char s_marked[MARKED_MAX][APPS_ID_MAX + 1];
+typedef struct {
+    char app[APPS_ID_MAX + 1];
+    char name[APPS_ALARM_NAME_MAX + 1];
+} note_t;
+
+static EXT_RAM_BSS_ATTR marked_t s_marked[MARKED_MAX];
 static int s_marked_n;
-static int64_t s_marked_due;            /* when the marks are brought to the records */
-static int64_t s_marked_retry_at;       /* a refusal's, or the budget's: not before then */
+static int64_t s_marked_retry_at;       /* the worker refused an op, or there was no memory for one: not before then */
 
 static EXT_RAM_BSS_ATTR handed_t s_recs[APPS_STORE_RECORDS_MAX];
 static int s_recs_n;
 static bool s_recs_taken;
 static int64_t s_rearm_at;              /* a re-arm that got no memory: not before then */
-static bool s_clock_seen;
-/* Apps synced with no clock while they had alarms: synced again when it comes. */
-static EXT_RAM_BSS_ATTR char s_unclocked[MARKED_MAX][APPS_ID_MAX + 1];
+/* Names synced armed with no clock (their old records dropped): synced again when it comes. At most the alarm table's. */
+static EXT_RAM_BSS_ATTR note_t s_unclocked[APPS_ALARMS_MAX];
 static int s_unclocked_n;
+
+/* Notes from other tasks, under s_lock, which the app task's round takes: the records the worker's syncs couldn't write for the budget
+ * (at most one for each alarm of the table), and the apps the store removed or quarantined (more than that between two rounds: every
+ * record that waits goes). */
+static EXT_RAM_BSS_ATTR note_t s_waits[APPS_ALARMS_MAX];
+static int s_waits_n;
+static EXT_RAM_BSS_ATTR char s_forgotten[APPS_STORE_RECORDS_MAX][APPS_ID_MAX + 1];
+static int s_forgotten_n;
+static bool s_forgotten_all;
 
 static void sync_op(void *arg) {
     sync_t *s = arg;
-    apps_store_sync_alarms(s->app, s->alarms, s->n, s->keep, s->n_keep, s->epochs);
+    apps_store_sync_alarms(s->app, s->names, s->n, s->all);
     apps_port_free(s);
 }
 
-/* app's records are due a sync, APPS_VALUES_ALARM_DELAY_MS after the first mark of a batch. */
-static void mark_app(const char *app) {
-    for (int i = 0; i < s_marked_n; i++) {
-        if (strcmp(s_marked[i], app) == 0) {
+/* The earliest time any of m's names is due. */
+static int64_t marked_due(const marked_t *m) {
+    int64_t due = m->all ? m->all_due : INT64_MAX;
+    for (int i = 0; i < m->n; i++) {
+        due = m->names[i].due < due ? m->names[i].due : due;
+    }
+    return due;
+}
+
+/* app's alarm name (NULL: every name) is due a sync at due; batch: with the app's names that wait already, if they come sooner, so that a
+ * burst of changes is one op. */
+static void mark_name(const char *app, const char *name, int64_t due, bool batch) {
+    marked_t *m = NULL;
+    for (int i = 0; i < s_marked_n && m == NULL; i++) {
+        m = strcmp(s_marked[i].app, app) == 0 ? &s_marked[i] : NULL;
+    }
+    if (m == NULL) {
+        if (s_marked_n == MARKED_MAX) {
+            ESP_LOGW(TAG, "alarm: the records of %s's alarms weren't updated: %d other apps' wait", app, MARKED_MAX);
             return;
         }
+        m = &s_marked[s_marked_n++];
+        memset(m, 0, sizeof *m);
+        snprintf(m->app, sizeof m->app, "%s", app);
     }
-    if (s_marked_n == MARKED_MAX) {
-        ESP_LOGW(TAG, "alarm: the records of %s's alarms weren't updated: %d other apps' wait", app, MARKED_MAX);
-        return;
+    int64_t earliest = marked_due(m);
+    if (batch && earliest < due) {
+        due = earliest;
     }
-    if (s_marked_n == 0) {
-        s_marked_due = apps_port_mono_ms() + APPS_VALUES_ALARM_DELAY_MS;
+    if (m->all) {
+        m->all_due = due < m->all_due ? due : m->all_due;
+        return;  /* every name waits already */
     }
-    snprintf(s_marked[s_marked_n++], sizeof s_marked[0], "%s", app);
+    if (name != NULL) {
+        for (int i = 0; i < m->n; i++) {
+            if (strcmp(m->names[i].name, name) == 0) {
+                m->names[i].due = due < m->names[i].due ? due : m->names[i].due;
+                return;
+            }
+        }
+        if (m->n < APPS_STORE_SYNC_MAX) {
+            snprintf(m->names[m->n].name, sizeof m->names[0].name, "%s", name);
+            m->names[m->n++].due = due;
+            return;
+        }
+        ESP_LOGW(TAG, "alarm: %s touched more than %d names before its records were synced: they all follow the table", app,
+                 APPS_STORE_SYNC_MAX);
+    }
+    m->all = true;
+    m->all_due = due < earliest ? due : earliest;
+    m->n = 0;
 }
 
 /* The records the mount read, taken once it has run (RAM mode has none). */
@@ -558,7 +645,7 @@ static void records_take(void) {
 }
 
 void apps_values_alarm_touched(const char *app, const char *name) {
-    if (app == NULL || strlen(app) > APPS_ID_MAX) {
+    if (app == NULL || strlen(app) > APPS_ID_MAX || (name != NULL && strlen(name) > APPS_ALARM_NAME_MAX)) {
         return;
     }
     records_take();
@@ -568,7 +655,82 @@ void apps_values_alarm_touched(const char *app, const char *name) {
             h->state = REC_DONE;  /* the app's, or the system's, choice: its record follows the table from now on */
         }
     }
-    mark_app(app);
+    mark_name(app, name, apps_port_mono_ms() + APPS_VALUES_ALARM_DELAY_MS, true);
+}
+
+void apps_values_record_waits(const char *app, const char *name) {
+    if (app == NULL || name == NULL || strlen(app) > APPS_ID_MAX || strlen(name) > APPS_ALARM_NAME_MAX) {
+        return;
+    }
+    lock();
+    bool noted = false;
+    for (int i = 0; i < s_waits_n && !noted; i++) {
+        noted = strcmp(s_waits[i].app, app) == 0 && strcmp(s_waits[i].name, name) == 0;
+    }
+    bool room = noted || s_waits_n < APPS_ALARMS_MAX;
+    if (!noted && room) {
+        snprintf(s_waits[s_waits_n].app, sizeof s_waits[0].app, "%s", app);
+        snprintf(s_waits[s_waits_n++].name, sizeof s_waits[0].name, "%s", name);
+    }
+    unlock();
+    if (!room) {
+        ESP_LOGW(TAG, "alarm %s/%s: no record until it changes again: too many wait for the budget", app, name);
+    }
+}
+
+void apps_values_forget_records(const char *app) {
+    if (app == NULL || strlen(app) > APPS_ID_MAX) {
+        return;
+    }
+    lock();
+    bool noted = false;
+    for (int i = 0; i < s_forgotten_n && !noted; i++) {
+        noted = strcmp(s_forgotten[i], app) == 0;
+    }
+    if (!noted && s_forgotten_n < APPS_STORE_RECORDS_MAX) {
+        snprintf(s_forgotten[s_forgotten_n++], sizeof s_forgotten[0], "%s", app);
+    } else if (!noted) {
+        s_forgotten_all = true;
+    }
+    unlock();
+}
+
+/* The other tasks' notes: an app the store removed or quarantined has its handed-over records forgotten (#2), before the re-arm can look
+ * at them (once they are taken: a quarantine at the mount comes before); a record the budget couldn't take is synced again once it can
+ * (#1), on its own. */
+static void notes_take(int64_t now_ms) {
+    note_t waits[APPS_ALARMS_MAX];
+    char gone[APPS_STORE_RECORDS_MAX][APPS_ID_MAX + 1];
+    int n_gone = 0;
+    bool gone_all = false;
+    lock();
+    int n_waits = s_waits_n;
+    memcpy(waits, s_waits, (size_t)n_waits * sizeof waits[0]);
+    s_waits_n = 0;
+    if (s_recs_taken) {
+        n_gone = s_forgotten_n;
+        gone_all = s_forgotten_all;
+        memcpy(gone, s_forgotten, (size_t)n_gone * sizeof gone[0]);
+        s_forgotten_n = 0;
+        s_forgotten_all = false;
+    }
+    unlock();
+    for (int i = 0; i < s_recs_n; i++) {
+        bool forgotten = gone_all;
+        for (int k = 0; k < n_gone && !forgotten; k++) {
+            forgotten = strcmp(s_recs[i].r.id, gone[k]) == 0;
+        }
+        if (forgotten) {
+            s_recs[i].state = REC_DONE;  /* the store dropped its records: nothing of the app that was is armed again */
+        }
+    }
+    if (n_waits > 0) {
+        int64_t wait = apps_values_budget_wait_ms(APPS_VALUES_RECORD_COST);
+        int64_t due = now_ms + (wait > APPS_VALUES_ALARM_DELAY_MS ? wait : APPS_VALUES_ALARM_DELAY_MS);
+        for (int i = 0; i < n_waits; i++) {
+            mark_name(waits[i].app, waits[i].name, due, false);
+        }
+    }
 }
 
 /* The handed-over records nothing touched arm again, for the time left (P1): the clock is valid. */
@@ -599,24 +761,47 @@ static void rearm(int64_t now_ms, int64_t epoch_now) {
             return;
         } else {
             h->state = REC_DONE;
-            mark_app(h->r.id);  /* its record goes at the sync: neither kept nor in the table */
+            mark_name(h->r.id, h->r.name, now_ms + APPS_VALUES_ALARM_DELAY_MS, true);  /* not in the table: its record goes at the sync */
             ESP_LOGW(TAG, "store: alarm %s/%s couldn't be armed again (the gadget has no slot for it): dropped", h->r.id, h->r.name);
         }
     }
 }
 
-static bool in_keep(const sync_t *s, const char *name) {
-    for (int i = 0; i < s->n_keep; i++) {
-        if (strcmp(s->keep[i], name) == 0) {
-            return true;
+/* The names synced armed with no clock, which get records when it comes: name's entry added, or dropped (synced with its time, or gone). */
+static void unclocked_note(const char *app, const char *name, bool add) {
+    for (int i = 0; i < s_unclocked_n; i++) {
+        if (strcmp(s_unclocked[i].app, app) == 0 && strcmp(s_unclocked[i].name, name) == 0) {
+            if (!add) {
+                s_unclocked[i] = s_unclocked[--s_unclocked_n];
+            }
+            return;
         }
     }
-    return false;
+    if (add && s_unclocked_n < APPS_ALARMS_MAX) {
+        snprintf(s_unclocked[s_unclocked_n].app, sizeof s_unclocked[0].app, "%s", app);
+        snprintf(s_unclocked[s_unclocked_n++].name, sizeof s_unclocked[0].name, "%s", name);
+    }
 }
 
-/* The marked apps' records, once due: an op each, with what the alarm table has of the app now and the names to keep. */
+/* One name into s, with what the table (info, n_info) has of it now. */
+static void sync_add(sync_t *s, const char *name, const apps_alarm_info_t *info, int n_info, bool clock, int64_t epoch_now) {
+    apps_store_name_t *a = &s->names[s->n++];
+    snprintf(a->name, sizeof a->name, "%s", name);
+    a->state = APPS_STORE_GONE;
+    for (int i = 0; i < n_info; i++) {
+        if (strcmp(info[i].name, name) == 0) {
+            a->state = clock ? APPS_STORE_ARMED : APPS_STORE_ARMED_NO_CLOCK;
+            a->epoch_ms = clock ? epoch_now + info[i].remaining_ms : 0;
+            a->sound = info[i].sound;
+            a->wake = info[i].wake;
+        }
+    }
+}
+
+/* The apps' names that are due, an op for each app with what the alarm table has of them now (or all of it, for all). An app whose names
+ * aren't due yet (a record that waits for the budget) holds no other. */
 static void alarms_tick(int64_t now_ms, bool clock, int64_t epoch_now) {
-    if (s_marked_n == 0 || now_ms < s_marked_due || now_ms < s_marked_retry_at) {
+    if (s_marked_n == 0 || now_ms < s_marked_retry_at) {
         return;
     }
     apps_storage_t mode = apps_store_mode();
@@ -624,50 +809,39 @@ static void alarms_tick(int64_t now_ms, bool clock, int64_t epoch_now) {
         return;  /* the mount hasn't run: they wait for it */
     }
     if (mode == APPS_STORAGE_RAM) {
-        s_marked_n = 0;  /* nothing outlives a reset in RAM mode */
+        s_marked_n = s_unclocked_n = 0;  /* nothing outlives a reset in RAM mode */
         return;
     }
-    while (s_marked_n > 0) {
-        const char *app = s_marked[s_marked_n - 1];
+    for (int i = 0; i < s_marked_n;) {
+        marked_t *m = &s_marked[i];
+        bool all = m->all && m->all_due <= now_ms;
+        int due = 0;
+        for (int k = 0; k < m->n; k++) {
+            due += m->names[k].due <= now_ms ? 1 : 0;
+        }
+        if (!all && due == 0) {
+            i++;
+            continue;
+        }
         sync_t *s = apps_port_realloc(NULL, sizeof *s);
         if (s == NULL) {
             s_marked_retry_at = now_ms + APPS_VALUES_RETRY_MS;
             return;
         }
         memset(s, 0, sizeof *s);
-        snprintf(s->app, sizeof s->app, "%s", app);
-        for (int i = 0; i < s_recs_n && s->n_keep < APPS_STORE_RECORDS_MAX; i++) {
-            if (s_recs[i].state != REC_DONE && strcmp(s_recs[i].r.id, app) == 0) {
-                memcpy(s->keep[s->n_keep++], s_recs[i].r.name, sizeof s->keep[0]);  /* the same size, NUL within */
-            }
-        }
+        snprintf(s->app, sizeof s->app, "%s", m->app);
+        s->all = all;
         apps_alarm_info_t info[APPS_ALARMS_PER_APP];
-        int n = apps_alarm_list_info(app, info);
-        for (int i = 0; i < n; i++) {
-            if (in_keep(s, info[i].name)) {
-                continue;  /* armed again from its record, which holds it already */
+        int n_info = apps_alarm_list_info(m->app, info);
+        if (all) {
+            for (int k = 0; k < n_info; k++) {
+                sync_add(s, info[k].name, info, n_info, clock, epoch_now);  /* the rest of the app's records go */
             }
-            apps_store_alarm_t *a = &s->alarms[s->n++];
-            memcpy(a->name, info[i].name, strnlen(info[i].name, sizeof a->name - 1));  /* its NUL: the memset's */
-            a->epoch_ms = clock ? epoch_now + info[i].remaining_ms : 0;
-            a->sound = info[i].sound;
-            a->wake = info[i].wake;
-        }
-        s->epochs = clock;
-        uint32_t cost = clock ? (uint32_t)s->n * APPS_VALUES_RECORD_COST : 0;
-        int64_t wait = cost > 0 ? apps_values_budget_wait_ms(cost) : 0;
-        if (wait > 0) {
-            apps_port_free(s);
-            s_marked_retry_at = now_ms + wait;  /* P3: the records wait for the budget, as values do */
-            return;
-        }
-        if (!clock && s->n > 0) {
-            bool listed = false;
-            for (int i = 0; i < s_unclocked_n && !listed; i++) {
-                listed = strcmp(s_unclocked[i], app) == 0;
-            }
-            if (!listed && s_unclocked_n < MARKED_MAX) {
-                snprintf(s_unclocked[s_unclocked_n++], sizeof s_unclocked[0], "%s", app);
+        } else {
+            for (int k = 0; k < m->n; k++) {
+                if (m->names[k].due <= now_ms) {
+                    sync_add(s, m->names[k].name, info, n_info, clock, epoch_now);
+                }
             }
         }
         if (!apps_io_submit_op(sync_op, s)) {
@@ -675,20 +849,44 @@ static void alarms_tick(int64_t now_ms, bool clock, int64_t epoch_now) {
             s_marked_retry_at = now_ms + APPS_VALUES_RETRY_MS;  /* the worker can't now (it said why) */
             return;
         }
-        s_marked_n--;
+        if (all) {
+            for (int k = s_unclocked_n - 1; k >= 0; k--) {
+                if (strcmp(s_unclocked[k].app, m->app) == 0) {
+                    s_unclocked[k] = s_unclocked[--s_unclocked_n];  /* their records went, or are in the op */
+                }
+            }
+        }
+        for (int k = 0; k < s->n; k++) {
+            unclocked_note(m->app, s->names[k].name, s->names[k].state == APPS_STORE_ARMED_NO_CLOCK);
+        }
+        if (all) {
+            m->all = false;
+            m->n = 0;
+        } else {
+            for (int k = m->n - 1; k >= 0; k--) {
+                if (m->names[k].due <= now_ms) {
+                    m->names[k] = m->names[--m->n];
+                }
+            }
+        }
+        if (!m->all && m->n == 0) {
+            *m = s_marked[--s_marked_n];  /* its place has another app now, looked at next */
+        } else {
+            i++;
+        }
     }
 }
 
-/* The records' share of a round: the mount's records taken, the clock's coming (the apps synced without it are marked), the re-arm, and
- * the syncs that are due. */
+/* The records' share of a round: the mount's records taken, the other tasks' notes, the clock's coming (the names synced without it are
+ * synced again), the re-arm, and the syncs that are due. */
 static void records_tick(int64_t now_ms) {
     records_take();
+    notes_take(now_ms);
     int64_t epoch_now = 0;
     bool clock = apps_port_epoch_ms(&epoch_now);
-    if (clock && !s_clock_seen) {
-        s_clock_seen = true;
+    if (clock && s_unclocked_n > 0) {
         for (int i = 0; i < s_unclocked_n; i++) {
-            mark_app(s_unclocked[i]);  /* their alarms were armed with no clock: they get records now */
+            mark_name(s_unclocked[i].app, s_unclocked[i].name, now_ms + APPS_VALUES_ALARM_DELAY_MS, true);  /* armed with no clock: records now */
         }
         s_unclocked_n = 0;
     }
@@ -709,13 +907,13 @@ void apps_values_tick(int64_t now_ms) {
         if (n == NULL) {
             continue;
         }
-        if (flash && !n->paid) {
-            if (!apps_values_budget_take(node_cost(n), false)) {
-                continue;  /* it waits for the budget */
-            }
-            n->paid = true;
+        if (!charge(n, flash)) {
+            n->held = true;  /* it waits for the budget */
+            continue;
         }
+        n->held = false;
         if (!apps_io_submit_op(store_put_op, n)) {
+            refund(n, flash);
             s_retry_at = now_ms + APPS_VALUES_RETRY_MS;  /* the worker still can't: the same again, a little later (it said why in its log line) */
             return;
         }

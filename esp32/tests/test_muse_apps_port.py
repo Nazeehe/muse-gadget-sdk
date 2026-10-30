@@ -172,7 +172,7 @@ class AppPortTest(unittest.TestCase):
     def test_a_small_value_is_never_held_back(self):  # P3
         self.run_case("a_small_value_is_never_held_back")
 
-    def test_untouched_records_wait_for_the_clock(self):  # P1: kept, then armed again for the time left
+    def test_untouched_records_wait_for_the_clock(self):  # P1: never in a sync, then armed again for the time left
         self.run_case("untouched_records_wait_for_the_clock")
 
     def test_a_touched_name_is_not_armed_again(self):  # P1: the app's choice wins; its new deadline once the clock comes
@@ -181,10 +181,21 @@ class AppPortTest(unittest.TestCase):
     def test_a_rearm_retries_drops_and_clamps(self):  # P1: no memory, no slot, the week, a due one, a removed app
         self.run_case("rearm_retries_drops_and_clamps")
 
-    def test_the_values_tables_are_in_psram(self):  # the gadget's internal RAM is what the I/O worker's stack is made from
+    # ---- Task 20's fix round 2 ----
+
+    def test_a_record_that_waits_for_the_budget_holds_no_other_sync(self):  # #1: handed over at once; drops never wait
+        self.run_case("a_record_that_waits_for_the_budget_holds_no_other_sync")
+
+    def test_a_removed_apps_records_are_not_armed_again(self):  # #2: forgotten at the next round, before the re-arm looks
+        self.run_case("a_removed_apps_records_are_not_armed_again")
+
+    def test_a_refused_save_is_charged_once(self):  # #4: charged when handed over, refunded on a refusal
+        self.run_case("a_refused_save_is_charged_once")
+
+    def test_the_values_tables_are_in_psram(self):  # the gadget's internal RAM is the Link's
         source = (APPS / "apps_values.c").read_text()
         self.assertIn('#include "esp_attr.h"', source)
-        for name in ("s_failing", "s_failed", "s_slow", "s_slow_new", "s_marked", "s_recs", "s_unclocked"):
+        for name in ("s_failing", "s_failed", "s_slow", "s_slow_new", "s_marked", "s_recs", "s_unclocked", "s_waits", "s_forgotten"):
             with self.subTest(name):
                 self.assertRegex(source, rf"(?m)^static EXT_RAM_BSS_ATTR [^\n]*\b{name}\[", f"{name}: plain memory of tasks, PSRAM")
         for name in ("s_lock_buf", "s_lock"):

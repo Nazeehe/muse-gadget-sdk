@@ -456,14 +456,15 @@ void heap_caps_free(void *ptr) {
     free(b);
 }
 
-/* What heap_caps_get_free_size says of internal RAM (apps_io_submit's admission): a case can make it short. */
+/* What heap_caps_get_free_size says of internal RAM: a case can make it short, which apps_io_submit doesn't ask about (R1: the
+ * worker's stack is in PSRAM). */
 static atomic_size_t internal_free = 200u * 1024;
 
 size_t heap_caps_get_free_size(uint32_t caps) {
     return (caps & MALLOC_CAP_INTERNAL) != 0 ? atomic_load(&internal_free) : 4u * 1024 * 1024;
 }
 
-/* And its largest free block (the admission of a new worker, P1): a case can fragment it. */
+/* And its largest free block: a case can fragment it, which apps_io_submit doesn't ask about either. */
 static atomic_size_t internal_largest = 200u * 1024;
 
 size_t heap_caps_get_largest_free_block(uint32_t caps) {
@@ -656,6 +657,9 @@ static void wait_print_blocked_at(int line) {
 
 /* When the I/O worker said it goes, and when its last job ended: both on the worker's own thread (T7). */
 static _Atomic int64_t io_idle_ms, io_job_end_ms;
+/* A case can hold the next worker that says it goes in that line (after it gave the worker's lock up, before it suspends itself), until it
+ * lets it go. */
+static atomic_bool hold_idle_line, idle_line_released;
 
 void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
     char msg[400];
@@ -668,6 +672,12 @@ void fake_esp_log(char level, const char *tag, const char *fmt, ...) {
     }
     if (strncmp(msg, "io: idle", 8) == 0) {
         atomic_store(&io_idle_ms, real_ms());
+        if (atomic_exchange(&hold_idle_line, false)) {
+            event("io idle line held");
+            while (!atomic_load(&idle_line_released)) {
+                sleep_ms(1);
+            }
+        }
     }
     if (fake_esp_timer_on_task()) {
         error("a log line from the esp_timer task, which serves every timer of the gadget and never waits for the console: %s", msg);
@@ -759,6 +769,7 @@ struct fake_task {
     void *arg;
     char name[24];
     UBaseType_t priority;
+    bool suspended, deleted;  /* under tasks_mu: the I/O worker's park (vTaskSuspend), and its end (vTaskDeleteWithCaps) */
 };
 
 static struct fake_task app_tasks[16];  /* the app task, then each I/O worker made */
@@ -766,6 +777,9 @@ static int n_app_tasks;
 static _Thread_local struct fake_task thread_task;  /* what a thread of the harness is to FreeRTOS */
 static _Thread_local struct fake_task *current_task;
 static pthread_mutex_t tasks_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t tasks_cv = PTHREAD_COND_INITIALIZER;  /* a parked task's wait for its end */
+static atomic_int io_workers_running;  /* I/O workers made and not parked yet */
+static atomic_bool worker_create_fails;  /* no memory for a new I/O worker: its creation fails, as xTaskCreatePinnedToCoreWithCaps does */
 static _Atomic(TickType_t) longest_receive;  /* the longest wait the app task asked of xQueueReceive */
 static _Atomic(TickType_t) last_receive;     /* and the last: what its loop is waiting for now */
 static atomic_uint zero_receives;            /* how many times it asked for no wait at all: it never blocked then */
@@ -810,34 +824,74 @@ static BaseType_t make_task(TaskFunction_t code, const char *name, void *arg, UB
     return rc == 0 ? pdPASS : pdFAIL;
 }
 
+/* The app task's, and the I/O worker's (each with its stack in PSRAM). A case can have the worker's fail (worker_create_fails): no memory for
+ * its stack or its TCB. */
 BaseType_t xTaskCreatePinnedToCoreWithCaps(TaskFunction_t code, const char *const name, const uint32_t stack, void *const arg,
                                            UBaseType_t priority, TaskHandle_t *const created, const BaseType_t core,
                                            UBaseType_t caps) {
+    bool worker = strcmp(name, "muse_apps_io") == 0;
+    if (worker && atomic_load(&worker_create_fails)) {
+        event("task %s: no memory", name);
+        return pdFAIL;
+    }
     event("task %s stack %u priority %u core %d caps 0x%x", name, (unsigned)stack, priority, core, caps);
-    return make_task(code, name, arg, priority, created);
+    if (worker) {
+        atomic_fetch_add(&io_workers_running, 1);
+    }
+    BaseType_t made = make_task(code, name, arg, priority, created);
+    if (worker && made != pdPASS) {
+        atomic_fetch_sub(&io_workers_running, 1);
+    }
+    return made;
 }
 
-/* The I/O worker's: its stack in internal RAM, on either core. */
-BaseType_t xTaskCreatePinnedToCore(TaskFunction_t code, const char *const name, const uint32_t stack, void *const arg,
-                                   UBaseType_t priority, TaskHandle_t *const created, const BaseType_t core) {
-    char where[16];
-    snprintf(where, sizeof where, core == tskNO_AFFINITY ? "any" : "%d", (int)core);
-    event("task %s stack %u priority %u core %s internal", name, (unsigned)stack, priority, where);
-    return make_task(code, name, arg, priority, created);
-}
-
-/* Only a task's own end (vTaskDelete(NULL)), as the I/O worker's. */
-void vTaskDelete(TaskHandle_t task) {
-    if (task != NULL && task != current_task) {
-        error("vTaskDelete of another task");
+/* Only a task's own suspension (vTaskSuspend(NULL)): the I/O worker's park. Its thread waits there until another task deletes it, and
+ * ends. */
+void vTaskSuspend(TaskHandle_t task) {
+    struct fake_task *self = current_task;
+    if (task != NULL || self == NULL) {
+        error("vTaskSuspend of another task, or from a thread that isn't a task");
         return;
     }
-    if (current_task == NULL) {
-        error("vTaskDelete(NULL) from a thread that isn't a task");
-        return;
+    pthread_mutex_lock(&tasks_mu);
+    self->suspended = true;
+    pthread_mutex_unlock(&tasks_mu);
+    if (strcmp(self->name, "muse_apps_io") == 0) {
+        atomic_fetch_sub(&io_workers_running, 1);
     }
-    event("task %s deleted", current_task->name);
+    event("task %s parked", self->name);
+    pthread_mutex_lock(&tasks_mu);
+    while (!self->deleted) {
+        pthread_cond_wait(&tasks_cv, &tasks_mu);
+    }
+    pthread_mutex_unlock(&tasks_mu);
     pthread_exit(NULL);
+}
+
+eTaskState eTaskGetState(TaskHandle_t task) {
+    pthread_mutex_lock(&tasks_mu);
+    eTaskState state = task->deleted ? eDeleted : task->suspended ? eSuspended : task == current_task ? eRunning : eReady;
+    pthread_mutex_unlock(&tasks_mu);
+    return state;
+}
+
+/* Another task's end, once it has suspended itself (the I/O worker that parked, deleted by the task that makes the next): never the
+ * caller's own (IDF would make a task in internal RAM for that, and abort without one), never a task that runs. */
+void vTaskDeleteWithCaps(TaskHandle_t task) {
+    if (task == NULL || task == current_task) {
+        error("vTaskDeleteWithCaps of the calling task itself");
+        return;
+    }
+    pthread_mutex_lock(&tasks_mu);
+    bool parked = task->suspended && !task->deleted;
+    task->deleted = task->deleted || parked;
+    pthread_cond_broadcast(&tasks_cv);
+    pthread_mutex_unlock(&tasks_mu);
+    if (!parked) {
+        error("vTaskDeleteWithCaps of a task that hasn't suspended itself");
+        return;
+    }
+    event("task %s deleted", task->name);
 }
 
 TaskHandle_t xTaskGetCurrentTaskHandle(void) {
@@ -924,29 +978,23 @@ char *apps_store_load_values(const char *id, size_t *len) {
     return json;
 }
 
-/* A sync of the records, as an event: "records <id> <n>", each alarm as <name>@<when>/<s|-><w|-> (when: ms from the worker's now, or - with
- * no clock), the names kept as they are ("keep a,b" or "keep -"), and "epochs" or "no clock". */
-void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n, const char (*keep)[APPS_ALARM_NAME_MAX + 1], int n_keep,
-                            bool epochs) {
+/* A sync of the records, as an event: "records <id> <n>", each name the app touched as <name>@<when>/<s|-><w|-> (armed; when: ms from the
+ * worker's now), <name>@- (armed with no clock) or <name>:gone, and " all" when every other record of the app goes too. */
+void apps_store_sync_alarms(const char *id, const apps_store_name_t *names, int n, bool all) {
     char text[480];
     size_t used = (size_t)snprintf(text, sizeof text, "records %s %d", id, n);
     int64_t now = WALL_BASE_MS + apps_port_mono_ms();
     for (int i = 0; i < n && used < sizeof text; i++) {
-        char when[24] = "-";
-        if (epochs) {
-            snprintf(when, sizeof when, "%lld", (long long)(alarms[i].epoch_ms - now));
+        const apps_store_name_t *a = &names[i];
+        if (a->state == APPS_STORE_ARMED) {
+            used += (size_t)snprintf(text + used, sizeof text - used, " %s@%lld/%c%c", a->name, (long long)(a->epoch_ms - now),
+                                     a->sound ? 's' : '-', a->wake ? 'w' : '-');
+        } else {
+            used += (size_t)snprintf(text + used, sizeof text - used, a->state == APPS_STORE_GONE ? " %s:gone" : " %s@-", a->name);
         }
-        used += (size_t)snprintf(text + used, sizeof text - used, " %s@%s/%c%c", alarms[i].name, when, alarms[i].sound ? 's' : '-',
-                                 alarms[i].wake ? 'w' : '-');
     }
-    for (int i = 0; i < n_keep && used < sizeof text; i++) {
-        used += (size_t)snprintf(text + used, sizeof text - used, "%s%s", i == 0 ? " keep " : ",", keep[i]);
-    }
-    if (n_keep == 0 && used < sizeof text) {
-        used += (size_t)snprintf(text + used, sizeof text - used, " keep -");
-    }
-    if (used < sizeof text) {
-        snprintf(text + used, sizeof text - used, epochs ? " epochs" : " no clock");
+    if (all && used < sizeof text) {
+        snprintf(text + used, sizeof text - used, " all");
     }
     event("%s", text);
 }
@@ -4133,7 +4181,20 @@ static void hold_the_worker(void) {
     }
 }
 
-/* apps_io: one worker, made when a job comes, runs the jobs in order and goes after 2 s without one. */
+/* No worker can be made (no memory for its stack or its TCB: worker_create_fails), and none runs: each one that ran has parked. Every submit
+ * is refused, with NO_TASK_LINE, until the case says otherwise. */
+#define NO_TASK_LINE "log W io: no memory for the worker: job refused"
+
+static void no_worker_can_be_made(void) {
+    atomic_store(&worker_create_fails, true);
+    for (int64_t until = real_ms() + 5000; atomic_load(&io_workers_running) > 0;) {
+        CHECK(real_ms() < until, "a worker never parked");
+        sleep_ms(5);
+    }
+}
+
+/* apps_io: one worker, made when a job comes, runs the jobs in order and parks after 2 s without one; the next job's submit deletes it before
+ * it makes the next worker. */
 static void io_runs_jobs_in_order(void) {
     int from = mark();
     CHECK(apps_io_submit(io_job, "one") && apps_io_submit(io_job, "chain") && apps_io_submit(io_job, "three"), "submit");
@@ -4142,18 +4203,20 @@ static void io_runs_jobs_in_order(void) {
     ORDERED(from, "job chain on", "job three on");
     ORDERED(from, "job three on", "job chained on");
     CHECK(count_from(from, "task muse_apps_io") == 1 &&
-              at_from(from, "task muse_apps_io stack 6144 priority 3 core 0 internal") >= 0,
-          "one worker: 6 KB of internal RAM, priority 3, on core 0 (F4: never in front of the app task or LVGL)");
-    WAIT(from, "log I io: idle, stack 3000 of 6144 free");
+              at_from(from, "task muse_apps_io stack 8192 priority 3 core 0 caps 0x404") >= 0,
+          "one worker: 8 KB of PSRAM for its stack (R1), priority 3, on core 0 (F4: never in front of the app task or LVGL)");
+    WAIT(from, "log I io: idle, stack 3000 of 8192 free");
     /* Measured on the worker's own thread: from its last job's end to its going (T7). */
     int64_t idle = atomic_load(&io_idle_ms) - atomic_load(&io_job_end_ms);
     CHECK(idle >= APPS_IO_IDLE_MS - 100, "it went after %lld ms without a job, not once idle for %d ms", (long long)idle,
           APPS_IO_IDLE_MS);
-    WAIT(from, "task muse_apps_io deleted");
+    WAIT(from, "task muse_apps_io parked");
+    CHECK(count_from(from, "task muse_apps_io deleted") == 0, "parked, not deleted: nothing has deleted it yet");
     int again = mark();
     CHECK(apps_io_submit(io_job, "four"), "submit four");
     WAIT(again, "job four on muse_apps_io");
     CHECK(count_from(again, "task muse_apps_io stack") == 1, "a new worker for it");
+    ORDERED(again, "task muse_apps_io deleted", "task muse_apps_io stack");  /* the parked one's stack and TCB go first */
 }
 
 /* T3: a job submitted after the worker's 2 s wait ran out, but before it decided to go, is run by that worker: it looks
@@ -4172,20 +4235,20 @@ static void io_takes_a_job_that_came_as_it_timed_out(void) {
           count_from(from, "task muse_apps_io stack"));
     WAIT(from, "log I io: idle");
     ORDERED(from, "job late on", "log I io: idle");
-    WAIT(from, "task muse_apps_io deleted");
-    CHECK(count_from(from, "task muse_apps_io deleted") == 1, "one worker went");
+    WAIT(from, "task muse_apps_io parked");
+    CHECK(count_from(from, "task muse_apps_io parked") == 1, "one worker went");
 }
 
-/* Admission: internal RAM short of the worker's stack and 16 KB, or APPS_IO_JOBS jobs waiting, refuse a job, which
- * never runs. */
-static void io_refuses_when_short(void) {
+/* Admission: with no worker and none that can be made (no memory for its stack in PSRAM or its TCB), or with APPS_IO_JOBS jobs waiting, a job
+ * is refused, never runs, and one line says why. */
+static void io_refuses_when_full_or_unmade(void) {
     int from = mark();
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
-    CHECK(!apps_io_submit(io_job, "short"), "refused without the room");
-    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM);
-    CHECK(apps_io_submit(io_job, "enough"), "taken with just the room");
-    WAIT(from, "job enough on muse_apps_io");
+    atomic_store(&worker_create_fails, true);
+    CHECK(!apps_io_submit(io_job, "unmade"), "refused when no worker can be made");
+    WAIT(from, NO_TASK_LINE);
+    atomic_store(&worker_create_fails, false);
+    CHECK(apps_io_submit(io_job, "made"), "taken once one can be made");
+    WAIT(from, "job made on muse_apps_io");
     atomic_store(&io_hold, true);
     CHECK(apps_io_submit(io_job, "hold"), "submit hold");
     for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
@@ -4203,39 +4266,54 @@ static void io_refuses_when_short(void) {
         CHECK(real_ms() < until, "the waiting jobs never ran");
         sleep_ms(1);
     }
-    ABSENT(from, "job short");
+    ABSENT(from, "job unmade");
     ABSENT(from, "job over");
-    atomic_store(&internal_free, 200u * 1024);
 }
 
-/* P1: a new worker's stack, its TCB and APPS_IO_BLOCK_MARGIN must fit in the largest free internal block. With internal
- * RAM enough in all but no block that big, a job is refused, never runs, and no worker is made. A worker that runs
- * already needs no new block, so a job for it is taken. */
-static void io_refuses_when_fragmented(void) {
-    const size_t need = APPS_IO_STACK + sizeof(StaticTask_t) + APPS_IO_BLOCK_MARGIN;
-    CHECK(need == 7268, "the board's sum, with the S3's 100-byte TCB: %zu", need);
-    char want[160];
+/* A worker on its way to park (it has said it goes, and may hold the log's lock as it does, but hasn't suspended itself) is never deleted: a
+ * submit then makes a new worker beside it, and the new one deletes it once it has suspended itself, as the new one goes idle in turn. (The
+ * fake's vTaskDeleteWithCaps fails the case for a task that hasn't suspended itself.) */
+static void a_worker_on_its_way_to_park_is_never_deleted(void) {
+    atomic_store(&idle_line_released, false);
+    atomic_store(&hold_idle_line, true);
     int from = mark();
-    atomic_store(&internal_largest, need - 1);
-    CHECK(!apps_io_submit(io_job, "fragmented"), "refused without a block for the worker");
-    snprintf(want, sizeof want, "log W io: the largest free internal block is %zu bytes, %zu needed: job refused",
-             need - 1, need);
-    WAIT(from, want);
-    CHECK(count_from(from, "task muse_apps_io") == 0, "no worker was made");
-    atomic_store(&internal_largest, need);
-    CHECK(apps_io_submit(io_job, "fits"), "taken with just the block");
-    WAIT(from, "job fits on muse_apps_io");
-    atomic_store(&io_hold, true);
-    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
-    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
-        CHECK(real_ms() < until, "the job never ran");
-        sleep_ms(1);
-    }
+    CHECK(apps_io_submit(io_job, "one"), "a worker, made by a job");
+    WAIT(from, "job one on muse_apps_io");
+    WAIT(from, "io idle line held");  /* it has said it goes: parked in name, not suspended */
+    int again = mark();
+    CHECK(apps_io_submit(io_job, "two"), "a job while it is on its way");
+    WAIT(again, "job two on muse_apps_io");
+    CHECK(count_from(again, "task muse_apps_io stack") == 1 && count_from(again, "task muse_apps_io deleted") == 0,
+          "a new worker beside it, the first not deleted: %d made, %d deleted", count_from(again, "task muse_apps_io stack"),
+          count_from(again, "task muse_apps_io deleted"));
+    atomic_store(&idle_line_released, true);
+    int first = wait_event_at(__LINE__, again, "task muse_apps_io parked", 5000);  /* the first suspends itself */
+    int deleted = wait_event_at(__LINE__, again, "task muse_apps_io deleted", 5000);  /* the second, idle 2 s on, deletes it */
+    int second = wait_event_at(__LINE__, first + 1, "task muse_apps_io parked", 5000);  /* and parks */
+    CHECK(first < deleted && deleted < second, "parked, deleted, parked: %d, %d, %d", first, deleted, second);
+    CHECK(count_from(again, "task muse_apps_io deleted") == 1, "one deleted: %d", count_from(again, "task muse_apps_io deleted"));
+}
+
+/* R1: the worker's stack is in PSRAM (8 KB, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT: 0x404), so internal RAM decides nothing: with 1 KB of it
+ * free, in a block of 1 KB, a job is taken and a worker made for it. Its end takes none either: it parks, and the next submit deletes it (IDF's
+ * vTaskDeleteWithCaps, from another task: no cleanup task in internal RAM) before it makes the next worker. */
+static void io_takes_jobs_whatever_internal_ram_says(void) {
+    atomic_store(&internal_free, 1024);
     atomic_store(&internal_largest, 1024);
-    CHECK(apps_io_submit(io_job, "behind"), "a job for the worker that runs is taken");
-    atomic_store(&io_hold, false);
-    WAIT(from, "job behind on muse_apps_io");
-    ABSENT(from, "job fragmented");
+    int from = mark();
+    CHECK(apps_io_submit(io_job, "low"), "taken with 1 KB of internal RAM free");
+    WAIT(from, "job low on muse_apps_io");
+    CHECK(at_from(from, "task muse_apps_io stack 8192 priority 3 core 0 caps 0x404") >= 0, "a worker with its 8 KB stack in PSRAM");
+    WAIT(from, "task muse_apps_io parked");
+    int again = mark();
+    CHECK(apps_io_submit(io_job, "next"), "the next job, with 1 KB free still");
+    WAIT(again, "job next on muse_apps_io");
+    ORDERED(again, "task muse_apps_io deleted", "task muse_apps_io stack 8192 priority 3 core 0 caps 0x404");
+    CHECK(count_from(again, "task muse_apps_io deleted") == 1 && count_from(again, "task muse_apps_io stack") == 1,
+          "the parked worker deleted, then one made: %d deleted, %d made", count_from(again, "task muse_apps_io deleted"),
+          count_from(again, "task muse_apps_io stack"));
+    ABSENT(from, "log W io:");
+    atomic_store(&internal_free, 200u * 1024);
     atomic_store(&internal_largest, 200u * 1024);
 }
 
@@ -4582,14 +4660,12 @@ static void sys_exit_saves_the_store(void) {
     clock_go();
 }
 
-/* The worker is gone (it goes after 2 s without a job or an op), and the gadget has no room for a new one: what the store asks of it is refused
- * until memory is back. The run that began this made one for its load. */
+/* The worker has parked (it goes after 2 s without a job or an op), and the gadget has no memory for a new one: what the store asks of the
+ * worker is refused until memory is back. The run that began this made one for its load. */
 static void no_worker_and_no_room_to_make_one(int from) {
-    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    wait_event_at(__LINE__, from, "task muse_apps_io parked", 5000);
+    no_worker_can_be_made();
 }
-
-#define NO_ROOM_LINE "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused"
 
 /* A save the worker refuses isn't lost: the port keeps it in PSRAM, takes it as saved (the runtime has nothing to ask again), and offers it
  * again every APPS_VALUES_RETRY_MS, no oftener (a retry with no period would write a line at every round); the worker has it once it can. */
@@ -4603,21 +4679,21 @@ static void a_save_the_worker_refuses_is_kept_and_offered_every_two_seconds(void
     clock_jump(2000);  /* start()'s change is due */
     ROUNDS();
     WAIT(from, "store save queued stored {");  /* the port has it */
-    CHECK(count_from(from, NO_ROOM_LINE) == 1, "offered once: %d", count_from(from, NO_ROOM_LINE));
+    CHECK(count_from(from, NO_TASK_LINE) == 1, "offered once: %d", count_from(from, NO_TASK_LINE));
     CHECK(store_pending_count() == 1, "kept: %d waiting", store_pending_count());
     for (int i = 0; i < 5; i++) {
         FIFO_SYNC();
     }
-    CHECK(count_from(from, NO_ROOM_LINE) == 1, "not again before the next tick: %d", count_from(from, NO_ROOM_LINE));
+    CHECK(count_from(from, NO_TASK_LINE) == 1, "not again before the next tick: %d", count_from(from, NO_TASK_LINE));
     clock_jump(1999);
     ROUNDS();
-    CHECK(count_from(from, NO_ROOM_LINE) == 1, "not 1999 ms on: %d", count_from(from, NO_ROOM_LINE));
+    CHECK(count_from(from, NO_TASK_LINE) == 1, "not 1999 ms on: %d", count_from(from, NO_TASK_LINE));
     clock_jump(1);
     ROUNDS();
-    CHECK(count_from(from, NO_ROOM_LINE) == 2, "again 2 s after: %d", count_from(from, NO_ROOM_LINE));
+    CHECK(count_from(from, NO_TASK_LINE) == 2, "again 2 s after: %d", count_from(from, NO_TASK_LINE));
     CHECK(store_pending_count() == 1, "still kept");
     ABSENT(from, "print stored store: the last changes");
-    atomic_store(&internal_free, 200u * 1024);
+    atomic_store(&worker_create_fails, false);
     clock_jump(2000);
     ROUNDS();
     EXPECT_STORED("\"runs\":1");  /* the worker has it, once there is one */
@@ -4644,7 +4720,7 @@ static void a_final_save_the_worker_refuses_is_kept_and_a_restart_reads_it(void)
     WAIT(from, "print stored runs 1");  /* the first run's count: read from what is kept */
     ABSENT(from, "store load failed");
     CHECK(store_pending_count() == 1, "still kept: the restart only read it");
-    atomic_store(&internal_free, 200u * 1024);
+    atomic_store(&worker_create_fails, false);
     CHECK(stop_app(err, sizeof err), "stop: %s", err);  /* runs is 2 now: this save replaces the kept one, and the worker takes it */
     CHECK(store_pending_count() == 0, "the newer save went to the worker: %d kept", store_pending_count());
     EXPECT_STORED("\"runs\":2");
@@ -4875,51 +4951,36 @@ static void io_ops_are_bounded(void) {
 static void io_op_with_no_worker_and_no_room_is_refused(void) {
     apps_io_register_op_task();  /* this thread is the one that submits ops (apps_io.h) */
     int from = mark();
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
-    CHECK(!apps_io_submit_op(io_op, "short"), "refused when no worker can be made");
-    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
-    atomic_store(&internal_free, 200u * 1024);
-    CHECK(apps_io_submit_op(io_op, "enough"), "taken with the room");
-    WAIT(from, "op enough on muse_apps_io");
-    ABSENT(from, "op short");
+    atomic_store(&worker_create_fails, true);
+    CHECK(!apps_io_submit_op(io_op, "unmade"), "refused when no worker can be made");
+    WAIT(from, NO_TASK_LINE);
+    atomic_store(&worker_create_fails, false);
+    CHECK(apps_io_submit_op(io_op, "made"), "taken once one can be made");
+    WAIT(from, "op made on muse_apps_io");
+    ABSENT(from, "op unmade");
 }
 
-/* With a worker that runs, an op is queued even when the nudge that would wake it is refused: the worker looks at the ops when its job ends. */
+/* With a worker that runs, an op is queued even when the nudge that would wake it is refused (its queue is full): the worker looks at the ops
+ * when its job ends, before the jobs that wait. (A worker that waits for a job has room in its queue, so its nudge is never refused.) */
 static void io_op_for_a_worker_that_runs_waits_for_its_job(void) {
     apps_io_register_op_task();  /* this thread is the one that submits ops (apps_io.h) */
-    atomic_store(&io_held, false);
-    atomic_store(&io_hold, true);
-    CHECK(apps_io_submit(io_job, "hold"), "submit hold");
-    for (int64_t until = real_ms() + 5000; !atomic_load(&io_held);) {
-        CHECK(real_ms() < until, "the job never ran");
-        sleep_ms(1);
+    hold_the_worker();
+    for (int i = 0; i < APPS_IO_JOBS; i++) {
+        CHECK(apps_io_submit(io_job, "queued"), "job %d of %d waiting", i + 1, APPS_IO_JOBS);
     }
     int from = mark();
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
     CHECK(apps_io_submit_op(io_op, "late"), "taken: the worker is there and will look");
-    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
-    atomic_store(&internal_free, 200u * 1024);
+    WAIT(from, "log W io: 8 jobs wait already: job refused");
     atomic_store(&io_hold, false);
     int64_t released = real_ms();
     WAIT(from, "op late on muse_apps_io");
     CHECK(real_ms() - released < 500, "the op ran %lld ms after the job ended: as it ended, not at the worker's idle look 2 s on",
           (long long)(real_ms() - released));
-}
-
-/* An idle worker, whose nudge was refused, looks at the ops when its wait for a job runs out, and doesn't go before it has run them. */
-static void io_op_for_an_idle_worker_runs_at_the_end_of_its_wait(void) {
-    apps_io_register_op_task();  /* this thread is the one that submits ops (apps_io.h) */
-    int from = mark();
-    CHECK(apps_io_submit(io_job, "one"), "a worker, made by a job");
-    WAIT(from, "job one on muse_apps_io");
-    sleep_ms(100);  /* the job is over and the worker waits */
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
-    CHECK(apps_io_submit_op(io_op, "idle"), "taken: the worker is there");
-    atomic_store(&internal_free, 200u * 1024);
-    WAIT(from, "op idle on muse_apps_io");
-    WAIT(from, "log I io: idle");
-    ORDERED(from, "op idle on muse_apps_io", "log I io: idle");
-    CHECK(count_from(from, "task muse_apps_io stack") == 1, "the worker that was there ran it: %d made", count_from(from, "task muse_apps_io stack"));
+    ORDERED(from, "op late on muse_apps_io", "job queued on muse_apps_io");
+    for (int64_t until = real_ms() + 5000; count_from(from, "job queued on") < APPS_IO_JOBS;) {
+        CHECK(real_ms() < until, "the waiting jobs never ran");
+        sleep_ms(1);
+    }
 }
 
 /* Only the app task submits ops (apps_io.h): the ring has one pusher, and the take-back of a refused op relies on it. The registered task's op
@@ -4952,7 +5013,7 @@ static void the_idle_line_of_a_worker_that_ran_only_ops_is_debug(void) {
     CHECK(atomic_load(&store_mounts) == 0, "no worker yet, no mount: %d", atomic_load(&store_mounts));
     CHECK(apps_io_submit_op(io_op, "first"), "an op, with no worker");
     WAIT(from, "op first on muse_apps_io");
-    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+    wait_event_at(__LINE__, from, "task muse_apps_io parked", 5000);
     CHECK(atomic_load(&store_mounts) == 1, "the first worker mounts the store: %d mounts", atomic_load(&store_mounts));
     CHECK(count_from(from, "log I io: idle, stack") == 1 && count_from(from, "log D io: idle") == 0,
           "the idle line of the worker that mounted: %d at info, %d at debug", count_from(from, "log I io: idle, stack"),
@@ -4960,7 +5021,7 @@ static void the_idle_line_of_a_worker_that_ran_only_ops_is_debug(void) {
     from = mark();
     CHECK(apps_io_submit_op(io_op, "only"), "an op, with no worker");
     WAIT(from, "op only on muse_apps_io");
-    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+    wait_event_at(__LINE__, from, "task muse_apps_io parked", 5000);
     CHECK(atomic_load(&store_mounts) == 1, "a worker made again doesn't mount again: %d mounts", atomic_load(&store_mounts));
     CHECK(count_from(from, "log D io: idle, stack") == 1 && count_from(from, "log I io: idle") == 0,
           "the idle line of a worker that ran only ops: %d at debug, %d at info", count_from(from, "log D io: idle, stack"),
@@ -4968,7 +5029,7 @@ static void the_idle_line_of_a_worker_that_ran_only_ops_is_debug(void) {
     from = mark();
     CHECK(apps_io_submit(io_job, "one"), "a job");
     CHECK(apps_io_submit_op(io_op, "with"), "an op");
-    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+    wait_event_at(__LINE__, from, "task muse_apps_io parked", 5000);
     CHECK(count_from(from, "log I io: idle, stack") == 1 && count_from(from, "log D io: idle") == 0,
           "the idle line of a worker that ran a job: %d at info, %d at debug", count_from(from, "log I io: idle, stack"),
           count_from(from, "log D io: idle"));
@@ -4978,13 +5039,13 @@ static void the_idle_line_of_a_worker_that_ran_only_ops_is_debug(void) {
  * no worker, and none that can be made, the load is refused at once and the run fails with a message that says why. */
 static void a_store_that_cannot_be_read_refuses_the_launch(void) {
     char err[300];
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    no_worker_can_be_made();
     int from = mark();
     CHECK(!apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "no app without its values");
     CHECK(strstr(err, "can't read the app's saved values") != NULL, "it says why: '%s'", err);
     ABSENT(from, "print stored runs");
     ABSENT(from, "store load stored");
-    atomic_store(&internal_free, 200u * 1024);
+    atomic_store(&worker_create_fails, false);
     CHECK(apps_task_run(stored_pkg(), false, 0, NULL, err, sizeof err), "run once the memory is back: %s", err);
     WAIT(from, "print stored runs nil");
 }
@@ -5133,9 +5194,10 @@ static void a_full_apps_nvs_is_said_once_a_streak(void) {
     clock_go();
 }
 
-/* The alarms' records follow the alarm table (apps_values.h) where the store is on flash: an arming (the port marks the app, as
- * apps_port_idf.c does) or a firing that is told marks it, and the round APPS_VALUES_ALARM_DELAY_MS after the first mark hands the store
- * what the table has of the app then, as an op of the worker. Where the store is in RAM nothing is handed: nothing outlives a reset there. */
+/* The alarms' records follow the alarm table (apps_values.h) where the store is on flash: an arming (the port says which name, as
+ * apps_port_idf.c does) or a firing that is told touches a name, and the round APPS_VALUES_ALARM_DELAY_MS after the first touch hands the
+ * store the names touched, each with what the table has of it then, as an op of the worker: no other name. Where the store is in RAM nothing
+ * is handed: nothing outlives a reset there. */
 static void the_alarms_records_follow_the_table_on_flash(void) {
     char err[300];
     atomic_store(&store_mode, APPS_STORAGE_FLASH);
@@ -5150,14 +5212,15 @@ static void the_alarms_records_follow_the_table_on_flash(void) {
     clock_jump(1);
     ROUNDS();
     worker_sync();
-    CHECK(count_from(from, "records alarmy 1 t") == 1 && count_from(from, "records") == 1, "t's record, once: %d",
+    CHECK(count_from(from, "records alarmy 1 t@-") == 1 && count_from(from, "records") == 1, "t's record, once (no clock yet): %d",
           count_from(from, "records"));
     from = mark();
     tell_alarmy("arm", "{\"name\":\"u\",\"ms\":60000}");
     clock_jump(APPS_VALUES_ALARM_DELAY_MS);
     ROUNDS();
     worker_sync();
-    CHECK(count_from(from, "records alarmy 2 ") == 1 && count_from(from, "records") == 1, "t's and u's: %d", count_from(from, "records"));
+    CHECK(count_from(from, "records alarmy 1 u@-") == 1 && count_from(from, "records") == 1, "u's alone: t wasn't touched again: %d",
+          count_from(from, "records"));
     from = mark();
     clock_jump(5000 - 2 * APPS_VALUES_ALARM_DELAY_MS);  /* t fires */
     fake_esp_timer_sync();
@@ -5165,7 +5228,7 @@ static void the_alarms_records_follow_the_table_on_flash(void) {
     clock_jump(APPS_VALUES_ALARM_DELAY_MS);
     ROUNDS();
     worker_sync();
-    CHECK(count_from(from, "records alarmy 1 u") == 1 && count_from(from, "records") == 1, "t's record went once it was told: %d",
+    CHECK(count_from(from, "records alarmy 1 t:gone") == 1 && count_from(from, "records") == 1, "t's record went once it was told: %d",
           count_from(from, "records"));
     tell_alarmy("stop", "{}");  /* the ring */
     /* In RAM: the marks go, and nothing is handed, then or later. */
@@ -5208,7 +5271,7 @@ static void the_store_is_mounted_first_and_ticked_every_round(void) {
     CHECK(apps_io_submit_op(mount_seen_op, NULL), "the boot's first op");
     WAIT(from, "op saw the mount");
     CHECK(atomic_load(&mounts_seen_by_op) == 1, "the op ran after the mount: it saw %d mounts", atomic_load(&mounts_seen_by_op));
-    wait_event_at(__LINE__, from, "task muse_apps_io deleted", 5000);
+    wait_event_at(__LINE__, from, "task muse_apps_io parked", 5000);
 }
 
 /* R: a list that comes while the launcher is up is shown, even when the frame that first looks can't have the names (another task holds
@@ -5236,9 +5299,9 @@ static void a_list_change_survives_a_frame_without_the_names(void) {
 }
 
 /* P1 with the real alarm table: the records the mount handed over wait for the clock. The app's own arming of one of their names (start()
- * arms t) makes it the app's: its old record goes at the sync, with no time, and the other's is kept. When the clock comes the untouched
- * record is armed again for the time it has left, t is not, and t gets its new record with its own deadline. The mount runs after the task
- * has started (preboot leaves the store's mode none), as on the gadget. */
+ * arms t) makes it the app's: its old record goes at the sync, with no time, and the other's isn't in the sync at all. When the clock comes the
+ * untouched record is armed again for the time it has left, t is not, and t gets its new record with its own deadline. The mount runs after
+ * the task has started (preboot leaves the store's mode none), as on the gadget. */
 static void handed_over_records_are_armed_again_when_the_clock_comes(void) {
     char err[300];
     clock_stop_at(apps_port_mono_ms());
@@ -5253,8 +5316,8 @@ static void handed_over_records_are_armed_again_when_the_clock_comes(void) {
     clock_jump(APPS_VALUES_ALARM_DELAY_MS);
     ROUNDS();
     worker_sync();
-    CHECK(count_from(from, "records alarmy 1 t@-/sw keep wake no clock") == 1 && count_from(from, "records") == 1,
-          "t synced with no time (its old record goes), wake kept: %d syncs", count_from(from, "records"));
+    CHECK(count_from(from, "records alarmy 1 t@-") == 1 && count_from(from, "records") == 1,
+          "t synced with no time (its old record goes), wake not in it: %d syncs", count_from(from, "records"));
     CHECK(apps_alarm_remaining("alarmy", "wake") == -1, "nothing armed again without the clock");
     from = mark();
     atomic_store(&wall_valid, true);  /* the clock comes */
@@ -5267,8 +5330,8 @@ static void handed_over_records_are_armed_again_when_the_clock_comes(void) {
     clock_jump(APPS_VALUES_ALARM_DELAY_MS);
     ROUNDS();
     worker_sync();
-    CHECK(count_from(from, "records alarmy 1 t@3000/sw keep wake epochs") == 1 && count_from(from, "records") == 1,
-          "t's new record, with its own deadline, wake kept: %d syncs", count_from(from, "records"));
+    CHECK(count_from(from, "records alarmy 1 t@3000/sw") == 1 && count_from(from, "records") == 1,
+          "t's new record, with its own deadline, and t's alone: %d syncs", count_from(from, "records"));
     clock_go();
 }
 
@@ -5294,7 +5357,7 @@ static void a_budget_cut_off_drops_the_records(void) {
     clock_jump(APPS_VALUES_ALARM_DELAY_MS);
     ROUNDS();
     worker_sync();
-    WAIT(from, "records alarmy 1 t@2000/sw keep - epochs");  /* t's record, from the arming */
+    WAIT(from, "records alarmy 1 t@2000/sw");  /* t's record, from the arming */
     from = mark();
     clock_jump(2000);  /* t's 7th firing in the minute: the budget cancels it */
     fake_esp_timer_sync();
@@ -5302,7 +5365,7 @@ static void a_budget_cut_off_drops_the_records(void) {
     clock_jump(APPS_VALUES_ALARM_DELAY_MS);
     ROUNDS();
     worker_sync();
-    CHECK(count_from(from, "records alarmy 0 keep - epochs") == 1, "the records go, from the cut-off alone: %d",
+    CHECK(count_from(from, "records alarmy 0 all") == 1, "every record of the app goes, from the cut-off alone: %d",
           count_from(from, "records alarmy 0"));
     ABSENT(from, "print alarmy rang");
     tell_alarmy("stop", "{}");
@@ -5457,13 +5520,13 @@ static void a_pick_runs_a_stored_app_that_stopped(void) {
 static void a_refused_launch_logs_once(void) {
     stopped_in_store();
     int from = mark();
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    no_worker_can_be_made();
     launch("busy", true);
-    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
+    WAIT(from, NO_TASK_LINE);
     WAIT_FRAMES(10);
     CHECK(count_from(from, "log W") == 1, "one log line for the refused launch, not %d", count_from(from, "log W"));
     ABSENT(from, "log I launch busy");
-    atomic_store(&internal_free, 200u * 1024);
+    atomic_store(&worker_create_fails, false);
     on_worker(empty_store_job, NULL);
 }
 
@@ -5765,11 +5828,11 @@ static void a_refused_alarm_launch_is_given_up_after_ten_seconds(void) {
     clock_stop_at(apps_port_mono_ms());
     store(alarmy());
     CHECK(apps_alarm_arm("alarmy", "t", 1000, true, true) == APPS_ALARM_ARMED, "arm");
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    no_worker_can_be_made();
     int from = mark();
     clock_jump(1000);
     fake_esp_timer_sync();
-    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
+    WAIT(from, NO_TASK_LINE);
     for (int i = 0; i < 9; i++) {
         clock_jump(1000);
         FIFO_SYNC();
@@ -5781,7 +5844,7 @@ static void a_refused_alarm_launch_is_given_up_after_ten_seconds(void) {
     WAIT(from, "log W alarm t: alarmy did not start within 10000 ms: dropped");
     WAIT(from, "log I ring stopped (alarm dropped)");
     CHECK(!apps_alarm_pending(), "dropped");
-    atomic_store(&internal_free, 200u * 1024);
+    atomic_store(&worker_create_fails, false);
     clock_jump(5000);
     FIFO_SYNC();
     ABSENT(from, "log I launch alarmy");  /* nothing is left to launch for */
@@ -5790,18 +5853,18 @@ static void a_refused_alarm_launch_is_given_up_after_ten_seconds(void) {
 }
 
 /* Giving up on a launch ends the pass, and the loop looks again at once: the alarm of another app that waited behind it is asked for in that same
- * round (the one that the post of its own firing brought), and not in the one a second on. The worker refuses every launch (little internal RAM),
+ * round (the one that the post of its own firing brought), and not in the one a second on. The worker refuses every launch (no memory for a worker),
  * so that an ask shows as its line. */
 static void a_launch_given_up_lets_the_next_apps_be_asked_for_in_the_same_round(void) {
     clock_stop_at(apps_port_mono_ms());
     store(alarmy_as("alarmy"));
     store(alarmy_as("second"));
     CHECK(apps_alarm_arm("alarmy", "t", 1000, false, false) == APPS_ALARM_ARMED, "arm");
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    no_worker_can_be_made();
     int from = mark();
     clock_jump(1000);
     fake_esp_timer_sync();
-    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
+    WAIT(from, NO_TASK_LINE);
     for (int i = 0; i < 9; i++) {
         clock_jump(1000);
         FIFO_SYNC();
@@ -5820,7 +5883,7 @@ static void a_launch_given_up_lets_the_next_apps_be_asked_for_in_the_same_round(
     }
     CHECK(count_from(from, "log W io:") == asked + 1, "second's launch was asked for %d times, once in the round that gave up alarmy's (within 600 ms)",
           count_from(from, "log W io:") - asked);
-    atomic_store(&internal_free, 200u * 1024);
+    atomic_store(&worker_create_fails, false);
     clock_go();
     on_worker(empty_store_job, NULL);
 }
@@ -6080,24 +6143,24 @@ static void a_crash_in_alarm_makes_the_loop_look_again_for_the_next_app(void) {
     on_worker(empty_store_job, NULL);
 }
 
-/* A launch the I/O worker refuses (not enough internal RAM) is one line in the log and is asked for again a second later, not at
+/* A launch the I/O worker refuses (no memory for a worker) is one line in the log and is asked for again a second later, not at
  * every round of the loop (which is what a retry with no period would be): once the memory is back, the app starts and is told. */
 static void a_refused_alarm_launch_is_asked_for_again(void) {
     char err[200];
     clock_stop_at(apps_port_mono_ms());
     store(alarmy());
     CHECK(apps_alarm_arm("alarmy", "t", 1000, true, true) == APPS_ALARM_ARMED, "arm");
-    atomic_store(&internal_free, APPS_IO_STACK + APPS_IO_HEADROOM - 1);
+    no_worker_can_be_made();
     int from = mark();
     clock_jump(1000);
     fake_esp_timer_sync();
-    WAIT(from, "log W io: 22527 bytes of internal RAM free, 22528 needed: job refused");
+    WAIT(from, NO_TASK_LINE);
     for (int i = 0; i < 5; i++) {
         FIFO_SYNC();  /* rounds of the loop, with the alarm waiting: it doesn't ask again at each one */
     }
     CHECK(count_from(from, "log W io:") == 1, "asked %d times in a second of the clock that didn't move", count_from(from, "log W io:"));
     ABSENT(from, "log I launch alarmy");
-    atomic_store(&internal_free, 200u * 1024);
+    atomic_store(&worker_create_fails, false);
     clock_jump(1000);  /* ALARM_RETRY_MS: the time to ask again */
     FIFO_SYNC();
     WAIT(from, "log I launch alarmy (256 KB)");
@@ -6254,8 +6317,9 @@ int main(int argc, char **argv) {
         {"a_message_gets_its_reply", a_message_gets_its_reply},
         {"a_message_after_its_caller_gave_up", a_message_after_its_caller_gave_up},
         {"io_runs_jobs_in_order", io_runs_jobs_in_order},
-        {"io_refuses_when_short", io_refuses_when_short},
-        {"io_refuses_when_fragmented", io_refuses_when_fragmented},
+        {"io_refuses_when_full_or_unmade", io_refuses_when_full_or_unmade},
+        {"io_takes_jobs_whatever_internal_ram_says", io_takes_jobs_whatever_internal_ram_says},
+        {"a_worker_on_its_way_to_park_is_never_deleted", a_worker_on_its_way_to_park_is_never_deleted},
         {"io_takes_a_job_that_came_as_it_timed_out", io_takes_a_job_that_came_as_it_timed_out},
         {"an_echo_waits_outside_the_call", an_echo_waits_outside_the_call},
         {"timers_run_on_the_app_task", timers_run_on_the_app_task},
@@ -6303,7 +6367,6 @@ int main(int argc, char **argv) {
         {"io_ops_are_bounded", io_ops_are_bounded},
         {"io_op_with_no_worker_and_no_room_is_refused", io_op_with_no_worker_and_no_room_is_refused},
         {"io_op_for_a_worker_that_runs_waits_for_its_job", io_op_for_a_worker_that_runs_waits_for_its_job},
-        {"io_op_for_an_idle_worker_runs_at_the_end_of_its_wait", io_op_for_an_idle_worker_runs_at_the_end_of_its_wait},
         {"io_op_from_another_task_asserts", io_op_from_another_task_asserts},
         {"the_idle_line_of_a_worker_that_ran_only_ops_is_debug", the_idle_line_of_a_worker_that_ran_only_ops_is_debug},
         {"the_launcher_says_loading_until_the_store_is_mounted", the_launcher_says_loading_until_the_store_is_mounted},

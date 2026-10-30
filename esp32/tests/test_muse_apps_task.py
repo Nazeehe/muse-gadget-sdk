@@ -217,16 +217,19 @@ class AppTaskTest(HarnessCase):
     def test_a_message_after_its_caller_gave_up(self):
         self.run_case("a_message_after_its_caller_gave_up")
 
-    def test_the_io_worker_runs_jobs_in_order(self):  # apps_io: made on demand, gone when idle
+    def test_the_io_worker_runs_jobs_in_order(self):  # apps_io: made on demand, parked when idle, deleted by the next submit
         self.run_case("io_runs_jobs_in_order")
 
-    def test_the_io_worker_refuses_when_short(self):  # apps_io's admission
-        self.run_case("io_refuses_when_short")
+    def test_the_io_worker_refuses_when_its_queue_is_full_or_none_can_be_made(self):  # apps_io's admission
+        self.run_case("io_refuses_when_full_or_unmade")
 
-    # ---- Task 13's pre-review fix ----
+    # ---- Task 20's fix round 2 (R1: the worker's stack is in PSRAM; it replaced Task 13's internal-RAM admission) ----
 
-    def test_the_io_worker_refuses_a_fragmented_heap(self):  # P1: the largest free internal block
-        self.run_case("io_refuses_when_fragmented")
+    def test_the_io_worker_takes_jobs_whatever_internal_ram_says(self):
+        self.run_case("io_takes_jobs_whatever_internal_ram_says")
+
+    def test_a_worker_on_its_way_to_park_is_never_deleted(self):  # only a worker that has suspended itself is deleted
+        self.run_case("a_worker_on_its_way_to_park_is_never_deleted")
 
     # ---- Task 13's fix round 1 ----
 
@@ -388,9 +391,6 @@ class AppTaskTest(HarnessCase):
 
     def test_an_op_for_a_worker_that_runs_waits_for_its_job_when_the_nudge_is_refused(self):
         self.run_case("io_op_for_a_worker_that_runs_waits_for_its_job")
-
-    def test_an_op_for_an_idle_worker_runs_when_its_wait_ends_and_the_worker_stays_for_it(self):
-        self.run_case("io_op_for_an_idle_worker_runs_at_the_end_of_its_wait")
 
     def test_an_op_from_a_task_that_is_not_the_app_task_asserts(self):  # D: apps_io_submit_op is the app task's
         done = self.run_case("io_op_from_another_task_asserts", aborts=True)

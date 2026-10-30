@@ -27,6 +27,18 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+/* The worker's stack is in PSRAM, and the worker writes flash (the FAT, apps_nvs). That is safe only while a flash write leaves the cache
+ * on, which IDF v6.0.1 does when code and rodata run from PSRAM: both options make SPI_FLASH_CACHE_NO_DISABLE true
+ * (components/spi_flash/spi_flash_os_func_app.c:32), so spi1_start takes a mutex and nothing else, and the internal-stack assert of the
+ * cache-disabling path (esp_task_stack_is_sane_cache_disabled, cache_utils.c:126) is never reached (ruling X18). Without them a flash
+ * write from this task would assert. */
+#if !CONFIG_SPIRAM_FETCH_INSTRUCTIONS || !CONFIG_SPIRAM_RODATA
+#error "apps_io.c: the I/O worker's stack is in PSRAM, so flash writes must leave the cache on: set CONFIG_SPIRAM_FETCH_INSTRUCTIONS and CONFIG_SPIRAM_RODATA (X18)"
+#endif
+#endif
+
 /*
  * The I/O worker (apps_io.h has the contract). The lock is held by a submit while it decides and queues, and by the
  * worker while it decides to go: so a job is either queued while the worker is there (and the worker sees it before it
@@ -38,13 +50,14 @@
  * waits for a job would not see a new op, so a push queues a job to wake it (drain_job), one at a time: s_ops_nudged says one is on its
  * way, and the job clears it before it looks, so an op that comes after the look queues the next. When that job can't be queued and
  * no worker is there, nothing could ever run the op, and it is taken back; with a worker there it stays, for the end of its job.
+ *
+ * A worker that goes idle parks: s_parked has it, suspended, until the next submit that makes a worker deletes it (reap_locked: the
+ * stack and the TCB are freed by vTaskDeleteWithCaps, from that task, as IDF advises). Only a worker that has suspended itself is
+ * deleted, never one still on its way (it may hold the log's lock while it says its line); one that is still on its way stays parked for
+ * the next look, and a worker that would park while another hasn't been deleted stays the worker a while longer, so at most one waits.
  */
 
 static const char *TAG = "muse_apps";
-
-/* What a new worker needs in one free internal block: its stack, its TCB (another block, which this one can hold too)
- * and the margin, so that making it never takes the last block that big. */
-#define BLOCK_NEEDED (APPS_IO_STACK + sizeof(StaticTask_t) + APPS_IO_BLOCK_MARGIN)
 
 typedef struct {
     void (*fn)(void *arg);
@@ -55,6 +68,7 @@ static StaticSemaphore_t s_lock_buf;
 static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_jobs;   /* APPS_IO_JOBS of job_t, in PSRAM */
 static TaskHandle_t s_worker;  /* under s_lock: the worker, or NULL when there is none */
+static TaskHandle_t s_parked;  /* under s_lock: a worker that went idle, suspended or about to be, for a submit to delete */
 static job_t s_ops[APPS_IO_OPS];  /* under s_lock: the ops waiting, a ring from s_ops_head */
 static unsigned s_ops_head, s_ops_n;
 static bool s_ops_nudged;         /* under s_lock: a drain job is queued, and has not looked yet */
@@ -77,6 +91,14 @@ static void drain_ops(void) {
             return;
         }
         op.fn(op.arg);
+    }
+}
+
+/* The parked worker deleted, its stack and TCB freed, once it has suspended itself; s_lock held, by a task that isn't it. */
+static void reap_locked(void) {
+    if (s_parked != NULL && eTaskGetState(s_parked) == eSuspended) {
+        vTaskDeleteWithCaps(s_parked);
+        s_parked = NULL;
     }
 }
 
@@ -115,7 +137,13 @@ static void worker(void *arg) {
             drain_ops();
             continue;
         }
+        reap_locked();  /* the worker before this one, which parked long ago */
+        if (s_parked != NULL) {
+            xSemaphoreGive(s_lock);  /* it hasn't suspended itself yet: this one stays the worker for another wait */
+            continue;
+        }
         s_worker = NULL;
+        s_parked = xTaskGetCurrentTaskHandle();
         xSemaphoreGive(s_lock);
         /* A worker that only ran ops is made for most saves of an app that keeps a store, which come 2 s or more apart, and says so each time:
          * that is a debug line. One that ran a job (an install, a launch) says it as it did. */
@@ -124,7 +152,7 @@ static void worker(void *arg) {
         } else {
             ESP_LOGD(TAG, "io: idle, stack %u of %u free", (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)APPS_IO_STACK);
         }
-        vTaskDelete(NULL);
+        vTaskSuspend(NULL);  /* parked, for good: the next submit that makes a worker deletes this one (reap_locked) */
     }
 }
 
@@ -154,38 +182,28 @@ bool apps_io_submit(void (*fn)(void *arg), void *arg) {
         ESP_LOGW(TAG, "io: not started: job refused");
         return false;
     }
-    enum { TAKEN, SHORT, FULL, FRAGMENTED, NO_TASK } why = TAKEN;
+    enum { TAKEN, FULL, NO_TASK } why = TAKEN;
     job_t job = {fn, arg};
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL), largest = 0;
-    if (free_internal < APPS_IO_STACK + APPS_IO_HEADROOM) {
-        why = SHORT;
-    } else if (uxQueueMessagesWaiting(s_jobs) >= APPS_IO_JOBS) {
+    if (uxQueueMessagesWaiting(s_jobs) >= APPS_IO_JOBS) {
         why = FULL;
-    } else if (s_worker == NULL && (largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)) < BLOCK_NEEDED) {
-        why = FRAGMENTED;  /* a worker that runs needs no new block */
-    } else if (s_worker == NULL &&
-               xTaskCreatePinnedToCore(worker, "muse_apps_io", APPS_IO_STACK, NULL, APPS_IO_PRIORITY, &s_worker,
-                                       APPS_IO_CORE) != pdPASS) {
-        s_worker = NULL;
-        why = NO_TASK;
-    } else if (xQueueSend(s_jobs, &job, 0) != pdTRUE) {
+    } else if (s_worker == NULL) {
+        reap_locked();  /* the worker that parked: its stack and TCB go before a new one's are taken */
+        if (xTaskCreatePinnedToCoreWithCaps(worker, "muse_apps_io", APPS_IO_STACK, NULL, APPS_IO_PRIORITY, &s_worker, APPS_IO_CORE,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+            s_worker = NULL;
+            why = NO_TASK;
+        }
+    }
+    if (why == TAKEN && xQueueSend(s_jobs, &job, 0) != pdTRUE) {
         why = FULL;  /* can't be: only submits fill the queue, under the lock, and there was room */
     }
     xSemaphoreGive(s_lock);
     switch (why) {
     case TAKEN:
         return true;
-    case SHORT:
-        ESP_LOGW(TAG, "io: %u bytes of internal RAM free, %u needed: job refused", (unsigned)free_internal,
-                 (unsigned)(APPS_IO_STACK + APPS_IO_HEADROOM));
-        return false;
     case FULL:
         ESP_LOGW(TAG, "io: %d jobs wait already: job refused", APPS_IO_JOBS);
-        return false;
-    case FRAGMENTED:
-        ESP_LOGW(TAG, "io: the largest free internal block is %u bytes, %u needed: job refused", (unsigned)largest,
-                 (unsigned)BLOCK_NEEDED);
         return false;
     default:
         ESP_LOGW(TAG, "io: no memory for the worker: job refused");

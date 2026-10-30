@@ -19,8 +19,8 @@
 /*
  * An app's saved object (the `store` module's values), behind apps_port_store_load and apps_port_store_save (apps_port.h says what the
  * runtime asks of them, and apps_port_idf.c forwards them here); the alarms' records and their re-arm; and the write budget of apps_nvs.
- * Every function but apps_values_forget, the budget's and apps_values_init is the app task's: they call apps_io_submit_op, which only the
- * app task may, or keep state only it touches.
+ * Every function but apps_values_forget, apps_values_record_waits, apps_values_forget_records, the budget's and apps_values_init is the
+ * app task's: they call apps_io_submit_op, which only the app task may, or keep state only it touches.
  *
  * The backend is chosen at run time, by the store's mode (apps_store.h), which the mount fixes before the I/O worker runs any op (it is
  * the worker's first step): FLASH, the op reads and writes apps_nvs (apps_store_load_values, apps_store_save_values); RAM, a map in PSRAM
@@ -44,23 +44,29 @@
  * pages of 4 KB; spread over apps_nvs's 16, with what NVS's garbage collection copies of the live entries besides (say a fifth of the
  * partition), each page is erased about 40 times a day, so its 100,000 erases last about 7 years, where an app saving a few KB every
  * second would wear it out in months. A save that doesn't fit waits (above) for the budget to fill: the app's values are kept, and
- * saved less often, which apps_values_take_slowdown says once per streak of the app (until one of its saves fits again). Records and
- * the order wait the same way. An app's end writes over the budget, which then fills from below zero.
+ * saved less often, which apps_values_take_slowdown says once per streak of the app (until one of its saves fits again). A save is
+ * charged when the worker is handed it: one the worker refuses gets its cost back, so the save that replaces it pays once. A record
+ * that doesn't fit waits too, and the order. An app's end writes over the budget, which then fills from below zero.
  *
  * The alarms' records (apps_store.h, Alarms). An app's names are touched when the app arms or cancels one through the port, when one of
  * its firings is told to it or given up on, and when the system cancels all of its alarms (its budget, a crash, a remove: through
- * apps_alarm_take_cancelled); apps_values_alarm_touched says so, and marks the app. APPS_VALUES_ALARM_DELAY_MS after the first mark (so a
- * burst of changes is one write, never inside the call that made them, and no app writes apps_nvs more than once a second), the tick reads
- * the app's alarms (apps_alarm_list_info) and hands the worker an op with them and the names to keep: the records the mount handed over
- * whose names nothing has touched, which wait to be armed again or were. The op writes each alarm's record when the clock is valid, drops
- * its old one when it isn't (the app armed it again, and its time isn't known: the app is marked again once the clock comes), and drops
- * the records of the other names. FLASH only: in RAM mode nothing outlives a reset, and the marks are dropped.
+ * apps_alarm_take_cancelled, every name); apps_values_alarm_touched says so. APPS_VALUES_ALARM_DELAY_MS after the first touch of a burst
+ * (so a burst of changes is one write, never inside the call that made them, and no app writes apps_nvs more than once a second), the tick
+ * reads the app's alarms (apps_alarm_list_info) and hands the worker an op with each name it touched and what the table has of it: armed
+ * with its time (the clock is valid), armed with no clock, or gone (apps_store_sync_alarms). The op writes or drops the records of those
+ * names and of no other: a record nothing touched (handed over at the mount or not: one the mount couldn't read, one past the ones it hands
+ * over) is never written or dropped. A name armed with no clock loses its old record and is synced again once the clock comes. A record that
+ * the budget can't take loses its old one at once and comes back here (apps_values_record_waits), to be synced again once the budget has
+ * room; drops never wait. Each app's names are synced on their own: one that waits holds no other. An app that touches more than the tick
+ * keeps has all its records follow the table. FLASH only: in RAM mode nothing outlives a reset, and the touches are dropped.
  *
  * The re-arm. The first tick after the mount takes the records the mount read (apps_store_take_records). Each one whose app is still
  * installed and whose name nothing has touched is armed again for the time left (apps_alarm_arm: 1 ms if it is due, the week of
  * APPS_ALARM_MAX_MS at most), at once if the clock is valid, else on the first tick that sees it valid. One that gets no memory is tried
  * again APPS_VALUES_REARM_RETRY_MS later; one the alarm table refuses (no slot) is dropped, record and all. Until then alarm.remaining is
  * nil for it, and an app that arms or cancels its name first has its own way: the re-arm and the app's calls are both the app task's.
+ * A remove or a quarantine of the app (the store's, on the worker) has its handed-over records forgotten at the next round
+ * (apps_values_forget_records), so that an app installed again under that id before the clock comes is armed nothing of the old one's.
  */
 
 #include <stdbool.h>
@@ -110,6 +116,14 @@ bool apps_values_take_slowdown(char *app, size_t cap);
 /* app's alarm `name` was touched (armed, cancelled, told, given up on), or all of them when name is NULL (the system cancelled them):
  * its records follow at a tick, and a record the mount handed over for that name is armed again no more (above). */
 void apps_values_alarm_touched(const char *app, const char *name);
+
+/* Any task (the I/O worker's sync, apps_store.c): the record of app's alarm `name` had to wait for the budget, its old one dropped; the
+ * app task syncs the name again once the budget has room. */
+void apps_values_record_waits(const char *app, const char *name);
+
+/* Any task (the store's remove and quarantine, on the I/O worker): the records the mount handed over for app are forgotten at the app
+ * task's next round, before its re-arm looks at them. */
+void apps_values_forget_records(const char *app);
 
 /* The I/O worker's: the RAM map forgets app's values (its remove, in RAM mode). */
 void apps_values_forget(const char *app);

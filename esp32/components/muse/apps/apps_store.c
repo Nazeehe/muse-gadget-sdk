@@ -55,7 +55,7 @@
  * at the mount's end, after the lock is made, the list read and the hint and the records for the app task set: the store of s_mode
  * publishes them, and a task that reads the mode first sees them whole.
  *
- * Nothing here recurses and no frame holds a large array (the worker's stack is 6 KB, and the values' ops can run inside a job's wait):
+ * Nothing here recurses and no frame holds a large array (the worker's stack is 8 KB, and the values' ops can run inside a job's wait):
  * paths are PATH_CAP bytes, everything bigger (a file's bytes, a manifest, the list being built, the order's blob) is on the apps' heap.
  */
 
@@ -976,13 +976,8 @@ char *apps_store_load_values(const char *id, size_t *len) {
     return (char *)blob;
 }
 
-bool apps_store_save_alarm(const char *id, const char *name, int64_t epoch_ms, bool sound, bool wake) {
-    if (s_kind != APPS_STORAGE_FLASH || !s_nvs_ok || !apps_id_valid(id) || !apps_alarm_name_valid(name)) {
-        return false;
-    }
-    if (!installed(id)) {
-        return true;  /* moot: it was removed */
-    }
+/* The record of id's alarm name written, its cost taken by the caller (the sync): false when apps_nvs refused it. */
+static bool save_record(const char *id, const char *name, int64_t epoch_ms, bool sound, bool wake) {
     char key[NVS_KEY_NAME_MAX_SIZE];
     key_state_t at = key_find('a', id, name, RECORD_LEN, key, NULL, NULL);
     if (at == KEY_TAKEN) {
@@ -993,7 +988,6 @@ bool apps_store_save_alarm(const char *id, const char *name, int64_t epoch_ms, b
     }
     uint8_t rec[RECORD_LEN];
     record_pack(rec, id, name, epoch_ms, sound, wake);
-    (void)apps_values_budget_take(APPS_VALUES_RECORD_COST, true);  /* the app task saw that it fits before it asked (apps_values.h) */
     return blob_set(key, rec, sizeof rec);
 }
 
@@ -1017,57 +1011,59 @@ void apps_store_drop_alarm(const char *id, const char *name) {
 
 typedef struct {
     const char *id;
-    const apps_store_alarm_t *alarms;
+    const apps_store_name_t *names;
     int n;
-    const char (*keep)[APPS_ALARM_NAME_MAX + 1];
-    int n_keep;
-    bool epochs;
-    unsigned seen;    /* bit i: alarms[i] has its record already */
+    bool all;
+    unsigned same;   /* bit i: names[i]'s record holds what it is armed with already */
+    unsigned found;  /* bit i: names[i] has a record (one that goes, if the new one must wait for the budget) */
 } sync_ctx_t;
-
-/* Whether name's record is one nothing touched (the app task's keep): never written or dropped by a sync. */
-static bool kept(const sync_ctx_t *s, const char *name) {
-    for (int i = 0; i < s->n_keep; i++) {
-        if (strcmp(s->keep[i], name) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
 
 static bool visit_sync(const record_t *r, void *arg) {
     sync_ctx_t *s = arg;
-    if (strcmp(r->id, s->id) != 0 || kept(s, r->name)) {
-        return false;  /* another app's, or one nothing touched */
+    if (strcmp(r->id, s->id) != 0) {
+        return false;  /* another app's */
     }
     for (int i = 0; i < s->n; i++) {
-        const apps_store_alarm_t *a = &s->alarms[i];
+        const apps_store_name_t *a = &s->names[i];
         if (strcmp(a->name, r->name) != 0) {
             continue;
         }
-        if (!s->epochs) {
-            return true;  /* armed again with no clock: the time it holds is the alarm's that the app replaced */
+        if (a->state != APPS_STORE_ARMED) {
+            return true;  /* gone (cancelled, told or given up on), or armed again with no clock: the time it holds is the old alarm's */
         }
         int64_t off = r->epoch_ms - a->epoch_ms;  /* both are times of this century: no overflow */
         bool same = (off < 0 ? -off : off) <= EPOCH_SLACK_MS && r->sound == a->sound && r->wake == a->wake;
-        s->seen |= same ? 1u << i : 0u;
+        s->same |= same ? 1u << i : 0u;
+        s->found |= 1u << i;
         return false;  /* written again below unless it is the same */
     }
-    return true;  /* no alarm of that name now: cancelled, told or given up on */
+    return s->all;  /* a name nothing touched is left as it is (P1), unless every name of the app was */
 }
 
-void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n, const char (*keep)[APPS_ALARM_NAME_MAX + 1],
-                            int n_keep, bool epochs) {
+void apps_store_sync_alarms(const char *id, const apps_store_name_t *names, int n, bool all) {
     if (s_kind != APPS_STORAGE_FLASH || !s_nvs_ok || !apps_id_valid(id)) {
         return;
     }
-    int n_alarms = n < 0 ? 0 : n < APPS_ALARMS_PER_APP ? n : APPS_ALARMS_PER_APP;
-    sync_ctx_t s = {id, alarms, n_alarms, keep, keep != NULL && n_keep > 0 ? n_keep : 0, epochs, 0};
-    (void)each_record(visit_sync, &s);
-    for (int i = 0; epochs && i < s.n; i++) {
-        if ((s.seen & (1u << i)) == 0 && !kept(&s, alarms[i].name) &&
-            !apps_store_save_alarm(id, alarms[i].name, alarms[i].epoch_ms, alarms[i].sound, alarms[i].wake)) {
-            ESP_LOGW(TAG, "alarm %s/%s: no record was kept: it won't outlive a restart", id, alarms[i].name);
+    int count = names == NULL || n < 0 ? 0 : n < APPS_STORE_SYNC_MAX ? n : APPS_STORE_SYNC_MAX;
+    sync_ctx_t s = {id, names, count, all, 0, 0};
+    (void)each_record(visit_sync, &s);  /* the drops: never later, an erase costs nothing */
+    for (int i = 0; i < count; i++) {
+        const apps_store_name_t *a = &names[i];
+        if (a->state != APPS_STORE_ARMED || (s.same & (1u << i)) != 0 || !apps_alarm_name_valid(a->name) || !installed(id)) {
+            continue;
+        }
+        if (!apps_values_budget_take(APPS_VALUES_RECORD_COST, false)) {
+            if ((s.found & (1u << i)) != 0) {
+                apps_store_drop_alarm(id, a->name);  /* the old time is wrong now: none is better than it (P3, #1) */
+            }
+            apps_values_record_waits(id, a->name);  /* the app task syncs it again once the budget has room */
+            continue;
+        }
+        if (!save_record(id, a->name, a->epoch_ms, a->sound, a->wake)) {
+            if ((s.found & (1u << i)) != 0) {
+                apps_store_drop_alarm(id, a->name);  /* apps_nvs kept the old time, which is wrong now (#1) */
+            }
+            ESP_LOGW(TAG, "alarm %s/%s: no record was kept: it won't outlive a restart", id, a->name);
         }
     }
 }
@@ -1210,6 +1206,7 @@ static void quarantine(const char *id) {
         }
     }
     apps_store_drop_alarm(id, NULL);
+    apps_values_forget_records(id);  /* and the app task's copies, should it have any (#2) */
     apps_alarm_cancel_app(id, "was running during two restarts in a row");
 }
 
@@ -1597,6 +1594,7 @@ bool apps_store_remove(const char *id, char *err, size_t n) {
     if (mode == APPS_STORAGE_RAM) {
         bool ok = apps_ram_remove(id);
         apps_values_forget(id);
+        apps_values_forget_records(id);
         apps_alarm_cancel_app(id, "was removed");
         cache_ram();
         if (!ok) {
@@ -1616,6 +1614,10 @@ bool apps_store_remove(const char *id, char *err, size_t n) {
         }
         apps_store_drop_alarm(id, NULL);
     }
+    /* The records the mount handed the app task go there too, so that a reinstall before the clock comes arms nothing of this app's (#2).
+     * A re-arm already past its look (apps_store_has said yes a moment before this) arms an alarm with no app: it fires as one "for
+     * missing app" and launches nothing. */
+    apps_values_forget_records(id);
     apps_alarm_cancel_app(id, "was removed");
     order_drop(id);
     (void)scan();

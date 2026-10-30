@@ -32,7 +32,7 @@
  * The install pipeline, the result and the status as JSON, and the RAM store (apps_install.h has the contract).
  *
  * Memory. An install's state (install_t: the messages, what the result lists of the files) and the package are blocks
- * of apps_port_realloc, PSRAM on the gadget, since the I/O worker's stack is 6 KB; the status record, several KB, is
+ * of apps_port_realloc, PSRAM on the gadget, since the I/O worker's stack is 8 KB; the status record, several KB, is
  * one too (X12). Each has one owner: the install frees its state and the package on every way out, but for the package
  * once ops->run has taken it. The status runs on the console's task (3,584 bytes of stack): nothing here keeps more
  * than a few dozen bytes in a frame, and numbers are printed by this file's own digits, so that no printf runs below

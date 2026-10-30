@@ -586,6 +586,44 @@ static void put_values(const char *id, const char *json) {
     CHECK(nvs_put_raw("apps_nvs", "apps", key, blob, n) == ESP_OK, "values");
 }
 
+/* A record's time and flags (bit 0 sound, bit 1 wake); -1 for no record. */
+static int64_t record_epoch(const char *id, const char *name) {
+    const nvs_item_t *rec = apps_key('a', id, name);
+    if (rec == NULL || rec->len != RECORD_LEN) {
+        return -1;
+    }
+    int64_t epoch = 0;
+    for (int i = 0; i < 8; i++) {
+        epoch |= (int64_t)rec->blob[RECORD_LEN - 8 + i] << (8 * i);
+    }
+    return epoch;
+}
+
+static int record_flags(const char *id, const char *name) {
+    const nvs_item_t *rec = apps_key('a', id, name);
+    return rec != NULL && rec->len == RECORD_LEN ? rec->blob[APPS_ID_MAX + 1 + APPS_ALARM_NAME_MAX + 1] : -1;
+}
+
+/* One name an app touched, as apps_values.c hands it to apps_store_sync_alarms. */
+static apps_store_name_t touched(const char *name, int state, int64_t epoch_ms, bool sound, bool wake) {
+    apps_store_name_t a;
+    memset(&a, 0, sizeof a);
+    snprintf(a.name, sizeof a.name, "%s", name);
+    a.state = (uint8_t)state;
+    a.epoch_ms = epoch_ms;
+    a.sound = sound;
+    a.wake = wake;
+    return a;
+}
+
+/* A record written as the app task's sync writes one (apps_store_sync_alarms, the name armed with its time): true when it is there now, as
+ * asked. */
+static bool saved(const char *id, const char *name, int64_t epoch_ms, bool sound, bool wake) {
+    apps_store_name_t a = touched(name, APPS_STORE_ARMED, epoch_ms, sound, wake);
+    apps_store_sync_alarms(id, &a, 1, false);
+    return record_epoch(id, name) == epoch_ms && record_flags(id, name) == ((sound ? 1 : 0) | (wake ? 2 : 0));
+}
+
 /* ---- The reset reason ---- */
 
 static esp_reset_reason_t reset_reason = ESP_RST_POWERON;
@@ -752,6 +790,25 @@ bool apps_values_budget_take(uint32_t bytes, bool force) {
 int64_t apps_values_budget_wait_ms(uint32_t bytes) {
     (void)bytes;
     return budget_spent ? 60000 : 0;
+}
+
+/* The notes the store leaves the app task: a record that had to wait for the budget ("<id>/<name>", in order), and an app whose records the
+ * app task forgets (a remove's, a quarantine's). */
+static char waits_noted[8][APPS_ID_MAX + APPS_ALARM_NAME_MAX + 2];
+static int n_waits_noted;
+static char records_forgotten[APPS_ID_MAX + 1];
+static int forget_calls;
+
+void apps_values_record_waits(const char *app, const char *name) {
+    if (n_waits_noted < (int)(sizeof waits_noted / sizeof waits_noted[0])) {
+        snprintf(waits_noted[n_waits_noted], sizeof waits_noted[0], "%s/%s", app, name);
+    }
+    n_waits_noted++;
+}
+
+void apps_values_forget_records(const char *app) {
+    snprintf(records_forgotten, sizeof records_forgotten, "%s", app);
+    forget_calls++;
 }
 
 /* ---- The system's alarms: the store cancels an app's (a remove, a quarantine) and arms none (the app task re-arms the records) ---- */
@@ -1022,8 +1079,8 @@ static void remove_app(void) {
     char err[256];
     CHECK(apps_store_commit(timer, &unchanged, err, sizeof err) && apps_store_commit(clock, &unchanged, err, sizeof err), "%s", err);
     CHECK(apps_store_save_values("timer", "{\"a\":1}", 7) && apps_store_save_values("clock", "{\"b\":2}", 7), "values");
-    CHECK(apps_store_save_alarm("timer", "done", epoch_now + 60000, true, true), "a record");
-    CHECK(apps_store_save_alarm("clock", "tick", epoch_now + 60000, false, true), "another app's record");
+    CHECK(saved("timer", "done", epoch_now + 60000, true, true), "a record");
+    CHECK(saved("clock", "tick", epoch_now + 60000, false, true), "another app's record");
     char key[16];
     key_of(key, 'q', "timer", NULL);
     CHECK(nvs_put_raw("apps_nvs", "apps", key, "timer", 6) == ESP_OK, "a quarantine");
@@ -1035,6 +1092,8 @@ static void remove_app(void) {
     CHECK(apps_store_remove("timer", err, sizeof err), "remove: %s", err);
     CHECK(!exists("apps_fs/timer"), "the folder went");
     CHECK(strcmp(cancelled_app, "timer") == 0, "its armed alarms are cancelled: '%s'", cancelled_app);
+    CHECK(forget_calls == 1 && strcmp(records_forgotten, "timer") == 0, "and the app task forgets the records it was handed (#2): %d, '%s'",
+          forget_calls, records_forgotten);
     CHECK(apps_key('s', "timer", NULL) == NULL && apps_key('a', "timer", "done") == NULL && apps_key('q', "timer", NULL) == NULL,
           "its keys went");
     CHECK(apps_key('s', "clock", NULL) != NULL && apps_key('a', "clock", "tick") != NULL && exists("apps_fs/clock/main.lua"),
@@ -1201,13 +1260,12 @@ static void keys_that_collide_stay_apart(void) {
     CHECK(apps_store_save_values("zleca55_", "{}", 2) && apps_key('s', "zleca55_", NULL) == NULL && apps_key('s', "timer", NULL) != NULL,
           "an empty store erases its own key only");
     CHECK(apps_store_save_values("zleca55_", "{\"z\":3}", 7) && apps_key_probe('s', "zleca55_", NULL) == 1, "and saves to it again");
-    CHECK(apps_store_save_alarm("timer", "done", epoch_now + 1000, true, true) &&
-              apps_store_save_alarm("zleca55_", "done", epoch_now + 2000, false, true),
+    CHECK(saved("timer", "done", epoch_now + 1000, true, true) && saved("zleca55_", "done", epoch_now + 2000, false, true),
           "two records under one CRC-32");
     CHECK(apps_key_probe('a', "timer", "done") == 0 && apps_key_probe('a', "zleca55_", "done") == 1, "two keys for them too");
     apps_store_drop_alarm("zleca55_", "done");
     CHECK(apps_key('a', "zleca55_", "done") == NULL && apps_key('a', "timer", "done") != NULL, "a drop takes its own");
-    CHECK(apps_store_save_alarm("zleca55_", "done", epoch_now + 2000, false, true), "again");
+    CHECK(saved("zleca55_", "done", epoch_now + 2000, false, true) && apps_key_probe('a', "zleca55_", "done") == 1, "again, at its probe");
     /* The quarantine: zleca55_ is quarantined at a boot, then timer (its q key is put where a quarantine of it would go: the next
      * probe); each load is refused for itself, and a reinstall of one clears its own. */
     apps_marker_t *m = apps_store_marker();
@@ -1271,7 +1329,10 @@ static void full_nvs_erases_only_apps_nvs(void) {
     char *json = apps_store_load_values("timer", &len);
     CHECK(json != NULL && strcmp(json, "{\"a\":1}") == 0, "and the last saved stays: %s", json != NULL ? json : "NULL");
     apps_port_free(json);
-    CHECK(!apps_store_save_alarm("timer", "done", epoch_now + 1000, true, true), "and a record");
+    apps_store_name_t done = touched("done", APPS_STORE_ARMED, epoch_now + 1000, true, true);
+    apps_store_sync_alarms("timer", &done, 1, false);
+    CHECK(apps_key('a', "timer", "done") == NULL && logged_has("alarm timer/done: no record was kept: it won't outlive a restart"),
+          "and a record, which is said");
 }
 
 /* The same for an apps_nvs written by a newer NVS. */
@@ -1315,6 +1376,7 @@ static void ram_mode_when_partition_missing(void) {
     CHECK(apps_store_remove("timer", err, sizeof err) && ram_removes == 1 && strcmp(forgotten, "timer") == 0,
           "a remove takes the package and its values: %s", err);
     CHECK(strcmp(cancelled_app, "timer") == 0, "and cancels its armed alarms: '%s'", cancelled_app);
+    CHECK(forget_calls == 1 && strcmp(records_forgotten, "timer") == 0, "and has the app task forget its records (#2): %d", forget_calls);
     CHECK(list_ids(ids, names, 4) == 0, "and the list");
     free_pkg(p);
 }
@@ -1461,6 +1523,8 @@ static void quarantine_refuses_until_reinstalled(void) {
     CHECK(logged_has("boot: reset reason panic") && logged_has("timer") && logged_has("quarantined"), "the boot line says so");
     CHECK(apps_key('q', "timer", NULL) != NULL, "the quarantine is kept in apps_nvs");
     CHECK(apps_key('a', "timer", "done") == NULL && strcmp(cancelled_app, "timer") == 0, "its alarms go, stored and armed");
+    CHECK(forget_calls == 1 && strcmp(records_forgotten, "timer") == 0, "and the app task's copies (#2): %d, '%s'", forget_calls,
+          records_forgotten);
     CHECK(apps_key('a', "clock", "tick") != NULL, "another app's record stays");
     apps_pkg_t *got = apps_port_realloc(NULL, sizeof *got);
     CHECK(!apps_store_load("timer", got, err, sizeof err) &&
@@ -1575,7 +1639,7 @@ static void records_survive_a_list_that_failed(void) {
           "hands timer's over, and drops ghost's: %d", handed);
 }
 
-/* A record is written as the brief has it (the reader above reads it back), dropped by name, or all of an app's at once. */
+/* A record is written as the brief has it (by the sync: the reader above reads it back), dropped by name, or all of an app's at once. */
 static void alarm_records_round_trip(void) {
     clock_set = true;
     CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
@@ -1585,7 +1649,7 @@ static void alarm_records_round_trip(void) {
     char err[256];
     CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "%s", err);
     free_pkg(p);
-    CHECK(apps_store_save_alarm("timer", "done", epoch_now + 30000, true, false), "save");
+    CHECK(saved("timer", "done", epoch_now + 30000, true, false), "save");
     const nvs_item_t *rec = apps_key('a', "timer", "done");
     CHECK(rec != NULL && rec->len == RECORD_LEN, "a%%08x of the CRC-32 of timer/done, %d bytes", RECORD_LEN);
     if (rec != NULL && rec->len == RECORD_LEN) {
@@ -1600,47 +1664,30 @@ static void alarm_records_round_trip(void) {
     apps_store_drop_alarm("timer", "done");
     CHECK(apps_key('a', "timer", "done") == NULL, "dropped");
     apps_store_drop_alarm("timer", "done");  /* nothing to drop: nothing happens */
-    CHECK(apps_store_save_alarm("timer", "a", epoch_now + 1, true, true) && apps_store_save_alarm("timer", "b", epoch_now + 2, true, true),
+    CHECK(saved("timer", "a", epoch_now + 1, true, true) && saved("timer", "b", epoch_now + 2, true, true),
           "two");
     apps_store_drop_alarm("timer", NULL);
     CHECK(apps_key('a', "timer", "a") == NULL && apps_key('a', "timer", "b") == NULL, "all of the app's at once");
-    CHECK(apps_store_save_alarm("ghost", "x", epoch_now + 1, true, true) && apps_key('a', "ghost", "x") == NULL,
-          "an app that isn't installed has no records: moot, not a failure");
+    n_logged = 0;
+    apps_store_name_t x = touched("x", APPS_STORE_ARMED, epoch_now + 1, true, true);
+    apps_store_sync_alarms("ghost", &x, 1, false);
+    CHECK(apps_key('a', "ghost", "x") == NULL && !logged_has("no record was kept"), "an app that isn't installed has no records: moot, not a failure");
     /* E: a key another's record holds is left to it; this one's record takes the next, and is found and dropped there. */
     char key[16];
     key_of(key, 'a', "timer", "done");
     put_record_at(0, "zleca55_", "done", epoch_now + 5, true, true);  /* "zleca55_/done" has timer/done's CRC-32 */
-    CHECK(apps_store_save_alarm("timer", "done", epoch_now + 30000, true, false) && apps_key_probe('a', "timer", "done") == 1, "the next key");
+    CHECK(saved("timer", "done", epoch_now + 30000, true, false) && apps_key_probe('a', "timer", "done") == 1, "the next key");
     const nvs_item_t *theirs = nvs_find("apps_nvs", "apps", key);
     CHECK(theirs != NULL && strcmp((const char *)theirs->blob, "zleca55_") == 0, "the other's record stays");
     apps_store_drop_alarm("timer", "done");
     CHECK(apps_key('a', "timer", "done") == NULL && nvs_find("apps_nvs", "apps", key) != NULL, "a drop takes its own only");
 }
 
-/* A record's time and flags (bit 0 sound, bit 1 wake); -1 for no record. */
-static int64_t record_epoch(const char *id, const char *name) {
-    const nvs_item_t *rec = apps_key('a', id, name);
-    if (rec == NULL || rec->len != RECORD_LEN) {
-        return -1;
-    }
-    int64_t epoch = 0;
-    for (int i = 0; i < 8; i++) {
-        epoch |= (int64_t)rec->blob[RECORD_LEN - 8 + i] << (8 * i);
-    }
-    return epoch;
-}
-
-static int record_flags(const char *id, const char *name) {
-    const nvs_item_t *rec = apps_key('a', id, name);
-    return rec != NULL && rec->len == RECORD_LEN ? rec->blob[APPS_ID_MAX + 1 + APPS_ALARM_NAME_MAX + 1] : -1;
-}
-
-/* P1: a sync (apps_store_sync_alarms: apps_values.c's op, on the worker) makes an app's records follow its alarms, except for the names
- * to keep, whose records nothing touched since the boot (they wait for the re-arm, or were armed again): those are never written or
- * dropped. Of an alarm, with a valid clock, a record that is new, more than EPOCH_SLACK_MS off or with other options is written and one
- * within it isn't written again; without a valid clock its old record goes (the app armed it again, and its time isn't known). The record
- * of a name in neither (cancelled, told, given up on) goes. Another app's records stay. */
-static void sync_alarms_keeps_untouched_names(void) {
+/* P1: a sync (apps_store_sync_alarms: apps_values.c's op, on the worker) writes or drops the records of the names it is handed, and of no
+ * other. An armed name's record is written when it is new, more than EPOCH_SLACK_MS off or with other options, and neither written again nor
+ * charged within it; each write takes its cost from the budget, not forced. One armed with no clock loses its old record (its time isn't
+ * known), and a gone one's goes. With all, every other record of the app goes too. Another app's records stay. */
+static void sync_alarms_touches_only_the_names_it_is_handed(void) {
     clock_set = true;
     CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
     const file_t files[] = {{"main.lua", "-- main\n"}};
@@ -1652,37 +1699,120 @@ static void sync_alarms_keeps_untouched_names(void) {
         CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "%s", err);
         free_pkg(p);
     }
-    budget_takes = budget_forced = 0;  /* the commits' orders took theirs (not forced): from here, the records' */
-    CHECK(apps_store_save_alarm("other", "x", epoch_now + 5000, true, true), "another app's record");
-    CHECK(apps_store_save_alarm("timer", "a", epoch_now + 10000, true, true) && apps_store_save_alarm("timer", "b", epoch_now + 20000, true, true),
+    CHECK(saved("other", "x", epoch_now + 5000, true, true), "another app's record");
+    CHECK(saved("timer", "a", epoch_now + 10000, true, true) && saved("timer", "b", epoch_now + 20000, true, true),
           "a and b, handed over at a mount and not armed yet");
-    static const char keep_ab[][APPS_ALARM_NAME_MAX + 1] = {"a", "b"};
     int writes = blob_writes;
-    apps_store_alarm_t c[1] = {{"c", 0, true, true}};  /* the app armed c with no clock */
-    apps_store_sync_alarms("timer", c, 1, keep_ab, 2, false);
-    CHECK(record_epoch("timer", "a") == epoch_now + 10000 && record_epoch("timer", "b") == epoch_now + 20000, "a and b stay");
+    apps_store_name_t c = touched("c", APPS_STORE_ARMED_NO_CLOCK, 0, true, true);  /* the app armed c with no clock */
+    apps_store_sync_alarms("timer", &c, 1, false);
+    CHECK(record_epoch("timer", "a") == epoch_now + 10000 && record_epoch("timer", "b") == epoch_now + 20000, "a and b, not handed, stay");
     CHECK(apps_key('a', "timer", "c") == NULL && blob_writes == writes, "c gets none (its time isn't known), nothing is written");
     /* The app armed a itself, still with no clock: a's old record goes, b's stays. */
-    apps_store_alarm_t a_new[1] = {{"a", 0, true, true}};
-    apps_store_sync_alarms("timer", a_new, 1, &keep_ab[1], 1, false);
+    apps_store_name_t a = touched("a", APPS_STORE_ARMED_NO_CLOCK, 0, true, true);
+    apps_store_sync_alarms("timer", &a, 1, false);
     CHECK(apps_key('a', "timer", "a") == NULL && record_epoch("timer", "b") == epoch_now + 20000, "a's old record went, b's stayed");
-    /* The clock: a's new deadline is written. */
-    a_new[0].epoch_ms = epoch_now + 90000;
-    apps_store_sync_alarms("timer", a_new, 1, &keep_ab[1], 1, true);
+    /* The clock: a's new deadline is written, charged, not forced. */
+    budget_takes = budget_forced = 0;
+    a = touched("a", APPS_STORE_ARMED, epoch_now + 90000, true, true);
+    apps_store_sync_alarms("timer", &a, 1, false);
     CHECK(record_epoch("timer", "a") == epoch_now + 90000 && record_flags("timer", "a") == 3, "a: its new deadline");
+    CHECK(budget_takes == 1 && budget_forced == 0, "its cost taken, not forced: %d takes, %d forced", budget_takes, budget_forced);
     writes = blob_writes;
-    a_new[0].epoch_ms += 700;  /* within the slack: the same alarm, its time left read a little later */
-    apps_store_sync_alarms("timer", a_new, 1, &keep_ab[1], 1, true);
-    CHECK(blob_writes == writes, "nothing written again: %d writes", blob_writes - writes);
-    a_new[0].sound = false;  /* other options */
-    apps_store_sync_alarms("timer", a_new, 1, &keep_ab[1], 1, true);
-    CHECK(blob_writes == writes + 1 && record_flags("timer", "a") == 2, "a written again, without sound: %d writes", blob_writes - writes);
-    /* b was cancelled by the app (touched, so no longer kept), and a was told: both go. */
-    apps_store_sync_alarms("timer", NULL, 0, NULL, 0, true);
+    a.epoch_ms += 700;  /* within the slack: the same alarm, its time left read a little later */
+    apps_store_sync_alarms("timer", &a, 1, false);
+    CHECK(blob_writes == writes && budget_takes == 1, "nothing written again, nor charged: %d writes, %d takes", blob_writes - writes,
+          budget_takes);
+    a.sound = false;  /* other options */
+    apps_store_sync_alarms("timer", &a, 1, false);
+    CHECK(blob_writes == writes + 1 && record_flags("timer", "a") == 2 && budget_takes == 2 && budget_forced == 0,
+          "a written again, without sound: %d writes, %d takes", blob_writes - writes, budget_takes);
+    /* b was cancelled by the app, and a was told: both go. */
+    apps_store_name_t gone[2] = {touched("b", APPS_STORE_GONE, 0, false, false), touched("a", APPS_STORE_GONE, 0, false, false)};
+    apps_store_sync_alarms("timer", gone, 2, false);
     CHECK(apps_key('a', "timer", "a") == NULL && apps_key('a', "timer", "b") == NULL, "a's and b's records went");
+    /* all: every other record of the app goes; z, in the table and the same, stays. */
+    CHECK(saved("timer", "y", epoch_now + 1000, true, true) && saved("timer", "z", epoch_now + 2000, true, true),
+          "y and z");
+    apps_store_name_t z = touched("z", APPS_STORE_ARMED, epoch_now + 2000, true, true);
+    apps_store_sync_alarms("timer", &z, 1, true);
+    CHECK(apps_key('a', "timer", "y") == NULL && record_epoch("timer", "z") == epoch_now + 2000, "all: y went, z stayed");
     CHECK(record_epoch("other", "x") == epoch_now + 5000, "another app's record stays");
-    CHECK(budget_takes > 0 && budget_forced == budget_takes, "each record written takes its cost, as the app task checked: %d of %d forced",
-          budget_forced, budget_takes);
+}
+
+/* #1: a record the budget can't take: the name's old record is dropped at once (its time is the replaced alarm's, and none is better than a
+ * wrong one after a reset), nothing is written, and the name goes back to the app task (apps_values_record_waits), to be synced again once the
+ * budget has room. A name with no record waits the same way. Drops never wait: another app's gone name loses its record with the budget
+ * spent. */
+static void a_record_that_must_wait_drops_the_old_one_at_once(void) {
+    clock_set = true;
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    const file_t files[] = {{"main.lua", "-- main\n"}};
+    bool unchanged;
+    char err[256];
+    static const char *const ids[] = {"timer", "clock"};
+    for (size_t i = 0; i < 2; i++) {
+        apps_pkg_t *p = make_pkg(ids[i], ids[i], "1", 1, files);
+        CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "%s", err);
+        free_pkg(p);
+    }
+    CHECK(saved("timer", "done", epoch_now + 10000, true, true) && saved("clock", "nap", epoch_now + 20000, true, false), "two records");
+    budget_spent = true;
+    int writes = blob_writes;
+    apps_store_name_t done = touched("done", APPS_STORE_ARMED, epoch_now + 90000, true, true);  /* armed again: a new countdown */
+    apps_store_sync_alarms("timer", &done, 1, false);
+    CHECK(apps_key('a', "timer", "done") == NULL, "done's old record went at once");
+    CHECK(blob_writes == writes, "nothing written: %d writes", blob_writes - writes);
+    CHECK(n_waits_noted == 1 && strcmp(waits_noted[0], "timer/done") == 0, "done goes back to wait for the budget: %d notes", n_waits_noted);
+    apps_store_name_t fresh = touched("fresh", APPS_STORE_ARMED, epoch_now + 30000, false, true);  /* a name with no record yet */
+    apps_store_sync_alarms("timer", &fresh, 1, false);
+    CHECK(n_waits_noted == 2 && strcmp(waits_noted[1], "timer/fresh") == 0 && apps_key('a', "timer", "fresh") == NULL, "fresh waits too: %d",
+          n_waits_noted);
+    apps_store_name_t nap = touched("nap", APPS_STORE_GONE, 0, false, false);
+    apps_store_sync_alarms("clock", &nap, 1, false);
+    CHECK(apps_key('a', "clock", "nap") == NULL && n_waits_noted == 2, "another app's drop goes through with the budget spent");
+    budget_spent = false;
+    apps_store_sync_alarms("timer", &done, 1, false);
+    CHECK(record_epoch("timer", "done") == epoch_now + 90000 && record_flags("timer", "done") == 3 && n_waits_noted == 2,
+          "written once the budget has room");
+}
+
+/* #3: a sync never touches a record whose name it isn't handed (P1), whether the mount handed that record over or not: one the mount couldn't
+ * read (S), which reads fine now, and one past the APPS_STORE_RECORDS_MAX the mount hands over both survive the app's sync of another name. */
+static void a_sync_leaves_the_records_nobody_touched(void) {
+    clock_set = true;
+    put_app("apps_fs/timer", "timer", "Timer", "-- main\n");
+    put_record("timer", "busy", epoch_now + 60000, true, true);
+    char name[8];
+    for (int i = 0; i <= APPS_STORE_RECORDS_MAX; i++) {
+        snprintf(name, sizeof name, "r%02d", i);
+        put_record("timer", name, epoch_now + 70000 + i, true, false);
+    }
+    key_of(nvs_fail_key, 'a', "timer", "busy");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    nvs_fail_key[0] = '\0';
+    apps_store_record_t got[APPS_STORE_RECORDS_MAX];
+    int n = apps_store_take_records(got, APPS_STORE_RECORDS_MAX);
+    CHECK(n == APPS_STORE_RECORDS_MAX && record_in(got, n, "timer", "busy") == NULL, "16 handed over, busy not: %d", n);
+    CHECK(logged_has("more alarm records than the 16 the gadget arms again at once"), "and the 17th r is left, said");
+    char left[8] = "";
+    for (int i = 0; i <= APPS_STORE_RECORDS_MAX && left[0] == '\0'; i++) {
+        snprintf(name, sizeof name, "r%02d", i);
+        if (record_in(got, n, "timer", name) == NULL) {
+            snprintf(left, sizeof left, "%s", name);
+        }
+    }
+    CHECK(left[0] != '\0', "an r record past the 16 isn't handed over");
+    apps_store_name_t nap = touched("nap", APPS_STORE_ARMED, epoch_now + 5000, true, true);
+    apps_store_sync_alarms("timer", &nap, 1, false);
+    CHECK(record_epoch("timer", "nap") == epoch_now + 5000, "nap's record is written");
+    CHECK(record_epoch("timer", "busy") == epoch_now + 60000, "busy, unreadable at the mount, stays");
+    CHECK(left[0] != '\0' && record_epoch("timer", left) > 0, "%s, past the 16, stays", left);
+    int stayed = 0;
+    for (int i = 0; i <= APPS_STORE_RECORDS_MAX; i++) {
+        snprintf(name, sizeof name, "r%02d", i);
+        stayed += record_epoch("timer", name) == epoch_now + 70000 + i ? 1 : 0;
+    }
+    CHECK(stayed == APPS_STORE_RECORDS_MAX + 1, "every r record stays as it was: %d", stayed);
 }
 
 /* The first mount of a partition with no file system formats it (format_if_mount_failed, 4 files, units of 4 KB), and the log
@@ -1900,7 +2030,9 @@ static const case_t CASES[] = {
     {"a_record_that_cannot_be_read_now_is_kept", a_record_that_cannot_be_read_now_is_kept},
     {"records_survive_a_list_that_failed", records_survive_a_list_that_failed},
     {"alarm_records_round_trip", alarm_records_round_trip},
-    {"sync_alarms_keeps_untouched_names", sync_alarms_keeps_untouched_names},
+    {"sync_alarms_touches_only_the_names_it_is_handed", sync_alarms_touches_only_the_names_it_is_handed},
+    {"a_record_that_must_wait_drops_the_old_one_at_once", a_record_that_must_wait_drops_the_old_one_at_once},
+    {"a_sync_leaves_the_records_nobody_touched", a_sync_leaves_the_records_nobody_touched},
     {"first_mount_formats", first_mount_formats},
     {"a_second_mount_is_not_new", a_second_mount_is_not_new},
     {"an_unmountable_partition_is_ram_mode", an_unmountable_partition_is_ram_mode},

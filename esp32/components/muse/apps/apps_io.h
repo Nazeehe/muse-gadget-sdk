@@ -18,16 +18,22 @@
 
 /*
  * The I/O worker of Muse apps: one task, "muse_apps_io", that runs jobs one at a time, in the order they were
- * submitted. Installs run on it (apps_install), and so does every use of the app store: the RAM store now, the flash
- * store's reads and writes from Task 20 (X11: a task with a PSRAM stack never touches flash), the snapshot's upload
- * from Task 25.
+ * submitted. Installs run on it (apps_install), and so does every use of the app store: the RAM store, the flash
+ * store's reads and writes (X11: every FAT and NVS access runs here, which keeps flash waits off the app task and LVGL),
+ * the snapshot's upload from Task 25.
  *
- * The task has a stack of APPS_IO_STACK bytes in internal RAM and priority APPS_IO_PRIORITY, on core APPS_IO_CORE: its
- * long console lines (a 6 KB reply spins about 0.53 s on the driverless UART) and its heavy steps (SHA-256, package
- * copies, the result's trim) never come in front of the app task or LVGL, on core 1. It is made when a job comes and
- * there is none, and it deletes itself once it has had no job for APPS_IO_IDLE_MS, logging the
- * least stack it had left: "io: idle, stack %u of %u free". So it costs no internal RAM while nothing is being
- * installed.
+ * The task has a stack of APPS_IO_STACK bytes in PSRAM (its TCB is in internal RAM, as every TCB is) and priority
+ * APPS_IO_PRIORITY, on core APPS_IO_CORE: its long console lines (a 6 KB reply spins about 0.53 s on the driverless UART)
+ * and its heavy steps (SHA-256, package copies, the result's trim) never come in front of the app task or LVGL, on core 1.
+ * A stack in PSRAM may write flash on this firmware (ruling X18): code and rodata run from PSRAM, so IDF keeps the cache on
+ * through a flash write (apps_io.c refuses to build otherwise). So the worker takes none of the internal RAM the Link needs
+ * but its TCB, and no rule of internal RAM decides whether it can be made.
+ *
+ * It is made when a job comes and there is none. Once it has had no job for APPS_IO_IDLE_MS it logs the least stack it had
+ * left, "io: idle, stack %u of %u free", and parks (suspends itself); the next submit deletes it, with its stack and its
+ * TCB, before it makes the next worker. A worker can't delete itself: IDF's vTaskDeleteWithCaps(NULL) makes a cleanup task
+ * in internal RAM and aborts when it can't, and the boot's first worker goes idle while the Link's handshake has internal
+ * RAM at its lowest.
  *
  * A job may wait (an install waits for the app task: a run's settle and 7 s more), but it must end: the jobs behind it
  * wait for it. A job may submit another.
@@ -48,16 +54,14 @@
 
 #include <stdbool.h>
 
-#define APPS_IO_STACK 6144        /* bytes, internal RAM */
+#define APPS_IO_STACK 8192        /* bytes, PSRAM: the deepest store step left 2328 of 6144 free */
 #define APPS_IO_PRIORITY 3        /* over the app task (2), under the console (5) and the screen's tasks */
 #define APPS_IO_CORE 0            /* the app task and LVGL are on core 1 */
 #define APPS_IO_IDLE_MS 2000      /* the worker goes after this long without a job */
-#define APPS_IO_HEADROOM 16384    /* internal RAM a submit leaves free besides the worker's stack */
-#define APPS_IO_BLOCK_MARGIN 1024 /* what the largest free internal block keeps besides a new worker's stack and TCB */
 #define APPS_IO_JOBS 8            /* jobs that can wait at once */
 #define APPS_IO_OPS 8             /* ops that can wait at once */
 
-/* What a caller says when apps_io_submit refuses: internal RAM dips while Wi-Fi joins, and that passes. */
+/* What a caller says when apps_io_submit refuses: no memory for a new worker, or its queue full, and that passes. */
 #define APPS_IO_REFUSED "the gadget is short of memory right now; try again in a few seconds"
 
 /* Makes the worker's lock (static) and its queue of APPS_IO_JOBS (PSRAM). muse_apps_start() calls it once, before
@@ -70,13 +74,12 @@ void apps_io_init(void);
 void apps_io_set_first(void (*fn)(void));
 
 /*
- * Queues fn(arg) for the worker, making the worker if there is none. Any task, the worker's own jobs included; it
- * never waits for another task's progress. True once the job is queued: fn(arg) then runs exactly once, on the worker.
- * False, with nothing queued (fn never runs, and arg stays the caller's), when internal RAM is short
- * (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < APPS_IO_STACK + APPS_IO_HEADROOM), when APPS_IO_JOBS jobs are
- * waiting already, when there is no worker and the largest free internal block can't hold a new one's stack, its TCB
- * and APPS_IO_BLOCK_MARGIN (heap_caps_get_largest_free_block), or when the worker can't be made; each says why in one
- * W log line. Callers try again later: a store flush at its next tick, an install by saying APPS_IO_REFUSED.
+ * Queues fn(arg) for the worker, making the worker if there is none (and deleting the one that parked before it). Any
+ * task, the worker's own jobs included; it never waits for another task's progress. True once the job is queued: fn(arg)
+ * then runs exactly once, on the worker. False, with nothing queued (fn never runs, and arg stays the caller's), when
+ * APPS_IO_JOBS jobs are waiting already, or when there is no worker and none can be made (no memory for its stack in
+ * PSRAM or its TCB); each says why in one W log line. Callers try again later: a store flush at its next tick, an
+ * install by saying APPS_IO_REFUSED.
  */
 bool apps_io_submit(void (*fn)(void *arg), void *arg);
 

@@ -58,7 +58,7 @@
  * a reset leaves two entries on one folder (f_rename's own warning). Power lost at any point leaves either the old app or the new one:
  * the mount's recovery puts .old-<id> back when <id> is missing, and deletes every other leftover (a stage, an old copy whose app is
  * there, and the .stage folder of an earlier layout). APPS_STORE_BASE/.store marks a file system the store has made its own (a mount
- * that doesn't find it says "a new file system"). Nothing is recursive: the worker's stack is 6 KB.
+ * that doesn't find it says "a new file system"). Nothing is recursive: the worker's stack is 8 KB (apps_io.h).
  *
  * apps_nvs, namespace "apps": s<key> (the id): the id, a NUL, then the values' JSON; a<key> (the id, a slash and the alarm's name): an
  * alarm's record (Alarms); q<key> (the id): the id, quarantined; and "order" (Order). A <key> is the CRC-32 (zlib's) of what it is
@@ -82,13 +82,14 @@
  * resets <n>, <what came of it>".
  *
  * Alarms. An alarm armed while the clock is valid has a record: its app, its name, its time as epoch ms and what it asked for. The
- * app task keeps the records in line with the alarms that the app, or the system, touched since the boot (apps_values.h): about a
- * second after one changes, it hands the worker the app's alarms and the names whose records nothing touched (keep), and
- * apps_store_sync_alarms writes or drops the records of the others. The mount reads the records (one that can't be read for now is
- * left as it is; one that isn't a record, or whose time isn't between 2025 and 2100, goes), drops those of an app that isn't
- * installed (unless the list couldn't be read) or is quarantined, and hands the rest to the app task (apps_store_take_records), which
- * arms each again for the time left unless the app touched its name first: at once if the clock is valid, else on the first round
- * that sees it valid. A quarantine and a remove drop all of the app's records here.
+ * app task keeps the records in line with the names that the app, or the system, touched since the boot (apps_values.h): about a
+ * second after one changes, it hands the worker each touched name with what the alarm table has of it (armed with its time, armed
+ * with no clock, or gone), and apps_store_sync_alarms writes or drops the records of those names and of no other. The mount reads
+ * the records (one that can't be read for now is left as it is; one that isn't a record, or whose time isn't between 2025 and 2100,
+ * goes), drops those of an app that isn't installed (unless the list couldn't be read) or is quarantined, and hands the rest to the
+ * app task (apps_store_take_records), which arms each again for the time left unless the app touched its name first: at once if the
+ * clock is valid, else on the first round that sees it valid. A quarantine and a remove drop all of the app's records here, and tell
+ * the app task to forget those it was handed (apps_values_forget_records), so that a reinstall arms nothing old.
  */
 
 #include <stdbool.h>
@@ -152,28 +153,37 @@ bool apps_store_save_values(const char *id, const char *json, size_t len);
  * launch is then refused, and never starts with an empty store that a later save would put in place of the real one. */
 char *apps_store_load_values(const char *id, size_t *len);
 
-/* FLASH: the record of the alarm name of id, at epoch_ms. True when nothing is left to do (written, or moot: id isn't installed);
- * false when apps_nvs refused it. */
-bool apps_store_save_alarm(const char *id, const char *name, int64_t epoch_ms, bool sound, bool wake);
-
 /* FLASH: drops the record of the alarm name of id, or every record of id when name is NULL. Nothing when there is none. */
 void apps_store_drop_alarm(const char *id, const char *name);
 
-/* One of an app's alarms as the alarm table has it, for its record. */
+#define APPS_STORE_SYNC_MAX 16  /* names in one sync */
+
+/* What the alarm table has of a name an app touched (apps_store_name_t's state). */
+enum {
+    APPS_STORE_ARMED,           /* armed, and the clock is valid: epoch_ms is when it fires */
+    APPS_STORE_ARMED_NO_CLOCK,  /* armed with no valid clock: when it fires as an epoch isn't known */
+    APPS_STORE_GONE,            /* not armed: cancelled, told or given up on */
+};
+
+/* A name an app touched since its last sync, as the alarm table has it now (apps_values.h). */
 typedef struct {
     char name[APPS_ALARM_NAME_MAX + 1];
-    int64_t epoch_ms;  /* when it fires (0 when the clock wasn't valid) */
-    bool sound, wake;
-} apps_store_alarm_t;
+    uint8_t state;     /* APPS_STORE_ARMED, _ARMED_NO_CLOCK or _GONE */
+    int64_t epoch_ms;  /* ARMED: when it fires */
+    bool sound, wake;  /* ARMED: what it asked for */
+} apps_store_name_t;
 
-/* FLASH: id's records made to follow its n alarms (apps_values.h's op), but for the names in keep, whose records are left as they are
- * (nothing touched them since the boot: they wait to be armed again, or were). A record of a name in neither is dropped (its alarm was
- * cancelled, told or given up on). Of an alarm: with epochs (the clock was valid) its record is written unless it holds that already
- * (its time within a second, the same sound and wake); without, its old record is dropped (the app armed it again, and its time isn't
- * known). Each record written takes its cost from the write budget (apps_values.h; the app task checked that it fits). Nothing is
- * written for an app that isn't installed. */
-void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n,
-                            const char (*keep)[APPS_ALARM_NAME_MAX + 1], int n_keep, bool epochs);
+/* FLASH: the records of the n names of id that its app, or the system, touched (apps_values.h's op), and of no other name (P1). An
+ * ARMED name's record is written unless it holds that already (its time within a second, the same sound and wake), which costs nothing;
+ * a write takes its cost from the write budget first (apps_values.h), and when that doesn't fit, the name's old record is dropped at
+ * once (its time is the alarm's that the app replaced: no record, which arms nothing after a reset, is better than a wrong one) and the
+ * name goes back to the app task (apps_values_record_waits), which syncs it again once the budget has room; a write that apps_nvs
+ * refuses drops the old record too, and says so. An ARMED_NO_CLOCK name's record is dropped (the app armed it again, and its time isn't
+ * known: the app task syncs it again when the clock comes), and so is a GONE one's. Drops never wait: an erase costs nothing. With all,
+ * every record of id whose name isn't among the n goes too: the system cancelled all of id's alarms (apps_alarm_take_cancelled), or the
+ * app touched more names than the app task keeps. Nothing is written for an app that isn't installed. At most APPS_STORE_SYNC_MAX
+ * names. */
+void apps_store_sync_alarms(const char *id, const apps_store_name_t *names, int n, bool all);
 
 /*
  * A fresh deep copy of id's package into pkg (a caller's apps_pkg_t, overwritten), every block of it from apps_port_realloc, for the

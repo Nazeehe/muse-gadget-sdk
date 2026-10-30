@@ -150,8 +150,14 @@ class Store(unittest.TestCase):
     def test_alarm_records_round_trip(self):
         self.run_case("alarm_records_round_trip")
 
-    def test_a_sync_follows_the_touched_names_and_keeps_the_rest(self):  # P1
-        self.run_case("sync_alarms_keeps_untouched_names")
+    def test_a_sync_touches_only_the_names_it_is_handed(self):  # P1, and #3: no keep-list
+        self.run_case("sync_alarms_touches_only_the_names_it_is_handed")
+
+    def test_a_record_that_must_wait_drops_the_old_one_at_once(self):  # #1: drops never wait for the budget
+        self.run_case("a_record_that_must_wait_drops_the_old_one_at_once")
+
+    def test_a_sync_leaves_the_records_nobody_touched(self):  # #3: unreadable at the mount, or past the 16 handed over
+        self.run_case("a_sync_leaves_the_records_nobody_touched")
 
     def test_first_mount_formats(self):  # the brief's config, and the log line with the time, the room and apps_nvs's use
         self.run_case("first_mount_formats")

@@ -408,35 +408,52 @@ char *apps_store_load_values(const char *id, size_t *len) {
     return copy;
 }
 
-static struct {
+/* Every sync the worker was handed (apps_store_sync_alarms), in order. The fake does with the write budget what apps_store.c's sync does (its
+ * own cases are tests/muse_apps_store_harness.c): an armed name's record takes APPS_VALUES_RECORD_COST, not forced, and one that doesn't fit
+ * goes back to the app task (apps_values_record_waits); a drop costs nothing. */
+typedef struct {
     char app[APPS_ID_MAX + 1];
-    apps_store_alarm_t alarms[APPS_ALARMS_PER_APP];
-    char keep[APPS_STORE_RECORDS_MAX][APPS_ALARM_NAME_MAX + 1];
-    int n, n_keep, calls;
-    bool epochs;
-} synced;
+    apps_store_name_t names[APPS_STORE_SYNC_MAX];
+    int n;
+    bool all;
+    unsigned written, waits;  /* bit i: names[i]'s record written, or sent back to wait for the budget */
+} sync_call_t;
 
-void apps_store_sync_alarms(const char *id, const apps_store_alarm_t *alarms, int n, const char (*keep)[APPS_ALARM_NAME_MAX + 1], int n_keep,
-                            bool epochs) {
-    snprintf(synced.app, sizeof synced.app, "%s", id);
-    memcpy(synced.alarms, alarms, (size_t)n * sizeof *alarms);
-    synced.n = n;
-    synced.n_keep = n_keep;
-    if (n_keep > 0) {
-        memcpy(synced.keep, keep, (size_t)n_keep * sizeof *keep);
+static sync_call_t syncs[16];
+static int n_syncs;
+
+void apps_store_sync_alarms(const char *id, const apps_store_name_t *names, int n, bool all) {
+    sync_call_t *s = n_syncs < (int)(sizeof syncs / sizeof syncs[0]) ? &syncs[n_syncs] : NULL;
+    n_syncs++;
+    if (s == NULL) {
+        return;
     }
-    synced.epochs = epochs;
-    synced.calls++;
-}
-
-/* Whether the last sync kept name's record as it is. */
-static bool kept(const char *name) {
-    for (int i = 0; i < synced.n_keep; i++) {
-        if (strcmp(synced.keep[i], name) == 0) {
-            return true;
+    memset(s, 0, sizeof *s);
+    snprintf(s->app, sizeof s->app, "%s", id);
+    memcpy(s->names, names, (size_t)n * sizeof *names);
+    s->n = n;
+    s->all = all;
+    for (int i = 0; i < n; i++) {
+        if (names[i].state != APPS_STORE_ARMED) {
+            continue;
+        }
+        if (apps_values_budget_take(APPS_VALUES_RECORD_COST, false)) {
+            s->written |= 1u << i;
+        } else {
+            apps_values_record_waits(id, names[i].name);
+            s->waits |= 1u << i;
         }
     }
-    return false;
+}
+
+/* name's entry in sync k (0: the first), or NULL. */
+static const apps_store_name_t *synced_name(int k, const char *name) {
+    for (int i = 0; k >= 0 && k < n_syncs && i < syncs[k].n; i++) {
+        if (strcmp(syncs[k].names[i].name, name) == 0) {
+            return &syncs[k].names[i];
+        }
+    }
+    return NULL;
 }
 
 /* The records the mount handed over (apps_store_take_records): the case's, taken once the mode isn't none. */
@@ -1351,22 +1368,18 @@ static void a_backend_failure_is_said_once_a_streak(void) {
     n_logged = 0;
 }
 
-/* An arming or a cancel touches the name and marks the app (apps_port_alarm_arm, apps_port_alarm_cancel); APPS_VALUES_ALARM_DELAY_MS after
- * the first mark a tick reads what the table has of the app and hands the worker one op, which syncs the records: each alarm with the time
- * it fires (the clock now and the time left), or without times when the clock isn't valid. A burst of changes is one op; a refused op is
- * asked again APPS_VALUES_RETRY_MS later; RAM mode drops the marks, with no op. The op is the app task's tick's, after the calls: never
- * inside one, and never from the esp_timer task (the alarm module's own cancels reach it through apps_alarm_take_cancelled, which the task
- * harness runs with the real module). */
+/* The alarms' records follow the names an app touched (P1): a burst of touches (an arming, a cancel, the same arming again) is one op,
+ * APPS_VALUES_ALARM_DELAY_MS after the first, that hands the worker each touched name with what the table has of it, and no other name: done
+ * armed (its time as an epoch, its sound and wake), old gone; other, armed but untouched, isn't in it. Without a valid clock an armed name has
+ * no time. A refused op is asked for again APPS_VALUES_RETRY_MS later, and RAM mode hands nothing (nothing outlives a reset there). */
 static void alarm_records_follow_the_table(void) {
     fake_mode = APPS_STORAGE_FLASH;
     worker_answers = true;
     clock_at_ms(10000);
     clock_is_set = true;
     alarm_calls.answer = APPS_ALARM_ARMED;
-    n_listed_info = 1;
-    snprintf(listed_info[0].name, sizeof listed_info[0].name, "done");
-    listed_info[0].remaining_ms = 120000;
-    listed_info[0].sound = listed_info[0].wake = true;
+    static const char *const done_and_other[] = {"done", "other"};
+    table_has("timer", 2, done_and_other, (const int64_t[]){120000, 50000}, (const bool[]){true, false}, (const bool[]){true, true});
     int before = live_blocks();
     (void)apps_port_alarm_arm("timer", "done", 120000, true, true);
     apps_port_alarm_cancel("timer", "old");
@@ -1378,21 +1391,30 @@ static void alarm_records_follow_the_table(void) {
     int64_t high = epoch_now_ms();
     CHECK(n_pending == 1 && info_asks == 1, "one op for the burst: %d ops, %d asks", n_pending, info_asks);
     worker_runs(1);
-    CHECK(synced.calls == 1 && strcmp(synced.app, "timer") == 0 && synced.n == 1 && synced.epochs && synced.n_keep == 0 &&
-              strcmp(synced.alarms[0].name, "done") == 0 && synced.alarms[0].epoch_ms >= low + 120000 &&
-              synced.alarms[0].epoch_ms <= high + 120000 && synced.alarms[0].sound && synced.alarms[0].wake,
-          "synced %s: %d alarms, epochs %d, %s at %lld (the clock %lld to %lld)", synced.app, synced.n, synced.epochs, synced.alarms[0].name,
-          (long long)synced.alarms[0].epoch_ms, (long long)low, (long long)high);
+    const apps_store_name_t *done = synced_name(0, "done"), *old = synced_name(0, "old");
+    CHECK(n_syncs == 1 && strcmp(syncs[0].app, "timer") == 0 && syncs[0].n == 2 && !syncs[0].all, "timer's two touched names: %d syncs, %d names",
+          n_syncs, syncs[0].n);
+    CHECK(done != NULL && done->state == APPS_STORE_ARMED && done->epoch_ms >= low + 120000 && done->epoch_ms <= high + 120000 && done->sound &&
+              done->wake,
+          "done armed, at %lld (the clock %lld to %lld)", done != NULL ? (long long)done->epoch_ms : -1LL, (long long)low, (long long)high);
+    CHECK(old != NULL && old->state == APPS_STORE_GONE, "old gone");
+    CHECK(synced_name(0, "other") == NULL, "other, armed but untouched, isn't in it");
     CHECK(live_blocks() == before, "%d blocks held", live_blocks() - before);
     apps_values_tick(20000);
     CHECK(n_pending == 0, "nothing more without a change");
-    /* Without a valid clock: the same op, without times. */
+    /* Without a valid clock: nap, armed, has no time; done, cancelled, is gone. */
     clock_is_set = false;
+    static const char *const just_nap[] = {"nap"};
+    table_has("timer", 1, just_nap, (const int64_t[]){30000}, (const bool[]){false}, (const bool[]){true});
+    (void)apps_port_alarm_arm("timer", "nap", 30000, false, true);
     apps_port_alarm_cancel("timer", "done");
-    n_listed_info = 0;
     apps_values_tick(21000);
     worker_runs(1);
-    CHECK(synced.calls == 2 && synced.n == 0 && !synced.epochs, "the cancel synced: %d alarms, epochs %d", synced.n, synced.epochs);
+    const apps_store_name_t *nap = synced_name(1, "nap");
+    done = synced_name(1, "done");
+    CHECK(n_syncs == 2 && syncs[1].n == 2 && nap != NULL && nap->state == APPS_STORE_ARMED_NO_CLOCK && done != NULL &&
+              done->state == APPS_STORE_GONE,
+          "no clock: nap with no time, done gone: %d syncs, %d names", n_syncs, syncs[1].n);
     /* A refusal: asked again 2 s later. */
     apps_port_alarm_cancel("timer", "x");
     ops_refused = true;
@@ -1408,7 +1430,7 @@ static void alarm_records_follow_the_table(void) {
     fake_mode = APPS_STORAGE_RAM;
     (void)apps_port_alarm_arm("timer", "done", 1000, false, false);
     apps_values_tick(60000);
-    CHECK(n_pending == 0 && synced.calls == 3, "RAM mode: no op");
+    CHECK(n_pending == 0 && n_syncs == 3, "RAM mode: no op");
     fake_mode = APPS_STORAGE_FLASH;
     apps_values_tick(70000);
     CHECK(n_pending == 0, "and the mark is gone");
@@ -1511,8 +1533,8 @@ static void a_small_value_is_never_held_back(void) {
 }
 
 /* P1: the records the mount handed over wait for the clock, and an alarm the app arms meanwhile under another name syncs that name alone:
- * the others' records are kept as they are (keep), never dropped for not being in the table. When the clock comes each untouched record
- * is armed again for the time it has left, with its sound and wake, and the app's alarm, armed without a clock, gets its record then. */
+ * the others' names aren't in the sync, so nothing drops their records for not being in the table. When the clock comes each untouched record
+ * is armed again for the time it has left, with its sound and wake, and the app's alarm, synced without a clock, gets its record then. */
 static void untouched_records_wait_for_the_clock(void) {
     fake_mode = APPS_STORAGE_FLASH;
     worker_answers = true;
@@ -1528,9 +1550,10 @@ static void untouched_records_wait_for_the_clock(void) {
     (void)apps_port_alarm_arm("timer", "c", 30000, true, false);
     apps_values_tick(10000 + APPS_VALUES_ALARM_DELAY_MS);
     worker_runs(1);
-    CHECK(synced.calls == 1 && strcmp(synced.app, "timer") == 0 && !synced.epochs && synced.n == 1 && strcmp(synced.alarms[0].name, "c") == 0,
-          "c synced, with no time: %d calls, %d alarms, epochs %d", synced.calls, synced.n, synced.epochs);
-    CHECK(synced.n_keep == 2 && kept("a") && kept("b"), "a's and b's records are kept as they are: %d kept", synced.n_keep);
+    const apps_store_name_t *c = synced_name(0, "c");
+    CHECK(n_syncs == 1 && strcmp(syncs[0].app, "timer") == 0 && syncs[0].n == 1 && !syncs[0].all && c != NULL &&
+              c->state == APPS_STORE_ARMED_NO_CLOCK,
+          "c synced alone, with no time (a's and b's names aren't in it): %d syncs, %d names", n_syncs, syncs[0].n);
     CHECK(alarm_calls.arms == 1, "nothing armed again without the clock: %d armings", alarm_calls.arms);
     /* The clock comes. */
     clock_is_set = true;
@@ -1548,24 +1571,24 @@ static void untouched_records_wait_for_the_clock(void) {
     CHECK(alarm_calls.arms == 3 && log_has("I muse_apps: store: alarm timer/a armed again: ") &&
               log_has("I muse_apps: store: alarm timer/b armed again: "),
           "two re-arms, each with its line: %d armings", alarm_calls.arms);
-    /* c gets its record: its app was synced without the clock while it had an alarm. */
+    /* c gets its record: it was synced without the clock. */
     static const char *const all[] = {"c", "a", "b"};
     table_has("timer", 3, all, (const int64_t[]){20000, 50000, 110000}, (const bool[]){true, true, false}, (const bool[]){false, true, true});
     low = epoch_now_ms();
     apps_values_tick(20000 + APPS_VALUES_ALARM_DELAY_MS);
     high = epoch_now_ms();
     worker_runs(1);
-    CHECK(synced.calls == 2 && synced.epochs && synced.n == 1 && strcmp(synced.alarms[0].name, "c") == 0 &&
-              synced.alarms[0].epoch_ms >= low + 20000 && synced.alarms[0].epoch_ms <= high + 20000 && synced.alarms[0].sound &&
-              !synced.alarms[0].wake,
-          "c's record, with its time: %d calls, epochs %d, %d alarms", synced.calls, synced.epochs, synced.n);
-    CHECK(synced.n_keep == 2 && kept("a") && kept("b"), "a and b, armed again from their records, are kept: %d kept", synced.n_keep);
+    c = synced_name(1, "c");
+    CHECK(n_syncs == 2 && syncs[1].n == 1 && c != NULL && c->state == APPS_STORE_ARMED && c->epoch_ms >= low + 20000 &&
+              c->epoch_ms <= high + 20000 && c->sound && !c->wake,
+          "c's record, with its time, and c's alone (a and b, armed again from their records, aren't touched): %d syncs, %d names", n_syncs,
+          syncs[1].n);
     CHECK(live_blocks() == before, "%d blocks held", live_blocks() - before);
 }
 
-/* P1: a name the app touches before the clock comes is the app's from then on: the record the mount handed over for it is neither kept
- * nor armed again. Armed again by the app without a clock, it is in the sync with no time (its old record goes: apps_store.h), and gets
- * its new record, with the new deadline, once the clock comes. Cancelled while it waited, its record goes, and nothing arms it. */
+/* P1: a name the app touches before the clock comes is the app's from then on: the record the mount handed over for it is not armed again.
+ * Armed again by the app without a clock, it is in the sync with no time (its old record goes: apps_store.h), and gets its new record, with
+ * the new deadline, once the clock comes. Cancelled while it waited, it is in the sync gone (its record goes), and nothing arms it. */
 static void a_touched_name_is_not_armed_again(void) {
     fake_mode = APPS_STORAGE_FLASH;
     worker_answers = true;
@@ -1581,9 +1604,9 @@ static void a_touched_name_is_not_armed_again(void) {
     apps_port_alarm_cancel("timer", "b");                        /* and cancels b, which waited for the clock */
     apps_values_tick(10000 + APPS_VALUES_ALARM_DELAY_MS);
     worker_runs(1);
-    CHECK(synced.calls == 1 && !synced.epochs && synced.n == 1 && strcmp(synced.alarms[0].name, "a") == 0 && synced.n_keep == 0,
-          "a with no time (its old record goes), b in neither (its record goes): %d calls, %d alarms, %d kept", synced.calls, synced.n,
-          synced.n_keep);
+    const apps_store_name_t *a = synced_name(0, "a"), *b = synced_name(0, "b");
+    CHECK(n_syncs == 1 && syncs[0].n == 2 && a != NULL && a->state == APPS_STORE_ARMED_NO_CLOCK && b != NULL && b->state == APPS_STORE_GONE,
+          "a with no time (its old record goes), b gone (its record goes): %d syncs, %d names", n_syncs, syncs[0].n);
     clock_is_set = true;
     clock_at_ms(20000);
     table_has("timer", 1, just_a, (const int64_t[]){35000}, (const bool[]){true}, (const bool[]){true});
@@ -1593,16 +1616,17 @@ static void a_touched_name_is_not_armed_again(void) {
     apps_values_tick(20000 + APPS_VALUES_ALARM_DELAY_MS);
     int64_t high = epoch_now_ms();
     worker_runs(1);
-    CHECK(synced.calls == 2 && synced.epochs && synced.n == 1 && strcmp(synced.alarms[0].name, "a") == 0 &&
-              synced.alarms[0].epoch_ms >= low + 35000 && synced.alarms[0].epoch_ms <= high + 35000 && synced.n_keep == 0,
-          "a's new record, with the new deadline: %d calls, epochs %d, %lld (%lld to %lld)", synced.calls, synced.epochs,
-          (long long)synced.alarms[0].epoch_ms, (long long)(low + 35000), (long long)(high + 35000));
+    a = synced_name(1, "a");
+    CHECK(n_syncs == 2 && syncs[1].n == 1 && a != NULL && a->state == APPS_STORE_ARMED && a->epoch_ms >= low + 35000 &&
+              a->epoch_ms <= high + 35000,
+          "a's new record, with the new deadline: %d syncs, %lld (%lld to %lld)", n_syncs, a != NULL ? (long long)a->epoch_ms : -1LL,
+          (long long)(low + 35000), (long long)(high + 35000));
     CHECK(!log_has("armed again"), "no line of a re-arm");
 }
 
 /* P1: a re-arm the alarm table has no memory for is tried again APPS_VALUES_REARM_RETRY_MS later, and its line says so; one it has no slot
- * for is dropped, record and all (its app is synced, keeping nothing of it), with its line; a time past the week of APPS_ALARM_MAX_MS is
- * cut to it, and one that is due fires at once (1 ms). A record of an app removed since the mount arms nothing. */
+ * for is dropped, record and all (its name is synced, gone), with its line; a time past the week of APPS_ALARM_MAX_MS is cut to it, and one
+ * that is due fires at once (1 ms). A record of an app removed since the mount arms nothing. */
 static void rearm_retries_drops_and_clamps(void) {
     fake_mode = APPS_STORAGE_FLASH;
     worker_answers = true;
@@ -1635,11 +1659,118 @@ static void rearm_retries_drops_and_clamps(void) {
     table_has("clock", 0, NULL, NULL, NULL, NULL);
     apps_values_tick(10000 + APPS_VALUES_REARM_RETRY_MS + APPS_VALUES_ALARM_DELAY_MS);
     worker_runs(1);
-    CHECK(synced.calls == 1 && strcmp(synced.app, "clock") == 0 && synced.n == 0 && synced.n_keep == 0,
-          "clock is synced, keeping nothing of full: its record goes: %d calls, %s, %d alarms, %d kept", synced.calls, synced.app, synced.n,
-          synced.n_keep);
+    const apps_store_name_t *full = synced_name(0, "full");
+    CHECK(n_syncs == 1 && strcmp(syncs[0].app, "clock") == 0 && syncs[0].n == 1 && full != NULL && full->state == APPS_STORE_GONE,
+          "clock's full is synced gone: its record goes: %d syncs, %s, %d names", n_syncs, syncs[0].app, syncs[0].n);
     apps_values_tick(60000);
-    CHECK(alarm_calls.arms == 4 && synced.calls == 1, "nothing more: %d armings, %d syncs", alarm_calls.arms, synced.calls);
+    CHECK(alarm_calls.arms == 4 && n_syncs == 1, "nothing more: %d armings, %d syncs", alarm_calls.arms, n_syncs);
+}
+
+/* #1: a record the budget can't take holds nothing up. With the budget overdrawn (a store-heavy app's end), timer's re-armed done is handed to
+ * the worker at once all the same (its old record goes there at once: apps_store.c), comes back to wait, and is synced again when the budget
+ * has room for its record, not before; meanwhile another app's cancel is synced at its own time (a drop needs no budget). */
+static void a_record_that_waits_for_the_budget_holds_no_other_sync(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    worker_answers = true;
+    clock_is_set = true;
+    alarm_calls.answer = APPS_ALARM_ARMED;
+    clock_at_ms(10000);
+    (void)apps_values_budget_take(APPS_VALUES_BUDGET_BYTES + 16 * 1024, true);  /* an app's end overdrew it by 16 KB */
+    static const char *const just_done[] = {"done"};
+    table_has("timer", 1, just_done, (const int64_t[]){120000}, (const bool[]){true}, (const bool[]){true});
+    (void)apps_port_alarm_arm("timer", "done", 120000, true, true);
+    apps_values_tick(10000 + APPS_VALUES_ALARM_DELAY_MS);
+    CHECK(n_pending == 1, "done's sync is handed over at once, whatever the budget: %d ops", n_pending);
+    worker_runs(1);
+    CHECK(n_syncs == 1 && syncs[0].n == 1 && syncs[0].waits == 1u && syncs[0].written == 0, "done had to wait for the budget: %d syncs", n_syncs);
+    /* The next round takes the worker's note: done waits for as long as the budget needs to have room for its record. */
+    clock_at_ms(12000);
+    int64_t wait = apps_values_budget_wait_ms(APPS_VALUES_RECORD_COST);
+    CHECK(wait > 600000, "about 11 minutes: %lld ms", (long long)wait);
+    apps_values_tick(12000);
+    CHECK(n_pending == 0, "nothing while it waits: %d ops", n_pending);
+    /* Another app's cancel goes through at its own time. */
+    apps_port_alarm_cancel("clock", "nap");
+    apps_values_tick(12000 + APPS_VALUES_ALARM_DELAY_MS);
+    CHECK(n_pending == 1, "clock's sync, while timer's waits: %d ops", n_pending);
+    worker_runs(1);
+    const apps_store_name_t *nap = synced_name(1, "nap");
+    CHECK(n_syncs == 2 && strcmp(syncs[1].app, "clock") == 0 && syncs[1].n == 1 && nap != NULL && nap->state == APPS_STORE_GONE,
+          "nap's record goes, with no budget: %d syncs", n_syncs);
+    /* done again, once the budget has room. */
+    clock_at_ms(12000 + wait - 1);
+    apps_values_tick(12000 + wait - 1);
+    CHECK(n_pending == 0, "not before the budget has room: %d ops", n_pending);
+    clock_at_ms(12000 + wait);
+    apps_values_tick(12000 + wait);
+    CHECK(n_pending == 1, "synced again once it has: %d ops", n_pending);
+    worker_runs(1);
+    const apps_store_name_t *done = synced_name(2, "done");
+    CHECK(n_syncs == 3 && syncs[2].n == 1 && done != NULL && done->state == APPS_STORE_ARMED && syncs[2].written == 1u,
+          "done's new record is written: %d syncs", n_syncs);
+    apps_values_tick(12000 + wait + 60000);
+    CHECK(n_pending == 0 && n_syncs == 3, "and nothing more: %d ops, %d syncs", n_pending, n_syncs);
+}
+
+/* #2: a remove (or a quarantine) of an app, on the worker, has the records the mount handed over for it forgotten at the next round
+ * (apps_values_forget_records): the app installed again under that id before the clock comes is armed nothing of the old one's, and nothing of
+ * it is synced. Another app's records are armed again. */
+static void a_removed_apps_records_are_not_armed_again(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    worker_answers = true;
+    clock_is_set = false;
+    alarm_calls.answer = APPS_ALARM_ARMED;
+    clock_at_ms(10000);
+    int64_t epoch = epoch_now_ms();
+    hand_over("timer", "a", epoch + 60000, true, true);
+    hand_over("timer", "b", epoch + 90000, false, true);
+    hand_over("clock", "c", epoch + 60000, true, false);
+    apps_values_tick(10000);
+    CHECK(log_has("I muse_apps: store: 3 alarm records wait for the clock"), "they wait for the clock");
+    apps_values_forget_records("timer");  /* the worker's remove of timer; the store has a timer again (a reinstall), and the clock comes */
+    clock_is_set = true;
+    clock_at_ms(20000);
+    apps_values_tick(20000);
+    int64_t ms = 0;
+    bool sound = false, wake = false;
+    CHECK(armed_as("timer", "a", &ms, &sound, &wake) == NULL && armed_as("timer", "b", &ms, &sound, &wake) == NULL,
+          "nothing of the removed timer's is armed");
+    CHECK(armed_as("clock", "c", &ms, &sound, &wake) != NULL && alarm_calls.arms == 1, "clock's is: %d armings", alarm_calls.arms);
+    CHECK(!log_has("I muse_apps: store: alarm timer/"), "no line of a re-arm of timer's");
+    apps_values_tick(30000);
+    CHECK(n_pending == 0 && n_syncs == 0, "and no sync: nothing of timer's was touched: %d ops, %d syncs", n_pending, n_syncs);
+}
+
+/* #4: a save is charged when the worker is handed it, and one the worker refuses gets its cost back, so the save that replaces it pays once.
+ * The tick's offer of a kept save is charged the same way, and refunded when the worker refuses it again. */
+static void a_refused_save_is_charged_once(void) {
+    fake_mode = APPS_STORAGE_FLASH;
+    clock_at_ms(10000);  /* the clock stands still: the budget doesn't fill in this case */
+    enum { LEN = 16000 };
+    char *json = malloc(LEN);
+    CHECK(json != NULL, "no memory");
+    if (json == NULL) {
+        return;
+    }
+    memset(json, 'x', LEN);
+    memcpy(json, "{\"x\":\"", 6);
+    json[LEN - 2] = '"';
+    json[LEN - 1] = '}';
+    const uint32_t cost = (uint32_t)(strlen("big") + 1 + LEN + APPS_VALUES_ENTRY_COST);
+    ops_refused = true;
+    CHECK(apps_port_store_save("big", json, LEN), "a refused save is kept: it says true");
+    CHECK(n_pending == 0 && apps_values_budget_wait_ms(APPS_VALUES_BUDGET_BYTES) == 0, "and costs nothing: the budget is full");
+    apps_values_tick(10000 + APPS_VALUES_RETRY_MS);
+    CHECK(n_pending == 0 && apps_values_budget_wait_ms(APPS_VALUES_BUDGET_BYTES) == 0, "the tick's offer, refused too, costs nothing");
+    ops_refused = false;
+    json[6] = 'y';
+    CHECK(apps_port_store_save("big", json, LEN), "the newer save");
+    CHECK(n_pending == 1, "the worker has it: %d ops", n_pending);
+    worker_runs(1);
+    CHECK(flash_saves == 1 && flash_app[0] != '\0', "written once: %d saves", flash_saves);
+    CHECK(apps_values_budget_wait_ms(APPS_VALUES_BUDGET_BYTES - cost) == 0 && apps_values_budget_wait_ms(APPS_VALUES_BUDGET_BYTES - cost + 1) > 0,
+          "charged once: the budget holds %u bytes less", (unsigned)cost);
+    free(json);
 }
 
 /* sys.battery()'s numbers are muse_state's, a percentage clamped to 0 to 100 and -1 for none. sys.wifi() is connected only when the
@@ -1731,6 +1862,9 @@ static const struct {
     {"untouched_records_wait_for_the_clock", untouched_records_wait_for_the_clock},
     {"a_touched_name_is_not_armed_again", a_touched_name_is_not_armed_again},
     {"rearm_retries_drops_and_clamps", rearm_retries_drops_and_clamps},
+    {"a_record_that_waits_for_the_budget_holds_no_other_sync", a_record_that_waits_for_the_budget_holds_no_other_sync},
+    {"a_removed_apps_records_are_not_armed_again", a_removed_apps_records_are_not_armed_again},
+    {"a_refused_save_is_charged_once", a_refused_save_is_charged_once},
 };
 
 int main(int argc, char **argv) {

@@ -755,13 +755,69 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertEqual(c_function(sources["apps_task.c"], "bool apps_task_compile(").count("apps_pkg_compile_order("), 1)
 
     def test_the_io_worker_is_on_core_0(self):  # Task 13's F4: never in front of the app task or LVGL on core 1
-        io = (MUSE / "apps/apps_io.c").read_text()
-        args = call_arguments(io, "xTaskCreatePinnedToCore")
-        self.assertEqual(len(args), 7, args)
+        io = strip_c_comments((MUSE / "apps/apps_io.c").read_text())
+        args = call_arguments(io, "xTaskCreatePinnedToCoreWithCaps")
+        self.assertEqual(len(args), 8, args)
         self.assertEqual(args[1], '"muse_apps_io"')
+        self.assertEqual(args[2], "APPS_IO_STACK")
         self.assertEqual(args[6], "APPS_IO_CORE")
+        self.assertEqual(args[7], "MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT")  # Task 20's R1: its stack in PSRAM (X18)
         header = dict(re.findall(r"^#define\s+(\w+)\s+(\S+)", (MUSE / "apps/apps_io.h").read_text(), re.M))
         self.assertEqual(header.get("APPS_IO_CORE"), "0")
+        self.assertEqual(header.get("APPS_IO_STACK"), "8192")
+
+    def test_the_io_worker_takes_no_internal_ram_to_be_made_or_to_go(self):  # Task 20's R1
+        # No internal-RAM admission is left, and the worker never deletes itself: IDF v6.0.1's vTaskDeleteWithCaps(NULL) makes a
+        # cleanup task in internal RAM and aborts when it can't. It parks, and the next submit deletes it, from that task.
+        io = strip_c_comments((MUSE / "apps/apps_io.c").read_text())
+        for gone in ("heap_caps_get_free_size", "heap_caps_get_largest_free_block", "APPS_IO_HEADROOM", "APPS_IO_BLOCK_MARGIN",
+                     "vTaskDelete(", "vTaskDeleteWithCaps(NULL)", "xTaskCreatePinnedToCore("):
+            with self.subTest(gone):
+                self.assertNotIn(gone, io)
+        self.assertIn("vTaskSuspend(NULL);", c_function(io, "static void worker(void *arg)"))
+        reap = c_function(io, "static void reap_locked(void)")
+        self.assertRegex(reap, r"eTaskGetState\(s_parked\) == eSuspended\)\s*\{\s*vTaskDeleteWithCaps\(s_parked\);")
+        header = (MUSE / "apps/apps_io.h").read_text()
+        for gone in ("APPS_IO_HEADROOM", "APPS_IO_BLOCK_MARGIN"):
+            with self.subTest(gone):
+                self.assertNotIn(gone, header)
+
+    def test_a_device_build_of_the_io_worker_needs_code_and_rodata_in_psram(self):  # Task 20's R1, X18: the #error
+        # The worker's stack is in PSRAM, and it writes flash: only safe while IDF keeps the cache on through a flash write, which
+        # CONFIG_SPIRAM_FETCH_INSTRUCTIONS and CONFIG_SPIRAM_RODATA together make it do (SPI_FLASH_CACHE_NO_DISABLE). A device build
+        # (ESP_PLATFORM) of apps_io.c stops at its #error without both; the host's builds don't look.
+        headers = ["freertos/FreeRTOS.h", "freertos/idf_additions.h", "freertos/queue.h", "freertos/semphr.h", "freertos/task.h",
+                   "esp_attr.h", "esp_err.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h", "lvgl.h"]
+        options = {"both": ["CONFIG_SPIRAM_FETCH_INSTRUCTIONS", "CONFIG_SPIRAM_RODATA"],
+                   "fetch only": ["CONFIG_SPIRAM_FETCH_INSTRUCTIONS"], "rodata only": ["CONFIG_SPIRAM_RODATA"], "neither": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            for name in headers:
+                (stage / name).parent.mkdir(parents=True, exist_ok=True)
+                (stage / name).write_text('#include "muse_apps_task_fakes.h"\n')
+            base = [*apps_host.cc(), "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", f"-I{stage}", f"-I{ROOT / 'tests'}",
+                    f"-I{MUSE / 'apps'}", str(MUSE / "apps/apps_io.c")]
+            for case, defined in options.items():
+                with self.subTest(case):
+                    (stage / "sdkconfig.h").write_text("".join(f"#define {name} 1\n" for name in defined))
+                    done = subprocess.run([*base, "-DESP_PLATFORM"], capture_output=True, text=True)
+                    if case == "both":
+                        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    else:
+                        self.assertNotEqual(done.returncode, 0, "built without both options")
+                        self.assertIn("set CONFIG_SPIRAM_FETCH_INSTRUCTIONS and CONFIG_SPIRAM_RODATA (X18)", done.stderr)
+            (stage / "sdkconfig.h").write_text("")
+            done = subprocess.run(base, capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, "the host's build: " + done.stdout + done.stderr)
+
+    def test_the_175c_runs_code_and_rodata_from_psram(self):  # Task 20's R1, X18: what apps_io.c's #error asks for
+        overlay = (ROOT / "devices/sdkconfig.muse-waveshare-s3-175c").read_text()
+        for option in ("CONFIG_SPIRAM_FETCH_INSTRUCTIONS", "CONFIG_SPIRAM_RODATA"):
+            with self.subTest(option):
+                self.assertRegex(overlay, rf"(?m)^{option}=y$")
+                # Nothing else the apps build loads (board.sh: defaults, muse, the board's, muse-apps, muse-bench) turns it off.
+                for other in ("sdkconfig.defaults", "devices/sdkconfig.muse", "devices/sdkconfig.muse-apps", "devices/sdkconfig.muse-bench"):
+                    self.assertNotRegex((ROOT / other).read_text(), rf"(?m)^(# {option} is not set|{option}=n)$", other)
 
     def test_sntp_left_the_clock(self):  # Task 16: the watch and the apps' time module share one SNTP helper
         clock = strip_c_comments((MUSE / "muse_clock.c").read_text())

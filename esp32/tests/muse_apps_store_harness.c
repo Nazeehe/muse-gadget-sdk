@@ -1198,6 +1198,73 @@ static void list_carries_icon_paths(void) {
     CHECK(listed_n == 2 && strcmp(listed[1].id, "plain") == 0 && listed[1].icon[0] == '\0', "plain lists none: '%s'", listed[1].icon);
 }
 
+/* The launcher's icons (apps_icons.c) read an app's file on the worker: APPS_STORE_BASE/<id>/<path>, at most max bytes, into a block
+ * of the apps' heap (through its floor) with a NUL after it. Every refusal leaves nothing held and *out NULL. */
+static void read_file_reads_an_apps_file(void) {
+    mkdir("apps_fs/art", 0777);
+    put_app_icon("apps_fs/art", "art", "Art", "img/icon.bin");
+    spit("apps_fs/art/img/icon.bin", "ICONBYTES");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    long held = blocks_held;
+    uint8_t *data = NULL;
+    size_t len = 0;
+    char err[128] = "?";
+    CHECK(apps_store_read_file("art", "img/icon.bin", 64, &data, &len, err, sizeof err) && err[0] == '\0', "read: '%s'", err);
+    CHECK(data != NULL && len == 9 && memcmp(data, "ICONBYTES", 10) == 0, "its bytes, and a NUL after them");
+    CHECK(blocks_held == held + 1, "one block of the apps' heap");
+    apps_port_free(data);
+    CHECK(apps_store_read_file("art", "img/icon.bin", 9, &data, &len, err, sizeof err) && len == 9, "max is the most it may have");
+    apps_port_free(data);
+
+    struct {
+        const char *id, *path;
+        size_t max;
+        const char *says;  /* what err holds (its start) */
+    } refused[] = {
+        {"art", "img/icon.bin", 8, "larger than 0 KB"},
+        {"art", "img/none.bin", 64, strerror(ENOENT)},
+        {"nobody", "img/icon.bin", 64, APPS_STORE_NO_SUCH_APP},
+        {"Art", "img/icon.bin", 64, APPS_STORE_NO_SUCH_APP},
+        {NULL, "img/icon.bin", 64, APPS_STORE_NO_SUCH_APP},
+        {"art", "../art/img/icon.bin", 64, "not a path an app's file may have"},
+        {"art", "/etc/hosts", 64, "not a path an app's file may have"},
+        {"art", NULL, 64, "not a path an app's file may have"},
+    };
+    for (size_t i = 0; i < sizeof refused / sizeof refused[0]; i++) {
+        data = (uint8_t *)err;
+        len = 7;
+        CHECK(!apps_store_read_file(refused[i].id, refused[i].path, refused[i].max, &data, &len, err, sizeof err),
+              "refusal %zu is refused", i);
+        CHECK(data == NULL && len == 0, "refusal %zu: nothing out", i);
+        CHECK(strncmp(err, refused[i].says, strlen(refused[i].says)) == 0, "refusal %zu: '%s', not '%s'", i, err, refused[i].says);
+    }
+    alloc_refuse_all = true;  /* the floor */
+    CHECK(!apps_store_read_file("art", "img/icon.bin", 64, &data, &len, err, sizeof err) && data == NULL && len == 0,
+          "the floor refused the block: refused");
+    alloc_refuse_all = false;
+    CHECK(strcmp(err, "out of memory") == 0, "out of memory: '%s'", err);
+    CHECK(blocks_held == held, "nothing held: %ld", blocks_held - held);
+}
+
+/* Only the flash store has files: before the mount, and in RAM mode, nothing is read. */
+static void read_file_needs_the_flash_store(void) {
+    uint8_t *data = NULL;
+    size_t len = 0;
+    char err[128];
+    CHECK(!apps_store_read_file("art", "icon.bin", 64, &data, &len, err, sizeof err) && strcmp(err, "storage not ready") == 0,
+          "before the mount: '%s'", err);
+    has_apps_partition = false;
+    CHECK(apps_store_mount() == APPS_STORAGE_RAM, "RAM mode");
+    const file_t files[] = {{"main.lua", "-- main\n"}};
+    apps_pkg_t *p = make_pkg("art", "Art", "1", 1, files);
+    bool unchanged;
+    CHECK(apps_store_commit(p, &unchanged, err, sizeof err), "kept in RAM: %s", err);
+    free_pkg(p);
+    CHECK(!apps_store_read_file("art", "main.lua", 64, &data, &len, err, sizeof err) && data == NULL && len == 0,
+          "RAM mode has no files to read");
+    CHECK(strcmp(err, "the apps are kept in RAM") == 0, "'%s'", err);
+}
+
 /* The list isn't cut at the launcher's old eight: every app the store keeps (up to 32) is in it. */
 static void list_has_every_app(void) {
     char dir[64], id[16];
@@ -2216,6 +2283,8 @@ static const case_t CASES[] = {
     {"list_reads_names", list_reads_names},
     {"list_carries_icon_paths", list_carries_icon_paths},
     {"list_has_every_app", list_has_every_app},
+    {"read_file_reads_an_apps_file", read_file_reads_an_apps_file},
+    {"read_file_needs_the_flash_store", read_file_needs_the_flash_store},
     {"a_refused_list_block_publishes_nothing", a_refused_list_block_publishes_nothing},
     {"unordered_tail_is_alphabetical_by_name", unordered_tail_is_alphabetical_by_name},
     {"unchanged_skips_commit", unchanged_skips_commit},

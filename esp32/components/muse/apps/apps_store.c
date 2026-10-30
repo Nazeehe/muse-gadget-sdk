@@ -1764,6 +1764,38 @@ bool apps_store_load(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
     }
 }
 
+bool apps_store_read_file(const char *id, const char *path, size_t max, uint8_t **out, size_t *len, char *err, size_t n) {
+    *out = NULL;
+    *len = 0;
+    switch (s_kind) {
+    case APPS_STORAGE_FLASH:
+        break;
+    case APPS_STORAGE_RAM:
+        put_err(err, n, "the apps are kept in RAM");
+        return false;
+    default:
+        put_err(err, n, "storage not ready");
+        return false;
+    }
+    if (!apps_id_valid(id) || !installed(id)) {
+        put_err(err, n, APPS_STORE_NO_SUCH_APP);
+        return false;
+    }
+    if (!apps_path_valid(path)) {  /* no "..", no leading '/': the path stays in the app's folder */
+        put_err(err, n, "not a path an app's file may have");
+        return false;
+    }
+    char file[PATH_CAP];
+    path_of(file, id, path);  /* an id and a path the checks pass fit (PATH_CAP) */
+    char *data;
+    if (!read_file(file, max, &data, len, err, n)) {
+        return false;
+    }
+    put_err(err, n, "%s", "");
+    *out = (uint8_t *)data;
+    return true;
+}
+
 bool apps_store_manifest(const char *id, apps_manifest_t *m) {
     memset(m, 0, sizeof *m);
     switch (s_kind) {

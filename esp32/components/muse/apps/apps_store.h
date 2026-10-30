@@ -205,6 +205,13 @@ bool apps_store_load(const char *id, apps_pkg_t *pkg, char *err, size_t n);
  * (apps_manifest_clear(m, apps_port_free)). False, with m zeroed, when there is none. */
 bool apps_store_manifest(const char *id, apps_manifest_t *m);
 
+/* FLASH: the file path of the app id (APPS_STORE_BASE/<id>/<path>) into a block of apps_port_realloc, through its floor, with a NUL
+ * after its *len bytes, for the caller to free with apps_port_free: the launcher's icons (apps_icons.h). False, with *out NULL, *len 0
+ * and why in err: APPS_STORE_NO_SUCH_APP (an id that isn't valid or installed), "not a path an app's file may have", the file's
+ * own error (strerror's), "larger than <max / 1024> KB" (no block is asked for), "out of memory" (the floor or the heap refused),
+ * "storage not ready" before the mount, or "the apps are kept in RAM" (RAM mode keeps no files). */
+bool apps_store_read_file(const char *id, const char *path, size_t max, uint8_t **out, size_t *len, char *err, size_t n);
+
 /* ---- Any task: what the mount and the worker's changes cache ---- */
 
 /* Up to max of the apps, in the launcher's order (RAM: most recently used, as the RAM store keeps them); returns how many. 0 before

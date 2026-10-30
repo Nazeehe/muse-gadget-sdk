@@ -98,6 +98,12 @@ class Store(unittest.TestCase):
     def test_list_has_every_app(self):  # twelve, where the launcher's list once stopped at eight
         self.run_case("list_has_every_app")
 
+    def test_read_file_reads_an_apps_file(self):  # the launcher's icons: <id>/<path>, capped, through the floor
+        self.run_case("read_file_reads_an_apps_file")
+
+    def test_read_file_needs_the_flash_store(self):  # before the mount and in RAM mode there is no file to read
+        self.run_case("read_file_needs_the_flash_store")
+
     def test_a_refused_list_block_publishes_nothing(self):  # the list is built in PSRAM, not on the worker's stack
         self.run_case("a_refused_list_block_publishes_nothing")
 

@@ -187,6 +187,7 @@ class VmFileTest(unittest.TestCase):
         (staged / "freertos").mkdir()
         (staged / "freertos" / "task.h").write_text(TASK.format(fake=TESTS / "link_fakes/freertos/task.h"))
         (staged / "freertos" / "idf_additions.h").write_text(IDF_ADDITIONS)
+        cls.include_dirs = [staged, TESTS / "image_fetch_fakes", TESTS / "link_fakes", MAIN]
         wrapped = root / "vm_file.c"
         wrapped.write_text(WRAPPER.format(source=MAIN / "vm_file.c"))
         wrapped_image = root / "image_fetch.c"
@@ -651,11 +652,12 @@ class VmFileTest(unittest.TestCase):
         out = self.run_case("image_on_an_idle_board", board="image_apps")
         self.assertEqual(out.one("idle"), "1  |  | 5")
         self.assertEqual(out.one("dma"), "1")
-        # It says what DMA RAM it saw, in bytes: before, the lowest during, after, and the lowest since boot.
-        m = re.fullmatch(r"I link\.image: image download dma: (\d+) free before, (\d+) lowest during, "
-                         r"(\d+) after, (\d+) lowest since boot", out.one("dmalog"))
+        # It says what DMA RAM it saw, in bytes: before, the least it saw at its reads, after, and IDF's lowest
+        # since boot before and after (the true floor, when it moved).
+        m = re.fullmatch(r"I link\.image: image download dma: (\d+) free before, (\d+) lowest at reads, "
+                         r"(\d+) after; lowest since boot (\d+) before, (\d+) after", out.one("dmalog"))
         self.assertIsNotNone(m, out.one("dmalog"))
-        before, lowest, after, _ = (int(n) for n in m.groups())
+        before, lowest, after, _, _ = (int(n) for n in m.groups())
         self.assertLessEqual(lowest, before)
         self.assertGreaterEqual(lowest, RESERVE)
         self.assertGreater(after, lowest)
@@ -669,6 +671,9 @@ class VmFileTest(unittest.TestCase):
         request = len("/fs/raw/pic.raw") + 64              # what the reader counts for the queued GET
         path = len("/fs/raw/") + 3 * len("pic.raw") + 1 + ALLOC_COST    # its copy of the request path
         self.assertEqual(int(out.one("admitted")), RESERVE + VM_RESERVE + request + tcb + path)
+        # With exactly that, it starts while the last download's task is still parked: the start deletes it
+        # before it counts, so the TCB isn't counted twice.
+        self.assertEqual(out.one("after_a_parked_task"), "1 1 ")
         # Elsewhere the stack and the pool are internal, and counted: more than 9 KB more.
         plain = self.run_case("image_admission", board="image")
         self.assertGreater(int(plain.one("admitted")) - int(out.one("admitted")), STACK + POOL - tcb)
@@ -676,7 +681,7 @@ class VmFileTest(unittest.TestCase):
     def test_a_download_needs_a_block_for_its_tcb(self):
         # On apps builds the only block of internal RAM a download needs of its own is its task's TCB.
         out = self.run_case("image_needs_a_block_for_its_tcb", board="image_apps")
-        tcb = 100 + ALLOC_COST
+        tcb = int(out.one("tcb")) + ALLOC_COST
         self.assertEqual(out.all("tcb_block"), [f"{tcb - 1} 0 out_of_memory | failed to allocate", f"{tcb} 1  | "])
 
     def test_the_download_keeps_its_memory_in_psram(self):
@@ -702,9 +707,10 @@ class VmFileTest(unittest.TestCase):
         # aborts when there is none: it parks, and the next start deletes it, with its TCB and stack, before it
         # counts anything, whether that start is a download, one refused, or a URL's.
         out = self.run_case("image_task_parks", board="image_apps")
-        self.assertEqual(out.one("first"), f"1 {100 + ALLOC_COST} {STACK + ALLOC_COST}")
+        tcb = int(out.one("tcb")) + ALLOC_COST
+        self.assertEqual(out.one("first"), f"1 {tcb} {STACK + ALLOC_COST}")
         self.assertEqual(out.one("second"), "2 1")
-        self.assertEqual(out.one("after_second"), f"1 {100 + ALLOC_COST} {STACK + ALLOC_COST}")
+        self.assertEqual(out.one("after_second"), f"1 {tcb} {STACK + ALLOC_COST}")
         self.assertEqual(out.one("url"), "out_of_memory | not enough free memory for a download | 2")
         self.assertEqual(out.one("after_url"), "0 0 0")
         # Elsewhere the task deletes itself, and holds nothing after.
@@ -735,27 +741,89 @@ class VmFileTest(unittest.TestCase):
                       "noise_ctrl_req_open", "noise_ctrl_req_cancel"):
             self.assertNotRegex(source, rf"\b{moved}\b", f"{moved} was moved to vm_file.c, not copied")
 
-    def test_the_psram_download_task_is_safe(self):
-        # The code, without its comments (which name what it must not do).
-        source = re.sub(r"//[^\n]*|/\*.*?\*/", "", (MAIN / "image_fetch.c").read_text(), flags=re.S)
+    def preprocess(self, *defines):
+        """image_fetch.c's own code as the compiler sees it (its headers' lines left out, comments gone), with the
+        harness's headers and these options."""
+        source = MAIN / "image_fetch.c"
+        cmd = [*apps_host.cc(), "-E", "-std=c11", *(f"-I{d}" for d in self.include_dirs),
+               "-DCONFIG_HOMEHUB_DAEMON_REQUESTS=1", "-DCONFIG_SPIRAM=1", "-DCONFIG_HOMEHUB_DISPLAY_COMMANDS=1",
+               "-DLINK_FAKE_CUSTOM_TASKS", "-DLINK_FAKE_CUSTOM_HEAP_CAPS", *(f"-D{d}" for d in defines), str(source)]
+        done = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        own, lines = False, []
+        for line in done.stdout.splitlines():
+            marker = re.match(r'# \d+ "([^"]*)"', line)
+            if marker:
+                own = Path(marker.group(1)).name == source.name
+            elif own:
+                lines.append(line)
+        return "\n".join(lines)
 
-        def has(pattern):
-            return re.search(pattern, source) is not None
-
-        # Only apps builds change: elsewhere the download is what it was (X5).
-        self.assertTrue(has(r"#if CONFIG_MUSE_APPS\b"), "the PSRAM download isn't under CONFIG_MUSE_APPS")
-        self.assertTrue(has(r"#define PSRAM_CAPS\s+\(MALLOC_CAP_SPIRAM \| MALLOC_CAP_8BIT\)"), "PSRAM_CAPS")
-        self.assertTrue(has(r"xTaskCreateWithCaps\(fetch_task,[^;]*PSRAM_CAPS\)"), "the task's stack isn't PSRAM")
+    def test_without_apps_the_download_is_what_it_was(self):
+        # X5: everything of the PSRAM download (the task with caps, the park and the reap, the placement, the DMA
+        # samples and their log line) is under CONFIG_MUSE_APPS. Without it none of it is compiled: the URL and VM
+        # downloads allocate with malloc/calloc and make their task with xTaskCreate, as before. (The proof that
+        # the file preprocesses exactly as it did at e5fc3ed with the board's flags is in Task 27a's fix report.)
+        apps_only = ("image download dma", "note_dma", "log_dma", "s_dma", "s_parked", "begin_download",
+                     "park_task", "vTaskSuspend", "xTaskGetCurrentTaskHandle", "xTaskCreateWithCaps",
+                     "vTaskDeleteWithCaps", "heap_caps_calloc", "StaticTask_t", "fetch_malloc", "fetch_calloc",
+                     "fetch_task_create")
+        plain = self.preprocess()
+        for name in apps_only:
+            self.assertNotIn(name, plain, f"{name} is compiled without CONFIG_MUSE_APPS")
+        self.assertIn("malloc(4 * row_bytes)", plain)
+        self.assertIn("malloc(3100)", plain)
+        self.assertIn("calloc(1, sizeof(*f))", plain)
+        self.assertIn('xTaskCreate(fetch_task, "image", stack, f, 4, ', plain)   # NULL is expanded
+        apps = self.preprocess("CONFIG_MUSE_APPS=1", "CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=1")
+        for name in apps_only:
+            self.assertIn(name, apps, f"{name} isn't compiled with CONFIG_MUSE_APPS")
         # A task with caps that deletes itself makes IDF start a cleanup task in internal RAM, and abort without
         # one: the download's task parks, and the next start deletes it.
-        self.assertFalse(has(r"vTaskDeleteWithCaps\(\s*NULL\s*\)"), "the PSRAM task deletes itself")
-        self.assertTrue(has(r"vTaskDeleteWithCaps\(s_parked\)"), "nothing deletes the parked task")
-        # A task with a PSRAM stack must not write flash (safe on the 1.75C anyway, X18): this one writes none.
-        for flash in (r"\bnvs_", r"esp_partition_write", r"esp_flash_write", r"\bfopen\(", r"\bfwrite\("):
-            self.assertFalse(has(flash), f"image_fetch.c calls {flash}")
-        # What the screen is handed is copied, never kept or sent to the panel from there: on boards with the
-        # full UI into the image's PSRAM buffer, which LVGL draws from (the panel's DMA reads only the fixed
-        # internal buffers of muse_lcd_bands.c).
+        self.assertNotRegex(apps, r"vTaskDeleteWithCaps\(\s*((void\s*\*)\s*)?0?\s*(NULL)?\s*\)")
+        self.assertIn("vTaskDeleteWithCaps(s_parked)", apps)
+        self.assertRegex(apps, r"xTaskCreateWithCaps\(fetch_task,[^;]*\(1 \| 2\)\)")   # MALLOC_CAP_SPIRAM|8BIT
+
+    def test_the_psram_stack_task_writes_no_flash(self):
+        # A task with a PSRAM stack must not write flash (it would be safe on the 1.75C anyway, X18). Scanned: all of
+        # image_fetch.c and vm_file.c (the reader runs on that task; its writer is in the same file), and what the
+        # task calls elsewhere: the screen (led_status_draw_rect/_done and muse_ui_image_draw/_done), the wake
+        # (muse_state_set_asleep, muse_state_poke) and the result (draw_url_done, noise_ctrl_send_command_result,
+        # queue_result). Not scanned: the ROM JPEG decoder (ROM code, pure compute on its pool), and IDF and FreeRTOS
+        # (queues, semaphores, the heap, the log).
+        flash = re.compile(r"\bnvs_\w+\(|\besp_partition_(write|erase)\w*\(|\besp_flash_(write|erase)\w*\(|"
+                           r"\bspi_flash_\w+\(|\bf(open|write|flush|sync)\(|\b(unlink|rename|remove|mkdir)\(|"
+                           r"\bmuse_settings_\w*(set|save)\w*\(")
+
+        def code(path):
+            return re.sub(r"//[^\n]*|/\*.*?\*/", "", (ROOT / path).read_text(), flags=re.S)
+
+        def body(path, name):
+            text = code(path)
+            m = re.search(rf"\n[^\n;{{}}]*\b{name}\([^;{{]*\)\s*\{{", text)
+            self.assertIsNotNone(m, f"{name} not found in {path}")
+            depth, i = 0, m.end() - 1
+            for j in range(i, len(text)):
+                depth += {"{": 1, "}": -1}.get(text[j], 0)
+                if depth == 0:
+                    return text[i:j + 1]
+            self.fail(f"{name} in {path} doesn't end")
+
+        scanned = {"main/image_fetch.c": code("main/image_fetch.c"), "main/vm_file.c": code("main/vm_file.c")}
+        for path, names in (("main/led_status.c", ("led_status_draw_rect", "led_status_draw_done")),
+                            ("components/muse/muse_ui.c", ("muse_ui_image_draw", "muse_ui_image_done")),
+                            ("components/muse/muse_state.c", ("muse_state_set_asleep", "muse_state_poke")),
+                            ("main/app.c", ("draw_url_done",)),
+                            ("main/noise_control.cpp", ("noise_ctrl_send_command_result", "queue_result"))):
+            for name in names:
+                scanned[f"{path}:{name}"] = body(path, name)
+        for where, text in scanned.items():
+            self.assertIsNone(flash.search(text), f"{where} writes flash: {flash.search(text)}")
+
+    def test_what_the_screen_is_handed_is_copied(self):
+        # Never kept or sent to the panel from there: on boards with the full UI it is copied into the image's PSRAM
+        # buffer, which LVGL draws from, and the panel's DMA reads only the fixed internal buffers of
+        # muse_lcd_bands.c. So the download's rows and MCU buffer may be PSRAM.
         ui = (ROOT / "components/muse/muse_ui.c").read_text()
         draw = ui[ui.index("bool muse_ui_image_draw("):]
         draw = draw[:draw.index("\n}\n")]

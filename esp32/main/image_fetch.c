@@ -47,19 +47,20 @@
 //   - The task writes no flash and calls nothing that turns the cache off (and on the 1.75C a
 //     flash write leaves it on: ruling X18).
 // What stays internal is the task's TCB, which IDF allocates there whatever the stack's caps.
-// A download from a URL is unchanged: TLS keeps its internal stack.
+// A download from a URL keeps its internal stack and buffers (TLS runs on that stack); its start
+// deletes the last VM download's parked task too, and it logs the same DMA line.
+// Everything for this is under VM_IN_PSRAM: without CONFIG_MUSE_APPS the file compiles to what it
+// was (X5).
 #if CONFIG_MUSE_APPS
 #include "freertos/idf_additions.h"
 #if !CONFIG_SPIRAM || !CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
 #error "image_fetch.c: apps builds put the download task's stack in PSRAM: set CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY"
 #endif
 #define VM_IN_PSRAM 1
+#define PSRAM_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #else
 #define VM_IN_PSRAM 0
 #endif
-#define PSRAM_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-// Does this download keep its stack and buffers in PSRAM?
-#define IN_PSRAM(vm) (VM_IN_PSRAM && (vm))
 
 static const char *TAG = "link.image";
 
@@ -130,9 +131,6 @@ typedef struct {
     // JPEG output placement and one MCU converted for the panel.
     int x0, y0;
     uint16_t mcu[JPEG_MCU_PIXELS];
-    // DMA-capable RAM free when the download was asked for, and the least seen at each read since:
-    // the Link's TX needs NOISE_TX_DMA_RESERVE_BYTES of it.
-    size_t dma_before, dma_low;
 } fetch_t;
 
 // Boards with the full UI also take IMAGE_FETCH_CENTRE, which centres a JPEG down the
@@ -148,11 +146,6 @@ typedef struct {
 #define TOP_ROW(f) (CENTRED(f) ? 0 : (f)->row)
 
 static atomic_bool s_busy;
-#if VM_IN_PSRAM
-// The last download in PSRAM's task, parked (suspended) at its end, or NULL. Written by that task
-// before it lets s_busy go, and read and cleared by the start() that takes s_busy next.
-static TaskHandle_t s_parked;
-#endif
 
 // Byte-addressable internal RAM. MALLOC_CAP_INTERNAL alone also counts
 // IRAM that only takes 32-bit accesses, which malloc() never hands out.
@@ -162,20 +155,38 @@ static size_t internal_free(void) {
     return heap_caps_get_free_size(BYTE_CAPS);
 }
 
-static void note_dma(fetch_t *f) {
+#if VM_IN_PSRAM
+// The last VM download's task, parked (suspended) at its end, or NULL. Written by that task
+// before it lets s_busy go, and read and cleared by the start() that takes s_busy next.
+static TaskHandle_t s_parked;
+
+// DMA-capable RAM, which the Link's TX needs NOISE_TX_DMA_RESERVE_BYTES of, around the download
+// that holds s_busy: free when it was asked for, the least free seen at its reads (a sample, not
+// a floor: what a read allocates and frees in between isn't seen), and IDF's lowest since boot
+// when it was asked for. The lowest since boot at its end, if lower, is the true floor of the
+// download (or of whatever else ran meanwhile).
+static struct {
+    size_t before, at_reads, min_before;
+} s_dma;
+
+static void note_dma(void) {
     size_t free_now = heap_caps_get_free_size(MALLOC_CAP_DMA);
-    if (free_now < f->dma_low) f->dma_low = free_now;
+    if (free_now < s_dma.at_reads) s_dma.at_reads = free_now;
 }
 
-// A download's own buffer: PSRAM for one that keeps its memory there.
-static void *fetch_alloc(const fetch_t *f, size_t size) {
-#if VM_IN_PSRAM
-    if (IN_PSRAM(f->vm)) return heap_caps_malloc(size, PSRAM_CAPS);
-#else
-    (void)f;
-#endif
-    return malloc(size);
+// Where a download's memory goes: a file from the VM's in PSRAM, a URL's where it always was.
+static void *fetch_malloc(bool vm, size_t size) {
+    return vm ? heap_caps_malloc(size, PSRAM_CAPS) : malloc(size);
 }
+
+static void *fetch_calloc(bool vm, size_t count, size_t size) {
+    return vm ? heap_caps_calloc(count, size, PSRAM_CAPS) : calloc(count, size);
+}
+#else
+// A download's memory, and its task (below), are where they always were.
+#define fetch_malloc(vm, size) malloc(size)
+#define fetch_calloc(vm, count, size) calloc(count, size)
+#endif
 
 static void log_memory(const char *stage) {
     ESP_LOGI(TAG, "%s: int=%uK/%uK min=%uK dma=%uK/%uK min=%uK", stage,
@@ -204,7 +215,9 @@ static bool within_deadline(fetch_t *f) {
 // Read up to `len` bytes, waiting for all of them unless the body ends.
 // Returns the count read, or -1 on a network error, low memory or timeout.
 static int fetch_read(fetch_t *f, uint8_t *buf, size_t len) {
-    note_dma(f);
+#if VM_IN_PSRAM
+    note_dma();
+#endif
     size_t have = 0;
     while (have < len && f->peek_len) {
         buf[have++] = f->peek[0];
@@ -237,7 +250,7 @@ static int fetch_read(fetch_t *f, uint8_t *buf, size_t len) {
 
 static const char *draw_raw(fetch_t *f, int *rows_drawn) {
     const size_t row_bytes = (size_t)f->width * sizeof(uint16_t);
-    uint8_t *buf = fetch_alloc(f, RAW_ROWS * row_bytes);
+    uint8_t *buf = fetch_malloc(f->vm, RAW_ROWS * row_bytes);
     if (!buf) return "out of memory";
     const char *err = NULL;
     int y = TOP_ROW(f);
@@ -301,7 +314,7 @@ static UINT jpeg_out(JDEC *jd, void *bitmap, JRECT *rect) {
 }
 
 static const char *draw_jpeg(fetch_t *f, int *out_w, int *out_h, int *out_scale) {
-    void *pool = fetch_alloc(f, JPEG_POOL_BYTES);
+    void *pool = fetch_malloc(f->vm, JPEG_POOL_BYTES);
     if (!pool) return "out of memory";
     const char *err = NULL;
     JDEC jd;
@@ -441,32 +454,36 @@ static bool timed_out(const fetch_t *f) {
     return f->timed_out || (f->file && vm_file_timed_out(f->file));
 }
 
-// The download's end: s_busy goes last. A task with its stack in PSRAM can't delete itself:
-// vTaskDeleteWithCaps(NULL) makes a cleanup task in internal RAM, and aborts when it can't. It
-// parks instead, suspended for good, and the next start() deletes it (reap_parked).
-static void end_task(bool park) {
 #if VM_IN_PSRAM
-    if (park) {
-        s_parked = xTaskGetCurrentTaskHandle();
-        atomic_store(&s_busy, false);   // after s_parked: the start() that takes the flag sees it
-        for (;;) vTaskSuspend(NULL);
+// A start() that has taken s_busy: deletes the last VM download's parked task, freeing its stack
+// and TCB, before anything is counted, and notes the DMA RAM. That task may not have suspended
+// itself yet, having just let s_busy go: then vTaskDeleteWithCaps suspends it and waits until it
+// is off its core, and it holds no lock by then.
+static void begin_download(void) {
+    if (s_parked) {
+        vTaskDeleteWithCaps(s_parked);
+        s_parked = NULL;
     }
-#else
-    (void)park;
-#endif
-    atomic_store(&s_busy, false);
-    vTaskDelete(NULL);
+    s_dma.before = s_dma.at_reads = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    s_dma.min_before = heap_caps_get_minimum_free_size(MALLOC_CAP_DMA);
 }
 
-#if VM_IN_PSRAM
-// Deletes the parked task of the last download in PSRAM, freeing its stack and TCB. Only with
-// s_busy held. It may not have suspended itself yet, having just let s_busy go: then
-// vTaskDeleteWithCaps suspends it and waits until it is off its core, and it holds no lock by
-// then.
-static void reap_parked(void) {
-    if (!s_parked) return;
-    vTaskDeleteWithCaps(s_parked);
-    s_parked = NULL;
+static void log_dma(void) {
+    note_dma();
+    ESP_LOGI(TAG, "image download dma: %u free before, %u lowest at reads, %u after; "
+             "lowest since boot %u before, %u after",
+             (unsigned)s_dma.before, (unsigned)s_dma.at_reads,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA), (unsigned)s_dma.min_before,
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA));
+}
+
+// The end of a VM download's task. A task with its stack in PSRAM can't delete itself:
+// vTaskDeleteWithCaps(NULL) makes a cleanup task in internal RAM, and aborts when it can't. It
+// parks instead, suspended for good, and the next start() deletes it (begin_download).
+static void park_task(void) {
+    s_parked = xTaskGetCurrentTaskHandle();
+    atomic_store(&s_busy, false);   // after s_parked: the start() that takes the flag sees it
+    for (;;) vTaskSuspend(NULL);
 }
 #endif
 
@@ -526,17 +543,29 @@ static void fetch_task(void *arg) {
              result.width, result.height, result.scale, (unsigned)result.bytes, result.ms,
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
     log_memory("image download end");
-    note_dma(f);
-    ESP_LOGI(TAG, "image download dma: %u free before, %u lowest during, %u after, %u lowest since boot",
-             (unsigned)f->dma_before, (unsigned)f->dma_low,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA));
+#if VM_IN_PSRAM
+    log_dma();
+    bool park = f->vm;
+#endif
     f->done(&result, f->user);
-    bool park = IN_PSRAM(f->vm);
     free(f->url);
     free(f);
-    end_task(park);
+#if VM_IN_PSRAM
+    if (park) park_task();   // doesn't return
+#endif
+    atomic_store(&s_busy, false);
+    vTaskDelete(NULL);
 }
+
+#if VM_IN_PSRAM
+// A file from the VM's task has its stack in PSRAM; a URL's keeps its internal one.
+static BaseType_t fetch_task_create(bool vm, size_t stack, fetch_t *f) {
+    return vm ? xTaskCreateWithCaps(fetch_task, "image", stack, f, 4, NULL, PSRAM_CAPS)
+              : xTaskCreate(fetch_task, "image", stack, f, 4, NULL);
+}
+#else
+#define fetch_task_create(vm, stack, f) xTaskCreate(fetch_task, "image", stack, f, 4, NULL)
+#endif
 
 static bool start(const char *target, bool vm, int row, image_fetch_done_cb done,
                   void *user, const char **code, const char **message) {
@@ -574,9 +603,8 @@ static bool start(const char *target, bool vm, int row, image_fetch_done_cb done
         return false;
     }
 #if VM_IN_PSRAM
-    reap_parked();   // before anything is counted: its TCB is internal RAM
+    begin_download();
 #endif
-    size_t dma_before = heap_caps_get_free_size(MALLOC_CAP_DMA);
 
     size_t stack = https ? FETCH_TLS_STACK : FETCH_STACK_BYTES;
     size_t need = stack + FETCH_RESERVE_BYTES
@@ -592,32 +620,32 @@ static bool start(const char *target, bool vm, int row, image_fetch_done_cb done
         return false;
     }
 
-#if VM_IN_PSRAM
-    fetch_t *f = IN_PSRAM(vm) ? heap_caps_calloc(1, sizeof(*f), PSRAM_CAPS) : calloc(1, sizeof(*f));
-#else
-    fetch_t *f = calloc(1, sizeof(*f));
-#endif
+    fetch_t *f = fetch_calloc(vm, 1, sizeof(*f));
     if (f && !vm) f->url = strdup(target);
     bool allocated = f && (vm || f->url);
     if (allocated && vm) {
         // The reader counts what the download will take from internal RAM (`keep`)
         // with the Noise session's margin and the request, and says why in code and
-        // message if it can't open: out of memory, or busy with an app install. Each
-        // part also needs a block of its own, after the range buffer took its share.
+        // message if it can't open: out of memory, or busy with an app install.
 #if VM_IN_PSRAM
-        // In PSRAM, that is only the task's TCB.
-        size_t keep = TASK_TCB_BYTES, block_need = TASK_TCB_BYTES;
+        // In PSRAM that is its task's TCB, which also needs a block of its own.
+        size_t block_need = TASK_TCB_BYTES;
+        f->file = vm_file_open(name, TASK_TCB_BYTES, VM_FILE_OWNER_IMAGE, code, message);
 #else
-        // The stack and the decoder's pool or the rows.
+        // The stack and the drawing memory.
         size_t draw = vm_draw_bytes(width);
-        size_t keep = stack + draw, block_need = stack > draw ? stack : draw;
+        f->file = vm_file_open(name, stack + draw, VM_FILE_OWNER_IMAGE, code, message);
 #endif
-        f->file = vm_file_open(name, keep, VM_FILE_OWNER_IMAGE, code, message);
         if (!f->file) {
             free(f);
             atomic_store(&s_busy, false);
             return false;
         }
+#if !VM_IN_PSRAM
+        // The stack and the decoder's pool or the rows each need a block of their
+        // own, after the range buffer took its share.
+        size_t block_need = stack > draw ? stack : draw;
+#endif
         if (heap_caps_get_largest_free_block(BYTE_CAPS) < block_need) {
             vm_file_close(f->file);
             f->file = NULL;
@@ -639,15 +667,7 @@ static bool start(const char *target, bool vm, int row, image_fetch_done_cb done
     f->user = user;
     f->width = width;
     f->height = height;
-    f->dma_before = f->dma_low = dma_before;
-#if VM_IN_PSRAM
-    BaseType_t made = IN_PSRAM(vm)
-        ? xTaskCreateWithCaps(fetch_task, "image", stack, f, 4, NULL, PSRAM_CAPS)
-        : xTaskCreate(fetch_task, "image", stack, f, 4, NULL);
-#else
-    BaseType_t made = xTaskCreate(fetch_task, "image", stack, f, 4, NULL);
-#endif
-    if (made != pdPASS) {
+    if (fetch_task_create(vm, stack, f) != pdPASS) {
         vm_file_close(f->file);
         free(f->url);
         free(f);

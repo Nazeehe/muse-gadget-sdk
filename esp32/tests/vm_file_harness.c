@@ -2783,6 +2783,7 @@ static void case_image_task_that_will_not_start(void) {
 static void case_image_needs_a_block_for_its_tcb(void) {
     const char *code = NULL, *message = NULL;
     size_t tcb = sizeof(StaticTask_t) + 32;     // with the allocator's cost
+    printf("@tcb %zu\n", sizeof(StaticTask_t));
     for (size_t block = tcb - 1; block <= tcb; block++) {
         reset_image(5 * ROW_BYTES);
         g_largest_block = block;
@@ -2840,6 +2841,17 @@ static void case_image_admission(void) {
     }
     printf("@admitted %zu\n", hi);
     printf("@tcb %zu\n", sizeof(StaticTask_t));
+
+    // With exactly that, a download starts while the last one's task is still parked (apps builds): the start
+    // deletes it, and frees its TCB, before it counts. Counting first would see the TCB twice, and refuse.
+    reset_image(5 * ROW_BYTES);
+    const char *code = NULL, *message = NULL;
+    CHECK(draw_vm("pic.raw", &code, &message), "the download before: %s", message);
+    bool parked = g_caps_task.tcb != NULL;
+    g_dma_free = g_internal_free = hi;
+    bool started = draw_vm("pic.raw", &code, &message);
+    printf("@after_a_parked_task %d %d %s\n", parked, started, started ? "" : message);
+    finish();
 }
 
 // Where a download's memory is: the task (how it was made, its stack, where), the rows handed to the screen,
@@ -2870,6 +2882,7 @@ static void case_image_placement(void) {
 // start deletes it before it counts anything: a download, a refused one, or a URL's.
 static void case_image_task_parks(void) {
     reset_image(5 * ROW_BYTES);
+    printf("@tcb %zu\n", sizeof(StaticTask_t));
     const char *code = NULL, *message = NULL;
     CHECK(draw_vm("pic.raw", &code, &message), "first: %s", message);
     print_parked("first");

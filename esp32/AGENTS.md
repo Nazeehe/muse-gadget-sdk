@@ -576,20 +576,32 @@ call's `POST /voice/realtime` and `POST /voice/end-call`:
 - `GET /chat/history`: the chat's messages. Ask for one at a time
   (`GET /chat/history?limit=1`) so the response stays under the frame bound
   below. A single message larger than that bound can't be fetched this way.
-- `POST /fs/read` and `POST /fs/write`: files on the user's VM, with JSON
-  bodies. A `path` is relative to the user's home on the VM, under the VM's
+- `GET` and `HEAD /fs/raw/{path}`: read a file on the user's VM, one
+  `Range: bytes=<first>-<last>` at a time, each under the frame bound below.
+  The answer is a 206 with that range, a 416 at or past the end of the file, a
+  404 (with a JSON error) for no such file, or a 200 with the whole file if the
+  VM ignores Range (`main/vm_file.h` takes that for the first range only, and
+  only if the file fits in the range buffer). `{path}` is relative to the
+  user's home on the VM, percent-encoded but for its slashes, under the VM's
   existing path rules; nothing confines it to a workspace folder.
-  - read: `{"path": "notes/today.md", "offset": 0, "len": 1024}`. `offset`
-    and `len` pick the part of the file to return. Keep `len` at 1024 or less:
-    the content comes back escaped (or base64), which can grow it well past
-    its size in the file, and the response has to fit the frame bound below.
-  - write: `{"path": "notes/today.md", "text": "...", "overwrite": true,
-    "append": false, "create_parent": true}`, or `data_base64` in place of
-    `text` (one of the two). `overwrite`, `append` and `create_parent` are
-    required booleans: send all three every time. Write a large file in
-    several requests, the later ones with `"append": true`.
+  `vm_file_open`, `vm_file_read` and `vm_file_read_all` read this way (one
+  reader across the firmware), for `display.draw_file` and the apps' installs.
+- `POST /fs/upload`: write a file, as `multipart/form-data` in one streamed
+  request (`Content-Type: multipart/form-data; boundary=<b>`). The text parts
+  come first, in this order: `path` (relative to the user's home, as above),
+  `overwrite` (`true`) and `create_parent` (`true`). Then the `file` part
+  (`filename` is the path's last name, `Content-Type:
+  application/octet-stream`) with the raw bytes: send them in pieces of at most
+  4 KB, and end the body with the closing boundary. The VM writes a temporary
+  file and renames it into place, so a file is replaced whole, and there is no
+  append. A 2xx reply is JSON with `bytes_written`: compare it with what you
+  sent. The boundary must not appear in the path or the file. `vm_file_write()`
+  in `main/vm_file.h` does all of this.
+- `POST /fs/read` and `POST /fs/write` are the owner's routes, not a gadget's:
+  its credentials get HTTP 403, `route not allowed for this credential's
+  scopes`. Read with `/fs/raw` and write with `/fs/upload`.
 
-There are no list or stat routes for gadgets.
+There is no route to list a folder for gadgets.
 
 Keep within the session's bounds:
 

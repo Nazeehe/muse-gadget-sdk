@@ -73,6 +73,23 @@ class LinkImageFetchHarnessTest(unittest.TestCase):
                 '#include "image_fetch_alloc.h"\n'
                 f'#include "{ROOT / "main" / "image_fetch.c"}"\n'
             )
+            # The reader of files on the VM, built the same way. Its writer is
+            # never called here; these two are all it needs that the harness
+            # doesn't have.
+            (tmp / "esp_random.h").write_text(
+                "#pragma once\n#include <stdint.h>\nuint32_t esp_random(void);\n"
+            )
+            wrapped_vm_file = tmp / "vm_file.c"
+            wrapped_vm_file.write_text(
+                '#include "image_fetch_alloc.h"\n'
+                f'#include "{ROOT / "main" / "vm_file.c"}"\n'
+                "bool noise_ctrl_req_send(int64_t id, const void *data, size_t len,\n"
+                "                         bool end_body, int wait_ms) {\n"
+                "    (void)id; (void)data; (void)len; (void)end_body; (void)wait_ms;\n"
+                "    return false;\n"
+                "}\n"
+                "uint32_t esp_random(void) { return 0; }\n"
+            )
             sanitizer_flags = _sanitizer_flags(cc, tmp)
             compile_cmd = [
                 *cc,
@@ -88,7 +105,10 @@ class LinkImageFetchHarnessTest(unittest.TestCase):
                 *sanitizer_flags,
                 "-DLINK_FAKE_CUSTOM_TASKS",
                 "-DLINK_FAKE_CUSTOM_HEAP_CAPS",
+                "-DCONFIG_HOMEHUB_DAEMON_REQUESTS=1",
                 f"-DCONFIG_SPIRAM={int(spiram)}",
+                "-I",
+                str(tmp),
                 "-I",
                 str(ROOT / "tests" / "image_fetch_fakes"),
                 "-I",
@@ -97,6 +117,7 @@ class LinkImageFetchHarnessTest(unittest.TestCase):
                 str(ROOT / "main"),
                 str(ROOT / "tests" / "link_image_fetch_harness.c"),
                 str(wrapped_source),
+                str(wrapped_vm_file),
                 "-o",
                 str(binary),
             ]

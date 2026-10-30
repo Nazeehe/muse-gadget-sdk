@@ -65,9 +65,10 @@ bool image_fetch_start(const char *url, int row, image_fetch_done_cb done,
 
 // The same for a file on the VM, fetched with GET /fs/raw/<path> over the
 // Noise session rather than from the internet, in Range requests small enough
-// that no reply overflows the session's buffers. Each range is drawn before
-// the next is asked for. Shares the one-download limit with
-// image_fetch_start.
+// that no reply overflows the session's buffers (vm_file.h). Each range is
+// drawn before the next is asked for. Shares the one-download limit with
+// image_fetch_start, and the VM file reader with an app install: while that
+// is reading a file, this is refused with the code "busy".
 bool image_fetch_start_vm(const char *path, int row, image_fetch_done_cb done,
                           void *user, const char **code, const char **message);
 

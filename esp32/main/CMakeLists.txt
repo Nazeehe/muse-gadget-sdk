@@ -35,6 +35,7 @@ set(GADGET_SRCS
     "bug_report.c"
     "ota.c"
     "image_fetch.c"
+    "vm_file.c"
     "../avatar/happy_anim.c"
     "pixel_font.c"
     "button.c"

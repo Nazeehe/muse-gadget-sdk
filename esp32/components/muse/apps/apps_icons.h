@@ -42,8 +42,9 @@
  * Generations. apps_icons_drop_all (the launcher's close, a change of the list, a voice turn) frees every ready icon and every load
  * that has ended, orphans the loads in flight, forgets the window, and starts a new generation. An orphaned load frees its own block
  * on the worker as it ends, wherever in the load the drop came, and is never shown, so nothing is held once the worker is done, with
- * no poll after the drop. Every load carries the generation of the want that asked, and only this generation's match a want: the
- * next want asks again, so after a reinstall the icon that shows is the new file's.
+ * no poll after the drop; one orphaned while it waited in the worker's queue reads nothing and takes no block. Every load carries
+ * the generation of the want that asked, and only this generation's match a want: the next want asks again, so after a reinstall
+ * the icon that shows is the new file's.
  *
  * A descriptor from apps_icons_get is the file in place: its header is the file's first 12 bytes with only the premultiplied flag
  * kept, and its data the pixels after them (as apps_lv.c makes an image's). It stays valid while its app stays in the window, until

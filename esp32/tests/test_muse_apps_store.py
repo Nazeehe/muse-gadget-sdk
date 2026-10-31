@@ -95,6 +95,9 @@ class Store(unittest.TestCase):
     def test_list_carries_icon_paths(self):  # the manifest's icon, or "" for an app with none
         self.run_case("list_carries_icon_paths")
 
+    def test_a_stored_bad_icon_is_left_out(self):  # final review m3: listed with its tile, a W line, and it loads; the install stays strict
+        self.run_case("a_stored_bad_icon_is_left_out")
+
     def test_list_has_every_app(self):  # twelve, where the launcher's list once stopped at eight
         self.run_case("list_has_every_app")
 

@@ -1747,6 +1747,17 @@ void apps_lv_hide_cards(void) {
     lv_icon_block = NULL;
 }
 
+/* The launcher alone closes (the final review's I1: the glue's, as the screen goes dark), its icons dropped; a crash card stays. */
+void apps_lv_close_launcher(void) {
+    lvgl_only("apps_lv_close_launcher");
+    if (lv_launcher) {
+        event("close launcher");
+    }
+    lv_launcher = lv_holding = false;
+    apps_port_free(lv_icon_block);
+    lv_icon_block = NULL;
+}
+
 bool apps_lv_launcher_shown(void) {
     lvgl_only("apps_lv_launcher_shown");
     return lv_launcher;
@@ -2979,6 +2990,39 @@ static void a_voice_turn_ends_the_hold(void) {
     TURN(false);
     WAIT(ended, "front 1");
     WAIT(ended, "print hello show");
+}
+
+/* The final review's I1, at its edges. A launcher that holds for a pick isn't closed by the dark: its hold ends it (the app's first frame
+ * once the screen is lit, a refusal, a voice turn, the bound), and its retry for memory needs it holding. One shown while the screen is dark
+ * (asked for just before it went) closes in the frame it shows: the dark holds no launcher open. */
+static void the_dark_leaves_a_holding_launcher(void) {
+    int from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 0");
+    int picked = mark();
+    ON_LVGL(pick_job, "slow");
+    WAIT(picked, "launch by id slow 1");  /* nothing here runs it, and nothing refuses it: it holds */
+    int dark = mark();
+    atomic_store(&lvgl_asleep, true);
+    WAIT_FRAMES(10);
+    atomic_store(&lvgl_asleep, false);
+    WAIT_FRAMES(5);
+    ABSENT(dark, "close launcher");
+    ABSENT(dark, "hide cards");
+    TURN(true);  /* a voice turn ends the hold */
+    WAIT(dark, "hide cards");
+    TURN(false);
+    atomic_store(&lvgl_asleep, true);
+    WAIT_FRAMES(3);
+    from = mark();
+    muse_apps_open_launcher();
+    int shown = WAIT(from, "launcher 0");
+    int closed = WAIT(from, "close launcher");
+    CHECK(closed > shown, "shown (%d), then closed (%d)", shown, closed);
+    WAIT_FRAMES(5);
+    CHECK(count_from(from, "launcher 0") == 1 && count_from(from, "close launcher") == 1, "once each: %d, %d",
+          count_from(from, "launcher 0"), count_from(from, "close launcher"));
+    atomic_store(&lvgl_asleep, false);
 }
 
 /* Task 6a's fix round 1 (I1): the app task's own admission of a pick's run (once more, after the app it replaces has gone) refusing it
@@ -6146,8 +6190,8 @@ static void a_refused_launch_closes_the_launcher(void) {
 }
 
 /* Task 6a's fix round 1 (I1): what the fake launcher holds while it shows, standing for its icons (the hold keeps at most the three on the
- * screen: 3 x 76,812 bytes at 160 px). */
-#define ICONS_HELD (3 * 76812)
+ * screen, APPS_LV_HOLD_KEEP: 3 x 76,812 bytes at 160 px). */
+#define ICONS_HELD (APPS_LV_HOLD_KEEP * APPS_ICON_MAX_BYTES)
 
 /* hello's copy, heap and reserve: what its launch needs free with nothing running (the worker's admission). */
 #define HELLO_NEEDS ((sizeof APP_HELLO - 1) + 256 * 1024 + APPS_RAM_RESERVE)
@@ -6242,6 +6286,44 @@ static void other_refusals_do_not_retry(void) {
     CHECK(count_from(picked, "log I launch broken (") == 1, "one try: %d", count_from(picked, "log I launch broken ("));
     ABSENT(picked, "log I launcher: ");
     atomic_store(&lv_icon_bytes, 0);
+    on_worker(empty_store_job, NULL);
+}
+
+/* The final review's I1: a launcher left open when the screen goes dark closes, which frees its icons, so an alarm that comes while the
+ * gadget sleeps (no one is there to try it again) is admitted without them: with them held, alarmy would be 100 KB short, and without them
+ * it has more than 100 KB to spare. The launcher alone closes (no "hide cards"), and the screen wakes with no launcher: to the watch. */
+#define ALARMY_NEEDS ((sizeof APP_ALARMY - 1) + 256 * 1024 + APPS_RAM_RESERVE)
+
+static void the_dark_closes_an_open_launcher(void) {
+    char err[200];
+    clock_stop_at(apps_port_mono_ms());
+    store(alarmy());
+    CHECK(apps_alarm_arm("alarmy", "t", 1000, true, true) == APPS_ALARM_ARMED, "arm");
+    atomic_store(&lv_icon_bytes, ICONS_HELD);
+    EXPECT_LAUNCHER("launcher 1 alarmy:Alarmy");
+    WAIT_FRAMES(3);
+    const size_t with_icons = held_now(&port_held);
+    atomic_store(&psram_total, with_icons + ALARMY_NEEDS - 100 * 1024);
+    int dark = mark();
+    atomic_store(&lvgl_asleep, true);
+    WAIT(dark, "close launcher");
+    CHECK(held_now(&port_held) == with_icons - ICONS_HELD, "its icons freed: %zu bytes held, %zu with them", held_now(&port_held),
+          with_icons);
+    int fired = mark();
+    clock_jump(1000);
+    fake_esp_timer_sync();
+    WAIT(fired, "log I launch alarmy (256 KB)");
+    WAIT(fired, "print alarmy start");
+    ABSENT(dark, "short of memory");
+    ABSENT(dark, "hide cards");
+    atomic_store(&lvgl_asleep, false);
+    WAIT(fired, "print alarmy rang t");
+    WAIT_FRAMES(5);
+    CHECK(count_from(dark, "launcher ") == 0, "the screen wakes with no launcher: %d", count_from(dark, "launcher "));
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    atomic_store(&psram_total, 0);
+    atomic_store(&lv_icon_bytes, 0);
+    clock_go();
     on_worker(empty_store_job, NULL);
 }
 
@@ -7131,6 +7213,7 @@ int main(int argc, char **argv) {
         {"a_failed_start_closes_the_launcher", a_failed_start_closes_the_launcher},
         {"a_voice_turn_ends_the_hold", a_voice_turn_ends_the_hold},
         {"the_app_tasks_memory_refusal_retries_once", the_app_tasks_memory_refusal_retries_once},
+        {"the_dark_leaves_a_holding_launcher", the_dark_leaves_a_holding_launcher},
         {"a_late_answer_writes_nothing", a_late_answer_writes_nothing},
         {"touches_past_a_full_queue_are_counted", touches_past_a_full_queue_are_counted},
         {"a_touch_on_an_ended_apps_object_never_reaches_the_new_app", a_touch_on_an_ended_apps_object_never_reaches_the_new_app},
@@ -7226,6 +7309,7 @@ int main(int argc, char **argv) {
         {"a_memory_refusal_during_the_hold_retries_once", a_memory_refusal_during_the_hold_retries_once},
         {"a_second_memory_refusal_is_reported", a_second_memory_refusal_is_reported},
         {"other_refusals_do_not_retry", other_refusals_do_not_retry},
+        {"the_dark_closes_an_open_launcher", the_dark_closes_an_open_launcher},
         {"the_launcher_lists_the_store", the_launcher_lists_the_store},
         {"the_launcher_gets_every_app", the_launcher_gets_every_app},
         {"the_launcher_keeps_apps_that_ended", the_launcher_keeps_apps_that_ended},

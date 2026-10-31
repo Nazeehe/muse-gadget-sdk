@@ -113,6 +113,13 @@ def icon_size_msg(w, h):
     return f"icon: {w}x{h} must be square, at most 160x160"
 
 
+ICON_MAX_BYTES = 12 + 160 * 160 * 3  # APPS_ICON_MAX_BYTES: the header and a 160 px square of RGB565A8
+
+
+def icon_bytes_msg(n):
+    return f"icon: {n} bytes is more than an icon's {ICON_MAX_BYTES}: its rows are padded"
+
+
 def image_big_msg(w, h):
     return f"image: {w}x{h} is larger than the 466x466 screen"
 
@@ -335,6 +342,24 @@ class MuseAppsPkgTest(unittest.TestCase):
 
     def test_icon_max_bytes_is_the_header_and_a_160_square_of_rgb565a8(self):
         self.assertEqual(len(lvgl_image(w=160, h=160, cf=0x14)), 12 + 160 * 160 * 3)
+
+    def test_icon_bytes_are_bounded(self):
+        # The final review's m2: an image apps_image_check passes may have rows padded past their pixels (a stride over w * 2), which
+        # can make a square icon of at most 160 px larger than APPS_ICON_MAX_BYTES, the most the launcher reads: refused at the install,
+        # not a tile at every load. Up to the bound it is taken, padded or not.
+        for w, stride in [(160, 322), (160, 336), (150, 400), (159, 336)]:
+            data = lvgl_image(w=w, h=w, cf=0x14, stride=stride)
+            self.assertGreater(len(data), ICON_MAX_BYTES)
+            self.assertEqual(self.image(data)["ok"], True, "an image apps_image_check passes")
+            with self.subTest(w=w, stride=stride):
+                self.assertEqual(self.icon(data), {"ok": False, "error": icon_bytes_msg(len(data))})
+        exactly = lvgl_image(w=160, h=160, cf=0x14)
+        self.assertEqual((len(exactly), self.icon(exactly)), (ICON_MAX_BYTES, {"ok": True}))
+        padded = lvgl_image(w=159, h=159, cf=0x14, stride=320)  # padded by 2 bytes a row, and under the bound
+        self.assertLessEqual(len(padded), ICON_MAX_BYTES)
+        self.assertEqual(self.icon(padded), {"ok": True})
+        self.assertEqual(self.icon(lvgl_image(w=160, h=160, cf=0x12, stride=480)), {"ok": True})  # RGB565, padded: 76,812 exactly
+        self.assertEqual(self.icon(lvgl_image(w=160, h=160, cf=0x12, stride=482))["error"], icon_bytes_msg(12 + 482 * 160))
 
     def test_main_listed_twice_is_deduplicated(self):
         # main, whether it is named or left to its default, is the first file and not listed again.

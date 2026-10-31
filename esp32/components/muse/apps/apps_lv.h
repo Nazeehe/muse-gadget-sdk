@@ -193,7 +193,7 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * on the first. The app at the centre is drawn APPS_LV_ICON_PX square and named under it, in one label (LONG_MODE_DOTS, in a
  * box inside the circle); its neighbours, APPS_LV_ITEM_PITCH to each side, are smaller (APPS_LV_ICON_SIDE_SCALE), and each
  * app's size follows its distance from the centre as the row scrolls (apps_lv_carousel_scale, at every LV_EVENT_SCROLL). The app
- * that runs has a small dot under its icon.
+ * that runs has a small dot under its face, as the face is drawn at its scale.
  *
  * Each app is an item of APPS_LV_ICON_PX across that shows one of two faces, never neither: its icon, once apps_icons has its
  * pixels (apps_icons.h: the window of APPS_ICONS_WINDOW apps around the centre, asked for as the centre moves and polled in at
@@ -211,22 +211,26 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * - A tap on any other app, anywhere in its item's box (APPS_LV_ICON_PX wide, wider than a neighbour's face), or on any app while
  *   the row moves (a drag, a fling's snap, the animation of an earlier tap), brings that app to the centre (lv_obj_scroll_to_view,
  *   animated) and opens nothing. A tap on the row between two apps does nothing.
- * - A tap on the card around the row (the title, the name, the empty state's text: none of them is clickable) closes it.
+ * - A tap in the strip from the row's bottom through the centre app's name, as wide as the name's box, is a tap on the app at the centre,
+ *   under the two rules above (the name isn't clickable: the card hears it, and tells the strip by where the press went down).
+ * - A tap anywhere else on the card around the row (the title, the empty state's text, the background: none of them is clickable)
+ *   closes it.
  * - A swipe sideways on the row scrolls it. A swipe up (LVGL's LV_DIR_TOP) whose press went down on the card itself within
  *   APPS_LV_CLOSE_EDGE_PX of the screen's bottom, inside the circle, closes it; no other swipe does. Whatever a swipe began on gets
  *   no tap.
- * Each close drops the icons. A touch that was down when the launcher closed does nothing more.
+ * Each close drops the icons. A touch that was down when the launcher closed does nothing more. The glue closes it when the screen goes
+ * dark (apps_lv_close_launcher), unless it holds.
  *
  * The launch hold: a pick doesn't close the launcher. It stays on the screen as it was, over the clock, until the app's first frame,
  * so the clock never shows between the two: the app task's glue fronts the layer under it and closes it (apps_lv_hide_cards) in the
  * frame whose apply step first runs a pass with the layer in front, before LVGL draws that frame. The glue also closes it when the
  * launch is refused or the app fails before that frame (its crash card comes in the same frame), and a voice turn closes it as it
  * closes any card. While it holds it is shown (apps_lv_launcher_shown, apps_lv_cards_shown) but takes no input: no tap, no scroll
- * (the row isn't scrollable) and no swipe does anything. Its icons on the screen stay as they are (the centre's and its neighbours'),
- * and the rest are freed at the pick (apps_icons_keep), loads in flight too, so the launch's admission doesn't count them; none is asked
- * for or swapped in while it holds. A launch refused for memory nonetheless closes it, which frees those too, and the glue tries it once
- * more (apps_task.c). If nothing has closed it APPS_LV_LAUNCH_HOLD_MS after the pick, apps_lv_launcher_poll does. Showing it again ends
- * the hold.
+ * (the row isn't scrollable) and no swipe does anything. Its icons on the screen stay as they are (the APPS_LV_HOLD_KEEP of the centre
+ * and its neighbours), and the rest are freed at the pick (apps_icons_keep), loads in flight too, so the launch's admission doesn't
+ * count them; none is asked for or swapped in while it holds. A launch refused for memory nonetheless closes it, which frees those too,
+ * and the glue tries it once more (apps_task.c). If nothing has closed it APPS_LV_LAUNCH_HOLD_MS after the pick, apps_lv_launcher_poll
+ * does. Showing it again ends the hold.
  *
  * A bench build (CONFIG_MUSE_BENCH) measures the carousel's frames: while it scrolls, each display refresh (LV_EVENT_REFR_READY, watched
  * from apps_lv_build) logs "launcher frame <ms> ms", the time since the refresh before it when that one found it scrolling too. Nothing
@@ -239,6 +243,7 @@ void apps_lv_stats(apps_lv_stats_t *out);
 #define APPS_LV_LAUNCHER_MAX 32      /* apps the carousel holds (the store's most); more are left out */
 #define APPS_LV_CLOSE_EDGE_PX 40     /* a swipe up closes the launcher when its press went down this close to the bottom */
 #define APPS_LV_LAUNCH_HOLD_MS 3000  /* a pick holds the launcher at most this long for the app's first frame */
+#define APPS_LV_HOLD_KEEP 3          /* the icons a pick keeps through its hold: the centre's and one each side, those on the screen */
 
 /* The launcher's n while the store hasn't been mounted (apps_store.h): "Loading apps..." in place of the carousel (the font has
  * no ellipsis). */
@@ -286,6 +291,10 @@ void apps_lv_show_crash(const char *name, const char *first_line);
 
 /* Closes both cards: an app came to the front, or a voice turn began. The launcher's icons are dropped (apps_icons_drop_all). */
 void apps_lv_hide_cards(void);
+
+/* Closes the launcher alone, as every close does (its icons dropped, a hold ended); a crash card stays. Nothing when it isn't shown. The
+ * glue's, when the screen goes dark (apps_task.c). */
+void apps_lv_close_launcher(void);
 
 /* Whether a card is showing. */
 bool apps_lv_cards_shown(void);

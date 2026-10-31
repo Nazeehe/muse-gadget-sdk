@@ -162,10 +162,12 @@ bool apps_room_beside(size_t free_bytes, const char *id, size_t bytes, unsigned 
  * install pipeline's. */
 #define APPS_MSG_BAD_ID "app id '%s' must match ^[a-z][a-z0-9_]{1,23}$"
 
-/* An icon's: the manifest's (%s is the icon as written) and apps_icon_check's (the image's width and height). */
+/* An icon's: the manifest's (%s is the icon as written) and apps_icon_check's (the image's width and height; its bytes and
+ * APPS_ICON_MAX_BYTES). */
 #define APPS_MSG_ICON_NOT_LISTED "manifest: icon '%s' is not one of the app's files"
 #define APPS_MSG_ICON_NOT_IMAGE "manifest: icon '%s' must be a .bin image"
 #define APPS_MSG_ICON_SIZE "icon: %ux%u must be square, at most %dx%d"
+#define APPS_MSG_ICON_BYTES "icon: %u bytes is more than an icon's %u: its rows are padded"
 
 enum { APPS_PERM_SOUND = 1, APPS_PERM_ALARM = 2, APPS_PERM_STORE = 4, APPS_PERM_KEEP_AWAKE = 8 };
 
@@ -259,6 +261,16 @@ size_t apps_text_clean(char *s, size_t n, bool keep_newline);
 bool apps_manifest_parse(const char *json, size_t len, const char *expected_id, int heap_max_kb, apps_manifest_t *m,
                          char *err, size_t err_len);
 
+/*
+ * apps_manifest_parse for a manifest the store already holds (apps_store.c), which an older firmware's install may have taken under
+ * looser rules: an icon that breaks the rules above (not an allowed path, not a .bin, not one of the files) doesn't fail it. The manifest
+ * is read without it (m->icon is "", so the launcher shows the app's tile) and the icon's message, as the install would say it, is put
+ * in dropped (dropped_len bytes with the NUL, cut on a character boundary; "" when nothing was left out, or the manifest failed; dropped
+ * may be NULL). Everything else is apps_manifest_parse's, which the install keeps using: there a bad icon is refused.
+ */
+bool apps_manifest_parse_stored(const char *json, size_t len, const char *expected_id, int heap_max_kb, apps_manifest_t *m,
+                                char *err, size_t err_len, char *dropped, size_t dropped_len);
+
 /* Frees messages_json with free_fn (NULL: free) and zeroes m. NULL is ignored. Safe after any parse. */
 void apps_manifest_clear(apps_manifest_t *m, void (*free_fn)(void *));
 
@@ -313,7 +325,9 @@ bool apps_image_check(const uint8_t *data, size_t len, uint16_t *w, uint16_t *h,
 
 /*
  * Whether data[0, len) is an icon: an image apps_image_check passes (its message, if not) that is square and at most
- * APPS_ICON_MAX_PX each way, otherwise APPS_MSG_ICON_SIZE in err. err may be NULL. The one rule for the install pipeline
- * and apphost's check, which apply it to the manifest's icon file.
+ * APPS_ICON_MAX_PX each way, otherwise APPS_MSG_ICON_SIZE in err, and at most APPS_ICON_MAX_BYTES long, the most the launcher
+ * reads (apps_icons.c), otherwise APPS_MSG_ICON_BYTES: only rows padded past their pixels (a stride over a row's bytes) make a
+ * square that size longer. err may be NULL. The one rule for the install pipeline and apphost's check, which apply it to the
+ * manifest's icon file, and for the launcher's load.
  */
 bool apps_icon_check(const uint8_t *data, size_t len, char *err, size_t err_len);

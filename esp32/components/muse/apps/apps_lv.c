@@ -1037,6 +1037,7 @@ void apps_lv_stats(apps_lv_stats_t *out) {
 
 _Static_assert(APPS_LV_ICON_SIDE_SCALE > 0 && APPS_LV_ICON_SIDE_SCALE < 256, "a neighbour is drawn smaller than the centre");
 _Static_assert(APPS_LV_ITEM_PITCH > 0 && APPS_LV_ITEM_PITCH >= APPS_LV_ICON_PX, "items don't overlap at rest");
+_Static_assert(APPS_LV_HOLD_KEEP % 2 == 1 && APPS_LV_HOLD_KEEP <= APPS_ICONS_WINDOW, "the hold keeps the centre and as many each side");
 
 /* Eight colours a white letter reads on, by the CRC-32 of the id. */
 static const uint32_t TILE_PALETTE[8] = {0xE53935, 0xD81B60, 0x8E24AA, 0x5E35B1, 0x1E88E5, 0x00897B, 0x43A047, 0xF4511E};
@@ -1046,6 +1047,7 @@ static const uint32_t TILE_PALETTE[8] = {0xE53935, 0xD81B60, 0x8E24AA, 0x5E35B1,
 typedef struct {
     char id[APPS_ID_MAX + 1], name[LAUNCHER_NAME_MAX + 1], icon[APPS_PATH_MAX + 1];
     lv_obj_t *box, *tile, *image;
+    lv_obj_t *dot;              /* the running app's, under its face; NULL for the others */
     const lv_image_dsc_t *dsc;  /* the icon the image shows, NULL while the tile shows */
     int scale;                  /* the scale it is drawn at */
     bool recolored;             /* the image has the white recolor on it (an A8 icon) */
@@ -1058,7 +1060,7 @@ static EXT_RAM_BSS_ATTR struct {
     int centre;                 /* the item nearest the centre, -1 until the first update */
     lv_obj_t *row, *name;
     lv_point_t press;           /* where the last press on the card itself or on an item went down */
-    bool press_moving;          /* the row was scrolling when the last press on an item went down */
+    bool press_moving;          /* the row was scrolling when the last press on the card or an item went down */
     bool holding;               /* a pick holds it for the app's first frame (apps_lv.h) */
     int64_t hold_until;         /* esp_timer_get_time() at which the hold's bound closes it */
 } C;
@@ -1131,14 +1133,18 @@ static lv_obj_t *new_card(void) {
 /* ---- The carousel's faces ---- */
 
 /* The item drawn at its scale: the face that shows, the tile by its size (about the face's centre, where it is aligned) or the
- * icon by LVGL's image scale. */
+ * icon by LVGL's image scale, either side across; and the running app's dot DOT_GAP under that face as drawn, not under the box, so a
+ * neighbour's small face keeps it close (6a m2). */
 static void draw_scale(item_t *it) {
+    int32_t side = (APPS_LV_ICON_PX * it->scale + 128) / 256;
     if (it->dsc != NULL) {
         uint32_t w = it->dsc->header.w;  /* 1 to APPS_ICON_MAX_PX: apps_icon_check passed it */
         lv_image_set_scale(it->image, ((uint32_t)it->scale * APPS_LV_ICON_PX + w / 2) / w);
     } else {
-        int32_t side = (APPS_LV_ICON_PX * it->scale + 128) / 256;
         lv_obj_set_size(it->tile, side, side);
+    }
+    if (it->dot != NULL) {  /* at the centre's scale, the bottom of the box, as ITEM_H leaves room for */
+        lv_obj_align(it->dot, LV_ALIGN_CENTER, 0, FACE_DY + side / 2 + DOT_GAP + DOT_PX / 2);
     }
 }
 
@@ -1324,9 +1330,9 @@ static void hold_launcher(void) {
     if (C.row != NULL) {
         lv_obj_remove_flag(C.row, LV_OBJ_FLAG_SCROLLABLE);
     }
-    const char *shown[3];
+    const char *shown[APPS_LV_HOLD_KEEP];
     int n = 0;
-    for (int k = C.centre - 1; k <= C.centre + 1; k++) {
+    for (int k = C.centre - APPS_LV_HOLD_KEEP / 2; k <= C.centre + APPS_LV_HOLD_KEEP / 2; k++) {
         if (k >= 0 && k < C.n && C.item[k].dsc != NULL) {
             shown[n++] = C.item[k].id;
         }
@@ -1364,20 +1370,58 @@ static bool lifted_in_place(void) {
     return dx > -TAP_SLOP_PX && dx < TAP_SLOP_PX && dy > -TAP_SLOP_PX && dy < TAP_SLOP_PX;
 }
 
-/* A tap that lands on no app: on the launcher itself, or on its text, which isn't clickable (C12). A slide there is no tap (I1): LVGL
- * clicks the card after one that didn't become a gesture, and it closes nothing. Nor does any touch while it holds, or one it closed
- * under (LVGL doesn't end a touch for a hide). */
-static void on_launcher_tap(lv_event_t *e) {
-    (void)e;
-    if (s_launcher_shown && !C.holding && lifted_in_place()) {
-        close_launcher();
+/* Whether a press at p went down in the strip under the row that names the centre app: from the row's bottom through the name's, as
+ * wide as the name's box (the final review's m1). Laid out as LVGL hit-tests the press, from the objects' coordinates. */
+static bool in_name_strip(lv_point_t p) {
+    if (C.row == NULL || C.name == NULL || C.n == 0 || C.centre < 0) {
+        return false;  /* no carousel (no apps yet, loading), or no name: the card's */
     }
+    lv_area_t row, name;
+    lv_obj_get_coords(C.row, &row);
+    lv_obj_get_coords(C.name, &name);
+    return p.x >= name.x1 && p.x <= name.x2 && p.y > row.y2 && p.y <= name.y2;
 }
 
-/* A press on the card itself (not on an app, or the row between them: those are clickable, and LVGL sends their presses to them). */
+/* A tap on item k: the settled centre opens (the launcher holds, then pick, which only posts, is given its id copied); any other tap brings
+ * its item to the centre and opens nothing (M2, M3: see on_item_event). Nothing is deleted here, inside a tap: the items go when the
+ * launcher is next shown. */
+static void tap_item(int k) {
+    if (C.press_moving || lv_obj_is_scrolling(C.row) || k != C.centre) {
+        lv_obj_scroll_to_view(C.item[k].box, LV_ANIM_ON);
+        return;
+    }
+    char id[APPS_ID_MAX + 1];
+    memcpy(id, C.item[k].id, sizeof id);
+    if (s_pick == NULL) {
+        close_launcher();  /* nothing to launch: nothing to hold for */
+        return;
+    }
+    hold_launcher();
+    s_pick(id);
+}
+
+/* A tap that lands on no app: on the launcher itself, or on its text, which isn't clickable. One in the strip of the centre app's name
+ * is a tap on that app (m1: tapping a name to open it is a natural guess); anywhere else it closes the launcher (C12). A slide there is
+ * no tap (I1): LVGL clicks the card after one that didn't become a gesture, and it does nothing. Nor does any touch while it holds, or
+ * one it closed under (LVGL doesn't end a touch for a hide). */
+static void on_launcher_tap(lv_event_t *e) {
+    (void)e;
+    if (!s_launcher_shown || C.holding || !lifted_in_place()) {
+        return;
+    }
+    if (in_name_strip(C.press)) {
+        tap_item(C.centre);
+        return;
+    }
+    close_launcher();
+}
+
+/* A press on the card itself (not on an app, or the row between them: those are clickable, and LVGL sends their presses to them): where
+ * it went down, and whether the row moved then, for a tap on the name (as on_item_event's press). */
 static void on_launcher_press(lv_event_t *e) {
     (void)e;
     note_press();
+    C.press_moving = C.row != NULL && lv_obj_is_scrolling(C.row);
 }
 
 /* Whether a press at p begins the close: in the screen's bottom APPS_LV_CLOSE_EDGE_PX rows, inside its circle. (A press on the card
@@ -1411,10 +1455,9 @@ static void on_launcher_gesture(lv_event_t *e) {
  * them for a tap, so an item pressed while the row moves has moved on by the lift). Any other tap brings its item to the centre and
  * opens nothing: a side app, anywhere in its box, which is wider than its face (M2: a tap there can only scroll), or any app while the
  * row moves (M3). LVGL sends no tap at all at the lift of a drag that scrolled; a slide up or down (the row doesn't scroll that way) that
- * isn't a gesture it does click, and that is no tap: it does nothing (I1). Opening: the launcher holds (apps_lv.h), then pick, which
- * only posts, is given the item's id copied. Nothing is deleted here, inside the item's event: the items go when the launcher is next
- * shown. While it holds no touch on an item does anything, and a touch the launcher closed under (an app to the front, a voice turn:
- * hiding it doesn't end the touch) does nothing at its lift. */
+ * isn't a gesture it does click, and that is no tap: it does nothing (I1). Opening: the launcher holds (apps_lv.h), then pick (tap_item).
+ * While it holds no touch on an item does anything, and a touch the launcher closed under (an app to the front, a voice turn: hiding it
+ * doesn't end the touch) does nothing at its lift. */
 static void on_item_event(lv_event_t *e) {
     intptr_t k = (intptr_t)lv_event_get_user_data(e);
     if (!s_launcher_shown || C.holding || k < 0 || k >= C.n || C.row == NULL) {
@@ -1425,21 +1468,9 @@ static void on_item_event(lv_event_t *e) {
         C.press_moving = lv_obj_is_scrolling(C.row);
         return;
     }
-    if (!lifted_in_place()) {
-        return;
+    if (lifted_in_place()) {
+        tap_item((int)k);
     }
-    if (C.press_moving || lv_obj_is_scrolling(C.row) || k != C.centre) {
-        lv_obj_scroll_to_view(C.item[k].box, LV_ANIM_ON);
-        return;
-    }
-    char id[APPS_ID_MAX + 1];
-    memcpy(id, C.item[k].id, sizeof id);
-    if (s_pick == NULL) {
-        close_launcher();  /* nothing to launch: nothing to hold for */
-        return;
-    }
-    hold_launcher();
-    s_pick(id);
 }
 
 static void on_crash_tap(lv_event_t *e) {
@@ -1537,24 +1568,22 @@ static bool new_item(int k, bool runs) {
     const char text[2] = {apps_lv_tile_letter(it->name), '\0'};
     lv_label_set_text(letter, text);
     lv_obj_align(letter, LV_ALIGN_CENTER, 0, 0);
-    if (runs) {
-        lv_obj_t *dot = lv_obj_create(box);
-        if (dot != NULL) {  /* without one, the app is still there */
-            lv_obj_remove_style_all(dot);
-            lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_set_size(dot, DOT_PX, DOT_PX);
-            lv_obj_set_style_bg_color(dot, colour(COLOR_TEXT), LV_PART_MAIN);
-            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
-            lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-            lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, 0, 0);
-        }
+    lv_obj_t *dot = runs ? lv_obj_create(box) : NULL;
+    if (dot != NULL) {  /* without one, the app is still there; draw_scale places it */
+        lv_obj_remove_style_all(dot);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(dot, DOT_PX, DOT_PX);
+        lv_obj_set_style_bg_color(dot, colour(COLOR_TEXT), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     }
     lv_obj_add_event_cb(box, on_item_event, LV_EVENT_PRESSED, (void *)(intptr_t)k);
     lv_obj_add_event_cb(box, on_item_event, LV_EVENT_CLICKED, (void *)(intptr_t)k);
     it->box = box;
     it->tile = tile;
     it->image = NULL;
+    it->dot = dot;
     it->dsc = NULL;
     it->scale = 256;  /* as made: the tile is sized at the first update */
     it->recolored = false;
@@ -1649,6 +1678,12 @@ void apps_lv_hide_cards(void) {
     }
     if (s_crash_shown) {
         close_crash();
+    }
+}
+
+void apps_lv_close_launcher(void) {
+    if (s_launcher_shown) {
+        close_launcher();
     }
 }
 

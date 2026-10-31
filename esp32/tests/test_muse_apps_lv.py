@@ -400,6 +400,17 @@ class HarnessTest(unittest.TestCase):
     def test_a_slide_on_an_app_opens_nothing(self):  # the same root on the apps: a slow or short vertical slide
         self.run_case("a_slide_on_an_app_opens_nothing")
 
+    # ---- The final review's fixes ----
+
+    def test_close_launcher_closes_it_alone(self):  # I1: the glue's close as the screen goes dark: icons dropped, a crash card kept
+        self.run_case("close_launcher_closes_it_alone")
+
+    def test_a_tap_on_the_name_opens_the_centre_app(self):  # m1: the strip from the row through the name; the tap rules; C12 around it
+        self.run_case("a_tap_on_the_name_opens_the_centre_app")
+
+    def test_running_dot_follows_its_face(self):  # hardening (a), 6a m2: under the face as drawn, at every scale
+        self.run_case("running_dot_follows_its_face")
+
     # ---- Task 6a: the user's feedback on preview 2: a clearly larger centre, and a launch with no clock flash ----
 
     def test_centre_is_clearly_larger(self):  # 150-160 px at the centre, a neighbour at most 40% of it, all inside the circle

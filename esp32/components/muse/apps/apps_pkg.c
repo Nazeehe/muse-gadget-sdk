@@ -355,6 +355,9 @@ typedef struct {
     int max_kb;  /* the most a memory_kb may be */
     char *err;
     size_t err_len;
+    char *dropped;       /* a stored manifest's (apps_manifest_parse_stored): where an icon left out says why; NULL: the install's */
+    size_t dropped_len;
+    bool stored;         /* the store's read: an icon that breaks its rules is left out, not a failure */
     slice_t val[K_COUNT];
 } parse_t;
 
@@ -602,6 +605,10 @@ static NOINLINE bool check_files(parse_t *p) {
     return r.err[0] == '\0' || reader_error(p, &r);
 }
 
+/* An icon that breaks a rule: the install's manifest fails; a stored one is read without its icon (m->icon stays ""), and dropped says
+ * why (the final review's m3: an app installed before the rules were this strict keeps its place, with its tile). */
+#define icon_fail(p, ...) ((p)->stored ? ((void)failf((p)->dropped, (p)->dropped_len, __VA_ARGS__), true) : fail(p, __VA_ARGS__))
+
 /* icon: one of the files, and a .bin. The image itself is checked with the package's files (apps_icon_check). */
 static NOINLINE bool check_icon(parse_t *p) {
     slice_t v = p->val[K_ICON];
@@ -612,13 +619,13 @@ static NOINLINE bool check_icon(parse_t *p) {
     bool read = decode_string(v, text, sizeof text);
     echo_t shown;
     if (!read || !apps_path_valid(text)) {
-        return fail(p, "manifest: icon '%s' is not an allowed path " PATH_RULE, quote(&shown, v, text, read));
+        return icon_fail(p, "manifest: icon '%s' is not an allowed path " PATH_RULE, quote(&shown, v, text, read));
     }
     if (apps_file_kind(text) != APPS_FILE_IMAGE) {
-        return fail(p, APPS_MSG_ICON_NOT_IMAGE, text);
+        return icon_fail(p, APPS_MSG_ICON_NOT_IMAGE, text);
     }
     if (!is_listed(p->m, text)) {
-        return fail(p, APPS_MSG_ICON_NOT_LISTED, text);
+        return icon_fail(p, APPS_MSG_ICON_NOT_LISTED, text);
     }
     copy_text(p->m->icon, sizeof p->m->icon, text);
     return true;
@@ -754,23 +761,40 @@ static bool validate(parse_t *p) {
            check_required(p);
 }
 
+static bool parse_manifest(parse_t *p, const char *json, size_t len, int heap_max_kb) {
+    p->max_kb = heap_max_kb > MAX_MEMORY_KB ? MAX_MEMORY_KB : heap_max_kb;
+    if (p->max_kb < MIN_MEMORY_KB) {
+        p->max_kb = MIN_MEMORY_KB;
+    }
+    memset(p->m, 0, sizeof *p->m);
+    if (p->err != NULL && p->err_len > 0) {
+        p->err[0] = '\0';
+    }
+    if (p->dropped != NULL && p->dropped_len > 0) {
+        p->dropped[0] = '\0';
+    }
+    bool ok = len > APPS_MANIFEST_MAX ? fail(p, "manifest: manifest.json is larger than 8 KB")
+                                      : scan(p, json, len) && validate(p) && keep_messages(p);
+    if (!ok) {
+        memset(p->m, 0, sizeof *p->m);
+        if (p->dropped != NULL && p->dropped_len > 0) {
+            p->dropped[0] = '\0';  /* a manifest that failed left nothing out: it isn't read at all */
+        }
+    }
+    return ok;
+}
+
 bool apps_manifest_parse(const char *json, size_t len, const char *expected_id, int heap_max_kb, apps_manifest_t *m,
                          char *err, size_t err_len) {
     parse_t p = {.m = m, .folder = expected_id, .err = err, .err_len = err_len};
-    p.max_kb = heap_max_kb > MAX_MEMORY_KB ? MAX_MEMORY_KB : heap_max_kb;
-    if (p.max_kb < MIN_MEMORY_KB) {
-        p.max_kb = MIN_MEMORY_KB;
-    }
-    memset(m, 0, sizeof *m);
-    if (err != NULL && err_len > 0) {
-        err[0] = '\0';
-    }
-    bool ok = len > APPS_MANIFEST_MAX ? fail(&p, "manifest: manifest.json is larger than 8 KB")
-                                      : scan(&p, json, len) && validate(&p) && keep_messages(&p);
-    if (!ok) {
-        memset(m, 0, sizeof *m);
-    }
-    return ok;
+    return parse_manifest(&p, json, len, heap_max_kb);
+}
+
+bool apps_manifest_parse_stored(const char *json, size_t len, const char *expected_id, int heap_max_kb, apps_manifest_t *m,
+                                char *err, size_t err_len, char *dropped, size_t dropped_len) {
+    parse_t p = {.m = m, .folder = expected_id, .err = err, .err_len = err_len, .dropped = dropped, .dropped_len = dropped_len,
+                 .stored = true};
+    return parse_manifest(&p, json, len, heap_max_kb);
 }
 
 /* free_fn, or free. */
@@ -947,6 +971,10 @@ bool apps_icon_check(const uint8_t *data, size_t len, char *err, size_t err_len)
     }
     if (w != h || w > APPS_ICON_MAX_PX) {
         return failf(err, err_len, APPS_MSG_ICON_SIZE, (unsigned)w, (unsigned)h, APPS_ICON_MAX_PX, APPS_ICON_MAX_PX);
+    }
+    /* The launcher reads at most this (apps_icons.c): a padded file past it would install and show as its tile at every load. */
+    if (len > APPS_ICON_MAX_BYTES) {
+        return failf(err, err_len, APPS_MSG_ICON_BYTES, (unsigned)len, (unsigned)APPS_ICON_MAX_BYTES);
     }
     return true;
 }

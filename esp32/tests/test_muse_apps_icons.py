@@ -100,6 +100,9 @@ class Icons(unittest.TestCase):
     def test_list_change_drops_stale_icons(self):  # Review Focus 2: drop_all while a load is in flight; never shown
         self.run_case("list_change_drops_stale_icons")
 
+    def test_an_orphaned_load_reads_nothing(self):  # final review, rec. 3: a load dropped or held before it began costs no read or block
+        self.run_case("an_orphaned_load_reads_nothing")
+
     def test_keep_frees_all_but_the_kept(self):  # Task 6a fix round 1 (I1): the hold keeps the drawn icons, frees and orphans the rest
         self.run_case("keep_frees_all_but_the_kept")
 

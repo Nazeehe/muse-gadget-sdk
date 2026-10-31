@@ -1614,7 +1614,11 @@ static void front_now(void) {
  * no-op event. Without it the loop notices the wake at its next round, up to that second, and an app in front shows its
  * frame from before the sleep (a clock, its old minute) all that time. Posted with no wait, as everything the LVGL task
  * posts: with the queue full the app task is awake anyway. Seen at a frame, whichever way the screen is: update_sleep clears
- * the flag later in the frame than the supervisor runs, so it is the next frame's that sees the edge. */
+ * the flag later in the frame than the supervisor runs, so it is the next frame's that sees the edge.
+ * While the screen is dark the launcher isn't left open (the final review's I1): its icons are PSRAM that an alarm's launch, which no one
+ * is there to try again, or one Muse asks for, would be admitted against. So at every dark frame, the edge's first, a launcher that shows
+ * closes, which frees them, and the screen wakes to the watch, as update_sleep has it. Not one that holds for a pick: its hold ends it (the
+ * app's first frame, a refusal, the bound), and its retry for memory needs it holding. */
 static void note_wake(void) {
     bool dark = apps_port_dark();
     if (L.dark && !dark) {
@@ -1622,6 +1626,9 @@ static void note_wake(void) {
         (void)xQueueSend(s_queue, &ev, 0);
     }
     L.dark = dark;
+    if (dark && apps_lv_launcher_shown() && !apps_lv_launcher_holding()) {
+        apps_lv_close_launcher();
+    }
 }
 
 /* The supervisor: a call that has run for more than APPS_TASK_HUNG_MS is hung, less the time a snapshot's drawing took from the

@@ -133,6 +133,9 @@ class AppTaskTest(HarnessCase):
     def test_the_app_tasks_memory_refusal_retries_once(self):  # fix round 1 (I1): the run's own admission, as the worker's
         self.run_case("the_app_tasks_memory_refusal_retries_once")
 
+    def test_the_dark_leaves_a_holding_launcher(self):  # final review I1: a hold isn't the dark's to end; one shown while dark closes
+        self.run_case("the_dark_leaves_a_holding_launcher")
+
     # ---- The rulings' ----
 
     def test_stop_tears_down_in_the_rulings_order(self):  # the teardown order (Task 11's ruling)
@@ -581,6 +584,9 @@ class AppTaskStoreTest(HarnessCase):
 
     def test_other_refusals_do_not_retry(self):  # no such app, no worker, no app (doesn't compile): one try each
         self.run_case("other_refusals_do_not_retry")
+
+    def test_the_dark_closes_an_open_launcher(self):  # final review I1: its icons freed, so an alarm while it sleeps is admitted
+        self.run_case("the_dark_closes_an_open_launcher")
 
     # ---- Task 13's fix round 1 ----
 

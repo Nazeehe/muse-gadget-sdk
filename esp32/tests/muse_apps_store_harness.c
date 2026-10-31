@@ -1198,6 +1198,52 @@ static void list_carries_icon_paths(void) {
     CHECK(listed_n == 2 && strcmp(listed[1].id, "plain") == 0 && listed[1].icon[0] == '\0', "plain lists none: '%s'", listed[1].icon);
 }
 
+/* The final review's m3: a manifest the store holds whose icon breaks the install's rules (not one of its files, not a .bin, not an
+ * allowed path: an app installed by firmware from before them) is read without its icon, with a W line, and not refused: the app is
+ * listed, with no icon (its tile), and loads and runs. The install stays strict (test_muse_apps_pkg.py's icon cases). */
+static void a_stored_bad_icon_is_left_out(void) {
+    spit("apps_fs/unlisted/manifest.json", "{\"id\":\"unlisted\",\"name\":\"Unlisted\",\"version\":\"1.0.0\",\"api\":1,\"icon\":\"icon.bin\"}");
+    spit("apps_fs/unlisted/main.lua", "-- main\n");
+    spit("apps_fs/notbin/manifest.json",
+         "{\"id\":\"notbin\",\"name\":\"Notbin\",\"version\":\"1.0.0\",\"api\":1,\"files\":[\"util.lua\"],\"icon\":\"util.lua\"}");
+    spit("apps_fs/notbin/main.lua", "-- main\n");
+    spit("apps_fs/notbin/util.lua", "return {}\n");
+    spit("apps_fs/badpath/manifest.json", "{\"id\":\"badpath\",\"name\":\"Badpath\",\"version\":\"1.0.0\",\"api\":1,\"icon\":\"../x.bin\"}");
+    spit("apps_fs/badpath/main.lua", "-- main\n");
+    spit("apps_fs/ctrl/manifest.json", "{\"id\":\"ctrl\",\"name\":\"Ctrl\",\"version\":\"1.0.0\",\"api\":1,\"icon\":\"a\\nb\\u001b.bin\"}");
+    spit("apps_fs/ctrl/main.lua", "-- main\n");
+    mkdir("apps_fs/art", 0777);
+    put_app_icon("apps_fs/art", "art", "Art", "img/icon.bin");
+    CHECK(apps_store_mount() == APPS_STORAGE_FLASH, "flash");
+    CHECK(listed_n == 5, "every app is listed: %d", listed_n);
+    static const struct {
+        const char *id, *icon, *says;
+    } apps[] = {{"art", "img/icon.bin", NULL},
+                {"badpath", "", "W muse_apps: store: badpath: manifest: icon '../x.bin' is not an allowed path"},
+                {"ctrl", "", "W muse_apps: store: ctrl: manifest: icon 'a?b?.bin' is not an allowed path"},  /* its control bytes as '?' */
+                {"notbin", "", "W muse_apps: store: notbin: manifest: icon 'util.lua' must be a .bin image"},
+                {"unlisted", "", "W muse_apps: store: unlisted: manifest: icon 'icon.bin' is not one of the app's files"}};
+    for (size_t i = 0; i < sizeof apps / sizeof apps[0]; i++) {
+        int at = -1;
+        for (int k = 0; k < listed_n; k++) {
+            at = strcmp(listed[k].id, apps[i].id) == 0 ? k : at;
+        }
+        CHECK(at >= 0 && strcmp(listed[at].icon, apps[i].icon) == 0, "%s is listed with the icon '%s': '%s'", apps[i].id, apps[i].icon,
+              at >= 0 ? listed[at].icon : "(not listed)");
+        if (apps[i].says != NULL) {
+            CHECK(logged_has(apps[i].says), "%s: a W line: %s", apps[i].id, apps[i].says);
+            CHECK(apps_store_has(apps[i].id), "%s: the store has it", apps[i].id);
+            apps_pkg_t *got = apps_port_realloc(NULL, sizeof *got);
+            char err[160] = "";
+            CHECK(apps_store_load(apps[i].id, got, err, sizeof err), "%s loads: %s", apps[i].id, err);
+            CHECK(got->manifest.icon[0] == '\0' && strcmp(got->manifest.id, apps[i].id) == 0, "%s: no icon in what it loads: '%s'",
+                  apps[i].id, got->manifest.icon);
+            free_pkg(got);
+        }
+    }
+    CHECK(logged_count("store: art:") == 0, "a good icon says nothing");
+}
+
 /* The launcher's icons (apps_icons.c) read an app's file on the worker: APPS_STORE_BASE/<id>/<path>, at most max bytes, into a block
  * of the apps' heap (through its floor) with a NUL after it. Every refusal leaves nothing held and *out NULL. */
 static void read_file_reads_an_apps_file(void) {
@@ -2282,6 +2328,7 @@ static const case_t CASES[] = {
     {"remove", remove_app},
     {"list_reads_names", list_reads_names},
     {"list_carries_icon_paths", list_carries_icon_paths},
+    {"a_stored_bad_icon_is_left_out", a_stored_bad_icon_is_left_out},
     {"list_has_every_app", list_has_every_app},
     {"read_file_reads_an_apps_file", read_file_reads_an_apps_file},
     {"read_file_needs_the_flash_store", read_file_needs_the_flash_store},

@@ -482,7 +482,9 @@ static void cache_free(void) {
 }
 
 /* id's manifest.json, read and parsed for the folder id, into m (zeroed on failure, with why). messages_json is apps_pkg.c's own
- * block (free). The bytes into *json (a block of the apps' heap) when json isn't NULL. */
+ * block (free). The bytes into *json (a block of the apps' heap) when json isn't NULL. An icon that breaks the install's rules (an app
+ * installed before they were this strict) is left out with a W line, not a failure: the app stays listed, with its tile, and runs
+ * (apps_manifest_parse_stored; the final review's m3). */
 static bool read_manifest(const char *id, apps_manifest_t *m, char **json, size_t *json_len, char *why, size_t cap) {
     char path[PATH_CAP];
     path_of(path, id, "manifest.json");
@@ -492,7 +494,12 @@ static bool read_manifest(const char *id, apps_manifest_t *m, char **json, size_
     if (!read_file(path, APPS_MANIFEST_MAX, &text, &len, why, cap)) {
         return false;
     }
-    bool ok = apps_manifest_parse(text, len, id, CONFIG_MUSE_APPS_HEAP_MAX_KB, m, why, cap);
+    char dropped[160];
+    bool ok = apps_manifest_parse_stored(text, len, id, CONFIG_MUSE_APPS_HEAP_MAX_KB, m, why, cap, dropped, sizeof dropped);
+    if (ok && dropped[0] != '\0') {
+        apps_text_clean(dropped, strlen(dropped), false);  /* it quotes the manifest's text, which reaches the console */
+        ESP_LOGW(TAG, "store: %s: %s: it shows its tile until it is installed again with a good icon", id, dropped);
+    }
     if (ok && json != NULL) {
         *json = text;
         *json_len = len;

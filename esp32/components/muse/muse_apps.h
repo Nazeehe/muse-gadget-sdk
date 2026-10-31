@@ -319,8 +319,9 @@ void muse_apps_ui_build(lv_obj_t *screen);
 /* The LVGL task, every frame, before update_sleep(): the hang supervisor (a call into the app that has run more than
  * APPS_TASK_HUNG_MS), the reset of an app that ended (before any apply in the frame), the front and back the app task
  * asked for (a front once the app's table is published), the layer's place after a voice turn has ended, and the
- * cards (neither of these two during a turn); last, a snapshot app.control asked for, on the first frame the screen
- * isn't dark (apps_snapshot_take_pending). */
+ * cards (neither of these two during a turn); a launcher left open while the screen is dark closes, which frees its
+ * icons (not one that holds for a pick); last, a snapshot app.control asked for, on the first frame the screen isn't dark
+ * (apps_snapshot_take_pending). */
 void muse_apps_ui_supervise(void);
 
 /* The LVGL task, every frame the screen is awake: the apply step (apps_lv_apply). True while the app layer or a card

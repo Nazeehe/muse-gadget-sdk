@@ -477,6 +477,9 @@ class GuideAndSkill(unittest.TestCase):
         icons_window = header_number("apps_icons.h", "APPS_ICONS_WINDOW")
         icons_in_flight = header_number("apps_icons.h", "APPS_ICONS_IN_FLIGHT")
         icon_px = header_number("apps_pkg.h", "APPS_ICON_MAX_PX")
+        # The final review's hardening (c): the icons a pick keeps through its hold, "the 3 on the screen", are a named constant.
+        hold_keep = header_number("apps_lv.h", "APPS_LV_HOLD_KEEP")
+        self.assertLessEqual(hold_keep, icons_window, "the hold keeps icons the window has")
         self.assertIn("#define APPS_ICON_MAX_BYTES (12 + APPS_ICON_MAX_PX * APPS_ICON_MAX_PX * 3)", (APPS / "apps_pkg.h").read_text())
         icon_bytes = 12 + icon_px * icon_px * 3
         table = {}
@@ -505,8 +508,12 @@ class GuideAndSkill(unittest.TestCase):
                 f"at most {path_max} characters",
                 f"While the launcher is open its icons are in PSRAM too, through the same floor: up to {icons_window} of at most "
                 f"{icon_bytes:,} bytes each (`APPS_ICONS_WINDOW`, `APPS_ICON_MAX_BYTES`) and {icons_in_flight} more loading; a pick keeps "
-                "only the 3 on the screen until the app's first frame, and a launch refused for memory closes the launcher, which frees "
-                "them, and is tried once more."):
+                f"only the {hold_keep} on the screen (`APPS_LV_HOLD_KEEP`) until the app's first frame, and a launch refused for memory "
+                "closes the launcher, which frees them, and is tried once more.",
+                # The final review's I1: a launcher left open doesn't hold them through a sleep, and what it holds while someone browses.
+                "The launcher closes when the screen goes dark, which frees them, so it holds none while the gadget sleeps; while someone "
+                "browses it, a launch it didn't pick (an alarm's, or one Muse asks for) and a snapshot are admitted with its icons "
+                "counted, and can be refused for them."):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
         kconfig = " ".join((MUSE / "Kconfig").read_text().split())
@@ -538,6 +545,8 @@ class GuideAndSkill(unittest.TestCase):
         # D12: the bottom band AGENTS.md quotes is APPS_LV_CLOSE_EDGE_PX.
         edge = header_number("apps_lv.h", "APPS_LV_CLOSE_EDGE_PX")
         hold = header_number("apps_lv.h", "APPS_LV_LAUNCH_HOLD_MS")
+        # Whole seconds, or "at most {hold // 1000} s" below would round a bound of 3500 ms down to the 3 s AGENTS.md says (6a m3).
+        self.assertEqual(hold % 1000, 0, f"APPS_LV_LAUNCH_HOLD_MS is {hold}: AGENTS.md quotes it in whole seconds")
         agents = (ROOT / "AGENTS.md").read_text()
         section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
         for phrase in ("the most recently used first; a tap on the app in the middle opens it and a tap on one at a side brings it to "
@@ -564,11 +573,15 @@ class GuideAndSkill(unittest.TestCase):
         for phrase in (
                 f"**Launcher:** a carousel (`apps_lv.c`): the app in the middle is {icon_px} px across (`APPS_LV_ICON_PX`), its "
                 f"neighbours {side}/256 of that, {side_px} px (`APPS_LV_ICON_SIDE_SCALE`), {pitch} px apart (`APPS_LV_ITEM_PITCH`);",
-                "A sideways swipe browses and snaps an app to the middle; a tap on the app in the middle opens it, a tap on a side app "
-                "brings it to the middle, and a swipe up from the bottom edge or a tap on the background closes the launcher.",
+                "A sideways swipe browses and snaps an app to the middle; a tap on the app in the middle or on its name opens it, a tap on "
+                "a side app brings it to the middle, and a swipe up from the bottom edge or a tap on the background closes the launcher.",
                 f"The guide asks for {icon_px} x {icon_px} icons, the size of the app in the middle",
                 f"the icons of the {window} apps around the middle (`APPS_ICONS_WINDOW`)",
-                "A bench build logs `launcher frame <ms> ms` (the `muse_apps` tag) at each display refresh while the carousel scrolls:"):
+                "A bench build logs `launcher frame <ms> ms` (the `muse_apps` tag) at each display refresh while the carousel scrolls:",
+                # The final review's hardening (d): the drag's own frames, so later per-frame work isn't sized against the 30 ms median.
+                "That median counts the snap's slow tail, 47 frames under 28 ms: the other 103, while a finger drags and as the snap "
+                "starts, have a median of 33 ms against the 30 of all 150, the gate's own limit, so per-frame work added later has no "
+                "margin to spend."):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
 
@@ -588,9 +601,15 @@ class GuideAndSkill(unittest.TestCase):
                        f"square and at most {px} x {px} px. Make it {centre} x {centre}: the launcher draws the app in the middle at that "
                        "size and its neighbours smaller, so a smaller icon is scaled up there and looks soft.",
                        f"`icon: <w>x<h> must be square, at most {px}x{px}`: redraw the icon {centre} x {centre} px and convert it again.",
+                       # The final review's m2: the install's byte bound, APPS_ICON_MAX_BYTES, as apps_pkg.h's message prints it.
+                       f"`icon: <n> bytes is more than an icon's {12 + px * px * 3}: its rows are padded`: convert the icon again with "
+                       "LVGLImage.py, without `--align`.",
                        "`manifest: icon '<path>' is not one of the app's files`",
                        "`manifest: icon '<path>' must be a .bin image`",
-                       "a coloured circle with the first letter of its name", "reinstall X with one", "--cf RGB565A8"):
+                       "a coloured circle with the first letter of its name", "reinstall X with one", "--cf RGB565A8",
+                       # The final review's m4: a dark shape on a transparent background is lost on the launcher's black card.
+                       "Draw one bold, simple shape that reads at a small size, on a transparent background. The launcher is black: draw "
+                       "in bright colours or make the shape light, since a dark one is lost on it."):
             with self.subTest(phrase):
                 self.assertIn(phrase, guide)
         self.assertEqual(guide.count("## Icons"), 1)

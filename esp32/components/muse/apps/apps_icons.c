@@ -36,9 +36,10 @@
  * which reads only its id and icon and writes only its result (block, len, fail). Slot k's hand-off is s_hand[k], the one word the
  * two tasks share, an internal static (S3 PSRAM has no read-modify-write, so no atomic is in the table): LENT while the job has the
  * slot; the job swaps LENT for DONE once its result is written, and a drop swaps LENT for ORPHANED. Whichever loses the swap frees
- * the block: a job that finds ORPHANED frees its own and then stores DONE; a drop that finds DONE frees it there. Until DONE the
- * LVGL task reads nothing of the slot and never empties it, so a job can't meet a slot used again; after DONE the job doesn't touch
- * it. So a drop frees every block, wherever it lands in a load, and no poll is needed after it (the launcher has closed).
+ * the block: a job that finds ORPHANED frees its own and then stores DONE (one that finds it before it begins reads nothing, and
+ * stores DONE at once); a drop that finds DONE frees it there. Until DONE the LVGL task reads nothing of the slot and never empties
+ * it, so a job can't meet a slot used again; after DONE the job doesn't touch it. So a drop frees every block, wherever it lands in
+ * a load, and no poll is needed after it (the launcher has closed).
  *
  * Bounds. READY and FAILED slots are only for wanted (id, icon) pairs, one slot each (a want frees the others at once, and a load
  * that ends unwanted is freed, not adopted), so there are at most APPS_ICONS_WINDOW of them; LOADING slots are at most
@@ -102,6 +103,12 @@ static atomic_uint s_hand[APPS_ICONS_SLOTS];
 static void load_job(void *arg) {
     slot_t *s = arg;
     atomic_uint *hand = &s_hand[s - S.slot];
+    if (atomic_load(hand) == HAND_ORPHANED) {
+        /* Orphaned before it began (a drop or the hold came while it waited in the queue), and only this job moves the word on from
+         * there: no read, no block. The slot is as ask() lent it (no block, no failure), the LVGL task's again from DONE. */
+        atomic_store(hand, HAND_DONE);
+        return;
+    }
     uint8_t *block = NULL;
     size_t len = 0;
     uint8_t fail = FAIL_NONE;

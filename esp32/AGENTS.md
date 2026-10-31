@@ -747,9 +747,9 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   (`APPS_LV_ICON_SIDE_SCALE`), 170 px apart (`APPS_LV_ITEM_PITCH`); each
   app's size follows its distance from the middle as the row scrolls, and a
   small dot marks the app that runs. A sideways swipe browses and snaps an app
-  to the middle; a tap on the app in the middle opens it, a tap on a side app
-  brings it to the middle, and a swipe up from the bottom edge or a tap on the
-  background closes the launcher. Each app shows its icon, or a coloured
+  to the middle; a tap on the app in the middle or on its name opens it, a tap
+  on a side app brings it to the middle, and a swipe up from the bottom edge
+  or a tap on the background closes the launcher. Each app shows its icon, or a coloured
   circle with its name's first letter while it has none or its pixels are
   still coming. The guide asks for 160 x 160 icons, the size of the app in the
   middle: a smaller one is scaled up there and looks soft. The I/O worker
@@ -767,7 +767,10 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   flings across all 10 apps (two `>swipe left` or `>swipe right` back to back
   each) gave 150 frames, a median of 30 ms and a 95th percentile of 41 ms
   (the longest 51), inside the frame gate of 33 and 50 ms, so the carousel
-  scales its icons live as they scroll.
+  scales its icons live as they scroll. That median counts the snap's slow
+  tail, 47 frames under 28 ms: the other 103, while a finger drags and as the
+  snap starts, have a median of 33 ms against the 30 of all 150, the gate's
+  own limit, so per-frame work added later has no margin to spend.
 - **Boot:** the apps' storage waits for the Link (`muse_apps.h`). The app task
   mounts the FAT and `apps_nvs`, and the I/O worker that does it is made, once
   the reply to the first `link.register` has come, accepted or not
@@ -808,9 +811,13 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   room for its heap and the reserve. While the launcher is open its icons are
   in PSRAM too, through the same floor: up to 5 of at most 76,812 bytes each
   (`APPS_ICONS_WINDOW`, `APPS_ICON_MAX_BYTES`) and 2 more loading; a pick
-  keeps only the 3 on the screen until the app's first frame, and a launch
-  refused for memory closes the launcher, which frees them, and is tried once
-  more. A snapshot is one block through
+  keeps only the 3 on the screen (`APPS_LV_HOLD_KEEP`) until the app's first
+  frame, and a launch refused for memory closes the launcher, which frees
+  them, and is tried once more. The launcher closes when the screen goes
+  dark, which frees them, so it holds none while the gadget sleeps; while
+  someone browses it, a launch it didn't pick (an alarm's, or one Muse asks
+  for) and a snapshot are admitted with its icons counted, and can be refused
+  for them. A snapshot is one block through
   the same floor (the screen's pixels, the picture masked in place and the
   JPEG's room: 565,392 bytes at scale 1 and 434,312 at scale 2, with 64 KB and
   40 KB allowed for the encoder's own buffers, also floored and counted with the

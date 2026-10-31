@@ -97,6 +97,7 @@ static void dump_log(void) {
 /* ---- The apps' heap: counted, with a floor that refuses every new block while it is closed ---- */
 
 static atomic_long blocks_held;
+static atomic_int blocks_taken;  /* new blocks given, ever: what a load cost even if it freed it again */
 static atomic_bool floor_closed;
 static atomic_int floor_refusals;
 
@@ -108,6 +109,7 @@ void *apps_port_realloc(void *ptr, size_t n) {
     void *block = realloc(ptr, n);
     if (ptr == NULL && block != NULL) {
         atomic_fetch_add(&blocks_held, 1);
+        atomic_fetch_add(&blocks_taken, 1);
     }
     return block;
 }
@@ -582,8 +584,9 @@ static void list_change_drops_stale_icons(void) {
     CHECK(jobs_waiting() == 1, "aa is asked for");
     apps_icons_drop_all();
     run_jobs();
-    CHECK(atomic_load(&reads) == 1, "the job ran: %d", atomic_load(&reads));
-    CHECK(atomic_load(&blocks_held) == 0, "its block was freed on the worker, with no poll: %ld", atomic_load(&blocks_held));
+    CHECK(atomic_load(&reads) == 0, "the job read nothing, orphaned before it began (an_orphaned_load_reads_nothing): %d",
+          atomic_load(&reads));
+    CHECK(atomic_load(&blocks_held) == 0, "nothing held, with no poll: %ld", atomic_load(&blocks_held));
     CHECK(!apps_icons_poll() && apps_icons_get("aa") == NULL, "and it never shows");
     CHECK(jobs_waiting() == 0, "the drop forgot the window: nothing is asked for again");
 
@@ -660,6 +663,57 @@ static void list_change_drops_stale_icons(void) {
  * in flight, queued or in the middle of its read, frees its block on the worker as it ends, never shown. An id given that isn't ready is
  * no exception. After it nothing is asked for, however many polls come. It starts a generation, as a drop does: an app wanted again
  * while its orphaned load still runs gets a load of its own, and its icon, not a tile. */
+/* Final review, recommendation 3: a load orphaned before its job began (a drop, or the launcher's hold, while it waited in the worker's
+ * queue) reads nothing and takes no block. Its job hands the slot back (DONE) at once, so the next want finds it free; nothing is said
+ * of it. A pick's launch job, queued behind it, then waits for no read. */
+static void an_orphaned_load_reads_nothing(void) {
+    put_icon("aa", 8, 0x11);
+    put_icon("bb", 8, 0x12);
+    put_icon("cc", 8, 0x13);
+
+    /* A drop: both loads queued, not begun. */
+    const char *two[] = {"aa", "bb"};
+    apps_icons_want(two, ICON, 2);
+    CHECK(jobs_waiting() == 2, "aa and bb are asked for: %d", jobs_waiting());
+    int reads0 = atomic_load(&reads), taken0 = atomic_load(&blocks_taken), said0 = logged_count("icons: ");
+    apps_icons_drop_all();
+    run_jobs();
+    CHECK(atomic_load(&reads) == reads0, "an orphaned load reads nothing: %d reads", atomic_load(&reads) - reads0);
+    CHECK(atomic_load(&blocks_taken) == taken0 && atomic_load(&blocks_held) == 0, "and takes no block: %d taken, %ld held",
+          atomic_load(&blocks_taken) - taken0, atomic_load(&blocks_held));
+    CHECK(logged_count("icons: ") == said0, "and says nothing");
+    CHECK(!apps_icons_poll() && apps_icons_get("aa") == NULL && apps_icons_get("bb") == NULL, "never shown");
+    /* Their slots came back: a want asks again, and the icons come. */
+    apps_icons_want(two, ICON, 2);
+    CHECK(jobs_waiting() == 2, "asked for again: %d", jobs_waiting());
+    settle();
+    CHECK(shows("aa", 8, 0x11) && shows("bb", 8, 0x12), "both show");
+
+    /* The hold: aa and bb kept, cc's load queued and orphaned by the keep. */
+    const char *three[] = {"aa", "bb", "cc"};
+    apps_icons_want(three, ICON, 3);
+    CHECK(jobs_waiting() == 1, "cc is asked for: %d", jobs_waiting());
+    reads0 = atomic_load(&reads);
+    taken0 = atomic_load(&blocks_taken);
+    apps_icons_keep(two, 2);
+    run_jobs();
+    CHECK(atomic_load(&reads) == reads0 && atomic_load(&blocks_taken) == taken0, "cc's orphaned load reads nothing: %d reads, %d blocks",
+          atomic_load(&reads) - reads0, atomic_load(&blocks_taken) - taken0);
+    CHECK(atomic_load(&blocks_held) == 2 && shows("aa", 8, 0x11) && shows("bb", 8, 0x12), "the kept two stay: %ld held",
+          atomic_load(&blocks_held));
+    CHECK(!apps_icons_poll() && apps_icons_get("cc") == NULL, "cc never shows");
+
+    /* A load already reading when it is orphaned still frees its own block (the hand-off's other half). */
+    apps_icons_want(three, ICON, 3);
+    gate_close();
+    jobs_start();
+    gate_wait_entered();
+    apps_icons_drop_all();
+    gate_open();
+    jobs_join();
+    CHECK(atomic_load(&blocks_held) == 0, "a read under way frees its block as it ends: %ld held", atomic_load(&blocks_held));
+}
+
 static void keep_frees_all_but_the_kept(void) {
     for (int i = 0; i < 6; i++) {
         put_icon(APPS[i], 8, (uint8_t)(0x30 + i));
@@ -1015,6 +1069,7 @@ static const case_t CASES[] = {
     {"get_is_null_until_loaded", get_is_null_until_loaded},
     {"refused_load_keeps_tile", refused_load_keeps_tile},
     {"list_change_drops_stale_icons", list_change_drops_stale_icons},
+    {"an_orphaned_load_reads_nothing", an_orphaned_load_reads_nothing},
     {"keep_frees_all_but_the_kept", keep_frees_all_but_the_kept},
     {"bad_icon_file_is_a_tile", bad_icon_file_is_a_tile},
     {"no_flash_on_the_lvgl_task", no_flash_on_the_lvgl_task},

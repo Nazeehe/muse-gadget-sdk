@@ -67,6 +67,8 @@ static const char *const handler_names[H_COUNT] = {"start", "stop", "show", "hid
 #define FILE_LIST_MAX 480
 
 #define NOT_RUNNING "the app is not running"
+#define IMAGES_FULL "no more than 4 images at once: free one with img:free()"
+_Static_assert(APPS_RT_IMAGES_MAX == 4, "IMAGES_FULL names the limit");
 
 /* What the store says to the log, and to apps_rt_new's caller when the store can't be had. */
 #define STORE_UNREADABLE "store: the saved values couldn't be read; starting with none"
@@ -92,6 +94,16 @@ typedef struct {
     int64_t period;  /* ms between runs of an every timer; 0 for a one-shot */
     uint32_t gen;    /* its life: a handle names (slot, gen); never 0 while armed */
 } armed_t;
+
+/* A runtime image's slot (apps_rt.h): free, an image the app holds, or one it freed whose bytes wait for the screen to let go. */
+typedef enum { IMAGE_FREE = 0, IMAGE_LIVE, IMAGE_FREED } image_state_t;
+
+typedef struct {
+    uint8_t *block;  /* the LVGL v9 file, from apps_port_realloc: the runtime's while state isn't IMAGE_FREE */
+    uint16_t w, h;
+    uint32_t gen;    /* its life, which its handles carry; never 0 for an image */
+    uint8_t state;   /* image_state_t */
+} rt_image_t;
 
 /* A key of the store and the text of its value (JSON, as json.encode writes it), in one block of the port's heap: outside the Lua heap,
  * so the 16 KB the store may hold never counts against memory_kb. */
@@ -132,6 +144,9 @@ struct apps_rt {
     /* sys.show (apps_rt_show_allowed): message() or alarm() is running, or a touch came at touch_ms. */
     bool show_ok, touched;
     int64_t touch_ms;
+    /* The runtime images (apps_rt.h), and the last gen given. */
+    rt_image_t images[APPS_RT_IMAGES_MAX];
+    uint32_t image_gen;
     /* apps_vm_call writes its error here. It is the crash record while the state is CRASHED (and nothing runs
      * after that), and the scratch of a call that fails the message alone otherwise. */
     char err[APPS_ERROR_MAX];
@@ -474,6 +489,7 @@ static void duty_roll(apps_rt_t *rt, int64_t now_ms);
 static void duty_book(apps_rt_t *rt, int64_t began, int64_t ended, uint64_t instr);
 static void timers_disarm(apps_rt_t *rt);
 static void store_flush_final(apps_rt_t *rt);
+static void images_open(lua_State *L, apps_rt_t *rt);
 
 /* Runs fn(arg) as one apps_vm_call with the budget: fn is a C function that gets arg as a light userdata and
  * does everything that touches the app's heap, so that a refusal there is an error inside the call. The
@@ -1046,6 +1062,7 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     apps_json_open(L);  /* safe outside a call: if the heap refuses, the call below ends out of memory */
     apps_ui_open(L, rt->ui);
     apps_svc_open(L, rt);  /* time, os, timer, alarm, sound, store and sys: before main.lua, so its top level can arm a timer */
+    images_open(L, rt);    /* the runtime images' handles (apps_rt.h) */
     if (apps_rt_permits(rt, APPS_PERM_STORE) && !store_load(rt)) {
         put_text(err, err_len, STORE_LOAD_FAILED);
         apps_rt_free(rt);
@@ -1528,6 +1545,220 @@ char *apps_rt_message(apps_rt_t *rt, const char *event, const char *data_json, s
     }
 }
 
+/* ---- Runtime images (apps_rt.h) ---- */
+
+/* Gives back the bytes of the freed images that no object draws: the apply step's last report (read under the UI lock, so no pass is
+ * half way through; the bytes are freed after the lock is let go, and the table has no way to them since their free). */
+static void images_collect(apps_rt_t *rt) {
+    bool waiting = false;
+    for (int i = 0; i < APPS_RT_IMAGES_MAX; i++) {
+        waiting = waiting || rt->images[i].state == IMAGE_FREED;
+    }
+    if (!waiting) {
+        return;
+    }
+    uint32_t drawn = apps_ui_images_drawn(rt->ui);
+    for (int i = 0; i < APPS_RT_IMAGES_MAX; i++) {
+        rt_image_t *img = &rt->images[i];
+        if (img->state == IMAGE_FREED && (drawn & (1u << i)) == 0) {
+            apps_port_free(img->block);
+            *img = (rt_image_t){0};
+        }
+    }
+}
+
+void apps_rt_image_collect(apps_rt_t *rt) {
+    if (rt != NULL) {
+        images_collect(rt);
+    }
+}
+
+int apps_rt_image_add(apps_rt_t *rt, uint8_t *block, size_t len, char *err, size_t err_len) {
+    put_text(err, err_len, "");
+    if (rt == NULL) {
+        apps_port_free(block);
+        put_text(err, err_len, NOT_RUNNING);
+        return -1;
+    }
+    uint16_t w, h;
+    char why[160];
+    if (!apps_image_check(block, len, &w, &h, why, sizeof why)) {  /* at most the screen a side: APPS_RT_IMAGE_SIDE_MAX */
+        apps_port_free(block);
+        put_text(err, err_len, why);
+        return -1;
+    }
+    images_collect(rt);
+    int slot = -1;
+    for (int i = 0; i < APPS_RT_IMAGES_MAX && slot < 0; i++) {
+        slot = rt->images[i].state == IMAGE_FREE ? i : -1;
+    }
+    if (slot < 0) {
+        apps_port_free(block);
+        put_text(err, err_len, IMAGES_FULL);
+        return -1;
+    }
+    if (++rt->image_gen == 0) {
+        rt->image_gen = 1;  /* never 0 */
+    }
+    rt->images[slot] = (rt_image_t){.block = block, .w = w, .h = h, .gen = rt->image_gen, .state = IMAGE_LIVE};
+    apps_ui_set_image(rt->ui, slot, rt->image_gen, block, len, w, h);
+    return slot;
+}
+
+void apps_rt_image_push(lua_State *L, apps_rt_t *rt, int slot) {
+    if (rt == NULL) {
+        lua_pushnil(L);
+        return;
+    }
+    apps_ui_push_image(L, rt->ui, slot);
+}
+
+int apps_rt_images_take(apps_rt_t *rt, void *blocks[APPS_RT_IMAGES_MAX]) {
+    int n = 0;
+    for (int i = 0; rt != NULL && i < APPS_RT_IMAGES_MAX; i++) {
+        rt_image_t *img = &rt->images[i];
+        if (img->state != IMAGE_FREE) {
+            apps_ui_set_image(rt->ui, i, 0, NULL, 0, 0, 0);
+            blocks[n++] = img->block;
+            *img = (rt_image_t){0};
+        }
+    }
+    return n;
+}
+
+/* The image a handle names, while the app holds it: the slot's, on the handle's gen. NULL for one that was freed. */
+static rt_image_t *image_of(apps_rt_t *rt, const apps_image_handle_t *h) {
+    if (h->slot >= APPS_RT_IMAGES_MAX) {
+        return NULL;
+    }
+    rt_image_t *img = &rt->images[h->slot];
+    return img->state == IMAGE_LIVE && img->gen == h->gen ? img : NULL;
+}
+
+/* The handle at arg 1 of a method. */
+static const apps_image_handle_t *self_image(lua_State *L, const char *method) {
+    const apps_image_handle_t *h = luaL_testudata(L, 1, APPS_IMAGE_MT);
+    if (h == NULL) {
+        luaL_error(L, "image: %s needs an image: call it as img:%s()", method, method);
+    }
+    return h;
+}
+
+/* img:size(): w, h. */
+static int image_size(lua_State *L) {
+    apps_vm_check(L);
+    apps_rt_t *rt = lua_touserdata(L, lua_upvalueindex(1));
+    const apps_image_handle_t *h = self_image(L, "size");
+    const rt_image_t *img = image_of(rt, h);
+    if (img == NULL) {
+        return luaL_error(L, "image#%d was freed", (int)h->slot);
+    }
+    lua_pushinteger(L, img->w);
+    lua_pushinteger(L, img->h);
+    return 2;
+}
+
+/* img:free(): an error while a live widget shows it; else no widget may name it from now on, and its bytes go once no object draws
+ * them (at once when none does). A handle of an image that was freed frees nothing. */
+static int image_free(lua_State *L) {
+    apps_vm_check(L);
+    apps_rt_t *rt = lua_touserdata(L, lua_upvalueindex(1));
+    const apps_image_handle_t *h = self_image(L, "free");
+    rt_image_t *img = image_of(rt, h);
+    if (img == NULL) {
+        return 0;
+    }
+    if (apps_ui_image_shown(rt->ui, h->slot)) {
+        return luaL_error(L, "image is in use by image#%d", (int)h->slot);
+    }
+    apps_ui_set_image(rt->ui, h->slot, 0, NULL, 0, 0, 0);
+    img->state = IMAGE_FREED;
+    images_collect(rt);
+    return 0;
+}
+
+static const luaL_Reg apps_image_methods[] = {
+    {"size", image_size}, {"free", image_free}, {NULL, NULL},
+};
+
+/* img.name: a method, or an error that lists them. */
+static int image_index(lua_State *L) {
+    apps_vm_check(L);
+    if (lua_type(L, 2) == LUA_TSTRING) {
+        lua_pushvalue(L, 2);
+        if (lua_rawget(L, lua_upvalueindex(1)) != LUA_TNIL) {  /* upvalue 1: the methods */
+            return 1;
+        }
+    }
+    char shown[SHOWN_MAX + 4];
+    if (lua_type(L, 2) == LUA_TSTRING) {
+        size_t len;
+        const char *name = lua_tolstring(L, 2, &len);
+        echo(shown, name, len, SHOWN_MAX);
+    } else {
+        snprintf(shown, sizeof shown, "<%s>", luaL_typename(L, 2));
+    }
+    return luaL_error(L, "image: unknown method '%s' (valid: size, free)", shown);
+}
+
+static int image_newindex(lua_State *L) {
+    apps_vm_check(L);
+    return luaL_error(L, "image: an image has no fields: img:size() gives its size");
+}
+
+static int image_tostring(lua_State *L) {
+    apps_vm_check(L);
+    const apps_image_handle_t *h = luaL_testudata(L, 1, APPS_IMAGE_MT);
+    if (h == NULL) {
+        return luaL_error(L, "image: tostring needs an image");
+    }
+    lua_pushfstring(L, "image#%d", (int)h->slot);
+    return 1;
+}
+
+/* Two handles are equal when they name the same image of the same life (while the app holds one it is the one object
+ * apps_ui_push_image gives, so this only matters for a handle made again after the app let go of the first). */
+static int image_eq(lua_State *L) {
+    apps_vm_check(L);
+    const apps_image_handle_t *a = luaL_testudata(L, 1, APPS_IMAGE_MT), *b = luaL_testudata(L, 2, APPS_IMAGE_MT);
+    lua_pushboolean(L, a != NULL && b != NULL && a->slot == b->slot && a->gen == b->gen);
+    return 1;
+}
+
+/* Runs under lua_pcall: the handles' metatable, protected (X17: getmetatable gives its name, so no app can add __gc to it). */
+static int open_images(lua_State *L) {
+    apps_rt_t *rt = lua_touserdata(L, 1);
+    lua_settop(L, 0);
+    luaL_newmetatable(L, APPS_IMAGE_MT);
+    lua_pushliteral(L, APPS_IMAGE_MT);
+    lua_setfield(L, -2, "__metatable");
+    lua_createtable(L, 0, 2);  /* the methods */
+    lua_pushlightuserdata(L, rt);
+    luaL_setfuncs(L, apps_image_methods, 1);
+    lua_pushcclosure(L, image_index, 1);
+    lua_setfield(L, -2, "__index");
+    lua_pushcfunction(L, image_newindex);
+    lua_setfield(L, -2, "__newindex");
+    lua_pushcfunction(L, image_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_pushcfunction(L, image_eq);
+    lua_setfield(L, -2, "__eq");
+    lua_pop(L, 1);
+    return 0;
+}
+
+/* Installs the handles' metatable. Safe outside a protected call, as apps_ui_open is: if the heap refuses, the VM is out of memory and
+ * the next call says so. */
+static void images_open(lua_State *L, apps_rt_t *rt) {
+    int top = lua_gettop(L);
+    if (lua_checkstack(L, 2)) {
+        lua_pushcfunction(L, open_images);
+        lua_pushlightuserdata(L, rt);
+        (void)lua_pcall(L, 1, 0, 0);
+    }
+    lua_settop(L, top);
+}
+
 /* ---- The rest of the API ---- */
 
 void apps_rt_free(apps_rt_t *rt) {
@@ -1538,6 +1769,9 @@ void apps_rt_free(apps_rt_t *rt) {
         /* The VM goes first: no app code runs after it, so no handle to the table is left to use. */
         apps_vm_free(rt->vm);
         apps_ui_free(rt->ui);
+        for (int i = 0; i < APPS_RT_IMAGES_MAX; i++) {
+            apps_port_free(rt->images[i].block);  /* those not taken (apps_rt_images_take): no object can draw them */
+        }
         apps_port_free(rt);
     }
 }

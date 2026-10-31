@@ -170,9 +170,10 @@
  * table.
  *
  * Memory: a runtime is one block from apps_port_realloc (itself, with its log and crash record), the VM's
- * heap, capped at the manifest's memory_kb, the widget table (apps_ui.h) with its text, and the store's cache (a block for each
- * key, and a table of them: outside memory_kb, and APPS_STORE_MAX_BYTES says how much). apps_rt_free gives all of it back, saves a
- * store that has a change in it, and runs no app code.
+ * heap, capped at the manifest's memory_kb, the widget table (apps_ui.h) with its text, the store's cache (a block for each
+ * key, and a table of them: outside memory_kb, and APPS_STORE_MAX_BYTES says how much), and its runtime images (below: outside
+ * memory_kb too). apps_rt_free gives all of it back (the images it still holds included), saves a store that has a change in it,
+ * and runs no app code.
  */
 
 #include <stdbool.h>
@@ -270,7 +271,8 @@ void apps_rt_stop(apps_rt_t *rt);
 /* Frees the runtime, its VM and its widget table, and runs no app code (a crashed or abandoned app can be freed
  * too). NULL is ignored. The LVGL task reads the table under the UI lock and this frees it without one
  * (apps_ui_free): the apply step must have let go of apps_rt_ui(rt) before this is called (Task 12 clears its
- * pointer to it under the lock first), or it reads freed memory. */
+ * pointer to it under the lock first), or it reads freed memory. The runtime images it still holds go too: for an app
+ * whose table was published, take them first (apps_rt_images_take), since objects draw them until the layer's reset. */
 void apps_rt_free(apps_rt_t *rt);
 
 apps_state_t apps_rt_state(const apps_rt_t *rt);
@@ -445,3 +447,81 @@ unsigned apps_rt_memory_kb(const apps_rt_t *rt);
 /* print, for sys.log (apps_svc.c): the same function print is, whose first upvalue is the runtime. It starts with apps_vm_check
  * like every binding. */
 int apps_rt_print(lua_State *L);
+
+/* ---- Runtime images (connected apps Task 2) ----
+ *
+ * A picture an app gets while it runs (a JPEG of its VM folder, decoded by apps_jpeg.h; a .bin), as opposed to its package's images.
+ * Each is an LVGL v9 image block (the 12-byte header, then the pixels: what apps_image_check passes) that the runtime owns from
+ * apps_rt_image_add until the app frees it or ends, in one of APPS_RT_IMAGES_MAX slots. The block comes through apps_port_realloc's
+ * floor (the decode's, or the read's), so it counts against the apps' room and not against memory_kb.
+ *
+ * Tasks (P2). apps_rt_image_add and apps_rt_image_push run on the app task only, like everything here. A worker that decodes (the
+ * network worker, Task 3) makes the block and hands it over in its result; the app task adds it, outside a call or inside one, and
+ * pushes the handle inside the call of the callback that gets it. The LVGL task never touches the runtime: it sees an image through
+ * the widget table (apps_ui.h), which the add publishes the block to, under the UI lock, and it draws from the block in place.
+ *
+ * The handle. A userdata with the protected metatable "muse.image" (APPS_IMAGE_MT: getmetatable(img) is that name): one object per
+ * image while the app holds it (ui's registry remembers it weakly, as it does widgets' handles), so rawequal holds, and == too for
+ * two handles of one image. Methods (apps_image_methods[]):
+ * - img:size() is the image's w, h, from its header.
+ * - img:free() lets go of the image. It is an error while a live widget (not deleted, hidden or not) shows it: "image is in use by
+ *   image#<n>". From then on no widget can show it, and its bytes go once the screen has let go of them (below). A second free does
+ *   nothing.
+ * - tostring(img) is "image#<slot>", freed or not.
+ * After the free (or the app's end) the handle stays a handle that knows it was freed: size() and src = img are errors, "image#<n> was
+ * freed" and "ui.<kind>: src image#<n> was freed". A handle names its image by slot and by its life (a gen), so the next image in the
+ * same slot is not the old handle's.
+ * ui.image{src = img} and w:set{src = img} take a handle as well as a package path, and w:get("src") gives the handle back (apps_ui.h).
+ * A runtime image is sized from its header, so its spin meets both of apps_ui.h's caps as a package image's does (P9).
+ *
+ * Never blank. An image object draws from the block in place, on the LVGL task, until a pass of the apply step takes it down or points
+ * it elsewhere, which can be a frame after the widget was deleted or moved to another src. So a freed image's bytes are given back
+ * only once the apply step has reported a pass after which no object draws them (apps_ui_images_drawn: the slots the layer's objects
+ * draw from, which apps_lv reports at the end of every pass); until then the image keeps its slot, and counts among the four. The
+ * runtime looks at each add, at each free, and in apps_rt_image_collect, which the app task's loop calls every round. While the screen
+ * is dark no pass runs, so a freed image the screen was drawing waits for the screen to wake. At an app's end the runtime's caller
+ * takes every image's bytes (apps_rt_images_take) before it frees the runtime, and frees them once the layer's reset has taken the
+ * objects down (apps_task.c, as it does the package's).
+ *
+ * Messages (beside the handle's, above):
+ *   no more than 4 images at once: free one with img:free()       the add, with every slot taken (freed images the screen still
+ *                                                                 draws included)
+ *   image: ...                                                    the add: apps_image_check's own words for a block that isn't an
+ *                                                                 image it takes
+ *   image: unknown method '<name>' (valid: size, free)
+ *   image: <method> needs an image: call it as img:<method>()
+ *   image: an image has no fields: img:size() gives its size
+ */
+
+#define APPS_RT_IMAGES_MAX 4        /* runtime images an app may hold at once */
+#define APPS_RT_IMAGE_SIDE_MAX 466  /* a runtime image's longest side, px: the screen, as apps_image_check allows */
+
+/* The handle's metatable, and what the userdata holds (apps_ui.c reads it for ui.image's src). */
+#define APPS_IMAGE_MT "muse.image"
+typedef struct {
+    uint32_t gen;   /* the image's life (never 0): a slot's next image has another */
+    uint16_t slot;  /* 0 to APPS_RT_IMAGES_MAX - 1 */
+} apps_image_handle_t;
+
+/*
+ * Takes block[0, len), an LVGL v9 image block from apps_port_realloc, as a runtime image: its slot, 0 to APPS_RT_IMAGES_MAX - 1. The
+ * runtime owns the block from here on, whatever comes back: on failure it is freed, and the result is -1 with err set (cut to err_len
+ * on a character boundary; err may be NULL): apps_image_check's message for a block that isn't an image it takes (so at most
+ * APPS_RT_IMAGE_SIDE_MAX a side), "no more than 4 images at once: free one with img:free()" with every slot taken, "the app is not
+ * running" for a NULL rt. Freed images that the screen has let go of give their slots back first. The app task, inside a call or
+ * outside one (P2): it runs no app code and allocates nothing in the app's heap.
+ */
+int apps_rt_image_add(apps_rt_t *rt, uint8_t *block, size_t len, char *err, size_t err_len);
+
+/* Pushes the handle of the image at slot (the one the app holds, if it does), or nil for a slot with no image or one that was freed.
+ * The app task, inside a call (P2): it may allocate the handle in the app's heap, and raises when that refuses. */
+void apps_rt_image_push(lua_State *L, apps_rt_t *rt, int slot);
+
+/* Gives back the bytes of the freed images that no object draws any more (the apply step's last report). The app task's loop calls it
+ * every round; it runs no app code. NULL is ignored. */
+void apps_rt_image_collect(apps_rt_t *rt);
+
+/* An app's end: hands every image's block (freed ones the screen may still draw included) to the caller, into blocks, and returns how
+ * many; the runtime holds none of them after it, and its handles are freed ones. The caller frees each with apps_port_free once no
+ * object can draw it: after the layer's reset, for an app whose table was published. 0 for NULL. */
+int apps_rt_images_take(apps_rt_t *rt, void *blocks[APPS_RT_IMAGES_MAX]);

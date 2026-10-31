@@ -17,7 +17,8 @@
 tests/muse_apps_lv_harness.c runs the real apps_ui (Lua's `ui` module and its table), the real apps_lv.c and the real
 apps_icons.c (the launcher's icons) against a fake LVGL (tests/muse_apps_lv_fakes.h, staged as lvgl.h, esp_attr.h,
 esp_heap_caps.h, esp_log.h and esp_timer.h, one line each, as test_muse_ptt_ui.py does), a fake I/O worker that runs its
-jobs when a case says, and a store of icon files in memory. The fake logs every call as a line, keeps every object it ever made so that a call on
+jobs when a case says, a store of icon files in memory, and (for the runtime images' cases, connected apps Task 2) the real
+runtime, apps_rt.c with its services. The fake logs every call as a line, keeps every object it ever made so that a call on
 a deleted one is caught, and counts an LVGL call made inside the pass without the UI lock; the harness's port is a
 counting allocator (every case ends at 0 bytes held) and a lock that records how it is used.
 
@@ -48,7 +49,7 @@ FAKES = TESTS / "muse_apps_lv_fakes.h"
 HARNESS = TESTS / "muse_apps_lv_harness.c"
 APPS_LV = APPS / "apps_lv.c"
 HARNESS_SOURCES = [HARNESS, APPS_LV, APPS / "apps_icons.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c",
-                   APPS / "apps_pkg.c", APPS / "apps_suggest.c"]
+                   APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_svc.c"]
 
 # What apps_lv.c and apps_icons.c include of LVGL and ESP-IDF: each one is a line that includes the fakes.
 FAKE_HEADERS = ["lvgl.h", "esp_attr.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h"]
@@ -482,6 +483,23 @@ class HarnessTest(unittest.TestCase):
 
     def test_rotation_sets_the_angle_a_spin_continues_from(self):
         self.run_case("rotation_sets_the_angle_a_spin_continues_from")
+
+    # ---- Connected apps Task 2: runtime images ----
+
+    def test_runtime_image_shows_in_ui_image(self):  # drawn from its block in place; rotation, spin and scale as a package image's
+        self.run_case("runtime_image_shows_in_ui_image")
+
+    def test_freed_runtime_image_is_never_drawn(self):  # Review Focus 3: the bytes stay until a pass that no longer draws them
+        self.run_case("freed_runtime_image_is_never_drawn")
+
+    def test_images_free_at_app_end_after_the_reset(self):
+        self.run_case("images_free_at_app_end_after_the_reset")
+
+    def test_the_pass_reports_what_it_draws(self):  # a rejected widget's object keeps its picture, and its image
+        self.run_case("the_pass_reports_what_it_draws")
+
+    def test_a_slots_next_image_can_be_at_the_same_address(self):  # its descriptor is made from its own header
+        self.run_case("a_slots_next_image_can_be_at_the_same_address")
 
     def test_spin_ends_with_the_widget(self):  # a delete, ui.clear(), a box's delete, the layer's reset: no animation is left
         self.run_case("spin_ends_with_the_widget")

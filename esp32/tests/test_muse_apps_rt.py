@@ -1488,6 +1488,36 @@ class HarnessTest(unittest.TestCase):
     def test_state_names(self):
         self.run_case("state_names")
 
+    # ---- Connected apps Task 2: runtime images ----
+
+    def test_a_runtime_images_handle(self):  # size, free, tostring, protected; ui.image takes it; free while shown is an error
+        self.run_case("images_api")
+
+    def test_the_fifth_image_is_refused(self):
+        self.run_case("the_fifth_image_is_refused")
+
+    def test_a_freed_image_waits_for_a_pass_that_doesnt_draw_it(self):  # Review Focus 3, with the pass's report given by hand
+        self.run_case("images_wait_for_the_screen")
+
+    def test_an_apps_end_hands_its_images_over(self):  # apps_rt_images_take: the app task frees them after the layer's reset
+        self.run_case("images_at_the_end")
+
+    def test_a_runtime_image_spins_under_both_caps(self):  # P9: sized from its header, 200 px spins, 201 is refused, 40,000 px
+        self.run_case("images_spin_caps")
+
+    def test_a_push_survives_a_heap_that_refuses_at_every_step(self):
+        self.run_case("images_refused")
+
+    def test_the_image_constants(self):
+        # The brief's numbers; the side is apps_image_check's screen, which the add relies on.
+        self.assertEqual(header_number("apps_rt.h", "APPS_RT_IMAGES_MAX"), 4)
+        self.assertEqual(header_number("apps_rt.h", "APPS_RT_IMAGE_SIDE_MAX"), 466)
+        pkg = (APPS / "apps_pkg.c").read_text()
+        self.assertRegex(pkg, r"#define IMAGE_SCREEN 466\b")
+        # P2: the add and the push are the app task's, and the header says so.
+        header = (APPS / "apps_rt.h").read_text()
+        self.assertRegex(header, r"(?s)apps_rt_image_add.{0,600}app task|app task.{0,600}apps_rt_image_add")
+
 
 if __name__ == "__main__":
     unittest.main()

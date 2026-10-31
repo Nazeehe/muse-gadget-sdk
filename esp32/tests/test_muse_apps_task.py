@@ -676,5 +676,30 @@ class AppTaskStoreTest(HarnessCase):
         self.run_case("a_launch_beside_a_big_app_counts_what_its_end_frees")
 
 
+class RuntimeImagesAtTheEndTest(unittest.TestCase):
+    """Connected apps Task 2: an app's runtime images (apps_rt.h) are drawn in place, as its package is, so they go with the package,
+    after the layer's reset. Until Task 3 the app task makes none (the network worker's results do), so this harness can't hand it
+    one: test_muse_apps_lv.py runs the runtime, its table and the pass through end_app's order, and this pins end_app to it."""
+
+    def test_the_images_go_with_the_package_after_the_reset(self):
+        from test_muse_apps_wiring import c_function, strip_c_comments
+        task = strip_c_comments((APPS / "apps_task.c").read_text())
+        end = c_function(task, "static void end_app(end_t how)")
+        take = end.index("apps_rt_images_take(T.rt, images)")
+        self.assertRegex(end, r"int n_images = T\.was_published \? apps_rt_images_take\(T\.rt, images\) : 0;",
+                         "taken only from an app whose table was published: an unpublished one's never had objects")
+        self.assertLess(take, end.index("apps_rt_free(T.rt);"), "taken before the runtime is freed")
+        self.assertLess(end.index("unpublish();"), take)
+        self.assertLess(end.index("(void)wait_reset(reset);"), end.index("release_pkg(T.pkg, images, n_images, reset);"))
+        release = c_function(task, "static void release_pkg(")
+        self.assertRegex(release, r"if \(reset_ran\(reset\)\) \{\s*free_pkg\(pkg\);\s*free_images\(images, n_images\);")
+        self.assertIn("memcpy(p->images, images, (size_t)n_images * sizeof images[0]);", release)
+        parked = c_function(task, "static void free_parked(void)")
+        self.assertRegex(parked, r"if \(reset_ran\(p->reset\)\) \{[^}]*free_pkg\(p->pkg\);\s*free_images\(p->images, p->n_images\);")
+        self.assertRegex(task, r"void \*images\[APPS_RT_IMAGES_MAX\];\s*/?\*?[^\n]*\n?\s*int n_images;", "parked_t holds them")
+        # A freed image the screen has let go of gives its bytes back every round, outside any call.
+        self.assertIn("apps_rt_image_collect(T.rt);", c_function(task, "static void run_timers(void)"))
+
+
 if __name__ == "__main__":
     unittest.main()

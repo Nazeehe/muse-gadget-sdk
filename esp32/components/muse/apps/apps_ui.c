@@ -32,6 +32,7 @@
 #include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
+#include "apps_rt.h"
 #include "apps_vm.h"
 #include "lauxlib.h"
 #include "lua.h"
@@ -41,6 +42,12 @@
 #define BIT(p) (1u << (p))
 
 _Static_assert(APPS_UI_ASSETS_MAX >= APPS_MAX_FILES, "every file of a package may be an image");
+_Static_assert(APPS_RT_IMAGES_MAX <= 32, "a runtime image is a bit of the pass's report");
+
+/* A widget's image: an asset's index, or IMAGE_RT + a runtime image's slot (apps_ui.h). */
+#define IMAGE_RT APPS_UI_ASSETS_MAX
+#define IMAGES_ALL (APPS_UI_ASSETS_MAX + APPS_RT_IMAGES_MAX)
+_Static_assert(IMAGES_ALL <= INT16_MAX, "a widget's image is an int16_t");
 
 #define SCREEN 466
 #define SCREEN_R 233
@@ -175,7 +182,13 @@ struct apps_ui {
     bool bg_changed, clear_pending;
     apps_asset_t assets[APPS_UI_ASSETS_MAX];
     int n_assets;
+    /* The runtime images by slot (apps_rt.h: the runtime sets them under the lock), data NULL for none; each one's life, as its
+     * handles carry it; and the apply step's report, a bit a slot: the ones the layer's objects draw from. */
+    apps_asset_t images[APPS_RT_IMAGES_MAX];
+    uint32_t image_gen[APPS_RT_IMAGES_MAX];
+    uint32_t drawn;
     char handle_key;  /* its address is the registry's key of the table that remembers the app's handles */
+    char image_key;   /* and this one's, of the table that remembers the runtime images' handles */
 };
 
 /* What a handle holds. A slot that is gone, or whose gen has moved on, is a deleted widget. */
@@ -724,8 +737,16 @@ static void read_parent(const ctx_t *x, prop_t p, int idx, change_t *c) {
 
 static void read_src(const ctx_t *x, prop_t p, int idx, change_t *c) {
     lua_State *L = x->L;
+    const apps_image_handle_t *img = luaL_testudata(L, idx, APPS_IMAGE_MT);
+    if (img != NULL) {  /* a runtime image (apps_rt.h): one that hasn't been freed, and is still this handle's */
+        if (img->slot >= APPS_RT_IMAGES_MAX || x->ui->images[img->slot].data == NULL || x->ui->image_gen[img->slot] != img->gen) {
+            fail_kind(L, x->kind, "src image#%d was freed", (int)img->slot);
+        }
+        c->v[p] = IMAGE_RT + img->slot;
+        return;
+    }
     if (lua_type(L, idx) != LUA_TSTRING) {
-        wrong_type(x, p, "a string", idx);
+        wrong_type(x, p, "a string or an image", idx);
     }
     size_t len;
     const char *s = lua_tolstring(L, idx, &len);
@@ -753,12 +774,12 @@ static uint32_t drawn_side(uint16_t side, int64_t scale) {
     return ((uint32_t)side * (uint32_t)scale + 50) / 100;
 }
 
-/* The size of the picture src names, from its header; 0 x 0 when the table can't size it (no image of the package, or one with no
- * size). Task 2 sizes its runtime images here (P9). */
+/* The size of the picture src names, from its header: a package image's, or a runtime image's (P9); 0 x 0 when the table can't size
+ * it (no image of the package and no runtime image, or one with no size). */
 static void picture_size(const apps_ui_t *ui, int64_t src, uint16_t *w, uint16_t *h) {
-    bool asset = src >= 0 && src < ui->n_assets;
-    *w = asset ? ui->assets[src].w : 0;
-    *h = asset ? ui->assets[src].h : 0;
+    const apps_asset_t *image = src >= 0 && src < IMAGES_ALL ? apps_ui_asset(ui, (int)src) : NULL;
+    *w = image != NULL ? image->w : 0;
+    *h = image != NULL ? image->h : 0;
 }
 
 /* Raises unless a picture of w x h px at scale percent may spin: sized (a side of 0 is one the table couldn't size, so this fails
@@ -1358,6 +1379,8 @@ static int w_get(lua_State *L) {
         case T_SRC:
             if (v >= 0 && v < ui->n_assets) {
                 lua_pushstring(L, ui->assets[v].path);
+            } else if (v >= IMAGE_RT && v < IMAGES_ALL) {
+                apps_ui_push_image(L, ui, (int)(v - IMAGE_RT));  /* the handle the app holds, or one of the same image */
             } else {
                 lua_pushnil(L);
             }
@@ -1512,6 +1535,13 @@ static int open_ui(lua_State *L) {
     lua_setmetatable(L, -2);
     lua_rawsetp(L, LUA_REGISTRYINDEX, &ui->handle_key);
 
+    lua_createtable(L, APPS_RT_IMAGES_MAX, 0);  /* the runtime images' handles, the same way: see apps_ui_push_image */
+    lua_createtable(L, 0, 1);
+    lua_pushliteral(L, "v");
+    lua_setfield(L, -2, "__mode");
+    lua_setmetatable(L, -2);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &ui->image_key);
+
     /* Protected: getmetatable gives the name, never the table. push_handle's luaL_setmetatable registers a
      * finalizer whenever the metatable holds __gc and skips the sandbox's setmetatable, which refuses one, so an
      * app that could write __gc into it would give every later handle a finalizer, and Lua runs those with the
@@ -1602,7 +1632,94 @@ apps_widget_t *apps_ui_slot(apps_ui_t *ui, int slot) {
 }
 
 const apps_asset_t *apps_ui_asset(const apps_ui_t *ui, int index) {
-    return ui != NULL && index >= 0 && index < ui->n_assets ? &ui->assets[index] : NULL;
+    if (ui == NULL || index < 0) {
+        return NULL;
+    }
+    if (index < ui->n_assets) {
+        return &ui->assets[index];
+    }
+    if (index >= IMAGE_RT && index < IMAGES_ALL && ui->images[index - IMAGE_RT].data != NULL) {
+        return &ui->images[index - IMAGE_RT];
+    }
+    return NULL;
+}
+
+void apps_ui_report_drawn(apps_ui_t *ui, uint32_t drawn) {
+    if (ui != NULL) {
+        ui->drawn = drawn;
+    }
+}
+
+/* ---- Runtime images: the runtime's side ---- */
+
+void apps_ui_set_image(apps_ui_t *ui, int slot, uint32_t gen, const uint8_t *block, size_t len, uint16_t w, uint16_t h) {
+    if (ui == NULL || slot < 0 || slot >= APPS_RT_IMAGES_MAX) {
+        return;
+    }
+    apps_port_ui_lock();
+    ui->images[slot] = block != NULL ? (apps_asset_t){.path = NULL, .data = block, .len = len, .w = w, .h = h} : (apps_asset_t){0};
+    ui->image_gen[slot] = block != NULL ? gen : 0;
+    apps_port_ui_unlock();
+}
+
+bool apps_ui_image_shown(const apps_ui_t *ui, int slot) {
+    if (ui == NULL || slot < 0 || slot >= APPS_RT_IMAGES_MAX) {
+        return false;
+    }
+    for (int i = 0; i < APPS_UI_SLOTS; i++) {
+        const apps_widget_t *w = &ui->w[i];
+        if (w->alive && w->kind == APPS_W_IMAGE && w->image == IMAGE_RT + slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t apps_ui_images_drawn(apps_ui_t *ui) {
+    if (ui == NULL) {
+        return 0;
+    }
+    apps_port_ui_lock();
+    uint32_t drawn = ui->drawn;
+    apps_port_ui_unlock();
+    return drawn;
+}
+
+/* A new handle of the runtime image at slot, on the stack. */
+static void push_image_handle(lua_State *L, int slot, uint32_t gen) {
+    apps_image_handle_t *h = lua_newuserdatauv(L, sizeof *h, 0);
+    h->gen = gen;
+    h->slot = (uint16_t)slot;
+    luaL_setmetatable(L, APPS_IMAGE_MT);
+}
+
+/* As push_widget does for widgets: a registry table with weak values and a place for each slot, which holds the handle of that slot's
+ * image as the app last had it, looked at (slot and gen) before it is given again. Made with its places, so storing a handle can't
+ * allocate. */
+void apps_ui_push_image(lua_State *L, apps_ui_t *ui, int slot) {
+    luaL_checkstack(L, 4, "image");
+    if (ui == NULL || slot < 0 || slot >= APPS_RT_IMAGES_MAX || ui->images[slot].data == NULL) {
+        lua_pushnil(L);
+        return;
+    }
+    const uint32_t gen = ui->image_gen[slot];
+    if (lua_rawgetp(L, LUA_REGISTRYINDEX, &ui->image_key) != LUA_TTABLE) {  /* never: ui is installed after it */
+        lua_pop(L, 1);
+        push_image_handle(L, slot, gen);
+        return;
+    }
+    if (lua_rawgeti(L, -1, slot + 1) == LUA_TUSERDATA) {
+        const apps_image_handle_t *known = luaL_testudata(L, -1, APPS_IMAGE_MT);
+        if (known != NULL && known->slot == slot && known->gen == gen) {
+            lua_remove(L, -2);
+            return;
+        }
+    }
+    lua_pop(L, 1);
+    push_image_handle(L, slot, gen);  /* may raise: nothing is held */
+    lua_pushvalue(L, -1);
+    lua_rawseti(L, -3, slot + 1);
+    lua_remove(L, -2);
 }
 
 uint32_t apps_ui_take_bg(apps_ui_t *ui, bool *changed) {

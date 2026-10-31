@@ -225,6 +225,8 @@ static atomic_bool s_list_changed;     /* the store gave a new list: the LVGL ta
 typedef struct parked {
     struct parked *next;
     apps_pkg_t *pkg;
+    void *images[APPS_RT_IMAGES_MAX];  /* its runtime's images (apps_rt_images_take), which objects drew from too */
+    int n_images;
     uint32_t reset;  /* freed once this reset has run */
 } parked_t;
 
@@ -621,24 +623,34 @@ static bool wait_reset(uint32_t n) {
     return true;
 }
 
-/* Image objects draw from the package's bytes until the reset has run: free it then, never before. */
-static void release_pkg(apps_pkg_t *pkg, uint32_t reset) {
-    if (pkg == NULL) {
+static void free_images(void *const *images, int n) {
+    for (int i = 0; i < n; i++) {
+        apps_port_free(images[i]);
+    }
+}
+
+/* Image objects draw from the package's bytes and from the runtime's images (apps_rt_images_take) until the reset has run: free them
+ * then, never before. */
+static void release_pkg(apps_pkg_t *pkg, void *const *images, int n_images, uint32_t reset) {
+    if (pkg == NULL && n_images == 0) {
         return;
     }
     atomic_store(&s_rec->waiting, 1);
     if (reset_ran(reset)) {
         free_pkg(pkg);
+        free_images(images, n_images);
     } else {
         parked_t *p = heap_caps_malloc(sizeof *p, CAPS_PSRAM);
         if (p != NULL) {
             p->pkg = pkg;
+            memcpy(p->images, images, (size_t)n_images * sizeof images[0]);
+            p->n_images = n_images;
             p->reset = reset;
             p->next = T.parked;
             T.parked = p;
         } else {
             /* Kept for good: never freed early. */
-            ESP_LOGE(TAG, "no memory to park %s's package: it is kept", pkg->manifest.id);
+            ESP_LOGE(TAG, "no memory to park %s's package: it is kept", pkg != NULL ? pkg->manifest.id : "an app");
         }
     }
     update_waiting();
@@ -650,6 +662,7 @@ static void free_parked(void) {
         if (reset_ran(p->reset)) {
             *link = p->next;
             free_pkg(p->pkg);
+            free_images(p->images, p->n_images);
             heap_caps_free(p);
         } else {
             link = &p->next;
@@ -750,9 +763,10 @@ static void recover(void) {
  * 1. the pending run is answered (with its settle's result, or the crash, or the hang);
  * 2. the table is unpublished, so no pass reads it from here on;
  * 4. the record takes the crash record, the log, the dump and the counters;
- * 5. the runtime is freed, and its table with it;
+ * 5. the runtime is freed, and its table with it (its runtime images taken from it first);
  * 3. the LVGL task takes the app's objects down (apps_lv_reset), and the app task waits for it, bounded;
- * 6. the package's bytes, which image objects drew from, go once that reset has run, parked until it does;
+ * 6. the package's bytes and the runtime images, which image objects drew from, go once that reset has run, parked until it
+ *    does;
  * 7. a crash card, which the LVGL task shows once that reset has run.
  * The ruling allows 4 and 5 before 3, never 6 or 7. Only an app whose table was published can have objects up: any
  * other skips 3, its package goes at once in 6, and its card waits for the reset that is outstanding, if one is. A new
@@ -800,6 +814,10 @@ static void end_app(end_t how) {
     end_alarms(how);
     apps_marker_clean_stop(apps_store_marker());  /* it ended without a reset */
     set_running(false);  /* the launcher lists it still while the store has it */
+    /* Objects of a published table may draw the runtime's images until the reset, as they do the package: they go with it, after
+     * the reset. An unpublished table's never had objects, and apps_rt_free frees them. */
+    void *images[APPS_RT_IMAGES_MAX];
+    int n_images = T.was_published ? apps_rt_images_take(T.rt, images) : 0;
     apps_rt_free(T.rt);  /* saves the store if a change is left in it (stop() has saved it when the app stopped) */
     T.rt = NULL;
     apps_values_flush(s_rec->st.id);  /* its last save is written now, even over the write budget (apps_values.h) */
@@ -808,7 +826,7 @@ static void end_app(end_t how) {
     if (T.was_published) {
         reset = ask_reset();
         (void)wait_reset(reset);
-        release_pkg(T.pkg, reset);
+        release_pkg(T.pkg, images, n_images, reset);
     } else {
         reset = atomic_load(&s_rec->reset_req);  /* the outstanding one, if any: a card mustn't come before it */
         free_pkg(T.pkg);
@@ -1483,6 +1501,7 @@ static void run_timers(void) {
     }
     int64_t now = apps_port_mono_ms();
     apps_rt_store_tick(T.rt, now);  /* a save of the store that is due: no call of the app, so no bracket (the port only queues it) */
+    apps_rt_image_collect(T.rt);    /* freed images the screen has let go of give their bytes back: no call of the app either */
     if (apps_rt_has_work(T.rt, now)) {
         call_begin();
         (void)apps_rt_run_one_timer(T.rt, now);

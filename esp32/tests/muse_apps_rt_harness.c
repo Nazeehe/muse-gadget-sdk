@@ -108,8 +108,19 @@ void *apps_port_realloc(void *ptr, size_t n) {
     return nb + 1;
 }
 
+/* Blocks a case watches (a runtime image's), and whether each has been freed since. */
+#define WATCH_MAX 8
+static const void *watch_ptr[WATCH_MAX];
+static bool watch_gone[WATCH_MAX];
+static int watch_n;
+
 void apps_port_free(void *ptr) {
     if (ptr != NULL) {
+        for (int i = 0; i < watch_n; i++) {
+            if (watch_ptr[i] == ptr && !watch_gone[i]) {
+                watch_gone[i] = true;
+            }
+        }
         block_t *b = (block_t *)ptr - 1;
         held -= b->size;
         free(b);
@@ -4122,6 +4133,362 @@ static void c_stack(void) {
 
 #endif /* UNDER_ASAN */
 
+/* ---- Runtime images (connected apps Task 2) ----
+ *
+ * What a worker decodes is handed to the app task as a block, which apps_rt_image_add takes, and the app's callback gets its handle
+ * (apps_rt_image_push, inside the call). These cases make the blocks here, as a decode would, and push the handles inside a call as
+ * the callback's trampoline will (Task 3). This harness has no apply step: where a case needs one it says what a pass found with
+ * apps_ui_report_drawn, which apps_lv calls at the end of every pass (test_muse_apps_lv.py runs the real one). */
+
+#define CF_A8 0x0E
+#define CF_RGB565 0x12
+#define CF_RGB565A8 0x14
+#define IMAGES_FULL "no more than 4 images at once: free one with img:free()"
+
+/* An LVGL v9 image block of w x h in cf, in the apps' heap as a decode makes one, every byte after the header fill. NULL when the
+ * heap refuses. */
+static uint8_t *image_block(unsigned cf, unsigned w, unsigned h, uint8_t fill, size_t *len) {
+    unsigned stride = cf == CF_A8 ? w : w * 2;
+    size_t n = 12 + (size_t)stride * h + (cf == CF_RGB565A8 ? (size_t)(stride / 2) * h : 0);
+    uint8_t *b = apps_port_realloc(NULL, n);
+    if (b == NULL) {
+        return NULL;
+    }
+    memset(b, fill, n);
+    const uint8_t header[12] = {0x19, (uint8_t)cf, 0, 0, (uint8_t)w, (uint8_t)(w >> 8), (uint8_t)h, (uint8_t)(h >> 8),
+                                (uint8_t)stride, (uint8_t)(stride >> 8), 0, 0};
+    memcpy(b, header, sizeof header);
+    *len = n;
+    return b;
+}
+
+/* A block of w x h handed to the runtime: its slot, or -1 with err. With *watched (may be NULL) the block's watch: whether it has been
+ * freed is watch_gone[*watched]. */
+static int add_image_watched(apps_rt_t *rt, unsigned cf, unsigned w, unsigned h, char *err, size_t err_len, int *watched) {
+    size_t len = 0;
+    uint8_t *b = image_block(cf, w, h, 0x5A, &len);
+    if (watched != NULL && watch_n < WATCH_MAX) {
+        watch_ptr[watch_n] = b;
+        watch_gone[watch_n] = false;
+        *watched = watch_n++;
+    }
+    return apps_rt_image_add(rt, b, len, err, err_len);
+}
+
+static int add_image(apps_rt_t *rt, unsigned cf, unsigned w, unsigned h, char *err, size_t err_len) {
+    return add_image_watched(rt, cf, w, h, err, err_len, NULL);
+}
+
+/* Runs src as a chunk in the runtime's VM with a call's budget (its globals: ui, print, ...). True when it ran; else err has the
+ * message, its first line only. */
+static bool chunk(apps_rt_t *rt, const char *src, char *err, size_t err_len) {
+    size_t len = strlen(src);
+    char *copy = exact_copy(src, len);
+    bool loaded = apps_vm_load(apps_rt_vm(rt), "t.lua", copy, len, err, err_len);
+    free(copy);
+    bool ran = loaded && apps_vm_call(apps_rt_vm(rt), 0, 0, APPS_BUDGET_CALL, err, err_len) == APPS_CALL_OK;
+    char *newline = strchr(err, '\n');
+    if (newline != NULL) {
+        *newline = '\0';
+    }
+    return ran;
+}
+
+static void chunk_ok_at(int line, apps_rt_t *rt, const char *src) {
+    char err[512] = "";
+    CHECK_AT(line, chunk(rt, src, err, sizeof err), "'%s' failed: %s", src, err);
+}
+#define CHUNK(rt, src) chunk_ok_at(__LINE__, (rt), (src))
+
+static void chunk_fails_at(int line, apps_rt_t *rt, const char *src, const char *want) {
+    char err[512] = "";
+    bool ran = chunk(rt, src, err, sizeof err);
+    CHECK_AT(line, !ran && strcmp(err, want) == 0, "'%s': ran %d, '%s', and was to fail with '%s'", src, ran, err, want);
+}
+#define CHUNK_FAILS(rt, src, want) chunk_fails_at(__LINE__, (rt), (src), (want))
+
+typedef struct {
+    apps_rt_t *rt;
+    int slot;
+    const char *name;
+} image_push_t;
+
+static int image_push_trampoline(lua_State *L) {
+    const image_push_t *p = lua_touserdata(L, 1);
+    int top = lua_gettop(L);
+    apps_rt_image_push(L, p->rt, p->slot);
+    if (lua_gettop(L) != top + 1) {
+        return luaL_error(L, "the push left %d values", lua_gettop(L) - top);
+    }
+    if (p->name != NULL) {
+        lua_setglobal(L, p->name);
+    } else if (!lua_isnil(L, -1)) {
+        return luaL_error(L, "a slot with no image pushed a %s", luaL_typename(L, -1));
+    }
+    return 0;
+}
+
+/* The handle of the image at slot, pushed inside a call as a callback's trampoline pushes it, into the global name; with name NULL,
+ * false unless the push gave nil. */
+static bool push_image(apps_rt_t *rt, int slot, const char *name) {
+    image_push_t p = {rt, slot, name};
+    lua_State *L = apps_vm_lua(apps_rt_vm(rt));
+    lua_pushcfunction(L, image_push_trampoline);
+    lua_pushlightuserdata(L, &p);
+    char err[256] = "";
+    return apps_vm_call(apps_rt_vm(rt), 1, 0, APPS_BUDGET_CALL, err, sizeof err) == APPS_CALL_OK;
+}
+
+/* The handle: size, free, tostring, its protected metatable; ui.image takes it as src, and w:get gives it back; a free while a widget
+ * shows it is an error, and after a free the handle knows (size and src are errors, tostring is as it was, a second free is
+ * nothing). A slot whose image is gone, and the next image in it, are not the old handle's. */
+static void images_api(void) {
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, "return {}");
+    if (rt == NULL) {
+        return;
+    }
+    watch_n = 0;
+    char err[256] = "x";
+    int first = 0;
+    int slot = add_image_watched(rt, CF_RGB565, 2, 1, err, sizeof err, &first);
+    CHECK(slot == 0 && err[0] == '\0', "slot %d, err '%s'", slot, err);
+    CHECK(push_image(rt, slot, "img"), "push");
+    CHUNK(rt, "local w, h = img:size() assert(w == 2 and h == 1, w .. ' x ' .. h)");
+    CHUNK(rt, "assert(tostring(img) == 'image#0', tostring(img))");
+    CHUNK(rt, "assert(type(img) == 'userdata' and getmetatable(img) == 'muse.image', tostring(getmetatable(img)))");
+    CHUNK_FAILS(rt, "img:resize()", "t.lua:1: image: unknown method 'resize' (valid: size, free)");
+    CHUNK_FAILS(rt, "img.size()", "t.lua:1: image: size needs an image: call it as img:size()");
+    CHUNK_FAILS(rt, "img.w = 3", "t.lua:1: image: an image has no fields: img:size() gives its size");
+    CHECK(push_image(rt, slot, "again"), "push again");
+    CHUNK(rt, "assert(rawequal(again, img), 'one image, one handle')");
+
+    CHUNK(rt, "w = ui.image{src = img}");
+    CHUNK(rt, "assert(rawequal(w:get('src'), img), 'w:get gives the handle back')");
+    CHUNK_FAILS(rt, "img:free()", "t.lua:1: image is in use by image#0");
+    CHECK(!watch_gone[first], "a free that failed freed nothing");
+    CHUNK(rt, "assert(img:size() == 2)");
+    CHUNK(rt, "w:set{hidden = true}");
+    CHUNK_FAILS(rt, "img:free()", "t.lua:1: image is in use by image#0");  /* hidden, it still shows it: a live widget */
+
+    /* Another image, and the widget moved to it: the first is shown by nothing alive, and goes. */
+    int second = 0;
+    int other = add_image_watched(rt, CF_RGB565A8, 3, 2, err, sizeof err, &second);
+    CHECK(other == 1, "slot %d (%s)", other, err);
+    CHECK(push_image(rt, other, "pic"), "push pic");
+    CHUNK(rt, "w:set{src = pic} assert(rawequal(w:get('src'), pic))");
+    CHUNK(rt, "img:free()");
+    CHECK(watch_gone[first] && !watch_gone[second], "the first image's block is gone at once (no pass draws it)");
+    CHUNK_FAILS(rt, "img:size()", "t.lua:1: image#0 was freed");
+    CHUNK_FAILS(rt, "ui.image{src = img}", "t.lua:1: ui.image: src image#0 was freed");
+    CHUNK_FAILS(rt, "w:set{src = img}", "t.lua:1: ui.image: src image#0 was freed");
+    CHUNK(rt, "assert(rawequal(w:get('src'), pic)) img:free() assert(tostring(img) == 'image#0')");
+    CHUNK(rt, "w:delete() pic:free()");
+    CHECK(watch_gone[second], "both blocks are gone");
+
+    /* The slot comes round to a new image: the old handle is still the freed one. */
+    int third = 0;
+    slot = add_image_watched(rt, CF_A8, 4, 4, err, sizeof err, &third);
+    CHECK(slot == 0, "slot %d (%s)", slot, err);
+    CHECK(push_image(rt, slot, "new"), "push new");
+    CHUNK(rt, "assert(tostring(new) == 'image#0' and new ~= img and not rawequal(new, img))");
+    CHUNK(rt, "assert(select(2, new:size()) == 4)");
+    CHUNK_FAILS(rt, "img:size()", "t.lua:1: image#0 was freed");
+    CHUNK(rt, "img:free() assert(new:size() == 4, 'a stale handle freed nothing')");
+    CHECK(!watch_gone[third], "the new image stays");
+    /* A slot with no image pushes nil. */
+    CHECK(push_image(rt, 3, NULL) && push_image(rt, -1, NULL) && push_image(rt, 99, NULL), "a slot with no image pushes nil");
+    finish(rt, pkg);  /* with an image in it: apps_rt_free frees it */
+    CHECK(watch_gone[third], "apps_rt_free freed the image it had");
+}
+
+/* At most APPS_RT_IMAGES_MAX at once: the fifth is refused (its block freed), as is a block that isn't an image (in the check's own
+ * words), and a free makes room. */
+static void the_fifth_image_is_refused(void) {
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, "return {}");
+    if (rt == NULL) {
+        return;
+    }
+    char err[256] = "";
+    size_t before = held;
+    size_t len = 0;
+    uint8_t *bad = image_block(CF_RGB565, 2, 1, 0, &len);
+    bad[0] = 0x18;
+    CHECK(apps_rt_image_add(rt, bad, len, err, sizeof err) == -1 &&
+              strcmp(err, "image: not an LVGL v9 image file (use LVGLImage.py --ofmt BIN)") == 0,
+          "not an image: '%s'", err);
+    CHECK(add_image(rt, CF_RGB565, 467, 1, err, sizeof err) == -1 && strcmp(err, "image: 467x1 is larger than the 466x466 screen") == 0,
+          "467 px: '%s'", err);
+    uint8_t *cut = image_block(CF_RGB565, 2, 2, 0, &len);
+    CHECK(apps_rt_image_add(rt, cut, len - 1, err, sizeof err) == -1 && strcmp(err, "image: size 19 doesn't match its header (20 expected)") == 0,
+          "short: '%s'", err);
+    CHECK(apps_rt_image_add(rt, NULL, 0, err, sizeof err) == -1 && strncmp(err, "image: not an LVGL v9", 21) == 0, "NULL: '%s'", err);
+    CHECK(held == before, "a refused block is freed: %zu held", held - before);
+    for (int i = 0; i < APPS_RT_IMAGES_MAX; i++) {
+        int slot = add_image(rt, CF_RGB565, 466, 2, err, sizeof err);
+        CHECK(slot == i, "image %d: slot %d (%s)", i, slot, err);
+    }
+    size_t four = held;
+    CHECK(add_image(rt, CF_RGB565, 2, 1, err, sizeof err) == -1 && strcmp(err, IMAGES_FULL) == 0, "the fifth: '%s'", err);
+    CHECK(held == four, "the fifth's block is freed: %zu more held", held - four);
+    char shortish[12];
+    CHECK(add_image(rt, CF_RGB565, 2, 1, shortish, sizeof shortish) == -1 && strcmp(shortish, "no more tha") == 0, "cut: '%s'", shortish);
+    CHECK(add_image(NULL, CF_RGB565, 2, 1, err, sizeof err) == -1 && strcmp(err, NOT_RUNNING) == 0, "no runtime: '%s'", err);
+    CHECK(held == four, "%zu more held", held - four);
+    CHECK(push_image(rt, 2, "third"), "push");
+    CHUNK(rt, "third:free()");
+    CHECK(add_image(rt, CF_RGB565, 2, 1, err, sizeof err) == 2, "a free makes room: %s", err);
+    finish(rt, pkg);
+}
+
+/* A freed image the screen still draws (an object of a widget deleted since the last pass) keeps its bytes, and its place among the
+ * four, until a pass reports it isn't drawn; the runtime's collect then frees it. The same for one a widget moved off, and for
+ * ui.clear(). */
+static void images_wait_for_the_screen(void) {
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, "return {}");
+    if (rt == NULL) {
+        return;
+    }
+    watch_n = 0;
+    apps_ui_t *ui = apps_rt_ui(rt);
+    char err[256] = "";
+    int big = 0;
+    int slot = add_image_watched(rt, CF_RGB565, 10, 10, err, sizeof err, &big);
+    CHECK(slot == 0 && push_image(rt, slot, "img"), "slot %d (%s)", slot, err);
+    CHUNK(rt, "w = ui.image{src = img}");
+    apps_ui_report_drawn(ui, 1u << slot);  /* a pass made its object */
+    CHUNK(rt, "w:delete() img:free()");
+    CHECK(!watch_gone[big], "the screen still draws it: its bytes stay");
+    apps_rt_image_collect(rt);
+    CHECK(!watch_gone[big], "and stay through a collect, while the last pass drew it");
+    CHUNK_FAILS(rt, "img:size()", "t.lua:1: image#0 was freed");
+    for (int i = 1; i < APPS_RT_IMAGES_MAX; i++) {
+        CHECK(add_image(rt, CF_RGB565, 2, 1, err, sizeof err) == i, "image %d: %s", i, err);
+    }
+    CHECK(add_image(rt, CF_RGB565, 2, 1, err, sizeof err) == -1 && strcmp(err, IMAGES_FULL) == 0, "its place is still taken: '%s'", err);
+    CHECK(!watch_gone[big], "a refused add leaves it");
+    apps_ui_report_drawn(ui, 0);  /* the next pass took the object down */
+    CHECK(add_image(rt, CF_RGB565, 2, 1, err, sizeof err) == 0, "the add collects it first: %s", err);
+    CHECK(watch_gone[big], "its bytes are gone");
+
+    /* A widget moved off it, then ui.clear(): each waits for the pass that lets go, and only its own slot does. */
+    int a = 0, b = 0;
+    CHECK(push_image(rt, 1, "x1") && push_image(rt, 2, "x2"), "push");
+    CHUNK(rt, "x1:free() x2:free()");
+    CHECK(add_image_watched(rt, CF_RGB565, 2, 1, err, sizeof err, &a) == 1 && add_image_watched(rt, CF_RGB565, 2, 1, err, sizeof err, &b) == 2,
+          "adds: %s", err);
+    CHECK(push_image(rt, 1, "a") && push_image(rt, 2, "b"), "push");
+    CHUNK(rt, "w = ui.image{src = a} v = ui.image{src = b}");
+    apps_ui_report_drawn(ui, 6u);
+    CHUNK(rt, "w:set{src = b} a:free()");
+    apps_rt_image_collect(rt);
+    CHECK(!watch_gone[a], "the moved widget's object still draws a");
+    apps_ui_report_drawn(ui, 4u);
+    apps_rt_image_collect(rt);
+    CHECK(watch_gone[a] && !watch_gone[b], "a is gone once a pass doesn't draw it");
+    CHUNK(rt, "ui.clear() b:free()");
+    apps_rt_image_collect(rt);
+    CHECK(!watch_gone[b], "b waits for the pass that cleans the layer");
+    apps_ui_report_drawn(ui, 0);
+    apps_rt_image_collect(rt);
+    CHECK(watch_gone[b], "b is gone");
+    apps_rt_image_collect(NULL);  /* nothing */
+    finish(rt, pkg);
+}
+
+/* An app's end: apps_rt_images_take gives the caller every image's bytes, a freed one the screen still draws included, and apps_rt_free
+ * then frees none of them: the app task frees them once the layer's reset has run. Not taken, apps_rt_free frees them. */
+static void images_at_the_end(void) {
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, "return {}");
+    if (rt == NULL) {
+        return;
+    }
+    char err[256] = "";
+    size_t before = held;
+    CHECK(add_image(rt, CF_RGB565, 4, 4, err, sizeof err) == 0 && add_image(rt, CF_RGB565A8, 2, 2, err, sizeof err) == 1 &&
+              add_image(rt, CF_A8, 8, 1, err, sizeof err) == 2,
+          "adds: %s", err);
+    size_t images = held - before;
+    CHECK(push_image(rt, 0, "a") && push_image(rt, 1, "b"), "push");
+    CHUNK(rt, "w = ui.image{src = a} v = ui.image{src = b}");
+    apps_ui_report_drawn(apps_rt_ui(rt), 3u);
+    CHUNK(rt, "w:delete() a:free()");  /* waits for the screen */
+    void *blocks[APPS_RT_IMAGES_MAX] = {NULL};
+    int n = apps_rt_images_take(rt, blocks);
+    CHECK(n == 3, "taken: %d", n);
+    CHECK(apps_rt_images_take(rt, blocks + 3) == 0, "a second take has none");
+    CHUNK_FAILS(rt, "b:size()", "t.lua:1: image#1 was freed");
+    apps_rt_image_collect(rt);
+    apps_rt_free(rt);
+    free_pkg(pkg);
+    forget_logged();
+    CHECK(held == images, "the runtime freed none of the taken images: %zu held of %zu", held, images);
+    for (int i = 0; i < n; i++) {
+        apps_port_free(blocks[i]);
+    }
+    CHECK(held == 0, "%zu held", held);
+    CHECK(apps_rt_images_take(NULL, blocks) == 0, "no runtime, no images");
+}
+
+/* P9: a runtime image is sized from its header, so its spin meets both caps as a package image's does: 200 px spins, 201 is the side
+ * cap's error, and two that cover more than 40,000 px together are the total's. */
+static void images_spin_caps(void) {
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch(&pkg, "return {}");
+    if (rt == NULL) {
+        return;
+    }
+    char err[256] = "";
+    CHECK(add_image(rt, CF_RGB565A8, 200, 200, err, sizeof err) == 0 && add_image(rt, CF_RGB565, 201, 201, err, sizeof err) == 1 &&
+              add_image(rt, CF_RGB565, 150, 150, err, sizeof err) == 2 && add_image(rt, CF_RGB565A8, 150, 150, err, sizeof err) == 3,
+          "adds: %s", err);
+    CHECK(push_image(rt, 0, "s200") && push_image(rt, 1, "s201") && push_image(rt, 2, "c") && push_image(rt, 3, "d"), "push");
+    CHUNK(rt, "x = ui.image{src = s200, spin = 30}");
+    CHUNK_FAILS(rt, "ui.image{src = s201, spin = 10}",
+                "t.lua:1: ui.image: spin: an image may spin only up to 200 x 200 px on screen (this one is 201 x 201)");
+    CHUNK(rt, "y = ui.image{src = s201}");
+    CHUNK_FAILS(rt, "y:set{spin = 10}", "t.lua:1: ui.image: spin: an image may spin only up to 200 x 200 px on screen (this one is 201 x 201)");
+    CHUNK_FAILS(rt, "x:set{src = s201}", "t.lua:1: ui.image: spin: an image may spin only up to 200 x 200 px on screen (this one is 201 x 201)");
+    CHUNK(rt, "x:set{scale = 50} x:set{src = s201}");  /* 101 x 101 */
+    CHUNK(rt, "x:delete() y:delete()");
+    CHUNK(rt, "p = ui.image{src = c, spin = 10}");  /* 22,500 px */
+    CHUNK_FAILS(rt, "ui.image{src = d, spin = 10}",
+                "t.lua:1: ui.image: spin: images spinning at once may cover at most 200 x 200 px together (these would cover 45000 px)");
+    CHUNK(rt, "q = ui.image{src = d}");
+    CHUNK_FAILS(rt, "q:set{spin = 5}",
+                "t.lua:1: ui.image: spin: images spinning at once may cover at most 200 x 200 px together (these would cover 45000 px)");
+    CHUNK(rt, "q:set{spin = 5, scale = 80}");  /* 120 x 120: 14,400 + 22,500 */
+    CHUNK(rt, "p:set{spin = 0} q:set{scale = 100} p:delete() q:delete()");
+    finish(rt, pkg);
+}
+
+/* A heap that refuses at every step of a push (the handle is made in the app's heap, inside the call): the call fails cleanly, the
+ * image stays the runtime's, and nothing is left when the app goes. */
+static void images_refused(void) {
+    for (long step = 1; step < 40; step++) {
+        apps_pkg_t *pkg;
+        apps_rt_t *rt = launch(&pkg, "return {}");
+        if (rt == NULL) {
+            return;
+        }
+        char err[256] = "";
+        CHECK(add_image(rt, CF_RGB565, 2, 2, err, sizeof err) == 0, "add: %s", err);
+        refuse_from = growths + step;
+        bool pushed = push_image(rt, 0, "img");
+        refuse_from = -1;
+        if (pushed) {
+            CHUNK(rt, "assert(img:size() == 2)");
+        }
+        finish(rt, pkg);
+        if (pushed && step > 4) {
+            break;
+        }
+    }
+}
+
 /* ---- budgets: the constants as this harness was compiled with them (D12) ----
  *
  * test_muse_apps_svc.py reads them and builds the messages it expects from them, and checks them against the headers' text, which
@@ -4188,6 +4555,12 @@ int main(int argc, char **argv) {
         {"duty_rate", duty_rate},
         {"duty_swap", duty_swap},
         {"c_stack", c_stack},
+        {"images_api", images_api},
+        {"the_fifth_image_is_refused", the_fifth_image_is_refused},
+        {"images_wait_for_the_screen", images_wait_for_the_screen},
+        {"images_at_the_end", images_at_the_end},
+        {"images_spin_caps", images_spin_caps},
+        {"images_refused", images_refused},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

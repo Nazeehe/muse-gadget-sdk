@@ -32,6 +32,7 @@
 #include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
+#include "apps_rt.h"
 
 /* The apply step, the layer and the cards over it; apps_lv.h has the contract. All of it runs on the LVGL task. */
 
@@ -55,6 +56,10 @@ static const char *TAG = "muse_apps";
 #define GROUPS (APPS_DIRTY_GEOM | APPS_DIRTY_STYLE | APPS_DIRTY_TEXT | APPS_DIRTY_VALUE | APPS_DIRTY_EVENTS)
 
 _Static_assert(sizeof(lv_image_header_t) == IMAGE_HEADER, "an image's header is the first 12 bytes of its file");
+
+/* A widget's image: an asset's index, or APPS_UI_ASSETS_MAX + a runtime image's slot (apps_ui.h). */
+#define IMAGES_ALL (APPS_UI_ASSETS_MAX + APPS_RT_IMAGES_MAX)
+_Static_assert(APPS_RT_IMAGES_MAX < 255, "a record keeps a runtime image's slot + 1 in a byte");
 _Static_assert(APPS_UI_SLOTS <= 0xFFFF, "a slot goes in 16 bits of a callback's user data");
 
 /* What the pass knows of one slot's object. Slots are the table's, so a record says nothing the table has not
@@ -69,6 +74,7 @@ typedef struct {
     bool subscribed;   /* the touch callbacks are on obj */
     bool recolored;    /* an A8 image has the white recolor on it */
     uint8_t spin;      /* an image's: the turns a minute its spin animation runs at; 0: it has none */
+    uint8_t runtime;   /* an image's: 1 + the slot of the runtime image its src was last set to; 0: none (a package image's) */
     uint32_t rotation_sets;  /* an image's: the widget's rotation_sets when its angle was last applied */
 } node_t;
 
@@ -77,7 +83,8 @@ typedef struct {
  * given back (the heap is not used under it), and freed by apps_lv_reset. */
 typedef struct {
     node_t node[APPS_UI_SLOTS];
-    lv_image_dsc_t image[APPS_UI_ASSETS_MAX];  /* per asset; data NULL until the asset is first drawn */
+    lv_image_dsc_t image[IMAGES_ALL];  /* per asset, then per runtime image's slot; data NULL until first drawn */
+    uint32_t drawn;                    /* the runtime images the objects draw from, a bit a slot: the pass's report */
 } state_t;
 
 static lv_obj_t *s_layer;
@@ -162,7 +169,7 @@ static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) {
  * goes to *iw and *ih (either may be NULL). */
 static bool image_size(const pass_t *p, const apps_widget_t *w, uint16_t *iw, uint16_t *ih) {
     const apps_asset_t *asset = apps_ui_asset(p->ui, w->image);
-    return asset != NULL && w->image < APPS_UI_ASSETS_MAX && apps_image_check(asset->data, asset->len, iw, ih, NULL, 0);
+    return asset != NULL && w->image < IMAGES_ALL && apps_image_check(asset->data, asset->len, iw, ih, NULL, 0);
 }
 
 /* Why the widget at slot can't be given to LVGL, or NULL when it can. This is the table's invariants (apps_ui.h)
@@ -461,6 +468,7 @@ static made_t make_object(pass_t *p, int slot, int depth) {
     n->subscribed = false;
     n->recolored = false;
     n->spin = 0;            /* a new image is at LVGL's angle, 0, and still */
+    n->runtime = 0;
     n->rotation_sets = 0;
     w->dirty = (w->dirty & ~(uint32_t)APPS_DIRTY_CREATE) | groups_of_new(w);
     p->changed = true;
@@ -520,24 +528,26 @@ static void style_bar_part(lv_obj_t *obj, uint32_t rgb, int32_t radius, lv_style
 static void apply_image(pass_t *p, const apps_widget_t *w, node_t *n) {
     lv_obj_t *obj = n->obj;
     const apps_asset_t *asset = apps_ui_asset(p->ui, w->image);
-    if (asset == NULL || w->image >= APPS_UI_ASSETS_MAX) {
+    if (asset == NULL || w->image >= IMAGES_ALL) {
         return;
     }
-    /* One descriptor per asset: its header is the file's first bytes, the pixels are the rest, in place. */
+    /* One descriptor per asset, and one per runtime image's slot: its header is the file's first bytes, the pixels are the rest,
+     * in place. Made again each time it is set: a slot's next runtime image can be another picture in a block at the same
+     * address. Every object that draws from a slot's descriptor draws its current image (the runtime frees an image, and gives
+     * its slot to the next, only once no object draws the slot: the report, below). */
     lv_image_dsc_t *dsc = &p->st->image[w->image];
-    if (dsc->data != asset->data + IMAGE_HEADER) {
-        memcpy(&dsc->header, asset->data, sizeof dsc->header);
-        /* Only premultiplied alpha means anything to an image drawn in place; the others say what the memory is
-         * (ALLOCATED: an lv_draw_buf, which this isn't, so LVGL refuses the image and it never shows).
-         * apps_image_check refuses them already: this keeps out of LVGL what the header said when it was
-         * copied, which may not be what the check saw. */
-        dsc->header.flags &= LV_IMAGE_FLAGS_PREMULTIPLIED;
-        dsc->data_size = (uint32_t)(asset->len - IMAGE_HEADER);
-        dsc->data = asset->data + IMAGE_HEADER;
-        dsc->reserved = NULL;
-        dsc->reserved_2 = NULL;
-    }
+    memcpy(&dsc->header, asset->data, sizeof dsc->header);
+    /* Only premultiplied alpha means anything to an image drawn in place; the others say what the memory is
+     * (ALLOCATED: an lv_draw_buf, which this isn't, so LVGL refuses the image and it never shows).
+     * apps_image_check refuses them already: this keeps out of LVGL what the header said when it was
+     * copied, which may not be what the check saw. */
+    dsc->header.flags &= LV_IMAGE_FLAGS_PREMULTIPLIED;
+    dsc->data_size = (uint32_t)(asset->len - IMAGE_HEADER);
+    dsc->data = asset->data + IMAGE_HEADER;
+    dsc->reserved = NULL;
+    dsc->reserved_2 = NULL;
     lv_image_set_src(obj, dsc);
+    n->runtime = w->image >= APPS_UI_ASSETS_MAX ? (uint8_t)(w->image - APPS_UI_ASSETS_MAX + 1) : 0;
     lv_image_set_scale(obj, (uint32_t)w->scale * 256 / 100);
     /* LVGL draws an A8 image as a mask filled with the image recolor, which is black unless it is set: nothing
      * on the layer's black. An app has no colour for an image, so white, in full. The other two formats have
@@ -892,6 +902,19 @@ static void write_back(pass_t *p) {
 
 /* ---- The pass ---- */
 
+/* The runtime images the objects draw from now, a bit a slot (what each image object's src was last set to). Only a pass that called
+ * LVGL for a widget can change it, so the pass works it out only then. */
+static uint32_t drawn_images(const state_t *st) {
+    uint32_t drawn = 0;
+    for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
+        const node_t *n = &st->node[slot];
+        if (n->obj != NULL && n->runtime != 0) {
+            drawn |= 1u << (n->runtime - 1);
+        }
+    }
+    return drawn;
+}
+
 /* Everything the pass does, with the UI lock held. */
 static void run_pass(pass_t *p) {
     if (apps_ui_take_clear(p->ui)) {
@@ -919,7 +942,9 @@ static void run_pass(pass_t *p) {
     }
     if (p->changed) {
         write_back(p);
+        p->st->drawn = drawn_images(p->st);
     }
+    apps_ui_report_drawn(p->ui, p->st->drawn);
 }
 
 /* The records, once per layer. Called without the lock: the heap is not used with it held. */

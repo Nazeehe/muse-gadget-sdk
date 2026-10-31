@@ -50,7 +50,7 @@
  *   An image spins only while both its sides as drawn (the header's w and h times scale, to the nearest px) are at
  *   most APPS_SPIN_SIDE_MAX: a create or a set that would leave a larger one spinning (a spin given, or a scale or
  *   src while it spins) is an error, and so is one whose size the table doesn't know (a src that is no image of
- *   the package). And the images that spin and show (not hidden, nor in a hidden box) cover at most
+ *   the package and no runtime image). A runtime image is sized from its header as a package image is (P9). And the images that spin and show (not hidden, nor in a hidden box) cover at most
  *   APPS_SPIN_AREA_MAX px together, each its drawn w x h: a create or a set that would raise the total past it (a
  *   spin made or given, a scale or src while it spins, or a hidden spinner or its box shown) is an error. spin =
  *   0, a smaller picture, a hide and a delete always go.
@@ -58,7 +58,8 @@
  *   or a number (as tostring makes it) of at most APPS_UI_TEXT_MAX bytes, valid UTF-8 (apps_json_utf8_len) and
  *   with no NUL byte; "" is no text. font is one of sans14 sans16 sans20 sans28 mono8 mono16 digits48 digits96
  *   (the digit fonts hold "0-9:.-+% "), text_align one of left center right. Colours are "#rgb", "#rrggbb" or
- *   0xRRGGBB, and bg also takes "none". src is the path of an image of the app's package (manifest.json "files").
+ *   0xRRGGBB, and bg also takes "none". src is the path of an image of the app's package (manifest.json "files"), or a
+ *   runtime image's handle (apps_rt.h: what vm.read gives for a picture) that hasn't been freed.
  *   parent is a box, and can be given only when the widget is made. Boxes nest at most APPS_UI_BOX_DEPTH_MAX deep: a
  *   box may have at most APPS_UI_BOX_DEPTH_MAX - 1 box ancestors, and any other widget at most APPS_UI_BOX_DEPTH_MAX.
  * - Defaults. Every widget: align center, x y 0, w h to content, visible, opacity 100, border_color white. label:
@@ -73,13 +74,15 @@
  *   widget drops its handlers.
  * - w:get returns what set takes: colours as "#rrggbb" (lower case) or "none"; align, font and text_align as
  *   names; radius "circle" or a number; w and h nil while they size to content (the declared values: the laid-out
- *   size comes from the LVGL task, later); parent as the parent's handle or nil; src as the path.
+ *   size comes from the LVGL task, later); parent as the parent's handle or nil; src as the path, or the runtime image's
+ *   handle.
  *
  * Messages (the position "main.lua:12: " comes first; ui.<kind> is ui.label ...; <p> is a property name):
  *   ui.<kind>: '<p>' must be a number, got <type>          also "got NaN"; must be a boolean, got <type>
  *   ui.image: 'rotation' must be a number of degrees, 0 to 359, got <type>      also "got NaN"; spin the same,
  *                                                    "of turns a minute, 0 to 60": these two say their range
  *   ui.<kind>: 'text' must be a string, got <type>
+ *   ui.image: 'src' must be a string or an image, got <type>
  *   ui.<kind>: unknown property '<name>' (valid: align, x, y, w, h, hidden, opacity, parent, text, ...)
  *   ui.<kind>: font 'sans24' is not one of sans14, sans16, ...      (align and text_align the same way, and for
  *                                                    a value that isn't text too: font '<boolean>')
@@ -91,7 +94,7 @@
  *   ui.box: boxes nest at most 4 deep
  *   ui.<kind>: parent can only be set when the widget is created
  *   ui.image: src is required (a .bin image of this app's manifest.json "files") | src '<s>' is not one of this
- *             app's images (manifest.json "files")
+ *             app's images (manifest.json "files") | src image#<n> was freed
  *   ui.image: spin: an image may spin only up to 200 x 200 px on screen (this one is <w> x <h>) | spin: this
  *             image's size is unknown
  *   ui.image: spin: images spinning at once may cover at most 200 x 200 px together (these would cover <n> px)
@@ -119,16 +122,17 @@
  *   box has at most APPS_UI_BOX_DEPTH_MAX - 1 above it), so the parent chain ends and the apply step may walk it;
  * - an arc or bar has min < max and min <= value <= max, and all of them are within +-APPS_UI_VALUE_MAX;
  * - every number and enum is in its range, text is NULL (for "") or a valid, NUL-terminated block of at most
- *   APPS_UI_TEXT_MAX bytes, and a widget of kind image has an image in the asset table;
+ *   APPS_UI_TEXT_MAX bytes, and a widget of kind image has an image in the asset table or a runtime image that hasn't
+ *   been freed (Runtime images, below);
  * - apps_ui_count() is the number of alive widgets.
  *
  * Threads and the lock. Everything that changes the table runs on the app task (the VM's), and the apply step
  * on the LVGL task. apps_port_ui_lock guards what both touch: every change takes it, the apply step holds it for
- * its whole pass (apps_port_ui_trylock) and reads, clears dirty bits and writes rx..overflow back. A binding
- * does all its work before it takes the lock (calls apps_vm_check, validates, allocates text and the handle) and
- * under the lock does plain C on the table, so it never raises, and never allocates, while it holds the lock; the
- * old text block is freed after the lock is released. The table's fields the apply step doesn't write
- * (everything but dirty and rx..overflow) are read by the app task without the lock.
+ * its whole pass (apps_port_ui_trylock) and reads, clears dirty bits, writes rx..overflow back and reports the runtime
+ * images it draws. A binding does all its work before it takes the lock (calls apps_vm_check, validates, allocates text and
+ * the handle) and under the lock does plain C on the table, so it never raises, and never allocates, while it holds the
+ * lock; the old text block is freed after the lock is released. The table's fields the apply step doesn't write
+ * (everything but dirty, rx..overflow and the report) are read by the app task without the lock.
  *
  * The apply step's side (Task 11). Per pass, with the lock held:
  * 1. apps_ui_take_clear: when it says true ui.clear() ran since the last pass: every object of the app is
@@ -157,6 +161,15 @@
  *
  * Handlers live in a table in the Lua registry, keyed by slot and event, and are looked up (apps_ui_push_handler)
  * against the slot's gen at dispatch, as well as dropped at delete.
+ *
+ * Runtime images (apps_rt.h, connected apps Task 2). The runtime owns them; the table holds what the apply step and the bindings
+ * need of each, by its slot: its block (the LVGL v9 file in the apps' heap, which the image object draws from in place), its
+ * length, its size and its life (gen), which the runtime sets and clears under the lock (apps_ui_set_image). A widget's image is
+ * then an index into the asset table (0 to APPS_UI_ASSETS_MAX - 1) or APPS_UI_ASSETS_MAX + a runtime image's slot, and
+ * apps_ui_asset resolves both. The runtime clears an image from the table when the app frees it, and frees its bytes only once
+ * the apply step's report (apps_ui_report_drawn, at the end of every pass, with the lock held) says no object draws its slot any
+ * more: the pass records the runtime slot each image object's src was last set to. The handles live in a weak registry table
+ * with a place for each slot (apps_ui_push_image), as the widgets' do, so an image is one object while the app holds it.
  *
  * apps_ui_dump is the dump Muse sees with a snapshot: one object per alive widget, in slot order, as a JSON
  * array: {"id":"label#3","kind":"label","text":"Time","x":0,"y":0,"w":null,"h":null,"hidden":false,"overflow":0}.
@@ -212,7 +225,7 @@ typedef struct {
     int16_t radius;                            /* radius -1: circle */
     int32_t min, max, value;
     int16_t start_angle, end_angle;
-    int16_t image;                             /* asset index or -1 */
+    int16_t image;                             /* asset index, APPS_UI_ASSETS_MAX + a runtime image's slot, or -1 */
     uint16_t scale;                            /* percent */
     int16_t rotation;                          /* clock degrees, 0..359 */
     uint8_t spin;                              /* turns a minute, 0..APPS_SPIN_RPM_MAX */
@@ -227,7 +240,7 @@ typedef struct {
 /* An image of the package: its path (manifest.json "files"), its .bin bytes (an LVGL v9 file that apps_pkg.h's
  * apps_image_check passed) and its size. The strings and the bytes stay the caller's: they must outlive the table. */
 typedef struct {
-    const char *path;
+    const char *path;  /* NULL for a runtime image */
     const uint8_t *data;
     size_t len;
     uint16_t w, h;
@@ -255,8 +268,11 @@ void apps_ui_open(lua_State *L, apps_ui_t *ui);
 
 /* The slot's widget, alive or not: its dirty bits say what is to be done. NULL for a slot out of range. */
 apps_widget_t *apps_ui_slot(apps_ui_t *ui, int slot);
-/* The image at index, or NULL. */
+/* The image at index: an asset of the package (0 to APPS_UI_ASSETS_MAX - 1), or the runtime image at APPS_UI_ASSETS_MAX + its slot
+ * (its path NULL); NULL for an index that names none (a runtime image that was freed, or a slot with none). */
 const apps_asset_t *apps_ui_asset(const apps_ui_t *ui, int index);
+/* The pass's report, at its end: the runtime images (bit n for slot n) the layer's objects draw from now. */
+void apps_ui_report_drawn(apps_ui_t *ui, uint32_t drawn);
 /* The background colour, and in *changed (may be NULL) whether it changed since the last take. A NULL table (no app
  * is running) has nothing pending: 0, and *changed false. */
 uint32_t apps_ui_take_bg(apps_ui_t *ui, bool *changed);
@@ -289,3 +305,22 @@ size_t apps_ui_dump(const apps_ui_t *ui, char *out, size_t cap, int *dropped);
 
 /* The number of alive widgets. Not under the lock: it may be a moment stale on another task. */
 int apps_ui_count(const apps_ui_t *ui);
+
+/* ---- Runtime images: the runtime's side (apps_rt.h; the app task) ---- */
+
+/* The runtime image at slot is block[0, len), of w x h and life gen, as the bindings and the apply step see it, or (block NULL) none:
+ * a freed one, which no widget may name from here on. Takes the lock. The block stays the caller's: it must outlive every object
+ * that draws it (apps_ui_images_drawn). */
+void apps_ui_set_image(apps_ui_t *ui, int slot, uint32_t gen, const uint8_t *block, size_t len, uint16_t w, uint16_t h);
+
+/* Whether a live widget (not deleted, hidden or not) shows the runtime image at slot. The app task's (the table's writer: no lock). */
+bool apps_ui_image_shown(const apps_ui_t *ui, int slot);
+
+/* The apply step's last report: the runtime images (a bit a slot) the layer's objects draw from. 0 before the first pass. Takes
+ * the lock, so it is the report of the last pass that finished, and no pass changes an object until the lock is free again. */
+uint32_t apps_ui_images_drawn(apps_ui_t *ui);
+
+/* Pushes the handle of the runtime image at slot: the one the app holds, if it does, or a new one (userdata apps_image_handle_t,
+ * with the metatable APPS_IMAGE_MT, which apps_rt installs), which the registry remembers weakly; nil for a slot with no image. For
+ * apps_vm_call, inside a C function the call runs: it allocates, and raises when the app's heap refuses. */
+void apps_ui_push_image(lua_State *L, apps_ui_t *ui, int slot);

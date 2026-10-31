@@ -583,7 +583,8 @@ static void dirty_groups(void) {
 }
 
 /* The spin cap fails closed (connected apps Task 1, fix round 1, I2): a picture the table can't size, one whose asset has no size
- * or a src that is no asset of the package (Task 2's runtime images, until P9 sizes them), may not spin. The call that would leave
+ * or a src that is neither an asset of the package nor a runtime image the table has (Task 2's, which P9 sizes from their headers:
+ * test_muse_apps_rt.py), may not spin. The call that would leave
  * it spinning is refused and changes nothing; spin = 0, and the picture still, are fine. */
 static void spin_refuses_an_unsized_src(void) {
     static const apps_asset_t assets[] = {{"a.bin", (const uint8_t *)"aa", 2, 1, 1}, {"u.bin", (const uint8_t *)"uu", 2, 0, 0}};
@@ -598,8 +599,8 @@ static void spin_refuses_an_unsized_src(void) {
     RUN_FAILS_EXACTLY(&e, "b:set{src = 'u.bin'}", unknown);
     CHECK(W(&e, 2)->image == 0 && W(&e, 2)->spin == 10, "b: image %d spin %d", W(&e, 2)->image, W(&e, 2)->spin);
 
-    /* A src that is no asset: the table's index past the package's images. The invariants don't allow it, so the chunk runs
-     * without the after-check, and the index is put back before anything else. */
+    /* A src that is no asset: the table's index past the package's images, a runtime image's slot with no image in it. The invariants
+     * don't allow it, so the chunk runs without the after-check, and the index is put back before anything else. */
     W(&e, 1)->image = APPS_UI_ASSETS_MAX + 1;
     char err[512] = "";
     bool ran = run(&e, "a:set{spin = 10}", err, sizeof err);

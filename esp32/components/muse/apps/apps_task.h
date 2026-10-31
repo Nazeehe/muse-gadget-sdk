@@ -85,9 +85,10 @@
  *
  * An app's end (stop, a new run, sys.exit, a crash, a hang) is one order, the rulings': the pending request is
  * answered; the table is unpublished (apps_lv_set_ui(NULL) under the UI lock); the record takes the crash record,
- * the log and the widget dump; the runtime is freed; the LVGL task is asked to reset the layer (apps_lv_reset) and
- * the app task waits for it, at most APPS_TASK_RESET_MS; the package's bytes, which image objects draw from, are
- * freed only once that reset has run (they wait for a later one if it didn't come in time); and a crash card is
+ * the log and the widget dump; the runtime is freed (its runtime images taken from it first: apps_rt_images_take); the
+ * LVGL task is asked to reset the layer (apps_lv_reset) and the app task waits for it, at most APPS_TASK_RESET_MS; the
+ * package's bytes and the runtime images, which image objects draw from, are freed only once that reset has run
+ * (they wait for a later one if it didn't come in time); and a crash card is
  * shown after the reset. A new app's table is published only once the old app's reset has run. Only an app whose
  * table was published asks for a reset: one that ends before its table is (a crash in main.lua or start(), or an
  * app replaced while its table still waited) frees its package at once, and its crash card waits for the reset

@@ -30,6 +30,9 @@
  * The launcher's icons are the real apps_icons.c's. What it asks of the I/O worker and the store is faked here: a submit
  * queues the job and run_io runs what is queued, on this thread; the store is a few icon files in memory, read into the
  * counting heap as the real reader does.
+ *
+ * The runtime images' cases (connected apps Task 2) run the real runtime too (apps_rt.c, with apps_svc.c): what it asks of the
+ * port beyond the heap and the lock is stubbed here, and the heap can watch a block for its free.
  */
 
 #include <limits.h>
@@ -47,6 +50,7 @@
 #include "apps_lv.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
+#include "apps_rt.h"
 #include "apps_store.h"
 #include "apps_ui.h"
 #include "apps_vm.h"
@@ -101,7 +105,23 @@ static void lock_error(const char *what) {
     }
 }
 
+/* Blocks a case watches (a runtime image's), and whether each has been freed since. */
+#define WATCH_MAX 8
+static const void *watch_ptr[WATCH_MAX];
+static bool watch_gone[WATCH_MAX];
+static int watch_n;
+/* With recycle set, the next watched block freed is kept, and the next block of its size handed out is it again: a heap that gives a
+ * freed block's address to the next request, which ASan's quarantine never does. */
+static bool recycle;
+static block_t *recycled;
+
 void *apps_port_realloc(void *ptr, size_t n) {
+    if (ptr == NULL && recycled != NULL && recycled->size == n) {
+        block_t *again = recycled;
+        recycled = NULL;
+        held += n;
+        return again + 1;
+    }
     if (realloc_hook != NULL) {
         /* Another task's turn, as this call begins: the heap is a place where a task can be overtaken. */
         void (*hook)(void *) = realloc_hook;
@@ -136,8 +156,20 @@ void apps_port_free(void *ptr) {
         if (lock_held) {
             lock_error("a block was freed while the lock was held");
         }
+        bool watched = false;
+        for (int i = 0; i < watch_n; i++) {
+            if (watch_ptr[i] == ptr && !watch_gone[i]) {
+                watch_gone[i] = true;
+                watched = true;
+            }
+        }
         block_t *b = (block_t *)ptr - 1;
         held -= b->size;
+        if (watched && recycle && recycled == NULL) {
+            recycle = false;
+            recycled = b;
+            return;
+        }
         free(b);
     }
 }
@@ -203,6 +235,65 @@ void apps_port_sha256(const void *data, size_t len, uint8_t out[32]) {
     (void)len;
     memset(out, 0, 32);
 }
+
+/* What the runtime and its services ask of the port (apps_rt.c and apps_svc.c, for the runtime images' cases): nothing any case here
+ * uses, so each does the least it may. */
+bool apps_port_dark(void) {
+    return false;
+}
+
+apps_alarm_result_t apps_port_alarm_arm(const char *app, const char *name, int64_t ms, bool sound, bool wake) {
+    (void)app, (void)name, (void)ms, (void)sound, (void)wake;
+    return APPS_ALARM_REFUSED;
+}
+
+void apps_port_alarm_cancel(const char *app, const char *name) {
+    (void)app, (void)name;
+}
+
+int64_t apps_port_alarm_remaining(const char *app, const char *name) {
+    (void)app, (void)name;
+    return -1;
+}
+
+int apps_port_alarm_list(const char *app, char names[4][24], int64_t remaining[4]) {
+    (void)app, (void)names, (void)remaining;
+    return 0;
+}
+
+void apps_port_sound_chirp(void) {}
+
+void apps_port_sound_stop(void) {}
+
+char *apps_port_store_load(const char *app, size_t *len) {
+    (void)app;
+    *len = 0;
+    return NULL;
+}
+
+bool apps_port_store_save(const char *app, const char *json, size_t len) {
+    (void)app, (void)json, (void)len;
+    return false;
+}
+
+apps_battery_t apps_port_battery(void) {
+    return (apps_battery_t){.pct = -1};
+}
+
+bool apps_port_wifi(char *ssid, size_t cap) {
+    if (cap > 0) {
+        ssid[0] = '\0';
+    }
+    return false;
+}
+
+void apps_port_show(void) {}
+
+void apps_port_keep_awake(bool on) {
+    (void)on;
+}
+
+void apps_port_exit(void) {}
 
 /* ---- The I/O worker and the store, for the launcher's icons ---- */
 
@@ -279,6 +370,7 @@ bool apps_store_read_file(const char *id, const char *path, size_t max, uint8_t 
 }
 
 #define CF_A8 0x0E
+#define CF_RGB565 0x12
 #define CF_RGB565A8 0x14
 
 /* id's icon.bin: an LVGL v9 image of w x h in cf (premultiplied when it has alpha), every byte after the header fill. */
@@ -7659,11 +7751,376 @@ static void running_dot_follows_its_face(void) {
     }
 }
 
+/* ---- Runtime images (connected apps Task 2): the real runtime, its table and the real pass ----
+ *
+ * A runtime image is a block the app task holds (apps_rt_image_add), which an image object draws from in place through the pass's
+ * descriptor of its slot. Never blank: its bytes are freed only once a pass has reported that no object draws them, and at an app's
+ * end only after the layer's reset. These cases run the runtime (apps_rt.c, with apps_svc.c, its services) on this fake LVGL, draw
+ * every image object after each step, every byte of its pixels whether it shows or not (so a freed block drawn is ASan's), and
+ * watch each block for its free. */
+
+typedef struct {
+    apps_pkg_t *pkg;
+    apps_rt_t *rt;
+    env_t e;  /* the runtime's VM and table, for RUN and APPLY */
+} rtenv_t;
+
+/* Every image object that isn't deleted, drawn from its descriptor: every byte of its pixels. How many. */
+static int draw_every_image(void) {
+    int drawn = 0;
+    for (int i = 0; i < n_objs; i++) {
+        const lv_obj_t *o = objs[i];
+        if (o->deleted || strcmp(o->cls, "image") != 0 || o->src == NULL) {
+            continue;
+        }
+        unsigned sum = 0;
+        for (uint32_t k = 0; k < o->src->data_size; k++) {
+            sum += o->src->data[k];
+        }
+        drawn_bytes += sum;
+        drawn++;
+    }
+    return drawn;
+}
+
+/* A block of w x h in cf, in the apps' heap as a decode makes one, given to the runtime: its slot, and the block's watch in *watched. */
+static int rt_add(rtenv_t *r, unsigned cf, unsigned w, unsigned h, int *watched) {
+    unsigned stride = cf == CF_A8 ? w : w * 2;
+    size_t n = 12 + (size_t)stride * h + (cf == CF_RGB565A8 ? (size_t)(stride / 2) * h : 0);
+    uint8_t *b = apps_port_realloc(NULL, n);
+    if (b == NULL) {
+        return -1;
+    }
+    for (size_t i = 12; i < n; i++) {
+        b[i] = (uint8_t)(i * 7);
+    }
+    const uint8_t header[12] = {0x19, (uint8_t)cf, 0, 0, (uint8_t)w, (uint8_t)(w >> 8), (uint8_t)h, (uint8_t)(h >> 8),
+                                (uint8_t)stride, (uint8_t)(stride >> 8), 0, 0};
+    memcpy(b, header, sizeof header);
+    if (watched != NULL && watch_n < WATCH_MAX) {
+        watch_ptr[watch_n] = b;
+        watch_gone[watch_n] = false;
+        *watched = watch_n++;
+    }
+    char err[200] = "";
+    int slot = apps_rt_image_add(r->rt, b, n, err, sizeof err);
+    CHECK(slot >= 0, "apps_rt_image_add: %s", err);
+    return slot;
+}
+
+typedef struct {
+    apps_rt_t *rt;
+    int slot;
+    const char *name;
+} rt_push_t;
+
+static int rt_push_trampoline(lua_State *L) {
+    const rt_push_t *p = lua_touserdata(L, 1);
+    apps_rt_image_push(L, p->rt, p->slot);
+    lua_setglobal(L, p->name);
+    return 0;
+}
+
+/* The handle of the image at slot, pushed inside a call as a callback's trampoline will push it, into the global name. */
+static void rt_push(rtenv_t *r, int slot, const char *name) {
+    rt_push_t p = {r->rt, slot, name};
+    lua_State *L = apps_vm_lua(r->e.vm);
+    lua_pushcfunction(L, rt_push_trampoline);
+    lua_pushlightuserdata(L, &p);
+    char err[256] = "";
+    CHECK(apps_vm_call(r->e.vm, 1, 0, APPS_BUDGET_CALL, err, sizeof err) == APPS_CALL_OK, "push %s: %s", name, err);
+}
+
+/* A fresh fake LVGL with its layer in front, and a running app with a.bin in its package, its table published and the first pass
+ * done. */
+static void rt_scene(rtenv_t *r) {
+    fake_reset();
+    refuse_from = -1;
+    trylock_refusals = 0;
+    create_fail_in = 0;
+    watch_n = 0;
+    recycle = false;
+    r->pkg = calloc(1, sizeof *r->pkg);
+    if (r->pkg == NULL) {
+        fputs("out of memory in the harness\n", stderr);
+        exit(2);
+    }
+    static const char main_lua[] = "return {}";
+    snprintf(r->pkg->manifest.id, sizeof r->pkg->manifest.id, "pics");
+    snprintf(r->pkg->manifest.name, sizeof r->pkg->manifest.name, "Pics");
+    snprintf(r->pkg->manifest.main, sizeof r->pkg->manifest.main, "main.lua");
+    r->pkg->manifest.memory_kb = 256;
+    r->pkg->manifest.file_count = 2;
+    snprintf(r->pkg->manifest.files[0], sizeof r->pkg->manifest.files[0], "main.lua");
+    snprintf(r->pkg->manifest.files[1], sizeof r->pkg->manifest.files[1], "a.bin");
+    snprintf(r->pkg->files[0].path, sizeof r->pkg->files[0].path, "main.lua");
+    r->pkg->files[0].data = (uint8_t *)exact_copy(main_lua, sizeof main_lua - 1);
+    r->pkg->files[0].len = sizeof main_lua - 1;
+    snprintf(r->pkg->files[1].path, sizeof r->pkg->files[1].path, "a.bin");
+    r->pkg->files[1].data = (uint8_t *)exact_copy((const char *)IMG_A, sizeof IMG_A);
+    r->pkg->files[1].len = sizeof IMG_A;
+    r->pkg->count = 2;
+    char err[256] = "";
+    r->rt = apps_rt_new(r->pkg, err, sizeof err);
+    if (r->rt == NULL || !apps_rt_start(r->rt)) {
+        fprintf(stderr, "the runtime: %s\n", err);
+        exit(2);
+    }
+    r->e.vm = apps_rt_vm(r->rt);
+    r->e.ui = apps_rt_ui(r->rt);
+    publish(&r->e);
+    apps_lv_build(fake_screen());
+    apps_lv_set_front(true);
+    apply_at(__LINE__, &r->e, false);
+    log_clear();
+    stats_base = stats_now();
+}
+
+/* An app's end, in apps_task.c's order (end_app): the table unpublished, the runtime's images taken, the runtime freed; then the
+ * caller draws, resets the layer and frees what was taken. */
+static int rt_end(rtenv_t *r, void *taken[APPS_RT_IMAGES_MAX]) {
+    unpublish();
+    int n = apps_rt_images_take(r->rt, taken);
+    apps_rt_free(r->rt);
+    apps_pkg_free(r->pkg, free);
+    free(r->pkg);
+    r->rt = NULL;
+    r->e.vm = NULL;
+    r->e.ui = NULL;
+    return n;
+}
+
+static void rt_finish_at(int line, rtenv_t *r) {
+    void *taken[APPS_RT_IMAGES_MAX];
+    int n = rt_end(r, taken);
+    apps_lv_reset();
+    for (int i = 0; i < n; i++) {
+        apps_port_free(taken[i]);
+    }
+    CHECK_AT(line, held == 0, "%zu bytes still held", held);
+    CHECK_AT(line, fake_errors == 0, "the fake LVGL counted %d errors, the first: %s", fake_errors, fake_note);
+    CHECK_AT(line, !lock_held && lock_errors == 0, "the lock: held %d, %d errors, the first: %s", lock_held, lock_errors, lock_note);
+}
+#define RT_FINISH(r) rt_finish_at(__LINE__, (r))
+
+/* ui.image{src = img}: the pass draws a runtime image from its block in place, as it draws a package image, and rotation, spin and
+ * scale apply to it as they do to a package image's (P1: the angle and the spin don't care where the descriptor came from). */
+static void runtime_image_shows_in_ui_image(void) {
+    rtenv_t r;
+    rt_scene(&r);
+    int img_watch = 0, disc_watch = 0;
+    int slot = rt_add(&r, CF_RGB565A8, 6, 4, &img_watch);
+    int disc = rt_add(&r, CF_RGB565, 200, 200, &disc_watch);
+    CHECK(slot == 0 && disc == 1, "slots %d %d", slot, disc);
+    rt_push(&r, slot, "img");
+    rt_push(&r, disc, "disc");
+    RUN(&r.e, "w = ui.image{src = img} p = ui.image{src = 'a.bin'}");
+    CHECK(APPLY(&r.e), "made");
+    lv_obj_t *w = fake_obj(2), *p = fake_obj(3);
+    CHECK(log_has_line("image_src 2 6x4 cf=0x14 data=72"), "the runtime image's descriptor\n%s", log_peek());
+    CHECK(log_has_line("image_src 3 2x1 cf=0x12 data=4"), "the package's\n%s", log_peek());
+    CHECK(w->src != NULL && w->src->data == (const uint8_t *)watch_ptr[img_watch] + 12, "drawn from the block in place");
+    CHECK(w->area.x2 - w->area.x1 + 1 == 6 && w->area.y2 - w->area.y1 + 1 == 4, "laid out at its size");
+    CHECK(draw_every_image() == 2, "both drawn");
+
+    /* The same calls as a package image's: the angle, the spin, the scale. */
+    log_clear();
+    RUN(&r.e, "w:set{src = disc, rotation = 90, spin = 30, scale = 50}");
+    CHECK(APPLY(&r.e), "changed");
+    CHECK(log_has_line("image_src 2 200x200 cf=0x12 data=80000") && log_has_line("image_rotation 2 900") &&
+              log_has_line("image_scale 2 128") && fake_spins() == 1 && stats_now().spinning == 1,
+          "rotation, spin and scale on a runtime image\n%s", log_peek());
+    CHECK(w->src->data == (const uint8_t *)watch_ptr[disc_watch] + 12 && w->area.x2 - w->area.x1 + 1 == 100,
+          "the other block, its box the drawn size");
+    CHECK(draw_every_image() == 2, "drawn");
+    fake_frame(500);
+    CHECK(w->rotation != 900, "it turns: %d", (int)w->rotation);
+    log_clear();
+    RUN(&r.e, "w:set{src = img}");
+    CHECK(APPLY(&r.e), "changed");
+    CHECK(log_has_line("image_src 2 6x4 cf=0x14 data=72") && fake_spins() == 1 && log_count("anim_") == 0,
+          "a src change leaves the spin alone\n%s", log_peek());
+    (void)p;
+    RT_FINISH(&r);
+}
+
+/* Review Focus 3. The widget is deleted, then img:free(): the object is still on the layer until the next pass, so the bytes stay,
+ * and the screen draws them; after the pass the collect frees them, and nothing draws them again. A free while the widget shows it is
+ * an error. The same for a widget moved to another image, for ui.clear(), and for a box deleted with the image in it. */
+static void freed_runtime_image_is_never_drawn(void) {
+    rtenv_t r;
+    rt_scene(&r);
+    int a_watch = 0;
+    int a = rt_add(&r, CF_RGB565, 8, 8, &a_watch);
+    rt_push(&r, a, "img");
+    RUN(&r.e, "w = ui.image{src = img}");
+    CHECK(APPLY(&r.e), "made");
+    CHECK(draw_every_image() == 1, "drawn");
+    char err[512] = "";
+    CHECK(!run(&r.e, "img:free()", err, sizeof err) && strstr(err, "image is in use by image#0") != NULL, "free while shown: '%s'", err);
+    CHECK(!watch_gone[a_watch], "nothing freed");
+
+    RUN(&r.e, "w:delete() img:free()");
+    CHECK(!watch_gone[a_watch], "the object is still there: the bytes stay");
+    CHECK(draw_every_image() == 1, "and the screen draws them");
+    apps_rt_image_collect(r.rt);
+    CHECK(!watch_gone[a_watch], "a collect before the pass frees nothing");
+    CHECK(draw_every_image() == 1, "drawn again");
+    CHECK(APPLY(&r.e), "the pass takes the object down");
+    CHECK(draw_every_image() == 0 && !watch_gone[a_watch], "nothing draws it, and the app task hasn't looked yet");
+    apps_rt_image_collect(r.rt);
+    CHECK(watch_gone[a_watch], "freed after the pass");
+    CHECK(draw_every_image() == 0, "never drawn again");
+
+    /* A widget moved to another image. */
+    int b_watch = 0, c_watch = 0;
+    int b = rt_add(&r, CF_RGB565, 4, 4, &b_watch), c = rt_add(&r, CF_A8, 4, 4, &c_watch);
+    rt_push(&r, b, "b");
+    rt_push(&r, c, "c");
+    RUN(&r.e, "v = ui.image{src = b}");
+    CHECK(APPLY(&r.e), "made");
+    RUN(&r.e, "v:set{src = c} b:free()");
+    CHECK(draw_every_image() == 1 && !watch_gone[b_watch], "the object still draws b until the pass");
+    apps_rt_image_collect(r.rt);
+    CHECK(!watch_gone[b_watch], "kept");
+    CHECK(APPLY(&r.e), "the pass moves it to c");
+    apps_rt_image_collect(r.rt);
+    CHECK(watch_gone[b_watch] && !watch_gone[c_watch] && draw_every_image() == 1, "b freed, c drawn");
+
+    /* ui.clear(). */
+    RUN(&r.e, "ui.clear() c:free()");
+    apps_rt_image_collect(r.rt);
+    CHECK(!watch_gone[c_watch] && draw_every_image() == 1, "kept until the pass cleans the layer");
+    CHECK(APPLY(&r.e), "cleaned");
+    apps_rt_image_collect(r.rt);
+    CHECK(watch_gone[c_watch] && draw_every_image() == 0, "freed");
+
+    /* A box deleted with the image in it (the pass deletes the box's object, and LVGL the image's with it). */
+    int d_watch = 0;
+    int d = rt_add(&r, CF_RGB565, 4, 4, &d_watch);
+    rt_push(&r, d, "d");
+    RUN(&r.e, "box = ui.box{w = 100, h = 100} u = ui.image{src = d, parent = box}");
+    CHECK(APPLY(&r.e), "made");
+    RUN(&r.e, "box:delete() d:free()");
+    apps_rt_image_collect(r.rt);
+    CHECK(!watch_gone[d_watch] && draw_every_image() == 1, "kept");
+    CHECK(APPLY(&r.e), "the box goes");
+    apps_rt_image_collect(r.rt);
+    CHECK(watch_gone[d_watch] && draw_every_image() == 0, "freed");
+
+    /* An image no pass ever drew goes at once. */
+    int e_watch = 0;
+    int e = rt_add(&r, CF_RGB565, 4, 4, &e_watch);
+    rt_push(&r, e, "e");
+    RUN(&r.e, "t = ui.image{src = e} t:delete() e:free()");
+    CHECK(watch_gone[e_watch], "made and deleted before a pass: no object, freed at once");
+    CHECK(APPLY(&r.e), "nothing to make");
+    CHECK(draw_every_image() == 0, "nothing drawn");
+    RT_FINISH(&r);
+}
+
+/* An app's end: the runtime is freed after its table is unpublished, but its images' bytes, taken from it, stay until the layer's
+ * reset has taken the objects down; the screen draws them until then. A freed image the screen still drew goes the same way. */
+static void images_free_at_app_end_after_the_reset(void) {
+    rtenv_t r;
+    rt_scene(&r);
+    int a_watch = 0, b_watch = 0, c_watch = 0;
+    int a = rt_add(&r, CF_RGB565A8, 10, 10, &a_watch), b = rt_add(&r, CF_RGB565, 4, 4, &b_watch);
+    int c = rt_add(&r, CF_RGB565, 2, 2, &c_watch);
+    rt_push(&r, a, "a");
+    rt_push(&r, b, "b");
+    rt_push(&r, c, "c");
+    RUN(&r.e, "w = ui.image{src = a, spin = 20} v = ui.image{src = b} c:free()");
+    CHECK(watch_gone[c_watch], "c, never drawn, is gone already");
+    CHECK(APPLY(&r.e), "made");
+    RUN(&r.e, "v:delete() b:free()");  /* still drawn */
+    CHECK(draw_every_image() == 2, "both drawn");
+    void *taken[APPS_RT_IMAGES_MAX];
+    int n = rt_end(&r, taken);
+    CHECK(n == 2, "a and b taken: %d", n);
+    CHECK(!watch_gone[a_watch] && !watch_gone[b_watch], "the runtime freed neither");
+    CHECK(draw_every_image() == 2, "the objects still draw them: the reset hasn't run");
+    apps_lv_reset();
+    CHECK(draw_every_image() == 0 && fake_spins() == 0, "the reset took them down");
+    for (int i = 0; i < n; i++) {
+        apps_port_free(taken[i]);
+    }
+    CHECK(watch_gone[a_watch] && watch_gone[b_watch], "freed after the reset");
+    CHECK(held == 0, "%zu bytes still held", held);
+    CHECK(fake_errors == 0, "the fake LVGL counted %d errors, the first: %s", fake_errors, fake_note);
+}
+
+/* A slot's next image can be another picture in a block at the address the last one had (the heap gives a freed block's address to the
+ * next request): the descriptor is made again from the new header, not kept because its pixels' address is the same. */
+static void a_slots_next_image_can_be_at_the_same_address(void) {
+    rtenv_t r;
+    rt_scene(&r);
+    int a_watch = 0, b_watch = 0;
+    int a = rt_add(&r, CF_RGB565, 8, 4, &a_watch);
+    rt_push(&r, a, "a");
+    RUN(&r.e, "w = ui.image{src = a}");
+    CHECK(APPLY(&r.e), "made");
+    CHECK(log_has_line("image_src 2 8x4 cf=0x12 data=64"), "8 x 4\n%s", log_peek());
+    recycle = true;
+    RUN(&r.e, "w:delete() a:free()");
+    CHECK(APPLY(&r.e), "deleted");
+    apps_rt_image_collect(r.rt);
+    CHECK(watch_gone[a_watch] && recycled != NULL, "a's block is freed, and kept for the next request");
+    log_clear();
+    int b = rt_add(&r, CF_RGB565, 4, 8, &b_watch);
+    CHECK(b == a && watch_ptr[b_watch] == watch_ptr[a_watch], "b is in a's slot, at a's address");
+    rt_push(&r, b, "b");
+    RUN(&r.e, "v = ui.image{src = b}");
+    CHECK(APPLY(&r.e), "made");
+    lv_obj_t *v = fake_obj(3);
+    CHECK(log_has_line("image_src 3 4x8 cf=0x12 data=64") && v->src->header.w == 4 && v->src->header.h == 8,
+          "the descriptor is b's: 4 x 8\n%s", log_peek());
+    CHECK(draw_every_image() == 1, "drawn");
+    RT_FINISH(&r);
+}
+
+/* The pass's report is the slots its objects draw from, made once a pass changes something: a rejected widget's object keeps its
+ * picture, so its bit stays, and the image isn't freed under it. */
+static void the_pass_reports_what_it_draws(void) {
+    rtenv_t r;
+    rt_scene(&r);
+    int a_watch = 0;
+    int a = rt_add(&r, CF_RGB565, 4, 4, &a_watch), b = rt_add(&r, CF_RGB565, 2, 2, NULL);
+    rt_push(&r, a, "a");
+    rt_push(&r, b, "b");
+    CHECK(apps_ui_images_drawn(r.e.ui) == 0, "nothing drawn before a pass");
+    RUN(&r.e, "w = ui.image{src = a} v = ui.image{src = b} p = ui.image{src = 'a.bin'}");
+    CHECK(APPLY(&r.e), "made");
+    CHECK(apps_ui_images_drawn(r.e.ui) == 3u, "slots 0 and 1: 0x%x", (unsigned)apps_ui_images_drawn(r.e.ui));
+    RUN(&r.e, "v:delete()");
+    CHECK(APPLY(&r.e), "deleted");
+    CHECK(apps_ui_images_drawn(r.e.ui) == 1u, "slot 0: 0x%x", (unsigned)apps_ui_images_drawn(r.e.ui));
+    CHECK(APPLY(&r.e), "a pass with nothing to do");
+    CHECK(apps_ui_images_drawn(r.e.ui) == 1u, "the same: 0x%x", (unsigned)apps_ui_images_drawn(r.e.ui));
+
+    /* w is moved to the package's image but goes bad in the table before the pass: rejected, its object keeps drawing a. */
+    RUN(&r.e, "w:set{src = 'a.bin'} a:free()");
+    W(&r.e, 0)->opacity = 101;
+    CHECK(APPLY(&r.e), "the pass ran");
+    CHECK(stats_since().rejects == 1, "rejected: %u", stats_since().rejects);
+    CHECK(apps_ui_images_drawn(r.e.ui) == 1u, "its object still draws slot 0: 0x%x", (unsigned)apps_ui_images_drawn(r.e.ui));
+    apps_rt_image_collect(r.rt);
+    CHECK(!watch_gone[a_watch] && draw_every_image() == 2, "kept while drawn");
+    W(&r.e, 0)->opacity = 100;
+    RT_FINISH(&r);
+    CHECK(watch_gone[a_watch], "freed after the reset");
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
         void (*run)(void);
     } cases[] = {
+        {"runtime_image_shows_in_ui_image", runtime_image_shows_in_ui_image},
+        {"freed_runtime_image_is_never_drawn", freed_runtime_image_is_never_drawn},
+        {"images_free_at_app_end_after_the_reset", images_free_at_app_end_after_the_reset},
+        {"the_pass_reports_what_it_draws", the_pass_reports_what_it_draws},
+        {"a_slots_next_image_can_be_at_the_same_address", a_slots_next_image_can_be_at_the_same_address},
         {"create_update_delete_sequence", create_update_delete_sequence},
         {"revalidation_drops_bad_slot", revalidation_drops_bad_slot},
         {"parent_chain_of_four_is_drawn", parent_chain_of_four_is_drawn},

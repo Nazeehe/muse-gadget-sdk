@@ -82,7 +82,8 @@
  * APPS_UI_BOX_DEPTH_MAX of them with the widget itself counted if it is a box, as apps_ui.h says, and it ends: it
  * is walked in at most 5 steps, so a loop can't hang the LVGL task), every number and enum in its range, text
  * (NULL is ""; at most APPS_UI_TEXT_MAX bytes of valid UTF-8), min < max with value between, and an image of the
- * asset table that apps_image_check passes (rotation 0..359 and spin 0..APPS_SPIN_RPM_MAX are among the numbers).
+ * asset table, or a runtime image the table has, that apps_image_check passes (rotation 0..359 and spin 0..APPS_SPIN_RPM_MAX
+ * are among the numbers).
  *
  * Fonts: sans14 sans16 sans20 sans28 are lv_font_montserrat_14/16/20/28, mono8 and mono16 are lv_font_unscii_8/16,
  * digits48 and digits96 are apps_digits_48 and apps_digits_96 (fonts/). CONFIG_MUSE_APPS selects every LVGL font
@@ -90,6 +91,15 @@
  * An image is drawn from the asset's bytes in place (its descriptor's header is the file's first 12 bytes, with
  * only the premultiplied flag kept: apps_image_check refuses the others), so they must outlive the objects, and be
  * 4-byte aligned, as a heap block is.
+ *
+ * Runtime images (apps_rt.h, connected apps Task 2). A widget whose image is a runtime image (apps_ui.h: APPS_UI_ASSETS_MAX + its
+ * slot) is drawn from the runtime's block in place, through a descriptor of that slot, as a package image is through its asset's;
+ * rotation, spin and scale don't care which it is. A descriptor is made again from the block's header each time it is set (a
+ * slot's next image can be another picture at the same address). At the end of every pass, with the lock held, the pass reports
+ * the runtime slots its image objects draw from (apps_ui_report_drawn): the slot each object's src was last set to, worked out
+ * again when the pass called LVGL for a widget. An object the pass took down, or pointed elsewhere, draws from it no more; one it
+ * rejected keeps its picture, and so its slot. The runtime frees a freed image's bytes only once the report has no bit for its slot
+ * (Never blank), and an ended app's after apps_lv_reset.
  *
  * Events. A widget with a subscribed event is clickable and has one callback for each of LV_EVENT_SHORT_CLICKED
  * (tap), LV_EVENT_LONG_PRESSED, LV_EVENT_PRESSED, LV_EVENT_RELEASED and LV_EVENT_PRESS_LOST (release), registered
@@ -126,8 +136,9 @@
  * overlays, this layer among them, in build_overlays(), on its own task, under the display lock and before the
  * frame timer exists, so no pass can run yet. apps_lv_set_ui runs on any task with the UI lock held, and
  * apps_lv_front and apps_lv_stats on any task. The table may be freed as soon as its pointer has been cleared.
- * What an object refers to is not the table but the package's images, which an image widget draws from in place:
- * free those only after apps_lv_reset has run on the LVGL task, which takes the objects down. The records are one
+ * What an object refers to is not the table but the package's images and the runtime images, which an image widget draws
+ * from in place: free those only after apps_lv_reset has run on the LVGL task, which takes the objects down (a runtime image
+ * the app frees while it runs, once the pass's report lets it go: Runtime images, above). The records are one
  * block from the apps' heap (apps_port_realloc, PSRAM on the device), made by the first pass that has a table and
  * freed by apps_lv_reset; the heap is not used with the lock held, so that pass lets go of the lock to make them
  * and reads the pointer again after.

@@ -25,7 +25,10 @@
  * The implementation is in tests/muse_apps_lv_harness.c. It keeps every object ever made (a deleted one is only
  * marked, so a call on it is caught: the fake counts it as an error, which a real LVGL would turn into a crash on
  * the device), logs each call as one line, and lets a test read the log, move the clock, set the free PSRAM, fire
- * an event at an object (a deleted one too) and set the objects' coordinates.
+ * an event at an object (a deleted one too) and set the objects' coordinates. A test can also touch the screen at a
+ * point, move the finger and lift it, and run the animations' frames: the fake then does what LVGL 9.5.0's pointer
+ * input does with that (lv_indev.c, lv_indev_scroll.c, lv_obj_scroll.c), from finding the object under the finger to a
+ * scroll, a gesture or a click, and a fling's snap as an animation.
  */
 
 #include <stdarg.h>
@@ -82,6 +85,11 @@ typedef struct {
     int32_t x2;
     int32_t y2;
 } lv_area_t;
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+} lv_point_t;
 
 /* The fonts are only compared by address: the real lv_font_t is much bigger. */
 typedef struct lv_font {
@@ -239,6 +247,7 @@ LV_FONT_DECLARE(lv_font_unscii_16)
 #define LV_OPA_TRANSP 0
 #define LV_OPA_COVER 255
 #define LV_ANIM_OFF false
+#define LV_ANIM_ON true
 
 /* ---- lvgl.h: functions ---- */
 
@@ -270,6 +279,8 @@ void lv_obj_set_scrollbar_mode(lv_obj_t *obj, lv_scrollbar_mode_t mode);
 void lv_obj_set_scroll_dir(lv_obj_t *obj, lv_dir_t dir);
 void lv_obj_set_scroll_snap_x(lv_obj_t *obj, lv_scroll_snap_t align);
 int32_t lv_obj_get_scroll_x(const lv_obj_t *obj);
+bool lv_obj_is_scrolling(const lv_obj_t *obj);
+void lv_obj_scroll_to_view(lv_obj_t *obj, lv_anim_enable_t anim_en);
 
 void lv_obj_set_style_opa(lv_obj_t *obj, lv_opa_t value, lv_style_selector_t selector);
 void lv_obj_set_style_bg_color(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector);
@@ -310,3 +321,5 @@ lv_event_dsc_t *lv_obj_add_event_cb(lv_obj_t *obj, lv_event_cb_t event_cb, lv_ev
 lv_indev_t *lv_indev_active(void);
 lv_dir_t lv_indev_get_gesture_dir(const lv_indev_t *indev);
 void lv_indev_wait_release(lv_indev_t *indev);
+void lv_indev_get_point(const lv_indev_t *indev, lv_point_t *point);
+lv_obj_t *lv_indev_get_active_obj(void);

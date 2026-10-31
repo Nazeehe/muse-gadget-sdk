@@ -1043,6 +1043,8 @@ static EXT_RAM_BSS_ATTR struct {
     int n;                      /* items made */
     int centre;                 /* the item nearest the centre, -1 until the first update */
     lv_obj_t *row, *name;
+    lv_point_t press;           /* where the last press on the card itself went down: the edge close's */
+    bool press_moving;          /* the row was scrolling when the last press on an item went down */
 } C;
 
 static lv_obj_t *s_launcher, *s_crash, *s_crash_title, *s_crash_body;
@@ -1257,27 +1259,67 @@ static void close_crash(void) {
     s_crash_shown = false;
 }
 
-/* A tap that lands on no app: on the launcher itself, or on its text, which isn't clickable. */
+/* A tap that lands on no app: on the launcher itself, or on its text, which isn't clickable (C12). */
 static void on_launcher_tap(lv_event_t *e) {
     (void)e;
     close_launcher();
 }
 
-/* A swipe that isn't the carousel's scroll (up or down; a sideways one scrolls, and LVGL sends no gesture then): the app it began on
- * gets no click (LVGL would click it at the lift, as nothing scrolled). It closes nothing (P3: the bottom-edge close is Task 5's). */
-static void on_launcher_gesture(lv_event_t *e) {
+/* A press on the card itself (not on an app, or the row between them: those are clickable, and LVGL sends their presses to them):
+ * where it went down, for the gesture it may become. */
+static void on_launcher_press(lv_event_t *e) {
     (void)e;
     lv_indev_t *indev = lv_indev_active();
     if (indev != NULL) {
-        lv_indev_wait_release(indev);
+        lv_indev_get_point(indev, &C.press);
     }
 }
 
-/* The item's own copy of its id: the launcher closes first (pick may open another card), and pick only posts. Nothing is deleted
- * here, inside the item's event: the items go when the launcher is next shown. */
-static void on_item_tap(lv_event_t *e) {
+/* Whether a press at p begins the close: in the screen's bottom APPS_LV_CLOSE_EDGE_PX rows, inside its circle. (A press on the card
+ * is on the screen: LVGL finds the card only for a point in its box.) */
+static bool in_close_edge(lv_point_t p) {
+    int32_t dx = p.x - SCREEN_R, dy = p.y - SCREEN_R;
+    return p.y >= SCREEN_PX - APPS_LV_CLOSE_EDGE_PX && dx * dx + dy * dy <= SCREEN_R * SCREEN_R;
+}
+
+/* A swipe that isn't the carousel's scroll (LVGL sends no gesture while a drag scrolls the row): whatever it began on gets no click
+ * (LVGL would click it at the lift, as nothing scrolled). A swipe up (LV_DIR_TOP) closes the launcher when its press went down on the
+ * card itself in the bottom band: the card is then the touch's object (lv_indev_get_active_obj; every object LVGL makes with a parent
+ * keeps the press it began with, LV_OBJ_FLAG_PRESS_LOCK), so C.press is this touch's. Nothing else closes it: a sideways swipe, a
+ * swipe up from higher, outside the circle, from an app or from between two apps (the card never heard that press). */
+static void on_launcher_gesture(lv_event_t *e) {
+    (void)e;
+    lv_indev_t *indev = lv_indev_active();
+    if (indev == NULL) {
+        return;
+    }
+    bool close = lv_indev_get_gesture_dir(indev) == LV_DIR_TOP && s_launcher != NULL && lv_indev_get_active_obj() == s_launcher &&
+                 in_close_edge(C.press);
+    lv_indev_wait_release(indev);
+    if (close) {
+        close_launcher();
+    }
+}
+
+/* An item's press and its tap. The settled centre opens: a tap on the item nearest the centre, with the row neither scrolling when the
+ * finger went down nor when it came up (lv_obj_is_scrolling: a drag, a fling's snap, an lv_obj_scroll_to_view; LVGL stops none of
+ * them for a tap, so an item pressed while the row moves has moved on by the lift). Any other tap brings its item to the centre and
+ * opens nothing: a side app, anywhere in its box, which is wider than its face (M2: a tap there can only scroll), or any app while the
+ * row moves (M3). LVGL sends no tap at all at the lift of a drag that scrolled. Opening: the launcher closes first (pick may open another
+ * card) with the item's id copied, and pick only posts. Nothing is deleted here, inside the item's event: the items go when the launcher
+ * is next shown. A touch the launcher closed under (an app to the front, a voice turn: hiding it doesn't end the touch) does nothing at
+ * its lift. */
+static void on_item_event(lv_event_t *e) {
     intptr_t k = (intptr_t)lv_event_get_user_data(e);
-    if (k < 0 || k >= C.n) {
+    if (!s_launcher_shown || k < 0 || k >= C.n || C.row == NULL) {
+        return;
+    }
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        C.press_moving = lv_obj_is_scrolling(C.row);
+        return;
+    }
+    if (C.press_moving || lv_obj_is_scrolling(C.row) || k != C.centre) {
+        lv_obj_scroll_to_view(C.item[k].box, LV_ANIM_ON);
         return;
     }
     char id[APPS_ID_MAX + 1];
@@ -1318,6 +1360,7 @@ static bool make_cards(void) {
         return false;
     }
     lv_obj_add_event_cb(launcher, on_launcher_tap, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(launcher, on_launcher_press, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(launcher, on_launcher_gesture, LV_EVENT_GESTURE, NULL);
     lv_obj_add_event_cb(crash, on_crash_tap, LV_EVENT_CLICKED, NULL);
     lv_label_set_long_mode(title, LV_LABEL_LONG_MODE_WRAP);
@@ -1352,7 +1395,7 @@ static lv_obj_t *new_row(void) {
     lv_obj_set_scroll_snap_x(row, LV_SCROLL_SNAP_CENTER);
     lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(row, on_carousel_scroll, LV_EVENT_SCROLL, NULL);
-    return row;  /* clickable, as an object is, so that a drag that begins between items scrolls it too */
+    return row;  /* clickable, as an object is, so that a drag that begins between items scrolls it too; a tap there does nothing */
 }
 
 /* Item k of the row: its box (clickable, a snap point: LVGL's default), its tile and letter, and the dot when its app runs. False
@@ -1396,7 +1439,8 @@ static bool new_item(int k, bool runs) {
             lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, 0, 0);
         }
     }
-    lv_obj_add_event_cb(box, on_item_tap, LV_EVENT_CLICKED, (void *)(intptr_t)k);
+    lv_obj_add_event_cb(box, on_item_event, LV_EVENT_PRESSED, (void *)(intptr_t)k);
+    lv_obj_add_event_cb(box, on_item_event, LV_EVENT_CLICKED, (void *)(intptr_t)k);
     it->box = box;
     it->tile = tile;
     it->image = NULL;

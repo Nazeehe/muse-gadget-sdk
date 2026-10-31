@@ -21,10 +21,11 @@ jobs when a case says, and a store of icon files in memory. The fake logs every 
 a deleted one is caught, and counts an LVGL call made inside the pass without the UI lock; the harness's port is a
 counting allocator (every case ends at 0 bytes held) and a lock that records how it is used.
 
-A fake is only as good as its likeness to the real thing, so four tests compare it with LVGL 9.5.0's tree when
+A fake is only as good as its likeness to the real thing, so five tests compare it with LVGL 9.5.0's tree when
 it is on this machine (the Espressif component cache, or managed_components/ after a device build): the
 prototypes it declares, the constants the log shows, the one default of an image the fake copies (it is centred in
-its box), and apps_lv.c itself, compiled against the real headers.
+its box), the numbers and object defaults its touch works from (a drag, a throw, a gesture, a scroll's animation),
+and apps_lv.c itself, compiled against the real headers.
 """
 
 import os
@@ -343,8 +344,8 @@ class HarnessTest(unittest.TestCase):
     def test_the_launcher_with_no_apps(self):  # C12: the empty-state text, unchanged, closes it too
         self.run_case("launcher_empty_state")
 
-    def test_no_swipe_closes_the_launcher(self):  # P3: sideways is the carousel's; the bottom-edge close is Task 5's
-        self.run_case("launcher_no_swipe_closes_it")
+    def test_a_swipe_that_begins_on_an_app_closes_nothing(self):  # P3, and the edge rule: the bottom band is the card's
+        self.run_case("launcher_a_swipe_on_an_app_closes_nothing")
 
     def test_the_launcher_keeps_its_own_copy(self):
         self.run_case("launcher_keeps_its_own_copy")
@@ -354,6 +355,29 @@ class HarnessTest(unittest.TestCase):
 
     def test_a_scroll_after_a_close_asks_nothing(self):  # fix round 1, I1: a snap animation after a close loads no icon
         self.run_case("a_scroll_after_a_close_asks_nothing")
+
+    # ---- Taps and the bottom-edge close (launcher carousel Task 5), through the fake's pointer ----
+
+    def test_tap_centre_launches(self):  # the app at the centre, at rest: anywhere in its item
+        self.run_case("tap_centre_launches")
+
+    def test_tap_side_scrolls_not_launches(self):  # and M2: the whole of a side item's box scrolls; between items, nothing
+        self.run_case("tap_side_scrolls_not_launches")
+
+    def test_tap_while_scrolling_does_not_launch(self):  # Review Focus 4, M3: a drag, a fling's snap, scroll_to_view's animation
+        self.run_case("tap_while_scrolling_does_not_launch")
+
+    def test_bottom_edge_swipe_up_closes(self):  # within APPS_LV_CLOSE_EDGE_PX of the bottom, inside the circle; icons dropped
+        self.run_case("bottom_edge_swipe_up_closes")
+
+    def test_swipe_up_from_middle_does_nothing(self):  # each beside a twin that starts inside the rule and closes
+        self.run_case("swipe_up_from_middle_does_nothing")
+
+    def test_right_swipe_no_longer_closes(self):  # P3's pin
+        self.run_case("right_swipe_no_longer_closes")
+
+    def test_horizontal_swipe_only_scrolls(self):
+        self.run_case("horizontal_swipe_only_scrolls")
 
     def test_the_launchers_records_are_in_psram_and_the_rows_are_gone(self):
         # X12 and the follow-up round's internal RAM: the carousel's copy of the list (32 ids, names and icon paths) and its
@@ -466,11 +490,12 @@ class FakesTest(unittest.TestCase):
         LV_EVENT_LONG_PRESSED_REPEAT LV_EVENT_CLICKED LV_EVENT_RELEASED LV_EVENT_SCROLL_BEGIN
         LV_EVENT_SCROLL_THROW_BEGIN LV_EVENT_SCROLL_END LV_EVENT_SCROLL LV_EVENT_GESTURE LV_EVENT_KEY
         LV_EVENT_PREPROCESS
-        LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_COVER LV_ANIM_OFF
+        LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_COVER LV_ANIM_OFF LV_ANIM_ON
         LV_IMAGE_ALIGN_DEFAULT LV_IMAGE_ALIGN_CENTER LV_COLOR_FORMAT_A8 LV_IMAGE_FLAGS_PREMULTIPLIED
         sizeof(lv_image_header_t) sizeof(lv_image_dsc_t) sizeof(lv_color_t) sizeof(lv_area_t)
         offsetof(lv_image_dsc_t,header) offsetof(lv_image_dsc_t,data_size) offsetof(lv_image_dsc_t,data)
         offsetof(lv_area_t,x1) offsetof(lv_area_t,x2) offsetof(lv_area_t,y1) offsetof(lv_area_t,y2)
+        sizeof(lv_point_t) offsetof(lv_point_t,x) offsetof(lv_point_t,y)
     """.split()
 
     def test_an_lvgl_image_is_centred_in_its_box_until_told_otherwise(self):
@@ -499,6 +524,48 @@ class FakesTest(unittest.TestCase):
         fake, real = outputs
         self.assertEqual(sorted(fake), sorted(self.CONSTANTS))
         self.assertEqual(fake, real)
+
+    def test_the_fakes_pointer_is_lvgl_9_5_0s(self):
+        """The fake's touch (fake_down, fake_move, fake_lift, fake_frame) uses LVGL 9.5.0's numbers and the defaults it gives an object:
+        the drag, throw and gesture limits, the elastic slowness, the scroll animation's times and speed, and the flags lv_obj_constructor
+        sets (press lock, scroll chain and gesture bubble on an object with a parent; elastic and momentum on every one), which the fake
+        takes as given (apps_lv.c can't change them: the fake declares none of them)."""
+        harness = HARNESS.read_text()
+
+        def fake(name):
+            match = re.search(rf"^#define {name} (\d+)\b", harness, re.M)
+            self.assertIsNotNone(match, f"no #define {name} in the harness")
+            return int(match.group(1))
+
+        def real(path, name):
+            match = re.search(rf"^\s*#define\s+{name}\s+(\d+)\b", (self.lvgl / path).read_text(errors="replace"), re.M)
+            self.assertIsNotNone(match, f"no #define {name} in {path}")
+            return int(match.group(1))
+
+        for fake_name, path, name in (("FAKE_SCROLL_LIMIT", "src/indev/lv_indev.c", "LV_INDEV_DEF_SCROLL_LIMIT"),
+                                      ("FAKE_SCROLL_THROW", "src/indev/lv_indev.c", "LV_INDEV_DEF_SCROLL_THROW"),
+                                      ("FAKE_GESTURE_LIMIT", "src/indev/lv_indev.c", "LV_INDEV_DEF_GESTURE_LIMIT"),
+                                      ("FAKE_GESTURE_MIN_VELOCITY", "src/indev/lv_indev.c", "LV_INDEV_DEF_GESTURE_MIN_VELOCITY"),
+                                      ("FAKE_ELASTIC_SLOWNESS", "src/indev/lv_indev_scroll.c", "ELASTIC_SLOWNESS_FACTOR"),
+                                      ("FAKE_SCROLL_ANIM_MIN_MS", "src/core/lv_obj_scroll.c", "SCROLL_ANIM_TIME_MIN"),
+                                      ("FAKE_SCROLL_ANIM_MAX_MS", "src/core/lv_obj_scroll.c", "SCROLL_ANIM_TIME_MAX")):
+            with self.subTest(name):
+                self.assertEqual(fake(fake_name), real(path, name))
+        scroll = _strip_comments((self.lvgl / "src/core/lv_obj_scroll.c").read_text(errors="replace"))
+        self.assertRegex(scroll, r"lv_anim_speed_clamped\(\(lv_display_get_horizontal_resolution\(d\)\) >> 1, SCROLL_ANIM_TIME_MIN,")
+        anim = _strip_comments((self.lvgl / "src/misc/lv_anim.c").read_text(errors="replace"))
+        self.assertIn("speed = (speed + 5) / 10;", anim)
+        self.assertIn("uint32_t time = (d * 100) / speed;", anim)
+        self.assertIn("int32_t speed = ((FAKE_HOR_RES >> 1) + 5) / 10;", harness)
+        self.assertEqual(fake("FAKE_HOR_RES"), 466)
+        obj = _strip_comments((self.lvgl / "src/core/lv_obj.c").read_text(errors="replace"))
+        constructor = re.search(r"static void lv_obj_constructor\([^)]*\)\s*\{.*?\n\}", obj, re.S)
+        self.assertIsNotNone(constructor, "lv_obj_constructor isn't in LVGL 9.5.0's lv_obj.c")
+        for line in ("if(parent) obj->flags |= LV_OBJ_FLAG_PRESS_LOCK;", "if(parent) obj->flags |= LV_OBJ_FLAG_SCROLL_CHAIN;",
+                     "if(parent) obj->flags |= LV_OBJ_FLAG_GESTURE_BUBBLE;", "obj->flags |= LV_OBJ_FLAG_SCROLL_ELASTIC;",
+                     "obj->flags |= LV_OBJ_FLAG_SCROLL_MOMENTUM;"):
+            with self.subTest(line):
+                self.assertIn(line, constructor.group(0))
 
     def test_apps_lv_compiles_against_the_real_headers(self):
         """The device build compiles apps_lv.c against these: every name, type and argument it uses is checked."""

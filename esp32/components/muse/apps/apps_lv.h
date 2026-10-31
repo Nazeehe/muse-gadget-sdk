@@ -203,15 +203,25 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * icon's descriptor is asked for again after every apps_icons_want and apps_icons_drop_all, so an item never shows a block
  * that was freed: one whose icon left the window, or went, is its tile again before LVGL draws.
  *
- * Touches: a tap on an app closes the launcher and calls pick with its id, on the LVGL task inside the tap (pick posts and
- * returns). A tap on the card around the row (the title, the name, the empty state's text: none of them is clickable) closes
- * it. A swipe sideways scrolls; no swipe closes it, and one that begins on an app picks nothing. Each close drops the icons.
+ * Touches, as LVGL makes them (a drag that scrolls the row sends no tap and no gesture):
+ * - A tap on the app at the centre, with the row at rest (lv_obj_is_scrolling false when the finger went down and when it came up),
+ *   closes the launcher and calls pick with its id, on the LVGL task inside the tap (pick posts and returns). Anywhere in its item
+ *   counts, the face or under it.
+ * - A tap on any other app, anywhere in its item's box (APPS_LV_ICON_PX wide, wider than a neighbour's face), or on any app while
+ *   the row moves (a drag, a fling's snap, the animation of an earlier tap), brings that app to the centre (lv_obj_scroll_to_view,
+ *   animated) and opens nothing. A tap on the row between two apps does nothing.
+ * - A tap on the card around the row (the title, the name, the empty state's text: none of them is clickable) closes it.
+ * - A swipe sideways on the row scrolls it. A swipe up (LVGL's LV_DIR_TOP) whose press went down on the card itself within
+ *   APPS_LV_CLOSE_EDGE_PX of the screen's bottom, inside the circle, closes it; no other swipe does. Whatever a swipe began on gets
+ *   no tap.
+ * Each close drops the icons.
  */
 
 #define APPS_LV_ICON_PX 120          /* the centre's icon, and every item's box */
 #define APPS_LV_ICON_SIDE_SCALE 150  /* a neighbour's scale, of 256: about 59%, 70 px */
 #define APPS_LV_ITEM_PITCH 150       /* from one app's centre to the next's */
 #define APPS_LV_LAUNCHER_MAX 32      /* apps the carousel holds (the store's most); more are left out */
+#define APPS_LV_CLOSE_EDGE_PX 40     /* a swipe up closes the launcher when its press went down this close to the bottom */
 
 /* The launcher's n while the store hasn't been mounted (apps_store.h): "Loading apps..." in place of the carousel (the font has
  * no ellipsis). */

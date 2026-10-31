@@ -721,8 +721,11 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   `components/muse/apps/apps_guide.md` is the guide Muse reads, and
   `skills/gadget-muse-apps/SKILL.md` holds it for an agent.
 - **Using it:** a long press on the pocket watch opens the launcher, a
-  carousel of every app, the most recently used first; a right swipe puts the
-  app behind, where it keeps running. Muse uses four Link commands:
+  carousel of every app, the most recently used first; a tap on the app in the
+  middle opens it and a tap on one at a side brings it to the middle; a swipe
+  up that starts in the bottom 40 px of the screen (`APPS_LV_CLOSE_EDGE_PX`)
+  closes it; a right swipe puts the app behind, where it keeps running. Muse
+  uses four Link commands:
   `app.api` (writes the guide and a timer example to
   `workspace/apps/_guide/` on its VM and returns the gadget's limits),
   `app.install` (the gadget reads `workspace/apps/<id>/`

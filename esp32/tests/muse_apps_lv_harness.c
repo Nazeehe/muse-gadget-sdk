@@ -528,6 +528,38 @@ static lv_obj_t *pressed_obj;  /* the object the finger went down on (LVGL's act
 static bool wait_released;     /* lv_indev_wait_release was called during this touch */
 static bool long_sent;         /* LONG_PRESSED was sent during this touch */
 
+/* The rest of the pointer, as LVGL 9.5.0's indev keeps it (lv_indev_private.h), for a touch at a point (fake_down, fake_move,
+ * fake_up). The fake has one read of history where LVGL keeps a few: a throw is the last read's movement. */
+static lv_point_t act_point, last_point, vect;  /* where the finger is, where it was at the last read, and the difference */
+static lv_obj_t *scroll_obj;    /* what this touch's drag scrolls; after the lift, until its throw has taken its first step */
+static lv_dir_t scroll_dir_now; /* pointer.scroll_dir: LV_DIR_HOR or LV_DIR_VER once a drag scrolls */
+static lv_point_t scroll_sum, gesture_sum;
+static bool gesture_sent;
+static bool throw_pending;      /* indev->scroll_throw_anim: a drag's lift started it, and it hasn't run yet */
+static int32_t throw_vect_x;    /* pointer.scroll_throw_vect_ori.x at the lift */
+static lv_obj_t *active_obj;    /* indev_obj_act: the pressed object while a read is processed, NULL otherwise */
+
+/* LVGL 9.5.0's numbers for all that (test_the_fakes_pointer_is_lvgl_9_5_0s reads them in its tree). */
+#define FAKE_SCROLL_LIMIT 10          /* LV_INDEV_DEF_SCROLL_LIMIT: a drag scrolls once it has gone this far */
+#define FAKE_SCROLL_THROW 10          /* LV_INDEV_DEF_SCROLL_THROW: a throw loses this % a step */
+#define FAKE_GESTURE_LIMIT 50         /* LV_INDEV_DEF_GESTURE_LIMIT: a gesture is this far */
+#define FAKE_GESTURE_MIN_VELOCITY 3   /* LV_INDEV_DEF_GESTURE_MIN_VELOCITY: a read that moves less starts the gesture again */
+#define FAKE_ELASTIC_SLOWNESS 4       /* ELASTIC_SLOWNESS_FACTOR: a scroll past the last snap point goes this much slower */
+#define FAKE_SCROLL_ANIM_MIN_MS 200   /* SCROLL_ANIM_TIME_MIN */
+#define FAKE_SCROLL_ANIM_MAX_MS 400   /* SCROLL_ANIM_TIME_MAX */
+#define FAKE_HOR_RES 466              /* the display: lv_obj_scroll_by animates at half its width a second */
+#define FAKE_COORD_MIN (-LV_COORD_MAX)
+
+/* A scroll animation (lv_obj_scroll_by with LV_ANIM_ON: scroll_x_anim), in LVGL's scroll.x, which is -lv_obj_get_scroll_x. */
+typedef struct {
+    lv_obj_t *obj;
+    int32_t from, to, now;
+    int32_t duration, elapsed;  /* ms */
+    bool started;               /* its first step has run (lv_anim_t.start_cb_called): its end sends SCROLL_END */
+} fake_anim_t;
+static fake_anim_t anims[8];
+static int n_anims;
+
 static int fake_errors;
 static char fake_note[240];
 
@@ -788,6 +820,21 @@ lv_obj_t *lv_image_create(lv_obj_t *parent) {
 
 static void mark_deleted(lv_obj_t *o) {
     o->deleted = true;
+    /* LVGL's obj_delete_core: its animations go with it, and an input device that presses or scrolls it is reset (obj_indev_reset):
+     * a finger that is down waits for its release, and nothing more of the touch is sent. */
+    for (int i = 0; i < n_anims; i++) {
+        if (anims[i].obj == o) {
+            anims[i--] = anims[--n_anims];
+        }
+    }
+    if (o == pressed_obj || o == scroll_obj) {
+        if (pressed_obj != NULL) {
+            wait_released = true;
+        }
+        pressed_obj = scroll_obj = NULL;
+        throw_pending = false;
+        scroll_dir_now = LV_DIR_NONE;
+    }
     for (int i = 0; i < n_objs; i++) {
         if (objs[i]->parent == o && !objs[i]->deleted) {
             mark_deleted(objs[i]);
@@ -1385,6 +1432,435 @@ void lv_indev_wait_release(lv_indev_t *indev) {
     logline("wait_release");
 }
 
+/* LVGL's: (0, 0) for no device. */
+void lv_indev_get_point(const lv_indev_t *indev, lv_point_t *point) {
+    if (point == NULL) {
+        fake_error("lv_indev_get_point with no point");
+        return;
+    }
+    *point = indev != NULL ? act_point : (lv_point_t){0, 0};
+}
+
+/* The object pressed, while a read is processed (LVGL clears it at the end of lv_indev_read): NULL for an event sent from code. */
+lv_obj_t *lv_indev_get_active_obj(void) {
+    return active_obj;
+}
+
+/* ---- Scrolling as LVGL 9.5.0 does it (lv_obj_scroll.c, lv_indev_scroll.c), for what apps_lv makes: a row that snaps its children to
+ * its centre. What the fake doesn't model (a vertical scroll, a throw without snapping, the other snap modes) is an error. ---- */
+
+static void fake_layout(void);
+static void fake_fire(int id, lv_event_code_t code);
+
+static bool anim_on(const lv_obj_t *o) {
+    for (int i = 0; i < n_anims; i++) {
+        if (anims[i].obj == o) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* lv_obj_scroll_by_raw: the content moves x to the right (scroll.x += x, so lv_obj_get_scroll_x falls by x), and SCROLL. */
+static void scroll_by_raw(lv_obj_t *o, int32_t x, int32_t y) {
+    if (x == 0 && y == 0) {
+        return;
+    }
+    if (y != 0) {
+        fake_error("a vertical scroll of %d by %d: the fake doesn't model one", o->id, (int)y);
+        return;
+    }
+    o->scroll_x -= x;
+    fake_layout();
+    fake_fire(o->id, LV_EVENT_SCROLL);
+}
+
+/* lv_anim_delete(obj, scroll_x_anim): its deleted_cb (scroll_end_cb) sends SCROLL_END when it had begun. */
+static void anim_delete(lv_obj_t *o) {
+    for (int i = 0; i < n_anims; i++) {
+        if (anims[i].obj == o) {
+            bool started = anims[i].started;
+            anims[i] = anims[--n_anims];
+            if (started) {
+                fake_fire(o->id, LV_EVENT_SCROLL_END);
+            }
+            return;  /* there is one at most: a new one takes the place of the old (remove_concurrent_anims) */
+        }
+    }
+}
+
+/* lv_obj_scroll_by. Animated: SCROLL_BEGIN, then an ease-out from where it is to dx further, over the distance at half the screen's
+ * width a second, 200 to 400 ms (lv_anim_speed_clamped), one step a frame (fake_frame), SCROLL_END at its end. It takes the place of
+ * one that was running (LVGL's remove_concurrent_anims, at the new one's first step). Not animated: the ones running stop, then
+ * SCROLL_BEGIN, the move and SCROLL_END. */
+static void scroll_by(lv_obj_t *o, int32_t dx, int32_t dy, bool anim) {
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+    if (dy != 0) {
+        fake_error("a vertical scroll of %d by %d: the fake doesn't model one", o->id, (int)dy);
+        return;
+    }
+    if (!anim) {
+        anim_delete(o);
+        fake_fire(o->id, LV_EVENT_SCROLL_BEGIN);
+        scroll_by_raw(o, dx, 0);
+        fake_fire(o->id, LV_EVENT_SCROLL_END);
+        return;
+    }
+    int32_t speed = ((FAKE_HOR_RES >> 1) + 5) / 10;  /* lv_anim_speed_clamped keeps it in 10 px/s */
+    int32_t d = dx < 0 ? -dx : dx, ms = d * 100 / speed;
+    ms = ms < FAKE_SCROLL_ANIM_MIN_MS ? FAKE_SCROLL_ANIM_MIN_MS : ms > FAKE_SCROLL_ANIM_MAX_MS ? FAKE_SCROLL_ANIM_MAX_MS : ms;
+    fake_fire(o->id, LV_EVENT_SCROLL_BEGIN);
+    anim_delete(o);
+    if (n_anims >= (int)ARRAY_LEN(anims)) {
+        fake_error("more scroll animations than the fake holds");
+        return;
+    }
+    int32_t from = -o->scroll_x;
+    anims[n_anims++] = (fake_anim_t){o, from, from + dx, from, ms, 0, false};
+}
+
+/* An object's children that LVGL counts for scrolling and snapping: alive and not hidden. */
+static bool counted_child(const lv_obj_t *c, const lv_obj_t *parent) {
+    return c->parent == parent && !c->deleted && (c->flags & LV_OBJ_FLAG_HIDDEN) == 0;
+}
+
+/* find_snap_point_x: of the snappable children whose centre, moved by ofs, is in min..max, the distance of the nearest to the
+ * row's centre, negated (what to scroll by); LV_COORD_MAX when there is none. */
+static int32_t find_snap_point_x(const lv_obj_t *o, int32_t min, int32_t max, int32_t ofs) {
+    if (o->snap_x == LV_SCROLL_SNAP_NONE) {
+        return LV_COORD_MAX;
+    }
+    if (o->snap_x != LV_SCROLL_SNAP_CENTER) {
+        fake_error("snapping %d to its start or end: the fake models the centre only", o->id);
+        return LV_COORD_MAX;
+    }
+    int32_t dist = LV_COORD_MAX;
+    int32_t x_parent = o->area.x1 + o->pad_left + (o->area.x2 - o->area.x1 + 1 - o->pad_left - o->pad_right) / 2;
+    for (int i = 0; i < n_objs; i++) {
+        const lv_obj_t *c = objs[i];
+        if (!counted_child(c, o) || (c->flags & LV_OBJ_FLAG_SNAPPABLE) == 0) {
+            continue;
+        }
+        int32_t x_child = c->area.x1 + (c->area.x2 - c->area.x1 + 1) / 2 + ofs;
+        if (x_child >= min && x_child <= max) {
+            int32_t x = x_child - x_parent;
+            if ((x < 0 ? -x : x) < (dist < 0 ? -dist : dist)) {
+                dist = x;
+            }
+        }
+    }
+    return dist == LV_COORD_MAX ? LV_COORD_MAX : -dist;
+}
+
+/* has_more_snap_points, sideways: a snap point left of the centre, and one right of it. */
+static void more_snap_points(const lv_obj_t *o, bool *start, bool *end) {
+    int32_t x = o->area.x1 + (o->area.x2 - o->area.x1 + 1 - o->pad_left - o->pad_right) / 2 + o->pad_left;
+    *end = find_snap_point_x(o, x + 1, LV_COORD_MAX, 0) != LV_COORD_MAX;
+    *start = find_snap_point_x(o, FAKE_COORD_MIN, x - 1, 0) != LV_COORD_MAX;
+}
+
+/* lv_obj_get_scroll_left/right/top/bottom (left to right, no self size, no vertical padding or scroll): how far the content goes
+ * past each side of the content area. */
+static int32_t scroll_left(const lv_obj_t *o) {
+    return o->scroll_x;
+}
+
+static int32_t scroll_right(const lv_obj_t *o) {
+    int32_t right = FAKE_COORD_MIN;
+    for (int i = 0; i < n_objs; i++) {
+        if (counted_child(objs[i], o) && objs[i]->area.x2 > right) {
+            right = objs[i]->area.x2;
+        }
+    }
+    int32_t self = -(o->area.x2 - o->area.x1 + 1 - o->pad_left - o->pad_right) - o->scroll_x;
+    right = right == FAKE_COORD_MIN ? right : right - (o->area.x2 - o->pad_right);
+    return right > self ? right : self;
+}
+
+static int32_t scroll_top(const lv_obj_t *o) {
+    (void)o;
+    return 0;  /* -scroll.y: nothing scrolls vertically here */
+}
+
+static int32_t scroll_bottom(const lv_obj_t *o) {
+    int32_t bottom = FAKE_COORD_MIN;
+    for (int i = 0; i < n_objs; i++) {
+        if (counted_child(objs[i], o) && objs[i]->area.y2 - o->area.y2 > bottom) {
+            bottom = objs[i]->area.y2 - o->area.y2;
+        }
+    }
+    int32_t self = -(o->area.y2 - o->area.y1 + 1);
+    return bottom > self ? bottom : self;
+}
+
+/* elastic_diff, sideways, with SCROLL_ELASTIC (every object has it): past the last snap point either way (or the content's end,
+ * without snapping), a quarter of the finger's movement. */
+static int32_t elastic_diff_x(const lv_obj_t *o, int32_t diff) {
+    bool out;
+    if (o->snap_x == LV_SCROLL_SNAP_NONE) {
+        out = scroll_right(o) < 0 || scroll_left(o) < 0;
+    } else {
+        bool start, end;
+        more_snap_points(o, &start, &end);
+        out = !start || !end;
+    }
+    if (!out || diff == 0) {
+        return diff;
+    }
+    diff += diff < 0 ? -FAKE_ELASTIC_SLOWNESS / 2 : FAKE_ELASTIC_SLOWNESS / 2;
+    return diff / FAKE_ELASTIC_SLOWNESS;
+}
+
+/* lv_indev_find_scroll_obj: up from the pressed object, the one that can scroll the way the drag goes, once it has gone
+ * FAKE_SCROLL_LIMIT; an object that can't scroll passes the drag to its parent (SCROLL_CHAIN, which LVGL gives every object made with a
+ * parent: the screen has none). */
+static lv_obj_t *find_scroll_obj(void) {
+    lv_obj_t *candidate = NULL;
+    lv_dir_t candidate_dir = LV_DIR_NONE;
+    bool hor_en = false, ver_en = false;
+    scroll_sum.x += vect.x;
+    scroll_sum.y += vect.y;
+    for (lv_obj_t *o = pressed_obj; o != NULL; o = o->parent) {
+        int32_t ax = scroll_sum.x < 0 ? -scroll_sum.x : scroll_sum.x, ay = scroll_sum.y < 0 ? -scroll_sum.y : scroll_sum.y;
+        if (ax > ay) {
+            hor_en = true;
+        } else {
+            ver_en = true;
+        }
+        bool chain = o->parent != NULL;
+        if ((o->flags & LV_OBJ_FLAG_SCROLLABLE) == 0) {
+            if (!chain) {
+                break;
+            }
+            continue;
+        }
+        bool up_en = ver_en, down_en = ver_en, left_en = hor_en, right_en = hor_en;
+        if ((o->scroll_dir & LV_DIR_LEFT) == 0) left_en = false;
+        if ((o->scroll_dir & LV_DIR_RIGHT) == 0) right_en = false;
+        if ((o->scroll_dir & LV_DIR_TOP) == 0) up_en = false;
+        if ((o->scroll_dir & LV_DIR_BOTTOM) == 0) down_en = false;
+        int32_t sl, sr;
+        if (o->snap_x == LV_SCROLL_SNAP_NONE) {
+            sl = scroll_left(o);
+            sr = scroll_right(o);
+        } else {
+            bool start, end;
+            more_snap_points(o, &start, &end);
+            sl = start ? 1 : -1;
+            sr = end ? 1 : -1;
+        }
+        int32_t st = scroll_top(o), sb = scroll_bottom(o);
+        const int32_t L = FAKE_SCROLL_LIMIT;
+        if ((st > 0 || sb > 0) && ((up_en && scroll_sum.y >= L) || (down_en && scroll_sum.y <= -L))) {
+            candidate = o;
+            candidate_dir = LV_DIR_VER;
+        }
+        if ((sl > 0 || sr > 0) && ((left_en && scroll_sum.x >= L) || (right_en && scroll_sum.x <= -L))) {
+            candidate = o;
+            candidate_dir = LV_DIR_HOR;
+        }
+        if (st <= 0) up_en = false;
+        if (sb <= 0) down_en = false;
+        if (sl <= 0) left_en = false;
+        if (sr <= 0) right_en = false;
+        if ((left_en && scroll_sum.x >= L) || (right_en && scroll_sum.x <= -L) || (up_en && scroll_sum.y >= L) ||
+            (down_en && scroll_sum.y <= -L)) {
+            break;
+        }
+        if (!chain) {
+            break;
+        }
+    }
+    if (candidate != NULL) {
+        scroll_dir_now = candidate_dir;
+        scroll_obj = candidate;
+        scroll_sum = (lv_point_t){0, 0};
+    }
+    return candidate;
+}
+
+/* lv_indev_scroll_handler: a read that moves scrolls what the drag scrolls (found on the first read that can: SCROLL_BEGIN). */
+static void indev_scroll(void) {
+    if (vect.x == 0 && vect.y == 0) {
+        return;
+    }
+    lv_obj_t *o = scroll_obj;
+    if (o == NULL) {
+        o = find_scroll_obj();
+        if (o == NULL) {
+            return;
+        }
+        fake_fire(o->id, LV_EVENT_SCROLL_BEGIN);
+    }
+    if (scroll_dir_now != LV_DIR_HOR) {
+        fake_error("a vertical drag of %d: the fake doesn't model one", o->id);
+        return;
+    }
+    int32_t dx = elastic_diff_x(o, vect.x);
+    if ((o->scroll_dir & LV_DIR_LEFT) == 0 && dx > 0) dx = 0;
+    if ((o->scroll_dir & LV_DIR_RIGHT) == 0 && dx < 0) dx = 0;
+    scroll_by_raw(o, dx, 0);
+    scroll_sum.x += dx;
+}
+
+/* indev_gesture: while nothing scrolls, the reads' movement adds up (a read under FAKE_GESTURE_MIN_VELOCITY starts it again), and
+ * past FAKE_GESTURE_LIMIT it is a gesture, its way the larger of the two, sent once, to the first object up from the pressed one that
+ * doesn't pass gestures on (no GESTURE_BUBBLE). */
+static void indev_gesture(void) {
+    if (scroll_obj != NULL || gesture_sent) {
+        return;
+    }
+    lv_obj_t *target = pressed_obj;
+    while (target != NULL && (target->flags & LV_OBJ_FLAG_GESTURE_BUBBLE) != 0) {
+        target = target->parent;
+    }
+    if (target == NULL) {
+        return;
+    }
+    if ((vect.x < 0 ? -vect.x : vect.x) < FAKE_GESTURE_MIN_VELOCITY && (vect.y < 0 ? -vect.y : vect.y) < FAKE_GESTURE_MIN_VELOCITY) {
+        gesture_sum = (lv_point_t){0, 0};
+    }
+    gesture_sum.x += vect.x;
+    gesture_sum.y += vect.y;
+    int32_t ax = gesture_sum.x < 0 ? -gesture_sum.x : gesture_sum.x, ay = gesture_sum.y < 0 ? -gesture_sum.y : gesture_sum.y;
+    if (ax > FAKE_GESTURE_LIMIT || ay > FAKE_GESTURE_LIMIT) {
+        gesture_sent = true;
+        gesture_dir = ax > ay ? (gesture_sum.x > 0 ? LV_DIR_RIGHT : LV_DIR_LEFT) : (gesture_sum.y > 0 ? LV_DIR_BOTTOM : LV_DIR_TOP);
+        fake_fire(target->id, LV_EVENT_GESTURE);
+    }
+}
+
+/* lv_indev_scroll_throw_predict: where the throw would carry the row, losing FAKE_SCROLL_THROW % a step. */
+static int32_t throw_predict(int32_t v) {
+    int32_t sum = 0;
+    while (v != 0) {
+        sum += v;
+        v = v * (100 - FAKE_SCROLL_THROW) / 100;
+    }
+    return sum;
+}
+
+/* The throw's first step (lv_indev_scroll_throw_handler, on a snapping row): an animated scroll to the snap point nearest where the
+ * throw would carry it, SCROLL_END, and the touch's scroll is over. Its later steps find no scroll object and stop. */
+static void indev_throw(void) {
+    throw_pending = false;
+    lv_obj_t *o = scroll_obj;
+    if (o == NULL || scroll_dir_now == LV_DIR_NONE) {
+        return;
+    }
+    if (scroll_dir_now != LV_DIR_HOR || o->snap_x == LV_SCROLL_SNAP_NONE) {
+        fake_error("a throw of %d that isn't a snapping row's: the fake doesn't model one", o->id);
+    } else {
+        int32_t diff = throw_predict(throw_vect_x);
+        int32_t x = find_snap_point_x(o, FAKE_COORD_MIN, LV_COORD_MAX, diff);
+        if (x == LV_COORD_MAX) {
+            fake_error("a throw of %d, which has no snap point", o->id);
+        } else {
+            scroll_by(o, x + diff, 0, true);
+        }
+    }
+    fake_fire(o->id, LV_EVENT_SCROLL_END);
+    scroll_dir_now = LV_DIR_NONE;
+    scroll_obj = NULL;
+}
+
+/* One run of LVGL's animation timer, ms after the last: a throw a lift started takes its first step, then each scroll animation
+ * moves on (an ease-out: LVGL's is a cubic Bezier, and only the ends and the time matter here), sending SCROLL, and one that has run
+ * its time ends, with SCROLL_END. */
+static void fake_frame(int ms) {
+    if (throw_pending) {
+        indev_throw();
+    }
+    lv_obj_t *moving[ARRAY_LEN(anims)];
+    int n = n_anims;
+    for (int i = 0; i < n; i++) {
+        moving[i] = anims[i].obj;
+    }
+    for (int i = 0; i < n; i++) {
+        fake_anim_t *a = NULL;
+        for (int k = 0; k < n_anims; k++) {
+            if (anims[k].obj == moving[i]) {
+                a = &anims[k];
+            }
+        }
+        if (a == NULL) {
+            continue;  /* a SCROLL before it stopped it */
+        }
+        a->started = true;
+        a->elapsed += ms;
+        int32_t t = a->elapsed < a->duration ? a->elapsed : a->duration;
+        int32_t p = t * 1024 / a->duration, eased = 1024 - (1024 - p) * (1024 - p) / 1024;
+        int32_t v = a->from + (a->to - a->from) * eased / 1024;
+        lv_obj_t *o = a->obj;
+        bool done = a->elapsed >= a->duration;
+        if (v != a->now) {
+            a->now = v;
+            scroll_by_raw(o, v + o->scroll_x, 0);  /* scroll_x_anim: scroll.x becomes v */
+        }
+        if (done && anim_on(o)) {
+            for (int k = 0; k < n_anims; k++) {
+                if (anims[k].obj == o) {
+                    anims[k] = anims[--n_anims];
+                    break;
+                }
+            }
+            fake_fire(o->id, LV_EVENT_SCROLL_END);
+        }
+    }
+}
+
+bool lv_obj_is_scrolling(const lv_obj_t *obj) {
+    if (use((lv_obj_t *)obj, "lv_obj_is_scrolling", NULL) == NULL) {
+        return false;
+    }
+    return scroll_obj == obj || anim_on(obj);
+}
+
+/* scroll_area_into_view for the object's own box, in its parent: as little scroll as shows it all, then, for a parent that snaps its
+ * children to its centre, the scroll that puts its centre there. The parent's animations stop first. */
+void lv_obj_scroll_to_view(lv_obj_t *obj, lv_anim_enable_t anim_en) {
+    if (use(obj, "lv_obj_scroll_to_view", NULL) == NULL) {
+        return;
+    }
+    logline("scroll_to_view %d%s", obj->id, anim_en ? " anim" : "");
+    fake_layout();  /* lv_obj_update_layout */
+    lv_obj_t *parent = obj->parent;
+    if (parent == NULL || (parent->flags & LV_OBJ_FLAG_SCROLLABLE) == 0) {
+        return;
+    }
+    const lv_area_t *c = &obj->area, *p = &parent->area;
+    int32_t y_scroll = 0, top_diff = p->y1 - c->y1, bottom_diff = -(p->y2 - c->y2);
+    if (!(top_diff >= 0 && bottom_diff >= 0)) {
+        if (top_diff > 0) {
+            y_scroll = scroll_top(parent) - top_diff < 0 ? 0 : top_diff;
+        } else if (bottom_diff > 0) {
+            y_scroll = scroll_bottom(parent) - bottom_diff < 0 ? 0 : -bottom_diff;
+        }
+    }
+    int32_t x_scroll = 0, left_diff = p->x1 + parent->pad_left - c->x1, right_diff = -(p->x2 - parent->pad_right - c->x2);
+    if (!(left_diff >= 0 && right_diff >= 0)) {
+        if (left_diff > 0) {
+            x_scroll = scroll_left(parent) - left_diff < 0 ? 0 : left_diff;
+        } else if (right_diff > 0) {
+            x_scroll = scroll_right(parent) - right_diff < 0 ? 0 : -right_diff;
+        }
+    }
+    if (parent->snap_x == LV_SCROLL_SNAP_CENTER) {
+        int32_t parent_w = p->x2 - p->x1 + 1 - parent->pad_left - parent->pad_right;
+        x_scroll += p->x1 + parent->pad_left + parent_w / 2 - ((c->x2 - c->x1 + 1) / 2 + c->x1 + x_scroll);
+    } else if (parent->snap_x != LV_SCROLL_SNAP_NONE) {
+        fake_error("scroll_to_view in %d, which snaps to its start or end: the fake models the centre only", parent->id);
+    }
+    anim_delete(parent);
+    if ((parent->scroll_dir & LV_DIR_LEFT) == 0 && x_scroll < 0) x_scroll = 0;
+    if ((parent->scroll_dir & LV_DIR_RIGHT) == 0 && x_scroll > 0) x_scroll = 0;
+    if ((parent->scroll_dir & LV_DIR_TOP) == 0 && y_scroll < 0) y_scroll = 0;
+    if ((parent->scroll_dir & LV_DIR_BOTTOM) == 0 && y_scroll > 0) y_scroll = 0;
+    scroll_by(parent, x_scroll, y_scroll, anim_en);
+}
+
 /* ---- What the tests do to the fake ---- */
 
 static lv_obj_t *fake_obj(int id) {
@@ -1463,57 +1939,171 @@ static void fake_fire(int id, lv_event_code_t code) {
     }
 }
 
-/* A touch the way LVGL 9.5.0's indev (lv_indev.c) sends it. The finger goes down on an object: PRESSED. */
+/* lv_indev_search_obj: the topmost object under the point that is clickable, children before their parent and the last made
+ * first; a hidden object hides what is in it, and a child outside its parent's box can't be found. */
+static lv_obj_t *search_obj(lv_obj_t *o, int32_t x, int32_t y) {
+    if ((o->flags & LV_OBJ_FLAG_HIDDEN) != 0) {
+        return NULL;
+    }
+    bool on = x >= o->area.x1 && x <= o->area.x2 && y >= o->area.y1 && y <= o->area.y2;
+    if (on) {
+        for (int below = INT_MAX;;) {
+            lv_obj_t *child = NULL;
+            for (int i = 0; i < n_objs; i++) {
+                lv_obj_t *c = objs[i];
+                if (c->parent == o && !c->deleted && c->order < below && (child == NULL || c->order > child->order)) {
+                    child = c;
+                }
+            }
+            if (child == NULL) {
+                break;
+            }
+            below = child->order;
+            lv_obj_t *found = search_obj(child, x, y);
+            if (found != NULL) {
+                return found;
+            }
+        }
+    }
+    return on && (o->flags & LV_OBJ_FLAG_CLICKABLE) != 0 ? o : NULL;
+}
+
+/* A touch the way LVGL 9.5.0's indev (lv_indev.c) sends it. A new touch on an object: a throw still waiting for its first step takes
+ * it (indev_proc_press stops the throw so: the snap's animation it starts goes on), the touch's state starts afresh, and the object gets
+ * PRESSED. */
+static void begin_touch(lv_obj_t *o) {
+    if (scroll_obj != NULL) {
+        indev_throw();
+    }
+    pressed_obj = active_obj = o;
+    last_point = act_point;
+    vect = scroll_sum = gesture_sum = (lv_point_t){0, 0};
+    scroll_obj = NULL;
+    scroll_dir_now = gesture_dir = LV_DIR_NONE;
+    gesture_sent = wait_released = long_sent = false;
+    if (o != NULL) {
+        fake_fire(o->id, LV_EVENT_PRESSED);
+    }
+    active_obj = NULL;
+}
+
+/* The finger goes down on an object (at the middle of its box). */
 static void fake_press(int id) {
-    pressed_obj = fake_obj(id);
-    wait_released = false;
-    long_sent = false;
-    fake_fire(id, LV_EVENT_PRESSED);
+    fake_layout();
+    lv_obj_t *o = fake_obj(id);
+    act_point = (lv_point_t){(o->area.x1 + o->area.x2 + 1) / 2, (o->area.y1 + o->area.y2 + 1) / 2};
+    begin_touch(o);
+}
+
+/* The finger goes down at (x, y), on what lv_indev_search_obj finds there (it searches before it stops a throw). Its id, 0 for none. */
+static int fake_down(int32_t x, int32_t y) {
+    fake_layout();
+    act_point = (lv_point_t){x, y};
+    lv_obj_t *o = search_obj(&screen_obj, x, y);
+    begin_touch(o);
+    return o != NULL ? o->id : 0;
 }
 
 /* It stays down long enough: LONG_PRESSED. */
 static void fake_hold(void) {
     long_sent = true;
+    active_obj = pressed_obj;
     fake_fire(pressed_obj->id, LV_EVENT_LONG_PRESSED);
+    active_obj = NULL;
 }
 
-/* It moves far enough: indev_gesture sends the gesture, to the first object up from the pressed one that doesn't pass
- * gestures on (one with no GESTURE_BUBBLE), and to that one only. */
+/* It moves far enough: the gesture (indev_gesture), to the first object up from the pressed one that doesn't pass gestures on (one
+ * with no GESTURE_BUBBLE), and to that one only. Whatever a real drag would have scrolled, this one doesn't: fake_move does that. */
 static void fake_swipe(lv_dir_t dir) {
     lv_obj_t *target = pressed_obj;
     while (target != NULL && (target->flags & LV_OBJ_FLAG_GESTURE_BUBBLE) != 0) {
         target = target->parent;
     }
     gesture_dir = dir;
+    gesture_sent = true;
+    active_obj = pressed_obj;
     if (target != NULL) {
         fake_fire(target->id, LV_EVENT_GESTURE);
     }
+    active_obj = NULL;
 }
 
-/* It lifts. After lv_indev_wait_release the pressed object gets PRESS_LOST and nothing else (no RELEASED, no click).
- * Otherwise RELEASED, then SHORT_CLICKED (when no long press was sent), then CLICKED. */
-static void fake_lift(void) {
-    lv_obj_t *o = pressed_obj;
-    pressed_obj = NULL;
-    if (o == NULL) {
-        return;
+/* One read of a finger that is down, now at (x, y) (indev_proc_press): nothing once lv_indev_wait_release was called; otherwise
+ * PRESSING, the scroll's animation stopped (lv_obj_stop_scroll_anim) when a drag already scrolls it, the drag (indev_scroll) and the
+ * gesture (indev_gesture). */
+static void fake_move(int32_t x, int32_t y) {
+    act_point = (lv_point_t){x, y};
+    if (pressed_obj != NULL && !wait_released) {
+        active_obj = pressed_obj;
+        vect = (lv_point_t){act_point.x - last_point.x, act_point.y - last_point.y};
+        fake_fire(pressed_obj->id, LV_EVENT_PRESSING);
+        if (pressed_obj != NULL && !wait_released) {
+            if (scroll_obj != NULL) {
+                anim_delete(scroll_obj);
+            }
+            indev_scroll();
+            indev_gesture();
+        }
+        active_obj = NULL;
     }
+    last_point = act_point;
+}
+
+/* It lifts (indev_proc_release). After lv_indev_wait_release the pressed object gets PRESS_LOST and nothing else (no RELEASED, no
+ * click). Otherwise RELEASED, then, when no drag of the touch scrolled, SHORT_CLICKED (when no long press was sent) and CLICKED; a drag
+ * that scrolled gets SCROLL_THROW_BEGIN on what it scrolled instead, and its throw starts: its first step is at the next frame
+ * (fake_frame), or at the next touch. */
+static void fake_lift(void) {
+    lv_obj_t *o = pressed_obj, *s = scroll_obj;
+    pressed_obj = NULL;
+    active_obj = o;
     if (wait_released) {
         wait_released = false;
-        fake_fire(o->id, LV_EVENT_PRESS_LOST);
-        return;
+        if (o != NULL) {
+            fake_fire(o->id, LV_EVENT_PRESS_LOST);
+        }
+    } else if (o != NULL) {
+        fake_fire(o->id, LV_EVENT_RELEASED);
+        if (s == NULL) {
+            if (!long_sent) {
+                fake_fire(o->id, LV_EVENT_SHORT_CLICKED);
+            }
+            fake_fire(o->id, LV_EVENT_CLICKED);
+        } else {
+            fake_fire(s->id, LV_EVENT_SCROLL_THROW_BEGIN);
+        }
     }
-    fake_fire(o->id, LV_EVENT_RELEASED);
-    if (!long_sent) {
-        fake_fire(o->id, LV_EVENT_SHORT_CLICKED);
+    active_obj = NULL;
+    if (s != NULL && scroll_obj == s) {
+        throw_pending = true;
+        throw_vect_x = vect.x;
     }
-    fake_fire(o->id, LV_EVENT_CLICKED);
 }
 
 /* A tap: down and up. */
 static void fake_tap(int id) {
     fake_press(id);
     fake_lift();
+}
+
+/* A tap at a point; the id of what it landed on, 0 for nothing. */
+static int fake_tap_at(int32_t x, int32_t y) {
+    int id = fake_down(x, y);
+    fake_lift();
+    return id;
+}
+
+/* Down at (x0, y0), then steps reads on the line to (x1, y1), then still reads more that don't move (a finger that stops before it
+ * lifts throws nothing). The finger stays down. Its id, 0 for nothing. */
+static int fake_drag(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int steps, int still) {
+    int id = fake_down(x0, y0);
+    for (int i = 1; i <= steps; i++) {
+        fake_move(x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
+    }
+    for (int i = 0; i < still; i++) {
+        fake_move(x1, y1);
+    }
+    return id;
 }
 
 /* Where LVGL 9.5.0's draw_image puts the picture of an image object: the image at its own size, placed in the box by the
@@ -1554,6 +2144,12 @@ static void fake_free_all(void) {
     pressed_obj = NULL;
     wait_released = false;
     long_sent = false;
+    act_point = last_point = vect = scroll_sum = gesture_sum = (lv_point_t){0, 0};
+    scroll_obj = active_obj = NULL;
+    scroll_dir_now = LV_DIR_NONE;
+    gesture_sent = throw_pending = false;
+    throw_vect_x = 0;
+    n_anims = 0;
 }
 
 /* A fresh LVGL: nothing made, the log empty, the clock and the PSRAM as they start. Errors are not cleared: a
@@ -4513,6 +5109,53 @@ static const apps_lv_app_t FIVE[] = {
     {"alpha", "Alpha", ""}, {"bravo", "Bravo", ""}, {"charlie", "Charlie", ""}, {"delta", "Delta", ""}, {"echo", "Echo", ""},
 };
 
+/* ---- Fingers on the launcher (launcher carousel Task 5), through the fake's pointer: LVGL 9.5.0's way of making PRESSED, a scroll, a
+ * gesture or a click of them ---- */
+
+#define FRAME_MS 40                                            /* the 1.75C's frame */
+#define EDGE_TOP (2 * SCREEN_CENTRE - APPS_LV_CLOSE_EDGE_PX)  /* the bottom band's first row */
+
+static bool in_area(const lv_area_t *a, lv_point_t p) {
+    return p.x >= a->x1 && p.x <= a->x2 && p.y >= a->y1 && p.y <= a->y2;
+}
+
+/* What lv_obj_is_scrolling says, without a call of the code under test's: a drag scrolls it, or an animation. */
+static bool fake_scrolling(int id) {
+    const lv_obj_t *o = fake_obj(id);
+    return scroll_obj == o || anim_on(o);
+}
+
+/* Frames until nothing moves: no throw waiting for its first step, no animation. */
+static void settle_at(int line) {
+    for (int i = 0; i < 100 && (throw_pending || n_anims > 0); i++) {
+        fake_frame(FRAME_MS);
+    }
+    CHECK_AT(line, !throw_pending && n_anims == 0, "the row never came to rest");
+}
+#define SETTLE() settle_at(__LINE__)
+
+static int32_t scroll_now(void) {
+    return fake_obj(carousel_row())->scroll_x;
+}
+
+/* The middle of item k's face (its tile's place, where an icon is drawn too), and of its box, as they are now. */
+static lv_point_t face_at(int k) {
+    fake_layout();
+    const lv_area_t *a = &fake_obj(item_parts(carousel_item(k)).tile)->area;
+    return (lv_point_t){(a->x1 + a->x2 + 1) / 2, (a->y1 + a->y2 + 1) / 2};
+}
+
+static lv_point_t box_at(int k) {
+    fake_layout();
+    const lv_area_t *a = &fake_obj(carousel_item(k))->area;
+    return (lv_point_t){(a->x1 + a->x2 + 1) / 2, (a->y1 + a->y2 + 1) / 2};
+}
+
+/* A swipe from (x, y) by (dx, dy), in 8 reads, the finger still down; the id of what it began on. */
+static int swipe_from(int32_t x, int32_t y, int32_t dx, int32_t dy) {
+    return fake_drag(x, y, x + dx, y + dy, 8, 0);
+}
+
 /* ---- The pure parts ---- */
 
 static void scale_curve(void) {
@@ -4765,6 +5408,9 @@ static void every_app_is_an_item(void) {
     const apps_lv_app_t gaps[] = {{"one", "One", ""}, {NULL, "Nobody", ""}, {"", "Empty", ""}, {"two", "Two", ""}};
     apps_lv_show_launcher(gaps, 4, NULL, pick);
     CHECK(carousel_items(ids, 64) == 2, "the two with ids");
+    fake_tap(carousel_item(1));  /* a side app comes to the centre (Task 5), and a tap there opens it */
+    SETTLE();
+    CHECK(picks == 0 && strcmp(name_shown(), "Two") == 0, "the second item is the second app: %s", name_shown());
     fake_tap(carousel_item(1));
     CHECK(picks == 1 && strcmp(picked, "two") == 0, "and picks the right one: %s", picked);
     LAUNCHER_END();
@@ -4920,9 +5566,9 @@ static void launcher_empty_state(void) {
     LAUNCHER_END();
 }
 
-/* P3: a sideways swipe is the carousel's to scroll, so no swipe closes the launcher (the bottom-edge close is Task 5's). One that
- * begins on an app, followed through the lift, picks nothing either: the rest of the touch is nobody's. */
-static void launcher_no_swipe_closes_it(void) {
+/* P3, and Task 5's edge rule: a swipe that begins on an app closes nothing, whichever way it goes (the bottom-edge close is the card's,
+ * and an app is never in the bottom band). Followed through the lift, it picks nothing either: the rest of the touch is nobody's. */
+static void launcher_a_swipe_on_an_app_closes_nothing(void) {
     static const struct {
         lv_dir_t dir;
         const char *name;
@@ -4994,7 +5640,7 @@ static void launcher_survives_a_create_that_fails(void) {
  * the launcher closes, whichever way it closes. Those scrolls ask nothing of the icons: no load is submitted, no block is held while
  * the launcher is closed, no image is given a source, and the hidden card isn't touched. */
 static void a_scroll_after_a_close_asks_nothing(void) {
-    static const char *const ways[] = {"a tap on the card", "a pick", "hide_cards"};
+    static const char *const ways[] = {"a tap on the card", "a pick", "hide_cards", "a swipe up from the bottom edge"};
     const apps_lv_app_t apps[] = {{"a1", "A1", "icon.bin"}, {"a2", "A2", "icon.bin"}, {"a3", "A3", "icon.bin"}, {"a4", "A4", "icon.bin"},
                                   {"a5", "A5", "icon.bin"}, {"a6", "A6", "icon.bin"}, {"a7", "A7", "icon.bin"}, {"a8", "A8", "icon.bin"}};
     for (size_t w = 0; w < ARRAY_LEN(ways); w++) {
@@ -5006,15 +5652,19 @@ static void a_scroll_after_a_close_asks_nothing(void) {
         int row = carousel_row(), card = fake_parent(row);
         run_io();
         apps_lv_launcher_poll();
-        fake_scroll(row, APPS_LV_ITEM_PITCH / 2);  /* the fling begins: its animation is on its way to a5 */
+        fake_scroll(row, APPS_LV_ITEM_PITCH / 2);  /* the fling begins: its animation is on its way to a5 (fake_scroll moves the row
+                                                    * with no animation the fake can see, so a tap on a2 still opens it) */
         CHECK(strcmp(faces(), "IITTTTTT") == 0 && held > 0, "%s: icons up before the close: %s", ways[w], faces());
         if (w == 0) {
             fake_tap(card);
         } else if (w == 1) {
             fake_tap(carousel_item(1));
             CHECK(picks == 1 && strcmp(picked, "a2") == 0, "%s: picked: '%s'", ways[w], picked);
-        } else {
+        } else if (w == 2) {
             apps_lv_hide_cards();  /* an app to the front (an alarm), or a voice turn */
+        } else {
+            CHECK(swipe_from(SCREEN_CENTRE, EDGE_TOP + 14, 0, -80) == card, "%s: on the card", ways[w]);
+            fake_lift();
         }
         CHECK(!apps_lv_launcher_shown(), "%s: closed", ways[w]);
         run_io();
@@ -5036,6 +5686,401 @@ static void a_scroll_after_a_close_asks_nothing(void) {
         CHECK(held == 0, "%s: %zu bytes of icons held while the launcher is closed", ways[w], held);
         LAUNCHER_END();
     }
+}
+
+/* ---- Launcher carousel Task 5: the taps and the bottom-edge close ---- */
+
+/* A tap on the app at the centre, with the row at rest, opens it and closes the launcher. The whole of its item is its: the face, and
+ * under it, where the dot goes. Which app that is follows the scroll. */
+static void tap_centre_launches(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int card = fake_parent(carousel_row());
+    lv_point_t c = face_at(0);
+    CHECK(c.x == SCREEN_CENTRE, "the first app is at the centre: %d", (int)c.x);
+    CHECK(fake_tap_at(c.x, c.y) == carousel_item(0), "the tap lands on the first app");
+    CHECK(picks == 1 && strcmp(picked, "alpha") == 0, "it opens: %d '%s'", picks, picked);
+    CHECK(!apps_lv_launcher_shown() && fake_flag(card, LV_OBJ_FLAG_HIDDEN), "and the launcher closes");
+    /* Under the face, in the item's box (the dot's place): the same app. */
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    fake_layout();
+    lv_area_t box = fake_obj(carousel_item(0))->area, face = fake_obj(item_parts(carousel_item(0)).tile)->area;
+    lv_point_t under = {SCREEN_CENTRE, box.y2 - 2};
+    CHECK(under.y > face.y2, "under the face: %d, the face to %d", (int)under.y, (int)face.y2);
+    CHECK(fake_tap_at(under.x, under.y) == carousel_item(0) && picks == 2 && strcmp(picked, "alpha") == 0,
+          "a tap under the centre's face opens it: %d '%s'", picks, picked);
+    /* Two apps along, brought there by a drag and at rest: a tap at the centre opens the third. */
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    c = face_at(0);
+    fake_drag(c.x, c.y, c.x - 2 * APPS_LV_ITEM_PITCH, c.y, 20, 2);
+    fake_lift();
+    SETTLE();
+    CHECK(scroll_now() == 2 * APPS_LV_ITEM_PITCH && strcmp(name_shown(), "Charlie") == 0, "at rest on the third: %d %s",
+          (int)scroll_now(), name_shown());
+    c = face_at(2);
+    CHECK(c.x == SCREEN_CENTRE && fake_tap_at(c.x, c.y) == carousel_item(2), "the tap lands on the third: %d", (int)c.x);
+    CHECK(picks == 3 && strcmp(picked, "charlie") == 0, "and opens it: %d '%s'", picks, picked);
+    /* The launcher closes under a finger on the centre (an app to the front, a voice turn: LVGL doesn't end a touch for a hide): its
+     * lift opens nothing, and scrolls nothing. */
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    c = face_at(0);
+    CHECK(fake_down(c.x, c.y) == carousel_item(0), "the press lands on the centre");
+    apps_lv_hide_cards();
+    log_clear();
+    fake_lift();
+    CHECK(picks == 3 && !apps_lv_launcher_shown() && log_peek()[0] == '\0', "a tap the launcher closed under does nothing: %d\n%s",
+          picks, log_peek());
+    LAUNCHER_END();
+}
+
+/* A tap on a side app brings it to the centre (lv_obj_scroll_to_view, animated) and opens nothing; at rest there, a tap opens it.
+ * M2: an item's box is APPS_LV_ICON_PX wide and a neighbour's face about 70 px, and a tap in the box beside or above the face is the
+ * neighbour's too: it only scrolls, so it can't open the wrong app. Between two boxes is the row, where a tap does nothing at all. */
+static void tap_side_scrolls_not_launches(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int row = carousel_row(), item1 = carousel_item(1);
+    char line[48];
+    snprintf(line, sizeof line, "scroll_to_view %d anim", item1);
+    lv_point_t p = face_at(1);
+    CHECK(fake_tap_at(p.x, p.y) == item1, "the tap lands on the second app");
+    CHECK(picks == 0 && apps_lv_launcher_shown(), "a side app opens nothing: %d '%s'", picks, picked);
+    CHECK(log_has_line(line) && fake_scrolling(row), "it is brought to the centre\n%s", log_peek());
+    SETTLE();
+    CHECK(scroll_now() == APPS_LV_ITEM_PITCH && strcmp(name_shown(), "Bravo") == 0, "at the centre: %d %s", (int)scroll_now(),
+          name_shown());
+    CHECK_SCALES();
+    /* And back, to the left. */
+    p = face_at(0);
+    CHECK(fake_tap_at(p.x, p.y) == carousel_item(0) && picks == 0, "the first app, at the left, opens nothing: %d", picks);
+    SETTLE();
+    CHECK(scroll_now() == 0 && strcmp(name_shown(), "Alpha") == 0, "back: %d %s", (int)scroll_now(), name_shown());
+    /* M2: beside the right neighbour's face, in its box. */
+    fake_layout();
+    lv_area_t box = fake_obj(item1)->area, face = fake_obj(item_parts(item1).tile)->area;
+    lv_point_t beside = {box.x1 + 3, (face.y1 + face.y2 + 1) / 2};
+    CHECK(in_area(&box, beside) && !in_area(&face, beside), "beside the face, in the box: %d of %d..%d, the face %d..%d", (int)beside.x,
+          (int)box.x1, (int)box.x2, (int)face.x1, (int)face.x2);
+    CHECK(fake_tap_at(beside.x, beside.y) == item1 && picks == 0 && fake_scrolling(row), "it scrolls, and opens nothing: %d", picks);
+    SETTLE();
+    CHECK(scroll_now() == APPS_LV_ITEM_PITCH, "the second app at the centre: %d", (int)scroll_now());
+    /* Above the left neighbour's face, in its box. */
+    fake_layout();
+    box = fake_obj(carousel_item(0))->area;
+    face = fake_obj(item_parts(carousel_item(0)).tile)->area;
+    lv_point_t above = {(face.x1 + face.x2 + 1) / 2, box.y1 + 3};
+    CHECK(in_area(&box, above) && !in_area(&face, above), "above the face, in the box: %d", (int)above.y);
+    CHECK(fake_tap_at(above.x, above.y) == carousel_item(0) && picks == 0, "it scrolls, and opens nothing: %d", picks);
+    SETTLE();
+    CHECK(scroll_now() == 0, "the first app at the centre: %d", (int)scroll_now());
+    /* Between the centre's box and the next: the row. Nothing opens, nothing scrolls, nothing closes. */
+    fake_layout();
+    lv_area_t box0 = fake_obj(carousel_item(0))->area;
+    box = fake_obj(item1)->area;
+    lv_point_t gap = {(box0.x2 + box.x1) / 2, (box0.y1 + box0.y2 + 1) / 2};
+    CHECK(!in_area(&box0, gap) && !in_area(&box, gap), "between the boxes: %d", (int)gap.x);
+    log_clear();
+    CHECK(fake_tap_at(gap.x, gap.y) == row, "a tap between two apps is the row's");
+    CHECK(picks == 0 && apps_lv_launcher_shown() && !fake_scrolling(row) && log_find("scroll_to_view") < 0,
+          "and does nothing: %d picks, shown %d\n%s", picks, apps_lv_launcher_shown(), log_peek());
+    /* At rest on the second app, a tap at the centre opens it. */
+    p = face_at(1);
+    fake_tap_at(p.x, p.y);
+    SETTLE();
+    p = face_at(1);
+    CHECK(p.x == SCREEN_CENTRE && fake_tap_at(p.x, p.y) == item1 && picks == 1 && strcmp(picked, "bravo") == 0,
+          "the second app, at rest at the centre, opens: %d '%s'", picks, picked);
+    LAUNCHER_END();
+}
+
+/* Review Focus 4, and M3: a tap never opens an app while the row moves, or that lands while it moves (LVGL doesn't stop the snap's
+ * animation for a tap, so the app under the finger at the press goes on moving). It brings the app it landed on to the centre instead.
+ * During a drag (LVGL sends no click at the lift of a drag that scrolled), a fling's snap animation, an lv_obj_scroll_to_view animation
+ * from a side tap, a press that lands while the row moves and lifts once it is at rest, and the moment between a drag's lift and its
+ * throw's first step. */
+static void tap_while_scrolling_does_not_launch(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int row = carousel_row();
+    /* A drag from the second app to the centre. */
+    lv_point_t p = face_at(1);
+    fake_drag(p.x, p.y, p.x - APPS_LV_ITEM_PITCH, p.y, 10, 2);
+    CHECK(fake_scrolling(row), "the drag scrolls the row");
+    fake_lift();
+    CHECK(picks == 0 && apps_lv_launcher_shown(), "a drag that ends at the centre opens nothing: %d", picks);
+    SETTLE();
+    CHECK(scroll_now() == APPS_LV_ITEM_PITCH && strcmp(name_shown(), "Bravo") == 0, "at rest on the second: %d %s", (int)scroll_now(),
+          name_shown());
+    /* A drag on the centre app, away and back. */
+    p = face_at(1);
+    fake_down(p.x, p.y);
+    fake_move(p.x - 15, p.y);
+    fake_move(p.x - 30, p.y);
+    fake_move(p.x - 15, p.y);
+    fake_move(p.x, p.y);
+    fake_move(p.x, p.y);
+    fake_lift();
+    CHECK(picks == 0, "a drag that comes back to where it began opens nothing: %d", picks);
+    SETTLE();
+    CHECK(scroll_now() == APPS_LV_ITEM_PITCH, "still on the second: %d", (int)scroll_now());
+
+    /* A fling: the lift's throw snaps the row on to the third app. A tap on it as it comes, then on the second as it goes. */
+    p = face_at(1);
+    fake_drag(p.x, p.y, p.x - 60, p.y, 4, 0);
+    fake_lift();
+    CHECK(throw_pending && picks == 0, "a fling: its throw waits for the next frame");
+    fake_frame(FRAME_MS);
+    CHECK(fake_scrolling(row) && n_anims == 1, "the snap animates");
+    p = box_at(2);
+    CHECK(fake_tap_at(p.x, p.y) == carousel_item(2), "the tap lands on the third app, on its way");
+    CHECK(picks == 0 && apps_lv_launcher_shown(), "a tap during the snap opens nothing: %d '%s'", picks, picked);
+    fake_frame(FRAME_MS);
+    p = box_at(1);
+    CHECK(fake_tap_at(p.x, p.y) == carousel_item(1) && picks == 0, "nor one on the app it leaves: %d", picks);
+    SETTLE();
+    CHECK(scroll_now() == APPS_LV_ITEM_PITCH && strcmp(name_shown(), "Bravo") == 0, "the app tapped last is at the centre: %d %s",
+          (int)scroll_now(), name_shown());
+
+    /* lv_obj_scroll_to_view's animation, from a tap on the right neighbour: a tap on it on its way, and on the app it leaves. */
+    p = face_at(2);
+    CHECK(fake_tap_at(p.x, p.y) == carousel_item(2) && fake_scrolling(row) && picks == 0, "a side tap scrolls");
+    fake_frame(FRAME_MS);
+    p = box_at(2);
+    CHECK(fake_tap_at(p.x, p.y) == carousel_item(2) && picks == 0, "a tap on it on its way opens nothing: %d", picks);
+    fake_frame(FRAME_MS);
+    p = box_at(1);
+    CHECK(fake_tap_at(p.x, p.y) == carousel_item(1) && picks == 0, "nor one on the app it leaves: %d", picks);
+    SETTLE();
+    CHECK(scroll_now() == APPS_LV_ITEM_PITCH, "back on the second: %d", (int)scroll_now());
+
+    /* A press that lands while the row moves and lifts once it is at rest, on the app now at the centre. */
+    p = face_at(2);
+    fake_tap_at(p.x, p.y);
+    fake_frame(FRAME_MS);
+    p = box_at(2);
+    CHECK(fake_down(p.x, p.y) == carousel_item(2), "the press lands on the third app, on its way");
+    SETTLE();
+    CHECK(scroll_now() == 2 * APPS_LV_ITEM_PITCH && strcmp(name_shown(), "Charlie") == 0, "at rest under the finger: %d %s",
+          (int)scroll_now(), name_shown());
+    fake_lift();
+    CHECK(picks == 0 && apps_lv_launcher_shown() && !fake_scrolling(row), "a press made while the row moved opens nothing: %d", picks);
+
+    /* Between a drag's lift and its throw's first step, LVGL still holds the row as the touch's scroll: a tap then takes that step
+     * (the snap animation starts, and goes on), and opens nothing. */
+    p = face_at(2);
+    fake_drag(p.x, p.y, p.x - 60, p.y, 4, 0);
+    fake_lift();
+    CHECK(throw_pending && fake_scrolling(row), "the throw waits");
+    p = box_at(3);
+    CHECK(fake_tap_at(p.x, p.y) == carousel_item(3) && picks == 0, "a tap before the throw's first step opens nothing: %d", picks);
+    CHECK(!throw_pending, "the press took the throw's first step");
+    SETTLE();
+    CHECK(scroll_now() == 3 * APPS_LV_ITEM_PITCH && strcmp(name_shown(), "Delta") == 0, "at rest on the fourth: %d %s",
+          (int)scroll_now(), name_shown());
+
+    /* The row starts moving under a finger that went down on the centre at rest: code that scrolls it (none does yet; a re-centre
+     * when the list changes would) makes the tap at the lift one made while the row moves, which opens nothing. */
+    p = face_at(3);
+    CHECK(fake_down(p.x, p.y) == carousel_item(3), "the press lands on the centre, at rest");
+    lv_obj_scroll_to_view(fake_obj(carousel_item(4)), LV_ANIM_ON);
+    fake_lift();
+    CHECK(picks == 0 && apps_lv_launcher_shown(), "a tap that lifts while the row moves opens nothing: %d", picks);
+    SETTLE();
+    CHECK(scroll_now() == 3 * APPS_LV_ITEM_PITCH, "the tapped app was brought back: %d", (int)scroll_now());
+
+    /* At rest, a tap at the centre opens what is there. */
+    p = face_at(3);
+    CHECK(fake_tap_at(p.x, p.y) == carousel_item(3) && picks == 1 && strcmp(picked, "delta") == 0, "at rest, it opens: %d '%s'", picks,
+          picked);
+    LAUNCHER_END();
+}
+
+/* The bottom-edge close: a swipe up whose press went down within APPS_LV_CLOSE_EDGE_PX of the screen's bottom, inside the circle,
+ * closes the launcher as the gesture comes (before the lift), drops its icons and opens nothing; the lift is the card's PRESS_LOST
+ * alone. The empty and the loading launcher close so too. */
+static void bottom_edge_swipe_up_closes(void) {
+    static const struct {
+        int32_t x, y;
+        const char *what;
+    } starts[] = {
+        {SCREEN_CENTRE, EDGE_TOP + 14, "the band's middle"},
+        {SCREEN_CENTRE, EDGE_TOP, "its top row"},
+        {SCREEN_CENTRE, 2 * SCREEN_CENTRE - 1, "the screen's last row"},
+        {150, EDGE_TOP + 14, "towards the band's left end"},
+        {316, EDGE_TOP + 14, "towards its right end"},
+    };
+    const apps_lv_app_t apps[] = {{"a1", "A1", "icon.bin"}, {"a2", "A2", "icon.bin"}, {"a3", "A3", ""}};
+    for (size_t i = 0; i < ARRAY_LEN(starts); i++) {
+        cards_scene();
+        put_icon("a1", CF_RGB565A8, 120, 120, 0x11);
+        put_icon("a2", CF_RGB565A8, 120, 120, 0x22);
+        apps_lv_show_launcher(apps, 3, NULL, pick);
+        run_io();
+        apps_lv_launcher_poll();
+        int card = fake_parent(carousel_row());
+        CHECK(strcmp(faces(), "IIT") == 0 && held > 0, "%s: icons up first: %s", starts[i].what, faces());
+        log_clear();
+        CHECK(swipe_from(starts[i].x, starts[i].y, 0, -80) == card, "%s: the band is the card's", starts[i].what);
+        CHECK(!apps_lv_launcher_shown() && fake_flag(card, LV_OBJ_FLAG_HIDDEN), "%s: a swipe up closes it, before the lift",
+              starts[i].what);
+        CHECK(log_has_line("wait_release"), "%s: and the rest of the touch is nobody's\n%s", starts[i].what, log_peek());
+        CHECK(strcmp(faces(), "TTT") == 0, "%s: tiles again: %s", starts[i].what, faces());
+        CHECK_SOURCES();
+        fake_lift();
+        CHECK(picks == 0, "%s: nothing opens: %d", starts[i].what, picks);
+        run_io();
+        CHECK(held == 0, "%s: %zu bytes of icons held after the close", starts[i].what, held);
+        LAUNCHER_END();
+    }
+    static const int ns[] = {0, APPS_LV_LOADING};
+    for (size_t i = 0; i < ARRAY_LEN(ns); i++) {
+        cards_scene();
+        apps_lv_show_launcher(NULL, ns[i], NULL, pick);
+        int card = fake_parent(fake_label(ns[i] == 0 ? "No apps yet. Ask Muse to make one." : "Loading apps..."));
+        CHECK(swipe_from(SCREEN_CENTRE, EDGE_TOP + 14, 0, -80) == card && !apps_lv_launcher_shown(), "n %d: a swipe up closes it", ns[i]);
+        fake_lift();
+        CHECK(picks == 0, "n %d: nothing opens", ns[i]);
+        LAUNCHER_END();
+    }
+}
+
+/* A swipe up from anywhere but the bottom band closes nothing, and nothing of the touch is heard after it (no tap, no app opened): a
+ * row above the band, the name, the app at the centre, between two apps, the top; and in the band, outside the circle. Each has a twin
+ * that starts a row, or 10 px, inside the rule and closes, so that what is tested is the rule and not that nothing closes. A swipe from
+ * the band that isn't up leaves nothing behind for the next touch. */
+static void swipe_up_from_middle_does_nothing(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    lv_point_t centre = face_at(0);
+    lv_area_t box0 = fake_obj(carousel_item(0))->area, box1 = fake_obj(carousel_item(1))->area;
+    const int32_t gap_x = (box0.x2 + box1.x1) / 2, band = EDGE_TOP + 14;
+    LAUNCHER_END();
+    const struct {
+        int32_t x, y, twin_x, twin_y;
+        const char *what;
+    } starts[] = {
+        {SCREEN_CENTRE, EDGE_TOP - 1, SCREEN_CENTRE, EDGE_TOP, "a row above the band"},
+        {SCREEN_CENTRE, 298, SCREEN_CENTRE, band, "the name"},
+        {centre.x, centre.y, SCREEN_CENTRE, band, "the app at the centre"},
+        {gap_x, centre.y, SCREEN_CENTRE, band, "between two apps"},
+        {SCREEN_CENTRE, 100, SCREEN_CENTRE, band, "the top"},
+        {120, band, 130, band, "the band, outside the circle on the left"},
+        {346, band, 336, band, "the band, outside the circle on the right"},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(starts); i++) {
+        cards_scene();
+        apps_lv_show_launcher(FIVE, 5, NULL, pick);
+        log_clear();
+        swipe_from(starts[i].x, starts[i].y, 0, -80);
+        CHECK(apps_lv_launcher_shown() && log_has_line("wait_release"), "%s: a swipe up is a gesture that closes nothing (shown %d)\n%s",
+              starts[i].what, apps_lv_launcher_shown(), log_peek());
+        fake_lift();
+        CHECK(apps_lv_launcher_shown() && picks == 0, "%s: nor does its lift: shown %d, %d picks", starts[i].what,
+              apps_lv_launcher_shown(), picks);
+        swipe_from(starts[i].twin_x, starts[i].twin_y, 0, -80);
+        CHECK(!apps_lv_launcher_shown(), "%s: its twin, from (%d, %d), closes", starts[i].what, (int)starts[i].twin_x,
+              (int)starts[i].twin_y);
+        fake_lift();
+        LAUNCHER_END();
+    }
+    /* The press that counts is this touch's own. */
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    swipe_from(SCREEN_CENTRE, band, -80, 0);
+    fake_lift();
+    swipe_from(SCREEN_CENTRE, band, 80, 0);
+    fake_lift();
+    CHECK(apps_lv_launcher_shown() && scroll_now() == 0, "sideways from the band: nothing closes or scrolls");
+    swipe_from(centre.x, centre.y, 0, -80);
+    fake_lift();
+    CHECK(apps_lv_launcher_shown() && picks == 0, "the next touch, up from the app at the centre, closes nothing: %d", picks);
+    swipe_from(gap_x, centre.y, 0, -80);
+    fake_lift();
+    CHECK(apps_lv_launcher_shown(), "nor one up from between two apps (the card hears no press of the row's)");
+    swipe_from(SCREEN_CENTRE, band, 0, -80);
+    CHECK(!apps_lv_launcher_shown(), "and one up from the band closes");
+    fake_lift();
+    LAUNCHER_END();
+}
+
+/* P3's pin: the right-swipe close is gone. On the row a right swipe scrolls back; on the card (under the name, or from the bottom band) it
+ * is a gesture, and closes nothing. */
+static void right_swipe_no_longer_closes(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int row = carousel_row();
+    lv_point_t p = face_at(0);
+    fake_drag(p.x, p.y, p.x - 2 * APPS_LV_ITEM_PITCH, p.y, 20, 2);
+    fake_lift();
+    SETTLE();
+    CHECK(scroll_now() == 2 * APPS_LV_ITEM_PITCH, "two apps along, so that a right swipe has somewhere to go: %d", (int)scroll_now());
+    p = face_at(2);
+    fake_drag(p.x, p.y, p.x + 100, p.y, 10, 1);
+    CHECK(fake_scrolling(row), "on the row, a right swipe scrolls");
+    fake_lift();
+    CHECK(apps_lv_launcher_shown() && picks == 0, "and closes nothing: shown %d, %d picks", apps_lv_launcher_shown(), picks);
+    SETTLE();
+    CHECK(scroll_now() == APPS_LV_ITEM_PITCH && strcmp(name_shown(), "Bravo") == 0, "it went back an app: %d %s", (int)scroll_now(),
+          name_shown());
+    static const lv_point_t on_card[] = {{SCREEN_CENTRE, 360}, {SCREEN_CENTRE, EDGE_TOP + 14}};
+    for (size_t i = 0; i < ARRAY_LEN(on_card); i++) {
+        log_clear();
+        swipe_from(on_card[i].x, on_card[i].y, 80, 0);
+        CHECK(apps_lv_launcher_shown() && log_has_line("wait_release"), "from (%d, %d): a gesture that closes nothing",
+              (int)on_card[i].x, (int)on_card[i].y);
+        fake_lift();
+        CHECK(apps_lv_launcher_shown() && picks == 0 && scroll_now() == APPS_LV_ITEM_PITCH, "from (%d, %d): nothing more",
+              (int)on_card[i].x, (int)on_card[i].y);
+    }
+    LAUNCHER_END();
+}
+
+/* A sideways swipe on the row only scrolls: the items follow the finger at their scales, LVGL sends no gesture while it scrolls and
+ * no click at the lift, and the snap brings the next app to the centre. Off the row it moves nothing and closes nothing. And from the
+ * bottom band only up closes, which its twin shows. */
+static void horizontal_swipe_only_scrolls(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int row = carousel_row();
+    lv_point_t p = face_at(0);
+    log_clear();
+    fake_down(p.x, p.y);
+    for (int i = 1; i <= 16; i++) {
+        fake_move(p.x - 10 * i, p.y);
+        if (i == 8) {
+            CHECK(fake_scrolling(row) && scroll_now() > 0, "the row follows the finger: %d", (int)scroll_now());
+            CHECK_SCALES();
+        }
+    }
+    fake_move(p.x - 160, p.y);
+    CHECK(log_find("wait_release") < 0, "no gesture while the row scrolls\n%s", log_peek());
+    fake_lift();
+    CHECK(picks == 0 && apps_lv_launcher_shown(), "no tap at the lift, no close: %d picks, shown %d", picks, apps_lv_launcher_shown());
+    SETTLE();
+    CHECK(scroll_now() == APPS_LV_ITEM_PITCH && strcmp(name_shown(), "Bravo") == 0, "the next app came to the centre: %d %s",
+          (int)scroll_now(), name_shown());
+    CHECK_SCALES();
+    /* Off the row: the name, the title, under them. */
+    static const lv_point_t off_row[] = {{SCREEN_CENTRE, 298}, {SCREEN_CENTRE, 66}, {SCREEN_CENTRE, 360}};
+    for (size_t i = 0; i < ARRAY_LEN(off_row); i++) {
+        for (int way = -1; way <= 1; way += 2) {
+            log_clear();
+            swipe_from(off_row[i].x, off_row[i].y, way * 80, 0);
+            fake_lift();
+            CHECK(apps_lv_launcher_shown() && picks == 0 && scroll_now() == APPS_LV_ITEM_PITCH && log_has_line("wait_release"),
+                  "a swipe %d from (%d, %d): a gesture that moves and closes nothing", way, (int)off_row[i].x, (int)off_row[i].y);
+        }
+    }
+    /* From the bottom band, sideways closes nothing; up closes. */
+    swipe_from(SCREEN_CENTRE, EDGE_TOP + 14, -80, 0);
+    fake_lift();
+    swipe_from(SCREEN_CENTRE, EDGE_TOP + 14, 80, 0);
+    fake_lift();
+    CHECK(apps_lv_launcher_shown(), "sideways from the band closes nothing");
+    swipe_from(SCREEN_CENTRE, EDGE_TOP + 14, 0, -80);
+    CHECK(!apps_lv_launcher_shown(), "up from the band closes");
+    fake_lift();
+    LAUNCHER_END();
 }
 
 static void crash_card_text_and_tap(void) {
@@ -5164,10 +6209,17 @@ int main(int argc, char **argv) {
         {"launcher_lists_apps_and_picks", launcher_lists_apps_and_picks},
         {"launcher_closes_on_a_tap_elsewhere", launcher_closes_on_a_tap_elsewhere},
         {"launcher_empty_state", launcher_empty_state},
-        {"launcher_no_swipe_closes_it", launcher_no_swipe_closes_it},
+        {"launcher_a_swipe_on_an_app_closes_nothing", launcher_a_swipe_on_an_app_closes_nothing},
         {"launcher_keeps_its_own_copy", launcher_keeps_its_own_copy},
         {"launcher_survives_a_create_that_fails", launcher_survives_a_create_that_fails},
         {"a_scroll_after_a_close_asks_nothing", a_scroll_after_a_close_asks_nothing},
+        {"tap_centre_launches", tap_centre_launches},
+        {"tap_side_scrolls_not_launches", tap_side_scrolls_not_launches},
+        {"tap_while_scrolling_does_not_launch", tap_while_scrolling_does_not_launch},
+        {"bottom_edge_swipe_up_closes", bottom_edge_swipe_up_closes},
+        {"swipe_up_from_middle_does_nothing", swipe_up_from_middle_does_nothing},
+        {"right_swipe_no_longer_closes", right_swipe_no_longer_closes},
+        {"horizontal_swipe_only_scrolls", horizontal_swipe_only_scrolls},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},

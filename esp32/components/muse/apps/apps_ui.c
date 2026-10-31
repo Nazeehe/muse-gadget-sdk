@@ -88,7 +88,7 @@ static const char *const apps_ui_props_bar[] = {
     "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "min", "max", "value", "color", "track_color", "radius",
 };
 static const char *const apps_ui_props_image[] = {
-    "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "src", "scale",
+    "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "src", "scale", "rotation", "spin",
 };
 
 static const struct {
@@ -110,9 +110,10 @@ typedef enum {
     P_TEXT, P_FONT, P_COLOR, P_TEXT_ALIGN, P_WRAP,
     P_BG, P_RADIUS, P_BORDER, P_BORDER_COLOR,
     P_MIN, P_MAX, P_VALUE, P_START_ANGLE, P_END_ANGLE, P_THICKNESS, P_TRACK_COLOR,
-    P_SRC, P_SCALE,
+    P_SRC, P_SCALE, P_ROTATION, P_SPIN,
     P_COUNT
 } prop_t;
+_Static_assert(P_COUNT <= 32, "a property is a bit of change_t's set");
 
 static const char *const prop_names[P_COUNT] = {
     [P_ALIGN] = "align", [P_X] = "x", [P_Y] = "y", [P_W] = "w", [P_H] = "h", [P_HIDDEN] = "hidden",
@@ -120,7 +121,7 @@ static const char *const prop_names[P_COUNT] = {
     [P_TEXT_ALIGN] = "text_align", [P_WRAP] = "wrap", [P_BG] = "bg", [P_RADIUS] = "radius", [P_BORDER] = "border",
     [P_BORDER_COLOR] = "border_color", [P_MIN] = "min", [P_MAX] = "max", [P_VALUE] = "value",
     [P_START_ANGLE] = "start_angle", [P_END_ANGLE] = "end_angle", [P_THICKNESS] = "thickness",
-    [P_TRACK_COLOR] = "track_color", [P_SRC] = "src", [P_SCALE] = "scale",
+    [P_TRACK_COLOR] = "track_color", [P_SRC] = "src", [P_SCALE] = "scale", [P_ROTATION] = "rotation", [P_SPIN] = "spin",
 };
 
 typedef enum { T_NUM, T_BOOL, T_ENUM, T_COLOR, T_BG, T_TEXT, T_RADIUS, T_PARENT, T_SRC } ptype_t;
@@ -131,35 +132,38 @@ typedef struct {
     int32_t lo, hi;  /* T_NUM, T_RADIUS (the numbers' part) */
     const char *const *names;  /* T_ENUM */
     int n_names;
+    const char *unit;  /* T_NUM: what a number of it counts, which a message of the wrong type names with the range; NULL: none */
 } prop_info_t;
 
 static const prop_info_t prop_info[P_COUNT] = {
-    [P_ALIGN] = {T_ENUM, APPS_DIRTY_GEOM, 0, 0, apps_ui_aligns, ARRAY_LEN(apps_ui_aligns)},
-    [P_X] = {T_NUM, APPS_DIRTY_GEOM, -SCREEN, SCREEN, NULL, 0},
-    [P_Y] = {T_NUM, APPS_DIRTY_GEOM, -SCREEN, SCREEN, NULL, 0},
-    [P_W] = {T_NUM, APPS_DIRTY_GEOM, 1, SCREEN, NULL, 0},
-    [P_H] = {T_NUM, APPS_DIRTY_GEOM, 1, SCREEN, NULL, 0},
-    [P_HIDDEN] = {T_BOOL, APPS_DIRTY_STYLE, 0, 0, NULL, 0},
-    [P_OPACITY] = {T_NUM, APPS_DIRTY_STYLE, 0, 100, NULL, 0},
-    [P_PARENT] = {T_PARENT, 0, 0, 0, NULL, 0},
-    [P_TEXT] = {T_TEXT, APPS_DIRTY_TEXT, 0, 0, NULL, 0},
-    [P_FONT] = {T_ENUM, APPS_DIRTY_STYLE, 0, 0, apps_ui_fonts, ARRAY_LEN(apps_ui_fonts)},
-    [P_COLOR] = {T_COLOR, APPS_DIRTY_STYLE, 0, 0, NULL, 0},
-    [P_TEXT_ALIGN] = {T_ENUM, APPS_DIRTY_STYLE, 0, 0, apps_ui_text_aligns, ARRAY_LEN(apps_ui_text_aligns)},
-    [P_WRAP] = {T_BOOL, APPS_DIRTY_STYLE, 0, 0, NULL, 0},
-    [P_BG] = {T_BG, APPS_DIRTY_STYLE, 0, 0, NULL, 0},
-    [P_RADIUS] = {T_RADIUS, APPS_DIRTY_STYLE, 0, SCREEN_R, NULL, 0},
-    [P_BORDER] = {T_NUM, APPS_DIRTY_STYLE, 0, 20, NULL, 0},
-    [P_BORDER_COLOR] = {T_COLOR, APPS_DIRTY_STYLE, 0, 0, NULL, 0},
-    [P_MIN] = {T_NUM, APPS_DIRTY_VALUE, -APPS_UI_VALUE_MAX, APPS_UI_VALUE_MAX, NULL, 0},
-    [P_MAX] = {T_NUM, APPS_DIRTY_VALUE, -APPS_UI_VALUE_MAX, APPS_UI_VALUE_MAX, NULL, 0},
-    [P_VALUE] = {T_NUM, APPS_DIRTY_VALUE, -APPS_UI_VALUE_MAX, APPS_UI_VALUE_MAX, NULL, 0},
-    [P_START_ANGLE] = {T_NUM, APPS_DIRTY_VALUE, 0, 360, NULL, 0},
-    [P_END_ANGLE] = {T_NUM, APPS_DIRTY_VALUE, 0, 360, NULL, 0},
-    [P_THICKNESS] = {T_NUM, APPS_DIRTY_STYLE, 1, 64, NULL, 0},
-    [P_TRACK_COLOR] = {T_COLOR, APPS_DIRTY_STYLE, 0, 0, NULL, 0},
-    [P_SRC] = {T_SRC, APPS_DIRTY_STYLE, 0, 0, NULL, 0},
-    [P_SCALE] = {T_NUM, APPS_DIRTY_STYLE, 10, 400, NULL, 0},
+    [P_ALIGN] = {T_ENUM, APPS_DIRTY_GEOM, 0, 0, apps_ui_aligns, ARRAY_LEN(apps_ui_aligns), NULL},
+    [P_X] = {T_NUM, APPS_DIRTY_GEOM, -SCREEN, SCREEN, NULL, 0, NULL},
+    [P_Y] = {T_NUM, APPS_DIRTY_GEOM, -SCREEN, SCREEN, NULL, 0, NULL},
+    [P_W] = {T_NUM, APPS_DIRTY_GEOM, 1, SCREEN, NULL, 0, NULL},
+    [P_H] = {T_NUM, APPS_DIRTY_GEOM, 1, SCREEN, NULL, 0, NULL},
+    [P_HIDDEN] = {T_BOOL, APPS_DIRTY_STYLE, 0, 0, NULL, 0, NULL},
+    [P_OPACITY] = {T_NUM, APPS_DIRTY_STYLE, 0, 100, NULL, 0, NULL},
+    [P_PARENT] = {T_PARENT, 0, 0, 0, NULL, 0, NULL},
+    [P_TEXT] = {T_TEXT, APPS_DIRTY_TEXT, 0, 0, NULL, 0, NULL},
+    [P_FONT] = {T_ENUM, APPS_DIRTY_STYLE, 0, 0, apps_ui_fonts, ARRAY_LEN(apps_ui_fonts), NULL},
+    [P_COLOR] = {T_COLOR, APPS_DIRTY_STYLE, 0, 0, NULL, 0, NULL},
+    [P_TEXT_ALIGN] = {T_ENUM, APPS_DIRTY_STYLE, 0, 0, apps_ui_text_aligns, ARRAY_LEN(apps_ui_text_aligns), NULL},
+    [P_WRAP] = {T_BOOL, APPS_DIRTY_STYLE, 0, 0, NULL, 0, NULL},
+    [P_BG] = {T_BG, APPS_DIRTY_STYLE, 0, 0, NULL, 0, NULL},
+    [P_RADIUS] = {T_RADIUS, APPS_DIRTY_STYLE, 0, SCREEN_R, NULL, 0, NULL},
+    [P_BORDER] = {T_NUM, APPS_DIRTY_STYLE, 0, 20, NULL, 0, NULL},
+    [P_BORDER_COLOR] = {T_COLOR, APPS_DIRTY_STYLE, 0, 0, NULL, 0, NULL},
+    [P_MIN] = {T_NUM, APPS_DIRTY_VALUE, -APPS_UI_VALUE_MAX, APPS_UI_VALUE_MAX, NULL, 0, NULL},
+    [P_MAX] = {T_NUM, APPS_DIRTY_VALUE, -APPS_UI_VALUE_MAX, APPS_UI_VALUE_MAX, NULL, 0, NULL},
+    [P_VALUE] = {T_NUM, APPS_DIRTY_VALUE, -APPS_UI_VALUE_MAX, APPS_UI_VALUE_MAX, NULL, 0, NULL},
+    [P_START_ANGLE] = {T_NUM, APPS_DIRTY_VALUE, 0, 360, NULL, 0, NULL},
+    [P_END_ANGLE] = {T_NUM, APPS_DIRTY_VALUE, 0, 360, NULL, 0, NULL},
+    [P_THICKNESS] = {T_NUM, APPS_DIRTY_STYLE, 1, 64, NULL, 0, NULL},
+    [P_TRACK_COLOR] = {T_COLOR, APPS_DIRTY_STYLE, 0, 0, NULL, 0, NULL},
+    [P_SRC] = {T_SRC, APPS_DIRTY_STYLE, 0, 0, NULL, 0, NULL},
+    [P_SCALE] = {T_NUM, APPS_DIRTY_STYLE, 10, 400, NULL, 0, NULL},
+    [P_ROTATION] = {T_NUM, APPS_DIRTY_STYLE, 0, 359, NULL, 0, "degrees"},
+    [P_SPIN] = {T_NUM, APPS_DIRTY_STYLE, 0, APPS_SPIN_RPM_MAX, NULL, 0, "turns a minute"},
 };
 
 /* ---- The table ---- */
@@ -210,6 +214,8 @@ static int64_t fetch(const apps_widget_t *w, prop_t p) {
         case P_TRACK_COLOR: return w->track_color;
         case P_SRC: return w->image;
         case P_SCALE: return w->scale;
+        case P_ROTATION: return w->rotation;
+        case P_SPIN: return w->spin;
         case P_TEXT:
         case P_COUNT: break;
     }
@@ -244,6 +250,8 @@ static void store(apps_widget_t *w, prop_t p, int64_t v) {
         case P_TRACK_COLOR: w->track_color = (uint32_t)v; break;
         case P_SRC: w->image = (int16_t)v; break;
         case P_SCALE: w->scale = (uint16_t)v; break;
+        case P_ROTATION: w->rotation = (int16_t)v; break;
+        case P_SPIN: w->spin = (uint8_t)v; break;
         case P_TEXT:
         case P_COUNT: break;
     }
@@ -493,12 +501,26 @@ static NORETURN void wrong_type(const ctx_t *x, prop_t p, const char *want, int 
     fail_kind(x->L, x->kind, "'%s' must be %s, got %s", prop_names[p], want, luaL_typename(x->L, idx));
 }
 
+/* A number of a property with a unit says its range when it is the wrong type or NaN: "'spin' must be a number of
+ * turns a minute, 0 to 60, got string". */
+static NORETURN void not_a_number(const ctx_t *x, prop_t p, const char *got) {
+    const prop_info_t *info = &prop_info[p];
+    fail_kind(x->L, x->kind, "'%s' must be a number of %s, %d to %d, got %s", prop_names[p], info->unit, (int)info->lo,
+              (int)info->hi, got);
+}
+
 static void read_number(const ctx_t *x, prop_t p, int idx, change_t *c) {
     if (lua_type(x->L, idx) != LUA_TNUMBER) {
+        if (prop_info[p].unit != NULL) {
+            not_a_number(x, p, luaL_typename(x->L, idx));
+        }
         wrong_type(x, p, "a number", idx);
     }
     double d = (double)lua_tonumber(x->L, idx);
     if (isnan(d)) {
+        if (prop_info[p].unit != NULL) {
+            not_a_number(x, p, "NaN");
+        }
         fail_kind(x->L, x->kind, "'%s' must be a number, got NaN", prop_names[p]);
     }
     /* Rounded and clamped as doubles: an int16 or int32 made of a NaN or an out of range double is undefined. */
@@ -824,6 +846,8 @@ static int commit_create(apps_ui_t *ui, int kind, const change_t *c, char *text,
             }
         }
         w->text = text;
+        w->rotation_sets = (c->set & BIT(P_ROTATION)) != 0 ? 1u : 0u;
+        w->spun = w->spin != 0;
         w->alive = true;
         w->dirty = created_dirty(kind);
         ui->count++;
@@ -838,12 +862,20 @@ static void commit_set(apps_ui_t *ui, int slot, const change_t *c, char *text, c
     apps_port_ui_lock();
     apps_widget_t *w = &ui->w[slot];
     uint32_t dirty = 0;
+    /* A set of rotation turns the image to it: of another angle, or of the one it holds once a spin has turned it away (spun).
+     * The apply step turns it when rotation_sets moves. */
+    if ((c->set & BIT(P_ROTATION)) != 0 && (w->rotation != c->v[P_ROTATION] || w->spun)) {
+        w->rotation_sets++;
+        w->spun = false;
+        dirty |= APPS_DIRTY_STYLE;
+    }
     for (int p = 0; p < P_COUNT; p++) {
         if ((c->set & BIT(p)) != 0 && p != P_TEXT && p != P_PARENT && fetch(w, (prop_t)p) != c->v[p]) {
             store(w, (prop_t)p, c->v[p]);
             dirty |= prop_info[p].dirty;
         }
     }
+    w->spun = w->spun || w->spin != 0;
     if ((c->set & BIT(P_TEXT)) != 0) {
         *old = w->text;
         w->text = text;

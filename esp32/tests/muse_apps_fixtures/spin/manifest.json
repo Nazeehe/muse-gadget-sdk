@@ -1,0 +1,15 @@
+{
+  "id": "spin",
+  "name": "Spin",
+  "version": "1",
+  "api": 1,
+  "files": ["disc.bin"],
+  "permissions": ["keep_awake"],
+  "memory_kb": 64,
+  "messages": {
+    "spin": "data {rpm}: the disc's spin, 0 to 60 turns a minute (0 stops it where it is). Replies {rotation, spin, scale, taps}.",
+    "rotation": "data {deg}: turns the disc to deg, 0 to 359, spinning or not. Replies {rotation, spin, scale, taps}.",
+    "scale": "data {pct}: the disc's scale, 10 to 400 percent (100: 400 px). Replies {rotation, spin, scale, taps}.",
+    "state": "Change nothing. Replies {rotation, spin, scale, taps}: what get says, and the taps so far."
+  }
+}

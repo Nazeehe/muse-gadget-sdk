@@ -256,6 +256,8 @@ static void check_invariants(int line, env_t *e) {
                            in_range(w->scale, 10, 400),
                  "slot %d: radius %d border %d thickness %d scale %d", i, w->radius, w->border, w->thickness,
                  w->scale);
+        CHECK_AT(line, in_range(w->rotation, 0, 359) && w->spin <= APPS_SPIN_RPM_MAX, "slot %d: rotation %d spin %d", i,
+                 w->rotation, w->spin);
         CHECK_AT(line, in_range(w->start_angle, 0, 360) && in_range(w->end_angle, 0, 360), "slot %d: angles %d %d", i,
                  w->start_angle, w->end_angle);
         CHECK_AT(line, w->color <= 0xFFFFFF && w->border_color <= 0xFFFFFF && w->track_color <= 0xFFFFFF &&
@@ -558,7 +560,8 @@ static void dirty_groups(void) {
         {"ui.bar{}", "radius = 3", S},               {"ui.bar{}", "radius = 'circle'", S},
         {"ui.bar{}", "w = 9, h = 9", G},             {"ui.image{src = 'a.bin'}", "src = 'b.bin'", S},
         {"ui.image{src = 'a.bin'}", "scale = 50", S}, {"ui.image{src = 'a.bin'}", "x = 9", G},
-        {"ui.image{src = 'a.bin'}", "hidden = true", S},
+        {"ui.image{src = 'a.bin'}", "hidden = true", S}, {"ui.image{src = 'a.bin'}", "rotation = 90", S},
+        {"ui.image{src = 'a.bin'}", "spin = 30", S},
     };
     for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
         env_t e;
@@ -577,6 +580,72 @@ static void dirty_groups(void) {
               W(&e, 0)->dirty);
         finish(&e);
     }
+}
+
+/* rotation and spin (connected apps Task 1). A set of rotation turns the image to it, so the apply step must hear one even of
+ * the value the slot holds once the image has spun since rotation was last set (a spin turns it away): rotation_sets moves on and
+ * STYLE is set. Otherwise the same set again sets no bit, as for every property. A create with rotation counts one. */
+static void rotation_sets(void) {
+    env_t e;
+    CHECK(env_open(&e, TWO_IMAGES, 2), "env_open");
+    RUN(&e, "a = ui.image{src = 'a.bin'} b = ui.image{src = 'a.bin', rotation = 0} c = ui.image{src = 'a.bin', spin = 33}");
+    CHECK(W(&e, 0)->rotation_sets == 0 && W(&e, 1)->rotation_sets == 1 && W(&e, 2)->rotation_sets == 0,
+          "made: %u %u %u", W(&e, 0)->rotation_sets, W(&e, 1)->rotation_sets, W(&e, 2)->rotation_sets);
+    CHECK(W(&e, 2)->spin == 33 && W(&e, 2)->rotation == 0, "c: spin %d rotation %d", W(&e, 2)->spin, W(&e, 2)->rotation);
+    apply(&e, NULL);
+
+    /* Never spun: rotation is where the image is, so the same value is nothing, and another one a turn. */
+    RUN(&e, "a:set{rotation = 0}");
+    CHECK(W(&e, 0)->dirty == 0 && W(&e, 0)->rotation_sets == 0, "a, the same: dirty %u sets %u", W(&e, 0)->dirty,
+          W(&e, 0)->rotation_sets);
+    RUN(&e, "a:set{rotation = 30}");
+    CHECK(W(&e, 0)->dirty == APPS_DIRTY_STYLE && W(&e, 0)->rotation_sets == 1 && W(&e, 0)->rotation == 30, "a, 30: dirty %u sets %u",
+          W(&e, 0)->dirty, W(&e, 0)->rotation_sets);
+    apply(&e, NULL);
+
+    /* Spinning: every set of rotation counts, the value it holds too. */
+    RUN(&e, "c:set{rotation = 0}");
+    CHECK(W(&e, 2)->dirty == APPS_DIRTY_STYLE && W(&e, 2)->rotation_sets == 1, "c, the same while it spins: dirty %u sets %u",
+          W(&e, 2)->dirty, W(&e, 2)->rotation_sets);
+    apply(&e, NULL);
+    RUN(&e, "c:set{rotation = 0}");
+    CHECK(W(&e, 2)->dirty == APPS_DIRTY_STYLE && W(&e, 2)->rotation_sets == 2, "c, again: dirty %u sets %u", W(&e, 2)->dirty,
+          W(&e, 2)->rotation_sets);
+    apply(&e, NULL);
+    /* Stopped: it stays where the spin got to, so the next set of rotation still counts; after that, it is at rotation. */
+    RUN(&e, "c:set{spin = 0}");
+    CHECK(W(&e, 2)->dirty == APPS_DIRTY_STYLE && W(&e, 2)->rotation_sets == 2 && W(&e, 2)->spin == 0, "c stops: dirty %u",
+          W(&e, 2)->dirty);
+    apply(&e, NULL);
+    RUN(&e, "c:set{rotation = 0}");
+    CHECK(W(&e, 2)->dirty == APPS_DIRTY_STYLE && W(&e, 2)->rotation_sets == 3, "c, stopped after a spin: dirty %u sets %u",
+          W(&e, 2)->dirty, W(&e, 2)->rotation_sets);
+    apply(&e, NULL);
+    RUN(&e, "c:set{rotation = 0}");
+    CHECK(W(&e, 2)->dirty == 0 && W(&e, 2)->rotation_sets == 3, "c, at rest at rotation: dirty %u sets %u", W(&e, 2)->dirty,
+          W(&e, 2)->rotation_sets);
+    /* One set with both, the image at rest at rotation: the spin goes on from there, no turn first; and it has spun again. */
+    RUN(&e, "c:set{rotation = 0, spin = 45}");
+    CHECK(W(&e, 2)->dirty == APPS_DIRTY_STYLE && W(&e, 2)->rotation_sets == 3 && W(&e, 2)->spin == 45 && W(&e, 2)->spun,
+          "c, both: dirty %u sets %u", W(&e, 2)->dirty, W(&e, 2)->rotation_sets);
+    apply(&e, NULL);
+    RUN(&e, "c:set{spin = 45}");
+    CHECK(W(&e, 2)->dirty == 0, "c, the same spin: dirty %u", W(&e, 2)->dirty);
+    RUN(&e, "c:set{rotation = 0, spin = 20}");  /* spinning: the turn counts, and the new rate goes on from it */
+    CHECK(W(&e, 2)->dirty == APPS_DIRTY_STYLE && W(&e, 2)->rotation_sets == 4 && W(&e, 2)->spin == 20, "c, both while it spins: %u",
+          W(&e, 2)->rotation_sets);
+    apply(&e, NULL);
+    /* A set that fails counts nothing. */
+    RUN_FAILS(&e, "c:set{rotation = 10, spin = 'fast'}", "'spin' must be a number of turns a minute");
+    CHECK(W(&e, 2)->dirty == 0 && W(&e, 2)->rotation_sets == 4 && W(&e, 2)->rotation == 0 && W(&e, 2)->spin == 20,
+          "a failed set: dirty %u sets %u", W(&e, 2)->dirty, W(&e, 2)->rotation_sets);
+    /* A new widget in a slot starts its count again. */
+    RUN(&e, "c:delete()");
+    apply(&e, NULL);
+    RUN(&e, "d = ui.image{src = 'b.bin'}");
+    CHECK(W(&e, 2)->alive && W(&e, 2)->rotation_sets == 0 && W(&e, 2)->spin == 0 && W(&e, 2)->rotation == 0,
+          "the slot's next widget: sets %u spin %d rotation %d", W(&e, 2)->rotation_sets, W(&e, 2)->spin, W(&e, 2)->rotation);
+    finish(&e);
 }
 
 /* ---- A dying VM: every binding stops at apps_vm_check ---- */
@@ -1440,6 +1509,7 @@ int main(int argc, char **argv) {
     } cases[] = {
         {"dirty_bits", dirty_bits},
         {"dirty_groups", dirty_groups},
+        {"rotation_sets", rotation_sets},
         {"vm_check", vm_check},
         {"slot_reuse", slot_reuse},
         {"cascade", cascade},

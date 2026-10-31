@@ -89,7 +89,7 @@ return app
 - `ui.box{...}`: a rectangle with a background, corners and a border, and the parent of the widgets made with `parent = box` (boxes nest at most 4 deep). A box without `bg` (or a `border`) is invisible: it has no background until you give it one.
 - `ui.arc{...}`: a ring, or part of one, filled from start_angle by value between min and max. Give it `w` and `h`: without them it draws nothing.
 - `ui.bar{...}`: a straight progress bar, value between min and max. Give it `w` and `h`: without them it draws nothing.
-- `ui.image{...}`: one of the app's images (`src`, a path of the manifest's files).
+- `ui.image{...}`: one of the app's images (`src`, a path of the manifest's files), which can be turned (`rotation`) or spun (`spin`).
 - `ui.bg(color)`: the screen's background colour (black at first).
 - `ui.clear()`: removes every widget.
 - `ui.polar(deg, r)`: the x and y offsets, as integers, of the point r px from the centre at deg clock degrees, for a widget with `align = "center"`: `ui.polar(90, 100)` is `100, 0`, and `ui.polar(0, 100)` is `0, -100`.
@@ -100,7 +100,7 @@ return app
 - `ui.box` properties: align, x, y, w, h, hidden, opacity, parent, bg, radius, border, border_color; events: tap, long_press, press, release
 - `ui.arc` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, start_angle, end_angle, thickness, color, track_color; events: tap, long_press, press, release
 - `ui.bar` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, color, track_color, radius; events: tap, long_press, press, release
-- `ui.image` properties: align, x, y, w, h, hidden, opacity, parent, src, scale; events: tap, long_press, press, release
+- `ui.image` properties: align, x, y, w, h, hidden, opacity, parent, src, scale, rotation, spin; events: tap, long_press, press, release
 
 The values:
 
@@ -112,6 +112,7 @@ The values:
 - `radius` is 0 to 233, or `"circle"`. `border` is 0 to 20. `thickness` (of an arc) is 1 to 64, 12 by default.
 - `min`, `max` and `value` default to 0, 100 and 0, with min less than max; value is kept between them. `start_angle` and `end_angle` are clock degrees, 0 to 360: 0 is 12 o'clock, and they go clockwise.
 - `parent` is a box, and can be given only when the widget is made. Widgets inside a box lay out in its content area: a border moves them in by its width, and LVGL clips what sticks out of the box. A box may have three boxes above it; a label, button, arc, bar or image may go in the fourth. `scale` is a percentage, 10 to 400.
+- `rotation` (of an image) is clock degrees, 0 to 359, 0 by default: the picture turns clockwise about its centre. `spin` is turns a minute, 0 to 60, 0 (still) by default: the gadget turns the picture clockwise at that rate itself, with no Lua running. See Images.
 - Numbers are rounded (halves away from zero) and clamped to these ranges, and an infinity is clamped too; NaN is an error. A value of the wrong type is an error; so is an unknown property or name, and that error lists the valid ones.
 - A widget's handle is the same object for as long as the app holds it, so it can be a table key, and a handler gets the very handle the app holds. `tostring(w)` is like `label#3` (`label#3 (deleted)` once it is gone), and `getmetatable(w)` is the string `muse.widget`.
 
@@ -216,6 +217,8 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 - The formats are RGB565, RGB565A8 (colour with transparency) and A8. An A8 image draws as a white mask: for colour use RGB565A8. Images aren't compressed, and of the flags only premultiplied alpha is taken (LVGLImage.py's output passes).
 - An image is at most 466 x 466 px and 512 KB, and an app's images 1.5 MB together.
 - `scale` is a percentage: a scaled image's box is the scaled size. A w and h you give a scaled image are its box: the picture is centred in it and can spill past it. A scaled picture lands within 1 px of its box (2 px for an odd size at 400%), and a side that scales to under about 1 px draws nothing.
+- `rotation` and `spin` turn the picture about its centre as it is drawn: its box, its layout and the round-edge warning stay those of the picture unturned. A spin goes on from the angle the picture is at: `spin = 0` stops it where it got to, and a spin set again goes on from there, so pause and play are `w:set{spin = 0}` and `w:set{spin = 33}`. Setting `rotation` turns the picture to that angle, spinning or not, and a spin goes on from there: set it to bring a picture that spun back upright, even to the angle it already had. `w:get("rotation")` and `w:get("spin")` say what you set, not where the picture has got to.
+- Make a picture that spins round, like a record: bake a circle into its alpha, with the corners outside it transparent, and convert it with `--cf RGB565A8`. A square picture would swing its corners round the screen. With Pillow: `mask = Image.new("L", img.size, 0)`, `ImageDraw.Draw(mask).ellipse((0, 0, img.width - 1, img.height - 1), fill=255)` and `img.putalpha(mask)`, then save it as a PNG for LVGLImage.py.
 
 ## Icons
 

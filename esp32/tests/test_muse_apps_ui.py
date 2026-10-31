@@ -30,7 +30,7 @@ import unittest
 from pathlib import Path
 
 import apps_host
-from test_muse_apps_rt import BUDGET_CALL, CALL, START, AppHostTestCase, Run
+from test_muse_apps_rt import BUDGET_CALL, CALL, START, AppHostTestCase, Run, header_number
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
@@ -47,7 +47,7 @@ PROPS = {
     "box": COMMON + ["bg", "radius", "border", "border_color"],
     "arc": COMMON + ["min", "max", "value", "start_angle", "end_angle", "thickness", "color", "track_color"],
     "bar": COMMON + ["min", "max", "value", "color", "track_color", "radius"],
-    "image": COMMON + ["src", "scale"],
+    "image": COMMON + ["src", "scale", "rotation", "spin"],
 }
 KINDS = list(PROPS)
 
@@ -686,6 +686,66 @@ class UiTest(UiTestCase):
                 row("scale", "inf", 400), row("scale", "-inf", 10), row("scale", "-5", 10)]
         self.assertEqual(lines, want)
 
+    def test_rotation_and_spin_ranges(self):  # connected apps Task 1: an image's angle and its turns a minute
+        lines = self.lua_lines("""
+            local img = ui.image{src = "a.bin"}
+            local function put(name, v) img:set{[name] = v} print(name, v, img:get(name)) end
+            put("rotation", -1) put("rotation", 359) put("rotation", 360) put("rotation", 90.5) put("rotation", 1 / 0)
+            put("rotation", -1 / 0) put("rotation", 45)
+            put("spin", 61) put("spin", 33.4) put("spin", -1) put("spin", 1 / 0) put("spin", 0)
+            print(pcall(img.set, img, {rotation = "90"}))
+            print(pcall(img.set, img, {spin = "fast"}))
+            print(pcall(img.set, img, {rotation = 0 / 0}))
+            print(pcall(img.set, img, {spin = true}))
+            print(img:get("rotation"), img:get("spin"), math.type(img:get("rotation")))
+            local made = ui.image{src = "a.bin", rotation = 400, spin = 100}
+            print(made:get("rotation"), made:get("spin"))
+            print(pcall(ui.image, {src = "a.bin", spin = "33"}))
+        """, files={"a.bin": lvgl_image()})
+        def row(name, v, got):
+            return f"{name}\t{v}\t{got}"
+        rpm_max = header_number("apps_ui.h", "APPS_SPIN_RPM_MAX")
+        self.assertEqual(rpm_max, 60)
+        degrees = "'rotation' must be a number of degrees, 0 to 359"
+        turns = f"'spin' must be a number of turns a minute, 0 to {rpm_max}"
+        self.assertEqual(lines, [
+            row("rotation", "-1", 0), row("rotation", "359", 359), row("rotation", "360", 359), row("rotation", "90.5", 91),
+            row("rotation", "inf", 359), row("rotation", "-inf", 0), row("rotation", "45", 45),
+            row("spin", "61", 60), row("spin", "33.4", 33), row("spin", "-1", 0), row("spin", "inf", 60), row("spin", "0", 0),
+            f"false\tui.image: {degrees}, got string",
+            f"false\tui.image: {turns}, got string",
+            f"false\tui.image: {degrees}, got NaN",
+            f"false\tui.image: {turns}, got boolean",
+            "45\t0\tinteger",  # a set that failed changed nothing
+            "359\t60",
+            f"false\tui.image: {turns}, got string",
+        ])
+
+    def test_the_spin_fixture(self):  # connected apps Task 1: the board's spin gate's app, and its disc
+        disc = (FIXTURES / "spin/disc.bin").read_bytes()
+        magic, cf, flags, w, h, stride, _ = struct.unpack_from("<BBHHHHH", disc)
+        self.assertEqual((magic, cf, flags, w, h, stride), (0x19, 0x14, 0, 400, 400, 800), "a 400 x 400 RGB565A8 image")
+        self.assertEqual(len(disc), 12 + 400 * 400 * 3)
+        self.assertLess(len(disc), 512 * 1024, "under the 512 KB of an image")
+        alpha = disc[12 + 400 * 400 * 2:]
+
+        def a(x, y):
+            return alpha[y * 400 + x]
+
+        self.assertEqual([a(0, 0), a(399, 0), a(0, 399), a(399, 399), a(30, 30), a(370, 370)], [0] * 6, "the corners are clear")
+        self.assertEqual([a(200, 200), a(200, 5), a(5, 200), a(394, 200), a(200, 394)], [255] * 5, "the disc is whole")
+        colours = {disc[12 + 2 * (y * 400 + x):14 + 2 * (y * 400 + x)] for x in range(100, 300, 7) for y in range(100, 300, 7)}
+        self.assertGreater(len(colours), 8, "the disc has detail to show its angle")
+        run = self.host(FIXTURES / "spin", script=['tap "0"', 'tap "1"', 'message state', 'message spin {"rpm": 0}',
+                                                   'message rotation {"deg": 90}', 'message spin {"rpm": 99}',
+                                                   'message scale {"pct": 50}'])
+        self.assertEqual(run.kinds(), ["keep_awake", "started", "log", "log"] + ["reply"] * 5)
+        self.assertRegex(run.logs()[1], r"^tap 2 \d+$")
+        self.assertEqual([e["data"] for e in run.of("reply")], [
+            {"rotation": 0, "spin": 33, "scale": 100, "taps": 2}, {"rotation": 0, "spin": 0, "scale": 100, "taps": 2},
+            {"rotation": 90, "spin": 0, "scale": 100, "taps": 2}, {"rotation": 90, "spin": 60, "scale": 100, "taps": 2},
+            {"rotation": 90, "spin": 60, "scale": 50, "taps": 2}])
+
     def test_types_other_than_numbers(self):  # R9.2
         lines = self.lua_lines("""
             local a = ui.label{text = 42}
@@ -794,7 +854,7 @@ class UiTest(UiTestCase):
             "text": "", "font": "sans20", "color": "#ffffff", "text_align": "center", "wrap": False, "bg": "none",
             "radius": 0, "border": 0, "border_color": "#ffffff", "min": 0, "max": 100, "value": 0,
             "start_angle": 0, "end_angle": 360, "thickness": 12, "track_color": "#262626", "src": "logo.bin",
-            "scale": 100,
+            "scale": 100, "rotation": 0, "spin": 0,
         }
         per_kind = {"button": {"bg": "#262626", "radius": 16}}  # the rest follow the table above
         for kind in KINDS:
@@ -1121,6 +1181,9 @@ class HarnessTest(unittest.TestCase):
 
     def test_every_property_lands_in_its_dirty_group(self):
         self.run_case("dirty_groups")
+
+    def test_a_set_of_rotation_turns_an_image_that_has_spun(self):  # connected apps Task 1
+        self.run_case("rotation_sets")
 
     def test_a_dying_vm_gets_no_work_from_any_binding(self):
         self.run_case("vm_check")

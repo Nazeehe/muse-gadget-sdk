@@ -665,6 +665,26 @@ class GuideAndSkill(unittest.TestCase):
         self.assertRegex(section, r"- `layout not checked: the screen was asleep`: [^`]*didn't check[^`]*`app\.control` "
                                   r"`snapshot`[^`]*wakes")
 
+    def test_guide_states_rotation_and_spin(self):
+        # connected apps Task 1: the image line names rotation and spin (test_guide_matches_bindings has the list against apps_ui.c),
+        # the values say their ranges as apps_ui.c clamps them (D12: the spin's from APPS_SPIN_RPM_MAX), and Images says how a spin
+        # stops and goes on, and how to make a picture that spins round.
+        ui = strip_c_comments((APPS / "apps_ui.c").read_text())
+        rpm_max = header_number("apps_ui.h", "APPS_SPIN_RPM_MAX")
+        self.assertRegex(ui, r"\[P_ROTATION\] = \{T_NUM, APPS_DIRTY_STYLE, 0, 359,")
+        self.assertRegex(ui, r"\[P_SPIN\] = \{T_NUM, APPS_DIRTY_STYLE, 0, APPS_SPIN_RPM_MAX,")
+        guide = GUIDE.read_text()
+        reference = guide_section(guide, "API reference")
+        self.assertRegex(reference, r"(?m)^- `ui\.image` properties: [^;]*\bsrc, scale, rotation, spin; events:")
+        values = " ".join(reference.split())
+        self.assertIn("`rotation` (of an image) is clock degrees, 0 to 359", values)
+        self.assertIn(f"`spin` is turns a minute, 0 to {rpm_max}", values)
+        images = " ".join(guide_section(guide, "Images").split())
+        for pattern in (r"`spin = 0` stops it where it got to", r"goes on from there", r"[Ss]etting `rotation` turns",
+                        r"circle into its alpha", r"--cf RGB565A8"):
+            with self.subTest(pattern):
+                self.assertRegex(images, pattern)
+
     def test_guide_states_the_layout_and_alarm_facts(self):
         # Facts an app goes wrong without, with no error to tell it (fix round 1, A and B), each still true of the code and said
         # in the guide in words a reader finds: the guide's text for each must match every pattern of its fact.

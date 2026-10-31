@@ -56,6 +56,21 @@
  * (image_recolor white, image_recolor_opa LV_OPA_COVER), so a coloured image has to be RGB565A8. The other
  * formats get no recolor.
  *
+ * Rotation and spin. rotation is the image's own angle, lv_image_set_rotation(obj, rotation * 10) in 0.1 degrees, which
+ * LVGL draws as a transform about the image's pivot (its centre, LVGL's default: this never moves it), as it draws a
+ * scale: no layer, and the box, the layout written back and the overflow stay the unturned picture's. A new image at 0
+ * gets no call (LVGL's own angle is 0). A spin is one LVGL animation of that angle per spinning image, made and ended by
+ * the pass alone: its var is the image object, a turn is 60000 / spin ms, clockwise, repeated without end, from the
+ * angle the object is at (lv_image_get_rotation). Its path holds each angle for a step of at least APPS_SPIN_STEP_MS
+ * (a turn is duration / APPS_SPIN_STEP_MS whole steps), and LVGL calls its exec callback only when the value changes,
+ * so the angle changes at most once a step of the animation's time. The pass applies both with the style, by what the
+ * slot's record says it applied: when the widget's rotation_sets moved (apps_ui.h) it stops the spin, turns the image
+ * to rotation and starts the spin again from there; when only spin changed it stops it where it got to and starts it
+ * again from there at the new rate, if there is one; another style change leaves the angle and the animation alone.
+ * LVGL deletes an object's animations with it (lv_obj_destructor), so a spin ends with its widget, a box that goes with
+ * it, ui.clear(), apps_lv_reset and so the app. LVGL runs the animation on its own task, the LVGL task, and its exec
+ * callback touches the image object alone, never the table.
+ *
  * CREATE. A slot whose CREATE bit is set has no object: it is cleared only once the object exists, and the pass
  * keeps no pointer for a slot it hasn't finished making. A create is refused while the PSRAM free is under
  * APPS_LV_MIN_PSRAM (LVGL asserts when it can't allocate): the bits stay set, refused_creates counts it, and the
@@ -67,7 +82,7 @@
  * APPS_UI_BOX_DEPTH_MAX of them with the widget itself counted if it is a box, as apps_ui.h says, and it ends: it
  * is walked in at most 5 steps, so a loop can't hang the LVGL task), every number and enum in its range, text
  * (NULL is ""; at most APPS_UI_TEXT_MAX bytes of valid UTF-8), min < max with value between, and an image of the
- * asset table that apps_image_check passes.
+ * asset table that apps_image_check passes (rotation 0..359 and spin 0..APPS_SPIN_RPM_MAX are among the numbers).
  *
  * Fonts: sans14 sans16 sans20 sans28 are lv_font_montserrat_14/16/20/28, mono8 and mono16 are lv_font_unscii_8/16,
  * digits48 and digits96 are apps_digits_48 and apps_digits_96 (fonts/). CONFIG_MUSE_APPS selects every LVGL font
@@ -128,6 +143,10 @@
 /* A create is refused while this much PSRAM is not free. */
 #define APPS_LV_MIN_PSRAM (256 * 1024)
 
+/* A spinning image's angle changes at most once per this many ms of its animation's time (Images, above). The board's spin
+ * gate (connected apps Task 1) set it: a longer step can't make a frame that takes longer to draw any faster. */
+#define APPS_SPIN_STEP_MS 33
+
 /* A touch: the widget's slot and gen (what the object was made for), and one APPS_UI_* bit. Called on the LVGL
  * task: post it and return. */
 typedef void (*apps_lv_event_cb_t)(uint16_t slot, uint16_t gen, uint8_t event);
@@ -171,9 +190,11 @@ bool apps_lv_front(void);
 
 /* Since boot (a reset doesn't clear them). applies: passes that ran; skips: passes that didn't (the lock, a
  * callback, or no memory for the pass's records); rejects: slots dropped by re-validation; refused_creates:
- * widgets not made for want of PSRAM; slow: passes over 2 ms. Any task; a value may be a frame old. */
+ * widgets not made for want of PSRAM; slow: passes over 2 ms. And spinning, now: the images whose spin animates
+ * (one fewer as each animation is deleted, however that happens). Any task; a value may be a frame old. */
 typedef struct {
     uint32_t applies, skips, rejects, refused_creates, slow;
+    uint32_t spinning;  /* images whose spin animates now (not since boot) */
 } apps_lv_stats_t;
 void apps_lv_stats(apps_lv_stats_t *out);
 
@@ -234,7 +255,8 @@ void apps_lv_stats(apps_lv_stats_t *out);
  *
  * A bench build (CONFIG_MUSE_BENCH) measures the carousel's frames: while it scrolls, each display refresh (LV_EVENT_REFR_READY, watched
  * from apps_lv_build) logs "launcher frame <ms> ms", the time since the refresh before it when that one found it scrolling too. Nothing
- * at rest, closed or holding; nothing at all in other builds.
+ * at rest, closed or holding; nothing at all in other builds. It measures a spin's frames the same way: while an image spins on the
+ * layer in front with no card over it, each refresh logs "spin frame <ms> ms" (the spin gate's measurement, connected apps Task 1).
  */
 
 #define APPS_LV_ICON_PX 160          /* the centre's icon, and every item's box */

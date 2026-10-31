@@ -36,14 +36,18 @@
  *   "center". ui.W = ui.H = 466, ui.R = 233 and ui.SAFE = 330 (the inscribed square).
  * - Properties. All: align x y w h hidden opacity parent. label: text font color text_align wrap. button: text
  *   font color bg radius border border_color. box: bg radius border border_color. arc: min max value start_angle
- *   end_angle thickness color track_color. bar: min max value color track_color radius. image: src scale.
+ *   end_angle thickness color track_color. bar: min max value color track_color radius. image: src scale rotation
+ *   spin.
  *   (apps_ui_props_<kind> in apps_ui.c are the lists; the unknown-property message prints them.)
  * - Values. align is one of center top bottom left right top_left top_right bottom_left bottom_right, and x y are
  *   offsets from that anchor in the parent. Numbers are rounded to the nearest integer (halves away from zero)
  *   and then clamped: x, y to +-466; w, h to 1..466 (a widget with no w or h sizes to its content); opacity 0..100;
  *   radius 0..233, or "circle"; border 0..20; thickness 1..64; start_angle and end_angle 0..360 in clock degrees
- *   (0 is 12 o'clock, clockwise); scale 10..400 (percent); min and max +-APPS_UI_VALUE_MAX; value to [min, max]. An
- *   infinity clamps to the end of the range, and NaN is an error. hidden and wrap are booleans. text is a string
+ *   (0 is 12 o'clock, clockwise); scale 10..400 (percent); rotation 0..359 (clock degrees: the picture turns
+ *   clockwise about its centre); spin 0..APPS_SPIN_RPM_MAX (turns a minute: the apply step turns the picture
+ *   clockwise at that rate from the angle it is at, and 0 stops it where it got to); min and max
+ *   +-APPS_UI_VALUE_MAX; value to [min, max]. An infinity clamps to the end of the range, and NaN is an error.
+ *   hidden and wrap are booleans. text is a string
  *   or a number (as tostring makes it) of at most APPS_UI_TEXT_MAX bytes, valid UTF-8 (apps_json_utf8_len) and
  *   with no NUL byte; "" is no text. font is one of sans14 sans16 sans20 sans28 mono8 mono16 digits48 digits96
  *   (the digit fonts hold "0-9:.-+% "), text_align one of left center right. Colours are "#rgb", "#rrggbb" or
@@ -54,7 +58,7 @@
  *   font sans20, text_align center, color white. button: bg "#262626", radius 16, font sans20, color white.
  *   box: bg none, radius 0. arc: min 0, max 100, value 0, start_angle 0, end_angle 360, thickness 12, color
  *   white, track_color "#262626". bar: min 0, max 100, value 0, color white, track_color "#262626", radius 0.
- *   image: scale 100, and src is required.
+ *   image: scale 100, rotation 0, spin 0, and src is required.
  * - min < max is kept: a create or a set that would leave min >= max on an arc or a bar is an error, and value
  *   follows min and max (it is clamped again when they change).
  * - Events: tap (and click, the same), long_press, press and release, on a widget of any kind. A handler gets
@@ -66,6 +70,8 @@
  *
  * Messages (the position "main.lua:12: " comes first; ui.<kind> is ui.label ...; <p> is a property name):
  *   ui.<kind>: '<p>' must be a number, got <type>          also "got NaN"; must be a boolean, got <type>
+ *   ui.image: 'rotation' must be a number of degrees, 0 to 359, got <type>      also "got NaN"; spin the same,
+ *                                                    "of turns a minute, 0 to 60": these two say their range
  *   ui.<kind>: 'text' must be a string, got <type>
  *   ui.<kind>: unknown property '<name>' (valid: align, x, y, w, h, hidden, opacity, parent, text, ...)
  *   ui.<kind>: font 'sans24' is not one of sans14, sans16, ...      (align and text_align the same way, and for
@@ -128,11 +134,15 @@
  *      for a label and button, VALUE for an arc and bar, so one that applies each bit in turn after making the
  *      object applies everything.
  *    - alive with other bits: GEOM is align, x, y, w, h; STYLE is hidden, opacity, font, color, text_align, wrap,
- *      bg, radius, border, border_color, thickness, track_color, src and scale; TEXT is text; VALUE is min, max,
- *      value, start_angle and end_angle; EVENTS is the events mask (a widget with any is clickable). A change
- *      to what a widget sizes to (a text, a font) moves its neighbours: lay the layer out after any change and
- *      write rx, ry, rw, rh (screen coordinates) and overflow back.
- *    A set to the value a slot already has sets no bit. A widget made and deleted before a pass has no bits.
+ *      bg, radius, border, border_color, thickness, track_color, src, scale, rotation and spin; TEXT is text;
+ *      VALUE is min, max, value, start_angle and end_angle; EVENTS is the events mask (a widget with any is
+ *      clickable). A change to what a widget sizes to (a text, a font) moves its neighbours: lay the layer out
+ *      after any change and write rx, ry, rw, rh (screen coordinates) and overflow back.
+ *    A set to the value a slot already has sets no bit, with one exception: rotation, once the image has spun
+ *    since rotation was last set (spun), as the spin turned it away from that angle. Each set of rotation that
+ *    turns the image (another angle, or that one) moves rotation_sets on, and the apply step turns the picture to
+ *    rotation when it sees rotation_sets move; a create that gives rotation counts one. A widget made and deleted
+ *    before a pass has no bits.
  *
  * Handlers live in a table in the Lua registry, keyed by slot and event, and are looked up (apps_ui_push_handler)
  * against the slot's gen at dispatch, as well as dropped at delete.
@@ -155,6 +165,7 @@ typedef struct lua_State lua_State;
 #define APPS_UI_VALUE_MAX 1000000  /* an arc's or bar's min and max: lv_map multiplies by up to 466 in int32 */
 #define APPS_UI_BOX_DEPTH_MAX 4
 #define APPS_UI_ASSETS_MAX 32      /* the package's most files */
+#define APPS_SPIN_RPM_MAX 60       /* ui.image's spin: the most turns a minute */
 #define APPS_COLOR_NONE 0xFF000000u
 
 typedef enum { APPS_W_LABEL, APPS_W_BUTTON, APPS_W_BOX, APPS_W_ARC, APPS_W_BAR, APPS_W_IMAGE } apps_wkind_t;
@@ -190,6 +201,10 @@ typedef struct {
     int16_t start_angle, end_angle;
     int16_t image;                             /* asset index or -1 */
     uint16_t scale;                            /* percent */
+    int16_t rotation;                          /* clock degrees, 0..359 */
+    uint8_t spin;                              /* turns a minute, 0..APPS_SPIN_RPM_MAX */
+    bool spun;                                 /* it has spun since rotation was last set (the app task's alone) */
+    uint32_t rotation_sets;                    /* sets of rotation that turn the image (above) */
     char *text;                                /* PSRAM, NULL = "" */
     uint8_t events;                            /* APPS_UI_* subscribed */
     uint32_t dirty;                            /* APPS_DIRTY_*; the apply step clears it */

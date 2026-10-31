@@ -493,6 +493,10 @@ struct lv_obj {
     const lv_image_dsc_t *src;
     uint32_t scale;
     lv_image_align_t inner_align;  /* where an image sits in its box: CENTER until lv_image_set_inner_align says otherwise */
+    int32_t rotation;      /* an image's angle in 0.1 degrees, 0..3599 (lv_image_set_rotation): 0 until set, as LVGL's */
+    int turns;             /* times the angle changed */
+    long turned_ms;        /* anim_clock_ms when it last changed */
+    long turn_gap_ms;      /* the shortest time between two changes of it, by the animation timer's clock; -1 until two */
     lv_area_t area;
     bool forced;           /* the test set the area: the layout leaves it */
     int32_t pad_left, pad_right;  /* where its children's content area starts and ends (0 until set) */
@@ -567,6 +571,16 @@ typedef struct {
 } fake_anim_t;
 static fake_anim_t anims[8];
 static int n_anims;
+
+/* The animations apps_lv.c starts (lv_anim_start): LVGL's list, newest first as lv_ll_ins_head puts them, each a copy of what it was
+ * given, at an address of its own until it is deleted (freed: a pointer kept past that is an AddressSanitizer report). */
+#define FAKE_LV_ANIMS_MAX 160
+static lv_anim_t *lv_anims[FAKE_LV_ANIMS_MAX];
+static int n_lv_anims;
+static bool anim_list_changed;  /* state.anim_list_changed: the list changed while the timer walked it */
+static bool anim_run_round;     /* state.anim_run_round, flipped at each run of the timer */
+static long anim_clock_ms;      /* lv_tick_get() as the animation timer sees it: fake_frame moves it */
+static void lv_anims_of_deleted(const lv_obj_t *o);
 
 static int fake_errors;
 static char fake_note[240];
@@ -759,6 +773,7 @@ static lv_obj_t *make_object(const char *cls, lv_obj_t *parent, const char *fn) 
     o->w = o->h = LV_SIZE_CONTENT;
     o->align = LV_ALIGN_DEFAULT;
     o->scale = 256;
+    o->turn_gap_ms = -1;
     o->area = (lv_area_t){0, 0, -1, -1};
     o->scroll_dir = LV_DIR_ALL;
     o->scrollbar_mode = LV_SCROLLBAR_MODE_AUTO;
@@ -829,13 +844,15 @@ lv_obj_t *lv_image_create(lv_obj_t *parent) {
 
 static void mark_deleted(lv_obj_t *o) {
     o->deleted = true;
-    /* LVGL's obj_delete_core: its animations go with it, and an input device that presses or scrolls it is reset (obj_indev_reset):
-     * a finger that is down waits for its release, and nothing more of the touch is sent. */
+    /* LVGL's obj_delete_core: its animations go with it (lv_obj_destructor's lv_anim_delete(obj, NULL), each deleted callback
+     * called), and an input device that presses or scrolls it is reset (obj_indev_reset): a finger that is down waits for its
+     * release, and nothing more of the touch is sent. */
     for (int i = 0; i < n_anims; i++) {
         if (anims[i].obj == o) {
             anims[i--] = anims[--n_anims];
         }
     }
+    lv_anims_of_deleted(o);
     if (o == pressed_obj || o == scroll_obj) {
         if (pressed_obj != NULL) {
             wait_released = true;
@@ -1392,6 +1409,306 @@ void lv_image_set_inner_align(lv_obj_t *obj, lv_image_align_t align) {
     logline("image_inner_align %d %s", obj->id, align == LV_IMAGE_ALIGN_CENTER ? "center" : "default");
 }
 
+/* LVGL 9.5.0's lv_image_set_rotation (lv_image.c): 0.1 degrees, brought into 0..3599, about the pivot (the image's centre, LVGL's
+ * default: apps_lv.c never moves it); the same angle again does nothing. An image aligned to transform itself (stretch, fit ...)
+ * would take 0, but the fake knows only default and center. Every call is logged, with the angle as given. */
+void lv_image_set_rotation(lv_obj_t *obj, int32_t angle) {
+    if (use(obj, "lv_image_set_rotation", "image") == NULL) {
+        return;
+    }
+    logline("image_rotation %d %d", obj->id, (int)angle);
+    while (angle >= 3600) {
+        angle -= 3600;
+    }
+    while (angle < 0) {
+        angle += 3600;
+    }
+    if (angle == obj->rotation) {
+        return;
+    }
+    if (obj->turns > 0) {
+        long gap = anim_clock_ms - obj->turned_ms;
+        obj->turn_gap_ms = obj->turn_gap_ms < 0 || gap < obj->turn_gap_ms ? gap : obj->turn_gap_ms;
+    }
+    obj->rotation = angle;
+    obj->turns++;
+    obj->turned_ms = anim_clock_ms;
+}
+
+int32_t lv_image_get_rotation(lv_obj_t *obj) {
+    if (use(obj, "lv_image_get_rotation", "image") == NULL) {
+        return 0;
+    }
+    return obj->rotation;
+}
+
+/* ---- Animations, as LVGL 9.5.0's lv_anim.c runs them, for what apps_lv.c starts (test_the_fakes_animations_are_lvgl_9_5_0s reads
+ * the lines this follows in its tree). What the fake doesn't model (a delay, a reverse play, a speed for a time, the start, completed
+ * and get-value callbacks, a custom exec callback, pausing) is an error if apps_lv.c ever asks for it. ---- */
+
+#define FAKE_ANIM_SPEED_MASK 0x80000000u  /* LV_ANIM_SPEED_MASK: a time with this bit is a speed */
+
+/* An LVGL call that isn't on an object: counted, and inside the apply step only with the UI lock. */
+static void fake_call(const char *fn) {
+    tick();
+    if (apply_active && !lock_held) {
+        fake_error("%s was called inside the apply step without the UI lock", fn);
+    }
+}
+
+/* The id of the object an animation's var is, or 0 when it isn't one of the fake's. */
+static int anim_var_id(const void *var) {
+    for (int i = 0; i < n_objs; i++) {
+        if (objs[i] == var) {
+            return objs[i]->id;
+        }
+    }
+    return 0;
+}
+
+/* lv_anim_path_linear: lv_map(act_time, 0, duration, 0, LV_ANIM_RESOLUTION), then the share of the way from start to end. */
+static int32_t fake_path_linear(const lv_anim_t *a) {
+    int32_t t = a->act_time <= 0 ? 0 : a->act_time >= a->duration ? a->duration : a->act_time;
+    int32_t step = a->duration > 0 ? (int32_t)((int64_t)t * 1024 / a->duration) : 1024;
+    return ((step * (a->end_value - a->start_value)) >> 10) + a->start_value;
+}
+
+void lv_anim_init(lv_anim_t *a) {
+    fake_call("lv_anim_init");
+    memset(a, 0, sizeof *a);
+    a->duration = 500;
+    a->start_value = 0;
+    a->end_value = 100;
+    a->repeat_cnt = 1;
+    a->path_cb = fake_path_linear;
+    a->early_apply = 1;
+}
+
+void lv_anim_set_var(lv_anim_t *a, void *var) {
+    fake_call("lv_anim_set_var");
+    a->var = var;
+}
+
+void lv_anim_set_exec_cb(lv_anim_t *a, lv_anim_exec_xcb_t exec_cb) {
+    fake_call("lv_anim_set_exec_cb");
+    a->exec_cb = exec_cb;
+}
+
+void lv_anim_set_values(lv_anim_t *a, int32_t start, int32_t end) {
+    fake_call("lv_anim_set_values");
+    a->start_value = start;
+    a->current_value = INT32_MIN;
+    a->end_value = end;
+}
+
+void lv_anim_set_duration(lv_anim_t *a, uint32_t duration) {
+    fake_call("lv_anim_set_duration");
+    a->duration = (int32_t)duration;
+}
+
+void lv_anim_set_repeat_count(lv_anim_t *a, uint32_t cnt) {
+    fake_call("lv_anim_set_repeat_count");
+    a->repeat_cnt = cnt;
+}
+
+void lv_anim_set_path_cb(lv_anim_t *a, lv_anim_path_cb_t path_cb) {
+    fake_call("lv_anim_set_path_cb");
+    a->path_cb = path_cb;
+}
+
+void lv_anim_set_deleted_cb(lv_anim_t *a, lv_anim_deleted_cb_t deleted_cb) {
+    fake_call("lv_anim_set_deleted_cb");
+    a->deleted_cb = deleted_cb;
+}
+
+/* remove_anim: out of the list, the deleted callback, freed. */
+static void remove_lv_anim(int i) {
+    lv_anim_t *a = lv_anims[i];
+    memmove(&lv_anims[i], &lv_anims[i + 1], (size_t)(n_lv_anims - i - 1) * sizeof lv_anims[0]);
+    n_lv_anims--;
+    anim_list_changed = true;
+    if (a->deleted_cb != NULL) {
+        a->deleted_cb(a);
+    }
+    free(a);
+}
+
+/* remove_concurrent_anims: the others of the same var and exec callback that run (or applied their start) go. */
+static void remove_concurrent_lv_anims(const lv_anim_t *current) {
+    if (current->exec_cb == NULL) {
+        return;
+    }
+    for (int i = 0; i < n_lv_anims;) {
+        lv_anim_t *a = lv_anims[i];
+        if (a != current && (a->act_time >= 0 || a->early_apply) && a->var == current->var && a->exec_cb == current->exec_cb) {
+            remove_lv_anim(i);
+            i = 0;  /* from the head again, as LVGL does after a delete */
+        } else {
+            i++;
+        }
+    }
+}
+
+lv_anim_t *lv_anim_start(const lv_anim_t *a) {
+    fake_call("lv_anim_start");
+    int id = anim_var_id(a->var);
+    if (id != 0 && ((const lv_obj_t *)a->var)->deleted) {
+        fake_error("lv_anim_start on the deleted object %d", id);
+        return NULL;
+    }
+    if (a->custom_exec_cb != NULL || a->start_cb != NULL || a->completed_cb != NULL || a->get_value_cb != NULL ||
+        a->reverse_duration != 0 || a->repeat_delay != 0 || a->act_time != 0 || a->duration <= 0 ||
+        ((uint32_t)a->duration & FAKE_ANIM_SPEED_MASK) != 0 || !a->early_apply || a->path_cb == NULL) {
+        fake_error("lv_anim_start(%d) with what the fake doesn't model", id);
+        return NULL;
+    }
+    if (n_lv_anims >= FAKE_LV_ANIMS_MAX) {
+        fake_error("more animations than the fake holds");
+        return NULL;
+    }
+    if (a->early_apply && a->exec_cb != NULL) {
+        remove_concurrent_lv_anims(a);
+    }
+    lv_anim_t *copy = malloc(sizeof *copy);
+    if (copy == NULL) {
+        exit(2);
+    }
+    *copy = *a;
+    if (a->var == a) {
+        copy->var = copy;
+    }
+    copy->run_round = anim_run_round;
+    copy->last_timer_run = (uint32_t)anim_clock_ms;
+    copy->is_paused = 0;
+    memmove(&lv_anims[1], &lv_anims[0], (size_t)n_lv_anims * sizeof lv_anims[0]);
+    lv_anims[0] = copy;
+    n_lv_anims++;
+    char repeat[16];
+    if (copy->repeat_cnt == LV_ANIM_REPEAT_INFINITE) {
+        snprintf(repeat, sizeof repeat, "inf");
+    } else {
+        snprintf(repeat, sizeof repeat, "%u", (unsigned)copy->repeat_cnt);
+    }
+    logline("anim_start %d %d %d %d ms repeat=%s", id, (int)copy->start_value, (int)copy->end_value, (int)copy->duration, repeat);
+    if (copy->early_apply) {  /* the start value at once: the path at time 0, and the exec callback with it */
+        copy->current_value = copy->path_cb(copy);
+        if (copy->exec_cb != NULL) {
+            copy->exec_cb(copy->var, copy->current_value);
+        }
+    }
+    anim_list_changed = true;
+    return copy;
+}
+
+bool lv_anim_delete(void *var, lv_anim_exec_xcb_t exec_cb) {
+    fake_call("lv_anim_delete");
+    bool any = false;
+    for (int i = 0; i < n_lv_anims;) {
+        lv_anim_t *a = lv_anims[i];
+        if ((a->var == var || var == NULL) && (a->exec_cb == exec_cb || exec_cb == NULL)) {
+            remove_lv_anim(i);
+            any = true;
+            i = 0;
+        } else {
+            i++;
+        }
+    }
+    logline("anim_delete %d%s", anim_var_id(var), any ? "" : " none");
+    return any;
+}
+
+/* lv_obj_destructor's lv_anim_delete(obj, NULL), for an object the fake deletes: no call of apps_lv.c's, so not logged. */
+static void lv_anims_of_deleted(const lv_obj_t *o) {
+    for (int i = 0; i < n_lv_anims;) {
+        if (lv_anims[i]->var == o) {
+            remove_lv_anim(i);
+            i = 0;
+        } else {
+            i++;
+        }
+    }
+}
+
+/* anim_completed_handler, for an animation with no reverse play: one repeat less (none for an infinite one); with none left it goes,
+ * else it starts again with its overtime kept. */
+static void lv_anim_completed(lv_anim_t *a) {
+    if (a->repeat_cnt > 0 && a->repeat_cnt != LV_ANIM_REPEAT_INFINITE) {
+        a->repeat_cnt--;
+    }
+    if (a->repeat_cnt == 0) {
+        for (int i = 0; i < n_lv_anims; i++) {
+            if (lv_anims[i] == a) {
+                remove_lv_anim(i);
+                return;
+            }
+        }
+        return;
+    }
+    int32_t over_time = a->act_time > a->duration ? a->act_time - a->duration : 0;
+    a->start_cb_called = 0;
+    a->act_time = over_time - (int32_t)a->repeat_delay;
+}
+
+/* anim_timer, one run ms after the last: each animation's time moves on; at its first step after a start or a repeat the concurrent
+ * ones go; its time, held to its duration, gives the path's value; the exec callback hears it only when it changed; at its end it
+ * repeats or goes. A change of the list (a delete in a callback) sends the walk back to the head, and the run round keeps an
+ * animation from being stepped twice. */
+static void lv_anim_timer(int ms) {
+    anim_clock_ms += ms;
+    anim_run_round = !anim_run_round;
+    for (int i = 0; i < n_lv_anims;) {
+        lv_anim_t *a = lv_anims[i];
+        uint32_t elaps = (uint32_t)anim_clock_ms - a->last_timer_run;
+        a->act_time += (int32_t)elaps;
+        a->last_timer_run = (uint32_t)anim_clock_ms;
+        anim_list_changed = false;
+        if (a->run_round != anim_run_round) {
+            a->run_round = anim_run_round;
+            if (!a->start_cb_called && a->act_time >= 0) {
+                a->start_cb_called = 1;
+                remove_concurrent_lv_anims(a);
+            }
+            if (a->act_time >= 0) {
+                int32_t act_time_original = a->act_time;
+                if (a->act_time > a->duration) {
+                    a->act_time = a->duration;
+                }
+                int32_t act_time_before_exec = a->act_time;
+                int32_t new_value = a->path_cb(a);
+                if (new_value != a->current_value) {
+                    a->current_value = new_value;
+                    if (a->exec_cb != NULL) {
+                        a->exec_cb(a->var, new_value);
+                    }
+                }
+                if (!anim_list_changed) {
+                    if (a->act_time == act_time_before_exec && act_time_original < a->duration * 2) {
+                        a->act_time = act_time_original;
+                    }
+                    if (a->act_time >= a->duration) {
+                        lv_anim_completed(a);
+                    }
+                }
+            }
+        }
+        i = anim_list_changed ? 0 : i + 1;
+    }
+}
+
+/* The animations running now (lv_anim_count_running), and the one of the object id, or NULL. */
+static int fake_spins(void) {
+    return n_lv_anims;
+}
+
+static const lv_anim_t *fake_anim_of(int id) {
+    for (int i = 0; i < n_lv_anims; i++) {
+        if (anim_var_id(lv_anims[i]->var) == id) {
+            return lv_anims[i];
+        }
+    }
+    return NULL;
+}
+
 /* ---- Events and the input device ---- */
 
 void *lv_event_get_user_data(lv_event_t *e) {
@@ -1806,13 +2123,14 @@ static void indev_throw(void) {
     scroll_obj = NULL;
 }
 
-/* One run of LVGL's animation timer, ms after the last: a throw a lift started takes its first step, then each scroll animation
- * moves on (an ease-out: LVGL's is a cubic Bezier, and only the ends and the time matter here), sending SCROLL, and one that has run
- * its time ends, with SCROLL_END. */
+/* One run of LVGL's animation timer, ms after the last: a throw a lift started takes its first step, the animations apps_lv.c started
+ * take theirs (lv_anim_timer), then each scroll animation moves on (an ease-out: LVGL's is a cubic Bezier, and only the ends and the
+ * time matter here), sending SCROLL, and one that has run its time ends, with SCROLL_END. */
 static void fake_frame(int ms) {
     if (throw_pending) {
         indev_throw();
     }
+    lv_anim_timer(ms);
     lv_obj_t *moving[ARRAY_LEN(anims)];
     int n = n_anims;
     for (int i = 0; i < n; i++) {
@@ -2190,6 +2508,10 @@ static void fake_free_all(void) {
     gesture_sent = throw_pending = false;
     throw_vect_x = 0;
     n_anims = 0;
+    while (n_lv_anims > 0) {  /* lv_anim_delete_all: each deleted callback called */
+        remove_lv_anim(n_lv_anims - 1);
+    }
+    anim_list_changed = false;
 }
 
 /* A fresh LVGL: nothing made, the log empty, the clock and the PSRAM as they start. Errors are not cleared: a
@@ -4624,7 +4946,7 @@ static const char *const COLOUR_NAMES[] = {"'#fff'", "'#102030'", "0xff8800", "'
 /* One property, as a Lua field: mostly right for the kind, sometimes not (the binding raises and the pcall eats it). */
 static void random_prop(int kind, char *out, size_t cap) {
     char text[40];
-    switch (rnd(20)) {
+    switch (rnd(22)) {
         case 0: snprintf(out, cap, "x = %d", (int)rnd(1000) - 500); break;
         case 1: snprintf(out, cap, "y = %d", (int)rnd(1000) - 500); break;
         case 2: snprintf(out, cap, "w = %d", (int)rnd(500) - 10); break;
@@ -4650,6 +4972,8 @@ static void random_prop(int kind, char *out, size_t cap) {
         case 16: snprintf(out, cap, "start_angle = %d, end_angle = %d", (int)rnd(400), (int)rnd(400)); break;
         case 17: snprintf(out, cap, "thickness = %d", (int)rnd(70)); break;
         case 18: snprintf(out, cap, "src = '%s'", rnd(3) == 0 ? "c.bin" : (rnd(2) ? "a.bin" : "b.bin")); break;
+        case 19: snprintf(out, cap, "rotation = %d", (int)rnd(400) - 20); break;
+        case 20: snprintf(out, cap, "spin = %d", rnd(3) == 0 ? 0 : (int)rnd(80) - 5); break;
         default: snprintf(out, cap, "scale = %d", (int)rnd(500)); break;
     }
     (void)kind;
@@ -4658,7 +4982,7 @@ static void random_prop(int kind, char *out, size_t cap) {
 /* Overwrites one field of the slot with garbage (the harness puts the widget back after the pass). */
 static void corrupt(env_t *e, int slot) {
     apps_widget_t *w = W(e, slot);
-    switch (rnd(24)) {
+    switch (rnd(26)) {
         case 0: w->kind = (uint8_t)rnd(10); break;
         case 1: w->parent = (int16_t)((int)rnd(140) - 6); break;
         case 2: w->x = (int16_t)((int)rnd(2000) - 1000); break;
@@ -4682,6 +5006,8 @@ static void corrupt(env_t *e, int slot) {
         case 20: w->events = (uint8_t)rnd(255); break;
         case 21: w->dirty = (uint32_t)rnd(256); break;
         case 22: w->alive = !w->alive; break;
+        case 23: w->rotation = (int16_t)((int)rnd(800) - 200); break;
+        case 24: w->spin = (uint8_t)rnd(255); break;
         default: {  /* a block of its own: the widget's own is kept by the caller, who puts it back */
             const char *bytes = rnd(2) != 0 ? "\xff\xfe" : "plain";
             size_t len = bytes[0] == 'p' ? 5 : 2;
@@ -4715,6 +5041,13 @@ static void check_in_sync(env_t *e, uint32_t seed) {
             case APPS_W_IMAGE: images++; break;
         }
     }
+    int spinning = 0;
+    for (int i = 0; i < APPS_UI_SLOTS; i++) {
+        const apps_widget_t *w = W(e, i);
+        spinning += w->alive && w->kind == APPS_W_IMAGE && w->spin != 0;
+    }
+    CHECK(fake_spins() == spinning && stats_now().spinning == (uint32_t)spinning, "seed %u: %d animations, spinning %u, the table has %d",
+          seed, fake_spins(), stats_now().spinning, spinning);
     CHECK(fake_alive_of("label") == labels && fake_alive_of("button") == buttons && fake_alive_of("obj") == boxes &&
               fake_alive_of("arc") == arcs && fake_alive_of("bar") == bars && fake_alive_of("image") == images,
           "seed %u: the layer has labels %d buttons %d boxes %d arcs %d bars %d images %d, the table wants %d %d %d %d %d %d", seed,
@@ -4781,6 +5114,7 @@ static void fuzz_seed(uint32_t seed) {
                 bool in_callback = rnd(4) == 0;
                 apply_at(__LINE__, &e, in_callback);
                 create_fail_in = 0;
+                fake_frame((int)rnd(40) + 1);  /* the spins step: on objects that may have gone since */
                 if (damaged) {
                     /* Put the widget back as the app's side has it (the pass may have cleared its bits, and may have
                      * written its geometry back: those are the pass's to say). */
@@ -6738,6 +7072,350 @@ static void launcher_frame_log(void) {
     LAUNCHER_END();
 }
 
+/* ---- Connected apps Task 1: an image's rotation and spin ---- */
+
+/* n ms of frames of the animation timer, step ms each (the last one shorter, to land on n). */
+static void frames(long n, int step) {
+    for (long done = 0; done < n;) {
+        int ms = n - done < step ? (int)(n - done) : step;
+        fake_frame(ms);
+        done += ms;
+    }
+}
+
+/* The angle, in 0.1 degrees, of a spin from `from` at rpm turns a minute ms after it began, as apps_lv.c's path makes it: a turn of
+ * 60000 / rpm ms in that over APPS_SPIN_STEP_MS whole steps of equal time, each angle held for its step. */
+static int32_t spin_angle(int32_t from, int rpm, long ms) {
+    int32_t duration = 60000 / rpm, steps = duration / APPS_SPIN_STEP_MS;
+    if (steps < 1) {
+        steps = 1;
+    }
+    int32_t k = (int32_t)((ms % duration) * steps / duration);
+    return (from + 3600 * k / steps) % 3600;
+}
+
+/* Rotation is the image's own angle (lv_image_set_rotation, in 0.1 degrees, about its pivot: the centre, LVGL's default), applied
+ * with the style. A new image at 0 makes no call (LVGL's own angle is 0), a style change that isn't the angle leaves it, and an
+ * angle or a spin out of range in the table is a reject, never LVGL's. */
+static void image_rotation_applies(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "i = ui.image{src = 'a.bin', rotation = 90} j = ui.image{src = 'b.bin'}");
+    CHECK(APPLY(&e), "made");
+    lv_obj_t *i = fake_obj(2), *j = fake_obj(3);
+    CHECK(log_has_line("image_rotation 2 900") && i->rotation == 900, "rotation 90 is lv_image_set_rotation(obj, 900)\n%s", log_peek());
+    CHECK(log_count("image_rotation 3 ") == 0 && j->rotation == 0, "an image at 0 makes no call\n%s", log_peek());
+    CHECK(log_count("anim_") == 0 && fake_spins() == 0 && stats_now().spinning == 0, "no animation without a spin\n%s", log_peek());
+
+    log_clear();
+    RUN(&e, "i:set{rotation = 359}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(log_has_line("image_rotation 2 3590") && i->rotation == 3590, "359 degrees\n%s", log_peek());
+    log_clear();
+    RUN(&e, "i:set{opacity = 50, scale = 200} j:set{hidden = true}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(log_count("image_rotation") == 0 && log_count("anim_") == 0 && i->rotation == 3590, "a style change that isn't the angle\n%s",
+          log_peek());
+    log_clear();
+    RUN(&e, "i:set{rotation = 0}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(log_has_line("image_rotation 2 0") && i->rotation == 0, "back to 0\n%s", log_peek());
+
+    /* Out of range in the table: dropped, and LVGL hears nothing of it. */
+    log_clear();
+    apps_lv_stats_t before = stats_now();
+    W(&e, 0)->rotation = 360;
+    W(&e, 0)->dirty = APPS_DIRTY_STYLE;
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(stats_now().rejects == before.rejects + 1 && log_count("image_rotation") == 0, "rotation 360: %u rejects\n%s",
+          stats_now().rejects - before.rejects, log_peek());
+    W(&e, 0)->rotation = -1;
+    W(&e, 0)->dirty = APPS_DIRTY_STYLE;
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(stats_now().rejects == before.rejects + 2 && log_count("image_rotation") == 0, "rotation -1\n%s", log_peek());
+    W(&e, 0)->rotation = 0;
+    W(&e, 0)->spin = APPS_SPIN_RPM_MAX + 1;
+    W(&e, 0)->dirty = APPS_DIRTY_STYLE;
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(stats_now().rejects == before.rejects + 3 && log_count("anim_") == 0 && fake_spins() == 0, "spin %d\n%s",
+          APPS_SPIN_RPM_MAX + 1, log_peek());
+    W(&e, 0)->spin = 0;
+    FINISH(&e);
+}
+
+/* A spin is one animation of the image's angle, a turn in 60000 / rpm ms repeated without end, from the angle the image is at. Its
+ * angle changes at most once per APPS_SPIN_STEP_MS of the animation's time. spin = 0 deletes it and leaves the angle where it got
+ * to; a spin set again goes on from there, and a new rate goes on from where the old one got to. */
+static void image_spin_animates_and_stops_in_place(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "d = ui.image{src = 'a.bin', spin = 30}");
+    CHECK(APPLY(&e), "made");
+    lv_obj_t *d = fake_obj(2);
+    const lv_anim_t *a = fake_anim_of(2);
+    CHECK(fake_spins() == 1 && a != NULL, "one animation: %d", fake_spins());
+    if (a != NULL) {
+        CHECK(a->duration == 2000 && a->repeat_cnt == LV_ANIM_REPEAT_INFINITE && a->start_value == 0 && a->end_value == 3600 &&
+                  a->var == d,
+              "a turn of 2,000 ms from 0, without end: %d ms, %d..%d, repeat %u", (int)a->duration, (int)a->start_value,
+              (int)a->end_value, (unsigned)a->repeat_cnt);
+    }
+    CHECK(log_has_line("anim_start 2 0 3600 2000 ms repeat=inf"), "the animation\n%s", log_peek());
+    CHECK(stats_now().spinning == 1, "spinning %u", stats_now().spinning);
+
+    /* The fake's clock moves on: a quarter of a turn in 500 ms. */
+    frames(500, 10);
+    CHECK(d->rotation == 900 && d->rotation == spin_angle(0, 30, 500), "a quarter turn: %d", (int)d->rotation);
+
+    /* Stopped: the animation goes, and the angle stays where it got to, however long. */
+    log_clear();
+    RUN(&e, "d:set{spin = 0}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(log_has_line("anim_delete 2") && log_count("image_rotation") == 0 && fake_spins() == 0 && stats_now().spinning == 0,
+          "stopped in place\n%s", log_peek());
+    frames(1000, 10);
+    CHECK(d->rotation == 900, "it stays at 900: %d", (int)d->rotation);
+    RUN(&e, "assert(d:get('spin') == 0 and d:get('rotation') == 0, 'get says what the app set')");
+
+    /* Again: on from 900, and a whole turn brings it back there, one angle per step at the most. */
+    log_clear();
+    RUN(&e, "d:set{spin = 30}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(log_has_line("anim_start 2 900 4500 2000 ms repeat=inf") && fake_spins() == 1 && d->rotation == 900,
+          "resumed from where it stopped\n%s", log_peek());
+    int turns = d->turns;
+    d->turn_gap_ms = -1;
+    frames(2000, 1);
+    int steps = 2000 / APPS_SPIN_STEP_MS;
+    CHECK(d->rotation == 900 && d->turns - turns == steps, "a whole turn: at %d, %d changes, want %d", (int)d->rotation,
+          d->turns - turns, steps);
+    CHECK(d->turn_gap_ms >= APPS_SPIN_STEP_MS, "two changes %ld ms apart, under APPS_SPIN_STEP_MS (%d)", d->turn_gap_ms,
+          APPS_SPIN_STEP_MS);
+    /* At the board's rate of the animation timer (LV_DEF_REFR_PERIOD, 15 ms) it is one change per step it passes, never two. */
+    turns = d->turns;
+    frames(1000, 15);
+    CHECK(d->turns - turns <= 1000 / (2000 / steps) + 1 && d->rotation == spin_angle(900, 30, 1000), "15 ms frames: %d changes, at %d",
+          d->turns - turns, (int)d->rotation);
+    frames(250, 10);
+    int32_t at = spin_angle(900, 30, 1250);
+    CHECK(d->rotation == at, "on: %d, want %d", (int)d->rotation, (int)at);
+
+    /* A new rate: one animation still, at 1,000 ms a turn, from where the old one got to. */
+    log_clear();
+    RUN(&e, "d:set{spin = 60}");
+    CHECK(APPLY(&e), "changed");
+    char line[64];
+    snprintf(line, sizeof line, "anim_start 2 %d %d 1000 ms repeat=inf", (int)at, (int)at + 3600);
+    CHECK(log_has_line("anim_delete 2") && log_has_line(line) && fake_spins() == 1 && stats_now().spinning == 1,
+          "the new rate from %d\n%s", (int)at, log_peek());
+    frames(100, 10);
+    CHECK(d->rotation == spin_angle(at, 60, 100), "60 turns a minute: %d, want %d", (int)d->rotation, (int)spin_angle(at, 60, 100));
+    /* What the app set is what get says, whatever the angle. */
+    RUN(&e, "assert(d:get('spin') == 60 and d:get('rotation') == 0)");
+    FINISH(&e);
+}
+
+/* Setting rotation turns the image to it, spinning or not, and a spin goes on from there: the same value again too, once the image
+ * has spun away from it. */
+static void rotation_sets_the_angle_a_spin_continues_from(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "d = ui.image{src = 'a.bin', spin = 30}");
+    CHECK(APPLY(&e), "made");
+    lv_obj_t *d = fake_obj(2);
+    frames(500, 10);
+    CHECK(d->rotation == 900, "a quarter turn: %d", (int)d->rotation);
+
+    log_clear();
+    RUN(&e, "d:set{rotation = 45}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(log_has_line("anim_delete 2") && log_has_line("image_rotation 2 450") && log_has_line("anim_start 2 450 4050 2000 ms repeat=inf"),
+          "turned to 45 and on from there\n%s", log_peek());
+    CHECK(log_find("anim_delete 2") < log_find("image_rotation 2 450") && log_find("image_rotation 2 450") < log_find("anim_start 2"),
+          "stopped, turned, started\n%s", log_peek());
+    CHECK(d->rotation == 450 && fake_spins() == 1, "at %d, %d animations", (int)d->rotation, fake_spins());
+    frames(500, 10);
+    CHECK(d->rotation == spin_angle(450, 30, 500), "on from 45: %d", (int)d->rotation);
+
+    /* The value it holds, after the spin moved the image on: back to it. */
+    log_clear();
+    RUN(&e, "d:set{rotation = 45}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(log_has_line("anim_start 2 450 4050 2000 ms repeat=inf") && d->rotation == 450, "back to 45\n%s", log_peek());
+    frames(300, 10);
+    int32_t at = spin_angle(450, 30, 300);
+    CHECK(d->rotation == at, "on: %d", (int)d->rotation);
+
+    /* Stopped, it stays; a rotation then turns it, and no spin starts. */
+    RUN(&e, "d:set{spin = 0}");
+    CHECK(APPLY(&e), "changed");
+    frames(300, 10);
+    CHECK(d->rotation == at && fake_spins() == 0, "stopped at %d: %d", (int)at, (int)d->rotation);
+    log_clear();
+    RUN(&e, "d:set{rotation = 180}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(d->rotation == 1800 && log_count("anim_") == 0 && fake_spins() == 0, "turned, still\n%s", log_peek());
+    log_clear();
+    RUN(&e, "d:set{rotation = 180}");  /* where it is: nothing */
+    CHECK(APPLY(&e), "a pass");
+    LOG_EMPTY();
+
+    /* Both in one set: the turn first, and the spin from it. */
+    log_clear();
+    RUN(&e, "d:set{rotation = 270, spin = 60}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(log_has_line("image_rotation 2 2700") && log_has_line("anim_start 2 2700 6300 1000 ms repeat=inf"), "from 270\n%s",
+          log_peek());
+    frames(100, 10);
+    CHECK(d->rotation == spin_angle(2700, 60, 100), "on from 270: %d", (int)d->rotation);
+    RUN(&e, "d:set{rotation = 300, spin = 0}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(d->rotation == 3000 && fake_spins() == 0 && stats_now().spinning == 0, "stopped at 300: %d", (int)d->rotation);
+    FINISH(&e);
+}
+
+/* A spin is the image object's own animation: it ends with the object, whatever ends that (a delete, a box's delete, ui.clear(), the
+ * layer's reset as the app ends), and LVGL never steps it on an object that is gone (the fake counts any call on one). */
+static void spin_ends_with_the_widget(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "a = ui.image{src = 'a.bin', spin = 30}");
+    CHECK(APPLY(&e), "made");
+    CHECK(fake_spins() == 1 && stats_now().spinning == 1, "one spin");
+    frames(100, 10);
+    RUN(&e, "a:delete()");
+    CHECK(APPLY(&e), "deleted");
+    CHECK(fake_spins() == 0 && stats_now().spinning == 0, "a delete: %d animations, spinning %u", fake_spins(), stats_now().spinning);
+    frames(500, 10);
+
+    RUN(&e, "a = ui.image{src = 'a.bin', spin = 30} b = ui.image{src = 'b.bin', spin = 60, rotation = 10}");
+    CHECK(APPLY(&e), "made");
+    CHECK(fake_spins() == 2 && stats_now().spinning == 2, "two spins: %d", fake_spins());
+    frames(100, 10);
+    RUN(&e, "ui.clear()");
+    CHECK(APPLY(&e), "cleared");
+    CHECK(fake_spins() == 0 && stats_now().spinning == 0, "ui.clear(): %d animations, spinning %u", fake_spins(), stats_now().spinning);
+    frames(500, 10);
+
+    RUN(&e, "box = ui.box{w = 300, h = 300} c = ui.image{src = 'a.bin', parent = box, spin = 10}");
+    CHECK(APPLY(&e), "made");
+    CHECK(fake_spins() == 1, "a spin in a box");
+    log_clear();
+    RUN(&e, "box:delete()");
+    CHECK(APPLY(&e), "deleted");
+    CHECK(fake_spins() == 0 && stats_now().spinning == 0 && log_count("anim_") == 0, "the box's delete took it\n%s", log_peek());
+    frames(500, 10);
+
+    RUN(&e, "d = ui.image{src = 'a.bin', spin = 45}");
+    CHECK(APPLY(&e), "made");
+    CHECK(fake_spins() == 1, "a spin");
+    unpublish();  /* the app ends: its table let go, then the layer reset */
+    apps_lv_reset();
+    CHECK(fake_spins() == 0 && stats_now().spinning == 0, "the reset: %d animations, spinning %u", fake_spins(), stats_now().spinning);
+    frames(500, 10);
+    FINISH(&e);
+}
+
+/* The ms of each "spin frame <ms> ms" line apps_lv.c logged since the last esp_clear, as frame_lines_at reads the launcher's. */
+static int spin_lines_at(int line, int *ms, int cap) {
+    static const char prefix[] = "I muse_apps: spin frame ";
+    int n = 0;
+    for (const char *at = esp_peek(); (at = strstr(at, prefix)) != NULL; at += sizeof prefix - 1) {
+        char *end;
+        long v = strtol(at + sizeof prefix - 1, &end, 10);
+        CHECK_AT(line, end != at + sizeof prefix - 1 && strncmp(end, " ms\n", 4) == 0, "a spin frame line of another shape:\n%s", at);
+        if (n < cap) {
+            ms[n] = (int)v;
+        }
+        n++;
+    }
+    return n;
+}
+#define SPIN_LINES(ms, cap) spin_lines_at(__LINE__, (ms), (cap))
+
+/* The spin gate's measurement, in a bench build: while an image spins on the layer in front, each display refresh logs "spin frame
+ * <ms> ms", the time since the refresh before it, when that one found an image spinning there too (the first after a rest isn't
+ * timed). Nothing while none spins, while the layer is behind or a card is over it, and nothing at all without the bench. */
+static void spin_frame_log(void) {
+    env_t e;
+    scene(&e);
+    if (FRAMES_LOGGED) {
+        CHECK(display_obj.n_cbs == 1 && display_obj.cbs[0].filter == LV_EVENT_REFR_READY, "one callback on the display: %d",
+              display_obj.n_cbs);
+    } else {
+        CHECK(display_obj.n_cbs == 0, "a build without the bench adds nothing to the display: %d callbacks", display_obj.n_cbs);
+    }
+    apps_lv_set_front(true);
+    int ms[64];
+    esp_clear();
+    refresh_after(1000000);
+    refresh_after(16000);
+    CHECK(SPIN_LINES(ms, 64) == 0, "nothing while no image spins:\n%s", esp_peek());
+
+    RUN(&e, "d = ui.image{src = 'a.bin', spin = 33}");
+    CHECK(APPLY(&e), "made");
+    esp_clear();
+    refresh_after(500000);  /* after a rest: not timed */
+    static const int64_t gaps_us[] = {33000, 30000, 45000, 16400, 16600};
+    static const int want[] = {33, 30, 45, 16, 17};
+    for (size_t i = 0; i < ARRAY_LEN(gaps_us); i++) {
+        fake_frame(15);
+        refresh_after(gaps_us[i]);
+    }
+    int n = SPIN_LINES(ms, 64);
+    if (FRAMES_LOGGED) {
+        CHECK(n == 5, "the spin's frames after its first: %d lines\n%s", n, esp_peek());
+        for (int i = 0; i < 5 && i < n; i++) {
+            CHECK(ms[i] == want[i], "frame %d: %d ms, want %d", i, ms[i], want[i]);
+        }
+    } else {
+        CHECK(n == 0, "no spin frame line without the bench:\n%s", esp_peek());
+    }
+    CHECK(FRAME_LINES(ms, 64) == 0, "no launcher frame line for a spin:\n%s", esp_peek());
+
+    /* Behind (another page shows): nothing; in front again, the first refresh isn't timed. */
+    esp_clear();
+    apps_lv_set_front(false);
+    refresh_after(33000);
+    refresh_after(33000);
+    CHECK(SPIN_LINES(ms, 64) == 0, "nothing while the layer is behind:\n%s", esp_peek());
+    apps_lv_set_front(true);
+    refresh_after(33000);
+    refresh_after(20000);
+    n = SPIN_LINES(ms, 64);
+    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || ms[0] == 20), "in front again: %d lines\n%s", n, esp_peek());
+
+    /* A card over it: nothing. */
+    esp_clear();
+    apps_lv_show_crash("Spin", NULL);
+    refresh_after(33000);
+    refresh_after(33000);
+    CHECK(SPIN_LINES(ms, 64) == 0, "nothing under a card:\n%s", esp_peek());
+    apps_lv_hide_cards();
+
+    /* Stopped, or gone: nothing. */
+    RUN(&e, "d:set{spin = 0}");
+    CHECK(APPLY(&e), "stopped");
+    esp_clear();
+    for (int i = 0; i < 3; i++) {
+        refresh_after(33000);
+    }
+    CHECK(SPIN_LINES(ms, 64) == 0, "nothing once it stops:\n%s", esp_peek());
+    RUN(&e, "d:set{spin = 10}");
+    CHECK(APPLY(&e), "again");
+    esp_clear();
+    refresh_after(33000);
+    refresh_after(33000);
+    CHECK(SPIN_LINES(ms, 64) == (FRAMES_LOGGED ? 1 : 0), "spinning again:\n%s", esp_peek());
+    RUN(&e, "d:delete()");
+    CHECK(APPLY(&e), "deleted");
+    esp_clear();
+    refresh_after(33000);
+    refresh_after(33000);
+    CHECK(SPIN_LINES(ms, 64) == 0, "nothing once its widget is gone:\n%s", esp_peek());
+    FINISH(&e);
+}
+
 static void crash_card_text_and_tap(void) {
     cards_scene();
     apps_lv_show_crash("Timer", "main.lua:3: boom");
@@ -7082,6 +7760,11 @@ int main(int argc, char **argv) {
         {"a_voice_turn_ends_the_hold", a_voice_turn_ends_the_hold},
         {"a_touch_the_launcher_closed_under_does_nothing", a_touch_the_launcher_closed_under_does_nothing},
         {"launcher_frame_log", launcher_frame_log},
+        {"image_rotation_applies", image_rotation_applies},
+        {"image_spin_animates_and_stops_in_place", image_spin_animates_and_stops_in_place},
+        {"rotation_sets_the_angle_a_spin_continues_from", rotation_sets_the_angle_a_spin_continues_from},
+        {"spin_ends_with_the_widget", spin_ends_with_the_widget},
+        {"spin_frame_log", spin_frame_log},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},

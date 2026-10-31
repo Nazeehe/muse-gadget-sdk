@@ -38,7 +38,8 @@ import zlib
 from pathlib import Path
 
 import apps_host
-from test_muse_apps_wiring import c_function, open_conditions
+from test_muse_apps_rt import header_number
+from test_muse_apps_wiring import c_function, open_conditions, strip_c_comments
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
@@ -452,9 +453,10 @@ class HarnessTest(unittest.TestCase):
         # Every part of it is inside #if CONFIG_MUSE_BENCH: the callback, its state, the line and the registration in apps_lv_build.
         source = APPS_LV.read_text()
         self.assertIn('#include "sdkconfig.h"', source)
-        mentions = [m.start() for m in re.finditer(r"on_refresh|watch_frames|s_frames|launcher frame|LV_EVENT_REFR_READY|"
+        mentions = [m.start() for m in re.finditer(r"on_refresh|watch_frames|s_frames|launcher frame|spin frame|LV_EVENT_REFR_READY|"
                                                    r"lv_display_add_event_cb|lv_obj_get_display", source)]
-        self.assertGreaterEqual(len(mentions), 6)
+        self.assertGreaterEqual(len(mentions), 7)
+        self.assertIn("spin frame", " ".join(source[i:i + 12] for i in mentions))
         for index in mentions:
             with self.subTest(source[source.rindex("\n", 0, index) + 1:source.index("\n", index)].strip()):
                 self.assertEqual(open_conditions(source, index), ["if CONFIG_MUSE_BENCH"])
@@ -469,6 +471,58 @@ class HarnessTest(unittest.TestCase):
 
     def test_no_layer_no_cards(self):
         self.run_case("cards_need_a_layer")
+
+    # ---- Connected apps Task 1: an image's rotation and spin ----
+
+    def test_image_rotation_applies(self):  # rotation 90 is lv_image_set_rotation(obj, 900): the image's own angle, about its centre
+        self.run_case("image_rotation_applies")
+
+    def test_image_spin_animates_and_stops_in_place(self):  # one animation, 2,000 ms a turn at 30; spin 0 keeps the angle; resumes
+        self.run_case("image_spin_animates_and_stops_in_place")
+
+    def test_rotation_sets_the_angle_a_spin_continues_from(self):
+        self.run_case("rotation_sets_the_angle_a_spin_continues_from")
+
+    def test_spin_ends_with_the_widget(self):  # a delete, ui.clear(), a box's delete, the layer's reset: no animation is left
+        self.run_case("spin_ends_with_the_widget")
+
+    def test_a_build_without_the_bench_logs_no_spin_frames(self):
+        self.run_case("spin_frame_log")
+
+    def test_spin_is_on_the_lvgl_task_only(self):
+        # The animation is the apply step's: every lv_anim_ call of the apps' sources is apps_lv.c's, in apply_turn or start_spin,
+        # which only the apply step runs (apply_style calls apply_turn, and apply_turn start_spin). LVGL runs it on its own task, and
+        # its callbacks call no lv_anim_ function.
+        call = re.compile(r"\blv_anim_\w+\(")
+        for path in sorted(APPS.glob("*.c")):
+            if path != APPS_LV:
+                with self.subTest(path.name):
+                    self.assertIsNone(call.search(strip_c_comments(path.read_text())), f"{path.name} calls lv_anim")
+        source = strip_c_comments(APPS_LV.read_text())
+        definitions = [(m.group(1), m.start()) for m in
+                       re.finditer(r"^(?:static\s+)?[A-Za-z_][\w \*]*?\b(\w+)\([^;{}]*\)\s*\{", source, re.M)]
+        bodies = {name: (start, start + len(c_function(source[start:], source[start:source.index("(", start)])))
+                  for name, start in definitions}
+
+        def owner(index):
+            inside = [name for name, (start, end) in bodies.items() if start <= index < end]
+            return inside[0] if inside else None
+
+        owners = {owner(m.start()) for m in call.finditer(source)}
+        self.assertEqual(owners, {"apply_turn", "start_spin"})
+        for name, callers in (("apply_turn", {"apply_style"}), ("start_spin", {"apply_turn"})):
+            with self.subTest(name):
+                calls = {owner(m.start()) for m in re.finditer(rf"\b{name}\(", source)} - {None}
+                self.assertEqual(calls - {name}, callers, f"what calls {name}")
+        self.assertEqual({owner(m.start()) for m in re.finditer(r"\bapply_style\(", source)} - {None, "apply_style"},
+                         {"visit_live"}, "apply_style is the pass's")
+        self.assertIn("lv_anim_set_var(&a, obj);", c_function(source, "static bool start_spin("))
+
+    def test_spin_step_is_the_board_gates(self):
+        # connected apps Task 1, Step 5: the step of a spinning image's angle, in its animation's time, as the board's spin gate left it.
+        # 66 drew a 400 px disc no faster (its frames are the transform's time) and halved a 200 px disc's rate, which passes at 33
+        # (task-1-report.md has the runs). A retune is a new gate run.
+        self.assertEqual(header_number("apps_lv.h", "APPS_SPIN_STEP_MS"), 33)
 
     # ---- Random tables ----
 
@@ -497,6 +551,9 @@ class BenchHarnessTest(unittest.TestCase):
 
     def test_the_launcher_logs_its_frames_while_it_scrolls(self):  # Task 6: "launcher frame <ms> ms", only while the row moves
         self.run_case("launcher_frame_log")
+
+    def test_an_image_logs_its_frames_while_it_spins(self):  # connected apps Task 1: "spin frame <ms> ms", only while one spins in front
+        self.run_case("spin_frame_log")
 
 
 # ---- The fakes against the real headers ----
@@ -584,6 +641,9 @@ class FakesTest(unittest.TestCase):
         offsetof(lv_image_dsc_t,header) offsetof(lv_image_dsc_t,data_size) offsetof(lv_image_dsc_t,data)
         offsetof(lv_area_t,x1) offsetof(lv_area_t,x2) offsetof(lv_area_t,y1) offsetof(lv_area_t,y2)
         sizeof(lv_point_t) offsetof(lv_point_t,x) offsetof(lv_point_t,y)
+        LV_ANIM_REPEAT_INFINITE sizeof(lv_anim_t) offsetof(lv_anim_t,var) offsetof(lv_anim_t,exec_cb) offsetof(lv_anim_t,deleted_cb)
+        offsetof(lv_anim_t,path_cb) offsetof(lv_anim_t,start_value) offsetof(lv_anim_t,current_value) offsetof(lv_anim_t,end_value)
+        offsetof(lv_anim_t,duration) offsetof(lv_anim_t,act_time) offsetof(lv_anim_t,repeat_cnt) offsetof(lv_anim_t,last_timer_run)
     """.split()
 
     def test_an_lvgl_image_is_centred_in_its_box_until_told_otherwise(self):
@@ -592,6 +652,71 @@ class FakesTest(unittest.TestCase):
         constructor = re.search(r"static void lv_image_constructor\([^)]*\)\s*\{.*?\n\}", text, re.S)
         self.assertIsNotNone(constructor, "lv_image_constructor isn't in LVGL 9.5.0's lv_image.c")
         self.assertRegex(constructor.group(0), r"img->align\s*=\s*LV_IMAGE_ALIGN_CENTER;")
+
+    def test_the_fakes_rotation_and_animations_are_lvgl_9_5_0s(self):
+        """What the fake's lv_image_set_rotation and its animations (tests/muse_apps_lv_harness.c) follow, in LVGL 9.5.0's own lines: an
+        image's angle in 0.1 degrees brought into 0..3599 about a pivot at its centre by default; an animation's defaults, its copy at
+        lv_anim_start with the start applied at once, its timer (the time held to the duration, the exec callback only for a new value,
+        the repeat with its overtime kept), the deleted callback at every delete, an object's animations deleted with it, and the
+        timer's period (the display's refresh period)."""
+        def code(path):
+            return _strip_comments((self.lvgl / path).read_text(errors="replace"))
+
+        def definition(text, signature):  # the function's body, not a forward declaration of it: LVGL opens one on the next line
+            return c_function(text, signature + "\n{")
+
+        image = code("src/widgets/image/lv_image.c")
+        constructor = re.search(r"static void lv_image_constructor\([^)]*\)\s*\{.*?\n\}", image, re.S).group(0)
+        self.assertRegex(constructor, r"lv_point_set\(&img->pivot, LV_PCT\(50\), LV_PCT\(50\)\);")
+        self.assertRegex(constructor, r"img->rotation\s*=\s*0;")
+        rotation = definition(image, "void lv_image_set_rotation(lv_obj_t * obj, int32_t angle)")
+        for line in ("while(angle >= 3600) angle -= 3600;", "while(angle < 0) angle += 3600;",
+                     "if((uint32_t)angle == img->rotation) return;", "if(img->align > _LV_IMAGE_ALIGN_AUTO_TRANSFORM) {"):
+            with self.subTest(line):
+                self.assertIn(line, rotation)
+        self.assertIn("return img->rotation;", definition(image, "int32_t lv_image_get_rotation(lv_obj_t * obj)"))
+
+        anim = code("src/misc/lv_anim.c")
+        init = definition(anim, "void lv_anim_init(lv_anim_t * a)")
+        for line in ("a->duration = 500;", "a->start_value = 0;", "a->end_value = 100;", "a->repeat_cnt = 1;",
+                     "a->path_cb = lv_anim_path_linear;", "a->early_apply = 1;"):
+            with self.subTest(line):
+                self.assertIn(line, init)
+        self.assertIn("a->current_value = INT32_MIN;", definition(anim, "void lv_anim_set_values(lv_anim_t * a, int32_t start, int32_t end)"))
+        start = " ".join(definition(anim, "lv_anim_t * lv_anim_start(const lv_anim_t * a)").split())
+        for line in ("if(a->early_apply && (a->exec_cb || a->custom_exec_cb)) { remove_concurrent_anims(a); }",
+                     "lv_anim_t * new_anim = lv_ll_ins_head(anim_ll_p);", "lv_memcpy(new_anim, a, sizeof(lv_anim_t));",
+                     "new_anim->current_value = new_anim->path_cb(new_anim);",
+                     "if(new_anim->exec_cb) { new_anim->exec_cb(new_anim->var, new_anim->current_value); }"):
+            with self.subTest(line):
+                self.assertIn(line, start)
+        timer = " ".join(definition(anim, "static void anim_timer(lv_timer_t * param)").split())
+        for line in ("a->act_time += elaps;", "if(a->act_time > a->duration) a->act_time = a->duration;",
+                     "if(new_value != a->current_value) { a->current_value = new_value;",
+                     "if(a->exec_cb) a->exec_cb(a->var, new_value);", "if(a->act_time >= a->duration) { anim_completed_handler(a); }",
+                     "if(a->act_time == act_time_before_exec && act_time_original < a->duration * 2) {"):
+            with self.subTest(line):
+                self.assertIn(line, timer)
+        completed = " ".join(definition(anim, "static void anim_completed_handler(lv_anim_t * a)").split())
+        for line in ("a->repeat_cnt != LV_ANIM_REPEAT_INFINITE) { a->repeat_cnt--; }", "if(a->deleted_cb != NULL) a->deleted_cb(a);",
+                     "if(a->act_time > a->duration) over_time = a->act_time - a->duration;",
+                     "a->act_time = over_time - (int32_t)(a->repeat_delay);"):
+            with self.subTest(line):
+                self.assertIn(line, completed)
+        self.assertIn("if(anim->deleted_cb != NULL) anim->deleted_cb(anim);", definition(anim, "static void remove_anim(void * a)"))
+        delete = definition(anim, "bool lv_anim_delete(void * var, lv_anim_exec_xcb_t exec_cb)")
+        self.assertIn("if((a->var == var || var == NULL) && (a->exec_cb == exec_cb || exec_cb == NULL)) {", delete)
+        self.assertIn("remove_anim(a);", delete)
+        self.assertIn("state.timer = lv_timer_create(anim_timer, LV_DEF_REFR_PERIOD, NULL);", anim)
+        destructor = definition(code("src/core/lv_obj.c"), "static void lv_obj_destructor(const lv_obj_class_t * class_p, lv_obj_t * obj)")
+        self.assertIn("lv_anim_delete(obj, NULL);", destructor)
+        # And the fake says the same (the harness's own lines).
+        harness = HARNESS.read_text()
+        for line in ("a->duration = 500;", "a->repeat_cnt = 1;", "a->early_apply = 1;", "a->current_value = INT32_MIN;",
+                     "angle -= 3600;", "angle += 3600;", "if (new_value != a->current_value) {",
+                     "a->act_time = over_time - (int32_t)a->repeat_delay;", "lv_anims_of_deleted(o);"):
+            with self.subTest(fake=line):
+                self.assertIn(line, harness)
 
     def test_the_constants_the_fakes_log_are_lvgl_9_5_0s(self):
         printer = "#include <stddef.h>\n#include <stdio.h>\n#include \"lvgl.h\"\nint main(void) {\n" + "".join(

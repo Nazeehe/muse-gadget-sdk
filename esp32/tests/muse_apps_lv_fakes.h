@@ -29,7 +29,10 @@
  * an event at an object (a deleted one too) and set the objects' coordinates. A test can also touch the screen at a
  * point, move the finger and lift it, and run the animations' frames: the fake then does what LVGL 9.5.0's pointer
  * input does with that (lv_indev.c, lv_indev_scroll.c, lv_obj_scroll.c), from finding the object under the finger to a
- * scroll, a gesture or a click, and a fling's snap as an animation.
+ * scroll, a gesture or a click, and a fling's snap as an animation. The animations apps_lv.c starts itself (an image's spin)
+ * run as lv_anim.c runs them: copied into a list at lv_anim_start, stepped by each frame's animation timer (the path, the
+ * exec callback only when the value changes, a repeat), and deleted with lv_anim_delete or with their object (lv_obj_destructor),
+ * the deleted callback called each time.
  */
 
 #include <stdarg.h>
@@ -233,6 +236,56 @@ typedef struct {
     const void *reserved_2;
 } lv_image_dsc_t;
 
+/* lv_types.h and lv_anim.h: an animation (LV_USE_EXT_DATA is off in every Muse build, so it has no ext_data). lv_anim_start copies
+ * one into LVGL's list; apps_lv.c's path callback reads its times and values. */
+typedef struct _lv_anim_t lv_anim_t;
+typedef int32_t (*lv_anim_path_cb_t)(const lv_anim_t *);
+typedef void (*lv_anim_exec_xcb_t)(void *, int32_t);
+typedef void (*lv_anim_custom_exec_cb_t)(lv_anim_t *, int32_t);
+typedef void (*lv_anim_completed_cb_t)(lv_anim_t *);
+typedef void (*lv_anim_start_cb_t)(lv_anim_t *);
+typedef int32_t (*lv_anim_get_value_cb_t)(lv_anim_t *);
+typedef void (*lv_anim_deleted_cb_t)(lv_anim_t *);
+
+typedef struct {
+    int16_t x1;
+    int16_t y1;
+    int16_t x2;
+    int16_t y2;
+} lv_anim_bezier3_para_t;
+
+struct _lv_anim_t {
+    void *var;
+    lv_anim_exec_xcb_t exec_cb;
+    lv_anim_custom_exec_cb_t custom_exec_cb;
+    lv_anim_start_cb_t start_cb;
+    lv_anim_completed_cb_t completed_cb;
+    lv_anim_deleted_cb_t deleted_cb;
+    lv_anim_get_value_cb_t get_value_cb;
+    void *user_data;
+    lv_anim_path_cb_t path_cb;
+    int32_t start_value;
+    int32_t current_value;
+    int32_t end_value;
+    int32_t duration;
+    int32_t act_time;
+    uint32_t reverse_delay;
+    uint32_t reverse_duration;
+    uint32_t repeat_delay;
+    uint32_t repeat_cnt;
+    union _lv_anim_path_para_t {
+        lv_anim_bezier3_para_t bezier3;
+    } parameter;
+    uint32_t last_timer_run;
+    uint32_t pause_time;
+    uint32_t pause_duration;
+    uint8_t is_paused : 1;
+    uint8_t reverse_play_in_progress : 1;
+    uint8_t run_round : 1;
+    uint8_t start_cb_called : 1;
+    uint8_t early_apply : 1;
+};
+
 /* ---- lvgl.h: constants ---- */
 
 #define LV_ATTRIBUTE_EXTERN_DATA
@@ -251,6 +304,7 @@ LV_FONT_DECLARE(lv_font_unscii_16)
 #define LV_OPA_COVER 255
 #define LV_ANIM_OFF false
 #define LV_ANIM_ON true
+#define LV_ANIM_REPEAT_INFINITE 0xFFFFFFFF
 
 /* ---- lvgl.h: functions ---- */
 
@@ -315,6 +369,19 @@ void lv_bar_set_value(lv_obj_t *obj, int32_t value, lv_anim_enable_t anim);
 void lv_image_set_src(lv_obj_t *obj, const void *src);
 void lv_image_set_scale(lv_obj_t *obj, uint32_t zoom);
 void lv_image_set_inner_align(lv_obj_t *obj, lv_image_align_t align);
+void lv_image_set_rotation(lv_obj_t *obj, int32_t angle);
+int32_t lv_image_get_rotation(lv_obj_t *obj);
+
+void lv_anim_init(lv_anim_t *a);
+void lv_anim_set_var(lv_anim_t *a, void *var);
+void lv_anim_set_exec_cb(lv_anim_t *a, lv_anim_exec_xcb_t exec_cb);
+void lv_anim_set_values(lv_anim_t *a, int32_t start, int32_t end);
+void lv_anim_set_duration(lv_anim_t *a, uint32_t duration);
+void lv_anim_set_repeat_count(lv_anim_t *a, uint32_t cnt);
+void lv_anim_set_path_cb(lv_anim_t *a, lv_anim_path_cb_t path_cb);
+void lv_anim_set_deleted_cb(lv_anim_t *a, lv_anim_deleted_cb_t deleted_cb);
+lv_anim_t *lv_anim_start(const lv_anim_t *a);
+bool lv_anim_delete(void *var, lv_anim_exec_xcb_t exec_cb);
 
 void *lv_event_get_user_data(lv_event_t *e);
 lv_event_code_t lv_event_get_code(lv_event_t *e);

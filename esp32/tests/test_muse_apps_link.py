@@ -685,6 +685,16 @@ class GuideAndSkill(unittest.TestCase):
             with self.subTest(pattern):
                 self.assertRegex(images, pattern)
 
+    def test_guide_states_the_spin_cap(self):
+        # connected apps Task 1, fix round 0 (R1): Images says how large a picture may spin (D12: from APPS_SPIN_SIDE_MAX), why, and
+        # what to do with a larger one. test_muse_apps_ui.py's test_spin_is_capped_at_200_px_drawn has the error itself.
+        side_max = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
+        images = " ".join(guide_section(GUIDE.read_text(), "Images").split())
+        for pattern in (rf"`spin` is for a picture of at most {side_max} x {side_max} px on screen", r"times `scale`",
+                        r"about 1 µs for every pixel drawn", r"show it still and spin a smaller copy"):
+            with self.subTest(pattern):
+                self.assertRegex(images, pattern)
+
     def test_guide_states_the_layout_and_alarm_facts(self):
         # Facts an app goes wrong without, with no error to tell it (fix round 1, A and B), each still true of the code and said
         # in the guide in words a reader finds: the guide's text for each must match every pattern of its fact.

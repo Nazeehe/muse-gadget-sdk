@@ -1,11 +1,11 @@
 -- Copyright (c) Meta Platforms, Inc. and affiliates.
 -- SPDX-License-Identifier: Apache-2.0
 
--- The spin fixture (connected apps Task 1): a 400 px disc, an RGB565A8 image with a circular alpha, spinning at 33 turns a
--- minute, and a button over it. The board's spin gate reads a bench build's "spin frame <ms> ms" lines while it spins, and
--- taps the button: each tap counts on the button and prints "tap <n> <time.mono()>", so the host can time its answer.
--- "spin", "rotation" and "scale" change the disc, and "state" says what get says. The screen stays lit while it is in front.
--- Nothing here is an example of how to write an app.
+-- The spin fixture (connected apps Task 1): a 200 px disc (the most an image may spin), an RGB565A8 image with a circular
+-- alpha, spinning at 33 turns a minute, and a button under it. The board's spin gate reads a bench build's
+-- "spin frame <ms> ms" lines while it spins, and taps the button: each tap counts on the button and prints
+-- "tap <n> <time.mono()>", so the host can time its answer. "spin", "rotation" and "scale" change the disc, and "state"
+-- says what get says. The screen stays lit while it is in front. Nothing here is an example of how to write an app.
 local app = {}
 
 local disc = ui.image{src = "disc.bin", spin = 33}

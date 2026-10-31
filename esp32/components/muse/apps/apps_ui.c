@@ -740,6 +740,19 @@ static void read_src(const ctx_t *x, prop_t p, int idx, change_t *c) {
     fail_kind(L, x->kind, "src '%s' is not one of this app's images (manifest.json \"files\")", show(&shown, s, len));
 }
 
+/* Raises unless a picture of w x h px at scale percent may spin: both sides as drawn, to the nearest px (as apps_lv.c's
+ * scaled_side has them), at most APPS_SPIN_SIDE_MAX. The board's spin gate (connected apps Task 1) drew a turned picture at
+ * about 1 us a pixel each step: 200 px held its frame rate, 300 and 400 px didn't, and taps waited behind them. Every image
+ * that may spin comes through here, whatever its src. */
+static void check_spin_side(lua_State *L, int kind, uint16_t w, uint16_t h, uint16_t scale) {
+    uint32_t drawn_w = ((uint32_t)w * scale + 50) / 100;
+    uint32_t drawn_h = ((uint32_t)h * scale + 50) / 100;
+    if (drawn_w > APPS_SPIN_SIDE_MAX || drawn_h > APPS_SPIN_SIDE_MAX) {
+        fail_kind(L, kind, "spin: an image may spin only up to %d x %d px on screen (this one is %d x %d)", APPS_SPIN_SIDE_MAX,
+                  APPS_SPIN_SIDE_MAX, (int)drawn_w, (int)drawn_h);
+    }
+}
+
 /* The value at idx (a copy on the stack) as property p. */
 static void read_prop(const ctx_t *x, prop_t p, int idx, change_t *c) {
     switch (prop_info[p].type) {
@@ -804,6 +817,16 @@ static void read_props(const ctx_t *x, int t, change_t *c) {
     }
     if (x->kind == APPS_W_IMAGE && x->creating && (c->set & BIT(P_SRC)) == 0) {
         fail_kind(L, x->kind, "src is required (a .bin image of this app's manifest.json \"files\")");
+    }
+    if (x->kind == APPS_W_IMAGE) {
+        /* The call that would leave a picture spinning past the cap is the error: a spin given, or a scale or src while it
+         * spins. What a set leaves is checked: its own values, else the widget's. */
+        int64_t spin = (c->set & BIT(P_SPIN)) != 0 ? c->v[P_SPIN] : (x->cur != NULL ? x->cur->spin : 0);
+        int64_t src = (c->set & BIT(P_SRC)) != 0 ? c->v[P_SRC] : (x->cur != NULL ? x->cur->image : -1);
+        int64_t scale = (c->set & BIT(P_SCALE)) != 0 ? c->v[P_SCALE] : (x->cur != NULL ? x->cur->scale : 100);
+        if (spin != 0 && (c->set & (BIT(P_SPIN) | BIT(P_SCALE) | BIT(P_SRC))) != 0 && src >= 0 && src < x->ui->n_assets) {
+            check_spin_side(L, x->kind, x->ui->assets[src].w, x->ui->assets[src].h, (uint16_t)scale);
+        }
     }
 }
 

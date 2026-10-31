@@ -721,20 +721,77 @@ class UiTest(UiTestCase):
             f"false\tui.image: {turns}, got string",
         ])
 
+    def test_spin_is_capped_at_200_px_drawn(self):
+        # connected apps Task 1, fix round 0 (R1): an image spins only while both its sides as drawn (the header's w and h times scale,
+        # to the nearest px as apps_lv.c's scaled_side has it) are at most APPS_SPIN_SIDE_MAX. The call that would break that is the
+        # error: a create, a set of spin, or a set of scale or src while it spins. spin = 0 always goes, and a refused set changes
+        # nothing.
+        side_max = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
+        self.assertEqual(side_max, 200)
+        lines = self.lua_lines("""
+            local function try(f, ...) local ok, err = pcall(f, ...) print(ok, err) end
+            local a = ui.image{src = "s200.bin", spin = 33}
+            print(a:get("spin"))
+            try(ui.image, {src = "w201.bin", spin = 33})
+            local b = ui.image{src = "w201.bin"}
+            try(b.set, b, {spin = 10})
+            print(b:get("spin"))
+            try(ui.image, {src = "s120.bin", scale = 200, spin = 33})
+            local c = ui.image{src = "s120.bin", scale = 200}
+            try(c.set, c, {spin = 1})
+            local d = ui.image{src = "s150.bin", spin = 20}
+            try(d.set, d, {scale = 150})
+            print(d:get("scale"), d:get("spin"))
+            d:set{scale = 133}
+            print(d:get("scale"))
+            try(d.set, d, {scale = 134})
+            d:set{scale = 150, spin = 0}
+            print(d:get("scale"), d:get("spin"))
+            try(a.set, a, {src = "w201.bin"})
+            print(a:get("src"), a:get("spin"))
+            a:set{src = "w201.bin", spin = 0}
+            b:set{spin = 0}
+            local e = ui.image{src = "w201.bin", scale = 400, spin = 0}
+            print(a:get("src"), b:get("spin"), e:get("spin"))
+            local f = ui.image{src = "s120.bin", scale = 400}
+            f:set{src = "s50.bin", spin = 60}
+            print(f:get("scale"), f:get("spin"))
+        """, files={"s200.bin": lvgl_image(200, 200), "w201.bin": lvgl_image(201, 200), "s120.bin": lvgl_image(120, 120),
+                    "s150.bin": lvgl_image(150, 150), "s50.bin": lvgl_image(50, 50)})
+
+        def refused(w, h):
+            return f"false\tui.image: spin: an image may spin only up to {side_max} x {side_max} px on screen (this one is {w} x {h})"
+
+        self.assertEqual(lines, [
+            "33",
+            refused(201, 200),
+            refused(201, 200), "0",
+            refused(240, 240),
+            refused(240, 240),
+            refused(225, 225), "100\t20",  # a refused set changed nothing
+            "133",  # 150 px at 133% is 199.5, drawn as 200
+            refused(201, 201),
+            "150\t0",
+            refused(201, 200), "s200.bin\t33",
+            "w201.bin\t0\t0",
+            "400\t60",  # 50 px at 400% is 200
+        ])
+
     def test_the_spin_fixture(self):  # connected apps Task 1: the board's spin gate's app, and its disc
         disc = (FIXTURES / "spin/disc.bin").read_bytes()
         magic, cf, flags, w, h, stride, _ = struct.unpack_from("<BBHHHHH", disc)
-        self.assertEqual((magic, cf, flags, w, h, stride), (0x19, 0x14, 0, 400, 400, 800), "a 400 x 400 RGB565A8 image")
-        self.assertEqual(len(disc), 12 + 400 * 400 * 3)
-        self.assertLess(len(disc), 512 * 1024, "under the 512 KB of an image")
-        alpha = disc[12 + 400 * 400 * 2:]
+        # 200 x 200: the most an image may spin (APPS_SPIN_SIDE_MAX, fix round 0); the gate's 400 px runs are in task-1-report.md.
+        side = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
+        self.assertEqual((magic, cf, flags, w, h, stride), (0x19, 0x14, 0, side, side, side * 2), "a 200 x 200 RGB565A8 image")
+        self.assertEqual(len(disc), 12 + side * side * 3)
+        alpha = disc[12 + side * side * 2:]
 
         def a(x, y):
-            return alpha[y * 400 + x]
+            return alpha[y * side + x]
 
-        self.assertEqual([a(0, 0), a(399, 0), a(0, 399), a(399, 399), a(30, 30), a(370, 370)], [0] * 6, "the corners are clear")
-        self.assertEqual([a(200, 200), a(200, 5), a(5, 200), a(394, 200), a(200, 394)], [255] * 5, "the disc is whole")
-        colours = {disc[12 + 2 * (y * 400 + x):14 + 2 * (y * 400 + x)] for x in range(100, 300, 7) for y in range(100, 300, 7)}
+        self.assertEqual([a(0, 0), a(199, 0), a(0, 199), a(199, 199), a(15, 15), a(185, 185)], [0] * 6, "the corners are clear")
+        self.assertEqual([a(100, 100), a(100, 3), a(3, 100), a(196, 100), a(100, 196)], [255] * 5, "the disc is whole")
+        colours = {disc[12 + 2 * (y * side + x):14 + 2 * (y * side + x)] for x in range(50, 150, 4) for y in range(50, 150, 4)}
         self.assertGreater(len(colours), 8, "the disc has detail to show its angle")
         run = self.host(FIXTURES / "spin", script=['tap "0"', 'tap "1"', 'message state', 'message spin {"rpm": 0}',
                                                    'message rotation {"deg": 90}', 'message spin {"rpm": 99}',

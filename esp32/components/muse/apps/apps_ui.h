@@ -47,6 +47,9 @@
  *   clockwise about its centre); spin 0..APPS_SPIN_RPM_MAX (turns a minute: the apply step turns the picture
  *   clockwise at that rate from the angle it is at, and 0 stops it where it got to); min and max
  *   +-APPS_UI_VALUE_MAX; value to [min, max]. An infinity clamps to the end of the range, and NaN is an error.
+ *   An image spins only while both its sides as drawn (the header's w and h times scale, to the nearest px) are at
+ *   most APPS_SPIN_SIDE_MAX: a create or a set that would leave a larger one spinning (a spin given, or a scale or
+ *   src while it spins) is an error, and spin = 0 always goes.
  *   hidden and wrap are booleans. text is a string
  *   or a number (as tostring makes it) of at most APPS_UI_TEXT_MAX bytes, valid UTF-8 (apps_json_utf8_len) and
  *   with no NUL byte; "" is no text. font is one of sans14 sans16 sans20 sans28 mono8 mono16 digits48 digits96
@@ -85,6 +88,7 @@
  *   ui.<kind>: parent can only be set when the widget is created
  *   ui.image: src is required (a .bin image of this app's manifest.json "files") | src '<s>' is not one of this
  *             app's images (manifest.json "files")
+ *   ui.image: spin: an image may spin only up to 200 x 200 px on screen (this one is <w> x <h>)
  *   ui.<kind>: unknown method '<name>' (valid: set, get, on, delete)
  *   ui.<kind>: unknown event '<s>' (valid: tap, long_press, press, release)
  *   ui.<kind>: handler for '<event>' must be a function (or nil to remove it), got <type>
@@ -166,6 +170,7 @@ typedef struct lua_State lua_State;
 #define APPS_UI_BOX_DEPTH_MAX 4
 #define APPS_UI_ASSETS_MAX 32      /* the package's most files */
 #define APPS_SPIN_RPM_MAX 60       /* ui.image's spin: the most turns a minute */
+#define APPS_SPIN_SIDE_MAX 200     /* ui.image spins only up to this many px a side as drawn (scale applied): the spin gate */
 #define APPS_COLOR_NONE 0xFF000000u
 
 typedef enum { APPS_W_LABEL, APPS_W_BUTTON, APPS_W_BOX, APPS_W_ARC, APPS_W_BAR, APPS_W_IMAGE } apps_wkind_t;

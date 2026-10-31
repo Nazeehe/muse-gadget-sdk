@@ -1219,9 +1219,15 @@ static void update_carousel(void) {
     }
 }
 
-/* Every frame of a swipe, a fling, the snap's animation and an elastic end. */
+/* Every frame of a swipe, a fling, the snap's animation and an elastic end. Those go on after a close (LVGL animates a fling to its
+ * snap point, 200 to 400 ms, and stops for no hide, no tap and no hidden parent; a drag may still be under the finger when an alarm
+ * or a voice turn closes the card): closed, the launcher asks nothing of the icons, so it holds none until it is shown again, which
+ * makes the carousel again. Here, not in update_carousel: make_carousel runs that before the launcher is shown. */
 static void on_carousel_scroll(lv_event_t *e) {
     (void)e;
+    if (!s_launcher_shown) {
+        return;
+    }
     update_carousel();
 }
 

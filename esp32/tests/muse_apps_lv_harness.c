@@ -209,8 +209,10 @@ void apps_port_sha256(const void *data, size_t len, uint8_t out[32]) {
 static void (*io_fn[IO_JOBS])(void *arg);
 static void *io_arg[IO_JOBS];
 static int io_queued;  /* submitted and not run */
+static int io_submits; /* every submit, taken or not */
 
 bool apps_io_submit(void (*fn)(void *arg), void *arg) {
+    io_submits++;
     if (io_queued == IO_JOBS) {
         return false;
     }
@@ -4988,6 +4990,54 @@ static void launcher_survives_a_create_that_fails(void) {
     }
 }
 
+/* Fix round 1, I1: a fling's snap animation (or an elastic end, or a drag still under the finger) goes on scrolling the row after
+ * the launcher closes, whichever way it closes. Those scrolls ask nothing of the icons: no load is submitted, no block is held while
+ * the launcher is closed, no image is given a source, and the hidden card isn't touched. */
+static void a_scroll_after_a_close_asks_nothing(void) {
+    static const char *const ways[] = {"a tap on the card", "a pick", "hide_cards"};
+    const apps_lv_app_t apps[] = {{"a1", "A1", "icon.bin"}, {"a2", "A2", "icon.bin"}, {"a3", "A3", "icon.bin"}, {"a4", "A4", "icon.bin"},
+                                  {"a5", "A5", "icon.bin"}, {"a6", "A6", "icon.bin"}, {"a7", "A7", "icon.bin"}, {"a8", "A8", "icon.bin"}};
+    for (size_t w = 0; w < ARRAY_LEN(ways); w++) {
+        cards_scene();
+        for (size_t i = 0; i < ARRAY_LEN(apps); i++) {
+            put_icon(apps[i].id, CF_RGB565A8, 120, 120, (uint8_t)(0x10 + i));
+        }
+        apps_lv_show_launcher(apps, 8, NULL, pick);
+        int row = carousel_row(), card = fake_parent(row);
+        run_io();
+        apps_lv_launcher_poll();
+        fake_scroll(row, APPS_LV_ITEM_PITCH / 2);  /* the fling begins: its animation is on its way to a5 */
+        CHECK(strcmp(faces(), "IITTTTTT") == 0 && held > 0, "%s: icons up before the close: %s", ways[w], faces());
+        if (w == 0) {
+            fake_tap(card);
+        } else if (w == 1) {
+            fake_tap(carousel_item(1));
+            CHECK(picks == 1 && strcmp(picked, "a2") == 0, "%s: picked: '%s'", ways[w], picked);
+        } else {
+            apps_lv_hide_cards();  /* an app to the front (an alarm), or a voice turn */
+        }
+        CHECK(!apps_lv_launcher_shown(), "%s: closed", ways[w]);
+        run_io();
+        int submits = io_submits, reads = store_reads;
+        const char *name = name_shown();
+        char before[32];
+        snprintf(before, sizeof before, "%s", name);
+        log_clear();
+        for (int k = 1; k <= 8; k++) {  /* the animation's steps, on to the last app and an elastic end past it */
+            fake_scroll(row, k * 5 * APPS_LV_ITEM_PITCH / 8);
+            apps_lv_launcher_poll();
+        }
+        CHECK(io_submits == submits && io_queued == 0 && store_reads == reads, "%s: %d submits and %d reads after the close", ways[w],
+              io_submits - submits, store_reads - reads);
+        CHECK(log_peek()[0] == '\0', "%s: the hidden carousel was touched:\n%s", ways[w], log_peek());
+        CHECK(strcmp(name_shown(), before) == 0 && strcmp(faces(), "TTTTTTTT") == 0, "%s: %s %s", ways[w], name_shown(), faces());
+        CHECK_SOURCES();
+        run_io();
+        CHECK(held == 0, "%s: %zu bytes of icons held while the launcher is closed", ways[w], held);
+        LAUNCHER_END();
+    }
+}
+
 static void crash_card_text_and_tap(void) {
     cards_scene();
     apps_lv_show_crash("Timer", "main.lua:3: boom");
@@ -5117,6 +5167,7 @@ int main(int argc, char **argv) {
         {"launcher_no_swipe_closes_it", launcher_no_swipe_closes_it},
         {"launcher_keeps_its_own_copy", launcher_keeps_its_own_copy},
         {"launcher_survives_a_create_that_fails", launcher_survives_a_create_that_fails},
+        {"a_scroll_after_a_close_asks_nothing", a_scroll_after_a_close_asks_nothing},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},

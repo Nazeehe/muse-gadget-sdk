@@ -352,6 +352,9 @@ class HarnessTest(unittest.TestCase):
     def test_the_launcher_survives_a_create_that_fails(self):
         self.run_case("launcher_survives_a_create_that_fails")
 
+    def test_a_scroll_after_a_close_asks_nothing(self):  # fix round 1, I1: a snap animation after a close loads no icon
+        self.run_case("a_scroll_after_a_close_asks_nothing")
+
     def test_the_launchers_records_are_in_psram_and_the_rows_are_gone(self):
         # X12 and the follow-up round's internal RAM: the carousel's copy of the list (32 ids, names and icon paths) and its
         # objects are one static of the LVGL task's, in PSRAM; the old card's row count is gone.

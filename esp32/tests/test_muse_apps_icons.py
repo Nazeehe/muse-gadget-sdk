@@ -100,6 +100,9 @@ class Icons(unittest.TestCase):
     def test_list_change_drops_stale_icons(self):  # Review Focus 2: drop_all while a load is in flight; never shown
         self.run_case("list_change_drops_stale_icons")
 
+    def test_keep_frees_all_but_the_kept(self):  # Task 6a fix round 1 (I1): the hold keeps the drawn icons, frees and orphans the rest
+        self.run_case("keep_frees_all_but_the_kept")
+
     def test_bad_icon_file_is_a_tile(self):  # not square, too big, not an image, cut short, missing: a W line, a tile
         self.run_case("bad_icon_file_is_a_tile")
 

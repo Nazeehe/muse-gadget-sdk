@@ -47,7 +47,8 @@
  *
  * A drop. The generation goes up; every load still lent is orphaned, and every other slot is emptied with its block. A LOADING slot
  * of an older generation matches no want: an app asked for again after a drop gets a load of its own, and the old one, once its job
- * has stored DONE, is emptied (with no block: its job freed it).
+ * has stored DONE, is emptied (with no block: its job freed it). A keep (the launcher's hold) is a drop that spares the ready slots it
+ * is given: they move to the new generation, and the window is them alone, so nothing is asked for after it.
  *
  * Failures. A file that isn't an icon, or can't be read, is FAILED: its tile, not read again while it stays in the window. A block
  * the floor or the heap refused (the store's APPS_STORE_MSG_NO_MEMORY) is a shortage that passes: its slot is emptied, and no load is
@@ -298,11 +299,27 @@ bool apps_icons_poll(void) {
     return news;
 }
 
-void apps_icons_drop_all(void) {
+void apps_icons_keep(const char *const *ids, int n) {
+    /* The window becomes the kept icons: the ready ones given, in the order given. */
+    S.want_n = 0;
+    for (int i = 0; ids != NULL && i < n; i++) {
+        for (int k = 0; ids[i] != NULL && k < APPS_ICONS_SLOTS && S.want_n < APPS_ICONS_WINDOW; k++) {
+            const slot_t *s = &S.slot[k];
+            if (s->state == READY && strcmp(s->id, ids[i]) == 0 && !in_window(s->id)) {
+                wanted_t *w = &S.want[S.want_n++];
+                memcpy(w->id, s->id, sizeof w->id);
+                memcpy(w->icon, s->icon, sizeof w->icon);
+            }
+        }
+    }
     S.gen++;
     for (int i = 0; i < APPS_ICONS_SLOTS; i++) {
         slot_t *s = &S.slot[i];
         if (s->state == EMPTY) {
+            continue;
+        }
+        if (s->state == READY && wanted(s->id, s->icon)) {
+            s->gen = S.gen;  /* kept, in the new generation: a want after this finds it */
             continue;
         }
         unsigned lent = HAND_LENT;
@@ -314,6 +331,9 @@ void apps_icons_drop_all(void) {
         }
         release(s);  /* ready, failed, or a load that has ended: its block goes now */
     }
-    S.want_n = 0;
     S.news = false;
+}
+
+void apps_icons_drop_all(void) {
+    apps_icons_keep(NULL, 0);
 }

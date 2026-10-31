@@ -6394,8 +6394,9 @@ static void launch_holds_the_launcher_until_the_first_frame(void) {
 
 /* While the launcher holds it takes no input and changes nothing: a tap on the app at the centre picks nothing more, a tap on a side app
  * brings nothing to the centre, a drag along the row scrolls nothing (the row doesn't scroll while it holds), and a swipe up from the
- * bottom edge, a tap on the card and a slide on it close nothing. Its icons stay as they are: none asked for, none dropped, and those
- * that come from the worker meanwhile aren't swapped in for their tiles. The close then drops them all, those that came too. */
+ * bottom edge, a tap on the card and a slide on it close nothing. Its icons on the screen stay as they are, none is asked for, and the
+ * two loads that were in flight at the pick (h3, h5: off the screen) end freed on the worker, never swapped in (fix round 1). The close
+ * then drops the rest. */
 static void no_input_while_the_launch_holds(void) {
     char before[8];
     int drawn;
@@ -6420,7 +6421,7 @@ static void no_input_while_the_launch_holds(void) {
           "nor a tap on the card");
     slide_from(SCREEN_CENTRE, 360, 40, 0, 4);
     CHECK(apps_lv_launcher_holding() && picks == 1, "nor a slide on it");
-    run_io();  /* the two icons that were loading come */
+    run_io();  /* the two loads that were in flight end: orphaned at the pick, they free their blocks */
     for (int frame = 0; frame < 3; frame++) {
         apps_lv_launcher_poll();
     }
@@ -6514,6 +6515,53 @@ static void a_touch_the_launcher_closed_under_does_nothing(void) {
     CHECK(!apps_lv_launcher_shown() && log_count("add_flag") == 0 && log_count("remove_flag") == 0,
           "the swipe up closes nothing again\n%s", log_peek());
     LAUNCHER_END();
+}
+
+/* Task 6a's fix round 1 (I1): a pick must not leave the launcher's own memory in the way of the launch's admission. Its hold keeps only the
+ * icons it draws on the screen (the centre and its two neighbours, at rest) and frees the rest at once: a ready icon off the screen, and
+ * a load in flight, which frees its block on the worker as it ends. It asks for nothing more while it holds: no load, however many frames
+ * pass. Eight apps, the pick in the middle: of four icons ready (the centre, its neighbours, one two away) and one loading, three are
+ * held. The faces on the screen don't change (the same descriptors); the one off it is its tile again. */
+static void the_hold_drops_offscreen_icons(void) {
+    cards_scene();
+    static const apps_lv_app_t eight[] = {{"d1", "D1", "icon.bin"}, {"d2", "D2", "icon.bin"}, {"d3", "D3", "icon.bin"},
+                                          {"d4", "D4", "icon.bin"}, {"d5", "D5", "icon.bin"}, {"d6", "D6", "icon.bin"},
+                                          {"d7", "D7", "icon.bin"}, {"d8", "D8", "icon.bin"}};
+    for (int i = 0; i < 8; i++) {
+        put_icon(eight[i].id, CF_RGB565A8, 120, 120, (uint8_t)(0x20 + i));
+    }
+    apps_lv_show_launcher(eight, 8, NULL, pick);
+    fake_scroll(carousel_row(), 4 * APPS_LV_ITEM_PITCH);  /* at rest on d5: the window is d5, d6, d4, d7, d3 */
+    for (int round = 0; round < 3; round++) {
+        run_io();
+        apps_lv_launcher_poll();
+    }
+    CHECK(strcmp(faces(), "TTTIIIIT") == 0 && io_queued == 1, "d4 to d7 in, d3 on its way: %s, %d queued", faces(), io_queued);
+    const size_t one = held / 4;
+    CHECK(held == 4 * one && one > 43200, "four icons held: %zu bytes", held);
+    const void *shown[3];
+    for (int k = 3; k <= 5; k++) {
+        shown[k - 3] = fake_obj(item_parts(carousel_item(k)).image)->src;
+    }
+    const int submits = io_submits;
+    lv_point_t c = face_at(4);
+    CHECK(fake_tap_at(c.x, c.y) == carousel_item(4) && picks == 1 && strcmp(picked, "d5") == 0 && apps_lv_launcher_holding(),
+          "d5 is picked, and the launcher holds: %d '%s'", picks, picked);
+    CHECK(strcmp(faces(), "TTTIIITT") == 0, "the screen's three icons stay, the one off it is its tile: %s", faces());
+    for (int k = 3; k <= 5; k++) {
+        CHECK(fake_obj(item_parts(carousel_item(k)).image)->src == shown[k - 3], "item %d draws the same icon", k);
+    }
+    CHECK(held == 3 * one, "the off-screen icon freed at once: %zu bytes held, three icons are %zu", held, 3 * one);
+    CHECK_SOURCES();
+    run_io();  /* d3's load, orphaned, ends on the worker */
+    CHECK(held == 3 * one, "the load in flight freed its own block: %zu bytes held", held);
+    for (int frame = 0; frame < 5; frame++) {
+        apps_lv_launcher_poll();
+    }
+    run_io();
+    CHECK(io_submits == submits && held == 3 * one && strcmp(faces(), "TTTIIITT") == 0,
+          "nothing asked for while it holds: %d more loads, %zu bytes held, %s", io_submits - submits, held, faces());
+    LAUNCHER_END();  /* the close frees the three */
 }
 
 static void crash_card_text_and_tap(void) {
@@ -6658,6 +6706,7 @@ int main(int argc, char **argv) {
         {"a_tap_on_the_background_still_closes", a_tap_on_the_background_still_closes},
         {"a_slide_on_an_app_opens_nothing", a_slide_on_an_app_opens_nothing},
         {"centre_is_clearly_larger", centre_is_clearly_larger},
+        {"the_hold_drops_offscreen_icons", the_hold_drops_offscreen_icons},
         {"launch_holds_the_launcher_until_the_first_frame", launch_holds_the_launcher_until_the_first_frame},
         {"no_input_while_the_launch_holds", no_input_while_the_launch_holds},
         {"the_hold_times_out", the_hold_times_out},

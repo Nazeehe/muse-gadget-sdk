@@ -220,9 +220,11 @@ bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status
 void apps_task_launch(const char *id, bool front);
 
 /* Any task: a launch apps_task_launch asked for was refused before its app began (the I/O worker's word for muse_apps_launch's
- * job: no such app, or no room to load it; apps_task.c says it for the refusals it sees itself). The LVGL task's glue closes the
- * launcher that holds for the pick at its next frame. A run that began and failed isn't a refusal: its end closes the launcher. */
-void apps_task_launch_refused(void);
+ * job: no such app, or no room to load it; apps_task.c says it for the refusals it sees itself), why in the words it was logged with
+ * (NULL: unsaid). The LVGL task's glue closes the launcher that holds for the pick at its next frame. A refusal for want of memory
+ * (an admission's APPS_MSG_SHORT_*, or "out of memory: ...") it also tries once more, without the launcher's icons. A run that began
+ * and failed isn't a refusal: its end closes the launcher. */
+void apps_task_launch_refused(const char *why);
 
 /*
  * apps_task_run_by_id for Link's app.send (apps_control.c, on the I/O worker): behind, no settle, and the wait is at most bound_ms,

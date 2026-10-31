@@ -80,3 +80,9 @@ bool apps_icons_poll(void);
 /* The launcher's close, a change of the list, a voice turn: frees every ready icon and forgets the window. A load in flight frees
  * its block when it ends. */
 void apps_icons_drop_all(void);
+
+/* The launcher's hold for a launch (apps_lv.h): keeps the ready icons of ids[0..n-1] (those it draws: their descriptors stay valid) and
+ * frees everything else as apps_icons_drop_all does: every other ready icon, the failed ones and the loads that ended now, and each
+ * load in flight as it ends, on the worker. The window becomes the kept icons, so nothing is asked for after it (a poll loads nothing),
+ * and a generation starts, as at a drop. An id that isn't ready, unknown or NULL keeps nothing; apps_icons_drop_all keeps none. */
+void apps_icons_keep(const char *const *ids, int n);

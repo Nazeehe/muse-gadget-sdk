@@ -473,6 +473,12 @@ class GuideAndSkill(unittest.TestCase):
         wait_s = header_number("apps_port.h", "APPS_PORT_SNAPSHOT_WAIT_MS") / 1000
         tx_margin_kb = define_kb(MAIN / "noise_tunnel_internal.h", "NOISE_TX_DMA_RESERVE_BYTES")
         path_max = header_number("apps_pkg.h", "APPS_PATH_MAX")
+        # Task 6a's fix round 1 (I1): what the launcher's icons hold, open and during a launch's hold.
+        icons_window = header_number("apps_icons.h", "APPS_ICONS_WINDOW")
+        icons_in_flight = header_number("apps_icons.h", "APPS_ICONS_IN_FLIGHT")
+        icon_px = header_number("apps_pkg.h", "APPS_ICON_MAX_PX")
+        self.assertIn("#define APPS_ICON_MAX_BYTES (12 + APPS_ICON_MAX_PX * APPS_ICON_MAX_PX * 3)", (APPS / "apps_pkg.h").read_text())
+        icon_bytes = 12 + icon_px * icon_px * 3
         table = {}
         for line in (ROOT / "partitions_muse_apps.csv").read_text().splitlines():
             cells = [c.strip() for c in line.split(",")]
@@ -496,7 +502,11 @@ class GuideAndSkill(unittest.TestCase):
                 f"under the Link's {tx_margin_kb} KB TX margin",
                 f"`apps`, a {apps_size // (1024 * 1024)} MB FAT at `{apps_offset:#X}`".replace("0X", "0x"),
                 f"`apps_nvs`, {kb(nvs_size)} KB at `{nvs_offset:#X}`".replace("0X", "0x"),
-                f"at most {path_max} characters"):
+                f"at most {path_max} characters",
+                f"While the launcher is open its icons are in PSRAM too, through the same floor: up to {icons_window} of at most "
+                f"{icon_bytes:,} bytes each (`APPS_ICONS_WINDOW`, `APPS_ICON_MAX_BYTES`) and {icons_in_flight} more loading; a pick keeps "
+                "only the 3 on the screen until the app's first frame, and a launch refused for memory closes the launcher, which frees "
+                "them, and is tried once more."):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
         kconfig = " ".join((MUSE / "Kconfig").read_text().split())

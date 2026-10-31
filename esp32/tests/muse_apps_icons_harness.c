@@ -655,6 +655,81 @@ static void list_change_drops_stale_icons(void) {
 
 /* A file that isn't an icon (not square, past 160 px, past the bytes an icon may have, not an image, cut short, compressed,
  * missing) is a tile, with one W line, and isn't read again while it stays in the window; the others in the window show. */
+/* Task 6a's fix round 1 (I1): apps_icons_keep, the launcher's hold for a launch. It keeps the ready icons it is given (the same
+ * descriptors) and frees everything else at once: a ready icon it isn't given, a load that ended and wasn't adopted, a failed one; a load
+ * in flight, queued or in the middle of its read, frees its block on the worker as it ends, never shown. An id given that isn't ready is
+ * no exception. After it nothing is asked for, however many polls come. It starts a generation, as a drop does: an app wanted again
+ * while its orphaned load still runs gets a load of its own, and its icon, not a tile. */
+static void keep_frees_all_but_the_kept(void) {
+    for (int i = 0; i < 6; i++) {
+        put_icon(APPS[i], 8, (uint8_t)(0x30 + i));
+    }
+    const char *four[] = {"aa", "bb", "cc", "dd"};
+    apps_icons_want(four, ICON, 4);
+    settle();
+    CHECK(shows("aa", 8, 0x30) && shows("bb", 8, 0x31) && shows("cc", 8, 0x32) && shows("dd", 8, 0x33), "four show");
+    const lv_image_dsc_t *a = apps_icons_get("aa"), *b = apps_icons_get("bb");
+
+    /* ee in the middle of its read, ff queued behind it; dd left the window. */
+    const char *with_two[] = {"aa", "bb", "cc", "ee", "ff"};
+    apps_icons_want(with_two, ICON, 5);
+    CHECK(jobs_waiting() == 2, "ee and ff are asked for: %d", jobs_waiting());
+    gate_close();
+    jobs_start();
+    gate_wait_entered();
+    CHECK(atomic_load(&blocks_held) == 4, "aa, bb, cc, and ee's read: %ld", atomic_load(&blocks_held));
+    const char *keep[] = {"aa", "bb", "ee"};
+    apps_icons_keep(keep, 3);
+    CHECK(atomic_load(&blocks_held) == 3, "cc freed at once: %ld held", atomic_load(&blocks_held));
+    CHECK(apps_icons_get("aa") == a && apps_icons_get("bb") == b && shows("aa", 8, 0x30) && shows("bb", 8, 0x31),
+          "aa and bb keep their descriptors");
+    CHECK(apps_icons_get("cc") == NULL && apps_icons_get("ee") == NULL, "cc is a tile, and ee (not ready) too");
+    gate_open();
+    jobs_join();
+    CHECK(atomic_load(&blocks_held) == 2, "ee's and ff's loads freed their blocks on the worker: %ld held", atomic_load(&blocks_held));
+    int before = atomic_load(&reads);
+    for (int frame = 0; frame < 5; frame++) {
+        run_jobs();
+        CHECK(!apps_icons_poll(), "nothing comes");
+    }
+    CHECK(atomic_load(&reads) == before && jobs_waiting() == 0 && atomic_load(&blocks_held) == 2,
+          "nothing asked for after it: %d reads, %d waiting, %ld held", atomic_load(&reads) - before, jobs_waiting(),
+          atomic_load(&blocks_held));
+    CHECK(apps_icons_get("ee") == NULL && apps_icons_get("ff") == NULL, "never shown");
+
+    /* A load that ended, not adopted, and a failed one: freed too. gg has no file. */
+    const char *three[] = {"aa", "bb", "cc", "gg"};
+    apps_icons_want(three, ICON, 4);
+    run_jobs();
+    CHECK(atomic_load(&blocks_held) == 3, "cc's load ended, waiting for a poll: %ld held", atomic_load(&blocks_held));
+    apps_icons_keep(keep, 2);
+    CHECK(atomic_load(&blocks_held) == 2, "the ended load freed: %ld held", atomic_load(&blocks_held));
+    const char *with_gg[] = {"aa", "bb", "gg"};
+    apps_icons_want(with_gg, ICON, 3);
+    settle();
+    CHECK(apps_icons_get("gg") == NULL && logged_count("icons: gg: icon.bin: ") >= 1, "gg failed: a tile");
+    apps_icons_keep(keep, 2);
+    apps_icons_want(with_gg, ICON, 3);
+    CHECK(jobs_waiting() == 1, "the failed one was forgotten: asked for again (%d)", jobs_waiting());
+    settle();
+
+    /* A want while an orphaned load of the same app still runs: a load of its own, and its icon. */
+    const char *with_ee[] = {"aa", "bb", "ee"};
+    apps_icons_want(with_ee, ICON, 3);
+    gate_close();
+    jobs_start();
+    gate_wait_entered();  /* ee's read */
+    apps_icons_keep(keep, 2);
+    apps_icons_want(with_ee, ICON, 3);
+    gate_open();
+    jobs_join();
+    settle();
+    CHECK(shows("ee", 8, 0x34), "ee wanted again shows its icon");
+    apps_icons_drop_all();
+    run_jobs();
+    CHECK(atomic_load(&blocks_held) == 0, "the drop frees the rest: %ld held", atomic_load(&blocks_held));
+}
+
 static void bad_icon_file_is_a_tile(void) {
     size_t len;
     uint8_t *b = image(CF_RGB565A8, 8, 4, 0, 1, &len);
@@ -940,6 +1015,7 @@ static const case_t CASES[] = {
     {"get_is_null_until_loaded", get_is_null_until_loaded},
     {"refused_load_keeps_tile", refused_load_keeps_tile},
     {"list_change_drops_stale_icons", list_change_drops_stale_icons},
+    {"keep_frees_all_but_the_kept", keep_frees_all_but_the_kept},
     {"bad_icon_file_is_a_tile", bad_icon_file_is_a_tile},
     {"no_flash_on_the_lvgl_task", no_flash_on_the_lvgl_task},
     {"a_drop_racing_the_worker_frees_every_block", a_drop_racing_the_worker_frees_every_block},

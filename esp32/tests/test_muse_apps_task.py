@@ -130,6 +130,9 @@ class AppTaskTest(HarnessCase):
     def test_a_voice_turn_ends_the_hold(self):  # the turn's hide_cards
         self.run_case("a_voice_turn_ends_the_hold")
 
+    def test_the_app_tasks_memory_refusal_retries_once(self):  # fix round 1 (I1): the run's own admission, as the worker's
+        self.run_case("the_app_tasks_memory_refusal_retries_once")
+
     # ---- The rulings' ----
 
     def test_stop_tears_down_in_the_rulings_order(self):  # the teardown order (Task 11's ruling)
@@ -552,6 +555,32 @@ class AppTaskStoreTest(HarnessCase):
 
     def test_a_refused_launch_closes_the_launcher(self):  # Task 6a: no such app, short of memory, the worker refused
         self.run_case("a_refused_launch_closes_the_launcher")
+
+    # ---- Task 6a's fix round 1 (I1): the launcher's own memory never refuses a pick ----
+
+    def test_a_memory_refusal_during_the_hold_retries_once(self):  # closed (its icons freed), tried once more, and run
+        # The glue tells a refusal for memory by its words (apps_task.c's for_memory): every admission's message begins with them, and
+        # so does every refusal of a block while an app is loaded or made.
+        task = (APPS / "apps_task.c").read_text()
+        short = re.search(r'^#define SHORT_OF_MEMORY "([^"]+)"$', task, re.M).group(1)
+        oom = re.search(r'^#define OUT_OF_MEMORY "([^"]+)"$', task, re.M).group(1)
+        messages = re.findall(r'^#define (APPS_MSG_SHORT_\w+) \\\n\s*"([^"]+)"', (APPS / "apps_pkg.h").read_text(), re.M)
+        self.assertEqual({m[0] for m in messages}, {"APPS_MSG_SHORT_OF_MEMORY", "APPS_MSG_SHORT_ONCE_ENDED", "APPS_MSG_SHORT_BESIDE"})
+        for name, text in messages:
+            with self.subTest(name):
+                self.assertTrue(text.startswith(short), text)
+        self.assertIn('#define OUT_OF_MEMORY "out of memory: no room to load the app"', (APPS / "apps_store.c").read_text())
+        made = re.findall(r'"(out of memory: can\'t make[^"]*)"', (APPS / "apps_rt.c").read_text())
+        self.assertEqual(len(made), 3, made)  # the app's heap, its record, its screen
+        for text in made:
+            self.assertTrue(text.startswith(oom), text)
+        self.run_case("a_memory_refusal_during_the_hold_retries_once")
+
+    def test_a_second_memory_refusal_is_reported(self):  # short without the icons too: said twice, tried twice, no more
+        self.run_case("a_second_memory_refusal_is_reported")
+
+    def test_other_refusals_do_not_retry(self):  # no such app, no worker, no app (doesn't compile): one try each
+        self.run_case("other_refusals_do_not_retry")
 
     # ---- Task 13's fix round 1 ----
 

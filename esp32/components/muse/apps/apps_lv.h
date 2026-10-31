@@ -222,8 +222,11 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * frame whose apply step first runs a pass with the layer in front, before LVGL draws that frame. The glue also closes it when the
  * launch is refused or the app fails before that frame (its crash card comes in the same frame), and a voice turn closes it as it
  * closes any card. While it holds it is shown (apps_lv_launcher_shown, apps_lv_cards_shown) but takes no input: no tap, no scroll
- * (the row isn't scrollable) and no swipe does anything, and its icons stay as they are (none asked for, none swapped in). If nothing
- * has closed it APPS_LV_LAUNCH_HOLD_MS after the pick, apps_lv_launcher_poll does. Showing it again ends the hold.
+ * (the row isn't scrollable) and no swipe does anything. Its icons on the screen stay as they are (the centre's and its neighbours'),
+ * and the rest are freed at the pick (apps_icons_keep), loads in flight too, so the launch's admission doesn't count them; none is asked
+ * for or swapped in while it holds. A launch refused for memory nonetheless closes it, which frees those too, and the glue tries it once
+ * more (apps_task.c). If nothing has closed it APPS_LV_LAUNCH_HOLD_MS after the pick, apps_lv_launcher_poll does. Showing it again ends
+ * the hold.
  */
 
 #define APPS_LV_ICON_PX 160          /* the centre's icon, and every item's box */

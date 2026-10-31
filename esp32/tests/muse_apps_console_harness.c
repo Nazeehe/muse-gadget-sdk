@@ -730,11 +730,14 @@ bool apps_task_run_for_alarm(apps_pkg_t *pkg, uint32_t upto, apps_status_t *st, 
     return apps_task_run(pkg, true, 0, st, err, err_len);
 }
 
-/* The worker's word that a launch by id (the launcher's pick: muse_apps_launch's job) was refused before its app began (Task 6a). */
+/* The worker's word that a launch by id (the launcher's pick: muse_apps_launch's job) was refused before its app began (Task 6a), with
+ * the words it logged (Task 6a's fix round 1: the app task's glue tells a refusal for memory from the others by them). */
 static int launch_refusals;
+static char last_refusal[200];
 
-void apps_task_launch_refused(void) {
+void apps_task_launch_refused(const char *why) {
     launch_refusals++;
+    snprintf(last_refusal, sizeof last_refusal, "%s", why != NULL ? why : "(null)");
 }
 
 static int results;
@@ -1322,6 +1325,7 @@ static void launch_by_id_prints_nothing(void) {
     CHECK(results == 0 && wanted_calls == 0, "a launch that isn't for alarms tells the app task nothing: %d results, %d questions", results,
           wanted_calls);
     CHECK(launch_refusals == 1, "but that it was refused, once (Task 6a: the launcher's hold ends): %d", launch_refusals);
+    CHECK(strcmp(last_refusal, "no such app on the gadget") == 0, "in the words it logged: '%s'", last_refusal);
     run_ok = false;
     snprintf(run_err, sizeof run_err, "crashed in start(): main.lua:2: boom");
     CHECK(muse_apps_launch("hello", true), "queued");

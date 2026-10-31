@@ -282,6 +282,8 @@ static EXT_RAM_BSS_ATTR struct {
     apps_lv_app_t launcher[APPS_TASK_LIST_MAX];  /* what apps_lv_show_launcher is given: s_rec->rows, and the app that runs */
     char running[APPS_ID_MAX + 1];
     uint32_t hold_refusals;  /* s_launch_refusals when the launcher's last pick was made: a refusal since ends its hold */
+    uint32_t hold_memory_refusals;  /* s_launch_memory_refusals then: one since tries the pick once more (I1) */
+    char hold_id[APPS_ID_MAX + 1];  /* the app it picked */
 } L;
 
 _Static_assert(APPS_TASK_LIST_MAX <= APPS_LV_LAUNCHER_MAX, "the carousel holds every app of the list");
@@ -290,6 +292,20 @@ static atomic_bool s_covering;  /* the LVGL task's: the layer is in front or a c
 /* Launches refused before their app began (apps_task_launch's, launch_id's, the I/O worker's: apps_task_launch_refused): a count
  * of several writers, so internal, as an atomic. The LVGL task ends the launcher's hold when it moves (muse_apps_ui_supervise). */
 static atomic_uint s_launch_refusals;
+/* Of those, the ones for want of memory (for_memory), counted before the total: the glue tries the pick once more for one. */
+static atomic_uint s_launch_memory_refusals;
+
+/* The words a refusal for want of memory begins with: an admission's (APPS_MSG_SHORT_*, apps_pkg.h), or a block the floor or the heap
+ * refused while the app was loaded or made (the store's and apps_rt_new's "out of memory: ..."). */
+#define SHORT_OF_MEMORY "the gadget is short of memory "
+#define OUT_OF_MEMORY "out of memory"
+
+/* Whether why, a launch's refusal in the words it was logged with, is for want of memory: the refusal a launch can meet because of what
+ * the launcher holds (its icons). No other refusal is. */
+static bool for_memory(const char *why) {
+    return why != NULL &&
+           (strncmp(why, SHORT_OF_MEMORY, strlen(SHORT_OF_MEMORY)) == 0 || strncmp(why, OUT_OF_MEMORY, strlen(OUT_OF_MEMORY)) == 0);
+}
 
 /* ---- Small things ---- */
 
@@ -998,6 +1014,15 @@ static void finish_run(void) {
     complete(r, ok, ok ? NULL : "the app isn't running");
 }
 
+/* A launch by id in front (the launcher's pick: muse_apps_launch's job) that its run refused before the app began, for want of memory
+ * (the admission, or a block the floor refused while the app was made): told to the glue before no_app's back request, so that it tries
+ * the pick once more, without the launcher's icons. */
+static void pick_refused(const req_t *r, bool front, bool alarm, const char *err) {
+    if (r != NULL && r->by_id && front && !alarm && for_memory(err)) {
+        apps_task_launch_refused(err);
+    }
+}
+
 /*
  * A run, on the app task: apps_task_run's, with r waiting for the settle, and (Task 13 on) a launch's and the alarm
  * path's, with r NULL. It owns pkg. The current app ends first; the new one's table is published after start() once no
@@ -1023,6 +1048,7 @@ static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms, boo
      * must hold the heap and APPS_RAM_RESERVE, the files being in PSRAM already (apps_pkg.h). An update of the app that runs
      * is admitted here, after its old copy, so its heap isn't counted twice. */
     if (!apps_room(apps_port_psram_free(), pkg->manifest.id, 0, pkg->manifest.memory_kb, err, sizeof err)) {
+        pick_refused(r, front, alarm, err);
         no_app(err);
         return;
     }
@@ -1032,6 +1058,7 @@ static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms, boo
         return;  /* hung, or crashed at main.lua's top level (Task 8's F2): handled as in start() */
     }
     if (T.rt == NULL) {
+        pick_refused(r, front, alarm, err);
         no_app(err);
         return;
     }
@@ -1077,7 +1104,7 @@ static bool launch_id(const char *id, bool front) {
 /* The launcher's pick, or any apps_task_launch. A refused one ends the launcher's hold. */
 static void launch(const req_t *r) {
     if (!launch_id(r->id, r->front)) {
-        apps_task_launch_refused();
+        apps_task_launch_refused(NULL);  /* the worker refused the job, and said why */
     }
 }
 
@@ -1537,6 +1564,8 @@ static void on_close(void) {
 /* The launcher's pick, inside the row's tap: apps_lv holds the launcher until this launch's first frame, or its refusal. */
 static void on_pick(const char *id) {
     L.hold_refusals = atomic_load(&s_launch_refusals);
+    L.hold_memory_refusals = atomic_load(&s_launch_memory_refusals);  /* after: what the total counts, this counts already */
+    put_text(L.hold_id, sizeof L.hold_id, id);
     apps_task_launch(id, true);
 }
 
@@ -1544,6 +1573,26 @@ static void on_pick(const char *id) {
 static void end_hold(void) {
     if (apps_lv_launcher_holding()) {
         apps_lv_hide_cards();
+    }
+}
+
+/* A refusal since the launcher's pick ends its hold: at every frame, and before a back request does (which a refusal of the run comes
+ * before). One for want of memory closes the launcher, which frees its icons, and asks for the launch once more (I1: what the launcher
+ * holds never refuses a pick); the clock shows meanwhile. That launch holds nothing: a second refusal is said as the first was, and no
+ * third try follows. */
+static void follow_refusals(void) {
+    uint32_t refusals = atomic_load(&s_launch_refusals);
+    if (refusals == L.hold_refusals) {
+        return;
+    }
+    uint32_t memory = atomic_load(&s_launch_memory_refusals);  /* after the total: it counts each of those already */
+    bool again = apps_lv_launcher_holding() && memory != L.hold_memory_refusals;
+    L.hold_refusals = refusals;
+    L.hold_memory_refusals = memory;
+    end_hold();
+    if (again) {
+        ESP_LOGI(TAG, "launcher: %s was short of memory beside the launcher's icons: launching it again without them", L.hold_id);
+        apps_task_launch(L.hold_id, true);
     }
 }
 
@@ -1638,6 +1687,7 @@ static void follow_front(void) {
             apps_lv_set_front(false);
         }
         L.want_front = L.front_before_turn = false;
+        follow_refusals();  /* a refusal for memory said before this back: the pick is tried again */
         end_hold();  /* no app to show (main.lua gave none, or the app ended): the launcher holds for nothing */
     } else if (!atomic_load(&s_rec->hung)) {
         L.want_front = true;  /* a hung app stays behind */
@@ -1739,11 +1789,8 @@ void muse_apps_ui_supervise(void) {
     }
     watch_for_hang();
     run_reset();
+    follow_refusals();
     follow_front();
-    if (atomic_load(&s_launch_refusals) != L.hold_refusals) {
-        L.hold_refusals = atomic_load(&s_launch_refusals);
-        end_hold();  /* the launch the launcher holds for was refused (or one was, since its pick) */
-    }
     if (!L.in_turn) {
         carry_out_front();
         show_cards();
@@ -2062,14 +2109,14 @@ bool apps_task_footprint(char *id, size_t cap, size_t *bytes) {
 void apps_task_launch(const char *id, bool front) {
     if (id == NULL || !apps_id_valid(id)) {
         ESP_LOGW(TAG, "launch: not an app id");
-        apps_task_launch_refused();
+        apps_task_launch_refused("not an app id");
         return;
     }
     const char *why = refusal(false);
     req_t *r = why == NULL ? new_req(REQ_LAUNCH, 0) : NULL;
     if (why != NULL || r == NULL) {
         ESP_LOGW(TAG, "launch %s: %s", id, why != NULL ? why : "out of memory");
-        apps_task_launch_refused();
+        apps_task_launch_refused(why != NULL ? why : "out of memory");
         return;
     }
     r->holders = 1;
@@ -2079,11 +2126,14 @@ void apps_task_launch(const char *id, bool front) {
     if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
         ESP_LOGW(TAG, "launch %s: %s", id, MSG_BUSY);
         free_req(r);
-        apps_task_launch_refused();
+        apps_task_launch_refused(MSG_BUSY);
     }
 }
 
-void apps_task_launch_refused(void) {
+void apps_task_launch_refused(const char *why) {
+    if (for_memory(why)) {
+        atomic_fetch_add(&s_launch_memory_refusals, 1);
+    }
     atomic_fetch_add(&s_launch_refusals, 1);
 }
 

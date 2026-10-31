@@ -1272,15 +1272,26 @@ static void close_launcher(void) {
     refresh_faces();
 }
 
-/* A pick: the launcher stays as it is, and takes no input, until the glue closes it at the app's first frame or the bound does. The
+/* A pick: the launcher stays as it looks, and takes no input, until the glue closes it at the app's first frame or the bound does. The
  * row stops being scrollable, so a drag on it moves nothing (it is at rest: only a settled centre picks); it is made scrollable again
- * only by a new row, at the next show. */
+ * only by a new row, at the next show. Of its icons only those on the screen stay, the centre's and its neighbours' (the apps two away
+ * are off it, at rest): the rest are freed now, and the loads in flight as they end, so the launch is admitted without them, and nothing
+ * more is loaded while it holds (I1). An item that loses its icon is off the screen, and its tile again before LVGL draws. */
 static void hold_launcher(void) {
     C.holding = true;
     C.hold_until = esp_timer_get_time() + (int64_t)APPS_LV_LAUNCH_HOLD_MS * 1000;
     if (C.row != NULL) {
         lv_obj_remove_flag(C.row, LV_OBJ_FLAG_SCROLLABLE);
     }
+    const char *shown[3];
+    int n = 0;
+    for (int k = C.centre - 1; k <= C.centre + 1; k++) {
+        if (k >= 0 && k < C.n && C.item[k].dsc != NULL) {
+            shown[n++] = C.item[k].id;
+        }
+    }
+    apps_icons_keep(shown, n);
+    refresh_faces();
 }
 
 static void close_crash(void) {

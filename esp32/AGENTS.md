@@ -779,7 +779,12 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   what that end frees: its Lua heap as the VM counts it and its package). A
   launch short of either is refused and the app that runs keeps running.
   Every run is admitted once more, after the app it replaces has gone, with
-  room for its heap and the reserve. A snapshot is one block through
+  room for its heap and the reserve. While the launcher is open its icons are
+  in PSRAM too, through the same floor: up to 5 of at most 76,812 bytes each
+  (`APPS_ICONS_WINDOW`, `APPS_ICON_MAX_BYTES`) and 2 more loading; a pick
+  keeps only the 3 on the screen until the app's first frame, and a launch
+  refused for memory closes the launcher, which frees them, and is tried once
+  more. A snapshot is one block through
   the same floor (the screen's pixels, the picture masked in place and the
   JPEG's room: 565,392 bytes at scale 1 and 434,312 at scale 2, with 64 KB and
   40 KB allowed for the encoder's own buffers, also floored and counted with the

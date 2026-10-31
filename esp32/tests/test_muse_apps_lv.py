@@ -398,6 +398,9 @@ class HarnessTest(unittest.TestCase):
     def test_centre_is_clearly_larger(self):  # 150-160 px at the centre, a neighbour at most 40% of it, all inside the circle
         self.run_case("centre_is_clearly_larger")
 
+    def test_the_hold_drops_offscreen_icons(self):  # fix round 1 (I1): a pick keeps the three icons on the screen, frees the rest, loads none
+        self.run_case("the_hold_drops_offscreen_icons")
+
     def test_launch_holds_the_launcher_until_the_first_frame(self):  # nothing in apps_lv ends it: the glue does, at the first frame
         self.run_case("launch_holds_the_launcher_until_the_first_frame")
 

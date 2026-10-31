@@ -1492,6 +1492,10 @@ static void (*lv_close_cb)(void);
 static atomic_bool lv_front;
 static bool lv_launcher, lv_crash;
 static bool lv_holding;  /* the launcher holds for a pick (apps_lv.h): pick_job's, as apps_lv's tap on the centre */
+/* Task 6a's fix round 1: what the launcher holds of the apps' heap while it shows, as its icons do (a case's; 0: nothing), from its show
+ * to its close, which frees them as apps_icons_drop_all does. The LVGL task's block. */
+static _Atomic size_t lv_icon_bytes;
+static void *lv_icon_block;
 
 /* What a case watches the frames for (Task 6a): whether each one has something over the pages under the layer (the clock): a card, or
  * the layer in front with an app's objects on it. A frame with neither shows the clock through, or a layer in front with nothing of an
@@ -1714,6 +1718,9 @@ void apps_lv_show_launcher(const apps_lv_app_t *apps, int n, const char *running
     lv_launcher = true;
     lv_holding = false;  /* shown again, it is a launcher as ever */
     lv_pick = pick;
+    if (lv_icon_block == NULL && atomic_load(&lv_icon_bytes) > 0) {
+        lv_icon_block = apps_port_realloc(NULL, atomic_load(&lv_icon_bytes));
+    }
     event("%s", text);
 }
 
@@ -1736,6 +1743,8 @@ void apps_lv_hide_cards(void) {
         event("hide cards");
     }
     lv_launcher = lv_crash = lv_holding = false;
+    apps_port_free(lv_icon_block);  /* the close drops the icons */
+    lv_icon_block = NULL;
 }
 
 bool apps_lv_launcher_shown(void) {
@@ -2970,6 +2979,34 @@ static void a_voice_turn_ends_the_hold(void) {
     TURN(false);
     WAIT(ended, "front 1");
     WAIT(ended, "print hello show");
+}
+
+/* Task 6a's fix round 1 (I1): the app task's own admission of a pick's run (once more, after the app it replaces has gone) refusing it
+ * for memory retries it once too, as the worker's does: the launcher closes, which frees its icons, and the launch is asked for again.
+ * The case plays muse_apps_launch's job (apps_task_run_by_id), refused first and run the second time. */
+static void the_app_tasks_memory_refusal_retries_once(void) {
+    int from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 0");
+    int picked = mark();
+    ON_LVGL(pick_job, "hello");
+    WAIT(picked, "launch by id hello 1");
+    atomic_store(&psram_total, held_now(&port_held) + 1024);
+    char err[300];
+    CHECK(!apps_task_run_by_id(make_pkg("hello", "Hello", HELLO, 1), true, 0, NULL, err, sizeof err) &&
+              strstr(err, "the gadget is short of memory for hello: ") != NULL,
+          "the app task refuses it: '%s'", err);
+    int closed = WAIT(picked, "hide cards");
+    int again = WAIT(picked, "log I launcher: ");
+    int second = WAIT(closed, "launch by id hello 1");
+    CHECK(closed < again && again < second, "closed (%d), then said (%d), then asked for again (%d)", closed, again, second);
+    atomic_store(&psram_total, 0);
+    CHECK(apps_task_run_by_id(make_pkg("hello", "Hello", HELLO, 1), true, 0, NULL, err, sizeof err), "the second try runs: %s", err);
+    WAIT(second, "front 1");
+    WAIT(second, "print hello show");
+    WAIT_FRAMES(5);
+    CHECK(count_from(picked, "launch by id hello") == 2 && count_from(picked, "log I launcher: ") == 1, "once more, no more: %d, %d",
+          count_from(picked, "launch by id hello"), count_from(picked, "log I launcher: "));
 }
 
 /* A caller that gives up: its buffers are the case's, kept alive after it returns, so a late write by the app task
@@ -6094,6 +6131,7 @@ static void a_refused_launch_closes_the_launcher(void) {
     said = WAIT(picked, "log W launch hello: the gadget is short of memory");
     closed = WAIT(picked, "hide cards");
     CHECK(closed > said, "for memory: held until the refusal (%d), closed on it (%d)", said, closed);
+    WAIT(said + 1, "log W launch hello: the gadget is short of memory");  /* fix round 1: its one more try, refused too */
     ABSENT(picked, "log I launch hello");
     atomic_store(&psram_total, 0);
     EXPECT_LAUNCHER("launcher 1 hello:Hello");
@@ -6104,6 +6142,106 @@ static void a_refused_launch_closes_the_launcher(void) {
     closed = WAIT(picked, "hide cards");
     CHECK(closed > said, "the worker refused: held until the refusal (%d), closed on it (%d)", said, closed);
     atomic_store(&worker_create_fails, false);
+    on_worker(empty_store_job, NULL);
+}
+
+/* Task 6a's fix round 1 (I1): what the fake launcher holds while it shows, standing for its icons (the hold keeps at most the three on the
+ * screen: 3 x 76,812 bytes at 160 px). */
+#define ICONS_HELD (3 * 76812)
+
+/* hello's copy, heap and reserve: what its launch needs free with nothing running (the worker's admission). */
+#define HELLO_NEEDS ((sizeof APP_HELLO - 1) + 256 * 1024 + APPS_RAM_RESERVE)
+
+/* Task 6a's fix round 1 (I1): the launcher's own memory never refuses a pick. With its icons held, hello is 100 KB short; without them
+ * it has more than 100 KB to spare. The pick is refused for memory, in the worker's words, once; the launcher closes, which frees its
+ * icons, and the launch is asked for again, once, which runs hello. */
+static void a_memory_refusal_during_the_hold_retries_once(void) {
+    store(make_pkg("hello", "Hello", HELLO, 1));
+    atomic_store(&lv_icon_bytes, ICONS_HELD);
+    EXPECT_LAUNCHER("launcher 1 hello:Hello");
+    atomic_store(&psram_total, held_now(&port_held) + HELLO_NEEDS - 100 * 1024);
+    int picked = mark();
+    ON_LVGL(pick_job, "hello");
+    int said = WAIT(picked, "log W launch hello: the gadget is short of memory for hello: ");
+    int closed = WAIT(picked, "hide cards");
+    int again = WAIT(picked, "log I launcher: ");
+    int ran = WAIT(picked, "log I launch hello (256 KB)");
+    WAIT(picked, "front 1");
+    WAIT(picked, "print hello show");
+    CHECK(said < closed && closed < again && again < ran, "refused (%d), closed (%d), asked for again (%d), run (%d)", said, closed, again,
+          ran);
+    WAIT_FRAMES(5);
+    CHECK(count_from(picked, "log W launch hello") == 1 && count_from(picked, "log I launcher: ") == 1, "refused once, tried once more: "
+          "%d, %d", count_from(picked, "log W launch hello"), count_from(picked, "log I launcher: "));
+    atomic_store(&psram_total, 0);
+    atomic_store(&lv_icon_bytes, 0);
+    char err[200];
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    on_worker(empty_store_job, NULL);
+}
+
+/* Task 6a's fix round 1 (I1): a launch short of memory even without the launcher's icons is tried once more, and its second refusal is
+ * said as the first was (as any refused launch is), and that is all: no third try, no app, no front. */
+static void a_second_memory_refusal_is_reported(void) {
+    store(make_pkg("hello", "Hello", HELLO, 1));
+    atomic_store(&lv_icon_bytes, ICONS_HELD);
+    EXPECT_LAUNCHER("launcher 1 hello:Hello");
+    atomic_store(&psram_total, held_now(&port_held) + 1024);  /* far short, icons or none */
+    int picked = mark();
+    ON_LVGL(pick_job, "hello");
+    int first = WAIT(picked, "log W launch hello: the gadget is short of memory for hello: ");
+    int closed = WAIT(picked, "hide cards");
+    int again = WAIT(picked, "log I launcher: ");
+    int second = WAIT(first + 1, "log W launch hello: the gadget is short of memory for hello: ");
+    WAIT_FRAMES(10);
+    ROUNDS();
+    CHECK(first < closed && closed < again && again < second, "refused (%d), closed (%d), asked for again (%d), refused (%d)", first,
+          closed, again, second);
+    CHECK(count_from(picked, "log W launch hello") == 2 && count_from(picked, "log I launcher: ") == 1, "two tries, each said once: "
+          "%d refusals, %d retries", count_from(picked, "log W launch hello"), count_from(picked, "log I launcher: "));
+    ABSENT(picked, "log I launch hello");
+    ABSENT(picked, "front 1");
+    atomic_store(&psram_total, 0);
+    atomic_store(&lv_icon_bytes, 0);
+    on_worker(empty_store_job, NULL);
+}
+
+/* Task 6a's fix round 1 (I1): a refusal for anything but memory ends the hold as before, with no second try: an id the store doesn't have,
+ * a job the worker can't take (no worker can be made), and main.lua that doesn't compile (no app, the app task says). */
+static void other_refusals_do_not_retry(void) {
+    atomic_store(&lv_icon_bytes, ICONS_HELD);
+    EXPECT_LAUNCHER("launcher 0");
+    int picked = mark();
+    ON_LVGL(pick_job, "nosuch");
+    WAIT(picked, "log W launch nosuch: no such app on the gadget");
+    WAIT(picked, "hide cards");
+    WAIT_FRAMES(10);
+    ROUNDS();
+    CHECK(count_from(picked, "log W launch nosuch") == 1, "said once: %d", count_from(picked, "log W launch nosuch"));
+    ABSENT(picked, "log I launcher: ");
+    store(make_pkg("hello", "Hello", HELLO, 1));
+    EXPECT_LAUNCHER("launcher 1 hello:Hello");
+    no_worker_can_be_made();
+    picked = mark();
+    ON_LVGL(pick_job, "hello");
+    WAIT(picked, NO_TASK_LINE);
+    WAIT(picked, "hide cards");
+    WAIT_FRAMES(10);
+    CHECK(count_from(picked, NO_TASK_LINE) == 1, "the worker refused once: %d", count_from(picked, NO_TASK_LINE));
+    ABSENT(picked, "log I launcher: ");
+    atomic_store(&worker_create_fails, false);
+    const file_t broken[] = {LUA("main.lua", "local app = {\n")};
+    store(make_pkg("broken", "Broken", broken, 1));
+    EXPECT_LAUNCHER("launcher 2 broken:Broken hello:Hello");
+    picked = mark();
+    ON_LVGL(pick_job, "broken");
+    WAIT(picked, "log W launch broken: no app: ");
+    WAIT(picked, "hide cards");
+    WAIT_FRAMES(10);
+    ROUNDS();
+    CHECK(count_from(picked, "log I launch broken (") == 1, "one try: %d", count_from(picked, "log I launch broken ("));
+    ABSENT(picked, "log I launcher: ");
+    atomic_store(&lv_icon_bytes, 0);
     on_worker(empty_store_job, NULL);
 }
 
@@ -6992,6 +7130,7 @@ int main(int argc, char **argv) {
         {"picking_the_running_app", picking_the_running_app},
         {"a_failed_start_closes_the_launcher", a_failed_start_closes_the_launcher},
         {"a_voice_turn_ends_the_hold", a_voice_turn_ends_the_hold},
+        {"the_app_tasks_memory_refusal_retries_once", the_app_tasks_memory_refusal_retries_once},
         {"a_late_answer_writes_nothing", a_late_answer_writes_nothing},
         {"touches_past_a_full_queue_are_counted", touches_past_a_full_queue_are_counted},
         {"a_touch_on_an_ended_apps_object_never_reaches_the_new_app", a_touch_on_an_ended_apps_object_never_reaches_the_new_app},
@@ -7084,6 +7223,9 @@ int main(int argc, char **argv) {
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},
         {"a_refused_launch_closes_the_launcher", a_refused_launch_closes_the_launcher},
+        {"a_memory_refusal_during_the_hold_retries_once", a_memory_refusal_during_the_hold_retries_once},
+        {"a_second_memory_refusal_is_reported", a_second_memory_refusal_is_reported},
+        {"other_refusals_do_not_retry", other_refusals_do_not_retry},
         {"the_launcher_lists_the_store", the_launcher_lists_the_store},
         {"the_launcher_gets_every_app", the_launcher_gets_every_app},
         {"the_launcher_keeps_apps_that_ended", the_launcher_keeps_apps_that_ended},

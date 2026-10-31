@@ -94,7 +94,7 @@ class Icons(unittest.TestCase):
     def test_get_is_null_until_loaded(self):  # a tile until poll has adopted the pixels; the descriptor is the file's
         self.run_case("get_is_null_until_loaded")
 
-    def test_refused_load_keeps_tile(self):  # Review Focus 3: the floor refuses, get stays NULL, nothing leaks
+    def test_refused_load_keeps_tile(self):  # Review Focus 3: the floor refuses, get stays NULL, nothing leaks; asked again later
         self.run_case("refused_load_keeps_tile")
 
     def test_list_change_drops_stale_icons(self):  # Review Focus 2: drop_all while a load is in flight; never shown
@@ -107,6 +107,9 @@ class Icons(unittest.TestCase):
         self.run_case("no_flash_on_the_lvgl_task")
 
     # ---- Past the brief ----
+
+    def test_a_drop_racing_the_worker_frees_every_block(self):  # whichever side loses frees it; nothing polls after a close
+        self.run_case("a_drop_racing_the_worker_frees_every_block")
 
     def test_a_refused_submit_is_tried_again_later(self):  # the worker's queue full: no slot lost, asked again after the wait
         self.run_case("a_refused_submit_is_tried_again_later")
@@ -151,6 +154,27 @@ class Source(unittest.TestCase):
 
     def test_the_table_is_in_psram(self):  # X12
         self.assertRegex(self.code, r"static\s+EXT_RAM_BSS_ATTR\s+struct\s*\{")
+
+    def test_no_atomic_is_in_psram(self):
+        # S3 PSRAM has no read-modify-write (S32C1I): what another task loads, stores or swaps is an internal static (apps_alarm.c,
+        # apps_values.c: "atomics and locks stay internal"). The table and the window are plain data, in PSRAM.
+        atomic = r"\b(_Atomic|atomic_\w+_t|atomic_(bool|char|schar|uchar|short|ushort|int|uint|long|ulong|llong|ullong|size_t))\b"
+        for match in re.finditer(r"typedef struct \{(.*?)\n\} (\w+);", self.code, re.S):
+            self.assertNotRegex(match.group(1), atomic, f"{match.group(2)} holds an atomic, and lives in the PSRAM table")
+        for match in re.finditer(r"static\s+EXT_RAM_BSS_ATTR\s+struct\s*\{(.*?)\n\}\s*(\w+);", self.code, re.S):
+            self.assertNotRegex(match.group(1), atomic, f"{match.group(2)}: an atomic in PSRAM")
+        for line in self.code.splitlines():
+            if re.search(atomic, line) and line.startswith("static"):
+                self.assertNotIn("EXT_RAM_BSS_ATTR", line, line)
+        self.assertRegex(self.code, r"(?m)^static atomic_uint s_hand\[APPS_ICONS_SLOTS\];", "the slots' hand-off words, internal")
+
+    def test_a_refusal_by_the_floor_is_the_stores_words(self):
+        # The job tells a shortage (asked again after the wait) from a bad file (a tile while it stays) by the store's own words.
+        self.assertTrue("APPS_STORE_MSG_NO_MEMORY" in self.code, "apps_icons.c doesn't tell a shortage by the store's words")
+        store = strip_comments((APPS / "apps_store.c").read_text())
+        reader = function_source(store, "static bool read_file(")
+        self.assertTrue("APPS_STORE_MSG_NO_MEMORY" in reader, "read_file doesn't say APPS_STORE_MSG_NO_MEMORY")
+        self.assertTrue('"out of memory"' not in reader, "read_file spells the words out")
 
     def test_no_block_bypasses_the_floor(self):
         # The pixels' block is the store's reader's (apps_port_realloc, the floor): apps_icons.c allocates nothing of its own.

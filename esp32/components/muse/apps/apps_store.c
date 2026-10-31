@@ -331,7 +331,7 @@ static bool write_file(const char *path, const void *data, size_t len) {
 }
 
 /* The file path into a block of the apps' heap with a NUL after its *len bytes: false, with why (cap bytes), when it can't be read, is
- * larger than max, or there is no memory ("out of memory"). */
+ * larger than max, or there is no memory (APPS_STORE_MSG_NO_MEMORY). */
 static bool read_file(const char *path, size_t max, char **out, size_t *len, char *why, size_t cap) {
     *out = NULL;
     *len = 0;
@@ -353,7 +353,7 @@ static bool read_file(const char *path, size_t max, char **out, size_t *len, cha
     char *buf = apps_port_realloc(NULL, size + 1);
     if (buf == NULL) {
         close(fd);
-        put_err(why, cap, "out of memory");
+        put_err(why, cap, "%s", APPS_STORE_MSG_NO_MEMORY);
         return false;
     }
     size_t got = 0;
@@ -1679,7 +1679,7 @@ static bool load_flash(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
     }
     char why[160];
     if (!read_manifest(id, &pkg->manifest, &pkg->manifest_json, &pkg->manifest_len, why, sizeof why)) {
-        if (strcmp(why, "out of memory") == 0 || strcmp(why, "manifest: out of memory") == 0) {
+        if (strcmp(why, APPS_STORE_MSG_NO_MEMORY) == 0 || strcmp(why, "manifest: out of memory") == 0) {
             put_err(err, n, OUT_OF_MEMORY);  /* T: no room, which a try later may have; not damage */
         } else {
             put_err(err, n, "the stored copy of %s is damaged (manifest.json: %s); install it again", id, why);
@@ -1723,7 +1723,7 @@ static bool load_flash(const char *id, apps_pkg_t *pkg, char *err, size_t n) {
             return false;
         }
         if (!read_file(path, apps_file_max(apps_file_kind(rel)), &data, &len, why, sizeof why)) {
-            if (strcmp(why, "out of memory") == 0) {
+            if (strcmp(why, APPS_STORE_MSG_NO_MEMORY) == 0) {
                 put_err(err, n, OUT_OF_MEMORY);
             } else {
                 put_err(err, n, "the stored copy of %s is damaged (%s: %s); install it again", id, rel, why);

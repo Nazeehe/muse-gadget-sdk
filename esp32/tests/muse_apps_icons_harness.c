@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "apps_icons.h"
 #include "apps_io.h"
@@ -174,12 +175,23 @@ static void gate_close(void) {
     pthread_mutex_unlock(&gate_mu);
 }
 
-static void gate_wait_entered(void) {
+/* Until a read is held at the gate: false, and the gate opened, when none comes within 10 s (no load was asked for). */
+static bool gate_wait_entered(void) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 10;
     pthread_mutex_lock(&gate_mu);
-    while (!gate_entered) {
-        pthread_cond_wait(&gate_cv, &gate_mu);
+    int waited = 0;
+    while (!gate_entered && waited == 0) {
+        waited = pthread_cond_timedwait(&gate_cv, &gate_mu, &until);
+    }
+    bool entered = gate_entered;
+    if (!entered) {
+        gate_shut = false;
     }
     pthread_mutex_unlock(&gate_mu);
+    CHECK(entered, "no read came to the gate");
+    return entered;
 }
 
 static void gate_open(void) {
@@ -227,7 +239,7 @@ bool apps_store_read_file(const char *id, const char *path, size_t max, uint8_t 
     }
     uint8_t *block = apps_port_realloc(NULL, size + 1);
     if (block == NULL) {
-        snprintf(err, n, "out of memory");
+        snprintf(err, n, "%s", APPS_STORE_MSG_NO_MEMORY);
         return false;
     }
     memcpy(block, f->data, size);
@@ -517,7 +529,9 @@ static void get_is_null_until_loaded(void) {
     CHECK(apps_icons_get("zz") == NULL && apps_icons_get(NULL) == NULL, "no other id has one");
 }
 
-/* Review Focus 3: the floor refuses the block, so the tile stays; nothing leaks, and nothing goes round the floor. */
+/* Review Focus 3: the floor refuses the block, so the tile stays; nothing leaks, and nothing goes round the floor. A refusal is
+ * a shortage that passes (a snapshot holds memory, an install's read): while the icon stays in the window it is asked for again
+ * APPS_ICONS_RETRY_MS later, not at every frame, and shows once the floor lets it. */
 static void refused_load_keeps_tile(void) {
     put_icon("aa", 8, 1);
     put_icon("bb", 8, 2);
@@ -531,24 +545,29 @@ static void refused_load_keeps_tile(void) {
     CHECK(logged_count("W muse_apps: icons: aa: icon.bin: out of memory; its tile shows") == 1 &&
               logged_count("W muse_apps: icons: bb: icon.bin: out of memory; its tile shows") == 1,
           "one W line each");
-    /* While they stay in the window they aren't asked for again, however many frames and wants come. */
+    /* Not asked again before the wait, however many frames and wants come. */
     int before = atomic_load(&reads);
     for (int i = 0; i < 10; i++) {
         apps_icons_want(win, ICON, 2);
         settle();
     }
-    CHECK(atomic_load(&reads) == before, "a refused icon isn't asked again while it stays: %d more", atomic_load(&reads) - before);
-    /* The floor opens: an icon that leaves the window and comes back is asked for again, and shows. */
+    atomic_fetch_add(&now_ms, APPS_ICONS_RETRY_MS - 1);
+    settle();
+    CHECK(atomic_load(&reads) == before, "not asked again before the wait: %d more", atomic_load(&reads) - before);
+    /* After it, asked again while it stays in the window: still refused, still tiles, nothing held. */
+    atomic_fetch_add(&now_ms, 1);
+    settle();
+    CHECK(atomic_load(&reads) == before + 2, "both asked again after the wait: %d more", atomic_load(&reads) - before);
+    CHECK(apps_icons_get("aa") == NULL && apps_icons_get("bb") == NULL && atomic_load(&blocks_held) == 0, "tiles, nothing held");
+    CHECK(atomic_load(&floor_refusals) == 4, "the floor was asked again: %d", atomic_load(&floor_refusals));
+    /* The floor opens: within the window, without a scroll, both show after the next wait. */
     atomic_store(&floor_closed, false);
-    want_one("bb");
-    apps_icons_want(win, ICON, 2);
-    CHECK(settle(), "aa came");
-    CHECK(shows("aa", 8, 1), "aa left and came back: it shows");
-    CHECK(apps_icons_get("bb") == NULL, "bb never left: still its tile");
-    apps_icons_want(NULL, NULL, 0);
     apps_icons_want(win, ICON, 2);
     settle();
-    CHECK(shows("aa", 8, 1) && shows("bb", 8, 2), "both, once both came back");
+    CHECK(apps_icons_get("aa") == NULL, "not before the wait");
+    atomic_fetch_add(&now_ms, APPS_ICONS_RETRY_MS);
+    CHECK(settle(), "they came");
+    CHECK(shows("aa", 8, 1) && shows("bb", 8, 2), "both show, never having left the window");
     CHECK(atomic_load(&blocks_held) == 2, "two blocks: %ld", atomic_load(&blocks_held));
 }
 
@@ -615,6 +634,23 @@ static void list_change_drops_stale_icons(void) {
     CHECK(apps_icons_poll(), "the new one came");
     CHECK(shows("aa", 12, 0x22), "the reinstall's icon shows, never the old one");
     CHECK(atomic_load(&blocks_held) == 1, "the old block is gone: %ld held", atomic_load(&blocks_held));
+
+    /* Two drops while one load is in flight (a list change, then the launcher's close), then a want before it ends: the orphan
+     * stays its job's, and the new load gets a slot of its own. */
+    apps_icons_drop_all();
+    want_one("aa");
+    gate_close();
+    jobs_start();
+    gate_wait_entered();
+    apps_icons_drop_all();
+    apps_icons_drop_all();
+    put_icon("aa", 16, 0x33);
+    want_one("aa");
+    gate_open();
+    jobs_join();
+    CHECK(apps_icons_poll(), "the new one came");
+    CHECK(shows("aa", 16, 0x33), "the last want's icon shows");
+    CHECK(atomic_load(&blocks_held) == 1, "the orphan's block is gone: %ld held", atomic_load(&blocks_held));
 }
 
 /* A file that isn't an icon (not square, past 160 px, past the bytes an icon may have, not an image, cut short, compressed,
@@ -661,10 +697,11 @@ static void bad_icon_file_is_a_tile(void) {
     CHECK(logged_count("icons: gg: icon.bin: No such file or directory; its tile shows") == 1, "gg's line");
     int before = atomic_load(&reads);
     for (int i = 0; i < 5; i++) {
+        atomic_fetch_add(&now_ms, APPS_ICONS_RETRY_MS);  /* unlike a refusal by the floor, waiting changes nothing */
         apps_icons_want(second, ICON, 3);
         settle();
     }
-    CHECK(atomic_load(&reads) == before, "a bad file isn't read again while it stays in the window");
+    CHECK(atomic_load(&reads) == before, "a bad file isn't read again while it stays in the window, however long");
 }
 
 /* X11: the LVGL task never touches flash. Every read of the store, through every path (loads, scrolls, drops, refusals, a
@@ -686,6 +723,7 @@ static void no_flash_on_the_lvgl_task(void) {
     want_centre(5, N_APPS);
     settle();
     atomic_store(&floor_closed, false);
+    atomic_fetch_add(&now_ms, APPS_ICONS_RETRY_MS);  /* the shortage's wait */
     apps_icons_drop_all();
     want_centre(2, N_APPS);
     gate_close();
@@ -700,6 +738,25 @@ static void no_flash_on_the_lvgl_task(void) {
     CHECK(atomic_load(&reads) > N_APPS, "the store was read: %d times", atomic_load(&reads));
     CHECK(atomic_load(&reads_off_worker) == 0, "every read was the worker's: %d were the LVGL task's",
           atomic_load(&reads_off_worker));
+}
+
+/* A drop that races the worker, wherever it lands in the load (before the read, inside it, after the check, as the result is
+ * posted): the block is freed by whichever side loses, so once the worker has ended nothing is held, with no poll after the drop
+ * (the launcher has closed: nothing polls). Many rounds, each a fresh race. */
+static void a_drop_racing_the_worker_frees_every_block(void) {
+    put_icon("aa", 8, 1);
+    for (int round = 0; round < 3000 && failures == 0; round++) {
+        want_one("aa");
+        jobs_start();
+        for (int spin = 0; spin < round % 64; spin++) {
+            atomic_signal_fence(memory_order_seq_cst);  /* a little later each round, across the job's whole run */
+        }
+        apps_icons_drop_all();
+        jobs_join();
+        CHECK(atomic_load(&blocks_held) == 0, "round %d: %ld blocks held after the drop, with no poll", round,
+              atomic_load(&blocks_held));
+        CHECK(!apps_icons_poll() && apps_icons_get("aa") == NULL, "round %d: never shown", round);
+    }
 }
 
 /* ---- The cases: past the brief ---- */
@@ -885,6 +942,7 @@ static const case_t CASES[] = {
     {"list_change_drops_stale_icons", list_change_drops_stale_icons},
     {"bad_icon_file_is_a_tile", bad_icon_file_is_a_tile},
     {"no_flash_on_the_lvgl_task", no_flash_on_the_lvgl_task},
+    {"a_drop_racing_the_worker_frees_every_block", a_drop_racing_the_worker_frees_every_block},
     {"a_refused_submit_is_tried_again_later", a_refused_submit_is_tried_again_later},
     {"a_fling_keeps_the_worker_to_two_loads", a_fling_keeps_the_worker_to_two_loads},
     {"ram_mode_is_a_tile", ram_mode_is_a_tile},

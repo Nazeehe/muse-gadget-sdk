@@ -25,23 +25,25 @@
  * Flash (X11). The LVGL task never reads flash and never waits on the worker: apps_icons_want and apps_icons_poll queue a job
  * (apps_io_submit, which never waits for another task's progress; apps_io_submit_op is the app task's alone), and the job reads
  * APPS_STORE_BASE/<id>/<icon>, at most APPS_ICON_MAX_BYTES, with apps_store_read_file, into one block of apps_port_realloc: PSRAM,
- * through the apps' floor (APPS_RAM_RESERVE), so a block the floor refuses is a tile. The job checks it (apps_icon_check: an image
- * apps_image_check passes, square, at most APPS_ICON_MAX_PX), and a file that fails, or can't be read, is a tile with one W line,
- * "icons: <id>: <icon>: <why>; its tile shows". The store in RAM mode keeps no files, and before the mount has none: no load is
- * asked for, and every app is its tile.
+ * through the apps' floor (APPS_RAM_RESERVE), so a block the floor refuses is a tile until a later try fits. The job checks it
+ * (apps_icon_check: an image apps_image_check passes, square, at most APPS_ICON_MAX_PX), and a file that fails, or can't be read, is
+ * a tile. Each failure is one W line, "icons: <id>: <icon>: <why>; its tile shows". The store in RAM mode keeps no files, and before
+ * the mount has none: no load is asked for, and every app is its tile.
  *
  * The window. apps_icons_want is told the window, centre first: at most APPS_ICONS_WINDOW apps, each with its icon's path ("" for
  * none). Loads are asked for in the window's order, at most APPS_ICONS_IN_FLIGHT at once (stale ones count until they end), so a
  * fling through many apps queues no load for each and leaves the worker's queue to installs and launches; apps_icons_poll asks for
  * the rest as they end. A ready icon that leaves the window is freed at once (the want's), so at most APPS_ICONS_WINDOW blocks are
- * shown and APPS_ICONS_IN_FLIGHT more are loading. An icon that failed stays a tile while it stays in the window (it is not read
- * again at every frame); one that leaves and comes back is asked for again. A load the worker refused (its queue full) is asked for
- * again APPS_ICONS_RETRY_MS later, not at every frame: each refusal is a W line on the console.
+ * shown and APPS_ICONS_IN_FLIGHT more are loading. A bad file stays a tile while it stays in the window (it is not read again at
+ * every frame); one that leaves and comes back is asked for again. A shortage passes: an icon whose block the floor refused, and a
+ * load the worker refused (its queue full), are asked for again APPS_ICONS_RETRY_MS later while they are still wanted, and no other
+ * load is asked for meanwhile, not at every frame (each of the worker's refusals is a W line on the console).
  *
- * Generations. apps_icons_drop_all (the launcher's close, a change of the list, a voice turn) frees every ready icon, forgets the
- * window, and starts a new generation. Every load carries the generation of the want that asked; one that ends in an older
- * generation frees its own block on the worker and is never shown, and the next want asks again, so after a reinstall the icon
- * that shows is the new file's.
+ * Generations. apps_icons_drop_all (the launcher's close, a change of the list, a voice turn) frees every ready icon and every load
+ * that has ended, orphans the loads in flight, forgets the window, and starts a new generation. An orphaned load frees its own block
+ * on the worker as it ends, wherever in the load the drop came, and is never shown, so nothing is held once the worker is done, with
+ * no poll after the drop. Every load carries the generation of the want that asked, and only this generation's match a want: the
+ * next want asks again, so after a reinstall the icon that shows is the new file's.
  *
  * A descriptor from apps_icons_get is the file in place: its header is the file's first 12 bytes with only the premultiplied flag
  * kept, and its data the pixels after them (as apps_lv.c makes an image's). It stays valid while its app stays in the window, until
@@ -50,7 +52,8 @@
  * that is used again for another icon meets no stale entry. An A8 icon is a mask: the caller recolours it, as apps_lv.c does.
  *
  * Threads. Every function here is the LVGL task's (one task: they share plain state), outside the UI lock (apps_port_ui_lock), as
- * the apps' heap asks; the worker's job touches only its own slot until it marks it done. The table is static, in PSRAM.
+ * the apps' heap asks; the worker's job touches only its own slot until it hands it back. The table is static plain data, in PSRAM;
+ * the one word a slot's job and the LVGL task share (its hand-off, swapped by both) is an internal static.
  */
 
 #include <stdbool.h>

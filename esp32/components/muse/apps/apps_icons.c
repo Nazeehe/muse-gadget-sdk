@@ -32,20 +32,26 @@
 
 /*
  * The table (apps_icons.h has the contract). APPS_ICONS_SLOTS slots, each EMPTY, LOADING, READY or FAILED, with the app and icon it
- * is for and the generation of the want that asked. The LVGL task owns the table; a LOADING slot is lent to its job, which reads
- * only its id, icon and gen and writes only its result (block, len, ok), then done, last, with a store the LVGL task's load of done
- * pairs with. Until done the LVGL task reads nothing of it but done, and never empties it, so the job can't meet a slot used again;
- * after done the job doesn't touch it. done and gen are words with one writer each, loaded and stored whole (PSRAM promises no
- * read-modify-write).
+ * is for and the generation of the want that asked: plain data of the LVGL task's, in PSRAM. A LOADING slot is lent to its job,
+ * which reads only its id and icon and writes only its result (block, len, fail). Slot k's hand-off is s_hand[k], the one word the
+ * two tasks share, an internal static (S3 PSRAM has no read-modify-write, so no atomic is in the table): LENT while the job has the
+ * slot; the job swaps LENT for DONE once its result is written, and a drop swaps LENT for ORPHANED. Whichever loses the swap frees
+ * the block: a job that finds ORPHANED frees its own and then stores DONE; a drop that finds DONE frees it there. Until DONE the
+ * LVGL task reads nothing of the slot and never empties it, so a job can't meet a slot used again; after DONE the job doesn't touch
+ * it. So a drop frees every block, wherever it lands in a load, and no poll is needed after it (the launcher has closed).
  *
  * Bounds. READY and FAILED slots are only for wanted (id, icon) pairs, one slot each (a want frees the others at once, and a load
  * that ends unwanted is freed, not adopted), so there are at most APPS_ICONS_WINDOW of them; LOADING slots are at most
  * APPS_ICONS_IN_FLIGHT, as nothing is asked for while that many are out. So the table never fills (the assertion), and the blocks
  * held are at most APPS_ICONS_SLOTS.
  *
- * A drop. The generation goes up first, so a load that ends after it frees its own block on the worker; then every slot but a LOADING
- * one not yet done is emptied (a done one is the LVGL task's again, and its block goes with it). A LOADING slot of an older generation
- * matches no want: an app asked for again after a drop gets a load of its own, and the old one, once done, is emptied.
+ * A drop. The generation goes up; every load still lent is orphaned, and every other slot is emptied with its block. A LOADING slot
+ * of an older generation matches no want: an app asked for again after a drop gets a load of its own, and the old one, once its job
+ * has stored DONE, is emptied (with no block: its job freed it).
+ *
+ * Failures. A file that isn't an icon, or can't be read, is FAILED: its tile, not read again while it stays in the window. A block
+ * the floor or the heap refused (the store's APPS_STORE_MSG_NO_MEMORY) is a shortage that passes: its slot is emptied, and no load is
+ * asked for until APPS_ICONS_RETRY_MS later, when it is asked for again if it is still wanted.
  */
 
 static const char *TAG = "muse_apps";
@@ -56,17 +62,18 @@ _Static_assert(sizeof(lv_image_header_t) == IMAGE_HEADER, "a .bin's header is an
 _Static_assert(APPS_ICONS_SLOTS <= 2 * APPS_ICONS_WINDOW, "the table is at most two windows");
 _Static_assert(APPS_ICONS_SLOTS >= APPS_ICONS_WINDOW + APPS_ICONS_IN_FLIGHT, "a slot for each wanted app and each load in flight");
 
-enum { EMPTY, LOADING, READY, FAILED };
+enum { EMPTY, LOADING, READY, FAILED };      /* a slot's state: the LVGL task's */
+enum { HAND_FREE, HAND_LENT, HAND_DONE, HAND_ORPHANED };  /* s_hand[k] */
+enum { FAIL_NONE, FAIL_FILE, FAIL_MEMORY };  /* why a load failed: a tile while it stays, or asked for again after the wait */
 
 typedef struct {
     char id[APPS_ID_MAX + 1];
     char icon[APPS_PATH_MAX + 1];
-    uint32_t gen;       /* the generation of the want that asked */
+    uint32_t gen;       /* the generation of the want that asked (the LVGL task's) */
     uint8_t state;      /* the LVGL task's */
-    atomic_uint done;   /* LOADING: the job's last store; the slot is the LVGL task's again */
-    uint8_t *block;     /* the file, from the job (NULL when it failed); READY: what dsc points into */
+    uint8_t fail;       /* the job's: FAIL_NONE with a block, or why it has none */
+    uint8_t *block;     /* the file, from the job; READY: what dsc points into */
     size_t len;
-    bool ok;
     lv_image_dsc_t dsc; /* READY */
 } slot_t;
 
@@ -75,38 +82,50 @@ typedef struct {
     char icon[APPS_PATH_MAX + 1];
 } wanted_t;
 
-/* X12: 1,488 bytes on the gadget (7 slots of 144 and the window), in PSRAM; zeroed at boot: every slot EMPTY, generation 0. */
+/* X12: the LVGL task's plain data, 1,432 bytes on the gadget (7 slots of 136, the window), in PSRAM; zeroed at boot. */
 static EXT_RAM_BSS_ATTR struct {
     slot_t slot[APPS_ICONS_SLOTS];
     wanted_t want[APPS_ICONS_WINDOW];  /* the window, centre first */
     int want_n;
-    atomic_uint gen;    /* the LVGL task stores it (a drop); the jobs load it */
-    int64_t retry_at;   /* no load is asked for before this (the worker refused one) */
+    uint32_t gen;       /* a drop's: the jobs never read it */
+    int64_t retry_at;   /* no load is asked for before this (the worker or the floor refused one) */
     bool news;          /* an icon became ready since the last poll */
 } S;
+
+/* The slots' hand-off words: shared by the LVGL task and the jobs, and swapped, so in internal RAM (28 bytes), as the apps' atomics
+ * are. */
+static atomic_uint s_hand[APPS_ICONS_SLOTS];
 
 /* ---- The I/O worker's ---- */
 
 static void load_job(void *arg) {
     slot_t *s = arg;
+    atomic_uint *hand = &s_hand[s - S.slot];
     uint8_t *block = NULL;
     size_t len = 0;
+    uint8_t fail = FAIL_NONE;
     char why[96];
-    bool ok = apps_store_read_file(s->id, s->icon, APPS_ICON_MAX_BYTES, &block, &len, why, sizeof why) &&
-              apps_icon_check(block, len, why, sizeof why);
-    if (!ok) {
-        apps_port_free(block);  /* a file that isn't an icon (the read's own refusals leave none) */
+    if (!apps_store_read_file(s->id, s->icon, APPS_ICON_MAX_BYTES, &block, &len, why, sizeof why)) {
+        fail = strcmp(why, APPS_STORE_MSG_NO_MEMORY) == 0 ? FAIL_MEMORY : FAIL_FILE;
+    } else if (!apps_icon_check(block, len, why, sizeof why)) {
+        fail = FAIL_FILE;
+        apps_port_free(block);
         block = NULL;
+    }
+    if (fail != FAIL_NONE) {
         ESP_LOGW(TAG, "icons: %s: %s: %s; its tile shows", s->id, s->icon, why);
-    } else if (atomic_load(&S.gen) != s->gen) {
-        apps_port_free(block);  /* dropped while it loaded: freed here, never shown */
-        block = NULL;
-        ok = false;
     }
     s->block = block;
     s->len = len;
-    s->ok = ok;
-    atomic_store(&s->done, 1u);  /* last: from here the slot is the LVGL task's */
+    s->fail = fail;
+    unsigned lent = HAND_LENT;
+    if (!atomic_compare_exchange_strong(hand, &lent, HAND_DONE)) {
+        /* Orphaned: a drop came while it loaded, and the block is this job's to free. Never shown. */
+        apps_port_free(block);
+        s->block = NULL;
+        atomic_store(hand, HAND_DONE);
+    }
+    /* From here the slot is the LVGL task's. */
 }
 
 /* ---- The LVGL task's ---- */
@@ -131,14 +150,17 @@ static bool in_window(const char *id) {
 
 /* The slot of this generation for the pair, loading, ready or failed; NULL when there is none. */
 static slot_t *find(const char *id, const char *icon) {
-    const uint32_t gen = atomic_load(&S.gen);
     for (int i = 0; i < APPS_ICONS_SLOTS; i++) {
         slot_t *s = &S.slot[i];
-        if (s->state != EMPTY && s->gen == gen && strcmp(s->id, id) == 0 && strcmp(s->icon, icon) == 0) {
+        if (s->state != EMPTY && s->gen == S.gen && strcmp(s->id, id) == 0 && strcmp(s->icon, icon) == 0) {
             return s;
         }
     }
     return NULL;
+}
+
+static atomic_uint *hand_of(const slot_t *s) {
+    return &s_hand[s - S.slot];
 }
 
 /* A slot the LVGL task holds (not one lent to a job) emptied, its block freed. */
@@ -146,13 +168,15 @@ static void release(slot_t *s) {
     apps_port_free(s->block);
     s->block = NULL;
     s->len = 0;
-    s->ok = false;
+    s->fail = FAIL_NONE;
     memset(&s->dsc, 0, sizeof s->dsc);
     s->state = EMPTY;
+    atomic_store(hand_of(s), HAND_FREE);
 }
 
+/* A LOADING slot whose job hasn't stored DONE: the job's still (LENT or ORPHANED). */
 static bool lent(const slot_t *s) {
-    return s->state == LOADING && atomic_load(&s->done) == 0u;
+    return s->state == LOADING && atomic_load(hand_of(s)) != HAND_DONE;
 }
 
 /* The descriptor of a ready block, as apps_lv.c makes an image's (APPS_W_IMAGE): the header is the file's first bytes, the pixels the
@@ -167,21 +191,24 @@ static void describe(slot_t *s) {
     s->dsc.reserved_2 = NULL;
 }
 
-/* The loads that ended: a wanted one of this generation becomes READY (or FAILED, so it isn't asked for again while it stays);
- * any other is emptied, its block freed. */
+/* The loads that ended: a wanted one of this generation becomes READY, FAILED for a bad file (not asked for again while it stays),
+ * or, refused for want of memory, EMPTY again with no load asked for until APPS_ICONS_RETRY_MS later; any other is emptied, its block
+ * freed. */
 static void collect(void) {
-    const uint32_t gen = atomic_load(&S.gen);
     for (int i = 0; i < APPS_ICONS_SLOTS; i++) {
         slot_t *s = &S.slot[i];
         if (s->state != LOADING || lent(s)) {
             continue;
         }
-        if (s->gen != gen || !wanted(s->id, s->icon)) {
+        if (s->gen != S.gen || !wanted(s->id, s->icon)) {
             release(s);
-        } else if (s->ok && s->block != NULL) {
+        } else if (s->fail == FAIL_NONE && s->block != NULL) {
             describe(s);
             s->state = READY;
             S.news = true;
+        } else if (s->fail == FAIL_MEMORY) {
+            release(s);
+            S.retry_at = apps_port_mono_ms() + APPS_ICONS_RETRY_MS;
         } else {
             release(s);
             s->state = FAILED;
@@ -202,7 +229,6 @@ static void ask(void) {
     if (now < S.retry_at) {
         return;  /* the worker refused one: not at every frame (each refusal is a W line) */
     }
-    const uint32_t gen = atomic_load(&S.gen);
     for (int i = 0; i < S.want_n && in_flight < APPS_ICONS_IN_FLIGHT; i++) {
         const wanted_t *w = &S.want[i];
         if (find(w->id, w->icon) != NULL) {
@@ -217,13 +243,14 @@ static void ask(void) {
         }
         memcpy(s->id, w->id, sizeof s->id);
         memcpy(s->icon, w->icon, sizeof s->icon);
-        s->gen = gen;
+        s->gen = S.gen;
         s->block = NULL;
         s->len = 0;
-        s->ok = false;
-        atomic_store(&s->done, 0u);
+        s->fail = FAIL_NONE;
+        atomic_store(hand_of(s), HAND_LENT);  /* before the submit, whose lock hands the slot to the job */
         s->state = LOADING;
         if (!apps_io_submit(load_job, s)) {  /* it says why, in one W line */
+            atomic_store(hand_of(s), HAND_FREE);
             s->state = EMPTY;
             S.retry_at = now + APPS_ICONS_RETRY_MS;
             return;
@@ -272,12 +299,20 @@ bool apps_icons_poll(void) {
 }
 
 void apps_icons_drop_all(void) {
-    atomic_store(&S.gen, atomic_load(&S.gen) + 1u);  /* first: a load that ends from here on frees its own block */
+    S.gen++;
     for (int i = 0; i < APPS_ICONS_SLOTS; i++) {
         slot_t *s = &S.slot[i];
-        if (s->state != EMPTY && !lent(s)) {
-            release(s);
+        if (s->state == EMPTY) {
+            continue;
         }
+        unsigned lent = HAND_LENT;
+        if (s->state == LOADING && atomic_compare_exchange_strong(hand_of(s), &lent, HAND_ORPHANED)) {
+            continue;  /* its job frees the block as it ends; the slot is emptied after (an older generation's) */
+        }
+        if (s->state == LOADING && lent == HAND_ORPHANED) {
+            continue;  /* orphaned by an earlier drop, and still loading */
+        }
+        release(s);  /* ready, failed, or a load that has ended: its block goes now */
     }
     S.want_n = 0;
     S.news = false;

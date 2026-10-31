@@ -1163,9 +1163,15 @@ static void vm_ops_are_vm_file(void) {
     CHECK(strcmp(code, MUSE_APPS_VM_DROPPED) == 0 && strcmp(err, "could not send the request to the VM") == 0, "%s: %s", code,
           err);
     error_in_msg = true;
-    read_error = "VM answered HTTP 404";
+    read_error = "VM answered HTTP 404";  /* connected apps Task 3: the vm module says "no such file on the VM" for it */
     CHECK(!vm_read("workspace/apps/hello/main.lua", 100, 1, &code, err, sizeof err), "a 404");
-    CHECK(strcmp(code, MUSE_APPS_VM_FAILED) == 0 && strcmp(err, "VM answered HTTP 404") == 0, "%s: %s", code, err);
+    CHECK(strcmp(code, MUSE_APPS_VM_NOT_FOUND) == 0 && strcmp(err, "VM answered HTTP 404") == 0, "%s: %s", code, err);
+    read_error = "VM answered HTTP 404: Not Found";
+    CHECK(!vm_read("workspace/apps/hello/main.lua", 100, 1, &code, err, sizeof err), "a 404 with the VM's words");
+    CHECK(strcmp(code, MUSE_APPS_VM_NOT_FOUND) == 0 && strcmp(err, "VM answered HTTP 404: Not Found") == 0, "%s: %s", code, err);
+    read_error = "VM answered HTTP 4040";
+    CHECK(!vm_read("workspace/apps/hello/main.lua", 100, 1, &code, err, sizeof err), "another status");
+    CHECK(strcmp(code, MUSE_APPS_VM_FAILED) == 0, "%s: %s", code, err);
     error_in_msg = false;
     read_timed_out = true;
     read_error = "download timed out";
@@ -1185,7 +1191,7 @@ static void vm_ops_are_vm_file(void) {
     CHECK(strcmp(code, MUSE_APPS_VM_FAILED) == 0, "%s: %s", code, err);
     sink_stops = false;
     error_in_msg = false;
-    CHECK(closes == 7 && open_now == 0, "every read closed: %d", closes);
+    CHECK(closes == 9 && open_now == 0, "every read closed: %d", closes);
 
     /* write: the time left to the deadline, in ms. */
     now_us = 5000000;

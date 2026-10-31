@@ -638,6 +638,15 @@ void apps_task_exit(void) {
     exits++;
 }
 
+/* The vm module's requests (connected apps Task 3): the app task's, which stamps them for the network worker. */
+static struct apps_vm_job *vm_submitted;
+static bool vm_submit_answer = true;
+
+bool apps_task_vm_submit(struct apps_vm_job *job) {
+    vm_submitted = job;
+    return vm_submit_answer;
+}
+
 static int restamps;
 static int64_t restamp_at_ms;
 
@@ -2275,6 +2284,11 @@ static void show_keep_awake_and_exit_go_to_the_app_task(void) {
     CHECK(keep_awake_calls == 2 && !keep_awake_last, "keep_awake(false)");
     apps_port_exit();
     CHECK(exits == 1 && shows == 1 && keep_awake_calls == 2, "exit: %d %d %d", shows, exits, keep_awake_calls);
+    /* And the vm module's requests, as the app task answers. */
+    struct apps_vm_job *job = (struct apps_vm_job *)(uintptr_t)0x7a0b;
+    CHECK(apps_port_vm_submit(job) && vm_submitted == job, "a vm request goes to the app task");
+    vm_submit_answer = false;
+    CHECK(!apps_port_vm_submit(job), "and its refusal comes back");
 }
 
 static const struct {

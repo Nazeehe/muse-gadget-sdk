@@ -176,6 +176,7 @@
 #include "apps_port.h"
 #include "apps_rt.h"
 #include "apps_ui.h"
+#include "apps_vmio.h"
 
 /* The device's CONFIG_MUSE_APPS_HEAP_MAX_KB is set by its build; here the manifest's own ceiling holds. */
 #define HEAP_MAX_KB 1024
@@ -900,6 +901,28 @@ static void deliver_alarms(app_t *app) {
 static void begin_command(void);
 static void end_of_command(const app_t *app);
 
+/* Bounds one step's vm work: each request the port refuses is a callback, so the app's 8 and its watches, and their callbacks. */
+#define VM_PASSES_MAX (2 * (APPS_VM_QUEUE + APPS_VM_WATCHES_MAX + 2))
+
+/* The vm module's requests and callbacks, after the timers, as the app task's round has them (apps_task.c: run_vm). apphost has no
+ * VM: its port refuses every request, "the VM is not connected" (apphost_port.c), and the callback runs here, one call at a time. */
+static void run_vm(app_t *app, int64_t now) {
+    for (int pass = 0; pass < VM_PASSES_MAX; pass++) {
+        apps_vmio_tick(app->rt, now, !apps_port_dark());
+        if (!apps_vmio_has_work(app->rt)) {
+            if (apps_vmio_next_deadline(app->rt) > now) {
+                break;
+            }
+            continue;  /* a request is ready: the next tick sends it */
+        }
+        bool was_crashed = crashed(app);
+        apps_vmio_run_one(app->rt);
+        flush_warnings(app);
+        report_crash(app, was_crashed);
+        end_if_exited(app);
+    }
+}
+
 /* advance MS: the clock moves in steps and after each one the timers that are due run (apps_rt_run_timers: what the app task's
  * loop does, on the same clock), and the screen is applied, as the LVGL task's frame follows a callback. At least one step,
  * so `advance 0` is a pass. Every step is a command as far as the UI lock goes (end_of_command). */
@@ -925,6 +948,7 @@ static void cmd_advance(app_t *app, long ms) {
                     break;
                 }
             }
+            run_vm(app, now);
             end_of_command(app);
         }
     } while (done < ms);

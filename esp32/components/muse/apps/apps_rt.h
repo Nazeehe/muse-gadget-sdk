@@ -30,7 +30,8 @@
  * What the app's code is given besides the sandbox's libraries (apps_vm.h), `json` (apps_json.h), `ui`
  * (apps_ui.h; main.lua's top level can already draw, so ui.image finds the package's images from the start) and
  * `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` (apps_svc.h; main.lua's top level can already arm a timer, which
- * runs once start() has, and use the store, which is loaded before it runs):
+ * runs once start() has, and use the store, which is loaded before it runs), and `vm` (apps_vmio.h: requests made at main.lua's top
+ * level go once the app runs):
  * - print(...): the tostring of each argument, joined with tabs, as the lines of the app's log. The text
  *   is split at each "\n". In each line, a byte under 0x20 but tab, 0x7F, a C1 control character
  *   (U+0080 to U+009F) and anything that isn't valid UTF-8 (RFC 3629) become '?', one for each byte, or
@@ -392,6 +393,19 @@ bool apps_rt_permits(const apps_rt_t *rt, unsigned perm);
  * which leaves out stolen time: apps_vm.h) and the memory counters (apps_vm.h). What is installed into its globals
  * through it is there for the handlers, not for main.lua's top level, which has run by the time the runtime exists. */
 apps_vm_t *apps_rt_vm(apps_rt_t *rt);
+
+/* ---- Callbacks that come later (the `vm` module, apps_vmio.h) ---- */
+
+/* The vm module's books, which live in the runtime's block from apps_rt_new to apps_rt_free; NULL for NULL. A crash and a stop that
+ * stopped release them (apps_vmio_release, as the timers are disarmed), so no callback runs and no request goes after either. */
+struct apps_vmio;
+struct apps_vmio *apps_rt_vmio(const apps_rt_t *rt);
+
+/* A callback of a module that answers later: fn(arg) runs as one call of the app with APPS_BUDGET_CALL, through the runtime's one way
+ * into the app (the duty cycle books it), for a RUNNING app; fn pushes what it calls and calls it. True when it returned; false, with
+ * nothing run, for an app that isn't RUNNING, and false, with the app CRASHED (as a timer's error crashes it), when it failed. The app
+ * task, outside a call. */
+bool apps_rt_callback(apps_rt_t *rt, int (*fn)(lua_State *L), void *arg);
 
 /* ---- The store, show and exit (above; the `store` and `sys` modules of apps_svc.c are built on these) ---- */
 

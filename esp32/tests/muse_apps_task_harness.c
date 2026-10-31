@@ -1181,6 +1181,119 @@ void apps_port_exit(void) {
     apps_task_exit();
 }
 
+/* The vm module's requests (connected apps Task 3) go the device's way: the app task stamps them and the real network worker runs them
+ * (apps_net.c, its thread made by the fakes), against the VM's files below. */
+bool apps_port_vm_submit(struct apps_vm_job *job) {
+    return apps_task_vm_submit(job);
+}
+
+/* The VM's files for the cases that use it: a picture, an image file and a rev, any app's. An op can be held until the case lets it go
+ * (or its deadline comes), and every op is an event: "vm read <path>", "vm write <path>". */
+static pthread_mutex_t vmf_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t vmf_cv = PTHREAD_COND_INITIALIZER;
+static bool vmf_hold;
+static char vmf_rev[16] = "1";
+/* The fake TJpgDec's 200 x 100 baseline picture (tests/fake_tjpgd.h). */
+static const uint8_t VMF_JPEG[] = {'F', 'J', 'P', 'G', 'B', 1, 1, 0, 200, 0, 100, 0, 0, 0, 'E', 'N', 'D', '!'};
+/* A 2 x 1 RGB565 LVGL image. */
+static const uint8_t VMF_BIN[] = {0x19, 0x12, 0, 0, 2, 0, 1, 0, 4, 0, 0, 0, 0x11, 0x22, 0x33, 0x44};
+
+static const char *vmf_rel(const char *path) {
+    const char *rel = strncmp(path, APPS_VM_DIR, strlen(APPS_VM_DIR)) == 0 ? strchr(path + strlen(APPS_VM_DIR), '/') : NULL;
+    return rel != NULL ? rel + 1 : path;
+}
+
+/* Waits while ops are held (vmf_mu held): false when the deadline came first. */
+static bool vmf_wait(int64_t deadline_us) {
+    while (vmf_hold) {
+        if (apps_port_mono_ms() * 1000 >= deadline_us) {
+            return false;
+        }
+        struct timespec ts = deadline_in(2);
+        pthread_cond_timedwait(&vmf_cv, &vmf_mu, &ts);
+    }
+    return true;
+}
+
+static bool vmf_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                     int64_t deadline_us, const char **code, char *err, size_t err_len) {
+    const char *rel = vmf_rel(path);
+    event("vm read %s", rel);
+    pthread_mutex_lock(&vmf_mu);
+    bool waited = vmf_wait(deadline_us);
+    char rev[sizeof vmf_rev];
+    snprintf(rev, sizeof rev, "%s", vmf_rev);
+    pthread_mutex_unlock(&vmf_mu);
+    if (!waited) {
+        *code = MUSE_APPS_VM_TIMED_OUT;
+        snprintf(err, err_len, "download timed out");
+        return false;
+    }
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    if (strcmp(rel, "pic.jpg") == 0) {
+        data = VMF_JPEG, len = sizeof VMF_JPEG;
+    } else if (strcmp(rel, "pic.bin") == 0) {
+        data = VMF_BIN, len = sizeof VMF_BIN;
+    } else if (strcmp(rel, "state/rev") == 0) {
+        data = (const uint8_t *)rev, len = strlen(rev);
+    }
+    if (data == NULL) {
+        *code = MUSE_APPS_VM_NOT_FOUND;
+        snprintf(err, err_len, "VM answered HTTP 404");
+        return false;
+    }
+    if (len > max) {
+        *code = MUSE_APPS_VM_TOO_LARGE;
+        snprintf(err, err_len, "larger than %zu bytes", max);
+        return false;
+    }
+    if (!sink(user, data, len)) {
+        *code = MUSE_APPS_VM_FAILED;
+        snprintf(err, err_len, "larger than %zu bytes", max);  /* vm_file says a sink's stop so */
+        return false;
+    }
+    return true;
+}
+
+static bool vmf_write(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
+                      size_t err_len) {
+    (void)data, (void)len;
+    event("vm write %s", vmf_rel(path));
+    pthread_mutex_lock(&vmf_mu);
+    bool waited = vmf_wait(deadline_us);
+    pthread_mutex_unlock(&vmf_mu);
+    if (!waited) {
+        *code = MUSE_APPS_VM_TIMED_OUT;
+        snprintf(err, err_len, "write timed out");
+    }
+    return waited;
+}
+
+static void vmf_set_hold(bool hold) {
+    pthread_mutex_lock(&vmf_mu);
+    vmf_hold = hold;
+    pthread_cond_broadcast(&vmf_cv);
+    pthread_mutex_unlock(&vmf_mu);
+}
+
+static const muse_apps_vm_ops_t VMF_OPS = {vmf_read, vmf_write};
+static atomic_bool vmf_on;  /* the VM's ops are set */
+
+/* The cases that use the VM set its ops: apps_console.c keeps them in a build that has it, and this harness without it. */
+static void use_vm_files(void) {
+#ifdef HARNESS_CONSOLE
+    muse_apps_set_vm_ops(&VMF_OPS);
+#endif
+    atomic_store(&vmf_on, true);
+}
+
+#ifndef HARNESS_CONSOLE
+const muse_apps_vm_ops_t *muse_apps_vm_ops(void) {
+    return atomic_load(&vmf_on) ? &VMF_OPS : NULL;
+}
+#endif
+
 void muse_state_poke(void) {
     event("poke at %lld", (long long)apps_port_mono_ms());
 }
@@ -1253,8 +1366,9 @@ static const char *const EVENT_NAMES[] = {
     [APPS_EV_ALARM] = "ALARM",
     [APPS_EV_WAKE] = "WAKE",
     [APPS_EV_ALARM_LAUNCH] = "ALARM_LAUNCH",
+    [APPS_EV_VM_DONE] = "VM_DONE",
 };
-_Static_assert(ARRAY_LEN(EVENT_NAMES) == APPS_EV_ALARM_LAUNCH + 1, "a name for each event");
+_Static_assert(ARRAY_LEN(EVENT_NAMES) == APPS_EV_VM_DONE + 1, "a name for each event");
 
 static void note_send(const void *item, size_t item_size, TickType_t wait) {
     _Atomic(TickType_t) *longest = on_lvgl_task()            ? &lvgl_longest_send
@@ -1508,13 +1622,15 @@ static atomic_uint lv_applies;
 static int lv_callback_skips;
 static int (*overflow_rule)(const apps_widget_t *w);  /* the overflow a pass writes back for a visible widget */
 
-/* The image objects a pass made: each points into the package's bytes until a reset. */
+/* The image objects a pass made: each points into the package's bytes, or a runtime image's block, until a reset. */
 static struct {
     int slot;
+    int rt_slot;  /* the runtime image's slot it draws (apps_rt.h), or -1 for a package image */
     const uint8_t *data;
     size_t len;
 } lv_objects[APPS_UI_SLOTS];
 static int lv_n_objects;
+static uint32_t lv_reported;  /* the runtime images the last pass said its objects draw (apps_ui_report_drawn): a change is an event */
 static apps_ui_t *lv_objects_table;  /* the table they were made for */
 static volatile unsigned lv_drawn;   /* what the draws read, so they can't be left out */
 
@@ -1617,6 +1733,7 @@ bool apps_lv_apply(bool in_callback) {
     }
     (void)apps_ui_take_bg(ui, NULL);
     const uint8_t *made[APPS_UI_SLOTS];
+    int made_rt[APPS_UI_SLOTS];
     int n_made = 0;
     for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
         apps_widget_t *w = apps_ui_slot(ui, slot);
@@ -1630,10 +1747,13 @@ bool apps_lv_apply(bool in_callback) {
         if (w->kind == APPS_W_IMAGE && object_of(slot) < 0) {
             const apps_asset_t *a = apps_ui_asset(ui, w->image);
             if (a != NULL) {
+                int rt_slot = w->image >= APPS_UI_ASSETS_MAX ? w->image - APPS_UI_ASSETS_MAX : -1;
                 lv_objects[lv_n_objects].slot = slot;
+                lv_objects[lv_n_objects].rt_slot = rt_slot;
                 lv_objects[lv_n_objects].data = a->data;
                 lv_objects[lv_n_objects].len = a->len;
                 lv_n_objects++;
+                made_rt[n_made] = rt_slot;
                 made[n_made++] = a->data;
             }
         }
@@ -1646,11 +1766,25 @@ bool apps_lv_apply(bool in_callback) {
          * skip hidden and zero-width widgets itself. */
         w->overflow = (int16_t)(overflow_rule != NULL ? overflow_rule(w) : 0);
     }
+    /* What the pass's objects draw of the runtime images, said to the table as apps_lv's run_pass does (connected apps Task 3, P16): a
+     * freed image's bytes go only once no object draws them. */
+    uint32_t drawn = 0;
+    for (int i = 0; i < lv_n_objects; i++) {
+        drawn |= lv_objects[i].rt_slot >= 0 ? 1u << lv_objects[i].rt_slot : 0;
+    }
+    apps_ui_report_drawn(ui, drawn);
+    if (drawn != lv_reported) {
+        event("drawn 0x%x", (unsigned)drawn);  /* under the lock: the app task's collect, which frees after it, can't come first */
+    }
+    lv_reported = drawn;
     int number = atomic_load(&watch_cover) && lv_launcher ? table_number(ui) : 0;
     pthread_mutex_unlock(&lv_mu);
     apps_port_ui_unlock();
     for (int i = 0; i < n_made; i++) {
         char label[80];
+        if (made_rt[i] >= 0 && watched_label(made[i], label, sizeof label)[0] == '?') {
+            watch(made[i], "rt image#%d", made_rt[i]);  /* a runtime image's block: its free is an event */
+        }
         event("object %s", watched_label(made[i], label, sizeof label));
     }
     if (number > 0) {
@@ -1683,6 +1817,7 @@ void apps_lv_reset(void) {
     lv_n_objects = 0;
     lv_objects_table = NULL;
     lv_callback_skips = 0;
+    lv_reported = 0;
     pthread_mutex_unlock(&lv_mu);
     event("reset");
 }
@@ -7179,6 +7314,161 @@ static void a_launch_beside_a_big_app_counts_what_its_end_frees(void) {
 
 #endif
 
+/* ---- The vm module on the app task (connected apps Task 3) ---- */
+
+/* An app that shows a picture of its VM folder (vm.read of a .jpg, decoded on the network worker, or a .bin), frees it, and shows
+ * another. */
+static const char APP_VMPIC[] =
+    "local app = {}\n"
+    "local img, w\n"
+    "local function show(name)\n"
+    "  vm.read(name, function(v, err)\n"
+    "    if v == nil then print('failed', err) return end\n"
+    "    img = v\n"
+    "    w = ui.image{src = img}\n"
+    "    print('shown', tostring(img))\n"
+    "  end)\n"
+    "end\n"
+    "function app.start() show('pic.jpg') end\n"
+    "function app.message(event, data)\n"
+    "  if event == 'drop' then w:delete() img:free() print('freed') return true end\n"
+    "  if event == 'again' then show('pic.bin') return true end\n"
+    "end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+static const file_t VMPIC[] = {LUA("main.lua", APP_VMPIC)};
+
+static void message_ok_at(int line, const char *id, const char *event_name) {
+    char err[200];
+    char *reply = apps_task_message(id, event_name, NULL, false, 2000, err, sizeof err);
+    if (reply == NULL) {
+        fail_at(line, "message %s: %s", event_name, err);
+    }
+    apps_port_free(reply);
+}
+#define MESSAGE_OK(id, event_name) message_ok_at(__LINE__, (id), (event_name))
+
+/* P16: an image that came through vm.read is drawn in place, so a freed one gives its bytes back only after the pass that let go of it
+ * (the fake apply step reports what it draws), and one an object draws when the app ends goes after the layer's reset, with the
+ * package. The result came by APPS_EV_VM_DONE, posted with no wait, from the network worker's own task. */
+static void vm_images_go_after_the_reset(void) {
+    use_vm_files();
+    char err[200];
+    int from = mark();
+    CHECK(apps_task_run(with_perms(make_pkg("vmpic", "VM pic", VMPIC, 1), APPS_PERM_VM), true, 100, NULL, err, sizeof err), "run: %s",
+          err);
+    WAIT(from, "print vmpic shown\timage#0");
+    WAIT(from, "object rt image#0");
+    WAIT(from, "drawn 0x1");
+    CHECK(at_from(from, "task muse_apps_net stack 8192 priority 3 core 0 caps 0x404") >= 0, "the network worker: 8 KB of PSRAM, 3, core 0");
+    CHECK(at_from(from, "queue VM_DONE wait 0") >= 0, "the result came by its event, posted with no wait");
+    ORDERED(from, "vm read pic.jpg", "queue VM_DONE wait 0");
+    int freed = mark();
+    MESSAGE_OK("vmpic", "drop");
+    int let_go = WAIT(freed, "drawn 0x0");
+    int gone = WAIT(freed, "free rt image#0");
+    CHECK(let_go < gone, "the bytes went after the pass that let go of them: %d, %d", let_go, gone);
+    from = mark();
+    MESSAGE_OK("vmpic", "again");
+    WAIT(from, "print vmpic shown\timage#0");
+    WAIT(from, "object rt image#0");
+    WAIT_FRAMES(3);
+    from = mark();
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    WAIT(from, "free rt image#0");
+    ORDERED(from, "print vmpic stop", "set_ui NULL");
+    ORDERED(from, "set_ui NULL", "reset");
+    ORDERED(from, "reset", "free rt image#0");
+    ORDERED(from, "reset", "free pkg vmpic");
+    WAIT(from, "front 0");
+}
+
+/* P16: the reset comes late (LVGL paused): the image is parked with the package and freed by free_parked once the reset has run. */
+static void vm_images_park_when_the_reset_is_late(void) {
+    use_vm_files();
+    char err[200];
+    int from = mark();
+    CHECK(apps_task_run(with_perms(make_pkg("vmpic", "VM pic", VMPIC, 1), APPS_PERM_VM), true, 100, NULL, err, sizeof err), "run: %s",
+          err);
+    WAIT(from, "object rt image#0");
+    pause_lvgl();
+    from = mark();
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    CHECK(count_from(from, "log W the screen didn't take the app down within 500 ms") == 1, "the reset came late");
+    ABSENT(from, "reset");
+    ABSENT(from, "free rt image#0");
+    ABSENT(from, "free pkg vmpic");
+    int woke = mark();
+    atomic_store(&lvgl_paused, false);
+    int reset = WAIT(woke, "reset");
+    int freed = WAIT(woke, "free rt image#0");
+    int pkg = WAIT(woke, "free pkg vmpic");
+    CHECK(reset < freed && reset < pkg, "freed after the reset: %d, %d, %d", reset, freed, pkg);
+}
+
+/* Review Focus 1, on the real app task: the app ends while its read is at the VM; the decoded picture comes back by the event, and the
+ * app task frees it by its generation, running nothing (finish() checks that no byte is left). */
+static void vm_result_for_an_ended_app_is_dropped(void) {
+    use_vm_files();
+    vmf_set_hold(true);
+    char err[200];
+    int from = mark();
+    CHECK(apps_task_run(with_perms(make_pkg("vmpic", "VM pic", VMPIC, 1), APPS_PERM_VM), true, 100, NULL, err, sizeof err), "run: %s",
+          err);
+    WAIT(from, "vm read pic.jpg");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    int stopped = mark();
+    vmf_set_hold(false);
+    WAIT(stopped, "queue VM_DONE wait 0");
+    FIFO_SYNC();
+    ABSENT(from, "print vmpic shown");
+    ABSENT(from, "print vmpic failed");
+}
+
+static const char APP_VMWATCH[] =
+    "local app = {}\n"
+    "function app.start() vm.watch('state/rev', 1, function(t, e) print('rev', t, e) end) end\n"
+    "function app.show() print('show') end\n"
+    "function app.hide() print('hide') end\n"
+    "return app\n";
+static const file_t VMWATCH[] = {LUA("main.lua", APP_VMWATCH)};
+
+/* Review Focus 4, on the app task's own "in front and lit": no watch read and no heartbeat while the screen is dark or the app is behind;
+ * the heartbeat at once and the overdue read when it is in front and lit again. */
+static void vm_watch_pauses_behind_or_dark(void) {
+    use_vm_files();
+    char err[200];
+    int from = mark();
+    CHECK(apps_task_run(with_perms(make_pkg("vmwatch", "VM watch", VMWATCH, 1), APPS_PERM_VM), true, 100, NULL, err, sizeof err),
+          "run: %s", err);
+    WAIT(from, "print vmwatch rev\t1");
+    WAIT(from, "vm write outbox/active.json");
+    int first = WAIT(from, "vm read state/rev");
+    WAIT(first + 1, "vm read state/rev");  /* a second later */
+    atomic_store(&lvgl_asleep, true);
+    sleep_ms(300);  /* a read on its way as the screen went dark ends */
+    int dark = mark();
+    sleep_ms(2500);
+    ABSENT(dark, "vm read state/rev");
+    ABSENT(dark, "vm write outbox/active.json");
+    int lit = mark();
+    atomic_store(&lvgl_asleep, false);
+    WAIT(lit, "vm write outbox/active.json");
+    WAIT(lit, "vm read state/rev");
+    TURN(true);  /* a voice turn puts the app behind */
+    WAIT(lit, "print vmwatch hide");
+    sleep_ms(300);
+    int behind = mark();
+    sleep_ms(2500);
+    ABSENT(behind, "vm read state/rev");
+    ABSENT(behind, "vm write outbox/active.json");
+    int back = mark();
+    TURN(false);
+    WAIT(back, "print vmwatch show");
+    WAIT(back, "vm write outbox/active.json");
+    WAIT(back, "vm read state/rev");
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -7302,6 +7592,10 @@ int main(int argc, char **argv) {
         {"a_budget_cut_off_drops_the_records", a_budget_cut_off_drops_the_records},
         {"a_save_the_budget_holds_back_is_said_and_written_at_the_end", a_save_the_budget_holds_back_is_said_and_written_at_the_end},
         {"each_apps_failure_is_said_in_its_own_log", each_apps_failure_is_said_in_its_own_log},
+        {"vm_images_go_after_the_reset", vm_images_go_after_the_reset},
+        {"vm_images_park_when_the_reset_is_late", vm_images_park_when_the_reset_is_late},
+        {"vm_result_for_an_ended_app_is_dropped", vm_result_for_an_ended_app_is_dropped},
+        {"vm_watch_pauses_behind_or_dark", vm_watch_pauses_behind_or_dark},
 #ifdef HARNESS_CONSOLE
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},

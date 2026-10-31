@@ -32,6 +32,7 @@
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_vm.h"
+#include "apps_vmio.h"
 #include "lauxlib.h"
 #include "lua.h"
 
@@ -836,7 +837,7 @@ static int sys_keep_awake(lua_State *L) {
 }
 
 /* The gadget's own modules, what sys.has says yes to: not Lua's libraries, and none of the ones that aren't there yet. */
-static const char *const HAS[] = {"ui", "time", "timer", "alarm", "store", "sound", "json", "sys"};
+static const char *const HAS[] = {"ui", "time", "timer", "alarm", "store", "sound", "json", "sys", "vm"};
 
 /* sys.has(name): whether the gadget has the module of that name. */
 static int sys_has(lua_State *L) {
@@ -956,7 +957,7 @@ static const luaL_Reg apps_timer_meta[] = {
     {NULL, NULL},
 };
 
-/* Runs under lua_pcall: the seven globals and the timer handle's metatable. */
+/* Runs under lua_pcall: the seven globals and the timer handle's metatable, then the vm module (apps_vmio.h). */
 static int open_svc(lua_State *L) {
     apps_rt_t *rt = lua_touserdata(L, 1);
     lua_settop(L, 0);
@@ -1010,6 +1011,8 @@ static int open_svc(lua_State *L) {
     lua_pushinteger(L, SYS_API);
     lua_setfield(L, -2, "api");
     lua_setglobal(L, "sys");
+
+    apps_vmio_open(L, rt);  /* `vm` and its watch handle's metatable */
     return 0;
 }
 

@@ -330,7 +330,8 @@ static void check_manifest(const apps_manifest_t *m, const char *folder, int hea
         }
         CHECK(listed && apps_file_kind(m->icon) == APPS_FILE_IMAGE, "icon '%s' isn't a listed .bin", m->icon);
     }
-    CHECK((m->perms & ~15u) == 0, "perms 0x%x", m->perms);
+    const unsigned known = APPS_PERM_SOUND | APPS_PERM_ALARM | APPS_PERM_STORE | APPS_PERM_KEEP_AWAKE | APPS_PERM_VM;
+    CHECK((m->perms & ~known) == 0, "perms 0x%x", m->perms);
     int max_kb = heap_kb > 1024 ? 1024 : heap_kb;
     if (max_kb < 64) {
         max_kb = 64;

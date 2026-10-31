@@ -41,7 +41,8 @@ TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_task_harness.c"
 SOURCES = [HARNESS, TESTS / "muse_apps_fake_esp_timer.c", APPS / "apps_task.c", APPS / "apps_io.c", APPS / "apps_alarm.c",
            APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c", APPS / "apps_pkg.c",
-           APPS / "apps_suggest.c", APPS / "apps_svc.c"]
+           APPS / "apps_suggest.c", APPS / "apps_svc.c", APPS / "apps_vmio.c", APPS / "apps_net.c", APPS / "apps_jpeg.c",
+           TESTS / "fake_tjpgd.c"]
 CONSOLE_SOURCES = [APPS / "apps_console.c", APPS / "apps_install.c", APPS / "apps_result.c"]
 
 # What apps_task.c and muse_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one is a line that includes the fakes.
@@ -55,6 +56,8 @@ def stage_fakes(directory):
     for name in FAKE_HEADERS:
         (directory / name).parent.mkdir(parents=True, exist_ok=True)
         (directory / name).write_text('#include "muse_apps_task_fakes.h"\n')
+    (directory / "rom").mkdir(parents=True, exist_ok=True)
+    (directory / "rom/tjpgd.h").write_text('#include "fake_tjpgd.h"\n')  # the JPEG decoder's ROM TJpgDec (apps_jpeg.c)
     (directory / "sdkconfig.h").write_text(SDKCONFIG)
     return directory
 
@@ -135,6 +138,20 @@ class AppTaskTest(HarnessCase):
 
     def test_the_dark_leaves_a_holding_launcher(self):  # final review I1: a hold isn't the dark's to end; one shown while dark closes
         self.run_case("the_dark_leaves_a_holding_launcher")
+
+    # ---- The vm module on the app task (connected apps Task 3; tests/test_muse_apps_vmio.py has the module's own) ----
+
+    def test_vm_images_go_after_the_reset(self):  # P16: a freed one after the pass that lets go of it; at the end, after the reset
+        self.run_case("vm_images_go_after_the_reset")
+
+    def test_vm_images_park_when_the_reset_is_late(self):  # P16: parked with the package, freed by free_parked after the reset
+        self.run_case("vm_images_park_when_the_reset_is_late")
+
+    def test_a_vm_result_for_an_ended_app_is_dropped(self):  # Review Focus 1: freed by its generation, never run
+        self.run_case("vm_result_for_an_ended_app_is_dropped")
+
+    def test_vm_watches_pause_behind_or_dark(self):  # Review Focus 4: the app task's own "in front and lit"
+        self.run_case("vm_watch_pauses_behind_or_dark", timeout=180)
 
     # ---- The rulings' ----
 
@@ -678,8 +695,8 @@ class AppTaskStoreTest(HarnessCase):
 
 class RuntimeImagesAtTheEndTest(unittest.TestCase):
     """Connected apps Task 2: an app's runtime images (apps_rt.h) are drawn in place, as its package is, so they go with the package,
-    after the layer's reset. Until Task 3 the app task makes none (the network worker's results do), so this harness can't hand it
-    one: test_muse_apps_lv.py runs the runtime, its table and the pass through end_app's order, and this pins end_app to it."""
+    after the layer's reset. AppTaskTest's vm cases (Task 3) hand the app task one through vm.read and follow it to its free, after
+    the reset and parked; test_muse_apps_lv.py runs the runtime, its table and the pass through end_app's order; this pins end_app."""
 
     def test_the_images_go_with_the_package_after_the_reset(self):
         from test_muse_apps_wiring import c_function, strip_c_comments

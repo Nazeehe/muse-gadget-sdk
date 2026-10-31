@@ -219,3 +219,13 @@ void apps_port_keep_awake(bool on);
 /* sys.exit(): the app ends once the callback that called it has returned (stop() runs, its store is saved, the layer goes behind).
  * The callback itself runs to its end. */
 void apps_port_exit(void);
+
+/*
+ * A request of the `vm` module (apps_vmio.h's job) for the platform to run, and to hand back, done, to apps_vmio_take on the app task
+ * while the app runs. The device stamps it with the app's generation and queues it for the network worker (apps_task_vm_submit,
+ * apps_net.h), the only task that waits on the VM; apphost has no VM, and answers each one "the VM is not connected". True once the
+ * port has taken the job. False, with the job the caller's and why in its err (the callback's words: "the gadget is short of memory"
+ * when the worker can't be made), when it can't. The app task, outside any call.
+ */
+struct apps_vm_job;
+bool apps_port_vm_submit(struct apps_vm_job *job);

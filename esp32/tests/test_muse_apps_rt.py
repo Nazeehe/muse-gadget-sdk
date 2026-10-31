@@ -44,7 +44,7 @@ APPS = ROOT / "components/muse/apps"
 FIXTURES = ROOT / "tests/muse_apps_fixtures"
 HARNESS_SOURCES = [ROOT / "tests/muse_apps_rt_harness.c", APPS / "apps_rt.c", APPS / "apps_vm.c",
                    APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_ui.c",
-                   APPS / "apps_svc.c"]
+                   APPS / "apps_svc.c", APPS / "apps_vmio.c"]
 INCLUDES = [ROOT / "components/lua/src", APPS]
 
 _rt_harness = None

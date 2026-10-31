@@ -157,7 +157,6 @@ cJSON *apps_install_run(const char *id, bool run, const apps_source_t *src, cons
  * them) and the time the whole install's (compile, commit and run included). NULL only when there is no memory for even the
  * result.
  */
-#define APPS_VM_DIR "workspace/apps/"  /* where Muse writes an app's folder on its VM, relative to its home */
 
 struct muse_apps_vm_ops;
 cJSON *apps_install_from_vm(const char *id, bool run, const struct muse_apps_vm_ops *vm, const apps_install_ops_t *ops);

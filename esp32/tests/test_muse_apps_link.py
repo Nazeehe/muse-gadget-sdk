@@ -744,6 +744,90 @@ class GuideAndSkill(unittest.TestCase):
                     self.assertRegex(guide, pattern, f"the guide doesn't say: {fact}")
 
 
+    def test_guide_documents_the_vm_module_and_runtime_images(self):
+        # connected apps Task 3: the `vm` reference quotes apps_vmio.h's numbers as the code has them (D12), and next to vm.read the
+        # guide says what a muse.image is (P16, from Task 2's review): img:size(), img:free() and its "in use" error, tostring, src = img,
+        # the limit of 4 and its message, the decoder's five messages, and that a freed image shown when the screen went dark keeps its
+        # place until the screen lights.
+        def number(name):
+            return header_number("apps_vmio.h", name)
+
+        def kb(name):
+            match = re.search(rf"(?m)^#define {name} \((\d+) \* 1024\)", (APPS / "apps_vmio.h").read_text())
+            self.assertIsNotNone(match, name)
+            return int(match.group(1))
+
+        def whole(value, unit):
+            self.assertEqual(value % unit, 0, f"{value} isn't a whole number of {unit}")
+            return value // unit
+
+        side = header_number("apps_rt.h", "APPS_RT_IMAGE_SIDE_MAX")
+        images = header_number("apps_rt.h", "APPS_RT_IMAGES_MAX")
+        # A .bin read is at most a package image's bytes.
+        self.assertRegex((APPS / "apps_vmio.h").read_text(), r"(?m)^#define APPS_VM_BIN_MAX APPS_IMAGE_MAX$")
+        image_kb = int(re.search(r"(?m)^#define APPS_IMAGE_MAX \((\d+) \* 1024\)", (APPS / "apps_pkg.h").read_text()).group(1))
+        guide = GUIDE.read_text()
+        reference = guide_section(guide, "API reference")
+        self.assertIn("\n### vm\n", reference)
+        vm = " ".join(reference[reference.index("\n### vm\n"):].split("\n### ", 2)[1].split())
+        for pattern in (
+                r"These need the `vm` permission",
+                rf"`\.json` the decoded value \(the file at most {kb('APPS_VM_JSON_MAX')} KB\)",
+                rf"`\.txt` a string \(at most {kb('APPS_VM_TXT_MAX')} KB\)",
+                rf"`\.jpg` or `\.jpeg` a `muse\.image` \(at most {kb('APPS_VM_JPEG_MAX')} KB; baseline, not progressive\)",
+                rf"`\.bin` a `muse\.image` \(an LVGL image of at most {side} x {side} px and {image_kb} KB",
+                rf"decodes it to fit 200 px \(1 to {side}, {side} if left out\)",
+                rf"writes value as JSON \(at most {whole(number('APPS_VM_WRITE_MAX'), 1024)} KB\) to path, which must be in `outbox/`",
+                rf"reads `state/acks\.json` every {whole(number('APPS_VM_ACK_POLL_MS'), 1000)} s until the hook lists seq",
+                rf"`cb\(false, \"timed out\"\)` after {whole(number('APPS_VM_ACK_MS'), 1000)} s",
+                rf"name is 1 to {number('APPS_VM_NAME_MAX')} characters of a-z, 0-9 and _",
+                rf"at most {whole(number('APPS_VM_ARGS_MAX'), 1024)} KB as JSON",
+                rf"reads the file \(at most {whole(number('APPS_VM_WATCH_MAX'), 1024)} KB, like `state/rev`\)",
+                rf"every every_s seconds \({number('APPS_VM_EVERY_MIN_S')} to {number('APPS_VM_EVERY_MAX_S')}; "
+                rf"{number('APPS_VM_EVERY_DEFAULT_S')} if left out\) while the app is in front and the screen is lit",
+                r"`cb\(text\)` on the first read and whenever the text changes",
+                r"`cb\(nil, err\)`, once for each new error",
+                rf"At most {number('APPS_VM_WATCHES_MAX')} watches an app",
+                rf"at once and then every {whole(number('APPS_VM_HEARTBEAT_MS'), 1000)} s",
+                r'`\{"acks":\[\{"seq":<seq>,"result":\.\.\.\}, \.\.\.\]\}`',
+                rf"one at the VM at a time and at most {number('APPS_VM_QUEUE')} more waiting",
+                rf"Each has {whole(number('APPS_VM_REQUEST_MS'), 1000)} s",
+                rf"tried again {number('APPS_VM_BUSY_RETRIES')} times, {number('APPS_VM_BUSY_WAIT_MS')} ms apart",
+                r"even while the app is behind or the screen is dark",
+                # muse.image
+                r"`ui\.image\{src = img\}` and `w:set\{src = img\}` show it",
+                r"`img:size\(\)` is its width and height in px",
+                r"`img:free\(\)` lets go of it",
+                r"`image is in use by image#<n>` while a widget shows it",
+                r"`image#<n> was freed`",
+                r"`tostring\(img\)` is like `image#2`, freed or not",
+                rf"holds at most {images} at once: a fifth gets `no more than {images} images at once: free one with img:free\(\)`",
+                rf"keeps its place among the {images} until the screen lights again"):
+            with self.subTest(pattern):
+                self.assertRegex(vm, pattern)
+        jpeg = (APPS / "apps_jpeg.h").read_text()
+        messages = re.findall(r'#define APPS_JPEG_MSG_\w+ "([^"]+)"', jpeg)
+        self.assertEqual(len(messages), 5, "the decoder's five messages")
+        for message in messages:
+            with self.subTest(message):
+                self.assertIn(f"`{message.replace('%d', '<n>')}`", vm)
+        rt = (APPS / "apps_rt.c").read_text()
+        for text in ('"no more than 4 images at once: free one with img:free()"', '"image is in use by image#%d"', '"image#%d was freed"'):
+            self.assertIn(text, rt)
+        # The watch's handle method, as the timer's is documented.
+        vmio = strip_c_comments((APPS / "apps_vmio.c").read_text())
+        for method in c_table(vmio, "apps_watch_methods"):
+            self.assertRegex(vm, rf"`h:{method}\(", f"h:{method}")
+        # sys.has names what HAS has, and the manifest's permissions and the refusal's list name vm.
+        has = c_table(strip_c_comments((APPS / "apps_svc.c").read_text()), "HAS")
+        self.assertIn("vm", has)
+        self.assertIn(f"- `sys.has(name)`: whether the gadget has the module name ({', '.join(has)}).", reference)
+        valid = re.search(r'#define PERMISSIONS_VALID "([^"]+)"', (APPS / "apps_pkg.c").read_text()).group(1)
+        self.assertEqual(valid, "(valid: sound, alarm, store, keep_awake, vm)")
+        self.assertIn(f"- `manifest: unknown permission '<name>' {valid}`", guide)
+        self.assertIn("and `vm` (the `vm` module)", guide_section(guide, "Files and the manifest"))
+
+
 class LinkWiring(unittest.TestCase):
     def test_the_registration_is_printed_into_psram_in_an_apps_build(self):
         # I2: with the apps the registration is near 4 KB, where malloc picks internal RAM (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096),
@@ -762,6 +846,9 @@ class LinkWiring(unittest.TestCase):
             self.assertIn(word, words)
         literals = set(c_literals((MAIN / "vm_file.c").read_text()))
         self.assertEqual([w for w in words if w not in literals], [])
+        # The VM's 404 is a prefix of vm_file's "VM answered HTTP %d" (the VM's words may follow): Task 3's not_found.
+        self.assertIn("VM answered HTTP %d", literals)
+        self.assertIn('static const char HTTP_404[] = "VM answered HTTP 404";', link)
 
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))

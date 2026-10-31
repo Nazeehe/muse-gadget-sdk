@@ -79,6 +79,13 @@ static bool session_gone(const char *why) {
     return strcmp(why, "the VM connection dropped") == 0 || strcmp(why, "could not send the request to the VM") == 0;
 }
 
+// vm_file's words for the VM's 404: "VM answered HTTP %d", then ": " and the VM's own words, if any (MUSE_APPS_VM_NOT_FOUND).
+static bool not_found(const char *why) {
+    static const char HTTP_404[] = "VM answered HTTP 404";
+    const size_t n = sizeof HTTP_404 - 1;
+    return strncmp(why, HTTP_404, n) == 0 && (why[n] == '\0' || why[n] == ':');
+}
+
 // ---- The VM's files, behind muse_apps_vm_ops_t ----
 
 static bool vm_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
@@ -100,6 +107,7 @@ static bool vm_read(const char *path, size_t max, bool (*sink)(void *user, const
         *code = vm_file_timed_out(f)      ? MUSE_APPS_VM_TIMED_OUT
                 : vm_file_bytes(f) > max ? MUSE_APPS_VM_TOO_LARGE
                 : session_gone(err)      ? MUSE_APPS_VM_DROPPED
+                : not_found(err)         ? MUSE_APPS_VM_NOT_FOUND
                                          : MUSE_APPS_VM_FAILED;
     }
     vm_file_close(f);

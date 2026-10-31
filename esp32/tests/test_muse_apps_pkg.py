@@ -41,13 +41,13 @@ SOURCES = [ROOT / "tests/muse_apps_pkg_harness.c", APPS / "apps_pkg.c", APPS / "
 INCLUDES = [ROOT / "components/lua/src", APPS, ROOT / "tests/apps_pkg_fakes"]
 
 # The perms bits, as apps_pkg.h gives them.
-SOUND, ALARM, STORE, KEEP_AWAKE = 1, 2, 4, 8
+SOUND, ALARM, STORE, KEEP_AWAKE, VM = 1, 2, 4, 8, 16
 
 DROP = object()  # a key left out of doc()
 
 # The messages, exactly (apps_pkg.h lists them all).
 PATH_RULE = "(a-z 0-9 _ . / -, no '..', at most 64 characters)"
-PERMS_VALID = "(valid: sound, alarm, store, keep_awake)"
+PERMS_VALID = "(valid: sound, alarm, store, keep_awake, vm)"
 NAME_MSG = "manifest: name must be 1 to 24 characters"
 VERSION_MSG = 'manifest: version must be text of at most 23 characters, like "1.0.0"'
 NAME_CONTROL_MSG = "manifest: name has a control character"
@@ -376,7 +376,8 @@ class MuseAppsPkgTest(unittest.TestCase):
 
     def test_permissions_make_a_bit_set(self):
         for permissions, bits in [([], 0), (["sound"], SOUND), (["alarm"], ALARM), (["store"], STORE),
-                                  (["keep_awake"], KEEP_AWAKE), (["sound", "alarm", "store", "keep_awake"], 15),
+                                  (["keep_awake"], KEEP_AWAKE), (["vm"], VM),
+                                  (["sound", "alarm", "store", "keep_awake", "vm"], 31),
                                   (["store", "store", "sound"], STORE | SOUND)]:
             with self.subTest(permissions=permissions):
                 self.assertEqual(self.ok(doc(permissions=j(permissions)))["perms"], bits)
@@ -499,6 +500,16 @@ class MuseAppsPkgTest(unittest.TestCase):
         self.refused(doc(api=DROP), API_MISSING_MSG)
 
     # ---- The permissions ----
+
+    def test_vm_permission(self):
+        # Connected apps Task 3: "vm" is a permission of api 1 (bit 16), and the ones still to come keep their refusal.
+        self.assertEqual(self.ok(doc(permissions=j(["vm"])))["perms"], VM)
+        self.assertEqual(self.ok(doc(permissions=j(["store", "vm"])))["perms"], STORE | VM)
+        for name in ["net", "secrets"]:
+            with self.subTest(permission=name):
+                self.refused(doc(permissions=j(["vm", name])), not_yet_msg(name))
+        header = (APPS / "apps_pkg.h").read_text()
+        self.assertIn("APPS_PERM_KEEP_AWAKE = 8, APPS_PERM_VM = 16 }", header)
 
     def test_permissions_not_available_yet(self):
         for name in ["net", "secrets", "muse"]:

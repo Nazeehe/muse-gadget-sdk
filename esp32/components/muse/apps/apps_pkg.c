@@ -69,7 +69,7 @@
 #define MESSAGE_TEXT_MAX 200  /* each name and description is under this: read into this many bytes, NUL included */
 
 #define PATH_RULE "(a-z 0-9 _ . / -, no '..', at most 64 characters)"
-#define PERMISSIONS_VALID "(valid: sound, alarm, store, keep_awake)"
+#define PERMISSIONS_VALID "(valid: sound, alarm, store, keep_awake, vm)"
 
 /* LVGL v9's image header: magic, colour format, flags (16 bits), w, h, stride and 16 reserved bits, all
  * little-endian, in 12 bytes. */
@@ -338,6 +338,7 @@ static const struct {
     {"alarm", APPS_PERM_ALARM},
     {"store", APPS_PERM_STORE},
     {"keep_awake", APPS_PERM_KEEP_AWAKE},
+    {"vm", APPS_PERM_VM},  /* the app's folder on the VM (apps_vmio.h): connected apps, api 1 */
 };
 
 /* Designed for api 2 and refused in api 1. */

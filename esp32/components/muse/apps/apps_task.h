@@ -169,6 +169,7 @@ typedef enum {
     APPS_EV_ALARM,      /* an alarm fired (apps_alarm.h): brings the loop round, which delivers; no payload */
     APPS_EV_WAKE,       /* the LVGL task ran a reset the app task waits for, or the screen was lit: the round's housekeeping */
     APPS_EV_ALARM_LAUNCH,  /* the I/O worker's launch for an app's alarms is over: code the outcome (apps_alarm_launch_t), app_gen its identity */
+    APPS_EV_VM_DONE,       /* the network worker has results (apps_net.h): brings the loop round, whose housekeeping takes them; no payload */
 } apps_event_type_t;
 
 typedef struct {
@@ -349,3 +350,16 @@ void apps_task_exit(void);
 
 /* Whether the caller is the app task (the port's wait for a snapshot's blocks is the app task's alone: apps_port.h). Any task. */
 bool apps_task_current(void);
+
+/*
+ * The `vm` module's requests (connected apps Task 3; apps_port_vm_submit is this on the device). The app task alone, outside any call:
+ * the job is stamped with the running app's generation and queued for the network worker (apps_net.h); false, with the job the
+ * caller's and "the gadget is short of memory" in its err, when the worker can't take it. Each result comes back by APPS_EV_VM_DONE
+ * (posted as alarms are: once while the loop hasn't looked, never into the last 2 slots, and a post that finds no room loses nothing,
+ * as the loop comes round within a second and takes every result in its housekeeping). The loop gives a result to the app it was for,
+ * if that app still runs (apps_vmio_take), and frees one whose app has ended: it never runs (Review Focus 1). Each round, next to the
+ * timers, the loop ticks the module with "in front and lit" (the layer shown and the screen not dark: watches and the heartbeat pause
+ * otherwise, P12) and runs one callback, a call of the app like any other.
+ */
+struct apps_vm_job;
+bool apps_task_vm_submit(struct apps_vm_job *job);

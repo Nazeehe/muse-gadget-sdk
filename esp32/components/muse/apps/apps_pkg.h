@@ -40,7 +40,7 @@
  *   api          required whole number: 1
  *   main         optional path of a .lua file; "main.lua" if left out
  *   files        optional list of paths (.lua, .json, .bin): every file but main
- *   permissions  optional list of sound alarm store keep_awake (net, secrets and muse aren't there yet)
+ *   permissions  optional list of sound alarm store keep_awake vm (net, secrets and muse aren't there yet)
  *   memory_kb    optional whole number, 64 to min(1024, heap_max_kb); 256 (or heap_max_kb, if less) if left out
  *   messages     optional object of at most 16 event names to descriptions, each under 200 bytes
  * Any other key is ignored, with a warning. A key that appears twice has its last value, as in json.decode.
@@ -73,9 +73,9 @@
  *   manifest: icon '%s' is not an allowed path (a-z 0-9 _ . / -, no '..', at most 64 characters)
  *   manifest: icon '%s' must be a .bin image
  *   manifest: icon '%s' is not one of the app's files
- *   manifest: permissions must be a list, like ["sound"] (valid: sound, alarm, store, keep_awake)
+ *   manifest: permissions must be a list, like ["sound"] (valid: sound, alarm, store, keep_awake, vm)
  *   manifest: permission '%s' is not available in this firmware yet (api 1)       (net, secrets, muse)
- *   manifest: unknown permission '%s' (valid: sound, alarm, store, keep_awake)
+ *   manifest: unknown permission '%s' (valid: sound, alarm, store, keep_awake, vm)
  *   manifest: memory_kb must be a whole number from 64 to %d
  *   manifest: messages must map event names to descriptions (at most 16, each under 200 characters)
  *   manifest: out of memory                                                (messages_json didn't fit)
@@ -169,7 +169,11 @@ bool apps_room_beside(size_t free_bytes, const char *id, size_t bytes, unsigned 
 #define APPS_MSG_ICON_SIZE "icon: %ux%u must be square, at most %dx%d"
 #define APPS_MSG_ICON_BYTES "icon: %u bytes is more than an icon's %u: its rows are padded"
 
-enum { APPS_PERM_SOUND = 1, APPS_PERM_ALARM = 2, APPS_PERM_STORE = 4, APPS_PERM_KEEP_AWAKE = 8 };
+enum { APPS_PERM_SOUND = 1, APPS_PERM_ALARM = 2, APPS_PERM_STORE = 4, APPS_PERM_KEEP_AWAKE = 8, APPS_PERM_VM = 16 };
+
+/* Where Muse writes an app's folder on its VM, relative to its home: the install reads a package from workspace/apps/<id>/, and the `vm`
+ * module (apps_vmio.h) reads and writes the running app's own folder there. */
+#define APPS_VM_DIR "workspace/apps/"
 
 typedef enum { APPS_FILE_LUA, APPS_FILE_JSON, APPS_FILE_IMAGE, APPS_FILE_BAD } apps_file_kind_t;
 

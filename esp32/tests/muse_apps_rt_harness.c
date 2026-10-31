@@ -381,6 +381,12 @@ void apps_port_exit(void) {
     fake_exits++;
 }
 
+/* No VM here: the vm module's requests are refused (its callbacks say so; tests/muse_apps_vmio_harness.c is the module's). */
+bool apps_port_vm_submit(struct apps_vm_job *job) {
+    (void)job;
+    return false;
+}
+
 void apps_port_ui_lock(void) {}
 
 bool apps_port_ui_trylock(int ms) {

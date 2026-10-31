@@ -72,14 +72,15 @@ if(CONFIG_MUSE_ENABLED)
         # >app.* lines, Link's app.control and app.api, app.control's snapshot (apps_snapshot.c: LVGL's snapshot and
         # esp_new_jpeg, which idf_component.yml brings in with the apps), the D14 results those jobs share
         # (apps_result.c), the launcher's icons (apps_icons.c: read on the I/O worker, shown by the LVGL task), the
-        # apps' JPEG decoder (apps_jpeg.c: runtime images, over the ROM's TJpgDec), and the big digit fonts
-        # (apps/fonts/, made by tools/muse/gen_app_fonts.sh).
+        # apps' JPEG decoder (apps_jpeg.c: runtime images, over the ROM's TJpgDec), the apps' vm module and the
+        # network worker that runs its requests through the VM ops (apps_vmio.c, apps_net.c), and the big digit
+        # fonts (apps/fonts/, made by tools/muse/gen_app_fonts.sh).
         list(APPEND srcs "apps/apps_vm.c" "apps/apps_suggest.c" "apps/apps_json.c" "apps/apps_pkg.c"
             "apps/apps_rt.c" "apps/apps_svc.c" "apps/apps_ui.c" "apps/apps_lv.c" "apps/apps_task.c"
             "apps/apps_port_idf.c" "apps/apps_alarm.c" "apps/apps_io.c" "apps/apps_values.c" "apps/apps_store.c"
             "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/apps_snapshot.c"
-            "apps/apps_result.c" "apps/apps_icons.c" "apps/apps_jpeg.c" "apps/fonts/apps_digits_48.c"
-            "apps/fonts/apps_digits_96.c")
+            "apps/apps_result.c" "apps/apps_icons.c" "apps/apps_jpeg.c" "apps/apps_vmio.c" "apps/apps_net.c"
+            "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
         # What app.api writes to Muse's VM (apps_control.c): the app guide and the timer example.
         list(APPEND embed "apps/apps_guide.md" "apps/examples/timer/manifest.json" "apps/examples/timer/main.lua"
             "apps/examples/timer/icon.bin")

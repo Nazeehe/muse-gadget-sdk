@@ -35,6 +35,7 @@
 #include "apps_rt.h"
 
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -44,6 +45,7 @@
 #include "apps_svc.h"
 #include "apps_ui.h"
 #include "apps_vm.h"
+#include "apps_vmio.h"
 #include "lauxlib.h"
 #include "lua.h"
 
@@ -147,6 +149,8 @@ struct apps_rt {
     /* The runtime images (apps_rt.h), and the last gen given. */
     rt_image_t images[APPS_RT_IMAGES_MAX];
     uint32_t image_gen;
+    /* The vm module's books (apps_vmio.h), in this block after the struct (RT_BLOCK): their size is apps_vmio.c's. */
+    apps_vmio_t *vmio;
     /* apps_vm_call writes its error here. It is the crash record while the state is CRASHED (and nothing runs
      * after that), and the scratch of a call that fails the message alone otherwise. */
     char err[APPS_ERROR_MAX];
@@ -156,6 +160,10 @@ struct apps_rt {
     unsigned ring_lines;
     uint8_t ring[APPS_LOG_RING_BYTES];
 };
+
+/* The runtime's block holds the struct, then the vm module's books (apps_vmio_size), aligned as any block is: one block, so the
+ * runtime is made or refused whole, as it was before the books. */
+#define RT_BLOCK ((sizeof(struct apps_rt) + _Alignof(max_align_t) - 1) / _Alignof(max_align_t) * _Alignof(max_align_t))
 
 /* ---- Text that leaves the runtime ----
  *
@@ -516,12 +524,13 @@ static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t b
     return result;
 }
 
-/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. Its timers go, and what it had
- * written to its store is saved. */
+/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. Its timers go, its vm callbacks and
+ * requests too, and what it had written to its store is saved. */
 static void crash(apps_rt_t *rt) {
     apps_text_clean(rt->err, strlen(rt->err), true);
     rt->state = APPS_STATE_CRASHED;
     timers_disarm(rt);
+    apps_vmio_release(rt->vmio, apps_vm_lua(rt->vm));
     store_flush_final(rt);
 }
 
@@ -1029,12 +1038,14 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
         put_text(err, err_len, text);
         return NULL;
     }
-    apps_rt_t *rt = apps_port_realloc(NULL, sizeof *rt);
+    apps_rt_t *rt = apps_port_realloc(NULL, RT_BLOCK + apps_vmio_size());
     if (rt == NULL) {
         put_text(err, err_len, "out of memory: can't make room for the app");
         return NULL;
     }
     memset(rt, 0, sizeof *rt);
+    rt->vmio = (apps_vmio_t *)((char *)rt + RT_BLOCK);
+    apps_vmio_init(rt->vmio, rt);
     rt->pkg = pkg;
     rt->state = APPS_STATE_STOPPED;
     for (int h = 0; h < H_COUNT; h++) {
@@ -1156,6 +1167,7 @@ void apps_rt_stop(apps_rt_t *rt) {
     if (rt->handler[H_STOP] == LUA_NOREF || call_handler(rt, H_STOP, NULL, APPS_BUDGET_CALL)) {
         rt->state = APPS_STATE_STOPPED;
         timers_disarm(rt);
+        apps_vmio_release(rt->vmio, apps_vm_lua(rt->vm));  /* no vm callback runs after stop(), and no request goes */
         store_flush_final(rt);  /* what stop() wrote too */
     }
 }
@@ -1766,6 +1778,7 @@ void apps_rt_free(apps_rt_t *rt) {
         store_flush_final(rt);  /* a change that is left is saved (the app's end has done it already, as a rule) */
         store_clear(rt);
         apps_port_free(rt->store);
+        apps_vmio_free(rt->vmio);  /* the requests and results it still holds (a job at the worker comes back to a freed app, and goes) */
         /* The VM goes first: no app code runs after it, so no handle to the table is left to use. */
         apps_vm_free(rt->vm);
         apps_ui_free(rt->ui);
@@ -1820,4 +1833,19 @@ apps_vm_t *apps_rt_vm(apps_rt_t *rt) {
 
 apps_ui_t *apps_rt_ui(apps_rt_t *rt) {
     return rt != NULL ? rt->ui : NULL;
+}
+
+apps_vmio_t *apps_rt_vmio(const apps_rt_t *rt) {
+    return rt != NULL ? rt->vmio : NULL;
+}
+
+bool apps_rt_callback(apps_rt_t *rt, int (*fn)(lua_State *L), void *arg) {
+    if (rt == NULL || rt->state != APPS_STATE_RUNNING) {
+        return false;
+    }
+    if (vm_run(rt, fn, arg, APPS_BUDGET_CALL) == APPS_CALL_OK) {
+        return true;
+    }
+    crash(rt);
+    return false;
 }

@@ -492,6 +492,11 @@ void apps_port_exit(void) {
     apps_task_exit();
 }
 
+/* The vm module's requests go to the network worker, stamped with the app that runs (apps_task.h). */
+bool apps_port_vm_submit(struct apps_vm_job *job) {
+    return apps_task_vm_submit(job);
+}
+
 /* PSA's SHA-256 (C21): IDF v6's mbedTLS is PSA, as main/link_pairing.c uses it. psa_crypto_init is cheap once it has
  * run. */
 void apps_port_sha256(const void *data, size_t len, uint8_t out[32]) {

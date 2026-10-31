@@ -121,6 +121,7 @@ struct cJSON;
 #define MUSE_APPS_VM_TIMED_OUT "timed_out"          /* deadline_us came first */
 #define MUSE_APPS_VM_TOO_LARGE "too_large"          /* read: the file is longer than max */
 #define MUSE_APPS_VM_DROPPED "dropped"              /* the session is gone: the request wasn't sent, or the connection dropped */
+#define MUSE_APPS_VM_NOT_FOUND "not_found"          /* read: the VM has no such file (HTTP 404) */
 #define MUSE_APPS_VM_FAILED "failed"                /* anything else: the VM's answer (a refusal), a bad path */
 
 typedef struct muse_apps_vm_ops {

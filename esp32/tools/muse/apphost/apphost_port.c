@@ -42,6 +42,7 @@
 #include "apps_alarm.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
+#include "apps_vmio.h"
 
 /* Not 0: a clock at 0 reads as "unset" in places. */
 #define FAKE_MONO_MS 1000
@@ -256,6 +257,12 @@ void apps_port_keep_awake(bool on) {
 
 void apps_port_exit(void) {
     exit_asked = true;
+}
+
+/* apphost has no VM: every vm request is refused, in the words the gadget uses for a VM it can't reach (apps_vmio.h). */
+bool apps_port_vm_submit(struct apps_vm_job *job) {
+    snprintf(job->err, sizeof job->err, "%s", APPS_VM_MSG_NOT_CONNECTED);
+    return false;
 }
 
 bool apphost_take_exit(void) {

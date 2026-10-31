@@ -25,7 +25,7 @@ manifest.json, a JSON object of at most 8 KB:
 - `main` (optional): the main `.lua` file, `"main.lua"` if left out.
 - `files` (optional): every other file, like `["util.lua", "assets/bell.bin"]`: modules for `require`, `.json` data and images.
 - `icon` (optional): one of `files`, a square `.bin` image at most 160 x 160, shown in the launcher; make it 160 x 160, the size of the app in the middle. See Icons.
-- `permissions` (optional): any of `sound` (for `sound.chirp`), `alarm` (the `alarm` module), `store` (the `store` module) and `keep_awake` (for `sys.keep_awake`). `net`, `secrets` and `muse` aren't available in this firmware yet.
+- `permissions` (optional): any of `sound` (for `sound.chirp`), `alarm` (the `alarm` module), `store` (the `store` module), `keep_awake` (for `sys.keep_awake`) and `vm` (the `vm` module). `net`, `secrets` and `muse` aren't available in this firmware yet.
 - `memory_kb` (optional): the Lua heap, a whole number from 64 to 1024; 256 if left out.
 - `messages` (optional): up to 16 event names, each with a description under 200 characters: the events Muse may send with `app.send`. Describe the data each takes and what it replies.
 
@@ -178,13 +178,40 @@ These need the `store` permission. The values are the app's own, kept by id: the
 
 A key is a string of 1 to 32 characters; a value may be nested 16 levels deep, and all the values together may take 16 KB as JSON. The store's cache lives outside the Lua heap: it doesn't count against `memory_kb` or show in `sys.mem()`. The store is saved 2 s after the last change (10 s at the latest, however often the app writes) and when the app ends, so a restart loses at most the last 10 s of changes (2 s for an app that pauses between writes). On flash, saves can come less often when the app writes a lot, to spare the flash.
 
+### vm
+
+These need the `vm` permission. They read and write the app's own folder on your VM, `workspace/apps/<id>/`, while the app runs: a hook on the VM can keep files there for the app (data it fetches, and a small `state/rev` it changes with them) and apply the commands the app writes to `outbox/`. A path is relative to that folder and follows the package's rules: `a-z 0-9 _ . / -`, at most 64 characters, no `..` and no part that starts with a dot. Each call returns at once, and its callback runs later, never during the call, as a callback of the app: with a callback's budget, and an error in it crashes the app as one in a timer does.
+
+- `vm.read(path, [opts,] cb)`: reads the file and calls `cb(value)`, or `cb(nil, err)`. The ending says what value is: `.json` the decoded value (the file at most 32 KB), `.txt` a string (at most 16 KB), `.jpg` or `.jpeg` a `muse.image` (at most 256 KB; baseline, not progressive), `.bin` a `muse.image` (an LVGL image of at most 466 x 466 px and 512 KB, as in Images). Any other ending is an error. opts are for a JPEG: `{circle = true, max = 200}` makes the corners outside the circle in the picture transparent (a disc to spin) and decodes it to fit 200 px (1 to 466, 466 if left out). The gadget only shrinks a JPEG, by 1/2, 1/4 or 1/8, to the largest of those that fits, so write it at the size you show.
+- `vm.write(path, value, [cb])`: writes value as JSON (at most 8 KB) to path, which must be in `outbox/`, then calls `cb(true)` or `cb(false, err)`.
+- `vm.command(name, args, [cb])`: writes `outbox/cmd-<seq>.json`, `{"seq":<seq>,"name":"<name>","args":<args>}`, for the hook to apply, then reads `state/acks.json` every 1 s until the hook lists seq there: `cb(true, result)`, with the hook's result (nil if it gave none), or `cb(false, "timed out")` after 15 s. seq is the wall clock in epoch ms (or one more than the last seq, when that is later), so the call needs the clock set. name is 1 to 32 characters of a-z, 0-9 and _; args is a table, nil or anything `json.encode` takes, at most 4 KB as JSON. Without cb the command is done once it is written.
+- `vm.watch(path, [every_s,] cb)`: reads the file (at most 1 KB, like `state/rev`) every every_s seconds (1 to 60; 2 if left out) while the app is in front and the screen is lit, counted from the end of the last read. It calls `cb(text)` on the first read and whenever the text changes. When a read fails it calls `cb(nil, err)`, once for each new error: the same error again is quiet, and a read that works after it calls `cb(text)`. Returns a handle: `h:cancel()` stops the watch, and `tostring(h)` is like `watch#0`. At most 4 watches an app.
+
+While the app holds a watch and is in front with the screen lit, the gadget writes `outbox/active.json`, `{"app":"<id>","n":<watches>}`, at once and then every 10 s, so a hook can fetch only while someone looks. It stops when the app goes behind, the screen goes dark or the last watch is cancelled.
+
+The hook acks a command in `state/acks.json`: `{"acks":[{"seq":<seq>,"result":...}, ...]}`, newest last. `result` is any JSON, and may be left out. A file that isn't there yet, or doesn't read as that, is an ack that hasn't come.
+
+The app's reads, writes and commands go one at the VM at a time and at most 8 more waiting, a command that waits for its ack among them: one more gets `too many vm requests at once` through its callback. The watches' reads, the acks' reads and the heartbeat are the gadget's own and never take one of those places. Each has 10 s at the VM, and a VM file reader or writer that is busy (an install, a picture) is tried again 3 times, 500 ms apart. A read's, a write's or a command's callback runs when its answer comes, even while the app is behind or the screen is dark; only the watches and the heartbeat pause.
+
+A mistake in a call's own arguments is an error at the call, `vm.<name>: ...`, and nothing is sent: a bad path or ending, a write outside `outbox/`, a value too large, a bad name, every_s out of range, a fifth watch, a missing cb, and the clock not set for `vm.command`. What depends on the VM comes to the callback as err (see Common errors).
+
+A `muse.image` is a picture the app got while it runs, beside its package's images:
+
+- On screen, `ui.image{src = img}` and `w:set{src = img}` show it, as a path of the app's files does, and `w:get("src")` gives the handle back. `scale`, `rotation` and `spin` work as for any image.
+- `img:size()` is its width and height in px: `local w, h = img:size()`.
+- `img:free()` lets go of it: it raises `image is in use by image#<n>` while a widget shows it (hidden or not), so delete the widget or give it another `src` first. After the free, `img:size()` and `src = img` are errors, `image#<n> was freed`; a second free does nothing.
+- `tostring(img)` is like `image#2`, freed or not, and `getmetatable(img)` is the string `muse.image`.
+- The gadget holds at most 4 at once: a fifth gets `no more than 4 images at once: free one with img:free()` through its callback. The images go when the app ends, and their bytes count against the gadget's room for apps, not against `memory_kb`.
+- A freed image that the screen was drawing when it went dark keeps its place among the 4 until the screen lights again.
+- A JPEG the gadget can't take gets the decoder's words through the callback: `unsupported JPEG: use baseline, not progressive`, `not a valid JPEG`, `the picture is larger than <n> px even at 1/8`, `the picture is too thin to scale down to <n> px` or `the gadget is short of memory`. A `.bin` it can't take gets the `image: ...` errors of Common errors.
+
 ### sys
 
 - `sys.battery()`: `{pct = 0 to 100, charging = bool, usb = bool}`; pct is -1 when the gadget can't tell.
 - `sys.wifi()`: `{connected = bool, ssid = "..."}`.
 - `sys.show()`: asks for the front. Allowed in `message()` and `alarm()`, and in any callback within 10 s of a tap.
 - `sys.keep_awake(on)`: true keeps the screen lit while the app is in front; false lets it sleep. Needs the `keep_awake` permission.
-- `sys.has(name)`: whether the gadget has the module name (ui, time, timer, alarm, store, sound, json, sys).
+- `sys.has(name)`: whether the gadget has the module name (ui, time, timer, alarm, store, sound, json, sys, vm).
 - `sys.mem()`: `{used_kb, peak_kb, limit_kb}` of the Lua heap.
 - `sys.exit()`: the app ends once this callback has returned: `stop()` runs and the store is saved.
 - `sys.log(...)`: the same as `print(...)`.
@@ -214,6 +241,7 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 2. `python3 LVGLImage.py --ofmt BIN --cf RGB565A8 --compress NONE -o assets --name bell bell.png` writes `assets/bell.bin`.
 3. List `"assets/bell.bin"` in the manifest's files, write it to `workspace/apps/<id>/assets/bell.bin`, and draw it with `ui.image{src = "assets/bell.bin"}`.
 
+- An app can also get a picture while it runs, a JPEG or a `.bin` from its VM folder: see `vm.read` and `muse.image` in the API reference.
 - The formats are RGB565, RGB565A8 (colour with transparency) and A8. An A8 image draws as a white mask: for colour use RGB565A8. Images aren't compressed, and of the flags only premultiplied alpha is taken (LVGLImage.py's output passes).
 - An image is at most 466 x 466 px and 512 KB, and an app's images 1.5 MB together.
 - `scale` is a percentage: a scaled image's box is the scaled size. A w and h you give a scaled image are its box: the picture is centred in it and can spill past it. A scaled picture lands within 1 px of its box (2 px for an odd size at 400%), and a side that scales to under about 1 px draws nothing.
@@ -269,13 +297,13 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `manifest: icon '<path>' must be a .bin image`: name a `.bin` made with LVGLImage.py (see Icons).
 - `icon: <w>x<h> must be square, at most 160x160`: redraw the icon 160 x 160 px and convert it again.
 - `icon: <n> bytes is more than an icon's 76812: its rows are padded`: convert the icon again with LVGLImage.py, without `--align`.
-- `manifest: unknown permission '<name>' (valid: sound, alarm, store, keep_awake)`: use one of those.
+- `manifest: unknown permission '<name>' (valid: sound, alarm, store, keep_awake, vm)`: use one of those.
 - `manifest: permission '<name>' is not available in this firmware yet (api 1)`: do without it.
 - `manifest: memory_kb must be a whole number from 64 to <max>`: pick a whole number in range, or leave it out (256).
 - `manifest: messages must map event names to descriptions (at most 16, each under 200 characters)`: shorten them.
 - `unknown key '<key>' ignored (did you mean '<key>'?)`: a warning; fix the key's spelling.
 - `reading <path>: VM answered HTTP 404`: write the file to `workspace/apps/<id>/<path>`, or take it out of `files`.
-- `<path> is larger than <n> KB`: split the module, or shrink the image.
+- `<path> is larger than <n> KB`: split the module, or shrink the image. From `vm.read`, the file is over its kind's limit (see vm): write less, or a smaller picture.
 - `the app is larger than 2 MB`: shrink the images or the code.
 - `images add up to more than 1.5 MB`: use fewer or smaller images.
 - `files[<n>] <path> is a compiled chunk: install Lua source text`: install the `.lua` source, not luac's output.
@@ -306,7 +334,24 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `layout not checked: the screen was asleep`: a warning: the screen was dark, so the install didn't check the layout (the round-edge warnings above); take an `app.control` `snapshot`, which wakes the screen, and read its `warnings`.
 - `ui.<kind>: src '<path>' is not one of this app's images (manifest.json "files")`: list the `.bin` in `files`.
 - `ui.<kind>: boxes nest at most 4 deep`: flatten the layout; a label, button, arc, bar or image may still go in the fourth box.
-- `<module>: add "<permission>" to "permissions" in manifest.json`: add the permission (`alarm`, `store`, `sound` or `keep_awake`).
+- `<module>: add "<permission>" to "permissions" in manifest.json`: add the permission (`alarm`, `store`, `sound`, `keep_awake` or `vm`).
+- `the VM is not connected`: the gadget has no session with Muse right now (Wi-Fi, or Muse reconnecting): show it, and read again later; a watch tries again by itself.
+- `no such file on the VM: <path>`: nothing wrote `workspace/apps/<id>/<path>` yet: check the path, and that the hook has run.
+- `<path> is not valid JSON: <why>`: fix what writes the file.
+- `vm.write: only outbox/ can be written`: write to a path in `outbox/`.
+- `too many vm requests at once`: wait for callbacks before sending more: 8 wait at most, beside the one at the VM.
+- `the VM file reader is busy`, `the VM file writer is busy`: an install or a picture held it for longer than the retries: try again in a few seconds.
+- `timed out`: the VM didn't answer in 10 s, or a command's ack didn't come in 15 s: check that the hook runs and acks the seq.
+- `the gadget is short of memory`: free images you don't show, or try again in a few seconds.
+- `vm.command: the gadget's clock isn't set yet`: check `time.synced()` first.
+- `vm.watch: no more than 4 watches per app`: cancel one with `h:cancel()`, or watch one rev file for everything.
+- `no more than 4 images at once: free one with img:free()`: free the images you no longer show.
+- `image is in use by image#<n>`: delete the widget that shows it, or give it another `src`, then free it.
+- `image#<n> was freed`, `ui.<kind>: src image#<n> was freed`: read the picture again with `vm.read`.
+- `unsupported JPEG: use baseline, not progressive`: save the picture as a baseline JPEG.
+- `not a valid JPEG`: the file is cut short or isn't a JPEG: write it again.
+- `the picture is larger than <n> px even at 1/8`: shrink it on the VM first.
+- `the picture is too thin to scale down to <n> px`: crop it nearer to square, or raise `max`.
 - `alarm: no more than 4 alarms per app`: cancel one first, or reuse its name.
 - `alarm: the gadget has no free alarm slots (8 in all); cancel one`: other apps hold the rest: cancel one of this app's, or try later.
 - `alarm: the gadget is short of memory; try again`: try again later; leave the state as it was meanwhile.

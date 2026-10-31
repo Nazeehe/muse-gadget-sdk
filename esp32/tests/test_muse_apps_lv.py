@@ -393,6 +393,26 @@ class HarnessTest(unittest.TestCase):
     def test_a_slide_on_an_app_opens_nothing(self):  # the same root on the apps: a slow or short vertical slide
         self.run_case("a_slide_on_an_app_opens_nothing")
 
+    # ---- Task 6a: the user's feedback on preview 2: a clearly larger centre, and a launch with no clock flash ----
+
+    def test_centre_is_clearly_larger(self):  # 150-160 px at the centre, a neighbour at most 40% of it, all inside the circle
+        self.run_case("centre_is_clearly_larger")
+
+    def test_launch_holds_the_launcher_until_the_first_frame(self):  # nothing in apps_lv ends it: the glue does, at the first frame
+        self.run_case("launch_holds_the_launcher_until_the_first_frame")
+
+    def test_no_input_while_the_launch_holds(self):  # no tap, scroll or swipe up; its icons as they were
+        self.run_case("no_input_while_the_launch_holds")
+
+    def test_the_hold_times_out(self):  # APPS_LV_LAUNCH_HOLD_MS after the pick
+        self.run_case("the_hold_times_out")
+
+    def test_a_voice_turn_ends_the_hold(self):  # apps_lv_hide_cards closes a launcher that holds, at once
+        self.run_case("a_voice_turn_ends_the_hold")
+
+    def test_a_touch_the_launcher_closed_under_does_nothing(self):  # Task 5's m3: the card's tap and swipe up, after a hide
+        self.run_case("a_touch_the_launcher_closed_under_does_nothing")
+
     def test_the_launchers_records_are_in_psram_and_the_rows_are_gone(self):
         # X12 and the follow-up round's internal RAM: the carousel's copy of the list (32 ids, names and icon paths) and its
         # objects are one static of the LVGL task's, in PSRAM; the old card's row count is gone.

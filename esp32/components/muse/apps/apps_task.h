@@ -219,6 +219,11 @@ bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status
  */
 void apps_task_launch(const char *id, bool front);
 
+/* Any task: a launch apps_task_launch asked for was refused before its app began (the I/O worker's word for muse_apps_launch's
+ * job: no such app, or no room to load it; apps_task.c says it for the refusals it sees itself). The LVGL task's glue closes the
+ * launcher that holds for the pick at its next frame. A run that began and failed isn't a refusal: its end closes the launcher. */
+void apps_task_launch_refused(void);
+
 /*
  * apps_task_run_by_id for Link's app.send (apps_control.c, on the I/O worker): behind, no settle, and the wait is at most bound_ms,
  * clamped to 1..APPS_TASK_SEND_LAUNCH_MS, instead of APPS_TASK_RUN_EXTRA_MS (the caller gives what is left of the send's deadline).

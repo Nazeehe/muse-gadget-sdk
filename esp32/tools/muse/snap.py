@@ -23,8 +23,9 @@ Bench touch boards use '>ui=settings' / '>ui=face' / '>ui=clock' to select the t
 'a/s' are non-touch menu keys, not touch-settings navigation.
 A bench build also injects touch through LVGL's input, as a finger would arrive:
 '>tap X Y' presses that point for 80 ms, '>longpress X Y' for 900 ms (LVGL's long press
-is 400 ms), and '>swipe left' / '>swipe right' drags across the screen along y=233 in
-about 240 ms (a left swipe starts at the right). The screen is woken with 'w' first, since
+is 400 ms), '>swipe left' / '>swipe right' drags across the screen along y=233 in
+about 240 ms (a left swipe starts at the right), and '>swipe up' drags 200 px up from 8 px
+above the bottom, at the middle, in as long. The screen is woken with 'w' first, since
 LVGL doesn't read its input while it sleeps on battery, and the picture is taken once the
 script has run and 0.6 s more have passed. --settle S sets that wait, in seconds, for any
 command (the others take 0.35 s).

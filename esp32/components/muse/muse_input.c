@@ -908,17 +908,17 @@ static bool console_command(char *line, bool whole)
         return true;
     }
     /* Touch, played through LVGL's input (muse_ui.h): "tap X Y" presses that point for 80 ms, "longpress X Y" for
-     * 900 ms, and "swipe left" / "swipe right" drags across the screen in about 240 ms. Wake the screen first
-     * ('w'). Nothing is printed unless the line is wrong. */
+     * 900 ms, "swipe left" / "swipe right" drags across the screen in about 240 ms, and "swipe up" drags up from the
+     * bottom edge in as long. Wake the screen first ('w'). Nothing is printed unless the line is wrong. */
     bool tap = !strncmp(line, "tap ", 4), hold = !strncmp(line, "longpress ", 10), swipe = !strncmp(line, "swipe ", 6);
     if (tap || hold || swipe) {
         muse_ui_touch_t kind = tap ? MUSE_UI_TOUCH_TAP : MUSE_UI_TOUCH_LONG;
         long x = 0, y = 0;
         bool ok;
         if (swipe) {
-            bool left = !strcmp(line + 6, "left");
-            kind = left ? MUSE_UI_TOUCH_SWIPE_LEFT : MUSE_UI_TOUCH_SWIPE_RIGHT;
-            ok = left || !strcmp(line + 6, "right");
+            bool left = !strcmp(line + 6, "left"), up = !strcmp(line + 6, "up");
+            kind = left ? MUSE_UI_TOUCH_SWIPE_LEFT : up ? MUSE_UI_TOUCH_SWIPE_UP : MUSE_UI_TOUCH_SWIPE_RIGHT;
+            ok = left || up || !strcmp(line + 6, "right");
         } else {
             char *end;
             x = strtol(line + (tap ? 4 : 10), &end, 10);
@@ -928,7 +928,7 @@ static bool console_command(char *line, bool whole)
         if (ok) {
             muse_ui_bench_touch(kind, (int)x, (int)y);
         } else {
-            printf("@touch.error usage: tap X Y | longpress X Y (X 0..%d, Y 0..%d) | swipe left|right\n",
+            printf("@touch.error usage: tap X Y | longpress X Y (X 0..%d, Y 0..%d) | swipe left|right|up\n",
                    muse_board->width - 1, muse_board->height - 1);
             fflush(stdout);
         }

@@ -116,6 +116,20 @@ class AppTaskTest(HarnessCase):
     def test_the_launcher_lists_the_running_app(self):  # F1: the app that runs, where no store lists it
         self.run_case("the_launcher_lists_the_running_app")
 
+    # ---- Launcher carousel Task 6a: a pick holds the launcher until the app's first frame ----
+
+    def test_launch_holds_the_launcher_until_the_first_frame(self):  # the layer fronted under it; closed at the first pass in front
+        self.run_case("launch_holds_the_launcher_until_the_first_frame")
+
+    def test_picking_the_running_app(self):  # nothing launched; the launcher closes at the next pass with the layer in front
+        self.run_case("picking_the_running_app")
+
+    def test_a_failed_start_closes_the_launcher(self):  # no app (the back), and a crash in start() (its card, in the same frame)
+        self.run_case("a_failed_start_closes_the_launcher")
+
+    def test_a_voice_turn_ends_the_hold(self):  # the turn's hide_cards
+        self.run_case("a_voice_turn_ends_the_hold")
+
     # ---- The rulings' ----
 
     def test_stop_tears_down_in_the_rulings_order(self):  # the teardown order (Task 11's ruling)
@@ -535,6 +549,9 @@ class AppTaskStoreTest(HarnessCase):
 
     def test_a_refused_launch_logs_once(self):  # P2
         self.run_case("a_refused_launch_logs_once")
+
+    def test_a_refused_launch_closes_the_launcher(self):  # Task 6a: no such app, short of memory, the worker refused
+        self.run_case("a_refused_launch_closes_the_launcher")
 
     # ---- Task 13's fix round 1 ----
 

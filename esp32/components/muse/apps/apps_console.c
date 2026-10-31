@@ -641,6 +641,9 @@ static void launch_job(void *arg) {
         } else {
             ESP_LOGW(TAG, "launch %s: %s", job->id, job->why);
         }
+        if (!job->print && job->alarm_upto == 0) {
+            apps_task_launch_refused();  /* muse_apps_launch's (the launcher's pick): its hold ends */
+        }
         if (job->alarm_upto != 0) {  /* the alarms that fired for it are given up on: the store has no such app, or it can't be loaded now */
             apps_task_alarm_launch_result(job->alarm_upto, apps_store_has(job->id) ? APPS_ALARM_LAUNCH_FAILED : APPS_ALARM_LAUNCH_MISSING);
         }

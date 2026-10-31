@@ -269,7 +269,7 @@ class MuseBenchTest(unittest.TestCase):
             with self.subTest(text):
                 self.assertEqual(open_conditions(header, header.index(text)), ["if CONFIG_MUSE_BENCH"])
         self.assertRegex(header, r"MUSE_UI_TOUCH_TAP,\s*MUSE_UI_TOUCH_LONG,\s*MUSE_UI_TOUCH_SWIPE_LEFT,\s*"
-                                 r"MUSE_UI_TOUCH_SWIPE_RIGHT")
+                                 r"MUSE_UI_TOUCH_SWIPE_RIGHT,\s*MUSE_UI_TOUCH_SWIPE_UP,")
         # Streaming a screenshot is not a bench option's: it stays declared for every build.
         self.assertEqual(open_conditions(header, header.index("void muse_ui_request_snapshot(void)")), [])
         ui = (MUSE / "muse_ui.c").read_text()
@@ -376,13 +376,13 @@ int main(void)
         return done.stdout.splitlines()
 
     def test_touch_and_page_commands_parse_and_validate(self):
-        usage = "@touch.error usage: tap X Y | longpress X Y (X 0..465, Y 0..465) | swipe left|right"
+        usage = "@touch.error usage: tap X Y | longpress X Y (X 0..465, Y 0..465) | swipe left|right|up"
         out = self.run_bench_block([
-            "tap 233 300", "longpress 10 20", "tap  5   6", "swipe left", "swipe right", "tap 0 465",
+            "tap 233 300", "longpress 10 20", "tap  5   6", "swipe left", "swipe right", "swipe up", "tap 0 465",
             "ui=settings", "ui=face", "ui=clock", "ui.demo=1", "ui.demo=0",
             "tap 466 0", "tap 0 466", "tap -1 5", "tap 5", "tap ", "tap a b", "tap 1 2 3", "tap 1 2x", "tap 1 ",
-            "tap 99999999999999999999 1", "longpress 1", "swipe up", "swipe ", "swipe leftx", "swipe left ",
-            "tapx 1 2", "swipes left", "taps", "swipe", "other",
+            "tap 99999999999999999999 1", "longpress 1", "swipe down", "swipe ", "swipe leftx", "swipe left ", "swipe upx",
+            "swipe up ", "tapx 1 2", "swipes left", "taps", "swipe", "other",
         ])
         self.assertEqual(out, [
             "touch 0 233 300", "[tap 233 300] taken=1",
@@ -390,6 +390,7 @@ int main(void)
             "touch 0 5 6", "[tap  5   6] taken=1",
             "touch 2 0 0", "[swipe left] taken=1",
             "touch 3 0 0", "[swipe right] taken=1",
+            "touch 4 0 0", "[swipe up] taken=1",
             "touch 0 0 465", "[tap 0 465] taken=1",
             "page 1", "[ui=settings] taken=1",
             "page 0", "[ui=face] taken=1",
@@ -397,8 +398,8 @@ int main(void)
             "demo 1", "[ui.demo=1] taken=1",
             "demo 0", "[ui.demo=0] taken=1",
             *[x for line in ("tap 466 0", "tap 0 466", "tap -1 5", "tap 5", "tap ", "tap a b", "tap 1 2 3", "tap 1 2x",
-                             "tap 1 ", "tap 99999999999999999999 1", "longpress 1", "swipe up", "swipe ",
-                             "swipe leftx", "swipe left ")
+                             "tap 1 ", "tap 99999999999999999999 1", "longpress 1", "swipe down", "swipe ",
+                             "swipe leftx", "swipe left ", "swipe upx", "swipe up ")
               for x in (usage, f"[{line}] taken=1")],
             "[tapx 1 2] taken=0", "[swipes left] taken=0", "[taps] taken=0", "[swipe] taken=0", "[other] taken=0",
         ])
@@ -537,6 +538,9 @@ int main(int argc, char **argv)
     } else if (!strcmp(what, "swipe_right")) {
         muse_ui_bench_touch(MUSE_UI_TOUCH_SWIPE_RIGHT, 99, 99);
         play("swipe_right", step);
+    } else if (!strcmp(what, "swipe_up")) {
+        muse_ui_bench_touch(MUSE_UI_TOUCH_SWIPE_UP, 5, 5);
+        play("swipe_up", step);
     } else if (!strcmp(what, "clamp")) {
         muse_ui_bench_touch(MUSE_UI_TOUCH_TAP, 9999, -5);
         play("clamp", step);
@@ -669,6 +673,47 @@ int main(int argc, char **argv)
                     xs = [r[1] for r in pressed]
                     self.assertTrue(all((b - a) * delta > 0 for a, b in zip(xs, xs[1:])), xs)   # every read moves
                     self.assertEqual(self.lvgl_gesture(reads)[0], d)
+
+    @staticmethod
+    def lvgl_gesture_2d(reads):
+        """lvgl_gesture on both axes, as LVGL 9.5's indev_gesture does it: a read whose vector is under the minimum velocity on both
+        axes forgets the sums, and the gesture fires once either sum passes 50 px, its way the larger one's (up is LV_DIR_TOP)."""
+        last, sx, sy = None, 0, 0
+        for state, x, y, ms in reads:
+            if state != "P":
+                return None
+            vx, vy = (0, 0) if last is None else (x - last[0], y - last[1])
+            last = (x, y)
+            if abs(vx) < 3 and abs(vy) < 3:
+                sx = sy = 0
+            sx, sy = sx + vx, sy + vy
+            if abs(sx) > 50 or abs(sy) > 50:
+                way = ("right" if sx > 0 else "left") if abs(sx) > abs(sy) else ("down" if sy > 0 else "up")
+                return way, ms
+        return None
+
+    def test_a_swipe_up_starts_in_the_launchers_bottom_edge(self):
+        # Task 6a, for Task 6's board check of the launcher's bottom-edge close: '>swipe up' drags from 8 px above the bottom, at the middle,
+        # straight up 200 px in 240 ms, its point following the clock on every read as the sideways swipes' does. Its press is within
+        # APPS_LV_CLOSE_EDGE_PX of the bottom and inside the round screen, and LVGL makes an up gesture of it at any read period.
+        edge = int(re.search(r"#define APPS_LV_CLOSE_EDGE_PX (\d+)", (MUSE / "apps/apps_lv.h").read_text()).group(1))
+        periods = (5, 10, 15, 20, 33, 100)
+        out = self.run_touch_harness({f"up_{p}": ("swipe_up", p) for p in periods})
+        for p in periods:
+            with self.subTest(period=p):
+                reads = self.reads(out[f"up_{p}"][2])
+                pressed, release = reads[:-1], reads[-1]
+                self.assertEqual(pressed[0], ("P", 233, 458, 0))
+                self.assertEqual(release, ("R", 233, 258, -(-240 // p) * p))
+                self.assertTrue(all(r[1] == 233 for r in reads))
+                self.assertEqual([r[2] for r in pressed], [458 - 200 * r[3] // 240 for r in pressed])
+                ys = [r[2] for r in pressed]
+                self.assertTrue(all(b < a for a, b in zip(ys, ys[1:])), ys)   # every read moves up
+                self.assertEqual(self.lvgl_gesture_2d(reads)[0], "up")
+                self.assertTrue(out[f"up_{p}"][2].endswith("real=0"))
+        x, y = 233, 458
+        self.assertGreaterEqual(y, 466 - edge, "the press is in the launcher's bottom band")
+        self.assertLessEqual((x - 233) ** 2 + (y - 233) ** 2, 233 ** 2, "and inside the round screen")
 
     def test_a_touch_input_in_event_mode_gets_no_wrapper_and_says_why(self):
         # S7: in LV_INDEV_MODE_EVENT LVGL reads the touch only when its driver says so, so a script couldn't advance
@@ -1369,9 +1414,11 @@ int main(void)
         # pyserial is imported inside the functions that open a port, never at the top.
         self.assertEqual(len(re.findall(r"^import serial|^from serial", source, re.M)), 0)
         self.assertIn('if __name__ == "__main__":', source)
-        for command in (">tap", ">longpress", ">swipe"):
+        for command in (">tap", ">longpress", ">swipe", ">swipe up"):
             with self.subTest(command):
                 self.assertIn(command, snap.__doc__)
+        # Task 6a: the bench's touch line in AGENTS.md names the up swipe with the sideways ones.
+        self.assertIn("`>swipe left|right|up`", (ROOT / "AGENTS.md").read_text())
 
     def test_snap_parse_detects_corruption(self):
         snap = load_snap()
@@ -1718,7 +1765,8 @@ int main(void)
         snap = load_snap()
         raw = pixels(30, 8, seed=18)
         good = stream(30, 8, raw)
-        for command, ms in (("tap 1 2", 80), ("longpress 233 233", 900), ("swipe left", 240), ("swipe right", 240)):
+        for command, ms in (("tap 1 2", 80), ("longpress 233 233", 900), ("swipe left", 240), ("swipe right", 240),
+                            ("swipe up", 240)):
             with self.subTest(command):
                 result, board, clock, _ = self.capture(snap, [good], keys=">" + command)
                 self.assertEqual(result, (30, 8, raw))
@@ -1792,7 +1840,7 @@ int main(void)
         # command is preceded by 'w', and 'p' waits the script's length (80, 900 or 240 ms) plus 600 ms.
         snap = load_snap()
         for command, ms in (("tap 233 233", 80), ("longpress 233 233", 900), ("swipe left", 240),
-                            ("swipe right", 240)):
+                            ("swipe right", 240), ("swipe up", 240)):
             with self.subTest(command):
                 keys, settle = snap.prepare(">" + command)
                 self.assertEqual(keys, "w>" + command)

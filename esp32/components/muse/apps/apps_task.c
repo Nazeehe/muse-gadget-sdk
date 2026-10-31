@@ -281,11 +281,15 @@ static EXT_RAM_BSS_ATTR struct {
     char hung_name[25];
     apps_lv_app_t launcher[APPS_TASK_LIST_MAX];  /* what apps_lv_show_launcher is given: s_rec->rows, and the app that runs */
     char running[APPS_ID_MAX + 1];
+    uint32_t hold_refusals;  /* s_launch_refusals when the launcher's last pick was made: a refusal since ends its hold */
 } L;
 
 _Static_assert(APPS_TASK_LIST_MAX <= APPS_LV_LAUNCHER_MAX, "the carousel holds every app of the list");
 
 static atomic_bool s_covering;  /* the LVGL task's: the layer is in front or a card is shown */
+/* Launches refused before their app began (apps_task_launch's, launch_id's, the I/O worker's: apps_task_launch_refused): a count
+ * of several writers, so internal, as an atomic. The LVGL task ends the launcher's hold when it moves (muse_apps_ui_supervise). */
+static atomic_uint s_launch_refusals;
 
 /* ---- Small things ---- */
 
@@ -1070,9 +1074,11 @@ static bool launch_id(const char *id, bool front) {
     return muse_apps_launch(id, front);
 }
 
-/* The launcher's pick, or any apps_task_launch. */
+/* The launcher's pick, or any apps_task_launch. A refused one ends the launcher's hold. */
 static void launch(const req_t *r) {
-    (void)launch_id(r->id, r->front);
+    if (!launch_id(r->id, r->front)) {
+        apps_task_launch_refused();
+    }
 }
 
 static void on_run(req_t *r) {
@@ -1528,14 +1534,26 @@ static void on_close(void) {
     update_covering();
 }
 
-/* The launcher's pick, inside the row's tap. */
+/* The launcher's pick, inside the row's tap: apps_lv holds the launcher until this launch's first frame, or its refusal. */
 static void on_pick(const char *id) {
+    L.hold_refusals = atomic_load(&s_launch_refusals);
     apps_task_launch(id, true);
+}
+
+/* The launcher's hold ends, and the launcher closes: the launch failed, or something else is to show (a crash card). */
+static void end_hold(void) {
+    if (apps_lv_launcher_holding()) {
+        apps_lv_hide_cards();
+    }
 }
 
 /* Fronts L's app: show() goes to that app alone. */
 static void front_now(void) {
-    apps_lv_hide_cards();  /* opening an app closes the launcher (C12), and a card would cover it */
+    /* Opening an app closes the launcher (C12), and a card would cover it. A launcher that holds for the launch stays over the layer
+     * until the app's first frame is on it (muse_apps_ui_tick), so the clock doesn't show between them. */
+    if (!apps_lv_launcher_holding()) {
+        apps_lv_hide_cards();
+    }
     if (!apps_lv_front()) {
         apps_lv_set_front(true);
     }
@@ -1620,6 +1638,7 @@ static void follow_front(void) {
             apps_lv_set_front(false);
         }
         L.want_front = L.front_before_turn = false;
+        end_hold();  /* no app to show (main.lua gave none, or the app ended): the launcher holds for nothing */
     } else if (!atomic_load(&s_rec->hung)) {
         L.want_front = true;  /* a hung app stays behind */
     }
@@ -1670,6 +1689,7 @@ static void show_cards(void) {
     if (L.hung_card) {
         L.hung_card = false;
         if (L.hung_gen == L.gen) {  /* an app that began since drops it, as it does a crash card */
+            end_hold();
             apps_lv_show_crash(L.hung_name, NULL);
         }
     }
@@ -1679,9 +1699,10 @@ static void show_cards(void) {
     if (!names_take(NAMES_LOCK_MS)) {
         return;  /* next frame, which finds what this one would have (the list's change too: it is taken below) */
     }
-    /* The store's list changed while the launcher shows (the mount's end, an install): it is shown again, with the new rows. */
+    /* The store's list changed while the launcher shows (the mount's end, an install): it is shown again, with the new rows. Not
+     * while it holds for a launch, which changes the list itself (the app is the most recent): it closes soon, as it is. */
     bool changed = atomic_exchange(&s_list_changed, false);
-    bool launcher = atomic_load(&s_launcher_wanted) || (changed && apps_lv_launcher_shown());
+    bool launcher = atomic_load(&s_launcher_wanted) || (changed && apps_lv_launcher_shown() && !apps_lv_launcher_holding());
     if (s_rec->names.card && reset_ran(s_rec->names.card_after)) {
         card = true;
         s_rec->names.card = false;
@@ -1694,6 +1715,7 @@ static void show_cards(void) {
     }
     names_give();
     if (card) {
+        end_hold();  /* the card replaces it, in this frame */
         apps_lv_show_crash(name, line);
     }
     if (launcher) {
@@ -1718,6 +1740,10 @@ void muse_apps_ui_supervise(void) {
     watch_for_hang();
     run_reset();
     follow_front();
+    if (atomic_load(&s_launch_refusals) != L.hold_refusals) {
+        L.hold_refusals = atomic_load(&s_launch_refusals);
+        end_hold();  /* the launch the launcher holds for was refused (or one was, since its pick) */
+    }
     if (!L.in_turn) {
         carry_out_front();
         show_cards();
@@ -1734,7 +1760,12 @@ bool muse_apps_ui_tick(void) {
     }
     if (!atomic_load(&s_rec->hung)) {
         bool published = atomic_load(&s_rec->published) != 0;
-        (void)apps_lv_apply(published && atomic_load(&s_rec->in_call) != 0);
+        bool passed = apps_lv_apply(published && atomic_load(&s_rec->in_call) != 0);
+        /* The app's first frame: a pass ran on its table with the layer in front (a skipped one isn't: the layer may be bare). The
+         * launcher that held over it closes now, before LVGL draws this frame. */
+        if (passed && apps_lv_front()) {
+            end_hold();
+        }
     }
     return update_covering();
 }
@@ -2031,12 +2062,14 @@ bool apps_task_footprint(char *id, size_t cap, size_t *bytes) {
 void apps_task_launch(const char *id, bool front) {
     if (id == NULL || !apps_id_valid(id)) {
         ESP_LOGW(TAG, "launch: not an app id");
+        apps_task_launch_refused();
         return;
     }
     const char *why = refusal(false);
     req_t *r = why == NULL ? new_req(REQ_LAUNCH, 0) : NULL;
     if (why != NULL || r == NULL) {
         ESP_LOGW(TAG, "launch %s: %s", id, why != NULL ? why : "out of memory");
+        apps_task_launch_refused();
         return;
     }
     r->holders = 1;
@@ -2046,7 +2079,12 @@ void apps_task_launch(const char *id, bool front) {
     if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
         ESP_LOGW(TAG, "launch %s: %s", id, MSG_BUSY);
         free_req(r);
+        apps_task_launch_refused();
     }
+}
+
+void apps_task_launch_refused(void) {
+    atomic_fetch_add(&s_launch_refusals, 1);
 }
 
 bool apps_task_stop(char *err, size_t err_len) {

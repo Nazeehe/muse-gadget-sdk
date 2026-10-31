@@ -730,6 +730,13 @@ bool apps_task_run_for_alarm(apps_pkg_t *pkg, uint32_t upto, apps_status_t *st, 
     return apps_task_run(pkg, true, 0, st, err, err_len);
 }
 
+/* The worker's word that a launch by id (the launcher's pick: muse_apps_launch's job) was refused before its app began (Task 6a). */
+static int launch_refusals;
+
+void apps_task_launch_refused(void) {
+    launch_refusals++;
+}
+
 static int results;
 static uint32_t result_upto[8];
 static const char *result_name[8];
@@ -1314,12 +1321,14 @@ static void launch_by_id_prints_nothing(void) {
           "one log line: '%s'", last_log);
     CHECK(results == 0 && wanted_calls == 0, "a launch that isn't for alarms tells the app task nothing: %d results, %d questions", results,
           wanted_calls);
+    CHECK(launch_refusals == 1, "but that it was refused, once (Task 6a: the launcher's hold ends): %d", launch_refusals);
     run_ok = false;
     snprintf(run_err, sizeof run_err, "crashed in start(): main.lua:2: boom");
     CHECK(muse_apps_launch("hello", true), "queued");
     run_jobs();
     EXPECT("");
     CHECK(strcmp(last_log, "W muse_apps: launch hello: crashed in start(): main.lua:2: boom") == 0, "'%s'", last_log);
+    CHECK(launch_refusals == 1, "a run that began and failed is no refusal (the app task's end says it): %d", launch_refusals);
     run_ok = true;
     logged = logs;
     submit_refuses = true;
@@ -1329,6 +1338,7 @@ static void launch_by_id_prints_nothing(void) {
     CHECK(runs == before + 3 && logs == logged + 1, "a refused submit logs nothing here; a bad id logs once (%d)",
           logs - logged);
     CHECK(runs_by_id == 3, "every launch by id ran by id: %d", runs_by_id);
+    CHECK(launch_refusals == 1, "a refused submit is the caller's to count (it says false): %d", launch_refusals);
     EXPECT("");
 }
 
@@ -1394,6 +1404,7 @@ static void launch_for_alarms_tells_the_app_task_what_came_of_it(void) {
     run_jobs();
     CHECK(results == results_then && alarm_runs == runs_then + 1, "nothing of those ran: %d results, %d runs", results - results_then,
           alarm_runs - runs_then);
+    CHECK(launch_refusals == 0, "an alarm's launch is no pick's: its outcome is told as its result alone (%d refusals)", launch_refusals);
     EXPECT("");
 }
 

@@ -175,8 +175,9 @@ and saves the screen, and `>face=thinking` (or `idle`, `listening`,
 Screenshots are off in normal builds because each one takes a buffer the size
 of the screen. `>face=` works in any build. A bench build also takes touch from
 the Mac, through LVGL's own input: `>tap X Y`, `>longpress X Y` and
-`>swipe left|right` in KEYS (`snap.py PORT '>swipe left' OUT.png`) press and drag
-as a finger would, on a touch screen that LVGL polls. `snap.py` sends `w` first,
+`>swipe left|right|up` in KEYS (`snap.py PORT '>swipe left' OUT.png`) press and drag
+as a finger would, on a touch screen that LVGL polls (`>swipe up` from the bottom
+edge, at the middle, as the launcher's close takes it). `snap.py` sends `w` first,
 since LVGL doesn't read its input while the screen sleeps on battery, and waits
 for the script to finish before the picture (`snap.capture()` does both for
 every caller). Each screenshot ends with a CRC-32 that `snap.py` checks, retaking
@@ -724,8 +725,10 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   carousel of every app, the most recently used first; a tap on the app in the
   middle opens it and a tap on one at a side brings it to the middle; a swipe
   up that starts in the bottom 40 px of the screen (`APPS_LV_CLOSE_EDGE_PX`)
-  closes it; a right swipe puts the app behind, where it keeps running. Muse
-  uses four Link commands:
+  closes it; a right swipe puts the app behind, where it keeps running. After
+  the tap the launcher stays up, taking no touch, until the app's first frame,
+  for at most 3 s (`APPS_LV_LAUNCH_HOLD_MS`), so the watch doesn't flash
+  between them. Muse uses four Link commands:
   `app.api` (writes the guide and a timer example to
   `workspace/apps/_guide/` on its VM and returns the gadget's limits),
   `app.install` (the gadget reads `workspace/apps/<id>/`

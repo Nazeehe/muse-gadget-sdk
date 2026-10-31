@@ -85,7 +85,9 @@ void muse_ui_bench_demo(bool enabled);
  * finger. A tap and a long press hold the point (x, y) for 80 and 900 ms; a
  * swipe ignores x and y and drags along y=233 between x=406 and x=60 over
  * 240 ms, its point following the clock on every read, a left swipe from the
- * right. While a script plays the real touch isn't read. A request made while
+ * right; an up swipe drags from 8 px above the bottom, at the middle (inside
+ * the launcher's close edge), straight up 200 px in as long. While a script
+ * plays the real touch isn't read. A request made while
  * one plays waits for it, and the latest of several waits. LVGL doesn't read
  * its input while the screen sleeps on battery: wake it first. No effect on
  * boards without a touch screen, or whose touch reads only on its interrupt.
@@ -95,6 +97,7 @@ typedef enum {
     MUSE_UI_TOUCH_LONG,
     MUSE_UI_TOUCH_SWIPE_LEFT,
     MUSE_UI_TOUCH_SWIPE_RIGHT,
+    MUSE_UI_TOUCH_SWIPE_UP,
 } muse_ui_touch_t;
 void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y);
 #endif

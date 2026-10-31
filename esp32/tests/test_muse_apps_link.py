@@ -527,12 +527,15 @@ class GuideAndSkill(unittest.TestCase):
     def test_agents_md_says_how_the_launcher_is_used(self):
         # D12: the bottom band AGENTS.md quotes is APPS_LV_CLOSE_EDGE_PX.
         edge = header_number("apps_lv.h", "APPS_LV_CLOSE_EDGE_PX")
+        hold = header_number("apps_lv.h", "APPS_LV_LAUNCH_HOLD_MS")
         agents = (ROOT / "AGENTS.md").read_text()
         section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
         for phrase in ("the most recently used first; a tap on the app in the middle opens it and a tap on one at a side brings it to "
                        "the middle;",
                        f"a swipe up that starts in the bottom {edge} px of the screen (`APPS_LV_CLOSE_EDGE_PX`) closes it; a right swipe "
-                       "puts the app behind, where it keeps running."):
+                       "puts the app behind, where it keeps running.",
+                       # Task 6a: the launch hold's bound is APPS_LV_LAUNCH_HOLD_MS.
+                       f"until the app's first frame, for at most {hold // 1000} s (`APPS_LV_LAUNCH_HOLD_MS`)"):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
 

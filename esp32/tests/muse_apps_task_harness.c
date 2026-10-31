@@ -1491,6 +1491,14 @@ static apps_lv_event_cb_t lv_event_cb;
 static void (*lv_close_cb)(void);
 static atomic_bool lv_front;
 static bool lv_launcher, lv_crash;
+static bool lv_holding;  /* the launcher holds for a pick (apps_lv.h): pick_job's, as apps_lv's tap on the centre */
+
+/* What a case watches the frames for (Task 6a): whether each one has something over the pages under the layer (the clock): a card, or
+ * the layer in front with an app's objects on it. A frame with neither shows the clock through, or a layer in front with nothing of an
+ * app on it: bare_frames counts them, and the first is an event. While it watches, a pass that runs with the launcher up is an event
+ * too ("pass table#<n>"). */
+static atomic_bool watch_cover;
+static atomic_uint bare_frames;
 static void (*lv_pick)(const char *id);
 static atomic_uint lv_applies;
 static int lv_callback_skips;
@@ -1634,11 +1642,15 @@ bool apps_lv_apply(bool in_callback) {
          * skip hidden and zero-width widgets itself. */
         w->overflow = (int16_t)(overflow_rule != NULL ? overflow_rule(w) : 0);
     }
+    int number = atomic_load(&watch_cover) && lv_launcher ? table_number(ui) : 0;
     pthread_mutex_unlock(&lv_mu);
     apps_port_ui_unlock();
     for (int i = 0; i < n_made; i++) {
         char label[80];
         event("object %s", watched_label(made[i], label, sizeof label));
+    }
+    if (number > 0) {
+        event("pass table#%d", number);
     }
     atomic_fetch_add(&lv_applies, 1);
     return true;
@@ -1654,7 +1666,11 @@ static void lv_draw(void) {
         }
     }
     lv_drawn = sum;
+    bool covered = lv_launcher || lv_crash || (atomic_load(&lv_front) && lv_objects_table != NULL);
     pthread_mutex_unlock(&lv_mu);
+    if (atomic_load(&watch_cover) && !covered && atomic_fetch_add(&bare_frames, 1) == 0) {
+        event("draw: nothing over the clock");
+    }
 }
 
 void apps_lv_reset(void) {
@@ -1696,6 +1712,7 @@ void apps_lv_show_launcher(const apps_lv_app_t *apps, int n, const char *running
         snprintf(text + used, sizeof text - (size_t)used, " running=%s", running_id);
     }
     lv_launcher = true;
+    lv_holding = false;  /* shown again, it is a launcher as ever */
     lv_pick = pick;
     event("%s", text);
 }
@@ -1718,12 +1735,17 @@ void apps_lv_hide_cards(void) {
     if (lv_launcher || lv_crash) {
         event("hide cards");
     }
-    lv_launcher = lv_crash = false;
+    lv_launcher = lv_crash = lv_holding = false;
 }
 
 bool apps_lv_launcher_shown(void) {
     lvgl_only("apps_lv_launcher_shown");
     return lv_launcher;
+}
+
+bool apps_lv_launcher_holding(void) {
+    lvgl_only("apps_lv_launcher_holding");
+    return lv_launcher && lv_holding;
 }
 
 bool apps_lv_cards_shown(void) {
@@ -1879,7 +1901,9 @@ static void swipe_job(void *arg) {
     }
 }
 
+/* A tap on the app at the centre of the launcher: apps_lv holds the launcher (Task 6a), then calls the pick. */
 static void pick_job(void *arg) {
+    lv_holding = lv_launcher;
     if (lv_pick != NULL) {
         lv_pick((const char *)arg);
     }
@@ -2781,6 +2805,171 @@ static void the_launcher_lists_the_running_app(void) {
     int stopped = mark();
     muse_apps_open_launcher();
     WAIT(stopped, "launcher 0");
+}
+
+/* ---- Launcher carousel Task 6a: the launch hold ---- */
+
+/* The last event before `before` (and at or after from) that starts with prefix, or -1. */
+static int last_before(int from, int before, const char *prefix) {
+    size_t len = strlen(prefix);
+    int found = -1;
+    pthread_mutex_lock(&events_mu);
+    for (int i = from; i < before && i < n_events; i++) {
+        if (strncmp(events[i], prefix, len) == 0) {
+            found = i;
+        }
+    }
+    pthread_mutex_unlock(&events_mu);
+    return found;
+}
+
+/* The hold ended at the app's first frame: the layer came to the front under the launcher ("front 1", with no close of the cards
+ * before it), and the close came after a pass that ran with the layer in front, in that frame (nothing drawn between them), and no
+ * frame drew nothing over the clock. */
+static void ended_at_the_first_frame_at(int line, int from) {
+    int front = at_from(from, "front 1"), hide = at_from(from, "hide cards");
+    int pass = hide >= 0 ? last_before(from, hide, "pass table#") : -1;
+    int drawn = hide >= 0 ? last_before(from, hide, "draw:") : -1;
+    if (front < 0 || hide < front || pass < front || drawn > pass || atomic_load(&bare_frames) != 0) {
+        fail_at(line, "the hold's end: front 1 at %d, the cards closed at %d after the pass at %d (a bare frame at %d); %u bare frames",
+                front, hide, pass, drawn, atomic_load(&bare_frames));
+    }
+}
+#define ENDED_AT_THE_FIRST_FRAME(from) ended_at_the_first_frame_at(__LINE__, (from))
+
+static void watch_frames(void) {
+    atomic_store(&bare_frames, 0);
+    atomic_store(&watch_cover, true);
+}
+
+/* An app whose first callback, a timer at the soonest, prints 'first': a case holds it there. */
+static const char APP_SLOW_FIRST[] =
+    "local app = {}\n"
+    "function app.start() ui.label{text = 'Slow'} timer.after(40, function() print('first') end) end\n"
+    "function app.show() print('show') end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+
+static struct {
+    apps_pkg_t *pkg;
+    bool ok;
+    char err[200];
+} slow_run;
+
+static void *slow_runner(void *arg) {
+    (void)arg;
+    slow_run.ok = apps_task_run(slow_run.pkg, true, 1000, NULL, slow_run.err, sizeof slow_run.err);
+    return NULL;
+}
+
+/* Task 6a: a pick holds the launcher (pick_job does as apps_lv does) over the clock while the app loads, and the glue ends the hold at
+ * the app's first frame: it fronts the layer under the launcher and closes the cards at the first pass of the apply step that runs with
+ * the layer in front, in that frame. Made hard here: the app's table is published and its front asked for while no frame runs, and its
+ * first callback is stuck in a print when the frames come again, so the passes are skipped for it (three frames: apps_lv.h) once the
+ * layer is in front. No frame draws nothing over the clock. */
+static void launch_holds_the_launcher_until_the_first_frame(void) {
+    int from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 0");
+    int picked = mark();
+    ON_LVGL(pick_job, "slow");
+    WAIT(picked, "launch by id slow 1");  /* to the worker, which runs it (below, as its job would) */
+    pause_lvgl();
+    watch_frames();
+    block_print("first");
+    const file_t files[] = {LUA("main.lua", APP_SLOW_FIRST)};
+    slow_run.pkg = make_pkg("slow", "Slow", files, 1);
+    pthread_t runner;
+    CHECK(pthread_create(&runner, NULL, slow_runner, NULL) == 0, "no runner thread");
+    WAIT_PRINT_BLOCKED();
+    WAIT(picked, "set_ui table#");
+    ABSENT(picked, "front 1");
+    int frames_from = mark();
+    atomic_store(&lvgl_paused, false);
+    WAIT(frames_from, "hide cards");
+    WAIT_FRAMES(5);
+    ENDED_AT_THE_FIRST_FRAME(frames_from);
+    CHECK(count_from(frames_from, "pass table#") == 1, "one pass with the launcher up, the one that ended the hold: %d",
+          count_from(frames_from, "pass table#"));
+    atomic_store(&watch_cover, false);
+    release_print();
+    pthread_join(runner, NULL);
+    CHECK(slow_run.ok, "the run: %s", slow_run.err);
+    WAIT(frames_from, "print slow show");
+}
+
+/* Task 6a: a pick of the app that runs, behind: nothing is launched; the layer comes to the front under the launcher, which closes at the
+ * next pass (the app's frame is on the layer already: the passes run behind), in that frame. */
+static void picking_the_running_app(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 50, NULL, err, sizeof err), "run behind: %s", err);
+    int from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 1 busy:Busy");
+    watch_frames();
+    int picked = mark();
+    ON_LVGL(pick_job, "busy");
+    WAIT(picked, "hide cards");
+    WAIT(picked, "print busy show");
+    WAIT_FRAMES(5);
+    ENDED_AT_THE_FIRST_FRAME(picked);
+    atomic_store(&watch_cover, false);
+    ABSENT(picked, "launch by id");
+    ABSENT(picked, "log I launch");
+}
+
+/* Task 6a: a launch whose app fails before its first frame ends the hold as today's close does: main.lua that doesn't compile (no app:
+ * the app task puts the layer behind, and the launcher closes on that word), and a crash in start(), whose card replaces the launcher in
+ * one frame (the launcher closes as the card shows: nothing is drawn between them). */
+static void a_failed_start_closes_the_launcher(void) {
+    char err[200];
+    int from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 0");
+    int picked = mark();
+    ON_LVGL(pick_job, "broken");
+    WAIT(picked, "launch by id broken 1");
+    const file_t broken[] = {LUA("main.lua", "local app = {\n")};
+    CHECK(!apps_task_run(make_pkg("broken", "Broken", broken, 1), true, 50, NULL, err, sizeof err), "it doesn't compile");
+    WAIT(picked, "hide cards");
+    ABSENT(picked, "front 1");
+    from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 0");
+    watch_frames();
+    picked = mark();
+    ON_LVGL(pick_job, "crashy");
+    WAIT(picked, "launch by id crashy 1");
+    const file_t crashy[] = {LUA("main.lua", "local app = {}\nfunction app.start() error('boom') end\nreturn app\n")};
+    CHECK(!apps_task_run(make_pkg("crashy", "Crashy", crashy, 1), true, 50, NULL, err, sizeof err), "it crashes in start()");
+    int card = WAIT(picked, "crash Crashy | ");
+    int hide = WAIT(picked, "hide cards");
+    WAIT_FRAMES(5);
+    CHECK(hide < card && last_before(hide, card, "draw:") < 0 && atomic_load(&bare_frames) == 0,
+          "the launcher closes as the card shows: closed at %d, the card at %d, %u bare frames", hide, card, atomic_load(&bare_frames));
+    atomic_store(&watch_cover, false);
+    ABSENT(picked, "front 1");
+}
+
+/* Task 6a: a voice turn ends the hold at once (muse_apps_ui_turn's apps_lv_hide_cards, as for any card); the app's front, held back
+ * during the turn, comes at its end. */
+static void a_voice_turn_ends_the_hold(void) {
+    int from = mark();
+    muse_apps_open_launcher();
+    WAIT(from, "launcher 0");
+    int picked = mark();
+    ON_LVGL(pick_job, "hello");
+    WAIT(picked, "launch by id hello 1");
+    TURN(true);
+    WAIT(picked, "hide cards");
+    char err[200];
+    CHECK(apps_task_run(make_pkg("hello", "Hello", HELLO, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT_FRAMES(10);
+    ABSENT(picked, "front 1");
+    int ended = mark();
+    TURN(false);
+    WAIT(ended, "front 1");
+    WAIT(ended, "print hello show");
 }
 
 /* A caller that gives up: its buffers are the case's, kept alive after it returns, so a late write by the app task
@@ -5887,6 +6076,37 @@ static void a_refused_launch_logs_once(void) {
     on_worker(empty_store_job, NULL);
 }
 
+/* Task 6a: a launch the launcher's pick asked for that is refused before its app begins ends the hold, as today's close: an id the
+ * store doesn't have (the worker's load says so), an app it can't load for want of memory (the store's admission), and a launch the
+ * worker can't take (muse_apps_launch refused: no worker can be made). The launcher holds until the refusal, and closes on it. */
+static void a_refused_launch_closes_the_launcher(void) {
+    EXPECT_LAUNCHER("launcher 0");
+    int picked = mark();
+    ON_LVGL(pick_job, "nosuch");
+    int said = WAIT(picked, "log W launch nosuch: no such app on the gadget");
+    int closed = WAIT(picked, "hide cards");
+    CHECK(closed > said, "held until the refusal (%d), closed on it (%d)", said, closed);
+    store(make_pkg("hello", "Hello", HELLO, 1));
+    EXPECT_LAUNCHER("launcher 1 hello:Hello");
+    atomic_store(&psram_total, held_now(&port_held) + 1024);  /* far short of hello's heap and the reserve */
+    picked = mark();
+    ON_LVGL(pick_job, "hello");
+    said = WAIT(picked, "log W launch hello: the gadget is short of memory");
+    closed = WAIT(picked, "hide cards");
+    CHECK(closed > said, "for memory: held until the refusal (%d), closed on it (%d)", said, closed);
+    ABSENT(picked, "log I launch hello");
+    atomic_store(&psram_total, 0);
+    EXPECT_LAUNCHER("launcher 1 hello:Hello");
+    no_worker_can_be_made();
+    picked = mark();
+    ON_LVGL(pick_job, "hello");
+    said = WAIT(picked, NO_TASK_LINE);
+    closed = WAIT(picked, "hide cards");
+    CHECK(closed > said, "the worker refused: held until the refusal (%d), closed on it (%d)", said, closed);
+    atomic_store(&worker_create_fails, false);
+    on_worker(empty_store_job, NULL);
+}
+
 /* F1: the launcher lists the store's apps, most recent first (an install, with or without run, or a run makes an app
  * the most recent), every one of them; the app that runs is named (its dot). A pick of the app that runs fronts it; a pick of
  * any other launches it through the worker. */
@@ -6768,6 +6988,10 @@ int main(int argc, char **argv) {
         {"a_voice_turn_hides_the_app", a_voice_turn_hides_the_app},
         {"a_right_swipe_only_backgrounds", a_right_swipe_only_backgrounds},
         {"the_launcher_lists_the_running_app", the_launcher_lists_the_running_app},
+        {"launch_holds_the_launcher_until_the_first_frame", launch_holds_the_launcher_until_the_first_frame},
+        {"picking_the_running_app", picking_the_running_app},
+        {"a_failed_start_closes_the_launcher", a_failed_start_closes_the_launcher},
+        {"a_voice_turn_ends_the_hold", a_voice_turn_ends_the_hold},
         {"a_late_answer_writes_nothing", a_late_answer_writes_nothing},
         {"touches_past_a_full_queue_are_counted", touches_past_a_full_queue_are_counted},
         {"a_touch_on_an_ended_apps_object_never_reaches_the_new_app", a_touch_on_an_ended_apps_object_never_reaches_the_new_app},
@@ -6859,6 +7083,7 @@ int main(int argc, char **argv) {
 #ifdef HARNESS_CONSOLE
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},
+        {"a_refused_launch_closes_the_launcher", a_refused_launch_closes_the_launcher},
         {"the_launcher_lists_the_store", the_launcher_lists_the_store},
         {"the_launcher_gets_every_app", the_launcher_gets_every_app},
         {"the_launcher_keeps_apps_that_ended", the_launcher_keeps_apps_that_ended},

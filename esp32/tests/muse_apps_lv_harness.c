@@ -5086,6 +5086,14 @@ static const char *name_shown(void) {
     return id > 0 ? fake_obj(id)->text : "(none)";
 }
 
+/* The screen row through the middle of the name, as it is laid out under the carousel of a launcher that shows (on the card: the label
+ * isn't clickable). */
+static int32_t name_middle_y(void) {
+    fake_layout();
+    const lv_area_t *a = &fake_obj(name_label())->area;
+    return (a->y1 + a->y2 + 1) / 2;
+}
+
 /* The centre of an object's laid-out box, in screen x. */
 static int32_t centre_x(int id) {
     const lv_area_t *a = &fake_obj(id)->area;
@@ -5179,6 +5187,11 @@ static void scale_curve(void) {
     }
     CHECK(apps_lv_carousel_scale(P / 2) < 256 && apps_lv_carousel_scale(P / 2) > SIDE, "between, it is between: %d",
           apps_lv_carousel_scale(P / 2));
+    /* Task 6a's: a neighbour at most 40% of the centre (102 of 256), half way at half a pitch, and the boxes apart at rest. */
+    CHECK(SIDE <= 102, "a neighbour's scale is at most 102 of 256: %d", SIDE);
+    int half = apps_lv_carousel_scale(P / 2), mid = (256 + SIDE) / 2;
+    CHECK(half - mid <= 1 && mid - half <= 1, "half a pitch away, half way: %d, the middle %d", half, mid);
+    CHECK(P > APPS_LV_ICON_PX, "the row shows between two items' boxes at rest: pitch %d, box %d", P, APPS_LV_ICON_PX);
 }
 
 /* Printed for the test, which checks them against the palette and zlib's CRC-32: "color <id> <rrggbb>", each asked twice. */
@@ -5531,7 +5544,8 @@ static void launcher_lists_apps_and_picks(void) {
           "labels aren't: LVGL gives their touches to what is under them");
     fake_tap(item);
     CHECK(picks == 1 && strcmp(picked, "hello") == 0, "tapping an app runs it: %d '%s'", picks, picked);
-    CHECK(fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "and closes the launcher (C12)");
+    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && apps_lv_cards_shown() && apps_lv_launcher_holding(),
+          "and holds the launcher for the app's first frame, when it closes (C12; Task 6a)");
     LAUNCHER_END();
 }
 
@@ -5640,7 +5654,7 @@ static void launcher_survives_a_create_that_fails(void) {
  * the launcher closes, whichever way it closes. Those scrolls ask nothing of the icons: no load is submitted, no block is held while
  * the launcher is closed, no image is given a source, and the hidden card isn't touched. */
 static void a_scroll_after_a_close_asks_nothing(void) {
-    static const char *const ways[] = {"a tap on the card", "a pick", "hide_cards", "a swipe up from the bottom edge"};
+    static const char *const ways[] = {"a tap on the card", "a pick, and its hold's bound", "hide_cards", "a swipe up from the bottom edge"};
     const apps_lv_app_t apps[] = {{"a1", "A1", "icon.bin"}, {"a2", "A2", "icon.bin"}, {"a3", "A3", "icon.bin"}, {"a4", "A4", "icon.bin"},
                                   {"a5", "A5", "icon.bin"}, {"a6", "A6", "icon.bin"}, {"a7", "A7", "icon.bin"}, {"a8", "A8", "icon.bin"}};
     for (size_t w = 0; w < ARRAY_LEN(ways); w++) {
@@ -5659,7 +5673,9 @@ static void a_scroll_after_a_close_asks_nothing(void) {
             fake_tap(card);
         } else if (w == 1) {
             fake_tap(carousel_item(1));
-            CHECK(picks == 1 && strcmp(picked, "a2") == 0, "%s: picked: '%s'", ways[w], picked);
+            CHECK(picks == 1 && strcmp(picked, "a2") == 0 && apps_lv_launcher_holding(), "%s: picked, and held: '%s'", ways[w], picked);
+            clock_us += (int64_t)APPS_LV_LAUNCH_HOLD_MS * 1000;  /* the app showed nothing: the hold ends at its bound */
+            apps_lv_launcher_poll();
         } else if (w == 2) {
             apps_lv_hide_cards();  /* an app to the front (an alarm), or a voice turn */
         } else {
@@ -5700,7 +5716,7 @@ static void tap_centre_launches(void) {
     CHECK(c.x == SCREEN_CENTRE, "the first app is at the centre: %d", (int)c.x);
     CHECK(fake_tap_at(c.x, c.y) == carousel_item(0), "the tap lands on the first app");
     CHECK(picks == 1 && strcmp(picked, "alpha") == 0, "it opens: %d '%s'", picks, picked);
-    CHECK(!apps_lv_launcher_shown() && fake_flag(card, LV_OBJ_FLAG_HIDDEN), "and the launcher closes");
+    CHECK(apps_lv_launcher_holding() && !fake_flag(card, LV_OBJ_FLAG_HIDDEN), "and the launcher holds for the app's first frame");
     /* Under the face, in the item's box (the dot's place): the same app. */
     apps_lv_show_launcher(FIVE, 5, NULL, pick);
     fake_layout();
@@ -5953,14 +5969,14 @@ static void swipe_up_from_middle_does_nothing(void) {
     apps_lv_show_launcher(FIVE, 5, NULL, pick);
     lv_point_t centre = face_at(0);
     lv_area_t box0 = fake_obj(carousel_item(0))->area, box1 = fake_obj(carousel_item(1))->area;
-    const int32_t gap_x = (box0.x2 + box1.x1) / 2, band = EDGE_TOP + 14;
+    const int32_t gap_x = (box0.x2 + box1.x1) / 2, band = EDGE_TOP + 14, name_y = name_middle_y();
     LAUNCHER_END();
     const struct {
         int32_t x, y, twin_x, twin_y;
         const char *what;
     } starts[] = {
         {SCREEN_CENTRE, EDGE_TOP - 1, SCREEN_CENTRE, EDGE_TOP, "a row above the band"},
-        {SCREEN_CENTRE, 298, SCREEN_CENTRE, band, "the name"},
+        {SCREEN_CENTRE, name_y, SCREEN_CENTRE, band, "the name"},
         {centre.x, centre.y, SCREEN_CENTRE, band, "the app at the centre"},
         {gap_x, centre.y, SCREEN_CENTRE, band, "between two apps"},
         {SCREEN_CENTRE, 100, SCREEN_CENTRE, band, "the top"},
@@ -6061,7 +6077,7 @@ static void horizontal_swipe_only_scrolls(void) {
           (int)scroll_now(), name_shown());
     CHECK_SCALES();
     /* Off the row: the name, the title, under them. */
-    static const lv_point_t off_row[] = {{SCREEN_CENTRE, 298}, {SCREEN_CENTRE, 66}, {SCREEN_CENTRE, 360}};
+    const lv_point_t off_row[] = {{SCREEN_CENTRE, name_middle_y()}, {SCREEN_CENTRE, 66}, {SCREEN_CENTRE, 360}};
     for (size_t i = 0; i < ARRAY_LEN(off_row); i++) {
         for (int way = -1; way <= 1; way += 2) {
             log_clear();
@@ -6150,7 +6166,11 @@ static void a_tap_on_the_background_still_closes(void) {
                  {FAKE_SCROLL_LIMIT, 0, false},
                  {0, FAKE_SCROLL_LIMIT, false},
                  {-FAKE_SCROLL_LIMIT, -3, false}};
-    static const lv_point_t at[] = {{SCREEN_CENTRE, 360}, {SCREEN_CENTRE, 298}, {SCREEN_CENTRE, 66}};
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    const int32_t name_y = name_middle_y();
+    LAUNCHER_END();
+    const lv_point_t at[] = {{SCREEN_CENTRE, 360}, {SCREEN_CENTRE, name_y}, {SCREEN_CENTRE, 66}};
     for (size_t a = 0; a < ARRAY_LEN(at); a++) {
         for (size_t i = 0; i < ARRAY_LEN(lifts); i++) {
             cards_scene();
@@ -6205,6 +6225,294 @@ static void a_slide_on_an_app_opens_nothing(void) {
     fake_move(c.x + FAKE_SCROLL_LIMIT - 1, c.y - (FAKE_SCROLL_LIMIT - 1));
     fake_lift();
     CHECK(picks == 1 && strcmp(picked, "alpha") == 0, "a tap that rolled under the scroll limit opens the centre: %d '%s'", picks, picked);
+    LAUNCHER_END();
+}
+
+/* ---- Launcher carousel Task 6a: a clearly larger centre, and the launch hold ---- */
+
+/* What item k's face covers on the screen now: its tile's box, or the picture its icon's image draws (fake_drawn: LVGL's image scale,
+ * about the middle of the box). */
+static lv_area_t face_area(int k) {
+    fake_layout();
+    int item = carousel_item(k);
+    item_parts_t p = item_parts(item);
+    return item_face(item) == 'I' ? fake_drawn(p.image) : fake_obj(p.tile)->area;
+}
+
+static int32_t area_w(lv_area_t a) {
+    return a.x2 - a.x1 + 1;
+}
+
+/* Every corner of a is inside the round screen. */
+static bool area_inside_circle(lv_area_t a) {
+    const int32_t xs[2] = {a.x1, a.x2 + 1}, ys[2] = {a.y1, a.y2 + 1};
+    for (int i = 0; i < 4; i++) {
+        int32_t dx = xs[i & 1] - SCREEN_CENTRE, dy = ys[i >> 1] - SCREEN_CENTRE;
+        if (dx * dx + dy * dy > SCREEN_CENTRE * SCREEN_CENTRE) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Nothing of a is on the screen's columns. */
+static bool area_off_screen(lv_area_t a) {
+    return a.x1 >= 2 * SCREEN_CENTRE || a.x2 < 0;
+}
+
+/* The user's word on preview 2: the app at the centre is clearly larger than the two beside it. At rest on the first app, the third and
+ * the last, with tiles and with icons (120 px, the size apps are made at, drawn larger at the centre): the centre's face is 150 to 160 px
+ * across and a neighbour's at most 40% of it; each neighbour is wholly on the screen and inside its circle, at least 12 px from the
+ * centre's face; the apps two away are off the screen; the centre's face, its running dot, the name and the title are inside the circle,
+ * and the title is clear above the face. */
+static void centre_is_clearly_larger(void) {
+    CHECK(APPS_LV_ICON_PX >= 150 && APPS_LV_ICON_PX <= 160, "the centre's box is 150 to 160 px: %d", APPS_LV_ICON_PX);
+    CHECK(APPS_LV_ICON_SIDE_SCALE <= 102, "a neighbour's scale is at most 102 of 256 (40%%): %d", APPS_LV_ICON_SIDE_SCALE);
+    const apps_lv_app_t tiles[] = {{"c1", "C1", ""}, {"c2", "C2", ""}, {"c3", "C3", ""}, {"c4", "C4", ""}, {"c5", "C5", ""}};
+    const apps_lv_app_t icons[] = {{"c1", "C1", "icon.bin"}, {"c2", "C2", "icon.bin"}, {"c3", "C3", "icon.bin"}, {"c4", "C4", "icon.bin"},
+                                   {"c5", "C5", "icon.bin"}};
+    for (int kind = 0; kind < 2; kind++) {
+        const char *what = kind == 0 ? "tiles" : "icons";
+        for (int k = 0; k < 5; k += 2) {
+            cards_scene();
+            if (kind == 1) {
+                for (int i = 0; i < 5; i++) {
+                    put_icon(icons[i].id, CF_RGB565A8, 120, 120, (uint8_t)(0x10 + i));
+                }
+            }
+            apps_lv_show_launcher(kind == 0 ? tiles : icons, 5, (kind == 0 ? tiles : icons)[k].id, pick);
+            fake_scroll(carousel_row(), k * APPS_LV_ITEM_PITCH);  /* at rest there, as the snap leaves it */
+            for (int round = 0; round < 4; round++) {
+                run_io();
+                apps_lv_launcher_poll();
+            }
+            CHECK_SCALES();
+            const char face = kind == 0 ? 'T' : 'I';
+            lv_area_t c = face_area(k);
+            CHECK(item_face(carousel_item(k)) == face, "%s, at %d: the centre's face is its %c: %s", what, k, face, faces());
+            CHECK(area_w(c) >= 150 && area_w(c) <= 160 && area_inside_circle(c), "%s, at %d: the centre's face is %d px, %d,%d - %d,%d",
+                  what, k, (int)area_w(c), (int)c.x1, (int)c.y1, (int)c.x2, (int)c.y2);
+            for (int way = -1; way <= 1; way += 2) {
+                int n = k + way, far = k + 2 * way;
+                if (n < 0 || n >= 5) {
+                    continue;
+                }
+                lv_area_t a = face_area(n);
+                CHECK(item_face(carousel_item(n)) == face, "%s, at %d: the neighbour %d's face is its %c: %s", what, k, n, face, faces());
+                CHECK(area_w(a) * 10 <= 4 * area_w(c), "%s, at %d: the neighbour %d is %d px of the centre's %d: over 40%%", what, k, n,
+                      (int)area_w(a), (int)area_w(c));
+                CHECK(area_inside_circle(a), "%s, at %d: the neighbour %d is inside the circle: %d,%d - %d,%d", what, k, n, (int)a.x1,
+                      (int)a.y1, (int)a.x2, (int)a.y2);
+                int32_t gap = way > 0 ? a.x1 - c.x2 - 1 : c.x1 - a.x2 - 1;
+                CHECK(gap >= 12, "%s, at %d: %d px between the neighbour %d and the centre", what, k, (int)gap, n);
+                if (far >= 0 && far < 5) {
+                    lv_area_t f = face_area(far);
+                    CHECK(area_off_screen(f), "%s, at %d: the app two away (%d) is off the screen: %d - %d", what, k, far, (int)f.x1,
+                          (int)f.x2);
+                }
+            }
+            int title = fake_label("Apps"), name = name_label(), dot = item_parts(carousel_item(k)).dot;
+            CHECK(title > 0 && name > 0 && dot > 0, "%s, at %d: the title, the name and the dot: %d %d %d", what, k, title, name, dot);
+            if (title > 0 && name > 0 && dot > 0) {
+                CHECK(inside_circle(name) && inside_circle(dot) && inside_circle(title), "%s, at %d: the name %d, the dot %d, the title %d "
+                      "inside the circle", what, k, inside_circle(name), inside_circle(dot), inside_circle(title));
+                CHECK(fake_obj(title)->area.y2 < c.y1, "%s, at %d: the title (to %d) clear of the centre's face (from %d)", what, k,
+                      (int)fake_obj(title)->area.y2, (int)c.y1);
+                CHECK(fake_obj(dot)->area.y1 > c.y2 && fake_obj(name)->area.y1 > fake_obj(dot)->area.y2,
+                      "%s, at %d: the face, then the dot, then the name", what, k);
+            }
+            LAUNCHER_END();
+        }
+    }
+}
+
+static const apps_lv_app_t HOLD_APPS[] = {{"h1", "H1", "icon.bin"}, {"h2", "H2", "icon.bin"}, {"h3", "H3", "icon.bin"},
+                                          {"h4", "H4", ""},         {"h5", "H5", "icon.bin"}};
+
+/* The launcher over the clock, its first two icons in and two more of its window loading on the worker, looked at for browse_us; then a
+ * tap on the app at the centre, which picks it. before and *drawn are what it showed before the tap. */
+static void hold_scene_at(int line, int64_t browse_us, char before[8], int *drawn) {
+    cards_scene();
+    for (size_t i = 0; i < ARRAY_LEN(HOLD_APPS); i++) {
+        if (HOLD_APPS[i].icon[0] != '\0') {
+            put_icon(HOLD_APPS[i].id, CF_RGB565A8, 120, 120, (uint8_t)(0x10 + i));
+        }
+    }
+    apps_lv_show_launcher(HOLD_APPS, 5, NULL, pick);
+    run_io();
+    apps_lv_launcher_poll();
+    CHECK_AT(line, strcmp(faces(), "IITTT") == 0 && io_queued == 2, "two icons in, the next two of the window (h3, h5) on their way: %s, "
+             "%d queued", faces(), io_queued);
+    snprintf(before, 8, "%s", faces());
+    *drawn = fake_draw();
+    clock_us += browse_us;
+    lv_point_t c = face_at(0);
+    CHECK_AT(line, fake_tap_at(c.x, c.y) == carousel_item(0) && picks == 1 && strcmp(picked, "h1") == 0, "the centre is picked: %d '%s'",
+             picks, picked);
+}
+#define HOLD_SCENE(before, drawn) hold_scene_at(__LINE__, 0, (before), (drawn))
+
+/* A pick doesn't close the launcher: it holds it as it was, over the clock, while the app loads, and nothing apps_lv does by itself ends
+ * that before the app's first frame: the app's table coming, passes of the apply step behind it and in front of it, a pass skipped for a
+ * callback, the layer coming to the front under it, frames of the icons' poll. The app task's glue ends it at that frame
+ * (tests/test_muse_apps_task.py), with apps_lv_hide_cards, which closes it as any close does in the same call: the icons dropped, every
+ * item its tile, and the app's widget, on the layer in front, in its place. */
+static void launch_holds_the_launcher_until_the_first_frame(void) {
+    char before[8];
+    int drawn;
+    HOLD_SCENE(before, &drawn);
+    int card = fake_parent(carousel_row());
+    CHECK(apps_lv_launcher_shown() && apps_lv_launcher_holding() && !fake_flag(card, LV_OBJ_FLAG_HIDDEN) && apps_lv_cards_shown(),
+          "the pick holds the launcher: shown %d, holding %d", apps_lv_launcher_shown(), apps_lv_launcher_holding());
+    CHECK(strcmp(faces(), before) == 0 && fake_draw() == drawn, "as it was: %s, %d icons drawn", faces(), fake_draw());
+    CHECK_SOURCES();
+    env_t e;
+    CHECK(env_open(&e, ASSETS, 2), "env_open");  /* the app's table, published */
+    RUN(&e, "ui.label{text = 'Hi'}");
+    CHECK(APPLY(&e) && apps_lv_launcher_holding(), "a pass behind the launcher: it holds");
+    apps_lv_set_front(true);
+    CHECK(apps_lv_launcher_holding() && !fake_flag(card, LV_OBJ_FLAG_HIDDEN), "the layer to the front, under it: it holds");
+    CHECK(!APPLY_CB(&e) && apps_lv_launcher_holding(), "a pass skipped for a callback: it holds");
+    CHECK(APPLY(&e) && apps_lv_launcher_holding(), "a pass with the layer in front: it holds (the glue's to end)");
+    for (int frame = 0; frame < 5; frame++) {
+        apps_lv_launcher_poll();
+    }
+    CHECK(apps_lv_launcher_holding() && strcmp(faces(), before) == 0 && fake_draw() == drawn, "frames of the poll: it holds, as it was: %s",
+          faces());
+    int label = fake_label("Hi");
+    CHECK(label > 0 && fake_index(card) > fake_index(1), "the app's widget is on the layer, under the launcher");
+    apps_lv_hide_cards();  /* the glue, at the app's first frame */
+    CHECK(!apps_lv_launcher_shown() && !apps_lv_launcher_holding() && fake_flag(card, LV_OBJ_FLAG_HIDDEN), "it closes");
+    CHECK(label > 0 && fake_shown(label), "the app's widget shows in its place");
+    CHECK(strcmp(faces(), "TTTTT") == 0 && apps_icons_get("h1") == NULL && apps_icons_get("h2") == NULL,
+          "its icons dropped, every item its tile: %s", faces());
+    CHECK_SOURCES();
+    apps_lv_reset();
+    env_close(&e);
+    LAUNCHER_END();
+}
+
+/* While the launcher holds it takes no input and changes nothing: a tap on the app at the centre picks nothing more, a tap on a side app
+ * brings nothing to the centre, a drag along the row scrolls nothing (the row doesn't scroll while it holds), and a swipe up from the
+ * bottom edge, a tap on the card and a slide on it close nothing. Its icons stay as they are: none asked for, none dropped, and those
+ * that come from the worker meanwhile aren't swapped in for their tiles. The close then drops them all, those that came too. */
+static void no_input_while_the_launch_holds(void) {
+    char before[8];
+    int drawn;
+    HOLD_SCENE(before, &drawn);
+    int row = carousel_row(), card = fake_parent(row), submits = io_submits;
+    lv_point_t c = face_at(0), side = face_at(1);
+    CHECK(fake_tap_at(c.x, c.y) == carousel_item(0) && picks == 1, "a tap on the centre again picks nothing: %d", picks);
+    log_clear();
+    CHECK(fake_tap_at(side.x, side.y) == carousel_item(1) && log_find("scroll_to_view") < 0 && !fake_scrolling(row),
+          "a tap on a side app brings nothing to the centre\n%s", log_peek());
+    fake_drag(c.x, c.y, c.x - 2 * APPS_LV_ITEM_PITCH, c.y, 20, 2);
+    CHECK(!fake_scrolling(row) && scroll_now() == 0, "a drag along the row scrolls nothing: %d", (int)scroll_now());
+    fake_lift();
+    SETTLE();
+    CHECK(scroll_now() == 0 && strcmp(name_shown(), "H1") == 0 && picks == 1, "still on the first: %d %s, %d picks", (int)scroll_now(),
+          name_shown(), picks);
+    CHECK_SCALES();
+    CHECK(swipe_from(SCREEN_CENTRE, EDGE_TOP + 14, 0, -80) == card && apps_lv_launcher_holding() && !fake_flag(card, LV_OBJ_FLAG_HIDDEN),
+          "a swipe up from the bottom edge closes nothing");
+    fake_lift();
+    CHECK(fake_tap_at(SCREEN_CENTRE, 360) == card && apps_lv_launcher_holding() && !fake_flag(card, LV_OBJ_FLAG_HIDDEN),
+          "nor a tap on the card");
+    slide_from(SCREEN_CENTRE, 360, 40, 0, 4);
+    CHECK(apps_lv_launcher_holding() && picks == 1, "nor a slide on it");
+    run_io();  /* the two icons that were loading come */
+    for (int frame = 0; frame < 3; frame++) {
+        apps_lv_launcher_poll();
+    }
+    CHECK(strcmp(faces(), before) == 0 && fake_draw() == drawn && io_submits == submits,
+          "its icons as they were: %s, %d drawn, %d more asked for", faces(), fake_draw(), io_submits - submits);
+    CHECK_SOURCES();
+    CHECK(apps_lv_launcher_holding() && picks == 1, "and it holds still");
+    LAUNCHER_END();  /* hide_cards, and every block goes */
+}
+
+/* A launch whose app shows nothing and whose end the glue doesn't hear of doesn't leave the launcher holding: APPS_LV_LAUNCH_HOLD_MS
+ * after the pick (not after the launcher opened) the poll closes it, as any close. Nothing of the hold is left after. */
+static void the_hold_times_out(void) {
+    CHECK(APPS_LV_LAUNCH_HOLD_MS == 3000, "the brief's bound: %d ms", APPS_LV_LAUNCH_HOLD_MS);
+    char before[8];
+    int drawn;
+    hold_scene_at(__LINE__, 5 * 1000000, before, &drawn);  /* looked at for 5 s before the pick */
+    int card = fake_parent(carousel_row());
+    clock_us += (int64_t)APPS_LV_LAUNCH_HOLD_MS * 1000 - 1;
+    apps_lv_launcher_poll();
+    CHECK(apps_lv_launcher_holding() && !fake_flag(card, LV_OBJ_FLAG_HIDDEN) && strcmp(faces(), before) == 0,
+          "a microsecond short of the bound: it holds, as it was: %s", faces());
+    clock_us += 1;
+    apps_lv_launcher_poll();
+    CHECK(!apps_lv_launcher_shown() && !apps_lv_launcher_holding() && fake_flag(card, LV_OBJ_FLAG_HIDDEN) && strcmp(faces(), "TTTTT") == 0,
+          "at %d ms it closes: shown %d, %s", APPS_LV_LAUNCH_HOLD_MS, apps_lv_launcher_shown(), faces());
+    CHECK_SOURCES();
+    run_io();
+    CHECK(held == 0, "its icons dropped: %zu bytes held", held);
+    log_clear();
+    clock_us += 10 * 1000000;
+    apps_lv_launcher_poll();
+    LOG_EMPTY();
+    LAUNCHER_END();
+}
+
+/* A voice turn closes a launcher that holds at once (muse_apps_ui_turn's apps_lv_hide_cards), as any close; nothing of the hold is left
+ * after. A list that changes while it holds can show it again (it is then a launcher as ever: its row scrolls, and a pick holds again). */
+static void a_voice_turn_ends_the_hold(void) {
+    char before[8];
+    int drawn;
+    HOLD_SCENE(before, &drawn);
+    int card = fake_parent(carousel_row());
+    apps_lv_hide_cards();
+    CHECK(!apps_lv_launcher_shown() && !apps_lv_launcher_holding() && fake_flag(card, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown() &&
+              strcmp(faces(), "TTTTT") == 0,
+          "the turn closes it: shown %d, %s", apps_lv_launcher_shown(), faces());
+    run_io();
+    CHECK(held == 0, "its icons dropped: %zu bytes held", held);
+    log_clear();
+    clock_us += (int64_t)APPS_LV_LAUNCH_HOLD_MS * 1000;
+    apps_lv_launcher_poll();
+    LOG_EMPTY();
+    /* Shown again over a hold: a launcher as ever. */
+    apps_lv_show_launcher(HOLD_APPS, 5, NULL, pick);
+    lv_point_t c = face_at(0);
+    fake_tap_at(c.x, c.y);
+    CHECK(apps_lv_launcher_holding(), "a pick holds");
+    apps_lv_show_launcher(HOLD_APPS, 5, NULL, pick);
+    CHECK(apps_lv_launcher_shown() && !apps_lv_launcher_holding() && fake_flag(carousel_row(), LV_OBJ_FLAG_SCROLLABLE),
+          "shown again, it doesn't hold, and its row scrolls");
+    c = face_at(0);
+    fake_drag(c.x, c.y, c.x - APPS_LV_ITEM_PITCH, c.y, 10, 2);
+    fake_lift();
+    SETTLE();
+    CHECK(scroll_now() == APPS_LV_ITEM_PITCH && strcmp(name_shown(), "H2") == 0, "a drag scrolls it: %d %s", (int)scroll_now(),
+          name_shown());
+    LAUNCHER_END();
+}
+
+/* Task 5's m3: a touch on the card that the launcher closed under (an app to the front, a voice turn: LVGL doesn't end a touch for a
+ * hide) does nothing at its lift or at its swipe up from the bottom edge: no second close, no call on the hidden card. */
+static void a_touch_the_launcher_closed_under_does_nothing(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int card = fake_parent(carousel_row());
+    CHECK(fake_down(SCREEN_CENTRE, 360) == card, "the press is the card's");
+    apps_lv_hide_cards();
+    log_clear();
+    fake_lift();
+    CHECK(picks == 0 && !apps_lv_launcher_shown(), "the lift opens nothing");
+    LOG_EMPTY();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    CHECK(fake_down(SCREEN_CENTRE, EDGE_TOP + 14) == card, "the press in the band is the card's");
+    apps_lv_hide_cards();
+    log_clear();
+    for (int i = 1; i <= 8; i++) {
+        fake_move(SCREEN_CENTRE, EDGE_TOP + 14 - 10 * i);
+    }
+    fake_lift();
+    CHECK(!apps_lv_launcher_shown() && log_count("add_flag") == 0 && log_count("remove_flag") == 0,
+          "the swipe up closes nothing again\n%s", log_peek());
     LAUNCHER_END();
 }
 
@@ -6349,6 +6657,12 @@ int main(int argc, char **argv) {
         {"a_short_slow_sideways_drag_on_the_name_does_not_close", a_short_slow_sideways_drag_on_the_name_does_not_close},
         {"a_tap_on_the_background_still_closes", a_tap_on_the_background_still_closes},
         {"a_slide_on_an_app_opens_nothing", a_slide_on_an_app_opens_nothing},
+        {"centre_is_clearly_larger", centre_is_clearly_larger},
+        {"launch_holds_the_launcher_until_the_first_frame", launch_holds_the_launcher_until_the_first_frame},
+        {"no_input_while_the_launch_holds", no_input_while_the_launch_holds},
+        {"the_hold_times_out", the_hold_times_out},
+        {"a_voice_turn_ends_the_hold", a_voice_turn_ends_the_hold},
+        {"a_touch_the_launcher_closed_under_does_nothing", a_touch_the_launcher_closed_under_does_nothing},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},

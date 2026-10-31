@@ -1684,7 +1684,9 @@ void muse_ui_bench_page(muse_ui_page_t page)
 #define BENCH_SWIPE_Y 233
 #define BENCH_SWIPE_FROM 406   /* a left swipe starts here and ends at TO; a right swipe goes the other way */
 #define BENCH_SWIPE_TO 60
-#define BENCH_PENDING 0x80000000u   /* a request: this bit, the kind in bits 24-25, x in 12-23, y in 0-11 */
+#define BENCH_SWIPE_UP_FROM 8      /* an up swipe starts this far above the bottom, at the middle (the launcher's close edge) */
+#define BENCH_SWIPE_UP_PX 200      /* and goes straight up this far */
+#define BENCH_PENDING 0x80000000u   /* a request: this bit, the kind in bits 24-26, x in 12-23, y in 0-11 */
 
 static lv_indev_read_cb_t s_real_read;   /* the touch driver's, found in place by muse_ui_start() */
 static atomic_uint s_touch_request;      /* waiting for the LVGL task: 0, or BENCH_PENDING and the rest */
@@ -1706,7 +1708,7 @@ void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y)
         ESP_LOGW(TAG, "bench touch: no touch input to script on this board");
         return;
     }
-    if ((unsigned)kind > MUSE_UI_TOUCH_SWIPE_RIGHT) {
+    if ((unsigned)kind > MUSE_UI_TOUCH_SWIPE_UP) {
         return;
     }
     atomic_store(&s_touch_request, BENCH_PENDING | ((unsigned)kind << 24) | ((unsigned)bench_clamp(x, s_w) << 12) |
@@ -1718,7 +1720,7 @@ static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
     if (!s_touch.running) {
         unsigned request = atomic_exchange(&s_touch_request, 0);
         if (request & BENCH_PENDING) {
-            s_touch.kind = (muse_ui_touch_t)((request >> 24) & 3);
+            s_touch.kind = (muse_ui_touch_t)((request >> 24) & 7);
             s_touch.x = (int)((request >> 12) & 0xfff);
             s_touch.y = (int)(request & 0xfff);
             s_touch.start = lv_tick_get();
@@ -1734,7 +1736,11 @@ static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
                     : s_touch.kind == MUSE_UI_TOUCH_LONG ? BENCH_LONG_MS
                                                          : BENCH_SWIPE_MS;
     int x = s_touch.x, y = s_touch.y;
-    if (s_touch.kind >= MUSE_UI_TOUCH_SWIPE_LEFT) {
+    if (s_touch.kind == MUSE_UI_TOUCH_SWIPE_UP) {
+        int from = s_h - BENCH_SWIPE_UP_FROM, to = from - BENCH_SWIPE_UP_PX;
+        x = s_w / 2;
+        y = t >= hold ? to : from + (to - from) * (int)t / (int)hold;
+    } else if (s_touch.kind >= MUSE_UI_TOUCH_SWIPE_LEFT) {
         bool left = s_touch.kind == MUSE_UI_TOUCH_SWIPE_LEFT;
         int from = left ? BENCH_SWIPE_FROM : BENCH_SWIPE_TO;
         int to = left ? BENCH_SWIPE_TO : BENCH_SWIPE_FROM;

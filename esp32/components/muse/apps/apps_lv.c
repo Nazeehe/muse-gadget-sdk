@@ -1011,13 +1011,16 @@ void apps_lv_stats(apps_lv_stats_t *out) {
 
 /* The carousel (apps_lv.h). The row is the screen's width and an item's height, CAROUSEL_Y from the middle; an item is the
  * icon's box with room under it for the dot; padding of SIDE_PAD at each end lets the first and the last come to the centre.
- * The name is one line under the row, inside the circle: corners at about (165, 77) from the middle. */
+ * On the 466 px screen: the centre's face spans y 134 to 293, under the title (56 to 77) with room to spare, and its dot 300 to
+ * 307; a neighbour's 63 px face is at x 371 to 433 (58 px from the centre's), y 182 to 244, its corners at most 208 px from
+ * the middle, inside the 233 px circle; the apps two away start past x 540, off the screen. The name is one line under the row, inside
+ * the circle: corners at about (165, 109) from the middle. */
 #define DOT_PX 8
 #define DOT_GAP 6
 #define ITEM_H (APPS_LV_ICON_PX + DOT_GAP + DOT_PX)
 #define FACE_DY (-(ITEM_H - APPS_LV_ICON_PX) / 2)  /* the face's centre from the item's: the top of the box is the icon's */
 #define SIDE_PAD ((SCREEN_PX - APPS_LV_ICON_PX) / 2)
-#define CAROUSEL_Y (-24)
+#define CAROUSEL_Y (-12)
 #define NAME_H 24               /* one line of montserrat_20 */
 #define NAME_GAP 10
 /* A tap lifts less than this from where it went down, on each axis: LVGL 9.5.0's scroll limit (LV_INDEV_DEF_SCROLL_LIMIT), the movement
@@ -1049,6 +1052,8 @@ static EXT_RAM_BSS_ATTR struct {
     lv_obj_t *row, *name;
     lv_point_t press;           /* where the last press on the card itself or on an item went down */
     bool press_moving;          /* the row was scrolling when the last press on an item went down */
+    bool holding;               /* a pick holds it for the app's first frame (apps_lv.h) */
+    int64_t hold_until;         /* esp_timer_get_time() at which the hold's bound closes it */
 } C;
 
 static lv_obj_t *s_launcher, *s_crash, *s_crash_title, *s_crash_body;
@@ -1231,13 +1236,23 @@ static void update_carousel(void) {
  * makes the carousel again. Here, not in update_carousel: make_carousel runs that before the launcher is shown. */
 static void on_carousel_scroll(lv_event_t *e) {
     (void)e;
-    if (!s_launcher_shown) {
-        return;
+    if (!s_launcher_shown || C.holding) {
+        return;  /* holding: the row doesn't scroll, and nothing changes the window */
     }
     update_carousel();
 }
 
+static void close_launcher(void);
+
 void apps_lv_launcher_poll(void) {
+    if (s_launcher_shown && C.holding) {
+        /* Its icons stay as they are (a load that ends meanwhile isn't polled in: the close drops it), until the bound. */
+        if (esp_timer_get_time() >= C.hold_until) {
+            ESP_LOGW(TAG, "the launch didn't show in %d ms: the launcher closes", APPS_LV_LAUNCH_HOLD_MS);
+            close_launcher();
+        }
+        return;
+    }
     if (s_launcher_shown && C.n > 0 && apps_icons_poll()) {
         refresh_faces();
     }
@@ -1252,8 +1267,20 @@ static void close_launcher(void) {
         lv_obj_add_flag(s_launcher, LV_OBJ_FLAG_HIDDEN);
     }
     s_launcher_shown = false;
+    C.holding = false;
     apps_icons_drop_all();
     refresh_faces();
+}
+
+/* A pick: the launcher stays as it is, and takes no input, until the glue closes it at the app's first frame or the bound does. The
+ * row stops being scrollable, so a drag on it moves nothing (it is at rest: only a settled centre picks); it is made scrollable again
+ * only by a new row, at the next show. */
+static void hold_launcher(void) {
+    C.holding = true;
+    C.hold_until = esp_timer_get_time() + (int64_t)APPS_LV_LAUNCH_HOLD_MS * 1000;
+    if (C.row != NULL) {
+        lv_obj_remove_flag(C.row, LV_OBJ_FLAG_SCROLLABLE);
+    }
 }
 
 static void close_crash(void) {
@@ -1286,10 +1313,11 @@ static bool lifted_in_place(void) {
 }
 
 /* A tap that lands on no app: on the launcher itself, or on its text, which isn't clickable (C12). A slide there is no tap (I1): LVGL
- * clicks the card after one that didn't become a gesture, and it closes nothing. */
+ * clicks the card after one that didn't become a gesture, and it closes nothing. Nor does any touch while it holds, or one it closed
+ * under (LVGL doesn't end a touch for a hide). */
 static void on_launcher_tap(lv_event_t *e) {
     (void)e;
-    if (lifted_in_place()) {
+    if (s_launcher_shown && !C.holding && lifted_in_place()) {
         close_launcher();
     }
 }
@@ -1318,8 +1346,8 @@ static void on_launcher_gesture(lv_event_t *e) {
     if (indev == NULL) {
         return;
     }
-    bool close = lv_indev_get_gesture_dir(indev) == LV_DIR_TOP && s_launcher != NULL && lv_indev_get_active_obj() == s_launcher &&
-                 in_close_edge(C.press);
+    bool close = s_launcher_shown && !C.holding && lv_indev_get_gesture_dir(indev) == LV_DIR_TOP && s_launcher != NULL &&
+                 lv_indev_get_active_obj() == s_launcher && in_close_edge(C.press);
     lv_indev_wait_release(indev);
     if (close) {
         close_launcher();
@@ -1331,13 +1359,13 @@ static void on_launcher_gesture(lv_event_t *e) {
  * them for a tap, so an item pressed while the row moves has moved on by the lift). Any other tap brings its item to the centre and
  * opens nothing: a side app, anywhere in its box, which is wider than its face (M2: a tap there can only scroll), or any app while the
  * row moves (M3). LVGL sends no tap at all at the lift of a drag that scrolled; a slide up or down (the row doesn't scroll that way) that
- * isn't a gesture it does click, and that is no tap: it does nothing (I1). Opening: the launcher closes first (pick may open another
- * card) with the item's id copied, and pick only posts. Nothing is deleted here, inside the item's event: the items go when the launcher
- * is next shown. A touch the launcher closed under (an app to the front, a voice turn: hiding it doesn't end the touch) does nothing at
- * its lift. */
+ * isn't a gesture it does click, and that is no tap: it does nothing (I1). Opening: the launcher holds (apps_lv.h), then pick, which
+ * only posts, is given the item's id copied. Nothing is deleted here, inside the item's event: the items go when the launcher is next
+ * shown. While it holds no touch on an item does anything, and a touch the launcher closed under (an app to the front, a voice turn:
+ * hiding it doesn't end the touch) does nothing at its lift. */
 static void on_item_event(lv_event_t *e) {
     intptr_t k = (intptr_t)lv_event_get_user_data(e);
-    if (!s_launcher_shown || k < 0 || k >= C.n || C.row == NULL) {
+    if (!s_launcher_shown || C.holding || k < 0 || k >= C.n || C.row == NULL) {
         return;
     }
     if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
@@ -1354,11 +1382,12 @@ static void on_item_event(lv_event_t *e) {
     }
     char id[APPS_ID_MAX + 1];
     memcpy(id, C.item[k].id, sizeof id);
-    void (*pick)(const char *id) = s_pick;
-    close_launcher();
-    if (pick != NULL) {
-        pick(id);
+    if (s_pick == NULL) {
+        close_launcher();  /* nothing to launch: nothing to hold for */
+        return;
     }
+    hold_launcher();
+    s_pick(id);
 }
 
 static void on_crash_tap(lv_event_t *e) {
@@ -1577,6 +1606,10 @@ bool apps_lv_cards_shown(void) {
 
 bool apps_lv_launcher_shown(void) {
     return s_launcher_shown;
+}
+
+bool apps_lv_launcher_holding(void) {
+    return s_launcher_shown && C.holding;
 }
 
 /* A new screen: the cards and the carousel of the old one are forgotten (apps_lv_build). Its icons are dropped at the next show. */

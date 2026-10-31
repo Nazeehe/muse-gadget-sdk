@@ -582,6 +582,40 @@ static void dirty_groups(void) {
     }
 }
 
+/* The spin cap fails closed (connected apps Task 1, fix round 1, I2): a picture the table can't size, one whose asset has no size
+ * or a src that is no asset of the package (Task 2's runtime images, until P9 sizes them), may not spin. The call that would leave
+ * it spinning is refused and changes nothing; spin = 0, and the picture still, are fine. */
+static void spin_refuses_an_unsized_src(void) {
+    static const apps_asset_t assets[] = {{"a.bin", (const uint8_t *)"aa", 2, 1, 1}, {"u.bin", (const uint8_t *)"uu", 2, 0, 0}};
+    static const char unknown[] = "t.lua:1: ui.image: spin: this image's size is unknown";
+    env_t e;
+    CHECK(env_open(&e, assets, 2), "env_open");
+    RUN_FAILS_EXACTLY(&e, "ui.image{src = 'u.bin', spin = 10}", unknown);
+    CHECK(apps_ui_count(e.ui) == 0, "a refused create made %d widgets", apps_ui_count(e.ui));
+    RUN(&e, "u = ui.image{src = 'u.bin', spin = 0} a = ui.image{src = 'a.bin'} b = ui.image{src = 'a.bin', spin = 10}");
+    RUN_FAILS_EXACTLY(&e, "u:set{spin = 10}", unknown);
+    CHECK(W(&e, 0)->spin == 0, "u: spin %d", W(&e, 0)->spin);
+    RUN_FAILS_EXACTLY(&e, "b:set{src = 'u.bin'}", unknown);
+    CHECK(W(&e, 2)->image == 0 && W(&e, 2)->spin == 10, "b: image %d spin %d", W(&e, 2)->image, W(&e, 2)->spin);
+
+    /* A src that is no asset: the table's index past the package's images. The invariants don't allow it, so the chunk runs
+     * without the after-check, and the index is put back before anything else. */
+    W(&e, 1)->image = APPS_UI_ASSETS_MAX + 1;
+    char err[512] = "";
+    bool ran = run(&e, "a:set{spin = 10}", err, sizeof err);
+    char *newline = strchr(err, '\n');
+    if (newline != NULL) {
+        *newline = '\0';
+    }
+    CHECK(!ran && strcmp(err, unknown) == 0, "a src that is no asset: ran %d, '%s'", ran, err);
+    CHECK(W(&e, 1)->spin == 0, "a: spin %d", W(&e, 1)->spin);
+    ran = run(&e, "a:set{spin = 0, rotation = 90}", err, sizeof err);
+    CHECK(ran && W(&e, 1)->rotation == 90, "a, still: ran %d, '%s'", ran, err);
+    W(&e, 1)->image = 0;
+    RUN(&e, "a:set{spin = 10}");
+    finish(&e);
+}
+
 /* rotation and spin (connected apps Task 1). A set of rotation turns the image to it, so the apply step must hear one even of
  * the value the slot holds once the image has spun since rotation was last set (a spin turns it away): rotation_sets moves on and
  * STYLE is set. Otherwise the same set again sets no bit, as for every property. A create with rotation counts one. */
@@ -1510,6 +1544,7 @@ int main(int argc, char **argv) {
         {"dirty_bits", dirty_bits},
         {"dirty_groups", dirty_groups},
         {"rotation_sets", rotation_sets},
+        {"spin_refuses_an_unsized_src", spin_refuses_an_unsized_src},
         {"vm_check", vm_check},
         {"slot_reuse", slot_reuse},
         {"cascade", cascade},

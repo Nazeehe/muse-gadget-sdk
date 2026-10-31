@@ -725,7 +725,7 @@ class UiTest(UiTestCase):
         # connected apps Task 1, fix round 0 (R1): an image spins only while both its sides as drawn (the header's w and h times scale,
         # to the nearest px as apps_lv.c's scaled_side has it) are at most APPS_SPIN_SIDE_MAX. The call that would break that is the
         # error: a create, a set of spin, or a set of scale or src while it spins. spin = 0 always goes, and a refused set changes
-        # nothing.
+        # nothing. A picture too large itself is that error, before what spins at once (test_spin_total_area_is_capped) is counted.
         side_max = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
         self.assertEqual(side_max, 200)
         lines = self.lua_lines("""
@@ -739,6 +739,7 @@ class UiTest(UiTestCase):
             try(ui.image, {src = "s120.bin", scale = 200, spin = 33})
             local c = ui.image{src = "s120.bin", scale = 200}
             try(c.set, c, {spin = 1})
+            a:set{spin = 0}  -- room for d among what spins at once (R1a)
             local d = ui.image{src = "s150.bin", spin = 20}
             try(d.set, d, {scale = 150})
             print(d:get("scale"), d:get("spin"))
@@ -747,6 +748,7 @@ class UiTest(UiTestCase):
             try(d.set, d, {scale = 134})
             d:set{scale = 150, spin = 0}
             print(d:get("scale"), d:get("spin"))
+            a:set{spin = 33}
             try(a.set, a, {src = "w201.bin"})
             print(a:get("src"), a:get("spin"))
             a:set{src = "w201.bin", spin = 0}
@@ -775,6 +777,79 @@ class UiTest(UiTestCase):
             refused(201, 200), "s200.bin\t33",
             "w201.bin\t0\t0",
             "400\t60",  # 50 px at 400% is 200
+        ])
+
+    def test_spin_total_area_is_capped(self):
+        # connected apps Task 1, fix round 1 (R1a): the images that spin at once and show (not hidden, nor in a hidden box) cover at
+        # most APPS_SPIN_AREA_MAX px together, their drawn w x h added up. A call that would raise the total past it is the error:
+        # a spin made or given, a scale or src while it spins, or a hidden spinner (or the box it's in) shown. A refused call changes
+        # nothing; a delete, spin = 0 or a hide frees room.
+        side_max = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
+        area_max = header_number("apps_ui.h", "APPS_SPIN_AREA_MAX")
+        self.assertEqual(area_max, 40000)
+        self.assertEqual(area_max, side_max * side_max, "the message says the total as one picture's sides")
+        lines = self.lua_lines("""
+            local function try(f, ...) local ok, err = pcall(f, ...) print(ok, err) end
+            local a = ui.image{src = "s150.bin", spin = 10}
+            try(ui.image, {src = "s150.bin", spin = 10})
+            local b = ui.image{src = "s150.bin"}
+            try(b.set, b, {spin = 10})
+            print(b:get("spin"))
+            a:delete()
+            b:set{spin = 10}
+            print(b:get("spin"))
+            b:set{spin = 0}
+            local c = ui.image{src = "s200.bin", spin = 33}
+            try(ui.image, {src = "s50.bin", spin = 33})
+            c:set{spin = 0}
+            local d = ui.image{src = "s140.bin", spin = 20}
+            local e = ui.image{src = "s140.bin", spin = 20}
+            print(d:get("spin"), e:get("spin"))
+            try(e.set, e, {scale = 110})
+            try(e.set, e, {src = "s150.bin"})
+            print(e:get("scale"), e:get("src"))
+            e:set{hidden = true}
+            local f = ui.image{src = "s140.bin", spin = 20}
+            try(e.set, e, {hidden = false})
+            print(e:get("hidden"))
+            local g = ui.image{src = "s140.bin", spin = 20, hidden = true}
+            local box = ui.box{hidden = true}
+            local h = ui.image{src = "s140.bin", spin = 20, parent = box}
+            try(box.set, box, {hidden = false})
+            print(box:get("hidden"))
+            f:set{spin = 0}
+            e:set{hidden = false}
+            print(e:get("hidden"))
+            d:set{spin = 0}
+            e:set{scale = 50}
+            box:set{hidden = false}
+            print(box:get("hidden"))
+            ui.clear()
+            local i = ui.image{src = "s200.bin", spin = 60}
+            print(i:get("spin"))
+        """, files={"s200.bin": lvgl_image(200, 200), "s150.bin": lvgl_image(150, 150), "s140.bin": lvgl_image(140, 140),
+                    "s50.bin": lvgl_image(50, 50)})
+
+        def refused(kind, n):
+            return (f"false\tui.{kind}: spin: images spinning at once may cover at most {side_max} x {side_max} px together "
+                    f"(these would cover {n} px)")
+
+        self.assertEqual(lines, [
+            refused("image", 45000),  # two 150 px
+            refused("image", 45000), "0",
+            "10",  # a deleted spinner freed its area
+            refused("image", 42500),  # 200 px and 50 px
+            "20\t20",  # 140 px and 140 px: 39,200
+            refused("image", 19600 + 154 * 154),  # e grows while it spins
+            refused("image", 19600 + 22500),  # e's src grows while it spins
+            "100\ts140.bin",
+            refused("image", 3 * 19600),  # a hidden spinner shown: d, f and e
+            "true",
+            refused("box", 3 * 19600),  # a box shown with a spinner in it (g is hidden itself): d, f and h
+            "true",
+            "false",  # f stopped, so e shows: d and e, 39,200
+            "false",  # d stopped and e at 70 px, so the box shows: e and h, 24,500
+            "60",  # ui.clear() freed it all: one 200 px
         ])
 
     def test_the_spin_fixture(self):  # connected apps Task 1: the board's spin gate's app, and its disc
@@ -1241,6 +1316,9 @@ class HarnessTest(unittest.TestCase):
 
     def test_a_set_of_rotation_turns_an_image_that_has_spun(self):  # connected apps Task 1
         self.run_case("rotation_sets")
+
+    def test_spin_refuses_an_unsized_src(self):  # connected apps Task 1, fix round 1 (I2): the spin cap fails closed
+        self.run_case("spin_refuses_an_unsized_src")
 
     def test_a_dying_vm_gets_no_work_from_any_binding(self):
         self.run_case("vm_check")

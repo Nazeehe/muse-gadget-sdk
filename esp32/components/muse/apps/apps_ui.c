@@ -740,16 +740,123 @@ static void read_src(const ctx_t *x, prop_t p, int idx, change_t *c) {
     fail_kind(L, x->kind, "src '%s' is not one of this app's images (manifest.json \"files\")", show(&shown, s, len));
 }
 
-/* Raises unless a picture of w x h px at scale percent may spin: both sides as drawn, to the nearest px (as apps_lv.c's
- * scaled_side has them), at most APPS_SPIN_SIDE_MAX. The board's spin gate (connected apps Task 1) drew a turned picture at
- * about 1 us a pixel each step: 200 px held its frame rate, 300 and 400 px didn't, and taps waited behind them. Every image
- * that may spin comes through here, whatever its src. */
+/* ---- The spin cap (connected apps Task 1: R1, R1a) ----
+ * The board's spin gate drew a turned picture at about 1 us a pixel each step: one 200 px disc (40,000 px) held its frame rate,
+ * 300 and 400 px didn't, and taps waited behind them. So a spinning picture is at most APPS_SPIN_SIDE_MAX a side as drawn, and
+ * the pictures that spin at once and show cover at most APPS_SPIN_AREA_MAX together. The checks run on the app task, the table's
+ * only writer, so they read it without the lock. */
+
+_Static_assert(APPS_SPIN_AREA_MAX == APPS_SPIN_SIDE_MAX * APPS_SPIN_SIDE_MAX, "the total's message names it as one picture's sides");
+
+/* One side of a picture drawn at scale percent, to the nearest px, as apps_lv.c's scaled_side has it (without its screen clamp). */
+static uint32_t drawn_side(uint16_t side, int64_t scale) {
+    return ((uint32_t)side * (uint32_t)scale + 50) / 100;
+}
+
+/* The size of the picture src names, from its header; 0 x 0 when the table can't size it (no image of the package, or one with no
+ * size). Task 2 sizes its runtime images here (P9). */
+static void picture_size(const apps_ui_t *ui, int64_t src, uint16_t *w, uint16_t *h) {
+    bool asset = src >= 0 && src < ui->n_assets;
+    *w = asset ? ui->assets[src].w : 0;
+    *h = asset ? ui->assets[src].h : 0;
+}
+
+/* Raises unless a picture of w x h px at scale percent may spin: sized (a side of 0 is one the table couldn't size, so this fails
+ * closed) and both sides as drawn at most APPS_SPIN_SIDE_MAX. Every image that may spin comes through here, whatever its src. */
 static void check_spin_side(lua_State *L, int kind, uint16_t w, uint16_t h, uint16_t scale) {
-    uint32_t drawn_w = ((uint32_t)w * scale + 50) / 100;
-    uint32_t drawn_h = ((uint32_t)h * scale + 50) / 100;
+    if (w == 0 || h == 0) {
+        fail_kind(L, kind, "spin: this image's size is unknown");
+    }
+    uint32_t drawn_w = drawn_side(w, scale);
+    uint32_t drawn_h = drawn_side(h, scale);
     if (drawn_w > APPS_SPIN_SIDE_MAX || drawn_h > APPS_SPIN_SIDE_MAX) {
         fail_kind(L, kind, "spin: an image may spin only up to %d x %d px on screen (this one is %d x %d)", APPS_SPIN_SIDE_MAX,
                   APPS_SPIN_SIDE_MAX, (int)drawn_w, (int)drawn_h);
+    }
+}
+
+/* A create or a set not yet made, as the spin total counts it: c's values over those of the widget at slot `at`, or (at -1) the
+ * widget of kind being made. */
+typedef struct {
+    int at;
+    int kind;
+    const change_t *c;
+} pending_t;
+
+/* Property p of the widget at slot i, with pend's change over it (pend NULL: as the table has it). */
+static int64_t value_of(const apps_ui_t *ui, int i, prop_t p, const pending_t *pend) {
+    if (pend != NULL && i == pend->at && (pend->c->set & BIT(p)) != 0) {
+        return pend->c->v[p];
+    }
+    return fetch(&ui->w[i], p);
+}
+
+/* Whether a widget hidden or not, in the box at slot parent (-1: the layer), shows: neither it nor a box it is in is hidden. A
+ * parent chain is at most APPS_UI_BOX_DEPTH_MAX boxes, and the walk stops there whatever the table says. */
+static bool shows(const apps_ui_t *ui, bool hidden, int64_t parent, const pending_t *pend) {
+    for (int steps = 0; !hidden && parent >= 0 && parent < APPS_UI_SLOTS && steps <= APPS_UI_BOX_DEPTH_MAX; steps++) {
+        hidden = value_of(ui, (int)parent, P_HIDDEN, pend) != 0;
+        parent = ui->w[parent].parent;
+    }
+    return !hidden;
+}
+
+/* The px a spinning picture covers as drawn; more than APPS_SPIN_AREA_MAX for one that can't be sized (closed: it can't be
+ * spinning, since check_spin_side refused its spin). */
+static uint64_t spin_area(const apps_ui_t *ui, int64_t src, int64_t scale) {
+    uint16_t w, h;
+    picture_size(ui, src, &w, &h);
+    return w == 0 || h == 0 ? APPS_SPIN_AREA_MAX + 1u : (uint64_t)drawn_side(w, scale) * drawn_side(h, scale);
+}
+
+/* The px the images that spin and show cover together, with pend (NULL: none) counted as made. */
+static uint64_t spin_total(const apps_ui_t *ui, const pending_t *pend) {
+    uint64_t total = 0;
+    for (int i = 0; i < APPS_UI_SLOTS; i++) {
+        const apps_widget_t *w = &ui->w[i];
+        if (w->alive && w->kind == APPS_W_IMAGE && value_of(ui, i, P_SPIN, pend) != 0 &&
+            shows(ui, value_of(ui, i, P_HIDDEN, pend) != 0, w->parent, pend)) {
+            total += spin_area(ui, value_of(ui, i, P_SRC, pend), value_of(ui, i, P_SCALE, pend));
+        }
+    }
+    if (pend != NULL && pend->at < 0 && pend->kind == APPS_W_IMAGE) {  /* the image being made, with its defaults */
+        const change_t *c = pend->c;
+        bool hidden = (c->set & BIT(P_HIDDEN)) != 0 && c->v[P_HIDDEN] != 0;
+        int64_t parent = (c->set & BIT(P_PARENT)) != 0 ? c->v[P_PARENT] : -1;
+        int64_t scale = (c->set & BIT(P_SCALE)) != 0 ? c->v[P_SCALE] : 100;
+        if ((c->set & BIT(P_SPIN)) != 0 && c->v[P_SPIN] != 0 && shows(ui, hidden, parent, pend)) {
+            total += spin_area(ui, c->v[P_SRC], scale);
+        }
+    }
+    return total;
+}
+
+/* Raises when the create or set c, on the widget x->cur (NULL: one being made), would leave a picture spinning past the cap: one
+ * that is too large itself (a spin given, or a scale or src while it spins), or the pictures that spin at once and show covering
+ * more than APPS_SPIN_AREA_MAX together where they covered less (a spin made or given, a scale or src while it spins, or a hidden
+ * spinner, or a box with one in it, shown). spin = 0, a smaller picture and a hide never fail. */
+static void check_spin(const ctx_t *x, const change_t *c) {
+    if (x->kind == APPS_W_IMAGE) {
+        int64_t spin = (c->set & BIT(P_SPIN)) != 0 ? c->v[P_SPIN] : (x->cur != NULL ? x->cur->spin : 0);
+        int64_t src = (c->set & BIT(P_SRC)) != 0 ? c->v[P_SRC] : (x->cur != NULL ? x->cur->image : -1);
+        int64_t scale = (c->set & BIT(P_SCALE)) != 0 ? c->v[P_SCALE] : (x->cur != NULL ? x->cur->scale : 100);
+        if (spin != 0 && (c->set & (BIT(P_SPIN) | BIT(P_SCALE) | BIT(P_SRC))) != 0) {
+            uint16_t w, h;
+            picture_size(x->ui, src, &w, &h);
+            check_spin_side(x->L, x->kind, w, h, (uint16_t)scale);
+        }
+    }
+    uint32_t grows = x->kind == APPS_W_IMAGE                ? BIT(P_SPIN) | BIT(P_SCALE) | BIT(P_SRC) | BIT(P_HIDDEN)
+                     : x->kind == APPS_W_BOX && !x->creating ? BIT(P_HIDDEN)
+                                                             : 0;
+    if ((c->set & grows) != 0) {
+        pending_t pend = {.at = x->cur != NULL ? (int)(x->cur - x->ui->w) : -1, .kind = x->kind, .c = c};
+        uint64_t before = spin_total(x->ui, NULL);
+        uint64_t after = spin_total(x->ui, &pend);
+        if (after > before && after > APPS_SPIN_AREA_MAX) {
+            fail_kind(x->L, x->kind, "spin: images spinning at once may cover at most %d x %d px together (these would cover %d px)",
+                      APPS_SPIN_SIDE_MAX, APPS_SPIN_SIDE_MAX, (int)after);
+        }
     }
 }
 
@@ -818,16 +925,7 @@ static void read_props(const ctx_t *x, int t, change_t *c) {
     if (x->kind == APPS_W_IMAGE && x->creating && (c->set & BIT(P_SRC)) == 0) {
         fail_kind(L, x->kind, "src is required (a .bin image of this app's manifest.json \"files\")");
     }
-    if (x->kind == APPS_W_IMAGE) {
-        /* The call that would leave a picture spinning past the cap is the error: a spin given, or a scale or src while it
-         * spins. What a set leaves is checked: its own values, else the widget's. */
-        int64_t spin = (c->set & BIT(P_SPIN)) != 0 ? c->v[P_SPIN] : (x->cur != NULL ? x->cur->spin : 0);
-        int64_t src = (c->set & BIT(P_SRC)) != 0 ? c->v[P_SRC] : (x->cur != NULL ? x->cur->image : -1);
-        int64_t scale = (c->set & BIT(P_SCALE)) != 0 ? c->v[P_SCALE] : (x->cur != NULL ? x->cur->scale : 100);
-        if (spin != 0 && (c->set & (BIT(P_SPIN) | BIT(P_SCALE) | BIT(P_SRC))) != 0 && src >= 0 && src < x->ui->n_assets) {
-            check_spin_side(L, x->kind, x->ui->assets[src].w, x->ui->assets[src].h, (uint16_t)scale);
-        }
-    }
+    check_spin(x, c);
 }
 
 /* ---- Changing the table ---- */

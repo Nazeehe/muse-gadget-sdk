@@ -53,6 +53,7 @@
 #include "lauxlib.h"
 #include "lua.h"
 #include "muse_apps_lv_fakes.h"
+#include "sdkconfig.h"  /* the staged one: CONFIG_MUSE_BENCH in the bench build of this harness, nothing in the other */
 
 static int failures;
 
@@ -508,6 +509,12 @@ struct lv_indev {
     int unused;
 };
 
+/* The one display. Its callbacks outlive the objects (fake_reset leaves them), as a display outlives a screen's. */
+struct lv_display {
+    fake_cb_t cbs[4];
+    int n_cbs;
+};
+
 struct lv_event {
     lv_event_code_t code;
     void *ud;
@@ -521,6 +528,7 @@ static int n_objs;
 static int next_id;
 static int next_order;
 static lv_obj_t screen_obj;
+static lv_display_t display_obj;
 static lv_indev_t indev_obj;
 static bool indev_present = true;
 static lv_dir_t gesture_dir = LV_DIR_NONE;
@@ -681,6 +689,7 @@ static const char *code_name(lv_event_code_t c) {
         case LV_EVENT_RELEASED: return "released";
         case LV_EVENT_SCROLL: return "scroll";
         case LV_EVENT_GESTURE: return "gesture";
+        case LV_EVENT_REFR_READY: return "refr_ready";
         default: break;
     }
     return "?";
@@ -1409,6 +1418,37 @@ lv_event_dsc_t *lv_obj_add_event_cb(lv_obj_t *obj, lv_event_cb_t event_cb, lv_ev
     logline("add_event_cb %d %s%s", obj->id, code_name((lv_event_code_t)(filter & ~LV_EVENT_PREPROCESS)),
          (filter & LV_EVENT_PREPROCESS) != 0 ? " preprocess" : "");
     return (lv_event_dsc_t *)&obj->cbs[obj->n_cbs - 1];
+}
+
+/* Every object is on the one display (the screen's). */
+lv_display_t *lv_obj_get_display(const lv_obj_t *obj) {
+    if (use((lv_obj_t *)obj, "lv_obj_get_display", NULL) == NULL) {
+        return NULL;
+    }
+    return &display_obj;
+}
+
+void lv_display_add_event_cb(lv_display_t *disp, lv_event_cb_t event_cb, lv_event_code_t filter, void *user_data) {
+    tick();
+    if (disp != &display_obj || event_cb == NULL || disp->n_cbs >= (int)ARRAY_LEN(disp->cbs)) {
+        fake_error("lv_display_add_event_cb on %p with cb %p, %d callbacks", (void *)disp, (void *)(uintptr_t)event_cb,
+                   disp == &display_obj ? disp->n_cbs : -1);
+        return;
+    }
+    disp->cbs[disp->n_cbs++] = (fake_cb_t){event_cb, filter, user_data};
+    logline("display_add_event_cb %s", code_name(filter));
+}
+
+/* One refresh of the display as lv_display_refr_timer ends it (lv_refr.c): LV_EVENT_REFR_READY to the display's callbacks, sent
+ * whether or not anything was drawn. LVGL runs it at most every LV_DEF_REFR_PERIOD while something is invalid; a case says when. */
+static void fake_refresh(void) {
+    lv_event_t e = {LV_EVENT_REFR_READY, NULL, NULL, false};
+    for (int i = 0; i < display_obj.n_cbs && !e.stopped; i++) {
+        if (display_obj.cbs[i].filter == LV_EVENT_ALL || display_obj.cbs[i].filter == LV_EVENT_REFR_READY) {
+            e.ud = display_obj.cbs[i].ud;
+            display_obj.cbs[i].cb(&e);
+        }
+    }
 }
 
 lv_indev_t *lv_indev_active(void) {
@@ -6261,7 +6301,8 @@ static bool area_off_screen(lv_area_t a) {
 }
 
 /* The user's word on preview 2: the app at the centre is clearly larger than the two beside it. At rest on the first app, the third and
- * the last, with tiles and with icons (120 px, the size apps are made at, drawn larger at the centre): the centre's face is 150 to 160 px
+ * the last, with tiles and with icons of 160 px (the size the guide asks for since Task 6: the centre's own) and of 120 px (what apps were
+ * made at before it, drawn larger at the centre): the centre's face is 150 to 160 px
  * across and a neighbour's at most 40% of it; each neighbour is wholly on the screen and inside its circle, at least 12 px from the
  * centre's face; the apps two away are off the screen; the centre's face, its running dot, the name and the title are inside the circle,
  * and the title is clear above the face. */
@@ -6271,13 +6312,14 @@ static void centre_is_clearly_larger(void) {
     const apps_lv_app_t tiles[] = {{"c1", "C1", ""}, {"c2", "C2", ""}, {"c3", "C3", ""}, {"c4", "C4", ""}, {"c5", "C5", ""}};
     const apps_lv_app_t icons[] = {{"c1", "C1", "icon.bin"}, {"c2", "C2", "icon.bin"}, {"c3", "C3", "icon.bin"}, {"c4", "C4", "icon.bin"},
                                    {"c5", "C5", "icon.bin"}};
-    for (int kind = 0; kind < 2; kind++) {
-        const char *what = kind == 0 ? "tiles" : "icons";
+    for (int kind = 0; kind < 3; kind++) {
+        const char *what = kind == 0 ? "tiles" : kind == 1 ? "icons of 160 px" : "icons of 120 px";
+        const unsigned px = kind == 1 ? 160 : 120;
         for (int k = 0; k < 5; k += 2) {
             cards_scene();
-            if (kind == 1) {
+            if (kind > 0) {
                 for (int i = 0; i < 5; i++) {
-                    put_icon(icons[i].id, CF_RGB565A8, 120, 120, (uint8_t)(0x10 + i));
+                    put_icon(icons[i].id, CF_RGB565A8, px, px, (uint8_t)(0x10 + i));
                 }
             }
             apps_lv_show_launcher(kind == 0 ? tiles : icons, 5, (kind == 0 ? tiles : icons)[k].id, pick);
@@ -6564,6 +6606,137 @@ static void the_hold_drops_offscreen_icons(void) {
     LAUNCHER_END();  /* the close frees the three */
 }
 
+/* ---- Launcher carousel Task 6: the frame gate's measurement, in a MUSE_BENCH build only ---- */
+
+#if CONFIG_MUSE_BENCH
+#define FRAMES_LOGGED true
+#else
+#define FRAMES_LOGGED false
+#endif
+
+/* The ms of each "launcher frame <ms> ms" line apps_lv.c logged since the last esp_clear, in order, into ms (at most cap of them);
+ * how many there were. A line of any other shape after the words is a failure. */
+static int frame_lines_at(int line, int *ms, int cap) {
+    static const char prefix[] = "I muse_apps: launcher frame ";
+    int n = 0;
+    for (const char *at = esp_peek(); (at = strstr(at, prefix)) != NULL; at += sizeof prefix - 1) {
+        char *end;
+        long v = strtol(at + sizeof prefix - 1, &end, 10);
+        CHECK_AT(line, end != at + sizeof prefix - 1 && strncmp(end, " ms\n", 4) == 0, "a frame line of another shape:\n%s", at);
+        if (n < cap) {
+            ms[n] = (int)v;
+        }
+        n++;
+    }
+    return n;
+}
+#define FRAME_LINES(ms, cap) frame_lines_at(__LINE__, (ms), (cap))
+
+/* A refresh gap_us after the last one. */
+static void refresh_after(int64_t gap_us) {
+    clock_us += gap_us;
+    fake_refresh();
+}
+
+/* While the carousel scrolls (a drag, a fling's snap), each display refresh logs "launcher frame <ms> ms", the time since the refresh
+ * before it, rounded to the ms, when that one found it scrolling too: the first refresh of a scroll follows a rest of any length and
+ * isn't timed. Nothing at rest, nothing from a row that moves on under a closed launcher, and one callback on the display however
+ * often the layer is built. A build without the bench registers nothing and logs nothing, whatever scrolls. */
+static void launcher_frame_log(void) {
+    cards_scene();
+    cards_scene();  /* the layer built again (a new screen on the same display) */
+    if (FRAMES_LOGGED) {
+        CHECK(display_obj.n_cbs == 1 && display_obj.cbs[0].filter == LV_EVENT_REFR_READY,
+              "a bench build watches the display's refreshes, once: %d callbacks", display_obj.n_cbs);
+    } else {
+        CHECK(display_obj.n_cbs == 0, "a build without the bench adds nothing to the display: %d callbacks", display_obj.n_cbs);
+    }
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int row = carousel_row();
+    int ms[64];
+    esp_clear();
+    for (int i = 0; i < 3; i++) {
+        refresh_after(1000000);  /* at rest: a clock tick, an icon swapped in */
+    }
+    CHECK(FRAME_LINES(ms, 64) == 0, "nothing at rest:\n%s", esp_peek());
+
+    /* A drag. Its first refresh follows the rest; the rest are timed, to the nearest ms. */
+    lv_point_t p = face_at(0);
+    fake_down(p.x, p.y);
+    fake_move(p.x - 12, p.y);
+    CHECK(fake_scrolling(row), "the drag scrolls the row");
+    refresh_after(15000);
+    static const int64_t gaps_us[] = {20000, 33000, 16400, 16600, 51000};
+    static const int want_drag[] = {20, 33, 16, 17, 51};
+    for (size_t i = 0; i < ARRAY_LEN(gaps_us); i++) {
+        fake_move(p.x - 12 * (int32_t)(i + 2), p.y);
+        refresh_after(gaps_us[i]);
+    }
+    int n = FRAME_LINES(ms, 64);
+    if (FRAMES_LOGGED) {
+        CHECK(n == 5, "the drag's frames after its first: %d lines\n%s", n, esp_peek());
+        for (int i = 0; i < 5 && i < n; i++) {
+            CHECK(ms[i] == want_drag[i], "frame %d of the drag: %d ms, want %d", i, ms[i], want_drag[i]);
+        }
+    } else {
+        CHECK(n == 0, "no frame line without the bench:\n%s", esp_peek());
+    }
+
+    /* The fling: after the lift, the snap's animation, a refresh after each of its frames, each timed until it has ended. */
+    esp_clear();
+    fake_lift();
+    int frames = 0;
+    for (; frames < 100 && (throw_pending || n_anims > 0); frames++) {
+        clock_us += 16000;
+        fake_frame(16);
+        fake_refresh();
+    }
+    CHECK(!fake_scrolling(row) && frames >= 6, "the snap ran %d frames and ended", frames);
+    n = FRAME_LINES(ms, 64);
+    if (FRAMES_LOGGED) {
+        CHECK(n == frames - 1, "every frame of the snap but the one that ended it: %d lines, %d frames\n%s", n, frames, esp_peek());
+        for (int i = 0; i < n && i < 64; i++) {
+            CHECK(ms[i] == 16, "frame %d of the snap: %d ms", i, ms[i]);
+        }
+    } else {
+        CHECK(n == 0, "no frame line without the bench:\n%s", esp_peek());
+    }
+
+    /* At rest again, for 5 s: nothing, and the next drag's first refresh isn't a 5,000 ms frame. */
+    esp_clear();
+    for (int i = 0; i < 5; i++) {
+        refresh_after(1000000);
+    }
+    p = (lv_point_t){SCREEN_CENTRE, face_at(0).y};  /* the app at the centre, wherever the fling left it */
+    int way = scroll_now() < 4 * APPS_LV_ITEM_PITCH ? -1 : 1;  /* towards an app there is */
+    fake_down(p.x, p.y);
+    fake_move(p.x + way * 12, p.y);
+    refresh_after(15000);
+    fake_move(p.x + way * 24, p.y);
+    refresh_after(18000);
+    n = FRAME_LINES(ms, 64);
+    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || ms[0] == 18), "after a rest, only the frame after the first: %d lines\n%s",
+          n, esp_peek());
+    fake_lift();
+    SETTLE();
+
+    /* A launcher closed under a fling: LVGL animates its hidden row to the snap point all the same, and nothing is logged. */
+    way = scroll_now() < 4 * APPS_LV_ITEM_PITCH ? -1 : 1;
+    swipe_from(p.x, p.y, way * 120, 0);
+    fake_lift();
+    fake_frame(16);
+    CHECK(fake_scrolling(row), "the snap runs");
+    apps_lv_hide_cards();
+    esp_clear();
+    for (int i = 0; i < 100 && (throw_pending || n_anims > 0); i++) {
+        clock_us += 16000;
+        fake_frame(16);
+        fake_refresh();
+    }
+    CHECK(FRAME_LINES(ms, 64) == 0, "nothing from a closed launcher's row:\n%s", esp_peek());
+    LAUNCHER_END();
+}
+
 static void crash_card_text_and_tap(void) {
     cards_scene();
     apps_lv_show_crash("Timer", "main.lua:3: boom");
@@ -6712,6 +6885,7 @@ int main(int argc, char **argv) {
         {"the_hold_times_out", the_hold_times_out},
         {"a_voice_turn_ends_the_hold", a_voice_turn_ends_the_hold},
         {"a_touch_the_launcher_closed_under_does_nothing", a_touch_the_launcher_closed_under_does_nothing},
+        {"launcher_frame_log", launcher_frame_log},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},

@@ -24,7 +24,7 @@ manifest.json, a JSON object of at most 8 KB:
 - `api` (required): `1`, a JSON integer (`1.0` isn't one).
 - `main` (optional): the main `.lua` file, `"main.lua"` if left out.
 - `files` (optional): every other file, like `["util.lua", "assets/bell.bin"]`: modules for `require`, `.json` data and images.
-- `icon` (optional): one of `files`, a square `.bin` image at most 160 x 160 (120 x 120 looks best), shown in the launcher. See Icons.
+- `icon` (optional): one of `files`, a square `.bin` image at most 160 x 160, shown in the launcher; make it 160 x 160, the size of the app in the middle. See Icons.
 - `permissions` (optional): any of `sound` (for `sound.chirp`), `alarm` (the `alarm` module), `store` (the `store` module) and `keep_awake` (for `sys.keep_awake`). `net`, `secrets` and `muse` aren't available in this firmware yet.
 - `memory_kb` (optional): the Lua heap, a whole number from 64 to 1024; 256 if left out.
 - `messages` (optional): up to 16 event names, each with a description under 200 characters: the events Muse may send with `app.send`. Describe the data each takes and what it replies.
@@ -221,7 +221,7 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 
 The launcher shows each app by its icon.
 
-- Make one with every app: a `.bin` image the manifest names with `icon` and lists in `files`, square and at most 160 x 160 px (120 x 120 looks best).
+- Make one with every app: a `.bin` image the manifest names with `icon` and lists in `files`, square and at most 160 x 160 px. Make it 160 x 160: the launcher draws the app in the middle at that size and its neighbours smaller, so a smaller icon is scaled up there and looks soft.
 - Draw one bold, simple shape that reads at a small size, on a transparent background.
 - Convert it like any other image, with `--cf RGB565A8` (see Images).
 - An app without an icon shows as a coloured circle with the first letter of its name.
@@ -263,7 +263,7 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `manifest: files[<n>] '<path>' has an unsupported type (use .lua, .json or .bin)`: convert the file (images with LVGLImage.py), or leave it out.
 - `manifest: icon '<path>' is not one of the app's files`: list the icon's file in `files`, or fix the path in `icon`.
 - `manifest: icon '<path>' must be a .bin image`: name a `.bin` made with LVGLImage.py (see Icons).
-- `icon: <w>x<h> must be square, at most 160x160`: redraw the icon square and at most 160 x 160 px (120 x 120), and convert it again.
+- `icon: <w>x<h> must be square, at most 160x160`: redraw the icon 160 x 160 px and convert it again.
 - `manifest: unknown permission '<name>' (valid: sound, alarm, store, keep_awake)`: use one of those.
 - `manifest: permission '<name>' is not available in this firmware yet (api 1)`: do without it.
 - `manifest: memory_kb must be a whole number from 64 to <max>`: pick a whole number in range, or leave it out (256).

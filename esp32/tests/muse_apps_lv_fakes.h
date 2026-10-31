@@ -17,7 +17,8 @@
 
 /*
  * A fake LVGL for apps_lv.c (tests/test_muse_apps_lv.py stages lvgl.h, esp_attr.h, esp_heap_caps.h, esp_log.h and
- * esp_timer.h as one line each that includes this). The declarations here are the real LVGL 9.5.0's: same names, same types,
+ * esp_timer.h as one line each that includes this, and an sdkconfig.h of its own: empty, or CONFIG_MUSE_BENCH for the bench
+ * build of the harness). The declarations here are the real LVGL 9.5.0's: same names, same types,
  * same parameters (test_the_fakes_match_lvgl_9_5_0 compares them with the headers when they are on this machine),
  * so what compiles here compiles against the real headers too. Only the functions apps_lv.c calls are declared:
  * one it doesn't call, like lv_obj_set_parent, is a compile error if it starts to.
@@ -63,6 +64,7 @@ void fake_esp_log(char level, const char *tag, const char *fmt, ...) __attribute
 /* ---- lvgl.h: types ---- */
 
 typedef struct lv_obj lv_obj_t;
+typedef struct lv_display lv_display_t;
 typedef struct lv_indev lv_indev_t;
 typedef struct lv_event lv_event_t;
 typedef struct lv_event_dsc lv_event_dsc_t;
@@ -183,6 +185,7 @@ typedef enum {
     LV_EVENT_SCROLL,
     LV_EVENT_GESTURE,
     LV_EVENT_KEY,
+    LV_EVENT_REFR_READY = 59,  /* a display's: the end of each refresh, drawn or not (the codes between aren't used) */
     LV_EVENT_PREPROCESS = 0x8000,
 } lv_event_code_t;
 
@@ -317,6 +320,9 @@ void *lv_event_get_user_data(lv_event_t *e);
 lv_event_code_t lv_event_get_code(lv_event_t *e);
 void lv_event_stop_processing(lv_event_t *e);
 lv_event_dsc_t *lv_obj_add_event_cb(lv_obj_t *obj, lv_event_cb_t event_cb, lv_event_code_t filter, void *user_data);
+
+lv_display_t *lv_obj_get_display(const lv_obj_t *obj);
+void lv_display_add_event_cb(lv_display_t *disp, lv_event_cb_t event_cb, lv_event_code_t filter, void *user_data);
 
 lv_indev_t *lv_indev_active(void);
 lv_dir_t lv_indev_get_gesture_dir(const lv_indev_t *indev);

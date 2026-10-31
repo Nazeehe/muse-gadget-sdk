@@ -742,6 +742,32 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   `>app.send ID EVENT [JSON]`; `>app.status` takes no id and reports the app
   that runs. The first line after the port opens can be lost, so send `w`
   first and wait a second.
+- **Launcher:** a carousel (`apps_lv.c`): the app in the middle is 160 px
+  across (`APPS_LV_ICON_PX`), its neighbours 100/256 of that, 63 px
+  (`APPS_LV_ICON_SIDE_SCALE`), 170 px apart (`APPS_LV_ITEM_PITCH`); each
+  app's size follows its distance from the middle as the row scrolls, and a
+  small dot marks the app that runs. A sideways swipe browses and snaps an app
+  to the middle; a tap on the app in the middle opens it, a tap on a side app
+  brings it to the middle, and a swipe up from the bottom edge or a tap on the
+  background closes the launcher. Each app shows its icon, or a coloured
+  circle with its name's first letter while it has none or its pixels are
+  still coming. The guide asks for 160 x 160 icons, the size of the app in the
+  middle: a smaller one is scaled up there and looks soft. The I/O worker
+  reads the icons of the 5 apps around the middle (`APPS_ICONS_WINDOW`) into
+  PSRAM as the middle moves, and a close frees them. Measured on the 1.75C on
+  2026-10-30 with 10 apps, seven of them with icons (two of 160 px): `>mem`'s
+  internal RAM free, its largest block and DMA free didn't move with the
+  launcher open, scrolling or closed; free PSRAM fell by 154,512 bytes open on
+  the first app (two icons in its window), by 198,720 on an app with three, by
+  at most 228,200 while scrolling, and came back to within 16 bytes at the
+  close. With an app of 1.3 MB running behind it (906 KB of Lua heap and a
+  434 KB image) the launcher cost the same and its icons still loaded. A bench
+  build logs `launcher frame <ms> ms` (the `muse_apps` tag) at each display
+  refresh while the carousel scrolls: the time since the refresh before. Five
+  flings across all 10 apps (two `>swipe left` or `>swipe right` back to back
+  each) gave 150 frames, a median of 30 ms and a 95th percentile of 41 ms
+  (the longest 51), inside the frame gate of 33 and 50 ms, so the carousel
+  scales its icons live as they scroll.
 - **Boot:** the apps' storage waits for the Link (`muse_apps.h`). The app task
   mounts the FAT and `apps_nvs`, and the I/O worker that does it is made, once
   the reply to the first `link.register` has come, accepted or not

@@ -38,6 +38,7 @@ import zlib
 from pathlib import Path
 
 import apps_host
+from test_muse_apps_wiring import c_function, open_conditions
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
@@ -52,11 +53,13 @@ HARNESS_SOURCES = [HARNESS, APPS_LV, APPS / "apps_icons.c", APPS / "apps_ui.c", 
 FAKE_HEADERS = ["lvgl.h", "esp_attr.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h"]
 
 
-def stage_fakes(directory):
+def stage_fakes(directory, bench=False):
+    """The fake headers in directory, and an sdkconfig.h: CONFIG_MUSE_BENCH for a bench build (bench), else nothing."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     for name in FAKE_HEADERS:
         (directory / name).write_text('#include "muse_apps_lv_fakes.h"\n')
+    (directory / "sdkconfig.h").write_text("#pragma once\n" + ("#define CONFIG_MUSE_BENCH 1\n" if bench else ""))
     return directory
 
 
@@ -83,14 +86,18 @@ def lvgl_dir():
     return None
 
 
+def build_harness(tmp, bench=False):
+    stage = stage_fakes(Path(tmp) / "fake_headers", bench=bench)
+    return apps_host.build("muse_apps_lv_harness_bench" if bench else "muse_apps_lv_harness",
+                           [*HARNESS_SOURCES, *apps_host.lua_sources()], tmp, include_dirs=[apps_host.LUA_SRC, APPS, stage, TESTS])
+
+
 class HarnessTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(tmp.cleanup)
-        stage = stage_fakes(Path(tmp.name) / "fake_headers")
-        cls.harness = apps_host.build("muse_apps_lv_harness", [*HARNESS_SOURCES, *apps_host.lua_sources()], tmp.name,
-                                      include_dirs=[apps_host.LUA_SRC, APPS, stage, TESTS])
+        cls.harness = build_harness(tmp.name)
 
     def run_case(self, case, timeout=300):
         try:
@@ -425,6 +432,24 @@ class HarnessTest(unittest.TestCase):
         self.assertNotIn("APPS_LV_LAUNCHER_ROWS", source + (APPS / "apps_lv.h").read_text())
         self.assertIn('#include "esp_attr.h"', APPS_LV.read_text())
 
+    # ---- Task 6: the frame gate's measurement is a bench build's alone ----
+
+    def test_a_build_without_the_bench_logs_no_frames(self):  # nothing on the display, nothing logged, whatever scrolls
+        self.run_case("launcher_frame_log")
+
+    def test_the_frame_log_is_the_bench_builds_alone(self):
+        # Every part of it is inside #if CONFIG_MUSE_BENCH: the callback, its state, the line and the registration in apps_lv_build.
+        source = APPS_LV.read_text()
+        self.assertIn('#include "sdkconfig.h"', source)
+        mentions = [m.start() for m in re.finditer(r"on_refresh|watch_frames|s_frames|launcher frame|LV_EVENT_REFR_READY|"
+                                                   r"lv_display_add_event_cb|lv_obj_get_display", source)]
+        self.assertGreaterEqual(len(mentions), 6)
+        for index in mentions:
+            with self.subTest(source[source.rindex("\n", 0, index) + 1:source.index("\n", index)].strip()):
+                self.assertEqual(open_conditions(source, index), ["if CONFIG_MUSE_BENCH"])
+        build = c_function(source, "void apps_lv_build(lv_obj_t *screen)")
+        self.assertIn("watch_frames(screen);", build)
+
     def test_the_crash_card(self):
         self.run_case("crash_card_text_and_tap")
 
@@ -446,6 +471,21 @@ class HarnessTest(unittest.TestCase):
         self.assertTrue(cases, "no cases found in the harness")
         self.assertEqual(sorted(cases - tested), [], "harness cases no test runs")
         self.assertEqual(sorted(tested - cases), [], "tests that run a case the harness doesn't have")
+
+
+class BenchHarnessTest(unittest.TestCase):
+    """The harness built as a MUSE_BENCH build is (its sdkconfig.h has CONFIG_MUSE_BENCH): the frame gate's log line."""
+
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        cls.harness = build_harness(tmp.name, bench=True)
+
+    run_case = HarnessTest.run_case
+
+    def test_the_launcher_logs_its_frames_while_it_scrolls(self):  # Task 6: "launcher frame <ms> ms", only while the row moves
+        self.run_case("launcher_frame_log")
 
 
 # ---- The fakes against the real headers ----
@@ -526,7 +566,7 @@ class FakesTest(unittest.TestCase):
         LV_EVENT_SINGLE_CLICKED LV_EVENT_DOUBLE_CLICKED LV_EVENT_TRIPLE_CLICKED LV_EVENT_LONG_PRESSED
         LV_EVENT_LONG_PRESSED_REPEAT LV_EVENT_CLICKED LV_EVENT_RELEASED LV_EVENT_SCROLL_BEGIN
         LV_EVENT_SCROLL_THROW_BEGIN LV_EVENT_SCROLL_END LV_EVENT_SCROLL LV_EVENT_GESTURE LV_EVENT_KEY
-        LV_EVENT_PREPROCESS
+        LV_EVENT_REFR_READY LV_EVENT_PREPROCESS
         LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_COVER LV_ANIM_OFF LV_ANIM_ON
         LV_IMAGE_ALIGN_DEFAULT LV_IMAGE_ALIGN_CENTER LV_COLOR_FORMAT_A8 LV_IMAGE_FLAGS_PREMULTIPLIED
         sizeof(lv_image_header_t) sizeof(lv_image_dsc_t) sizeof(lv_color_t) sizeof(lv_area_t)
@@ -605,26 +645,30 @@ class FakesTest(unittest.TestCase):
                 self.assertIn(line, constructor.group(0))
 
     def test_apps_lv_compiles_against_the_real_headers(self):
-        """The device build compiles apps_lv.c against these: every name, type and argument it uses is checked."""
-        with tempfile.TemporaryDirectory() as tmp:
-            stage = Path(tmp)
-            # The ESP-IDF headers the real LVGL doesn't bring: just what apps_lv.c uses of them.
-            (stage / "esp_attr.h").write_text("#pragma once\n#define EXT_RAM_BSS_ATTR\n")
-            (stage / "esp_heap_caps.h").write_text(
-                "#pragma once\n#include <stddef.h>\n#include <stdint.h>\n#define MALLOC_CAP_SPIRAM (1u << 10)\n"
-                "size_t heap_caps_get_free_size(uint32_t caps);\n")
-            (stage / "esp_timer.h").write_text("#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n")
-            (stage / "esp_log.h").write_text(
-                "#pragma once\nvoid esp_log_write(int level, const char *tag, const char *fmt, ...) "
-                "__attribute__((format(printf, 3, 4)));\n#define ESP_LOGW(tag, ...) esp_log_write(1, tag, __VA_ARGS__)\n")
-            # LVGL's defaults, and the fonts CONFIG_MUSE_APPS selects (components/muse/Kconfig).
-            fonts = [f"-DLV_FONT_{font}=1" for font in ("MONTSERRAT_14", "MONTSERRAT_16", "MONTSERRAT_20", "MONTSERRAT_28",
-                                                        "UNSCII_8", "UNSCII_16")]
-            args = [*apps_host.cc(), "-std=gnu17", "-Wall", "-Wextra", "-Werror", "-DLV_CONF_SKIP=1", *fonts, "-fsyntax-only",
-                    "-isystem", str(self.lvgl), "-isystem", str(self.lvgl / "src"), f"-I{stage}", f"-I{APPS}",
-                    f"-I{apps_host.LUA_SRC}", str(APPS_LV)]
-            done = subprocess.run(args, capture_output=True, text=True)
-            self.assertEqual(done.returncode, 0, shlex.join(args) + "\n" + done.stdout + done.stderr)
+        """The device build compiles apps_lv.c against these: every name, type and argument it uses is checked, a bench build's
+        (CONFIG_MUSE_BENCH: the frame log) too."""
+        for bench in (False, True):
+            with self.subTest(bench=bench), tempfile.TemporaryDirectory() as tmp:
+                stage = Path(tmp)
+                # The ESP-IDF headers the real LVGL doesn't bring: just what apps_lv.c uses of them.
+                (stage / "sdkconfig.h").write_text("#pragma once\n" + ("#define CONFIG_MUSE_BENCH 1\n" if bench else ""))
+                (stage / "esp_attr.h").write_text("#pragma once\n#define EXT_RAM_BSS_ATTR\n")
+                (stage / "esp_heap_caps.h").write_text(
+                    "#pragma once\n#include <stddef.h>\n#include <stdint.h>\n#define MALLOC_CAP_SPIRAM (1u << 10)\n"
+                    "size_t heap_caps_get_free_size(uint32_t caps);\n")
+                (stage / "esp_timer.h").write_text("#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n")
+                (stage / "esp_log.h").write_text(
+                    "#pragma once\nvoid esp_log_write(int level, const char *tag, const char *fmt, ...) "
+                    "__attribute__((format(printf, 3, 4)));\n#define ESP_LOGW(tag, ...) esp_log_write(1, tag, __VA_ARGS__)\n"
+                    "#define ESP_LOGI(tag, ...) esp_log_write(2, tag, __VA_ARGS__)\n")
+                # LVGL's defaults, and the fonts CONFIG_MUSE_APPS selects (components/muse/Kconfig).
+                fonts = [f"-DLV_FONT_{font}=1" for font in ("MONTSERRAT_14", "MONTSERRAT_16", "MONTSERRAT_20", "MONTSERRAT_28",
+                                                            "UNSCII_8", "UNSCII_16")]
+                args = [*apps_host.cc(), "-std=gnu17", "-Wall", "-Wextra", "-Werror", "-DLV_CONF_SKIP=1", *fonts, "-fsyntax-only",
+                        "-isystem", str(self.lvgl), "-isystem", str(self.lvgl / "src"), f"-I{stage}", f"-I{APPS}",
+                        f"-I{apps_host.LUA_SRC}", str(APPS_LV)]
+                done = subprocess.run(args, capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, shlex.join(args) + "\n" + done.stdout + done.stderr)
 
 
 if __name__ == "__main__":

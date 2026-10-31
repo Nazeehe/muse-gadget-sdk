@@ -2722,7 +2722,7 @@ static void guide_written_or_inline(void) {
                                         "workspace/apps/_guide/timer/main.lua", "workspace/apps/_guide/timer/icon.bin"};
     const char *const bytes[] = {guide, manifest, main_lua, icon};
     const size_t lens[] = {guide_len, manifest_len, main_len, icon_len};
-    CHECK(icon_len == 43212, "the icon is the 120 x 120 RGB565A8 file: %zu bytes", icon_len);
+    CHECK(icon_len == 76812, "the icon is the 160 x 160 RGB565A8 file: %zu bytes", icon_len);
     for (int i = 0; i < 4; i++) {
         CHECK(strcmp(written[i].path, paths[i]) == 0, "write %d: %s", i, written[i].path);
         CHECK(written[i].len == lens[i] && memcmp(written[i].data, bytes[i], lens[i]) == 0, "write %d: the firmware's bytes of %s", i,

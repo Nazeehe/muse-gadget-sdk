@@ -227,6 +227,10 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * for or swapped in while it holds. A launch refused for memory nonetheless closes it, which frees those too, and the glue tries it once
  * more (apps_task.c). If nothing has closed it APPS_LV_LAUNCH_HOLD_MS after the pick, apps_lv_launcher_poll does. Showing it again ends
  * the hold.
+ *
+ * A bench build (CONFIG_MUSE_BENCH) measures the carousel's frames: while it scrolls, each display refresh (LV_EVENT_REFR_READY, watched
+ * from apps_lv_build) logs "launcher frame <ms> ms", the time since the refresh before it when that one found it scrolling too. Nothing
+ * at rest, closed or holding; nothing at all in other builds.
  */
 
 #define APPS_LV_ICON_PX 160          /* the centre's icon, and every item's box */

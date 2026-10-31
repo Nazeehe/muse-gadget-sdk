@@ -549,21 +549,71 @@ class GuideAndSkill(unittest.TestCase):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
 
+    def test_agents_md_has_the_launcher_paragraph(self):
+        # Launcher carousel Task 6: AGENTS.md's launcher paragraph (its gestures, icons, memory and the frame gate measured on the
+        # board). D12 for what it quotes of the code: the layout (apps_lv.h), the icons' window (apps_icons.h), the size the guide asks
+        # for (the centre's) and the bench's log line as apps_lv.c prints it. The measured bytes and ms beside them are measurements.
+        icon_px = header_number("apps_lv.h", "APPS_LV_ICON_PX")
+        side = header_number("apps_lv.h", "APPS_LV_ICON_SIDE_SCALE")
+        pitch = header_number("apps_lv.h", "APPS_LV_ITEM_PITCH")
+        window = header_number("apps_icons.h", "APPS_ICONS_WINDOW")
+        side_px = (icon_px * side + 128) // 256  # a neighbour's tile, as apps_lv.c's draw_scale sizes it
+        self.assertIn('ESP_LOGI(TAG, "launcher frame %d ms"', (APPS / "apps_lv.c").read_text())
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        for phrase in (
+                f"**Launcher:** a carousel (`apps_lv.c`): the app in the middle is {icon_px} px across (`APPS_LV_ICON_PX`), its "
+                f"neighbours {side}/256 of that, {side_px} px (`APPS_LV_ICON_SIDE_SCALE`), {pitch} px apart (`APPS_LV_ITEM_PITCH`);",
+                "A sideways swipe browses and snaps an app to the middle; a tap on the app in the middle opens it, a tap on a side app "
+                "brings it to the middle, and a swipe up from the bottom edge or a tap on the background closes the launcher.",
+                f"The guide asks for {icon_px} x {icon_px} icons, the size of the app in the middle",
+                f"the icons of the {window} apps around the middle (`APPS_ICONS_WINDOW`)",
+                "A bench build logs `launcher frame <ms> ms` (the `muse_apps` tag) at each display refresh while the carousel scrolls:"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, section)
+
     def test_guide_icon_numbers_are_the_headers(self):
-        # D12: the icon's size limit is APPS_ICON_MAX_PX, and its largest file is the LVGL header and that square of RGB565A8.
+        # D12: the icon's size limit is APPS_ICON_MAX_PX, and its largest file is the LVGL header and that square of RGB565A8. The size
+        # the guide recommends is the launcher's centre, APPS_LV_ICON_PX (launcher carousel Task 6: 160, up from 120, which the centre
+        # scaled up and drew soft).
         px = header_number("apps_pkg.h", "APPS_ICON_MAX_PX")
+        centre = header_number("apps_lv.h", "APPS_LV_ICON_PX")
+        self.assertLessEqual(centre, px, "the size recommended is one the install takes")
         pkg = (APPS / "apps_pkg.h").read_text()
         self.assertIn("#define APPS_ICON_MAX_BYTES (12 + APPS_ICON_MAX_PX * APPS_ICON_MAX_PX * 3)", pkg)
         guide = " ".join(GUIDE.read_text().split())
-        for phrase in (f"a square `.bin` image at most {px} x {px} (120 x 120 looks best), shown in the launcher",
-                       f"square and at most {px} x {px} px (120 x 120 looks best)",
-                       f"`icon: <w>x<h> must be square, at most {px}x{px}`",
+        self.assertNotIn("120 x 120", guide)
+        for phrase in (f"a square `.bin` image at most {px} x {px}, shown in the launcher; make it {centre} x {centre}, the size of the "
+                       "app in the middle.",
+                       f"square and at most {px} x {px} px. Make it {centre} x {centre}: the launcher draws the app in the middle at that "
+                       "size and its neighbours smaller, so a smaller icon is scaled up there and looks soft.",
+                       f"`icon: <w>x<h> must be square, at most {px}x{px}`: redraw the icon {centre} x {centre} px and convert it again.",
                        "`manifest: icon '<path>' is not one of the app's files`",
                        "`manifest: icon '<path>' must be a .bin image`",
                        "a coloured circle with the first letter of its name", "reinstall X with one", "--cf RGB565A8"):
             with self.subTest(phrase):
                 self.assertIn(phrase, guide)
         self.assertEqual(guide.count("## Icons"), 1)
+
+    def test_the_examples_icons_are_the_launchers_centre_size(self):
+        # Launcher carousel Task 6: hello's and the timer's icons are drawn at the size the guide recommends, the launcher's centre
+        # (APPS_LV_ICON_PX), uncompressed RGB565A8 as LVGLImage.py writes it: the 12-byte header, then 3 bytes a pixel, which at 160 px
+        # is APPS_ICON_MAX_BYTES. app.api embeds the timer's for Muse (test_guide_and_timer_are_embedded).
+        centre = header_number("apps_lv.h", "APPS_LV_ICON_PX")
+        px = header_number("apps_pkg.h", "APPS_ICON_MAX_PX")
+        for example in ("hello", "timer"):
+            with self.subTest(example):
+                data = (APPS / "examples" / example / "icon.bin").read_bytes()
+                magic, cf, flags, w, h, stride = data[0], data[1], int.from_bytes(data[2:4], "little"), \
+                    int.from_bytes(data[4:6], "little"), int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+                self.assertEqual((magic, cf), (0x19, 0x14), "an LVGL v9 RGB565A8 image")
+                self.assertEqual(flags & ~0x0001, 0, "premultiplied at most: no compression")
+                self.assertEqual((w, h, stride), (centre, centre, centre * 2))
+                self.assertEqual(len(data), 12 + centre * centre * 3)
+                self.assertLessEqual(len(data), 12 + px * px * 3)
+                manifest = json.loads((APPS / "examples" / example / "manifest.json").read_text())
+                self.assertEqual(manifest["icon"], "icon.bin")
+        self.assertEqual(centre * centre * 3 + 12, 76812, "APPS_ICON_MAX_BYTES at 160 px, the figure AGENTS.md quotes for an icon")
 
     def test_guide_says_what_room_an_app_has(self):
         # C1's (d): an app's files and its heap share free PSRAM, less the APPS_RAM_RESERVE the apps leave to the rest of the gadget;

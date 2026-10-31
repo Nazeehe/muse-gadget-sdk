@@ -26,8 +26,13 @@
  * a counting allocator (LeakSanitizer doesn't run on macOS, so every case ends at 0 bytes held), and a UI lock
  * that records how it is used. The fake LVGL also counts an LVGL call made inside apps_lv_apply while the lock is
  * not held.
+ *
+ * The launcher's icons are the real apps_icons.c's. What it asks of the I/O worker and the store is faked here: a submit
+ * queues the job and run_io runs what is queued, on this thread; the store is a few icon files in memory, read into the
+ * counting heap as the real reader does.
  */
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -36,10 +41,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "apps_icons.h"
+#include "apps_io.h"
 #include "apps_json.h"
 #include "apps_lv.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
+#include "apps_store.h"
 #include "apps_ui.h"
 #include "apps_vm.h"
 #include "lauxlib.h"
@@ -193,6 +201,108 @@ void apps_port_sha256(const void *data, size_t len, uint8_t out[32]) {
     (void)data;
     (void)len;
     memset(out, 0, 32);
+}
+
+/* ---- The I/O worker and the store, for the launcher's icons ---- */
+
+#define IO_JOBS 16
+static void (*io_fn[IO_JOBS])(void *arg);
+static void *io_arg[IO_JOBS];
+static int io_queued;  /* submitted and not run */
+
+bool apps_io_submit(void (*fn)(void *arg), void *arg) {
+    if (io_queued == IO_JOBS) {
+        return false;
+    }
+    io_fn[io_queued] = fn;
+    io_arg[io_queued] = arg;
+    io_queued++;
+    return true;
+}
+
+/* The worker's turn: every job queued, in order, those they queue too. */
+static void run_io(void) {
+    while (io_queued > 0) {
+        void (*fn)(void *) = io_fn[0];
+        void *arg = io_arg[0];
+        memmove(&io_fn[0], &io_fn[1], (size_t)(io_queued - 1) * sizeof io_fn[0]);
+        memmove(&io_arg[0], &io_arg[1], (size_t)(io_queued - 1) * sizeof io_arg[0]);
+        io_queued--;
+        fn(arg);
+    }
+}
+
+apps_storage_t apps_store_mode(void) {
+    return APPS_STORAGE_FLASH;
+}
+
+/* The icon files: an app's icon.bin, malloc's (not the apps' heap). */
+typedef struct {
+    char id[APPS_ID_MAX + 1];
+    uint8_t *data;
+    size_t len;
+} icon_file_t;
+static icon_file_t icon_files[16];
+static int n_icon_files;
+static int store_reads;
+
+/* As apps_store.c's: the file into a block of the apps' heap, with a NUL after it, when it has at most max bytes. */
+bool apps_store_read_file(const char *id, const char *path, size_t max, uint8_t **out, size_t *len, char *err, size_t n) {
+    store_reads++;
+    *out = NULL;
+    *len = 0;
+    const icon_file_t *f = NULL;
+    for (int i = 0; i < n_icon_files && f == NULL; i++) {
+        f = strcmp(icon_files[i].id, id) == 0 && strcmp(path, "icon.bin") == 0 ? &icon_files[i] : NULL;
+    }
+    if (f == NULL) {
+        snprintf(err, n, "No such file or directory");
+        return false;
+    }
+    if (f->len > max) {
+        snprintf(err, n, "larger than %u KB", (unsigned)(max / 1024));
+        return false;
+    }
+    uint8_t *block = apps_port_realloc(NULL, f->len + 1);
+    if (block == NULL) {
+        snprintf(err, n, "%s", APPS_STORE_MSG_NO_MEMORY);
+        return false;
+    }
+    memcpy(block, f->data, f->len);
+    block[f->len] = '\0';
+    *out = block;
+    *len = f->len;
+    return true;
+}
+
+#define CF_A8 0x0E
+#define CF_RGB565A8 0x14
+
+/* id's icon.bin: an LVGL v9 image of w x h in cf (premultiplied when it has alpha), every byte after the header fill. */
+static void put_icon(const char *id, unsigned cf, unsigned w, unsigned h, uint8_t fill) {
+    unsigned stride = cf == CF_A8 ? w : w * 2;
+    size_t n = 12 + (size_t)stride * h + (cf == CF_RGB565A8 ? (size_t)(stride / 2) * h : 0);
+    uint8_t *b = malloc(n);
+    if (b == NULL || n_icon_files == (int)ARRAY_LEN(icon_files)) {
+        fputs("no room for an icon file in the harness\n", stderr);
+        exit(2);
+    }
+    memset(b, fill, n);
+    unsigned flags = cf == CF_RGB565A8 ? 1 : 0;
+    const uint8_t header[12] = {0x19, (uint8_t)cf, (uint8_t)flags, 0, (uint8_t)w, (uint8_t)(w >> 8), (uint8_t)h, (uint8_t)(h >> 8),
+                                (uint8_t)stride, (uint8_t)(stride >> 8), 0, 0};
+    memcpy(b, header, sizeof header);
+    icon_file_t *f = &icon_files[n_icon_files++];
+    snprintf(f->id, sizeof f->id, "%s", id);
+    f->data = b;
+    f->len = n;
+}
+
+static void free_icon_files(void) {
+    for (int i = 0; i < n_icon_files; i++) {
+        free(icon_files[i].data);
+    }
+    n_icon_files = 0;
 }
 
 /* ---- The logs ---- */
@@ -376,11 +486,17 @@ struct lv_obj {
     lv_align_t align;
     char *text;
     int32_t min, max, value;
+    lv_label_long_mode_t long_mode;  /* a label's: WRAP until set, as LVGL's */
     const lv_image_dsc_t *src;
     uint32_t scale;
     lv_image_align_t inner_align;  /* where an image sits in its box: CENTER until lv_image_set_inner_align says otherwise */
     lv_area_t area;
     bool forced;           /* the test set the area: the layout leaves it */
+    int32_t pad_left, pad_right;  /* where its children's content area starts and ends (0 until set) */
+    int32_t scroll_x;      /* how far its content is scrolled left (lv_obj_get_scroll_x): a test moves it */
+    lv_dir_t scroll_dir;   /* LV_DIR_ALL until set, as LVGL's */
+    lv_scroll_snap_t snap_x;
+    lv_scrollbar_mode_t scrollbar_mode;  /* LV_SCROLLBAR_MODE_AUTO until set, as LVGL's */
     fake_cb_t cbs[8];
     int n_cbs;
     int order;             /* where it is among its parent's children (lv_obj_get_index): made last, unless moved */
@@ -509,6 +625,7 @@ static const char *flag_name(lv_obj_flag_t f) {
         case LV_OBJ_FLAG_HIDDEN: return "hidden";
         case LV_OBJ_FLAG_CLICKABLE: return "clickable";
         case LV_OBJ_FLAG_SCROLLABLE: return "scrollable";
+        case LV_OBJ_FLAG_SNAPPABLE: return "snappable";
         case LV_OBJ_FLAG_GESTURE_BUBBLE: return "gesture_bubble";
     }
     return "?";
@@ -528,6 +645,7 @@ static const char *code_name(lv_event_code_t c) {
         case LV_EVENT_LONG_PRESSED_REPEAT: return "long_pressed_repeat";
         case LV_EVENT_CLICKED: return "clicked";
         case LV_EVENT_RELEASED: return "released";
+        case LV_EVENT_SCROLL: return "scroll";
         case LV_EVENT_GESTURE: return "gesture";
         default: break;
     }
@@ -599,9 +717,11 @@ static lv_obj_t *make_object(const char *cls, lv_obj_t *parent, const char *fn) 
     o->align = LV_ALIGN_DEFAULT;
     o->scale = 256;
     o->area = (lv_area_t){0, 0, -1, -1};
-    /* The flags LVGL 9.5.0's constructors leave: lv_obj is clickable and scrollable, a label and an image are
-     * not clickable, and a button, an arc and a bar are not scrollable. */
-    o->flags = LV_OBJ_FLAG_GESTURE_BUBBLE;
+    o->scroll_dir = LV_DIR_ALL;
+    o->scrollbar_mode = LV_SCROLLBAR_MODE_AUTO;
+    /* The flags LVGL 9.5.0's constructors leave: lv_obj is clickable, scrollable and snappable (every class keeps
+     * the last), a label and an image are not clickable, and a button, an arc and a bar are not scrollable. */
+    o->flags = LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_SNAPPABLE;
     if (strcmp(cls, "label") != 0 && strcmp(cls, "image") != 0) {
         o->flags |= LV_OBJ_FLAG_CLICKABLE;
     }
@@ -850,15 +970,18 @@ static void content_size(lv_obj_t *o, int32_t *w, int32_t *h) {
     }
 }
 
+/* As LVGL 9.5.0's lv_obj_refr_pos and lv_obj_move_to: an object is placed in its parent's content area (the parent's
+ * box less its left and right padding), moved left by how far the parent is scrolled. */
 static void layout_one(lv_obj_t *o) {
     if (o->forced) {
         return;
     }
-    const lv_area_t *pa = &o->parent->area;
-    int32_t pw = pa->x2 - pa->x1 + 1, ph = pa->y2 - pa->y1 + 1, cw, ch;
+    const lv_obj_t *parent = o->parent;
+    const lv_area_t *pa = &parent->area;
+    int32_t pw = pa->x2 - pa->x1 + 1 - parent->pad_left - parent->pad_right, ph = pa->y2 - pa->y1 + 1, cw, ch;
     content_size(o, &cw, &ch);
     int32_t w = px_of(o->w, pw, cw), h = px_of(o->h, ph, ch);
-    int32_t x1 = pa->x1, y1 = pa->y1;
+    int32_t x1 = pa->x1 + parent->pad_left - parent->scroll_x, y1 = pa->y1;
     switch (o->align) {
         case LV_ALIGN_DEFAULT:
         case LV_ALIGN_TOP_LEFT: break;
@@ -899,6 +1022,53 @@ void lv_obj_get_coords(const lv_obj_t *obj, lv_area_t *coords) {
     *coords = obj->area;
 }
 
+/* ---- Scrolling: what is set is kept and logged; a test moves the scroll (fake_scroll) ---- */
+
+void lv_obj_set_scrollbar_mode(lv_obj_t *obj, lv_scrollbar_mode_t mode) {
+    if (use(obj, "lv_obj_set_scrollbar_mode", NULL) == NULL) {
+        return;
+    }
+    static const char *const names[] = {"off", "on", "active", "auto"};
+    if ((unsigned)mode >= ARRAY_LEN(names)) {
+        fake_error("lv_obj_set_scrollbar_mode(%d, %d)", obj->id, (int)mode);
+        return;
+    }
+    obj->scrollbar_mode = mode;
+    logline("scrollbar_mode %d %s", obj->id, names[mode]);
+}
+
+void lv_obj_set_scroll_dir(lv_obj_t *obj, lv_dir_t dir) {
+    if (use(obj, "lv_obj_set_scroll_dir", NULL) == NULL) {
+        return;
+    }
+    if ((dir & ~LV_DIR_ALL) != 0) {
+        fake_error("lv_obj_set_scroll_dir(%d, 0x%x)", obj->id, (unsigned)dir);
+        return;
+    }
+    obj->scroll_dir = dir;
+    logline("scroll_dir %d %s", obj->id, dir == LV_DIR_HOR ? "hor" : dir == LV_DIR_VER ? "ver" : dir == LV_DIR_ALL ? "all" : "other");
+}
+
+void lv_obj_set_scroll_snap_x(lv_obj_t *obj, lv_scroll_snap_t align) {
+    if (use(obj, "lv_obj_set_scroll_snap_x", NULL) == NULL) {
+        return;
+    }
+    static const char *const names[] = {"none", "start", "end", "center"};
+    if ((unsigned)align >= ARRAY_LEN(names)) {
+        fake_error("lv_obj_set_scroll_snap_x(%d, %d)", obj->id, (int)align);
+        return;
+    }
+    obj->snap_x = align;
+    logline("scroll_snap_x %d %s", obj->id, names[align]);
+}
+
+int32_t lv_obj_get_scroll_x(const lv_obj_t *obj) {
+    if (use((lv_obj_t *)obj, "lv_obj_get_scroll_x", NULL) == NULL) {
+        return 0;
+    }
+    return obj->scroll_x;
+}
+
 /* ---- Styles ---- */
 
 static void style_log(lv_obj_t *obj, const char *prop, lv_style_selector_t sel, const char *fmt, ...)
@@ -936,6 +1106,24 @@ void lv_obj_set_style_radius(lv_obj_t *obj, int32_t value, lv_style_selector_t s
             fake_error("a negative radius %d on %d", (int)value, obj->id);
         }
         style_log(obj, "radius", selector, "%d", (int)value);
+    }
+}
+
+void lv_obj_set_style_pad_left(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    if (use(obj, "lv_obj_set_style_pad_left", NULL) != NULL) {
+        if (selector == LV_PART_MAIN) {
+            obj->pad_left = value;
+        }
+        style_log(obj, "pad_left", selector, "%d", (int)value);
+    }
+}
+
+void lv_obj_set_style_pad_right(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    if (use(obj, "lv_obj_set_style_pad_right", NULL) != NULL) {
+        if (selector == LV_PART_MAIN) {
+            obj->pad_right = value;
+        }
+        style_log(obj, "pad_right", selector, "%d", (int)value);
     }
 }
 
@@ -1021,7 +1209,11 @@ void lv_label_set_long_mode(lv_obj_t *obj, lv_label_long_mode_t long_mode) {
     if (use(obj, "lv_label_set_long_mode", "label") == NULL) {
         return;
     }
-    const char *name = long_mode == LV_LABEL_LONG_MODE_WRAP ? "wrap" : long_mode == LV_LABEL_LONG_MODE_CLIP ? "clip" : "other";
+    const char *name = long_mode == LV_LABEL_LONG_MODE_WRAP   ? "wrap"
+                       : long_mode == LV_LABEL_LONG_MODE_CLIP ? "clip"
+                       : long_mode == LV_LABEL_LONG_MODE_DOTS ? "dots"
+                                                              : "other";
+    obj->long_mode = long_mode;
     logline("long_mode %d %s", obj->id, name);
 }
 
@@ -1088,7 +1280,18 @@ void lv_image_set_src(lv_obj_t *obj, const void *src) {
         return;
     }
     const lv_image_dsc_t *dsc = src;
-    if (dsc == NULL || dsc->header.magic != 0x19 || dsc->data == NULL || dsc->header.w == 0 || dsc->header.h == 0 ||
+    if (src == NULL) {
+        /* LVGL 9.5.0 takes NULL for an unknown source: reset_image_attributes forgets the image, and nothing is drawn. The
+         * launcher does that to an icon it takes down; an app's image always has its asset, so from the apply step it is a
+         * mistake. */
+        if (apply_active) {
+            fake_error("lv_image_set_src(%d, NULL) in the apply step: an app's image always has a source", obj->id);
+        }
+        obj->src = NULL;
+        logline("image_src %d none", obj->id);
+        return;
+    }
+    if (dsc->header.magic != 0x19 || dsc->data == NULL || dsc->header.w == 0 || dsc->header.h == 0 ||
         dsc->header.stride == 0) {
         fake_error("lv_image_set_src(%d) with something that is not an image descriptor", obj->id);
         return;
@@ -4010,7 +4213,7 @@ static void fuzz(void) {
 
 /* ---- The cases ---- */
 
-/* ---- The launcher and the crash card (Task 12) ---- */
+/* ---- The launcher and the crash card (Task 12; the carousel, launcher carousel Task 4) ---- */
 
 /* The id of the live label whose text is text, or -1. */
 static int fake_label(const char *text) {
@@ -4028,18 +4231,59 @@ static int fake_parent(int id) {
     return parent == NULL || parent == &screen_obj ? 0 : parent->id;
 }
 
-/* How many live children of class cls the object (0: the screen) has. */
-static int fake_children_of(int id, const char *cls) {
-    const lv_obj_t *parent = id == 0 ? &screen_obj : fake_obj(id);
-    int n = 0;
-    for (int i = 0; i < n_objs; i++) {
-        n += objs[i]->parent == parent && !objs[i]->deleted && strcmp(objs[i]->cls, cls) == 0 ? 1 : 0;
-    }
-    return n;
-}
-
 static int fake_index(int id) {
     return (int)lv_obj_get_index(fake_obj(id));
+}
+
+/* Whether the object is drawn: it and every object up to the screen are not hidden. */
+static bool fake_shown(int id) {
+    for (const lv_obj_t *o = fake_obj(id); o != NULL && o != &screen_obj; o = o->parent) {
+        if ((o->flags & LV_OBJ_FLAG_HIDDEN) != 0 || o->deleted) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* LVGL's layout of everything, as a refresh does it before it draws (no LVGL call of the code under test). */
+static void fake_layout(void) {
+    for (int i = 0; i < n_objs; i++) {
+        if (!objs[i]->deleted) {
+            layout_one(objs[i]);
+        }
+    }
+}
+
+/* The finger (or a fling, or the snap's animation) scrolls the object to x: LVGL moves its children and sends SCROLL. */
+static void fake_scroll(int id, int32_t x) {
+    fake_obj(id)->scroll_x = x;
+    fake_layout();
+    fake_fire(id, LV_EVENT_SCROLL);
+}
+
+/* A frame: LVGL draws every image that shows, from its descriptor, every byte of its pixels. A descriptor that is no
+ * longer an image (its slot let go) is an error, and pixels whose block was freed are ASan's. How many were drawn. */
+static volatile unsigned drawn_bytes;
+static int fake_draw(void) {
+    int drawn = 0;
+    for (int i = 0; i < n_objs; i++) {
+        const lv_obj_t *o = objs[i];
+        if (o->deleted || strcmp(o->cls, "image") != 0 || o->src == NULL || !fake_shown(o->id)) {
+            continue;
+        }
+        const lv_image_dsc_t *d = o->src;
+        if (d->header.magic != 0x19 || d->data == NULL || d->header.w == 0 || d->header.h == 0 || d->data_size == 0) {
+            fake_error("image %d is drawn from a descriptor that is no longer an image", o->id);
+            continue;
+        }
+        unsigned sum = 0;
+        for (uint32_t k = 0; k < d->data_size; k++) {
+            sum += d->data[k];
+        }
+        drawn_bytes += sum;
+        drawn++;
+    }
+    return drawn;
 }
 
 static int picks;
@@ -4054,6 +4298,7 @@ static int cards_image;  /* the stand-in for muse_ui's downloaded image, made af
 
 /* A layer on a fresh screen, and an object made after it, as muse_ui's image is: the cards go between them. */
 static void cards_scene(void) {
+    run_io();  /* the worker ends what a scene before left it */
     fake_reset();
     apps_lv_build(fake_screen());
     cards_image = lv_image_create(fake_screen())->id;
@@ -4061,6 +4306,16 @@ static void cards_scene(void) {
     picks = 0;
     picked[0] = '\0';
 }
+
+/* The end of a launcher case: it closes, the worker ends what it has, and the icons hold nothing. */
+static void launcher_end_at(int line) {
+    apps_lv_hide_cards();
+    run_io();
+    free_icon_files();
+    CHECK_AT(line, held == 0, "%zu bytes of icons still held after the launcher closed", held);
+    CHECK_AT(line, fake_errors == 0, "the fake LVGL counted %d errors, the first: %s", fake_errors, fake_note);
+}
+#define LAUNCHER_END() launcher_end_at(__LINE__)
 
 /* A card is full-screen, black and takes every touch on it: the tileview under it never sees one. */
 static void check_card_at(int line, int card) {
@@ -4077,149 +4332,660 @@ static void check_card_at(int line, int card) {
 }
 #define CHECK_CARD(card) check_card_at(__LINE__, (card))
 
-static void launcher_lists_apps_and_picks(void) {
-    cards_scene();
-    const char *ids[] = {"hello", "timer"};
-    const char *names[] = {"Hello", "Kitchen timer"};
-    apps_lv_show_launcher(ids, names, 2, pick);
-    int hello = fake_label("Hello"), timer = fake_label("Kitchen timer"), title = fake_label("Apps");
-    CHECK(hello > 0 && timer > 0 && title > 0, "a row for each app, and the title: %d %d %d\n%s", hello, timer, title, log_peek());
-    int row = fake_parent(hello), launcher = fake_parent(row);
-    CHECK_CARD(launcher);
-    CHECK(fake_index(launcher) == fake_index(1) + 1, "the launcher is right over the layer: %d %d", fake_index(launcher), fake_index(1));
-    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && apps_lv_cards_shown(), "shown");
-    CHECK(fake_parent(fake_parent(timer)) == launcher && fake_children_of(launcher, "obj") == 2, "two rows on the launcher");
-    CHECK(fake_flag(row, LV_OBJ_FLAG_CLICKABLE) && !fake_flag(row, LV_OBJ_FLAG_SCROLLABLE), "a row is clickable");
-    CHECK(!fake_flag(hello, LV_OBJ_FLAG_CLICKABLE) && !fake_flag(title, LV_OBJ_FLAG_CLICKABLE),
-          "labels aren't: LVGL gives their touches to what is under them");
-    fake_tap(row);
-    CHECK(picks == 1 && strcmp(picked, "hello") == 0, "tapping a row runs its app: %d '%s'", picks, picked);
-    CHECK(fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "and closes the launcher (C12)");
+/* ---- The carousel, as the fake sees it ---- */
+
+#define SCREEN_CENTRE 233
+
+/* The carousel's row: the object that snaps its children to the centre. -1 when there is none. */
+static int carousel_row(void) {
+    for (int i = 0; i < n_objs; i++) {
+        if (!objs[i]->deleted && objs[i]->snap_x == LV_SCROLL_SNAP_CENTER) {
+            return objs[i]->id;
+        }
+    }
+    return -1;
 }
 
-static void launcher_closes_on_a_tap_elsewhere(void) {
-    cards_scene();
-    const char *ids[] = {"hello"};
-    const char *names[] = {"Hello"};
-    apps_lv_show_launcher(ids, names, 1, pick);
-    int launcher = fake_parent(fake_parent(fake_label("Hello")));
-    fake_tap(launcher);
-    CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(),
-          "a tap on no row closes the launcher and runs nothing (C12): %d", picks);
-    /* It opens again, rows and all. */
-    apps_lv_show_launcher(ids, names, 1, pick);
-    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && fake_children_of(launcher, "obj") == 1, "opens again");
-    fake_tap(fake_parent(fake_label("Hello")));
-    CHECK(picks == 1 && strcmp(picked, "hello") == 0, "and picks");
+/* The row's items (its children), in order, into ids; how many. */
+static int carousel_items(int *ids, int cap) {
+    int row = carousel_row();
+    if (row < 0) {
+        return 0;
+    }
+    int n = fake_children(fake_obj(row), fake_kids);
+    for (int i = 0; i < n && i < cap; i++) {
+        ids[i] = fake_kids[i]->id;
+    }
+    return n < cap ? n : cap;
 }
 
-static void launcher_empty_state(void) {
-    cards_scene();
-    apps_lv_show_launcher(NULL, NULL, 0, pick);
-    int empty = fake_label("No apps yet. Ask Muse to make one.");
-    CHECK(empty > 0, "the empty state\n%s", log_peek());
-    int launcher = fake_parent(empty);
-    CHECK_CARD(launcher);
-    CHECK(fake_children_of(launcher, "obj") == 0, "no rows");
-    /* LVGL gives a tap on the text, which isn't clickable, to the launcher under it: that closes it (C12). */
-    CHECK(!fake_flag(empty, LV_OBJ_FLAG_CLICKABLE), "the text isn't clickable");
-    fake_tap(launcher);
-    CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN), "closed");
+static int carousel_item(int k) {
+    int ids[64];
+    int n = carousel_items(ids, 64);
+    return k >= 0 && k < n ? ids[k] : -1;
 }
 
-/* P6, O: until the store is mounted the launcher says "Loading apps..." (APPS_LV_LOADING: three ASCII dots, which the font has), with no
- * rows and not the empty state; shown again with the list, it has the rows and the text is gone. apps_lv_launcher_shown says whether the
+/* What an item holds: its tile (a circle with its letter in it), its image (made once an icon came), its running dot. */
+typedef struct {
+    int tile, letter, image, dot;
+} item_parts_t;
+
+static item_parts_t item_parts(int item) {
+    item_parts_t p = {-1, -1, -1, -1};
+    int n = fake_children(fake_obj(item), fake_kids);
+    lv_obj_t *kids[16];
+    memcpy(kids, fake_kids, (size_t)(n < 16 ? n : 16) * sizeof kids[0]);
+    for (int i = 0; i < n && i < 16; i++) {
+        if (strcmp(kids[i]->cls, "image") == 0) {
+            p.image = kids[i]->id;
+        } else if (strcmp(kids[i]->cls, "obj") == 0) {
+            int inside = fake_children(kids[i], fake_kids);
+            if (inside == 1 && strcmp(fake_kids[0]->cls, "label") == 0) {
+                p.tile = kids[i]->id;
+                p.letter = fake_kids[0]->id;
+            } else if (inside == 0) {
+                p.dot = kids[i]->id;
+            }
+        }
+    }
+    return p;
+}
+
+/* What the item shows (whether the launcher does or not): 'T' its tile, 'I' its icon, '-' nothing (a blank), '2' both. */
+static char item_face(int item) {
+    item_parts_t p = item_parts(item);
+    bool tile = p.tile > 0 && !fake_flag(p.tile, LV_OBJ_FLAG_HIDDEN);
+    bool image = p.image > 0 && !fake_flag(p.image, LV_OBJ_FLAG_HIDDEN) && fake_obj(p.image)->src != NULL;
+    return tile && image ? '2' : tile ? 'T' : image ? 'I' : '-';
+}
+
+/* No item's image is left on a descriptor apps_icons doesn't give it now, shown or hidden: a tile's image has no source. */
+static void check_sources_at(int line) {
+    int ids[64];
+    int n = carousel_items(ids, 64);
+    for (int k = 0; k < n; k++) {
+        item_parts_t p = item_parts(ids[k]);
+        if (p.image < 0) {
+            continue;
+        }
+        const lv_image_dsc_t *src = fake_obj(p.image)->src;
+        bool tile = item_face(ids[k]) == 'T';
+        CHECK_AT(line, tile ? src == NULL : src != NULL, "item %d: a %s with a source %p", k, tile ? "tile" : "icon", (const void *)src);
+    }
+}
+#define CHECK_SOURCES() check_sources_at(__LINE__)
+
+/* Every item's face, "TTI..." (at most 63). */
+static const char *faces(void) {
+    static char out[64];
+    int ids[63];
+    int n = carousel_items(ids, 63);
+    for (int i = 0; i < n; i++) {
+        out[i] = item_face(ids[i]);
+    }
+    out[n] = '\0';
+    return out;
+}
+
+/* The side of a tile drawn at scale, and the scale of an icon side px wide drawn at scale (apps_lv.h). */
+static int32_t tile_side(int scale) {
+    return (APPS_LV_ICON_PX * scale + 128) / 256;
+}
+
+static uint32_t icon_zoom(int scale, unsigned px) {
+    return (uint32_t)(((uint32_t)scale * APPS_LV_ICON_PX + px / 2) / px);
+}
+
+/* Whether the item is drawn at scale: its tile that size, or its icon at the zoom that makes it that. */
+static bool item_at_scale(int item, int scale) {
+    item_parts_t p = item_parts(item);
+    char face = item_face(item);
+    if (face == 'T') {
+        const lv_obj_t *t = fake_obj(p.tile);
+        return t->w == tile_side(scale) && t->h == tile_side(scale);
+    }
+    if (face == 'I') {
+        const lv_obj_t *im = fake_obj(p.image);
+        return im->scale == icon_zoom(scale, im->src->header.w);
+    }
+    return false;
+}
+
+/* Every item is drawn at the scale its distance from the centre gives it. */
+static void check_scales_at(int line) {
+    int ids[64];
+    int n = carousel_items(ids, 64);
+    int32_t sx = fake_obj(carousel_row())->scroll_x;
+    for (int k = 0; k < n; k++) {
+        int want = apps_lv_carousel_scale(k * APPS_LV_ITEM_PITCH - (int)sx);
+        CHECK_AT(line, item_at_scale(ids[k], want), "item %d at scroll %d: not drawn at %d (its face %c)", k, (int)sx, want,
+                 item_face(ids[k]));
+    }
+}
+#define CHECK_SCALES() check_scales_at(__LINE__)
+
+/* The carousel's name label: the card's one label that is neither the title nor in the row. -1 when there is none; more than one is
+ * an error. */
+static int name_label(void) {
+    int row = carousel_row();
+    if (row < 0) {
+        return -1;
+    }
+    int card = fake_parent(row), found = -1, n = 0;
+    for (int i = 0; i < n_objs; i++) {
+        const lv_obj_t *o = objs[i];
+        if (!o->deleted && strcmp(o->cls, "label") == 0 && fake_parent(o->id) == card && strcmp(o->text, "Apps") != 0) {
+            found = o->id;
+            n++;
+        }
+    }
+    CHECK(n <= 1, "%d name labels", n);
+    return found;
+}
+
+static const char *name_shown(void) {
+    int id = name_label();
+    return id > 0 ? fake_obj(id)->text : "(none)";
+}
+
+/* The centre of an object's laid-out box, in screen x. */
+static int32_t centre_x(int id) {
+    const lv_area_t *a = &fake_obj(id)->area;
+    return (a->x1 + a->x2 + 1) / 2;
+}
+
+/* Every corner of the box is inside the round screen. */
+static bool inside_circle(int id) {
+    const lv_area_t *a = &fake_obj(id)->area;
+    const int32_t xs[2] = {a->x1, a->x2 + 1}, ys[2] = {a->y1, a->y2 + 1};
+    for (int i = 0; i < 4; i++) {
+        int32_t dx = xs[i & 1] - SCREEN_CENTRE, dy = ys[i >> 1] - SCREEN_CENTRE;
+        if (dx * dx + dy * dy > SCREEN_CENTRE * SCREEN_CENTRE) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const apps_lv_app_t FIVE[] = {
+    {"alpha", "Alpha", ""}, {"bravo", "Bravo", ""}, {"charlie", "Charlie", ""}, {"delta", "Delta", ""}, {"echo", "Echo", ""},
+};
+
+/* ---- The pure parts ---- */
+
+static void scale_curve(void) {
+    const int P = APPS_LV_ITEM_PITCH, SIDE = APPS_LV_ICON_SIDE_SCALE;
+    CHECK(SIDE > 0 && SIDE < 256, "a neighbour is smaller than the centre: %d", SIDE);
+    CHECK(apps_lv_carousel_scale(0) == 256, "the centre is full size: %d", apps_lv_carousel_scale(0));
+    CHECK(apps_lv_carousel_scale(P) == SIDE && apps_lv_carousel_scale(-P) == SIDE, "a pitch away is a neighbour's: %d %d",
+          apps_lv_carousel_scale(P), apps_lv_carousel_scale(-P));
+    const int beyond[] = {P + 1, -P - 1, 2 * P, -3 * P, 100000, -100000, INT_MAX, INT_MIN, INT_MIN + 1};
+    for (size_t i = 0; i < ARRAY_LEN(beyond); i++) {
+        CHECK(apps_lv_carousel_scale(beyond[i]) == SIDE, "%d away: %d", beyond[i], apps_lv_carousel_scale(beyond[i]));
+    }
+    int last = 256;
+    for (int d = 0; d <= P; d++) {
+        int s = apps_lv_carousel_scale(d);
+        CHECK(s <= last && s >= SIDE && s <= 256, "monotonic: %d at %d, after %d", s, d, last);
+        CHECK(apps_lv_carousel_scale(-d) == s, "the same either side: %d %d at %d", s, apps_lv_carousel_scale(-d), d);
+        int line = 256 - (256 - SIDE) * d / P;  /* linear, within a unit of rounding */
+        CHECK(s - line <= 1 && line - s <= 1, "linear: %d at %d, the line %d", s, d, line);
+        last = s;
+    }
+    CHECK(apps_lv_carousel_scale(P / 2) < 256 && apps_lv_carousel_scale(P / 2) > SIDE, "between, it is between: %d",
+          apps_lv_carousel_scale(P / 2));
+}
+
+/* Printed for the test, which checks them against the palette and zlib's CRC-32: "color <id> <rrggbb>", each asked twice. */
+static void tile_colors(void) {
+    static const char *const ids[] = {"timer", "stopwatch1", "stopwatch2", "stopwatch3", "mtg_life", "prayer_times", "hello",
+                                      "a", "b", "c", "d", "e", "f", "g", "h", "zz_9", "app00", "app01", "app02", "app03"};
+    for (size_t i = 0; i < ARRAY_LEN(ids); i++) {
+        uint32_t c = apps_lv_tile_color(ids[i]);
+        CHECK(c == apps_lv_tile_color(ids[i]), "%s: the same colour each time", ids[i]);
+        printf("color %s %06x\n", ids[i], (unsigned)c);
+    }
+    printf("color (null) %06x\n", (unsigned)apps_lv_tile_color(NULL));
+    printf("color (empty) %06x\n", (unsigned)apps_lv_tile_color(""));
+}
+
+static void tile_letter(void) {
+    static const struct {
+        const char *name;
+        char letter;
+    } cases[] = {{"timer", 'T'},   {"Timer", 'T'},   {"9lives", '9'}, {"zed", 'Z'}, {"\xc3\x9c" "ber", '?'}, {"\xe2\x8f\xb1 Timer", '?'},
+                 {"_x", '?'},      {" x", '?'},      {"", '?'},       {"-", '?'},   {"\x7f", '?'},        {"\xff", '?'}};
+    for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
+        char got = apps_lv_tile_letter(cases[i].name);
+        CHECK(got == cases[i].letter, "case %zu: '%c' and not '%c'", i, got, cases[i].letter);
+    }
+    CHECK(apps_lv_tile_letter(NULL) == '?', "NULL: '%c'", apps_lv_tile_letter(NULL));
+}
+
+/* ---- The carousel ---- */
+
+static void opens_centred_on_first_app(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    fake_layout();
+    int row = carousel_row();
+    CHECK(row > 0, "a carousel\n%s", log_peek());
+    if (row < 0) {
+        return;
+    }
+    const lv_obj_t *r = fake_obj(row);
+    CHECK(r->w == lv_pct(100) && r->scroll_dir == LV_DIR_HOR && r->scrollbar_mode == LV_SCROLLBAR_MODE_OFF &&
+              fake_flag(row, LV_OBJ_FLAG_SCROLLABLE),
+          "the row: full width, scrolls sideways, no scrollbar: w %d dir %d bar %d", (int)r->w, (int)r->scroll_dir,
+          (int)r->scrollbar_mode);
+    CHECK(r->pad_left == (466 - APPS_LV_ICON_PX) / 2 && r->pad_right == r->pad_left,
+          "the first and the last can come to the centre: pads %d %d", (int)r->pad_left, (int)r->pad_right);
+    CHECK(r->scroll_x == 0, "not scrolled: %d", (int)r->scroll_x);
+    int ids[8];
+    int n = carousel_items(ids, 8);
+    CHECK(n == 5, "an item each: %d", n);
+    for (int k = 0; k < n; k++) {
+        const lv_obj_t *o = fake_obj(ids[k]);
+        CHECK(o->w == APPS_LV_ICON_PX && fake_flag(ids[k], LV_OBJ_FLAG_SNAPPABLE) && !fake_flag(ids[k], LV_OBJ_FLAG_SCROLLABLE),
+              "item %d: %d wide, snappable %d, scrollable %d", k, (int)o->w, fake_flag(ids[k], LV_OBJ_FLAG_SNAPPABLE),
+              fake_flag(ids[k], LV_OBJ_FLAG_SCROLLABLE));
+        CHECK(centre_x(ids[k]) == SCREEN_CENTRE + k * APPS_LV_ITEM_PITCH, "item %d's centre: %d", k, (int)centre_x(ids[k]));
+        item_parts_t p = item_parts(ids[k]);
+        CHECK(p.tile > 0 && !fake_flag(p.tile, LV_OBJ_FLAG_CLICKABLE), "item %d's tile isn't clickable: its taps are the item's", k);
+    }
+    CHECK(strcmp(name_shown(), "Alpha") == 0, "the first app is named: %s", name_shown());
+    CHECK(strcmp(faces(), "TTTTT") == 0, "tiles: %s", faces());
+    CHECK(item_at_scale(ids[0], 256), "the first is full size");
+    CHECK_SCALES();
+    /* The snap brings item 3 to the centre: LVGL scrolls by three pitches. */
+    fake_scroll(row, 3 * APPS_LV_ITEM_PITCH);
+    CHECK(centre_x(ids[3]) == SCREEN_CENTRE && strcmp(name_shown(), "Delta") == 0, "item 3 centred: %d %s", (int)centre_x(ids[3]),
+          name_shown());
+    CHECK_SCALES();
+    LAUNCHER_END();
+}
+
+static void one_name_label_shows_the_centre_app(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int row = carousel_row();
+    const int P = APPS_LV_ITEM_PITCH;
+    static const struct {
+        int32_t x;
+        const char *name;
+    } steps[] = {{0, "Alpha"},       {P / 3, "Alpha"},          {2 * P, "Charlie"}, {2 * P + 2 * P / 5, "Charlie"},
+                 {2 * P + 3 * P / 5, "Delta"}, {-40, "Alpha"}, {4 * P + 60, "Echo"}, {P, "Bravo"}};
+    for (size_t i = 0; i < ARRAY_LEN(steps); i++) {
+        fake_scroll(row, steps[i].x);
+        CHECK(strcmp(name_shown(), steps[i].name) == 0, "at %d: %s, not %s", (int)steps[i].x, name_shown(), steps[i].name);
+        CHECK_SCALES();
+    }
+    int label = name_label();
+    CHECK(label > 0 && !fake_flag(label, LV_OBJ_FLAG_CLICKABLE), "the name isn't clickable");
+    /* The letters are the tiles', not names. */
+    CHECK(fake_label("A") > 0 && fake_label("E") > 0, "a letter on each tile");
+    LAUNCHER_END();
+}
+
+static void running_dot_under_running_app(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, "charlie", pick);
+    fake_layout();
+    int ids[8], dots = 0;
+    int n = carousel_items(ids, 8);
+    for (int k = 0; k < n; k++) {
+        item_parts_t p = item_parts(ids[k]);
+        if (p.dot > 0) {
+            dots++;
+            CHECK(k == 2, "the dot is under item %d, not charlie's", k);
+            const lv_obj_t *d = fake_obj(p.dot), *item = fake_obj(ids[k]);
+            CHECK(d->align == LV_ALIGN_BOTTOM_MID && d->area.y1 >= item->area.y1 + APPS_LV_ICON_PX && d->w > 0 && d->w == d->h,
+                  "under the icon, round: y %d, item from %d", (int)d->area.y1, (int)item->area.y1);
+        }
+    }
+    CHECK(dots == 1, "one dot: %d", dots);
+    char line[64];
+    item_parts_t p = item_parts(ids[2]);
+    snprintf(line, sizeof line, "radius %d %d", p.dot, LV_RADIUS_CIRCLE);
+    CHECK(log_has_line(line), "a round dot\n%s", log_peek());
+    /* No app runs, or one the list hasn't: no dot. */
+    const char *runs[] = {NULL, "zulu", ""};
+    for (size_t i = 0; i < ARRAY_LEN(runs); i++) {
+        apps_lv_show_launcher(FIVE, 5, runs[i], pick);
+        n = carousel_items(ids, 8);
+        dots = 0;
+        for (int k = 0; k < n; k++) {
+            dots += item_parts(ids[k]).dot > 0 ? 1 : 0;
+        }
+        CHECK(n == 5 && dots == 0, "running '%s': %d dots", runs[i] != NULL ? runs[i] : "(null)", dots);
+    }
+    LAUNCHER_END();
+}
+
+/* Before the worker's pixels are polled in, every item is its tile; a ready icon shows its image; an item whose icon left the window,
+ * failed or never was is its tile again; at no point is an item blank, or an image drawn from a block that was freed. */
+static void icon_or_tile_never_blank(void) {
+    cards_scene();
+    put_icon("alpha", CF_RGB565A8, 120, 120, 0x11);
+    put_icon("bravo", CF_A8, 120, 120, 0x22);
+    put_icon("delta", CF_RGB565A8, 120, 100, 0x44);  /* not square: a tile */
+    put_icon("echo", CF_RGB565A8, 160, 160, 0x55);   /* the largest: drawn in the same box */
+    put_icon("golf", CF_RGB565A8, 120, 120, 0x77);
+    const apps_lv_app_t apps[] = {{"alpha", "Alpha", "icon.bin"}, {"bravo", "Bravo", "icon.bin"}, {"charlie", "Charlie", ""},
+                                  {"delta", "Delta", "icon.bin"}, {"echo", "Echo", "icon.bin"},   {"foxtrot", "Foxtrot", "icon.bin"},
+                                  {"golf", "Golf", "icon.bin"}};
+    apps_lv_show_launcher(apps, 7, NULL, pick);
+    int row = carousel_row();
+    CHECK(strcmp(faces(), "TTTTTTT") == 0, "tiles until the pixels come: %s", faces());
+    CHECK(io_queued == 2 && store_reads == 0, "the centre's and the next asked for on the worker: %d queued, %d read", io_queued,
+          store_reads);
+    run_io();
+    CHECK(strcmp(faces(), "TTTTTTT") == 0, "read, not yet polled: tiles: %s", faces());
+    apps_lv_launcher_poll();
+    CHECK(strcmp(faces(), "IITTTTT") == 0, "polled: the icons: %s", faces());
+    CHECK(fake_draw() == 2, "two icons drawn");
+    item_parts_t a = item_parts(carousel_item(0)), b = item_parts(carousel_item(1));
+    CHECK(fake_obj(a.image)->src == apps_icons_get("alpha") && fake_obj(b.image)->src == apps_icons_get("bravo"),
+          "each its own app's");
+    char line[64];
+    snprintf(line, sizeof line, "image_recolor %d #ffffff", b.image);
+    CHECK(log_has_line(line), "an A8 icon is drawn white\n%s", log_peek());
+    snprintf(line, sizeof line, "image_recolor %d #ffffff", a.image);
+    CHECK(!log_has_line(line), "a colour one isn't recoloured");
+    CHECK_SCALES();
+    /* To delta: alpha leaves the window (freed at once), delta's file is bad, echo is the largest icon. */
+    fake_scroll(row, 3 * APPS_LV_ITEM_PITCH);
+    CHECK(fake_draw() == 1 && strcmp(faces(), "TITTTTT") == 0, "alpha is its tile again, bravo stays: %s", faces());
+    CHECK_SOURCES();
+    for (int frame = 0; frame < 4; frame++) {
+        run_io();
+        apps_lv_launcher_poll();
+        CHECK(strchr(faces(), '-') == NULL && strchr(faces(), '2') == NULL, "frame %d: %s", frame, faces());
+        fake_draw();
+        CHECK_SOURCES();
+    }
+    CHECK(strcmp(faces(), "TITTITT") == 0, "delta's bad file and foxtrot's missing one are tiles, echo is its icon: %s", faces());
+    CHECK(esp_count("W muse_apps: icons: delta: icon.bin: ") == 1 && esp_count("W muse_apps: icons: foxtrot: icon.bin: ") == 1,
+          "a line each\n%s", esp_peek());
+    CHECK_SCALES();
+    fake_scroll(row, 4 * APPS_LV_ITEM_PITCH);
+    CHECK(fake_obj(item_parts(carousel_item(4)).image)->scale == icon_zoom(256, 160), "the 160 px icon fills the box at the centre");
+    CHECK_SCALES();
+    /* To golf, at the end: bravo leaves. */
+    fake_scroll(row, 6 * APPS_LV_ITEM_PITCH);
+    run_io();
+    apps_lv_launcher_poll();
+    CHECK(fake_draw() == 2 && strcmp(faces(), "TTTTITI") == 0, "at the end: %s", faces());
+    CHECK_SOURCES();
+    /* Closed: every block goes, and no image is left on one. */
+    int card = fake_parent(row);
+    fake_tap(card);
+    CHECK(!apps_lv_launcher_shown() && strcmp(faces(), "TTTTTTT") == 0, "closed, every item its tile: %s", faces());
+    CHECK_SOURCES();
+    run_io();
+    CHECK(held == 0, "closed: %zu bytes held", held);
+    /* Opened again: the tiles first, then the icons. */
+    apps_lv_show_launcher(apps, 7, NULL, pick);
+    CHECK(strcmp(faces(), "TTTTTTT") == 0, "tiles first: %s", faces());
+    run_io();
+    apps_lv_launcher_poll();
+    CHECK(strcmp(faces(), "IITTTTT") == 0, "then the icons: %s", faces());
+    LAUNCHER_END();
+}
+
+static void every_app_is_an_item(void) {
+    cards_scene();
+    static char ids_text[40][12], names_text[40][12];
+    apps_lv_app_t apps[40];
+    for (int i = 0; i < 40; i++) {
+        snprintf(ids_text[i], sizeof ids_text[i], "app%02d", i);
+        snprintf(names_text[i], sizeof names_text[i], "%c%02d", 'A' + i % 26, i);
+        apps[i] = (apps_lv_app_t){ids_text[i], names_text[i], ""};
+    }
+    apps_lv_show_launcher(apps, 12, NULL, pick);
+    int ids[64];
+    int n = carousel_items(ids, 64);
+    CHECK(n == 12, "12 apps, 12 items: %d", n);
+    for (int k = 0; k < n; k++) {
+        item_parts_t p = item_parts(ids[k]);
+        char letter[2] = {(char)('A' + k % 26), '\0'};
+        CHECK(p.tile > 0 && strcmp(fake_obj(p.letter)->text, letter) == 0, "item %d is its app's: '%s'", k,
+              p.letter > 0 ? fake_obj(p.letter)->text : "");
+    }
+    fake_scroll(carousel_row(), 11 * APPS_LV_ITEM_PITCH);
+    CHECK(strcmp(name_shown(), "L11") == 0, "the last can be centred: %s", name_shown());
+    /* More than the launcher holds: the first APPS_LV_LAUNCHER_MAX. */
+    apps_lv_show_launcher(apps, 40, NULL, pick);
+    n = carousel_items(ids, 64);
+    CHECK(n == APPS_LV_LAUNCHER_MAX, "%d items of 40", n);
+    CHECK(fake_label("N39") < 0 && strcmp(name_shown(), "A00") == 0, "the rest left out");
+    /* An item with no id is left out. */
+    const apps_lv_app_t gaps[] = {{"one", "One", ""}, {NULL, "Nobody", ""}, {"", "Empty", ""}, {"two", "Two", ""}};
+    apps_lv_show_launcher(gaps, 4, NULL, pick);
+    CHECK(carousel_items(ids, 64) == 2, "the two with ids");
+    fake_tap(carousel_item(1));
+    CHECK(picks == 1 && strcmp(picked, "two") == 0, "and picks the right one: %s", picked);
+    LAUNCHER_END();
+}
+
+/* Review Focus 1: opened during the deferred start, the launcher says "Loading apps..." (APPS_LV_LOADING: three ASCII dots, which the
+ * font has), with no carousel and not the empty state; shown again with the list it is the carousel, centred on the first, and the
+ * text is gone; shown again with another list, the old items go with no call on them. apps_lv_launcher_shown says whether the
  * launcher is up: not before it is shown, not after it closes, and not for a crash card. */
-static void launcher_says_loading_then_lists_apps(void) {
+static void loading_then_list_rebuilds(void) {
     cards_scene();
     CHECK(!apps_lv_launcher_shown(), "nothing is shown yet");
-    apps_lv_show_launcher(NULL, NULL, APPS_LV_LOADING, pick);
+    apps_lv_show_launcher(NULL, APPS_LV_LOADING, NULL, pick);
     int loading = fake_label("Loading apps...");
     CHECK(loading > 0, "the loading text\n%s", log_peek());
     int launcher = fake_parent(loading);
     CHECK_CARD(launcher);
-    CHECK(fake_children_of(launcher, "obj") == 0 && fake_label("No apps yet. Ask Muse to make one.") < 0, "no rows, and not the empty state");
+    CHECK(carousel_row() < 0 && fake_label("No apps yet. Ask Muse to make one.") < 0, "no carousel, and not the empty state");
     CHECK(!fake_flag(loading, LV_OBJ_FLAG_CLICKABLE), "the text isn't clickable: a tap on it closes the launcher, as the empty state's");
     CHECK(apps_lv_launcher_shown() && apps_lv_cards_shown(), "the launcher is up");
-    const char *ids[] = {"hello", "timer"};
-    const char *names[] = {"Hello", "Kitchen timer"};
-    apps_lv_show_launcher(ids, names, 2, pick);
+    for (int frame = 0; frame < 3; frame++) {
+        apps_lv_launcher_poll();
+    }
+    CHECK(io_queued == 0, "nothing asked of the worker while it loads");
+    /* The mount's list comes. */
+    put_icon("hello", CF_RGB565A8, 120, 120, 0x10);
+    put_icon("timer", CF_RGB565A8, 120, 120, 0x20);
+    const apps_lv_app_t apps[] = {{"hello", "Hello", "icon.bin"}, {"timer", "Kitchen timer", "icon.bin"}, {"quiet", "Quiet", ""}};
+    apps_lv_show_launcher(apps, 3, "timer", pick);
     CHECK(fake_label("Loading apps...") < 0, "the loading text is gone");
-    CHECK(fake_label("Hello") > 0 && fake_label("Kitchen timer") > 0 && fake_children_of(launcher, "obj") == 2, "the list's rows\n%s",
+    int row = carousel_row();
+    CHECK(row > 0 && fake_parent(row) == launcher && carousel_items((int[8]){0}, 8) == 3, "the carousel, on the same card\n%s",
           log_peek());
+    CHECK(fake_obj(row)->scroll_x == 0 && strcmp(name_shown(), "Hello") == 0 && strcmp(faces(), "TTT") == 0,
+          "centred on the first, tiles: %s %s", name_shown(), faces());
     CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && apps_lv_launcher_shown(), "still up");
+    run_io();
+    apps_lv_launcher_poll();
+    CHECK(strcmp(faces(), "IIT") == 0 && fake_draw() == 2, "the icons come: %s", faces());
+    fake_scroll(row, APPS_LV_ITEM_PITCH);
+    /* The list changes while it shows (an install, and hello reinstalled with a new icon): rebuilt, centred on the first, the old
+     * icons dropped, so hello's is the new file's. */
+    int old_row = row, old_item = carousel_item(0);
+    put_icon("new", CF_RGB565A8, 120, 120, 0x30);
+    free(icon_files[0].data);  /* hello's: the same path, new pixels */
+    n_icon_files--;
+    memmove(&icon_files[0], &icon_files[1], (size_t)n_icon_files * sizeof icon_files[0]);
+    put_icon("hello", CF_RGB565A8, 120, 120, 0x40);
+    const apps_lv_app_t changed[] = {{"new", "New", "icon.bin"}, {"hello", "Hello", "icon.bin"}};
+    apps_lv_show_launcher(changed, 2, NULL, pick);
+    CHECK(fake_obj(old_row)->deleted && fake_obj(old_item)->deleted, "the old carousel is gone");
+    row = carousel_row();
+    CHECK(row > 0 && row != old_row && fake_obj(row)->scroll_x == 0 && strcmp(name_shown(), "New") == 0 && strcmp(faces(), "TT") == 0,
+          "the new list, from its first, tiles first: %s %s", name_shown(), faces());
+    CHECK(fake_draw() == 0, "nothing is drawn from the old icons");
+    run_io();
+    apps_lv_launcher_poll();
+    CHECK(strcmp(faces(), "II") == 0 && fake_draw() == 2, "the new icons: %s", faces());
+    const lv_image_dsc_t *hello = fake_obj(item_parts(carousel_item(1)).image)->src;
+    CHECK(hello == apps_icons_get("hello") && hello->data[0] == 0x40, "hello's own, the new file's: 0x%02x", hello->data[0]);
+    CHECK_SOURCES();
     fake_tap(launcher);
     CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_launcher_shown(), "closed: not shown");
     apps_lv_show_crash("Hello", "main.lua:1: boom");
     CHECK(apps_lv_cards_shown() && !apps_lv_launcher_shown(), "a crash card isn't the launcher");
+    LAUNCHER_END();
 }
 
-static void launcher_closes_on_a_right_swipe(void) {
+/* Review Focus 5: a name of 24 bytes, the most a manifest has, is shown whole and ellipsised by LVGL inside the circle; a name that
+ * starts with a byte that isn't ASCII has the tile '?'; a longer name is cut at 24 bytes; an app with no name shows its id. */
+static void long_and_non_ascii_names(void) {
     cards_scene();
-    const char *ids[] = {"hello"};
-    const char *names[] = {"Hello"};
-    apps_lv_show_launcher(ids, names, 1, pick);
-    int row = fake_parent(fake_label("Hello")), launcher = fake_parent(row);
-    /* A swipe that starts on a row climbs to the launcher, which keeps it from the screen. */
-    fake_press(row);
-    fake_swipe(LV_DIR_LEFT);
-    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN), "a left swipe leaves it open");
-    log_clear();
-    fake_swipe(LV_DIR_RIGHT);
-    CHECK(fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "a right swipe closes it (C12)");
-    CHECK(log_has_line("wait_release"), "and the rest of the touch is nobody's\n%s", log_peek());
-    fake_lift();
-    CHECK(picks == 0, "the row the swipe began on isn't picked: %d", picks);
+    const apps_lv_app_t apps[] = {{"long", "WWWWWWWWWWWWWWWWWWWWWWWW", ""}, {"umlaut", "\xc3\x9c" "ber timer", ""},
+                                  {"longer", "abcdefghijklmnopqrstuvwxyz0123", ""}, {"noname", "", ""}, {"nullname", NULL, ""}};
+    apps_lv_show_launcher(apps, 5, NULL, pick);
+    fake_layout();
+    int label = name_label();
+    const lv_obj_t *l = label > 0 ? fake_obj(label) : NULL;
+    CHECK(l != NULL && strcmp(l->text, "WWWWWWWWWWWWWWWWWWWWWWWW") == 0, "the whole name: %s", l != NULL ? l->text : "");
+    CHECK(l != NULL && l->long_mode == LV_LABEL_LONG_MODE_DOTS && l->w != LV_SIZE_CONTENT && l->h != LV_SIZE_CONTENT,
+          "LVGL ellipsises it in a box of its own");
+    CHECK(label > 0 && inside_circle(label), "the box is inside the circle: %d,%d - %d,%d", (int)l->area.x1, (int)l->area.y1,
+          (int)l->area.x2, (int)l->area.y2);
+    CHECK(strcmp(fake_obj(item_parts(carousel_item(1)).letter)->text, "?") == 0, "the umlaut's tile is '?'");
+    CHECK(strcmp(fake_obj(item_parts(carousel_item(0)).letter)->text, "W") == 0, "W");
+    fake_scroll(carousel_row(), APPS_LV_ITEM_PITCH);
+    CHECK(strcmp(name_shown(), "\xc3\x9c" "ber timer") == 0, "the name as it is: %s", name_shown());
+    fake_scroll(carousel_row(), 2 * APPS_LV_ITEM_PITCH);
+    CHECK(strcmp(name_shown(), "abcdefghijklmnopqrstuvwx") == 0, "cut at 24 bytes: %s", name_shown());
+    fake_scroll(carousel_row(), 3 * APPS_LV_ITEM_PITCH);
+    CHECK(strcmp(name_shown(), "noname") == 0 && strcmp(fake_obj(item_parts(carousel_item(3)).letter)->text, "N") == 0,
+          "no name: the id, and its letter: %s", name_shown());
+    fake_scroll(carousel_row(), 4 * APPS_LV_ITEM_PITCH);
+    CHECK(strcmp(name_shown(), "nullname") == 0, "NULL: the id: %s", name_shown());
+    /* At rest, the centre's tile and its neighbours' are inside the circle too. */
+    fake_scroll(carousel_row(), 2 * APPS_LV_ITEM_PITCH);
+    for (int k = 1; k <= 3; k++) {
+        int tile = item_parts(carousel_item(k)).tile;
+        CHECK(inside_circle(tile), "item %d's tile: %d,%d - %d,%d", k, (int)fake_obj(tile)->area.x1, (int)fake_obj(tile)->area.y1,
+              (int)fake_obj(tile)->area.x2, (int)fake_obj(tile)->area.y2);
+    }
+    LAUNCHER_END();
 }
 
-/* F4: only a right swipe does anything to the launcher. A left, up or down swipe that begins on a row, followed
- * through the lift, neither picks the row (LVGL would click it: nothing scrolled) nor closes the launcher. */
-static void launcher_ignores_every_other_swipe(void) {
+static void launcher_lists_apps_and_picks(void) {
+    cards_scene();
+    const apps_lv_app_t apps[] = {{"hello", "Hello", ""}, {"timer", "Kitchen timer", ""}};
+    apps_lv_show_launcher(apps, 2, NULL, pick);
+    int title = fake_label("Apps"), row = carousel_row();
+    CHECK(title > 0 && row > 0, "the title and the carousel: %d %d\n%s", title, row, log_peek());
+    int launcher = fake_parent(row);
+    CHECK_CARD(launcher);
+    CHECK(fake_index(launcher) == fake_index(1) + 1, "the launcher is right over the layer: %d %d", fake_index(launcher), fake_index(1));
+    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && apps_lv_cards_shown(), "shown");
+    int item = carousel_item(0);
+    CHECK(carousel_items((int[4]){0}, 4) == 2 && fake_flag(item, LV_OBJ_FLAG_CLICKABLE), "two items, clickable");
+    CHECK(!fake_flag(title, LV_OBJ_FLAG_CLICKABLE) && !fake_flag(name_label(), LV_OBJ_FLAG_CLICKABLE),
+          "labels aren't: LVGL gives their touches to what is under them");
+    fake_tap(item);
+    CHECK(picks == 1 && strcmp(picked, "hello") == 0, "tapping an app runs it: %d '%s'", picks, picked);
+    CHECK(fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "and closes the launcher (C12)");
+    LAUNCHER_END();
+}
+
+static void launcher_closes_on_a_tap_elsewhere(void) {
+    cards_scene();
+    const apps_lv_app_t apps[] = {{"hello", "Hello", ""}};
+    apps_lv_show_launcher(apps, 1, NULL, pick);
+    int launcher = fake_parent(carousel_row());
+    fake_tap(launcher);
+    CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(),
+          "a tap on no app closes the launcher and runs nothing (C12): %d", picks);
+    /* It opens again, items and all. */
+    apps_lv_show_launcher(apps, 1, NULL, pick);
+    CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && carousel_items((int[4]){0}, 4) == 1, "opens again");
+    fake_tap(carousel_item(0));
+    CHECK(picks == 1 && strcmp(picked, "hello") == 0, "and picks");
+    LAUNCHER_END();
+}
+
+static void launcher_empty_state(void) {
+    cards_scene();
+    apps_lv_show_launcher(NULL, 0, NULL, pick);
+    int empty = fake_label("No apps yet. Ask Muse to make one.");
+    CHECK(empty > 0, "the empty state\n%s", log_peek());
+    int launcher = fake_parent(empty);
+    CHECK_CARD(launcher);
+    CHECK(carousel_row() < 0, "no carousel");
+    /* LVGL gives a tap on the text, which isn't clickable, to the launcher under it: that closes it (C12). */
+    CHECK(!fake_flag(empty, LV_OBJ_FLAG_CLICKABLE), "the text isn't clickable");
+    fake_tap(launcher);
+    CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN), "closed");
+    LAUNCHER_END();
+}
+
+/* P3: a sideways swipe is the carousel's to scroll, so no swipe closes the launcher (the bottom-edge close is Task 5's). One that
+ * begins on an app, followed through the lift, picks nothing either: the rest of the touch is nobody's. */
+static void launcher_no_swipe_closes_it(void) {
     static const struct {
         lv_dir_t dir;
         const char *name;
-    } ways[] = {{LV_DIR_LEFT, "a left"}, {LV_DIR_TOP, "an up"}, {LV_DIR_BOTTOM, "a down"}};
-    const char *ids[] = {"hello"};
-    const char *names[] = {"Hello"};
-    for (size_t i = 0; i < sizeof ways / sizeof ways[0]; i++) {
+    } ways[] = {{LV_DIR_LEFT, "a left"}, {LV_DIR_RIGHT, "a right"}, {LV_DIR_TOP, "an up"}, {LV_DIR_BOTTOM, "a down"}};
+    const apps_lv_app_t apps[] = {{"hello", "Hello", ""}};
+    for (size_t i = 0; i < ARRAY_LEN(ways); i++) {
         cards_scene();
-        apps_lv_show_launcher(ids, names, 1, pick);
-        int row = fake_parent(fake_label("Hello")), launcher = fake_parent(row);
-        fake_press(row);
+        apps_lv_show_launcher(apps, 1, NULL, pick);
+        int item = carousel_item(0), launcher = fake_parent(carousel_row());
+        fake_press(item);
         fake_swipe(ways[i].dir);
+        CHECK(log_has_line("wait_release"), "%s swipe: the rest of the touch is nobody's\n%s", ways[i].name, log_peek());
         fake_lift();
-        CHECK(picks == 0, "%s swipe on a row picks it: %d", ways[i].name, picks);
+        CHECK(picks == 0, "%s swipe on an app picks it: %d", ways[i].name, picks);
         CHECK(!fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && apps_lv_cards_shown(), "%s swipe closes the launcher", ways[i].name);
+        LAUNCHER_END();
     }
-    cards_scene();
-    apps_lv_show_launcher(ids, names, 1, pick);
-    int row = fake_parent(fake_label("Hello")), launcher = fake_parent(row);
-    fake_press(row);
-    fake_swipe(LV_DIR_RIGHT);
-    fake_lift();
-    CHECK(picks == 0 && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "a right swipe closes it, picking nothing");
 }
 
-static void launcher_rows_are_its_own(void) {
+static void launcher_keeps_its_own_copy(void) {
     cards_scene();
-    char first[] = "alpha";
-    const char *ids[] = {first, "bravo", "charlie", "delta", "echo", "foxtrot"};
-    const char *names[] = {"Alpha", "Bravo", "Charlie", "Delta", "Echo", NULL};
-    apps_lv_show_launcher(ids, names, 6, pick);
-    int launcher = fake_parent(fake_parent(fake_label("Alpha")));
-    CHECK(fake_children_of(launcher, "obj") == APPS_LV_LAUNCHER_ROWS, "at most %d rows: %d", APPS_LV_LAUNCHER_ROWS,
-          fake_children_of(launcher, "obj"));
-    CHECK(fake_label("Echo") < 0, "the fifth isn't shown");
+    char first[] = "alpha", first_name[] = "Alpha";
+    const apps_lv_app_t apps[] = {{first, first_name, ""}, {"bravo", "Bravo", ""}};
+    apps_lv_show_launcher(apps, 2, first, pick);
     memcpy(first, "zulu!", sizeof first);  /* the caller's text changes: the launcher kept a copy */
-    fake_tap(fake_parent(fake_label("Alpha")));
+    memcpy(first_name, "Zulu!", sizeof first_name);
+    fake_scroll(carousel_row(), APPS_LV_ITEM_PITCH);
+    fake_scroll(carousel_row(), 0);
+    CHECK(strcmp(name_shown(), "Alpha") == 0, "its own name: %s", name_shown());
+    CHECK(item_parts(carousel_item(0)).dot > 0, "its own running id");
+    fake_tap(carousel_item(0));
     CHECK(picks == 1 && strcmp(picked, "alpha") == 0, "the copy is picked: '%s'", picked);
-    /* Shown again, it has the new rows only: the old ones are gone, and no call is made on them. */
-    const char *one_id[] = {"solo"};
-    const char *one_name[] = {NULL};  /* no name: the id stands in */
-    apps_lv_show_launcher(one_id, one_name, 1, pick);
-    CHECK(fake_children_of(launcher, "obj") == 1 && fake_label("solo") > 0 && fake_label("Alpha") < 0, "rebuilt\n%s", log_peek());
-    fake_tap(fake_parent(fake_label("solo")));
+    /* Shown again, it has the new items only: the old ones are gone, and no call is made on them. */
+    int launcher = fake_parent(carousel_row());
+    const apps_lv_app_t one[] = {{"solo", NULL, ""}};  /* no name: the id stands in */
+    apps_lv_show_launcher(one, 1, NULL, pick);
+    CHECK(carousel_items((int[4]){0}, 4) == 1 && fake_parent(carousel_row()) == launcher && strcmp(name_shown(), "solo") == 0 &&
+              fake_label("Alpha") < 0,
+          "rebuilt\n%s", log_peek());
+    fake_tap(carousel_item(0));
     CHECK(picks == 2 && strcmp(picked, "solo") == 0, "picked: '%s'", picked);
+    LAUNCHER_END();
+}
+
+/* LVGL had no memory for one of the launcher's objects, wherever in the build: what was made stays, no call is made on NULL, and an
+ * item that is there shows its tile. */
+static void launcher_survives_a_create_that_fails(void) {
+    for (int at = 1; at <= 30; at++) {
+        cards_scene();
+        apps_lv_show_launcher(FIVE, 1, NULL, pick);  /* the cards, made once */
+        apps_lv_hide_cards();
+        log_clear();
+        create_fail_in = at;
+        apps_lv_show_launcher(FIVE, 5, "bravo", pick);
+        create_fail_in = 0;
+        CHECK(strchr(faces(), '-') == NULL && strchr(faces(), '2') == NULL, "failing at create %d: %s", at, faces());
+        int row = carousel_row();
+        if (row > 0) {
+            fake_scroll(row, 2 * APPS_LV_ITEM_PITCH);
+            fake_scroll(row, 0);
+        }
+        apps_lv_launcher_poll();
+        CHECK(fake_errors == 0, "failing at create %d: %s", at, fake_note);
+        LAUNCHER_END();
+    }
 }
 
 static void crash_card_text_and_tap(void) {
@@ -4240,14 +5006,14 @@ static void crash_card_text_and_tap(void) {
     apps_lv_show_crash(NULL, "x");
     CHECK(fake_label("The app stopped") == title && fake_label("x") == body && !fake_flag(body, LV_OBJ_FLAG_HIDDEN), "no name");
     /* The launcher, made with the card, sits under it. */
-    const char *ids[] = {"hello"};
-    const char *names[] = {"Hello"};
-    apps_lv_show_launcher(ids, names, 1, pick);
-    int launcher = fake_parent(fake_parent(fake_label("Hello")));
+    const apps_lv_app_t apps[] = {{"hello", "Hello", ""}};
+    apps_lv_show_launcher(apps, 1, NULL, pick);
+    int launcher = fake_parent(carousel_row());
     CHECK(fake_index(launcher) < fake_index(card), "a crash card over the launcher: %d %d", fake_index(launcher), fake_index(card));
     apps_lv_hide_cards();
     CHECK(fake_flag(card, LV_OBJ_FLAG_HIDDEN) && fake_flag(launcher, LV_OBJ_FLAG_HIDDEN) && !apps_lv_cards_shown(), "both closed");
-    CHECK(fake_alive_of("obj") == 3 + 1, "the layer, two cards and a row: %d", fake_alive_of("obj"));
+    CHECK(fake_alive_of("obj") == 3 + 3, "the layer, two cards, and the carousel's row, item and tile: %d", fake_alive_of("obj"));
+    LAUNCHER_END();
 }
 
 /* The reset takes down the app's objects; the cards aren't on its layer, so a card shown before it stays. */
@@ -4265,9 +5031,9 @@ static void cards_survive_a_reset(void) {
 static void cards_need_a_layer(void) {
     fake_reset();
     long before = lvgl_calls;
-    const char *ids[] = {"hello"};
-    const char *names[] = {"Hello"};
-    apps_lv_show_launcher(ids, names, 1, pick);
+    const apps_lv_app_t apps[] = {{"hello", "Hello", ""}};
+    apps_lv_show_launcher(apps, 1, NULL, pick);
+    apps_lv_launcher_poll();
     apps_lv_show_crash("Timer", "boom");
     apps_lv_hide_cards();
     CHECK(!apps_lv_cards_shown() && lvgl_calls == before, "no LVGL call: %ld\n%s", lvgl_calls - before, log_peek());
@@ -4335,13 +5101,22 @@ int main(int argc, char **argv) {
         {"a_pass_with_no_memory_is_a_skip", a_pass_with_no_memory_is_a_skip},
         {"many_widgets", many_widgets},
         {"fuzz", fuzz},
+        {"scale_curve", scale_curve},
+        {"tile_colors", tile_colors},
+        {"tile_letter", tile_letter},
+        {"opens_centred_on_first_app", opens_centred_on_first_app},
+        {"one_name_label_shows_the_centre_app", one_name_label_shows_the_centre_app},
+        {"running_dot_under_running_app", running_dot_under_running_app},
+        {"icon_or_tile_never_blank", icon_or_tile_never_blank},
+        {"every_app_is_an_item", every_app_is_an_item},
+        {"loading_then_list_rebuilds", loading_then_list_rebuilds},
+        {"long_and_non_ascii_names", long_and_non_ascii_names},
         {"launcher_lists_apps_and_picks", launcher_lists_apps_and_picks},
         {"launcher_closes_on_a_tap_elsewhere", launcher_closes_on_a_tap_elsewhere},
         {"launcher_empty_state", launcher_empty_state},
-        {"launcher_says_loading_then_lists_apps", launcher_says_loading_then_lists_apps},
-        {"launcher_closes_on_a_right_swipe", launcher_closes_on_a_right_swipe},
-        {"launcher_ignores_every_other_swipe", launcher_ignores_every_other_swipe},
-        {"launcher_rows_are_its_own", launcher_rows_are_its_own},
+        {"launcher_no_swipe_closes_it", launcher_no_swipe_closes_it},
+        {"launcher_keeps_its_own_copy", launcher_keeps_its_own_copy},
+        {"launcher_survives_a_create_that_fails", launcher_survives_a_create_that_fails},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},

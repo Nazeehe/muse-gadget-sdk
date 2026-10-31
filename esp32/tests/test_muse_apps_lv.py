@@ -14,9 +14,10 @@
 
 """apps_lv, the apply step of Muse apps: the shadow widget table turned into LVGL objects, once per frame.
 
-tests/muse_apps_lv_harness.c runs the real apps_ui (Lua's `ui` module and its table) and the real apps_lv.c against
-a fake LVGL (tests/muse_apps_lv_fakes.h, staged as lvgl.h, esp_heap_caps.h, esp_log.h and esp_timer.h, one line each,
-as test_muse_ptt_ui.py does). The fake logs every call as a line, keeps every object it ever made so that a call on
+tests/muse_apps_lv_harness.c runs the real apps_ui (Lua's `ui` module and its table), the real apps_lv.c and the real
+apps_icons.c (the launcher's icons) against a fake LVGL (tests/muse_apps_lv_fakes.h, staged as lvgl.h, esp_attr.h,
+esp_heap_caps.h, esp_log.h and esp_timer.h, one line each, as test_muse_ptt_ui.py does), a fake I/O worker that runs its
+jobs when a case says, and a store of icon files in memory. The fake logs every call as a line, keeps every object it ever made so that a call on
 a deleted one is caught, and counts an LVGL call made inside the pass without the UI lock; the harness's port is a
 counting allocator (every case ends at 0 bytes held) and a lock that records how it is used.
 
@@ -32,6 +33,7 @@ import shlex
 import subprocess
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 import apps_host
@@ -42,11 +44,11 @@ TESTS = ROOT / "tests"
 FAKES = TESTS / "muse_apps_lv_fakes.h"
 HARNESS = TESTS / "muse_apps_lv_harness.c"
 APPS_LV = APPS / "apps_lv.c"
-HARNESS_SOURCES = [HARNESS, APPS_LV, APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c",
+HARNESS_SOURCES = [HARNESS, APPS_LV, APPS / "apps_icons.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c",
                    APPS / "apps_pkg.c", APPS / "apps_suggest.c"]
 
-# What apps_lv.c includes of LVGL and ESP-IDF: each one is a line that includes the fakes.
-FAKE_HEADERS = ["lvgl.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h"]
+# What apps_lv.c and apps_icons.c include of LVGL and ESP-IDF: each one is a line that includes the fakes.
+FAKE_HEADERS = ["lvgl.h", "esp_attr.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h"]
 
 
 def stage_fakes(directory):
@@ -286,28 +288,78 @@ class HarnessTest(unittest.TestCase):
     def test_build_makes_the_layer_again(self):
         self.run_case("build_makes_the_layer_again")
 
-    # ---- The launcher and the crash card (Task 12) ----
+    # ---- The launcher and the crash card (Task 12; the carousel, launcher carousel Task 4) ----
+
+    def test_scale_curve(self):  # 256 at the centre, falling linearly to the side scale a pitch away, and that beyond
+        self.run_case("scale_curve")
+
+    def test_tile_color_is_stable_and_in_palette(self):  # one of 8 colours, by the CRC-32 of the id (zlib's)
+        source = _strip_comments(APPS_LV.read_text())
+        match = re.search(r"static const uint32_t TILE_PALETTE\[(\d+)\] = \{([^}]*)\};", source)
+        self.assertIsNotNone(match, "no TILE_PALETTE in apps_lv.c")
+        palette = [int(v, 16) for v in re.findall(r"0x([0-9A-Fa-f]{6})", match.group(2))]
+        self.assertEqual(int(match.group(1)), 8)
+        self.assertEqual(len(palette), 8)
+        self.assertEqual(len(set(palette)), 8, "eight different colours")
+        out = self.run_case("tile_colors").stdout
+        colours = dict(line.split()[1:] for line in out.splitlines() if line.startswith("color "))
+        self.assertGreater(len(colours), 10)
+        for name, hexed in colours.items():
+            key = {"(null)": "", "(empty)": ""}.get(name, name)
+            with self.subTest(name):
+                self.assertEqual(int(hexed, 16), palette[zlib.crc32(key.encode()) % 8])
+        self.assertGreaterEqual(len(set(colours.values())), 4, "the ids spread over the palette")
+
+    def test_tile_letter(self):  # "timer" T, "9lives" 9, a UTF-8 first byte ?
+        self.run_case("tile_letter")
+
+    def test_opens_centred_on_first_app(self):
+        self.run_case("opens_centred_on_first_app")
+
+    def test_one_name_label_shows_the_centre_app(self):
+        self.run_case("one_name_label_shows_the_centre_app")
+
+    def test_running_dot_under_running_app(self):
+        self.run_case("running_dot_under_running_app")
+
+    def test_icon_or_tile_never_blank(self):  # a tile until the pixels are polled in; the icon then; a tile again once it goes
+        self.run_case("icon_or_tile_never_blank")
+
+    def test_every_app_is_an_item(self):  # 12 apps, 12 items; more than APPS_LV_LAUNCHER_MAX, that many
+        self.run_case("every_app_is_an_item")
+
+    def test_loading_then_list_rebuilds(self):  # Review Focus 1 (and P6, O): "Loading apps...", then the carousel; rebuilt on a change
+        self.run_case("loading_then_list_rebuilds")
+
+    def test_long_and_non_ascii_names(self):  # Review Focus 5: inside the circle, ellipsised; the tile is '?'
+        self.run_case("long_and_non_ascii_names")
 
     def test_the_launcher_lists_apps_and_a_tap_runs_one(self):
         self.run_case("launcher_lists_apps_and_picks")
 
-    def test_a_tap_on_no_row_closes_the_launcher(self):  # C12
+    def test_a_tap_on_no_app_closes_the_launcher(self):  # C12
         self.run_case("launcher_closes_on_a_tap_elsewhere")
 
-    def test_the_launcher_with_no_apps(self):  # C12: the empty-state text closes it too
+    def test_the_launcher_with_no_apps(self):  # C12: the empty-state text, unchanged, closes it too
         self.run_case("launcher_empty_state")
 
-    def test_the_launcher_says_loading_until_the_list_comes(self):  # P6, O: "Loading apps...", then the rows; launcher_shown
-        self.run_case("launcher_says_loading_then_lists_apps")
+    def test_no_swipe_closes_the_launcher(self):  # P3: sideways is the carousel's; the bottom-edge close is Task 5's
+        self.run_case("launcher_no_swipe_closes_it")
 
-    def test_a_right_swipe_closes_the_launcher(self):  # C12
-        self.run_case("launcher_closes_on_a_right_swipe")
+    def test_the_launcher_keeps_its_own_copy(self):
+        self.run_case("launcher_keeps_its_own_copy")
 
-    def test_the_launcher_ignores_every_other_swipe(self):  # fix round 1, F4
-        self.run_case("launcher_ignores_every_other_swipe")
+    def test_the_launcher_survives_a_create_that_fails(self):
+        self.run_case("launcher_survives_a_create_that_fails")
 
-    def test_the_launcher_keeps_its_own_rows(self):
-        self.run_case("launcher_rows_are_its_own")
+    def test_the_launchers_records_are_in_psram_and_the_rows_are_gone(self):
+        # X12 and the follow-up round's internal RAM: the carousel's copy of the list (32 ids, names and icon paths) and its
+        # objects are one static of the LVGL task's, in PSRAM; the old card's row count is gone.
+        source = _strip_comments(APPS_LV.read_text())
+        self.assertRegex(source, r"static EXT_RAM_BSS_ATTR struct \{[^}]*\bitem_t item\[APPS_LV_LAUNCHER_MAX\];",
+                         "the carousel's records aren't one PSRAM static")
+        self.assertNotIn("APPS_LV_LAUNCHER_ROWS", source + (APPS / "apps_lv.h").read_text())
+        self.assertIn('#include "esp_attr.h"', APPS_LV.read_text())
 
     def test_the_crash_card(self):
         self.run_case("crash_card_text_and_tap")
@@ -402,7 +454,9 @@ class FakesTest(unittest.TestCase):
         LV_TEXT_ALIGN_AUTO LV_TEXT_ALIGN_LEFT LV_TEXT_ALIGN_CENTER LV_TEXT_ALIGN_RIGHT
         LV_LABEL_LONG_MODE_WRAP LV_LABEL_LONG_MODE_DOTS LV_LABEL_LONG_MODE_SCROLL LV_LABEL_LONG_MODE_SCROLL_CIRCULAR
         LV_LABEL_LONG_MODE_CLIP
-        LV_OBJ_FLAG_HIDDEN LV_OBJ_FLAG_CLICKABLE LV_OBJ_FLAG_SCROLLABLE LV_OBJ_FLAG_GESTURE_BUBBLE
+        LV_OBJ_FLAG_HIDDEN LV_OBJ_FLAG_CLICKABLE LV_OBJ_FLAG_SCROLLABLE LV_OBJ_FLAG_SNAPPABLE LV_OBJ_FLAG_GESTURE_BUBBLE
+        LV_SCROLLBAR_MODE_OFF LV_SCROLLBAR_MODE_ON LV_SCROLLBAR_MODE_ACTIVE LV_SCROLLBAR_MODE_AUTO
+        LV_SCROLL_SNAP_NONE LV_SCROLL_SNAP_START LV_SCROLL_SNAP_END LV_SCROLL_SNAP_CENTER LV_DIR_HOR LV_DIR_VER LV_DIR_ALL
         LV_PART_MAIN LV_PART_INDICATOR LV_PART_KNOB
         LV_EVENT_ALL LV_EVENT_PRESSED LV_EVENT_PRESSING LV_EVENT_PRESS_LOST LV_EVENT_SHORT_CLICKED
         LV_EVENT_SINGLE_CLICKED LV_EVENT_DOUBLE_CLICKED LV_EVENT_TRIPLE_CLICKED LV_EVENT_LONG_PRESSED
@@ -447,7 +501,8 @@ class FakesTest(unittest.TestCase):
         """The device build compiles apps_lv.c against these: every name, type and argument it uses is checked."""
         with tempfile.TemporaryDirectory() as tmp:
             stage = Path(tmp)
-            # The three ESP-IDF headers the real LVGL doesn't bring: just what apps_lv.c uses of them.
+            # The ESP-IDF headers the real LVGL doesn't bring: just what apps_lv.c uses of them.
+            (stage / "esp_attr.h").write_text("#pragma once\n#define EXT_RAM_BSS_ATTR\n")
             (stage / "esp_heap_caps.h").write_text(
                 "#pragma once\n#include <stddef.h>\n#include <stdint.h>\n#define MALLOC_CAP_SPIRAM (1u << 10)\n"
                 "size_t heap_caps_get_free_size(uint32_t caps);\n")

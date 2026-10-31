@@ -712,18 +712,20 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   (`time`, `os`, `timer`, `alarm`, `sound`, `store`, `sys`), `apps_json.c`,
   `apps_task.c` (the app task and the supervisor that marks a hung call),
   `apps_io.c` (the I/O worker, which does every flash access), `apps_store.c`
-  and `apps_values.c` (the apps' FAT and `apps_nvs`), `apps_install.c` (the one
+  and `apps_values.c` (the apps' FAT and `apps_nvs`), `apps_icons.c` (the
+  launcher's icons, read on the I/O worker), `apps_install.c` (the one
   install pipeline), `apps_alarm.c`, `apps_console.c` (the console's
   `>app.*`), `apps_control.c` (`app.api`, `app.control`), `apps_snapshot.c`
   (JPEG snapshots) and the digit fonts (`fonts/`); `main/apps_link.c` (the Link
   commands); `tools/muse/app.py` and `tools/muse/apphost/` (the host runner).
   `components/muse/apps/apps_guide.md` is the guide Muse reads, and
   `skills/gadget-muse-apps/SKILL.md` holds it for an agent.
-- **Using it:** a long press on the pocket watch opens the launcher, which
-  lists the four most recently used apps; a right swipe puts the app behind,
-  where it keeps running. Muse uses four Link commands: `app.api` (writes the
-  guide and a timer example to `workspace/apps/_guide/` on its VM and returns
-  the gadget's limits), `app.install` (the gadget reads `workspace/apps/<id>/`
+- **Using it:** a long press on the pocket watch opens the launcher, a
+  carousel of every app, the most recently used first; a right swipe puts the
+  app behind, where it keeps running. Muse uses four Link commands:
+  `app.api` (writes the guide and a timer example to
+  `workspace/apps/_guide/` on its VM and returns the gadget's limits),
+  `app.install` (the gadget reads `workspace/apps/<id>/`
   from the VM, checks, compiles, stores and runs it), `app.control` (list,
   status, logs, launch, stop, remove, snapshot) and `app.send` (an event to the
   app's `message()`). From a laptop, `tools/muse/app.py check DIR` runs an app

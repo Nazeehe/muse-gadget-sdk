@@ -16,8 +16,8 @@
 #pragma once
 
 /*
- * A fake LVGL for apps_lv.c (tests/test_muse_apps_lv.py stages lvgl.h, esp_heap_caps.h, esp_log.h and esp_timer.h
- * as one line each that includes this). The declarations here are the real LVGL 9.5.0's: same names, same types,
+ * A fake LVGL for apps_lv.c (tests/test_muse_apps_lv.py stages lvgl.h, esp_attr.h, esp_heap_caps.h, esp_log.h and
+ * esp_timer.h as one line each that includes this). The declarations here are the real LVGL 9.5.0's: same names, same types,
  * same parameters (test_the_fakes_match_lvgl_9_5_0 compares them with the headers when they are on this machine),
  * so what compiles here compiles against the real headers too. Only the functions apps_lv.c calls are declared:
  * one it doesn't call, like lv_obj_set_parent, is a compile error if it starts to.
@@ -32,6 +32,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* ---- esp_attr.h: a static the device keeps in PSRAM is a plain one here ---- */
+
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 
 /* ---- esp_heap_caps.h ---- */
 
@@ -125,8 +131,24 @@ typedef enum {
     LV_OBJ_FLAG_HIDDEN = (1u << 0),
     LV_OBJ_FLAG_CLICKABLE = (1u << 1),
     LV_OBJ_FLAG_SCROLLABLE = (1u << 4),
+    LV_OBJ_FLAG_SNAPPABLE = (1u << 12),
     LV_OBJ_FLAG_GESTURE_BUBBLE = (1u << 15),
 } lv_obj_flag_t;
+
+/* lv_obj_scroll.h: when a scrollbar shows, and where a scroll that ends puts the snappable children. */
+typedef enum {
+    LV_SCROLLBAR_MODE_OFF,
+    LV_SCROLLBAR_MODE_ON,
+    LV_SCROLLBAR_MODE_ACTIVE,
+    LV_SCROLLBAR_MODE_AUTO,
+} lv_scrollbar_mode_t;
+
+typedef enum {
+    LV_SCROLL_SNAP_NONE,
+    LV_SCROLL_SNAP_START,
+    LV_SCROLL_SNAP_END,
+    LV_SCROLL_SNAP_CENTER,
+} lv_scroll_snap_t;
 
 typedef enum {
     LV_PART_MAIN = 0x000000,
@@ -244,10 +266,17 @@ void lv_obj_align(lv_obj_t *obj, lv_align_t align, int32_t x_ofs, int32_t y_ofs)
 void lv_obj_update_layout(const lv_obj_t *obj);
 void lv_obj_get_coords(const lv_obj_t *obj, lv_area_t *coords);
 
+void lv_obj_set_scrollbar_mode(lv_obj_t *obj, lv_scrollbar_mode_t mode);
+void lv_obj_set_scroll_dir(lv_obj_t *obj, lv_dir_t dir);
+void lv_obj_set_scroll_snap_x(lv_obj_t *obj, lv_scroll_snap_t align);
+int32_t lv_obj_get_scroll_x(const lv_obj_t *obj);
+
 void lv_obj_set_style_opa(lv_obj_t *obj, lv_opa_t value, lv_style_selector_t selector);
 void lv_obj_set_style_bg_color(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector);
 void lv_obj_set_style_bg_opa(lv_obj_t *obj, lv_opa_t value, lv_style_selector_t selector);
 void lv_obj_set_style_radius(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+void lv_obj_set_style_pad_left(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+void lv_obj_set_style_pad_right(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
 void lv_obj_set_style_border_width(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
 void lv_obj_set_style_border_color(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector);
 void lv_obj_set_style_text_font(lv_obj_t *obj, const lv_font_t *value, lv_style_selector_t selector);

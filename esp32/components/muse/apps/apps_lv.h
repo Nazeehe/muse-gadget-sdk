@@ -187,20 +187,63 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * next frame. Without a layer they do nothing.
  */
 
-/* Rows the launcher shows; more apps are left out. */
-#define APPS_LV_LAUNCHER_ROWS 4
+/*
+ * The launcher is a carousel: the apps in a row, most recently used first, that scrolls sideways and snaps an app to the
+ * centre (LV_SCROLL_SNAP_CENTER), with no scrollbar and room at each end for the first and the last to come there. It opens
+ * on the first. The app at the centre is drawn APPS_LV_ICON_PX square and named under it, in one label (LONG_MODE_DOTS, in a
+ * box inside the circle); its neighbours, APPS_LV_ITEM_PITCH to each side, are smaller (APPS_LV_ICON_SIDE_SCALE), and each
+ * app's size follows its distance from the centre as the row scrolls (apps_lv_carousel_scale, at every LV_EVENT_SCROLL). The app
+ * that runs has a small dot under its icon.
+ *
+ * Each app is an item of APPS_LV_ICON_PX across that shows one of two faces, never neither: its icon, once apps_icons has its
+ * pixels (apps_icons.h: the window of APPS_ICONS_WINDOW apps around the centre, asked for as the centre moves and polled in at
+ * every frame), or else its tile, a circle in apps_lv_tile_color with apps_lv_tile_letter in it. A tile of scale s is
+ * APPS_LV_ICON_PX * s / 256 across, to the nearest pixel; an icon w pixels square is drawn at s * APPS_LV_ICON_PX / w (LVGL's
+ * image scale, about its middle), so every icon fills the same box; an A8 icon is drawn white, as an app's A8 image is. An
+ * icon's descriptor is asked for again after every apps_icons_want and apps_icons_drop_all, so an item never shows a block
+ * that was freed: one whose icon left the window, or went, is its tile again before LVGL draws.
+ *
+ * Touches: a tap on an app closes the launcher and calls pick with its id, on the LVGL task inside the tap (pick posts and
+ * returns). A tap on the card around the row (the title, the name, the empty state's text: none of them is clickable) closes
+ * it. A swipe sideways scrolls; no swipe closes it, and one that begins on an app picks nothing. Each close drops the icons.
+ */
 
-/* The launcher's n while the store hasn't been mounted (apps_store.h): "Loading apps..." in place of the rows (the font has no
- * ellipsis). */
+#define APPS_LV_ICON_PX 120          /* the centre's icon, and every item's box */
+#define APPS_LV_ICON_SIDE_SCALE 150  /* a neighbour's scale, of 256: about 59%, 70 px */
+#define APPS_LV_ITEM_PITCH 150       /* from one app's centre to the next's */
+#define APPS_LV_LAUNCHER_MAX 32      /* apps the carousel holds (the store's most); more are left out */
+
+/* The launcher's n while the store hasn't been mounted (apps_store.h): "Loading apps..." in place of the carousel (the font has
+ * no ellipsis). */
 #define APPS_LV_LOADING (-1)
 
-/* The launcher: "Apps", and a row for each app, ids[i] named names[i] (NULL: the id), at most APPS_LV_LAUNCHER_ROWS,
- * or, for n 0 (or any other n under 1), "No apps yet. Ask Muse to make one.", or for APPS_LV_LOADING "Loading apps...".
- * Both are copied. A tap on a row closes the launcher and calls pick with the row's id, on the LVGL task inside the tap
- * (pick posts and returns). A tap anywhere else (the text included: it isn't clickable, so LVGL gives the tap to the
- * launcher) or a right swipe closes it. Any other swipe does nothing, even one that begins on a row: it picks nothing.
- * Showing it again makes its rows again (the app task's glue does when the store's list changes while it is shown). */
-void apps_lv_show_launcher(const char *const *ids, const char *const *names, int n, void (*pick)(const char *id));
+/* An app in the launcher: its id, the name it shows (NULL or "": the id) and its icon's path in its folder ("" or NULL: none,
+ * its tile). The launcher's own type, so apps_lv doesn't depend on the app task's. */
+typedef struct {
+    const char *id, *name, *icon;
+} apps_lv_app_t;
+
+/* The launcher: "Apps" over the carousel of apps[0..n-1] (at most APPS_LV_LAUNCHER_MAX; one with a NULL or "" id is left out),
+ * with the dot under running_id's (NULL or an id the list hasn't: none); for n 0 (or any other n under 1, or apps NULL), "No apps
+ * yet. Ask Muse to make one.", or for APPS_LV_LOADING "Loading apps...". Everything is copied (a name at most 24 bytes, as a
+ * manifest's). Showing it again makes the carousel again, from the first app (the app task's glue does when the store's list
+ * changes while it is shown), and drops the icons the last one had. The LVGL task, outside the UI lock (apps_icons.h). */
+void apps_lv_show_launcher(const apps_lv_app_t *apps, int n, const char *running_id, void (*pick)(const char *id));
+
+/* Each frame, on the LVGL task, outside the UI lock: while the launcher shows, its icons that came are swapped in for their tiles
+ * (apps_icons_poll). Nothing while it is closed. */
+void apps_lv_launcher_poll(void);
+
+/* The scale (256 = 100%) of an app whose centre is dx_px from the screen's: 256 at 0, falling linearly to APPS_LV_ICON_SIDE_SCALE
+ * at APPS_LV_ITEM_PITCH either side, and that beyond. */
+int apps_lv_carousel_scale(int dx_px);
+
+/* A tile's colour, 0xRRGGBB: one of 8, by the CRC-32 of the id (zlib's; NULL is ""), so an app's never changes. */
+uint32_t apps_lv_tile_color(const char *id);
+
+/* A tile's letter: name's first byte, upper case, when it is an ASCII letter or digit; '?' otherwise (NULL, "", a symbol, the
+ * first byte of a UTF-8 character). */
+char apps_lv_tile_letter(const char *name);
 
 /* Whether the launcher is showing. */
 bool apps_lv_launcher_shown(void);
@@ -210,7 +253,7 @@ bool apps_lv_launcher_shown(void);
  * app". A tap closes it. */
 void apps_lv_show_crash(const char *name, const char *first_line);
 
-/* Closes both cards: an app came to the front, or a voice turn began. */
+/* Closes both cards: an app came to the front, or a voice turn began. The launcher's icons are dropped (apps_icons_drop_all). */
 void apps_lv_hide_cards(void);
 
 /* Whether a card is showing. */

@@ -446,7 +446,7 @@ class GuideAndSkill(unittest.TestCase):
 
     def test_agents_md_and_kconfig_quote_the_memory_and_storage_limits_as_the_code_has_them(self):
         # D12 for the code constants esp32/AGENTS.md's "Muse apps" section and the option's Kconfig help quote: the stacks, the
-        # snapshot's admission, the partitions, the launcher's rows, the path limit and the Link's TX margin. The measured
+        # snapshot's admission, the partitions, the path limit and the Link's TX margin. The measured
         # numbers beside them (bytes free, image and RAM costs) are measurements and aren't pinned.
         def kb(n):
             self.assertEqual(n % 1024, 0)
@@ -472,7 +472,6 @@ class GuideAndSkill(unittest.TestCase):
         block2 = max(screen, (half + 15) // 16 * 16 + jpeg_max)
         wait_s = header_number("apps_port.h", "APPS_PORT_SNAPSHOT_WAIT_MS") / 1000
         tx_margin_kb = define_kb(MAIN / "noise_tunnel_internal.h", "NOISE_TX_DMA_RESERVE_BYTES")
-        rows = header_number("apps_lv.h", "APPS_LV_LAUNCHER_ROWS")
         path_max = header_number("apps_pkg.h", "APPS_PATH_MAX")
         table = {}
         for line in (ROOT / "partitions_muse_apps.csv").read_text().splitlines():
@@ -482,11 +481,11 @@ class GuideAndSkill(unittest.TestCase):
         apps_offset, apps_size = table["apps"]
         nvs_offset, nvs_size = table["apps_nvs"]
         self.assertEqual(apps_size % (1024 * 1024), 0)
-        words = {4: "four"}
         agents = (ROOT / "AGENTS.md").read_text()
         section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
         for phrase in (
-                f"lists the {words[rows]} most recently used apps",
+                "opens the launcher, a carousel of every app, the most recently used first;",
+                "`apps_icons.c` (the launcher's icons, read on the I/O worker)",
                 f"PSRAM holds the app task's {kb(task_stack)} KB stack",
                 f"free of {task_stack:,}",
                 f"the I/O worker's {kb(io_stack)} KB stack",
@@ -508,6 +507,14 @@ class GuideAndSkill(unittest.TestCase):
                        f"{apps_size // (1024 * 1024)} MB for the apps' files and {kb(nvs_size)} KB for what they save"):
             with self.subTest(phrase):
                 self.assertIn(phrase, kconfig)
+
+    def test_guide_says_the_launcher_is_a_carousel_of_every_app(self):
+        # Launcher carousel Task 4: no row count any more (APPS_LV_LAUNCHER_ROWS is gone); every app, the most recent first.
+        guide = " ".join(GUIDE.read_text().split())
+        self.assertIn("The user opens apps from the launcher (a long press on the watch face; a carousel of every app, the most "
+                      "recently used first).", guide)
+        self.assertNotIn("four most recently used", guide)
+        self.assertNotRegex((APPS / "apps_lv.h").read_text(), r"APPS_LV_LAUNCHER_ROWS")
 
     def test_guide_icon_numbers_are_the_headers(self):
         # D12: the icon's size limit is APPS_ICON_MAX_PX, and its largest file is the LVGL header and that square of RGB565A8.

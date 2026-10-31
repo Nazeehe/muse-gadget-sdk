@@ -1682,16 +1682,29 @@ void apps_lv_stats(apps_lv_stats_t *out) {
     out->applies = atomic_load(&lv_applies);
 }
 
-void apps_lv_show_launcher(const char *const *ids, const char *const *names, int n, void (*pick)(const char *id)) {
+/* "launcher <n> <id>:<name>[@<icon>] ... [running=<id>]": each app, its icon's path when it has one, and the app that runs. */
+void apps_lv_show_launcher(const apps_lv_app_t *apps, int n, const char *running_id, void (*pick)(const char *id)) {
     lvgl_only("apps_lv_show_launcher");
-    char text[400];
+    char text[2400];
     int used = snprintf(text, sizeof text, "launcher %d", n);
     for (int i = 0; i < n && used < (int)sizeof text; i++) {
-        used += snprintf(text + used, sizeof text - (size_t)used, " %s:%s", ids[i], names[i] != NULL ? names[i] : "(null)");
+        const apps_lv_app_t *a = &apps[i];
+        used += snprintf(text + used, sizeof text - (size_t)used, " %s:%s%s%s", a->id, a->name != NULL ? a->name : "(null)",
+                         a->icon != NULL && a->icon[0] != '\0' ? "@" : "", a->icon != NULL ? a->icon : "(null)");
+    }
+    if (running_id != NULL && used < (int)sizeof text) {
+        snprintf(text + used, sizeof text - (size_t)used, " running=%s", running_id);
     }
     lv_launcher = true;
     lv_pick = pick;
     event("%s", text);
+}
+
+static atomic_uint lv_launcher_polls;  /* apps_lv_launcher_poll calls: one a frame */
+
+void apps_lv_launcher_poll(void) {
+    lvgl_only("apps_lv_launcher_poll");
+    atomic_fetch_add(&lv_launcher_polls, 1);
 }
 
 void apps_lv_show_crash(const char *name, const char *first_line) {
@@ -5875,8 +5888,8 @@ static void a_refused_launch_logs_once(void) {
 }
 
 /* F1: the launcher lists the store's apps, most recent first (an install, with or without run, or a run makes an app
- * the most recent), up to its four rows; the app that runs comes first when the rows don't have it. A pick of the app
- * that runs fronts it; a pick of any other launches it through the worker. */
+ * the most recent), every one of them; the app that runs is named (its dot). A pick of the app that runs fronts it; a pick of
+ * any other launches it through the worker. */
 static void the_launcher_lists_the_store(void) {
     char err[200];
     EXPECT_LAUNCHER("launcher 0");
@@ -5889,7 +5902,7 @@ static void the_launcher_lists_the_store(void) {
     ON_LVGL(pick_job, "hello");
     WAIT(picked, "log I launch hello (256 KB)");
     WAIT(picked, "front 1");
-    EXPECT_LAUNCHER("launcher 2 hello:Hello busy:Busy");
+    EXPECT_LAUNCHER("launcher 2 hello:Hello busy:Busy running=hello");
     /* A pick of the app that runs fronts it: nothing is launched. */
     int swiped = mark();
     ON_LVGL(swipe_job, NULL);
@@ -5899,35 +5912,60 @@ static void the_launcher_lists_the_store(void) {
     WAIT(again, "front 1");
     WAIT(again, "print hello show");
     ABSENT(again, "log I launch");
-    /* Four installs push hello out of the four rows: while it runs, it comes first. */
+    /* Four installs come after hello: every app is listed, most recent first, and hello is named while it runs. */
     static const char *const more[][2] = {{"q1", "Q1"}, {"q2", "Q2"}, {"q3", "Q3"}, {"q4", "Q4"}};
     for (size_t i = 0; i < ARRAY_LEN(more); i++) {
         store(make_pkg(more[i][0], more[i][1], QUIET, 1));
     }
-    EXPECT_LAUNCHER("launcher 4 hello:Hello q4:Q4 q3:Q3 q2:Q2");
+    EXPECT_LAUNCHER("launcher 6 q4:Q4 q3:Q3 q2:Q2 q1:Q1 hello:Hello busy:Busy running=hello");
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
-    EXPECT_LAUNCHER("launcher 4 q4:Q4 q3:Q3 q2:Q2 q1:Q1");
+    EXPECT_LAUNCHER("launcher 6 q4:Q4 q3:Q3 q2:Q2 q1:Q1 hello:Hello busy:Busy");
     on_worker(empty_store_job, NULL);
     EXPECT_LAUNCHER("launcher 0");
 }
 
-/* P1: the list holds every app the store keeps (up to APPS_TASK_LIST_MAX), but the old launcher card has APPS_LV_LAUNCHER_ROWS rows until the
- * carousel replaces it: eight installed apps, four rows, the most recent first; the app that runs still comes first. */
-static void the_old_launcher_card_still_gets_four_rows(void) {
+/* Launcher carousel Task 4: the carousel shows every app the store lists, most recent first, each with its icon's path; twelve of them
+ * here (the RAM store of these cases keeps 8, so the list is given as the store gives it). The app that runs is named, for its dot,
+ * where it is in the list; when the list doesn't have it (a run that didn't come from the store) it comes first, and with a full
+ * list the oldest is left out. The launcher's icons are polled at every frame. */
+static void the_launcher_gets_every_app(void) {
+    static apps_listed_t listed[APPS_TASK_LIST_MAX];
+    static char want[2400];
     char err[200];
-    CHECK(APPS_LV_LAUNCHER_ROWS == 4, "the old card's rows");
-    static const char *const ids[8] = {"p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"};
-    for (size_t i = 0; i < ARRAY_LEN(ids); i++) {
-        store(make_pkg(ids[i], ids[i], QUIET, 1));
+    CHECK(APPS_TASK_LIST_MAX == 32 && APPS_LV_LAUNCHER_MAX >= APPS_TASK_LIST_MAX, "the carousel holds the whole list: %d %d",
+          APPS_TASK_LIST_MAX, APPS_LV_LAUNCHER_MAX);
+    for (int i = 0; i < APPS_TASK_LIST_MAX; i++) {
+        snprintf(listed[i].id, sizeof listed[i].id, "a%02d", i);
+        snprintf(listed[i].name, sizeof listed[i].name, "A%02d", i);
+        snprintf(listed[i].icon, sizeof listed[i].icon, "%s", i % 3 == 0 ? "icon.bin" : "");
     }
-    EXPECT_LAUNCHER("launcher 4 p8:p8 p7:p7 p6:p6 p5:p5");
-    int picked = mark();
-    ON_LVGL(pick_job, "p1");
-    WAIT(picked, "log I launch p1 (256 KB)");
-    WAIT(picked, "front 1");
-    EXPECT_LAUNCHER("launcher 4 p1:p1 p8:p8 p7:p7 p6:p6");
+    atomic_store(&store_mode, APPS_STORAGE_FLASH);
+    apps_task_set_list(listed, 12);
+    int used = snprintf(want, sizeof want, "launcher 12");
+    for (int i = 0; i < 12; i++) {
+        used += snprintf(want + used, sizeof want - (size_t)used, " a%02d:A%02d%s", i, i, i % 3 == 0 ? "@icon.bin" : "");
+    }
+    EXPECT_LAUNCHER(want);
+    /* busy runs, and isn't in the full list: first, and the oldest goes. */
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), false, 50, NULL, err, sizeof err), "run: %s", err);
+    apps_task_set_list(listed, APPS_TASK_LIST_MAX);
+    used = snprintf(want, sizeof want, "launcher %d busy:Busy", APPS_TASK_LIST_MAX);
+    for (int i = 0; i < APPS_TASK_LIST_MAX - 1; i++) {
+        used += snprintf(want + used, sizeof want - (size_t)used, " a%02d:A%02d%s", i, i, i % 3 == 0 ? "@icon.bin" : "");
+    }
+    snprintf(want + used, sizeof want - (size_t)used, " running=busy");
+    EXPECT_LAUNCHER(want);
+    /* In the list, it stays where it is, named. */
+    snprintf(listed[2].id, sizeof listed[2].id, "busy");
+    snprintf(listed[2].name, sizeof listed[2].name, "Busy");
+    apps_task_set_list(listed, 4);
+    EXPECT_LAUNCHER("launcher 4 a00:A00@icon.bin a01:A01 busy:Busy a03:A03@icon.bin running=busy");
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
-    on_worker(empty_store_job, NULL);
+    EXPECT_LAUNCHER("launcher 4 a00:A00@icon.bin a01:A01 busy:Busy a03:A03@icon.bin");
+    unsigned polls = atomic_load(&lv_launcher_polls);
+    WAIT_FRAMES(5);
+    CHECK(atomic_load(&lv_launcher_polls) >= polls + 5, "polled each frame: %u then %u", polls, atomic_load(&lv_launcher_polls));
+    apps_task_set_list(NULL, 0);
     EXPECT_LAUNCHER("launcher 0");
 }
 
@@ -6822,7 +6860,7 @@ int main(int argc, char **argv) {
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},
         {"the_launcher_lists_the_store", the_launcher_lists_the_store},
-        {"the_old_launcher_card_still_gets_four_rows", the_old_launcher_card_still_gets_four_rows},
+        {"the_launcher_gets_every_app", the_launcher_gets_every_app},
         {"the_launcher_keeps_apps_that_ended", the_launcher_keeps_apps_that_ended},
         {"two_launches_of_one_id_run_it_once", two_launches_of_one_id_run_it_once},
         {"an_alarm_starts_a_stopped_app_and_calls_it_after_start", an_alarm_starts_a_stopped_app_and_calls_it_after_start},

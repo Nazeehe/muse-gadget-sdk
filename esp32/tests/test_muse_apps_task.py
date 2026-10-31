@@ -538,11 +538,11 @@ class AppTaskStoreTest(HarnessCase):
 
     # ---- Task 13's fix round 1 ----
 
-    def test_the_launcher_lists_the_store(self):  # F1: most recent first, four rows, the running app first
+    def test_the_launcher_lists_the_store(self):  # F1: most recent first, every app, the running app named
         self.run_case("the_launcher_lists_the_store")
 
-    def test_the_old_launcher_card_still_gets_four_rows(self):  # P1: the list holds eight; the card, until the carousel, four
-        self.run_case("the_old_launcher_card_still_gets_four_rows")
+    def test_every_app_is_an_item(self):  # launcher carousel Task 4: 12 apps, 12 items, with icons; the running app; a poll a frame
+        self.run_case("the_launcher_gets_every_app")
 
     def test_the_launcher_keeps_apps_that_ended(self):  # T4: installed, crashed, no app, hung and back
         self.run_case("the_launcher_keeps_apps_that_ended")

@@ -207,7 +207,7 @@ typedef struct {
         uint32_t card_after;
         char card_name[25], card_line[FIRST_LINE_MAX];
     } names;
-    apps_listed_t rows[APPS_TASK_LIST_MAX];  /* the LVGL task's alone: the launcher's rows, copied out of names (the old card takes the first APPS_LV_LAUNCHER_ROWS) */
+    apps_listed_t rows[APPS_TASK_LIST_MAX];  /* the LVGL task's alone: the launcher's apps, copied out of names */
 } record_t;
 
 static atomic_bool s_up;
@@ -279,7 +279,11 @@ static EXT_RAM_BSS_ATTR struct {
     bool hung_card;          /* the supervisor's card, still to show (a voice turn holds it back) */
     uint32_t hung_gen;       /* the app it is about */
     char hung_name[25];
+    apps_lv_app_t launcher[APPS_TASK_LIST_MAX];  /* what apps_lv_show_launcher is given: s_rec->rows, and the app that runs */
+    char running[APPS_ID_MAX + 1];
 } L;
+
+_Static_assert(APPS_TASK_LIST_MAX <= APPS_LV_LAUNCHER_MAX, "the carousel holds every app of the list");
 
 static atomic_bool s_covering;  /* the LVGL task's: the layer is in front or a card is shown */
 
@@ -1637,27 +1641,26 @@ static void carry_out_front(void) {
 }
 
 /*
- * The launcher's rows, into s_rec->rows (the names lock held): the store's apps, most recent first, as many as the old
- * card has rows (APPS_LV_LAUNCHER_ROWS: the list and s_rec->rows hold more, for the carousel that replaces it), with the app that runs on the first row when they don't have it (the store never drops it, but a run that
- * didn't come from the store, as on the host, isn't in it), so the launcher can always bring it back.
+ * The launcher's apps, into s_rec->rows (the names lock held): every app of the store's list, most recent first, with the app
+ * that runs first when the list doesn't have it (the store never drops it, but a run that didn't come from the store, as on the
+ * host, isn't in it; it has no icon then), so the launcher can always bring it back. A full list then leaves its oldest out.
  */
 static int launcher_rows(void) {
     const int n = s_rec->names.list_n;
     const apps_listed_t *list = s_rec->names.list;
     bool listed = !s_rec->names.running;
-    for (int i = 0; i < n && i < APPS_LV_LAUNCHER_ROWS && !listed; i++) {
+    for (int i = 0; i < n && !listed; i++) {
         listed = strcmp(list[i].id, s_rec->names.id) == 0;
     }
     int rows = 0;
     if (!listed) {
         put_text(s_rec->rows[0].id, sizeof s_rec->rows[0].id, s_rec->names.id);
         put_text(s_rec->rows[0].name, sizeof s_rec->rows[0].name, s_rec->names.name);
+        s_rec->rows[0].icon[0] = '\0';
         rows = 1;
     }
-    for (int i = 0; i < n && rows < APPS_LV_LAUNCHER_ROWS; i++) {
-        if (listed || strcmp(list[i].id, s_rec->names.id) != 0) {
-            s_rec->rows[rows++] = list[i];
-        }
+    for (int i = 0; i < n && rows < APPS_TASK_LIST_MAX; i++) {
+        s_rec->rows[rows++] = list[i];
     }
     return rows;
 }
@@ -1687,6 +1690,7 @@ static void show_cards(void) {
     }
     if (launcher) {
         rows = apps_store_mode() == APPS_STORAGE_NONE ? APPS_LV_LOADING : launcher_rows();
+        put_text(L.running, sizeof L.running, s_rec->names.running ? s_rec->names.id : "");  /* its dot */
     }
     names_give();
     if (card) {
@@ -1694,12 +1698,10 @@ static void show_cards(void) {
     }
     if (launcher) {
         atomic_store(&s_launcher_wanted, false);
-        const char *ids[APPS_LV_LAUNCHER_ROWS], *names[APPS_LV_LAUNCHER_ROWS];
-        for (int i = 0; i < rows; i++) {
-            ids[i] = s_rec->rows[i].id;
-            names[i] = s_rec->rows[i].name;
+        for (int i = 0; i < rows; i++) {  /* in L, not on the LVGL task's stack: 32 of them */
+            L.launcher[i] = (apps_lv_app_t){s_rec->rows[i].id, s_rec->rows[i].name, s_rec->rows[i].icon};
         }
-        apps_lv_show_launcher(ids, names, rows, on_pick);  /* it copies them */
+        apps_lv_show_launcher(L.launcher, rows, L.running[0] != '\0' ? L.running : NULL, on_pick);  /* it copies them */
     }
 }
 
@@ -1720,6 +1722,7 @@ void muse_apps_ui_supervise(void) {
         carry_out_front();
         show_cards();
     }
+    apps_lv_launcher_poll();  /* the launcher's icons that came: nothing unless it shows */
     note_wake();
     update_covering();
     apps_snapshot_take_pending();  /* app.control snapshot's request, on the first lit frame (it looks at the dark itself) */

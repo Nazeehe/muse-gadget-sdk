@@ -22,10 +22,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "apps_icons.h"
 #include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
@@ -89,12 +91,9 @@ static int64_t s_slow_worst_us;
 
 static volatile uint32_t s_applies, s_skips, s_rejects, s_refused, s_slow;
 
-/* The cards (made at the first show): their parent, the screen the layer is on, and what is shown on them. */
+/* The cards' parent (made at the first show): the screen the layer is on. The cards themselves are with the launcher, below. */
 static lv_obj_t *s_screen;
-static lv_obj_t *s_launcher, *s_crash, *s_crash_title, *s_crash_body;
-static bool s_launcher_shown, s_crash_shown;
-static void (*s_pick)(const char *id);
-static char s_row_ids[APPS_LV_LAUNCHER_ROWS][APPS_ID_MAX + 1];
+static void forget_cards(void);
 
 /* One pass: what it works on and what it found. */
 typedef struct {
@@ -934,8 +933,7 @@ void apps_lv_build(lv_obj_t *screen) {
     s_reject_logged = false;
     s_front = false;
     s_screen = screen;
-    s_launcher = s_crash = s_crash_title = s_crash_body = NULL;
-    s_launcher_shown = s_crash_shown = false;
+    forget_cards();
 
     lv_obj_t *layer = lv_obj_create(screen);
     if (layer == NULL) {
@@ -1006,13 +1004,82 @@ void apps_lv_stats(apps_lv_stats_t *out) {
 #define COLOR_TEXT 0xf2efff     /* muse_ui's, the menu's and the settings' */
 #define COLOR_CAPTION 0xd8d2ff
 #define COLOR_DIM 0x8b84a8
-#define COLOR_ROW 0x1a1530      /* the settings' cards */
 #define CARD_TEXT_W 330         /* ui.SAFE: text this wide stays inside the circle near the middle */
-#define ROW_W 300
-#define ROW_H 64
-#define ROW_GAP 12
-#define ROWS_BELOW 20           /* the rows sit this much under the middle, clear of the title */
+#define EMPTY_W 300             /* the empty and the loading text */
 #define TITLE_MAX 96            /* "<name> stopped responding": a manifest's name is at most 24 bytes */
+#define LAUNCHER_NAME_MAX 24    /* a manifest's name, as the launcher keeps it */
+
+/* The carousel (apps_lv.h). The row is the screen's width and an item's height, CAROUSEL_Y from the middle; an item is the
+ * icon's box with room under it for the dot; padding of SIDE_PAD at each end lets the first and the last come to the centre.
+ * The name is one line under the row, inside the circle: corners at about (165, 77) from the middle. */
+#define DOT_PX 8
+#define DOT_GAP 6
+#define ITEM_H (APPS_LV_ICON_PX + DOT_GAP + DOT_PX)
+#define FACE_DY (-(ITEM_H - APPS_LV_ICON_PX) / 2)  /* the face's centre from the item's: the top of the box is the icon's */
+#define SIDE_PAD ((SCREEN_PX - APPS_LV_ICON_PX) / 2)
+#define CAROUSEL_Y (-24)
+#define NAME_H 24               /* one line of montserrat_20 */
+#define NAME_GAP 10
+
+_Static_assert(APPS_LV_ICON_SIDE_SCALE > 0 && APPS_LV_ICON_SIDE_SCALE < 256, "a neighbour is drawn smaller than the centre");
+_Static_assert(APPS_LV_ITEM_PITCH > 0 && APPS_LV_ITEM_PITCH >= APPS_LV_ICON_PX, "items don't overlap at rest");
+
+/* Eight colours a white letter reads on, by the CRC-32 of the id. */
+static const uint32_t TILE_PALETTE[8] = {0xE53935, 0xD81B60, 0x8E24AA, 0x5E35B1, 0x1E88E5, 0x00897B, 0x43A047, 0xF4511E};
+
+/* One app of the carousel: what the launcher copied of it, and its objects. A face is its tile, or its icon's image (made the
+ * first time an icon came, hidden and with no source while the tile shows). */
+typedef struct {
+    char id[APPS_ID_MAX + 1], name[LAUNCHER_NAME_MAX + 1], icon[APPS_PATH_MAX + 1];
+    lv_obj_t *box, *tile, *image;
+    const lv_image_dsc_t *dsc;  /* the icon the image shows, NULL while the tile shows */
+    int scale;                  /* the scale it is drawn at */
+    bool recolored;             /* the image has the white recolor on it (an A8 icon) */
+} item_t;
+
+/* X12, and no internal RAM: the LVGL task's plain data, in PSRAM. Made again at each show; forgotten with the screen. */
+static EXT_RAM_BSS_ATTR struct {
+    item_t item[APPS_LV_LAUNCHER_MAX];
+    int n;                      /* items made */
+    int centre;                 /* the item nearest the centre, -1 until the first update */
+    lv_obj_t *row, *name;
+} C;
+
+static lv_obj_t *s_launcher, *s_crash, *s_crash_title, *s_crash_body;
+static bool s_launcher_shown, s_crash_shown;
+static void (*s_pick)(const char *id);
+
+/* The CRC-32 of s, zlib's: apps_store.c's crc32_of (static there, and the store is no business of the launcher's). */
+static uint32_t crc32_of(const char *s) {
+    uint32_t crc = 0xffffffffu;
+    for (; *s != '\0'; s++) {
+        crc ^= (uint8_t)*s;
+        for (int k = 0; k < 8; k++) {
+            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+uint32_t apps_lv_tile_color(const char *id) {
+    return TILE_PALETTE[crc32_of(id != NULL ? id : "") % ARRAY_LEN(TILE_PALETTE)];
+}
+
+char apps_lv_tile_letter(const char *name) {
+    char c = name != NULL ? name[0] : '\0';
+    if (c >= 'a' && c <= 'z') {
+        return (char)(c - 'a' + 'A');
+    }
+    return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ? c : '?';
+}
+
+int apps_lv_carousel_scale(int dx_px) {
+    if (dx_px <= -APPS_LV_ITEM_PITCH || dx_px >= APPS_LV_ITEM_PITCH) {
+        return APPS_LV_ICON_SIDE_SCALE;  /* first: -dx_px of INT_MIN would overflow */
+    }
+    int d = dx_px < 0 ? -dx_px : dx_px;
+    return 256 - (256 - APPS_LV_ICON_SIDE_SCALE) * d / APPS_LV_ITEM_PITCH;
+}
 
 static lv_obj_t *new_label(lv_obj_t *parent, const lv_font_t *font, uint32_t rgb) {
     lv_obj_t *label = lv_label_create(parent);
@@ -1043,11 +1110,138 @@ static lv_obj_t *new_card(void) {
     return card;
 }
 
+/* ---- The carousel's faces ---- */
+
+/* The item drawn at its scale: the face that shows, the tile by its size (about the face's centre, where it is aligned) or the
+ * icon by LVGL's image scale. */
+static void draw_scale(item_t *it) {
+    if (it->dsc != NULL) {
+        uint32_t w = it->dsc->header.w;  /* 1 to APPS_ICON_MAX_PX: apps_icon_check passed it */
+        lv_image_set_scale(it->image, ((uint32_t)it->scale * APPS_LV_ICON_PX + w / 2) / w);
+    } else {
+        int32_t side = (APPS_LV_ICON_PX * it->scale + 128) / 256;
+        lv_obj_set_size(it->tile, side, side);
+    }
+}
+
+static void set_scale(item_t *it, int scale) {
+    if (scale != it->scale) {
+        it->scale = scale;
+        draw_scale(it);
+    }
+}
+
+/* The item shows dsc (NULL: its tile). The only place an image is given a descriptor or loses one. */
+static void set_face(item_t *it, const lv_image_dsc_t *dsc) {
+    if (dsc == it->dsc) {
+        return;
+    }
+    if (dsc != NULL && it->image == NULL) {
+        lv_obj_t *image = lv_image_create(it->box);
+        if (image == NULL) {
+            return;  /* no memory for it: the tile stays, and the next refresh tries again */
+        }
+        lv_obj_remove_style_all(image);
+        lv_obj_remove_flag(image, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(image, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(image, APPS_LV_ICON_PX, APPS_LV_ICON_PX);
+        lv_obj_align(image, LV_ALIGN_CENTER, 0, FACE_DY);
+        lv_image_set_inner_align(image, LV_IMAGE_ALIGN_CENTER);  /* centred, and scaled about its middle */
+        it->image = image;
+    }
+    it->dsc = dsc;
+    if (dsc == NULL) {
+        lv_image_set_src(it->image, NULL);  /* nothing of the old icon is kept: its block may be freed now */
+        lv_obj_add_flag(it->image, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(it->tile, LV_OBJ_FLAG_HIDDEN);
+        draw_scale(it);
+        return;
+    }
+    lv_image_set_src(it->image, dsc);
+    /* An A8 icon is a mask LVGL fills with the image recolor, black unless set: white, as an app's A8 image (apply_style). */
+    if (dsc->header.cf == LV_COLOR_FORMAT_A8) {
+        lv_obj_set_style_image_recolor(it->image, colour(0xFFFFFF), LV_PART_MAIN);
+        lv_obj_set_style_image_recolor_opa(it->image, LV_OPA_COVER, LV_PART_MAIN);
+        it->recolored = true;
+    } else if (it->recolored) {
+        lv_obj_set_style_image_recolor_opa(it->image, LV_OPA_TRANSP, LV_PART_MAIN);
+        it->recolored = false;
+    }
+    draw_scale(it);
+    lv_obj_remove_flag(it->image, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(it->tile, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Every item's descriptor asked for again: after each apps_icons_want and apps_icons_drop_all (which free what left the window, or
+ * everything), and when a poll says icons came. A pointer that is the same is the same icon: a ready descriptor stays until a want or
+ * a drop, and each of those is followed by this. */
+static void refresh_faces(void) {
+    for (int i = 0; i < C.n; i++) {
+        item_t *it = &C.item[i];
+        set_face(it, it->icon[0] != '\0' ? apps_icons_get(it->id) : NULL);
+    }
+}
+
+/* The window around the centre item, centre first, two each side (apps_icons.h), then the faces. */
+static void want_window(void) {
+    const char *ids[APPS_ICONS_WINDOW], *icons[APPS_ICONS_WINDOW];
+    int n = 0;
+    for (int step = 0; n < APPS_ICONS_WINDOW && step < 2 * APPS_ICONS_WINDOW; step++) {
+        int k = C.centre + (step % 2 == 1 ? (step + 1) / 2 : -(step / 2));  /* c, c+1, c-1, c+2, c-2 ... */
+        if (k >= 0 && k < C.n) {
+            ids[n] = C.item[k].id;
+            icons[n] = C.item[k].icon;
+            n++;
+        }
+    }
+    apps_icons_want(ids, icons, n);
+    refresh_faces();
+}
+
+/* The scroll as it is: each item drawn at the scale its distance from the centre gives it, and, when another item is nearest the
+ * centre, its name and the icons' window. */
+static void update_carousel(void) {
+    if (C.row == NULL || C.n == 0) {
+        return;
+    }
+    int32_t sx = lv_obj_get_scroll_x(C.row);  /* item k's centre is k pitches less this from the screen's */
+    for (int k = 0; k < C.n; k++) {
+        set_scale(&C.item[k], apps_lv_carousel_scale(k * APPS_LV_ITEM_PITCH - (int)sx));
+    }
+    int centre = sx <= 0 ? 0 : (int)((sx + APPS_LV_ITEM_PITCH / 2) / APPS_LV_ITEM_PITCH);
+    centre = centre < C.n ? centre : C.n - 1;
+    if (centre != C.centre) {
+        C.centre = centre;
+        if (C.name != NULL) {
+            lv_label_set_text(C.name, C.item[centre].name);
+        }
+        want_window();
+    }
+}
+
+/* Every frame of a swipe, a fling, the snap's animation and an elastic end. */
+static void on_carousel_scroll(lv_event_t *e) {
+    (void)e;
+    update_carousel();
+}
+
+void apps_lv_launcher_poll(void) {
+    if (s_launcher_shown && C.n > 0 && apps_icons_poll()) {
+        refresh_faces();
+    }
+}
+
+/* ---- The cards ---- */
+
+/* Closed, the launcher drops its icons, and every item is its tile again, so no image is left on a freed block. Its objects stay
+ * until it is shown again: a close is often inside an item's own tap, where it can't be deleted. */
 static void close_launcher(void) {
     if (s_launcher != NULL) {
         lv_obj_add_flag(s_launcher, LV_OBJ_FLAG_HIDDEN);
     }
     s_launcher_shown = false;
+    apps_icons_drop_all();
+    refresh_faces();
 }
 
 static void close_crash(void) {
@@ -1057,35 +1251,31 @@ static void close_crash(void) {
     s_crash_shown = false;
 }
 
-/* A tap that lands on no row: on the launcher itself, or on its text, which isn't clickable. */
+/* A tap that lands on no app: on the launcher itself, or on its text, which isn't clickable. */
 static void on_launcher_tap(lv_event_t *e) {
     (void)e;
     close_launcher();
 }
 
-/* Any swipe: the row it began on gets no click (LVGL would click it at the lift, as nothing scrolled). Only a right
- * swipe closes the launcher (C12); the others do nothing. */
+/* A swipe that isn't the carousel's scroll (up or down; a sideways one scrolls, and LVGL sends no gesture then): the app it began on
+ * gets no click (LVGL would click it at the lift, as nothing scrolled). It closes nothing (P3: the bottom-edge close is Task 5's). */
 static void on_launcher_gesture(lv_event_t *e) {
     (void)e;
     lv_indev_t *indev = lv_indev_active();
-    if (indev == NULL) {
-        return;
-    }
-    lv_indev_wait_release(indev);
-    if (lv_indev_get_gesture_dir(indev) == LV_DIR_RIGHT) {
-        close_launcher();
+    if (indev != NULL) {
+        lv_indev_wait_release(indev);
     }
 }
 
-/* The row's own copy of its id: the launcher closes first (pick may open another card), and pick only posts. Nothing
- * is deleted here, inside the row's event: the rows go when the launcher is next shown. */
-static void on_row_tap(lv_event_t *e) {
-    intptr_t row = (intptr_t)lv_event_get_user_data(e);
-    if (row < 0 || row >= APPS_LV_LAUNCHER_ROWS || s_row_ids[row][0] == '\0') {
+/* The item's own copy of its id: the launcher closes first (pick may open another card), and pick only posts. Nothing is deleted
+ * here, inside the item's event: the items go when the launcher is next shown. */
+static void on_item_tap(lv_event_t *e) {
+    intptr_t k = (intptr_t)lv_event_get_user_data(e);
+    if (k < 0 || k >= C.n) {
         return;
     }
     char id[APPS_ID_MAX + 1];
-    memcpy(id, s_row_ids[row], sizeof id);
+    memcpy(id, C.item[k].id, sizeof id);
     void (*pick)(const char *id) = s_pick;
     close_launcher();
     if (pick != NULL) {
@@ -1141,56 +1331,133 @@ static bool make_cards(void) {
     return true;
 }
 
-void apps_lv_show_launcher(const char *const *ids, const char *const *names, int n, void (*pick)(const char *id)) {
+/* The row, scrolling sideways and snapping an item to the centre. NULL when LVGL had no memory for it. */
+static lv_obj_t *new_row(void) {
+    lv_obj_t *row = lv_obj_create(s_launcher);
+    if (row == NULL) {
+        return NULL;
+    }
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), ITEM_H);
+    lv_obj_align(row, LV_ALIGN_CENTER, 0, CAROUSEL_Y);
+    lv_obj_set_style_pad_left(row, SIDE_PAD, LV_PART_MAIN);  /* the first and the last can come to the centre */
+    lv_obj_set_style_pad_right(row, SIDE_PAD, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(row, LV_DIR_HOR);
+    lv_obj_set_scroll_snap_x(row, LV_SCROLL_SNAP_CENTER);
+    lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(row, on_carousel_scroll, LV_EVENT_SCROLL, NULL);
+    return row;  /* clickable, as an object is, so that a drag that begins between items scrolls it too */
+}
+
+/* Item k of the row: its box (clickable, a snap point: LVGL's default), its tile and letter, and the dot when its app runs. False
+ * when LVGL had no memory for the box, the tile or the letter (what was made of it goes). */
+static bool new_item(int k, bool runs) {
+    item_t *it = &C.item[k];
+    lv_obj_t *box = lv_obj_create(C.row);
+    if (box == NULL) {
+        return false;
+    }
+    lv_obj_remove_style_all(box);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);  /* a drag on it is the row's */
+    lv_obj_set_size(box, APPS_LV_ICON_PX, ITEM_H);
+    lv_obj_align(box, LV_ALIGN_TOP_LEFT, k * APPS_LV_ITEM_PITCH, 0);
+    lv_obj_t *tile = lv_obj_create(box);
+    lv_obj_t *letter = tile != NULL ? new_label(tile, &lv_font_montserrat_28, 0xFFFFFF) : NULL;
+    if (letter == NULL) {
+        lv_obj_delete(box);
+        return false;
+    }
+    lv_obj_remove_style_all(tile);
+    lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(tile, LV_OBJ_FLAG_CLICKABLE);  /* its taps are the item's */
+    lv_obj_set_style_bg_color(tile, colour(apps_lv_tile_color(it->id)), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(tile, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_align(tile, LV_ALIGN_CENTER, 0, FACE_DY);  /* a size kept about the face's centre */
+    const char text[2] = {apps_lv_tile_letter(it->name), '\0'};
+    lv_label_set_text(letter, text);
+    lv_obj_align(letter, LV_ALIGN_CENTER, 0, 0);
+    if (runs) {
+        lv_obj_t *dot = lv_obj_create(box);
+        if (dot != NULL) {  /* without one, the app is still there */
+            lv_obj_remove_style_all(dot);
+            lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_size(dot, DOT_PX, DOT_PX);
+            lv_obj_set_style_bg_color(dot, colour(COLOR_TEXT), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+            lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, 0, 0);
+        }
+    }
+    lv_obj_add_event_cb(box, on_item_tap, LV_EVENT_CLICKED, (void *)(intptr_t)k);
+    it->box = box;
+    it->tile = tile;
+    it->image = NULL;
+    it->dsc = NULL;
+    it->scale = 256;  /* as made: the tile is sized at the first update */
+    it->recolored = false;
+    draw_scale(it);
+    return true;
+}
+
+/* The carousel of apps[0..n-1] on the launcher: the copies, the row and its items, the name, and the first update (the scales,
+ * the name and the icons' window). What LVGL had no memory for is left out, and what was made shows. */
+static void make_carousel(const apps_lv_app_t *apps, int n, const char *running_id) {
+    C.row = new_row();
+    if (C.row == NULL) {
+        return;
+    }
+    for (int i = 0; i < n && C.n < APPS_LV_LAUNCHER_MAX; i++) {
+        const apps_lv_app_t *a = &apps[i];
+        if (a->id == NULL || a->id[0] == '\0') {
+            continue;
+        }
+        item_t *it = &C.item[C.n];
+        snprintf(it->id, sizeof it->id, "%s", a->id);
+        snprintf(it->name, sizeof it->name, "%s", a->name != NULL && a->name[0] != '\0' ? a->name : a->id);
+        snprintf(it->icon, sizeof it->icon, "%s", a->icon != NULL ? a->icon : "");
+        bool runs = running_id != NULL && strcmp(running_id, a->id) == 0;
+        if (!new_item(C.n, runs)) {
+            break;
+        }
+        C.n++;
+    }
+    C.name = new_label(s_launcher, &lv_font_montserrat_20, COLOR_TEXT);
+    if (C.name != NULL) {
+        lv_label_set_long_mode(C.name, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_size(C.name, CARD_TEXT_W, NAME_H);  /* one line, ellipsised by LVGL inside the circle */
+        lv_obj_align(C.name, LV_ALIGN_CENTER, 0, CAROUSEL_Y + ITEM_H / 2 + NAME_GAP + NAME_H / 2);
+        lv_label_set_text(C.name, "");
+    }
+    C.centre = -1;
+    update_carousel();
+}
+
+void apps_lv_show_launcher(const apps_lv_app_t *apps, int n, const char *running_id, void (*pick)(const char *id)) {
     if (!make_cards()) {
         return;
     }
-    lv_obj_clean(s_launcher);  /* the last showing's rows */
-    memset(s_row_ids, 0, sizeof s_row_ids);
+    /* The last showing's records are forgotten, its objects go, then its icons (a change of the list drops them: apps_icons.h). */
+    memset(&C, 0, sizeof C);
+    lv_obj_clean(s_launcher);
+    apps_icons_drop_all();
     s_pick = pick;
     lv_obj_t *title = new_label(s_launcher, &lv_font_montserrat_20, COLOR_DIM);
     if (title != NULL) {
         lv_label_set_text(title, "Apps");
         lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 56);
     }
-    int rows = ids == NULL || n <= 0 ? 0 : n < APPS_LV_LAUNCHER_ROWS ? n : APPS_LV_LAUNCHER_ROWS;
-    if (rows == 0) {
+    if (apps != NULL && n > 0) {
+        make_carousel(apps, n, running_id);
+    }
+    if (C.row == NULL) {
         lv_obj_t *empty = new_label(s_launcher, &lv_font_montserrat_16, COLOR_DIM);
         if (empty != NULL) {
             lv_label_set_long_mode(empty, LV_LABEL_LONG_MODE_WRAP);
-            lv_obj_set_size(empty, ROW_W, LV_SIZE_CONTENT);
+            lv_obj_set_size(empty, EMPTY_W, LV_SIZE_CONTENT);
             lv_label_set_text(empty, n == APPS_LV_LOADING ? "Loading apps..." : "No apps yet. Ask Muse to make one.");
             lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
-        }
-    }
-    /* The first row's centre, so the list is centred a little under the middle. */
-    int32_t first = ROWS_BELOW - (rows * ROW_H + (rows - 1) * ROW_GAP) / 2 + ROW_H / 2;
-    for (int i = 0; i < rows; i++) {
-        if (ids[i] == NULL || ids[i][0] == '\0') {
-            continue;
-        }
-        snprintf(s_row_ids[i], sizeof s_row_ids[i], "%s", ids[i]);
-        lv_obj_t *row = lv_obj_create(s_launcher);
-        if (row == NULL) {
-            s_row_ids[i][0] = '\0';
-            break;
-        }
-        lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, ROW_W, ROW_H);
-        lv_obj_set_style_bg_color(row, colour(COLOR_ROW), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_radius(row, ROW_H / 2, LV_PART_MAIN);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_align(row, LV_ALIGN_CENTER, 0, first + i * (ROW_H + ROW_GAP));
-        lv_obj_add_event_cb(row, on_row_tap, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        lv_obj_t *label = new_label(row, &lv_font_montserrat_20, COLOR_TEXT);
-        if (label != NULL) {
-            lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
-            lv_obj_set_size(label, ROW_W - 40, 24);  /* one line */
-            bool named = names != NULL && names[i] != NULL && names[i][0] != '\0';
-            lv_label_set_text(label, named ? names[i] : s_row_ids[i]);
-            lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
         }
     }
     lv_obj_remove_flag(s_launcher, LV_OBJ_FLAG_HIDDEN);
@@ -1230,4 +1497,11 @@ bool apps_lv_cards_shown(void) {
 
 bool apps_lv_launcher_shown(void) {
     return s_launcher_shown;
+}
+
+/* A new screen: the cards and the carousel of the old one are forgotten (apps_lv_build). Its icons are dropped at the next show. */
+static void forget_cards(void) {
+    s_launcher = s_crash = s_crash_title = s_crash_body = NULL;
+    s_launcher_shown = s_crash_shown = false;
+    memset(&C, 0, sizeof C);
 }

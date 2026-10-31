@@ -284,8 +284,8 @@ typedef struct {
  * APPS_TASK_LIST_MAX; more are left out). The store's owner, the I/O worker, gives it after every change of the store
  * (apps_install.h). It is copied under the names lock, which the caller waits for (held only for copies; a W log line
  * says so in the unlikely case it stays busy for a second, and the list waits for the next change). When the launcher
- * opens, the LVGL task shows the first APPS_LV_LAUNCHER_ROWS of it (the old card; the list holds every app) (taking the lock with its 2 ms try), the app that
- * runs on the first row when they don't have it, so the launcher can always bring it back. A pick of the app that runs
+ * opens, the LVGL task shows every app of it in the carousel (taking the lock with its 2 ms try), the app that runs first when the
+ * list doesn't have it, so the launcher can always bring it back, and named for its dot. A pick of the app that runs
  * fronts it; a pick of any other launches it (apps_task_launch).
  */
 void apps_task_set_list(const apps_listed_t *apps, int n);

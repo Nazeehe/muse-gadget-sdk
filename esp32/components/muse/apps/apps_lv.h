@@ -203,7 +203,8 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * icon's descriptor is asked for again after every apps_icons_want and apps_icons_drop_all, so an item never shows a block
  * that was freed: one whose icon left the window, or went, is its tile again before LVGL draws.
  *
- * Touches, as LVGL makes them (a drag that scrolls the row sends no tap and no gesture):
+ * Touches, as LVGL makes them (a drag that scrolls the row sends no tap and no gesture). A tap is a touch that lifts less than LVGL's
+ * scroll limit (10 px) from where it went down, on each axis; a slide that is neither a scroll nor a swipe does nothing:
  * - A tap on the app at the centre, with the row at rest (lv_obj_is_scrolling false when the finger went down and when it came up),
  *   closes the launcher and calls pick with its id, on the LVGL task inside the tap (pick posts and returns). Anywhere in its item
  *   counts, the face or under it.

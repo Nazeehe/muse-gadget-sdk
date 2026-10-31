@@ -1020,6 +1020,10 @@ void apps_lv_stats(apps_lv_stats_t *out) {
 #define CAROUSEL_Y (-24)
 #define NAME_H 24               /* one line of montserrat_20 */
 #define NAME_GAP 10
+/* A tap lifts less than this from where it went down, on each axis: LVGL 9.5.0's scroll limit (LV_INDEV_DEF_SCROLL_LIMIT), the movement
+ * at which it makes a drag on something scrollable a scroll and no click (lv_indev_scroll.c, lv_indev_find_scroll_obj). LVGL clicks the
+ * card, which doesn't scroll, after any slide that isn't a gesture: under its 50 px, or slower than 3 px a read (lv_indev.c:1787-1797). */
+#define TAP_SLOP_PX 10
 
 _Static_assert(APPS_LV_ICON_SIDE_SCALE > 0 && APPS_LV_ICON_SIDE_SCALE < 256, "a neighbour is drawn smaller than the centre");
 _Static_assert(APPS_LV_ITEM_PITCH > 0 && APPS_LV_ITEM_PITCH >= APPS_LV_ICON_PX, "items don't overlap at rest");
@@ -1043,7 +1047,7 @@ static EXT_RAM_BSS_ATTR struct {
     int n;                      /* items made */
     int centre;                 /* the item nearest the centre, -1 until the first update */
     lv_obj_t *row, *name;
-    lv_point_t press;           /* where the last press on the card itself went down: the edge close's */
+    lv_point_t press;           /* where the last press on the card itself or on an item went down */
     bool press_moving;          /* the row was scrolling when the last press on an item went down */
 } C;
 
@@ -1259,20 +1263,41 @@ static void close_crash(void) {
     s_crash_shown = false;
 }
 
-/* A tap that lands on no app: on the launcher itself, or on its text, which isn't clickable (C12). */
-static void on_launcher_tap(lv_event_t *e) {
-    (void)e;
-    close_launcher();
-}
-
-/* A press on the card itself (not on an app, or the row between them: those are clickable, and LVGL sends their presses to them):
- * where it went down, for the gesture it may become. */
-static void on_launcher_press(lv_event_t *e) {
-    (void)e;
+/* Where the touch now pressing went down, for the tap or the gesture it may become: called on the PRESSED of the card or an item. */
+static void note_press(void) {
     lv_indev_t *indev = lv_indev_active();
     if (indev != NULL) {
         lv_indev_get_point(indev, &C.press);
     }
+}
+
+/* Whether the touch LVGL calls a click is a tap: its finger came up less than TAP_SLOP_PX from where it went down (C.press), on each
+ * axis. The card or the item that clicks heard that touch's PRESSED: LVGL clicks only the object a touch went down on, which keeps it
+ * (LV_OBJ_FLAG_PRESS_LOCK). */
+static bool lifted_in_place(void) {
+    lv_indev_t *indev = lv_indev_active();
+    if (indev == NULL) {
+        return false;
+    }
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    int32_t dx = p.x - C.press.x, dy = p.y - C.press.y;
+    return dx > -TAP_SLOP_PX && dx < TAP_SLOP_PX && dy > -TAP_SLOP_PX && dy < TAP_SLOP_PX;
+}
+
+/* A tap that lands on no app: on the launcher itself, or on its text, which isn't clickable (C12). A slide there is no tap (I1): LVGL
+ * clicks the card after one that didn't become a gesture, and it closes nothing. */
+static void on_launcher_tap(lv_event_t *e) {
+    (void)e;
+    if (lifted_in_place()) {
+        close_launcher();
+    }
+}
+
+/* A press on the card itself (not on an app, or the row between them: those are clickable, and LVGL sends their presses to them). */
+static void on_launcher_press(lv_event_t *e) {
+    (void)e;
+    note_press();
 }
 
 /* Whether a press at p begins the close: in the screen's bottom APPS_LV_CLOSE_EDGE_PX rows, inside its circle. (A press on the card
@@ -1305,7 +1330,8 @@ static void on_launcher_gesture(lv_event_t *e) {
  * finger went down nor when it came up (lv_obj_is_scrolling: a drag, a fling's snap, an lv_obj_scroll_to_view; LVGL stops none of
  * them for a tap, so an item pressed while the row moves has moved on by the lift). Any other tap brings its item to the centre and
  * opens nothing: a side app, anywhere in its box, which is wider than its face (M2: a tap there can only scroll), or any app while the
- * row moves (M3). LVGL sends no tap at all at the lift of a drag that scrolled. Opening: the launcher closes first (pick may open another
+ * row moves (M3). LVGL sends no tap at all at the lift of a drag that scrolled; a slide up or down (the row doesn't scroll that way) that
+ * isn't a gesture it does click, and that is no tap: it does nothing (I1). Opening: the launcher closes first (pick may open another
  * card) with the item's id copied, and pick only posts. Nothing is deleted here, inside the item's event: the items go when the launcher
  * is next shown. A touch the launcher closed under (an app to the front, a voice turn: hiding it doesn't end the touch) does nothing at
  * its lift. */
@@ -1315,7 +1341,11 @@ static void on_item_event(lv_event_t *e) {
         return;
     }
     if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        note_press();
         C.press_moving = lv_obj_is_scrolling(C.row);
+        return;
+    }
+    if (!lifted_in_place()) {
         return;
     }
     if (C.press_moving || lv_obj_is_scrolling(C.row) || k != C.centre) {

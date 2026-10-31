@@ -379,6 +379,20 @@ class HarnessTest(unittest.TestCase):
     def test_horizontal_swipe_only_scrolls(self):
         self.run_case("horizontal_swipe_only_scrolls")
 
+    # ---- Fix round 1, I1: a tap is a touch that lifts within LVGL's scroll limit of where it went down ----
+
+    def test_a_short_slow_sideways_drag_on_the_background_does_not_close(self):  # under 50 px, or under 3 px a read: no gesture
+        self.run_case("a_short_slow_sideways_drag_on_the_background_does_not_close")
+
+    def test_a_short_slow_sideways_drag_on_the_name_does_not_close(self):
+        self.run_case("a_short_slow_sideways_drag_on_the_name_does_not_close")
+
+    def test_a_tap_on_the_background_still_closes(self):  # C12, kept: a lift under the scroll limit away on each axis
+        self.run_case("a_tap_on_the_background_still_closes")
+
+    def test_a_slide_on_an_app_opens_nothing(self):  # the same root on the apps: a slow or short vertical slide
+        self.run_case("a_slide_on_an_app_opens_nothing")
+
     def test_the_launchers_records_are_in_psram_and_the_rows_are_gone(self):
         # X12 and the follow-up round's internal RAM: the carousel's copy of the list (32 ids, names and icon paths) and its
         # objects are one static of the LVGL task's, in PSRAM; the old card's row count is gone.

@@ -6083,6 +6083,131 @@ static void horizontal_swipe_only_scrolls(void) {
     LAUNCHER_END();
 }
 
+/* ---- Task 5 fix round 1, I1: a tap is a touch that lifts where it went down ---- */
+
+/* A slide off the row: from (x, y), dx sideways in steps reads (at 10 px a read it is under LVGL's 50 px gesture; at 2 px a read every
+ * read starts the gesture again, lv_indev.c:1787), then the lift. Neither becomes a gesture, so LVGL sends the card CLICKED. */
+static void slide_from(int32_t x, int32_t y, int32_t dx, int32_t dy, int steps) {
+    fake_drag(x, y, x + dx, y + dy, steps, 0);
+    fake_lift();
+}
+
+/* The sideways drags I1 names, short and fast or long and slow, each way, from a point on the card: none closes the launcher. */
+static void slides_close_nothing_at(int line, int32_t x, int32_t y, const char *where) {
+    static const struct {
+        int32_t dx;
+        int steps;
+        const char *what;
+    } slides[] = {{40, 4, "40 px at 10 px a read"}, {-40, 4, "40 px left"}, {80, 40, "80 px at 2 px a read"}, {-80, 40, "80 px left, slowly"},
+                  {FAKE_SCROLL_LIMIT, 5, "the scroll limit, slowly"}};
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int card = fake_parent(carousel_row());
+    for (size_t i = 0; i < ARRAY_LEN(slides); i++) {
+        log_clear();
+        CHECK_AT(line, fake_down(x, y) == card, "%s is the card's", where);
+        for (int k = 1; k <= slides[i].steps; k++) {
+            fake_move(x + slides[i].dx * k / slides[i].steps, y);
+        }
+        CHECK_AT(line, log_find("wait_release") < 0, "%s, %s: no gesture (so LVGL clicks the card at the lift)\n%s", where,
+                 slides[i].what, log_peek());
+        fake_lift();
+        CHECK_AT(line, apps_lv_launcher_shown() && !fake_flag(card, LV_OBJ_FLAG_HIDDEN) && picks == 0,
+                 "%s, %s: the slide closes nothing (shown %d, %d picks)", where, slides[i].what, apps_lv_launcher_shown(), picks);
+        CHECK_AT(line, scroll_now() == 0, "%s, %s: and scrolls nothing: %d", where, slides[i].what, (int)scroll_now());
+    }
+    LAUNCHER_END();
+}
+
+static void a_short_slow_sideways_drag_on_the_background_does_not_close(void) {
+    slides_close_nothing_at(__LINE__, SCREEN_CENTRE, 360, "the background under the name");
+    slides_close_nothing_at(__LINE__, SCREEN_CENTRE, 110, "the background over the row");
+}
+
+static void a_short_slow_sideways_drag_on_the_name_does_not_close(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    fake_layout();
+    const lv_area_t *name = &fake_obj(name_label())->area;
+    int32_t y = (name->y1 + name->y2 + 1) / 2;
+    CHECK(in_area(name, (lv_point_t){SCREEN_CENTRE, y}) && !fake_flag(name_label(), LV_OBJ_FLAG_CLICKABLE),
+          "(233, %d) is on the name, which passes its touches to the card", (int)y);
+    LAUNCHER_END();
+    slides_close_nothing_at(__LINE__, SCREEN_CENTRE, y, "the name");
+}
+
+/* A real tap on the background still closes (C12): one that lifts where it went down, and one whose finger rolled less than LVGL's
+ * scroll limit on each axis (the movement at which LVGL makes a drag a scroll and no click). At the limit it is a slide, and closes
+ * nothing. */
+static void a_tap_on_the_background_still_closes(void) {
+    static const struct {
+        int32_t dx, dy;
+        bool closes;
+    } lifts[] = {{0, 0, true},
+                 {FAKE_SCROLL_LIMIT - 1, 0, true},
+                 {0, -(FAKE_SCROLL_LIMIT - 1), true},
+                 {-(FAKE_SCROLL_LIMIT - 1), FAKE_SCROLL_LIMIT - 1, true},
+                 {FAKE_SCROLL_LIMIT, 0, false},
+                 {0, FAKE_SCROLL_LIMIT, false},
+                 {-FAKE_SCROLL_LIMIT, -3, false}};
+    static const lv_point_t at[] = {{SCREEN_CENTRE, 360}, {SCREEN_CENTRE, 298}, {SCREEN_CENTRE, 66}};
+    for (size_t a = 0; a < ARRAY_LEN(at); a++) {
+        for (size_t i = 0; i < ARRAY_LEN(lifts); i++) {
+            cards_scene();
+            apps_lv_show_launcher(FIVE, 5, NULL, pick);
+            int card = fake_parent(carousel_row());
+            CHECK(fake_down(at[a].x, at[a].y) == card, "(%d, %d) is the card's", (int)at[a].x, (int)at[a].y);
+            if (lifts[i].dx != 0 || lifts[i].dy != 0) {
+                fake_move(at[a].x + lifts[i].dx, at[a].y + lifts[i].dy);
+            }
+            fake_lift();
+            CHECK(apps_lv_launcher_shown() == !lifts[i].closes && picks == 0, "a lift %d, %d from (%d, %d) %s (shown %d)", (int)lifts[i].dx,
+                  (int)lifts[i].dy, (int)at[a].x, (int)at[a].y, lifts[i].closes ? "is a tap, and closes" : "is a slide, and closes nothing",
+                  apps_lv_launcher_shown());
+            LAUNCHER_END();
+        }
+    }
+    /* The empty and the loading launcher: the same. */
+    static const int ns[] = {0, APPS_LV_LOADING};
+    for (size_t i = 0; i < ARRAY_LEN(ns); i++) {
+        cards_scene();
+        apps_lv_show_launcher(NULL, ns[i], NULL, pick);
+        slide_from(SCREEN_CENTRE, SCREEN_CENTRE, 40, 0, 4);
+        CHECK(apps_lv_launcher_shown(), "n %d: a slide on the text closes nothing", ns[i]);
+        fake_tap_at(SCREEN_CENTRE, SCREEN_CENTRE);
+        CHECK(!apps_lv_launcher_shown(), "n %d: a tap on it closes", ns[i]);
+        LAUNCHER_END();
+    }
+}
+
+/* The same root on the apps: a slide up or down on an app (the row scrolls only sideways, so LVGL sends the app CLICKED when the slide
+ * is short or slow) opens nothing and scrolls nothing. A tap whose finger rolled less than the scroll limit still opens the centre. */
+static void a_slide_on_an_app_opens_nothing(void) {
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    int row = carousel_row();
+    static const struct {
+        int k;
+        int32_t dy;
+        int steps;
+        const char *what;
+    } slides[] = {{0, -40, 4, "40 px up the centre app"}, {0, 40, 20, "40 px down it, slowly"}, {0, -60, 30, "60 px up it at 2 px a read"},
+                  {1, -40, 4, "40 px up the side app"}, {1, 60, 30, "60 px down it, slowly"}};
+    for (size_t i = 0; i < ARRAY_LEN(slides); i++) {
+        lv_point_t p = face_at(slides[i].k);
+        log_clear();
+        slide_from(p.x, p.y, 0, slides[i].dy, slides[i].steps);
+        CHECK(picks == 0 && apps_lv_launcher_shown() && !fake_scrolling(row) && log_find("scroll_to_view") < 0 && scroll_now() == 0,
+              "%s: opens and scrolls nothing (%d picks, scroll %d)\n%s", slides[i].what, picks, (int)scroll_now(), log_peek());
+    }
+    lv_point_t c = face_at(0);
+    fake_down(c.x, c.y);
+    fake_move(c.x + FAKE_SCROLL_LIMIT - 1, c.y - (FAKE_SCROLL_LIMIT - 1));
+    fake_lift();
+    CHECK(picks == 1 && strcmp(picked, "alpha") == 0, "a tap that rolled under the scroll limit opens the centre: %d '%s'", picks, picked);
+    LAUNCHER_END();
+}
+
 static void crash_card_text_and_tap(void) {
     cards_scene();
     apps_lv_show_crash("Timer", "main.lua:3: boom");
@@ -6220,6 +6345,10 @@ int main(int argc, char **argv) {
         {"swipe_up_from_middle_does_nothing", swipe_up_from_middle_does_nothing},
         {"right_swipe_no_longer_closes", right_swipe_no_longer_closes},
         {"horizontal_swipe_only_scrolls", horizontal_swipe_only_scrolls},
+        {"a_short_slow_sideways_drag_on_the_background_does_not_close", a_short_slow_sideways_drag_on_the_background_does_not_close},
+        {"a_short_slow_sideways_drag_on_the_name_does_not_close", a_short_slow_sideways_drag_on_the_name_does_not_close},
+        {"a_tap_on_the_background_still_closes", a_tap_on_the_background_still_closes},
+        {"a_slide_on_an_app_opens_nothing", a_slide_on_an_app_opens_nothing},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},

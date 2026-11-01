@@ -231,7 +231,7 @@ struct apps_vm_job;
 bool apps_port_vm_submit(struct apps_vm_job *job);
 
 /*
- * muse.ask's turn (apps_ask.h): msg[0, len), "(app <id>) <text>", goes to the user's Muse chat as a typed turn, whose reply comes to the
+ * muse.ask's turn (apps_ask.h): msg[0, len), APPS_ASK_HEAD and the app's text, goes to the user's Muse chat as a typed turn, whose reply comes to the
  * module's sink, apps_ask_piece and apps_ask_done, with user (the ask's generation). The device copies msg into PSRAM and hands it to
  * the chat task (muse_hatch_text_turn_to, muse_chat.h), which calls the sink; it never waits. When the turn can't go (no memory for
  * the copy: APPS_ASK_MSG_NO_MEMORY; Muse not set up; the chat's queue full), apps_ask_done comes at once, on this task, with why.

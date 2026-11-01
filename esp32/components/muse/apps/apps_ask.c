@@ -45,7 +45,7 @@
 
 #define ELLIPSIS "\xe2\x80\xa6"  /* "…", U+2026: what a cut reply ends with */
 #define ELLIPSIS_LEN 3
-#define HEAD_MAX (sizeof "(app ) " + APPS_ID_MAX)  /* "(app <id>) ", NUL included */
+#define HEAD_MAX (sizeof APPS_ASK_HEAD - 2 + APPS_ID_MAX)  /* APPS_ASK_HEAD with the id for its %s, NUL included */
 #define SAY_MAX (sizeof "ask : done (99999 bytes)" + APPS_ID_MAX + APPS_ASK_ERR_MAX)  /* the ask's line */
 
 /*
@@ -285,6 +285,40 @@ bool apps_ask_run_one(apps_rt_t *rt) {
 
 /* ---- The binding ---- */
 
+/* The bytes of the line break that starts c[0, n), or 0: LF, CR, VT, FF, or U+0085, U+2028 or U+2029 in UTF-8. */
+static size_t line_break(const unsigned char *c, size_t n) {
+    if (*c == '\n' || *c == '\r' || *c == '\v' || *c == '\f') {
+        return 1;
+    }
+    if (n >= 2 && c[0] == 0xC2 && c[1] == 0x85) {
+        return 2;
+    }
+    if (n >= 3 && c[0] == 0xE2 && c[1] == 0x80 && (c[2] == 0xA8 || c[2] == 0xA9)) {
+        return 3;
+    }
+    return 0;
+}
+
+/* s[0, n) on one line, in place: each run of line breaks is one space. Its new length; it never lengthens. */
+static size_t flatten_lines(char *s, size_t n) {
+    size_t w = 0;
+    bool in_break = false;
+    for (size_t r = 0; r < n;) {
+        size_t k = line_break((const unsigned char *)s + r, n - r);
+        if (k == 0) {
+            s[w++] = s[r++];
+            in_break = false;
+            continue;
+        }
+        if (!in_break) {
+            s[w++] = ' ';
+        }
+        in_break = true;
+        r += k;
+    }
+    return w;
+}
+
 static apps_rt_t *rt_of(lua_State *L) {
     return lua_touserdata(L, lua_upvalueindex(1));
 }
@@ -324,11 +358,11 @@ static int muse_ask(lua_State *L) {
         int64_t left = s_last_start + APPS_ASK_GAP_MS - now;
         return luaL_error(L, APPS_ASK_MSG_WAIT, (int)((left + 999) / 1000));
     }
-    /* What goes: "(app <id>) <text>", the text cleaned to UTF-8 (newlines and tabs kept), on this stack. */
+    /* What goes, on this stack: APPS_ASK_HEAD for the app, then the text on one line (flatten_lines) and cleaned to UTF-8, tabs kept. */
     char msg[HEAD_MAX + APPS_ASK_TEXT_MAX];
-    size_t head = (size_t)snprintf(msg, HEAD_MAX, "(app %s) ", apps_rt_id(rt));
+    size_t head = (size_t)snprintf(msg, HEAD_MAX, APPS_ASK_HEAD, apps_rt_id(rt));
     memcpy(msg + head, text, len);
-    size_t n = head + apps_text_clean(msg + head, len, true);
+    size_t n = head + apps_text_clean(msg + head, flatten_lines(msg + head, len), false);
     /* The callback, in the app's heap before any block is held: a heap that refuses raises here, and leaks nothing. */
     lua_pushvalue(L, 2);
     a->ref = luaL_ref(L, LUA_REGISTRYINDEX);

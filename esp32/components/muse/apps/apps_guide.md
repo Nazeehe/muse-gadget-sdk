@@ -120,6 +120,8 @@ The values:
 
 Touches. A tap is heard as press, release, tap, in that order; a long press as press, long_press, release, with no tap. A right swipe that begins on a widget puts the app behind: the widget hears press, then release, and no tap. A left swipe that begins on a widget is heard as press, release, tap. A widget that is deleted, or cleared with `ui.clear()`, while it is pressed never hears its release.
 
+Stacking. Widgets draw in the order they are made: each new widget draws over every widget there is. So make what must stay in view (a score, a message) after what passes under it, and keep it on top by moving the widgets you have rather than making new ones. A widget with no handler takes no touches: the touch goes to the widget under it. So one full-screen box with a `press` handler, with a `bg` or without one, hears a touch anywhere no widget with a handler covers, whatever is drawn over it.
+
 ### time
 
 - `time.now()`: the wall clock in epoch milliseconds, an integer; nil until the gadget has set its clock.
@@ -287,7 +289,7 @@ The launcher shows each app by its icon.
 ## The loop
 
 1. Call `app.api`. It writes this guide and its examples (the timer, and the tally, a connected app) to `workspace/apps/_guide/`, and returns what the gadget is: `api`, `screen`, `fonts`, `limits`, `storage` and the installed `apps`. If the VM refuses the files, it returns the guide in `guide_text` and the examples in `example_files` instead (the tally's as `tally/<name>`; the timer without its icon: add one of your own).
-2. Write the app on your VM: `workspace/apps/<id>/manifest.json`, `main.lua` and the files it lists. Start from the timer example, or from the tally for an app that shows data from your VM or its connectors (Connected apps).
+2. Write the app on your VM: `workspace/apps/<id>/manifest.json`, `main.lua` and the files it lists. Start from the timer example, or from the tally for an app that shows data from your VM or its connectors (Connected apps). For a game, read Games first.
 3. Call `app.install` with the id. The gadget reads the files itself, checks them, compiles, stores and runs the app in front, and returns `ok` with its `state`, `log`, `ui` (every widget with where it was laid out) and `warnings` (unknown keys, widgets past the round edge); or an error with a `code` (invalid_package, read_failed, compile_failed with the lines around the error, crashed with the traceback and the log, busy) and a message that says what to fix.
 4. Fix and install again: an install replaces the app, and its store stays.
 5. Check it with `app.control`: `status` (state, the error with its traceback, the last 50 log lines, memory, CPU, the widgets), `logs`, and `snapshot`, a picture of the screen that you open and look at.
@@ -373,6 +375,21 @@ exec /bin/bash "$HOME/workspace/apps/<app-id>/hook.sh"
 - **Pictures.** A picture the hook fetches goes in `cache/`, as a baseline JPEG with 4:2:0 colour at the size it is shown (ffmpeg's `-pix_fmt yuvj420p`, with `-f mjpeg` for a temporary file's name: see `vm.read`), and a new `state/rev` after it. The app reads it with `vm.read`, which gives a `muse.image`, and shows it with `ui.image{src = img}`: `rotation` turns it and `spin` spins it. For a record-like disc, read it with `circle = true` (see `vm.read`) and spin it as Images says. A still picture under a spinning one is redrawn at every step: show it at scale 100, written at the size it's shown (a hook can resize it with ffmpeg); a scaled one costs as much as the spin. Show a packaged picture until the VM's arrives, and when there is none.
 - **Waiting.** Show a `ui.spinner` while a command or an ask waits, as the tally does (Waiting in Patterns).
 - **Commands come from the user.** Send `vm.command` from the user's actions, never from a timer: the hook serves and logs every command, even past its call budget.
+
+## Games
+
+A game is an app like any other, with the same manifest, API and limits, but it moves things many times a second and must answer a touch at once. Build one this way:
+
+- **One tick.** Run the game from one `timer.every(40, ...)`: 40 ms is the shortest period, so a game moves at most 25 times a second. Start it in `start()` and `show()`, and cancel it in `hide()` (Tick only while shown, in Patterns). Move everything by the time that has passed since the last tick, from `time.mono()` (milliseconds), never by counting ticks: a tick can come late. Cap that time at about 100 ms, so a late tick slows the game for a moment instead of jumping it, and split it into smaller steps where something fast could pass through something thin.
+- **Touches.** Act on `press`, the moment a finger lands: `tap` comes only when it lifts. Make one full-screen box with a `press` handler, and give no other widget a handler (Stacking, in the API reference): the box then hears every touch. After a game ends, ignore presses for half a second, so a touch meant for the game doesn't skip the game-over screen.
+- **Make the screen once.** Make every widget the game needs at the start, from the back to the front: the background pieces, then what moves, then the score and the messages, which then stay on top. Reuse them: move a pipe that has left the screen back to the far side, and hide what is out of play with `hidden = true`. A widget made during the game draws over everything made before it, the score too, and making and deleting widgets costs more than moving them.
+- **Few changes a tick.** Every `w:set` waits its turn with the screen. Put what moves together in one box (a pipe and its caps) and move the box; set only what has changed; and round what needs no precision, such as a tilt to steps of 5 degrees. Keep the background a plain colour with `ui.bg`: a still picture is redrawn under everything that moves over it.
+- **A score you can read.** Text has no outline or shadow. Put the score on a solid box with a `radius` (a pill), or make a dark copy of the label 2 px down and to the right just before it, as a shadow.
+- **Awake while playing.** Keep the screen lit with `sys.keep_awake(true)` (the `keep_awake` permission) while a game is played, and call `sys.keep_awake(false)` on the start and game-over screens and while paused. `hide()` comes with a swipe or a voice turn: pause the game there, and when the app is back, wait for a touch before going on.
+- **The best score** goes in the store when a game ends (Keep state in the store, in Patterns).
+- **Sound.** `sound.chirp()` is the one sound there is (the `sound` permission): keep it for one event, such as a point scored.
+- **Functions used before they are defined.** Declare the name first, `local on_press`, and define it further down with `function on_press() ... end`, which sets that local: never make a global for it.
+- **Testing it.** You can't touch the gadget, so give a game `messages` to drive it with: `state` (the screen, the score and where things are), `press` (what a touch does) and `reset`. Play it with `app.send` and look with `snapshot`. While the user plays, `app.control status` shows its CPU: the gadget slows an app that uses more than 40% of the CPU for 3 s and stops it after 5 s.
 
 ## Common errors
 

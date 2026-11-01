@@ -271,6 +271,35 @@ class GuideAndSkill(unittest.TestCase):
         lv = strip_c_comments((APPS / "apps_lv.c").read_text())
         self.assertRegex(lv, r"case APPS_W_BUTTON:\s*style_surface\(w, obj\);\s*style_pressed\(w, obj\);")
 
+    def test_guide_says_how_widgets_stack_and_take_touches(self):
+        # Muse's Flappy (2026-11-01) put a handler on every widget and lost its score under pipes it made later. apps_lv.c
+        # makes a widget with no handler unclickable (LVGL's hit test passes over it to the widget under it), and moves no
+        # app widget in the layer's order: only the launcher and the crash card are placed above the layer.
+        reference = " ".join(guide_section(GUIDE.read_text(), "API reference").split())
+        self.assertIn("Widgets draw in the order they are made: each new widget draws over every widget there is.", reference)
+        self.assertIn("A widget with no handler takes no touches: the touch goes to the widget under it.", reference)
+        lv = strip_c_comments((APPS / "apps_lv.c").read_text())
+        self.assertRegex(lv, r"if \(w->events == 0\) \{\s*lv_obj_remove_flag\(n->obj, LV_OBJ_FLAG_CLICKABLE\);\s*return;")
+        self.assertEqual(sorted(set(re.findall(r"lv_obj_move_(?:to_index|foreground|background)\((\w+)", lv))),
+                         ["crash", "launcher"])
+
+    def test_guide_games_section_quotes_the_firmware(self):
+        # The Games section's numbers (D12): the shortest timer, the ticks a second it allows, and the duty cycle's limits.
+        games = " ".join(guide_section(GUIDE.read_text(), "Games").split())
+        tick = header_number("apps_rt.h", "APPS_TIMER_MIN_MS")
+        busy = header_number("apps_rt.h", "APPS_DUTY_BUSY_PCT")
+        throttle = header_number("apps_rt.h", "APPS_DUTY_THROTTLE_WINDOWS")
+        kill = header_number("apps_rt.h", "APPS_DUTY_KILL_WINDOWS")
+        for sentence in (
+                f"Run the game from one `timer.every({tick}, ...)`: {tick} ms is the shortest period, so a game moves at most "
+                f"{1000 // tick} times a second.",
+                f"the gadget slows an app that uses more than {busy}% of the CPU for {throttle} s and stops it after {kill} s"):
+            with self.subTest(sentence):
+                self.assertIn(sentence, games)
+        guide = GUIDE.read_text()
+        self.assertLess(guide.index("\n## Connected apps\n"), guide.index("\n## Games\n"))
+        self.assertLess(guide.index("\n## Games\n"), guide.index("\n## Common errors\n"))
+
     def test_skill_is_the_guide(self):
         # D21: front matter (name, description), the six headings every skill of the repo has, and the guide verbatim under
         # "## Workflow". Markdown only, and Muse throughout.

@@ -85,7 +85,7 @@ return app
 ### ui
 
 - `ui.label{...}`: a line or block of text. Returns the widget.
-- `ui.button{...}`: a button with text on it; give it a "tap" handler.
+- `ui.button{...}`: a button with text on it; give it a "tap" handler. It shows itself pressed while touched.
 - `ui.box{...}`: a rectangle with a background, corners and a border, and the parent of the widgets made with `parent = box` (boxes nest at most 4 deep). A box without `bg` (or a `border`) is invisible: it has no background until you give it one.
 - `ui.arc{...}`: a ring, or part of one, filled from start_angle by value between min and max. Give it `w` and `h`: without them it draws nothing.
 - `ui.bar{...}`: a straight progress bar, value between min and max. Give it `w` and `h`: without them it draws nothing.

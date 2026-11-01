@@ -264,6 +264,13 @@ class GuideAndSkill(unittest.TestCase):
         for constant in ("ui.W", "ui.H", "ui.R", "ui.SAFE", "json.null", "sys.api"):
             self.assertIn(f"`{constant}`", reference, constant)
 
+    def test_guide_says_a_button_shows_its_press(self):
+        # P41: apps_lv.c gives every button a pressed style (button_shows_its_pressed_state), and the button's line says so.
+        reference = guide_section(GUIDE.read_text(), "API reference")
+        self.assertRegex(reference, r'(?m)^- `ui\.button\{\.\.\.\}`: .*It shows itself pressed while touched\.$')
+        lv = strip_c_comments((APPS / "apps_lv.c").read_text())
+        self.assertRegex(lv, r"case APPS_W_BUTTON:\s*style_surface\(w, obj\);\s*style_pressed\(w, obj\);")
+
     def test_skill_is_the_guide(self):
         # D21: front matter (name, description), the six headings every skill of the repo has, and the guide verbatim under
         # "## Workflow". Markdown only, and Muse throughout.

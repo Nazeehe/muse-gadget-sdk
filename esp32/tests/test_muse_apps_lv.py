@@ -153,6 +153,9 @@ class HarnessTest(unittest.TestCase):
     def test_tap_events(self):  # B16
         self.run_case("tap_events")
 
+    def test_a_button_shows_its_pressed_state(self):  # P41
+        self.run_case("button_shows_its_pressed_state")
+
     def test_a_create_that_is_pending_has_no_object(self):  # Task 9's review
         self.run_case("create_pending_has_no_object")
 
@@ -699,13 +702,13 @@ class FakesTest(unittest.TestCase):
         LV_OBJ_FLAG_HIDDEN LV_OBJ_FLAG_CLICKABLE LV_OBJ_FLAG_SCROLLABLE LV_OBJ_FLAG_SNAPPABLE LV_OBJ_FLAG_GESTURE_BUBBLE
         LV_SCROLLBAR_MODE_OFF LV_SCROLLBAR_MODE_ON LV_SCROLLBAR_MODE_ACTIVE LV_SCROLLBAR_MODE_AUTO
         LV_SCROLL_SNAP_NONE LV_SCROLL_SNAP_START LV_SCROLL_SNAP_END LV_SCROLL_SNAP_CENTER LV_DIR_HOR LV_DIR_VER LV_DIR_ALL
-        LV_PART_MAIN LV_PART_INDICATOR LV_PART_KNOB
+        LV_PART_MAIN LV_PART_INDICATOR LV_PART_KNOB LV_STATE_DEFAULT LV_STATE_PRESSED
         LV_EVENT_ALL LV_EVENT_PRESSED LV_EVENT_PRESSING LV_EVENT_PRESS_LOST LV_EVENT_SHORT_CLICKED
         LV_EVENT_SINGLE_CLICKED LV_EVENT_DOUBLE_CLICKED LV_EVENT_TRIPLE_CLICKED LV_EVENT_LONG_PRESSED LV_EVENT_REFR_EXT_DRAW_SIZE
         LV_EVENT_LONG_PRESSED_REPEAT LV_EVENT_CLICKED LV_EVENT_RELEASED LV_EVENT_SCROLL_BEGIN
         LV_EVENT_SCROLL_THROW_BEGIN LV_EVENT_SCROLL_END LV_EVENT_SCROLL LV_EVENT_GESTURE LV_EVENT_KEY
         LV_EVENT_REFR_READY LV_EVENT_PREPROCESS
-        LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_COVER LV_ANIM_OFF LV_ANIM_ON
+        LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_30 LV_OPA_COVER LV_ANIM_OFF LV_ANIM_ON
         LV_IMAGE_ALIGN_DEFAULT LV_IMAGE_ALIGN_CENTER LV_COLOR_FORMAT_A8 LV_COLOR_FORMAT_RGB565A8 LV_IMAGE_FLAGS_PREMULTIPLIED
         sizeof(lv_image_header_t) sizeof(lv_image_dsc_t) sizeof(lv_color_t) sizeof(lv_area_t)
         offsetof(lv_image_dsc_t,header) offsetof(lv_image_dsc_t,data_size) offsetof(lv_image_dsc_t,data)
@@ -936,6 +939,63 @@ class FakesTest(unittest.TestCase):
         for line in ("double px = w * 50 / 100, py = h * 50 / 100", "(int32_t)floor(x_hi) - 1", "lv_event_t e = {LV_EVENT_REFR_EXT_DRAW_SIZE, NULL, o, false, &s};",
                      "if (changed) {", "invalidate_turned(obj);\n    obj->rotation = angle;\n    obj->ext_draw = ext_of(obj);\n    invalidate_turned(obj);",
                      "if (zoom == obj->scale) {", "o->ext_draw = ext_of(o);  /* lv_obj_refr_size"):
+            with self.subTest(fake=line):
+                self.assertIn(line, harness)
+
+    def test_the_fakes_pressed_state_is_lvgl_9_5_0s(self):
+        """What the fake's state (fake_set_state, fake_style) follows, in LVGL 9.5.0's own lines: the base class's handler gives an
+        object the pressed state at PRESSED and takes it at RELEASED and PRESS_LOST, a drag that starts to scroll takes it too; a
+        state change that a style tells apart redraws the object, and its children with it; a property's value is that of the
+        highest state the object is in; lv_obj_remove_style_all removes every part's and state's styles; and an unset background
+        is white and transparent."""
+        def code(path):
+            return _strip_comments((self.lvgl / path).read_text(errors="replace"))
+
+        def squeeze(text):
+            return re.sub(r"\s+", " ", text)
+
+        obj = code("src/core/lv_obj.c")
+        event = squeeze(c_function(obj, "static void lv_obj_event(const lv_obj_class_t * class_p, lv_event_t * e)\n{"))
+        for line in ("if(code == LV_EVENT_PRESSED) { lv_obj_add_state(obj, LV_STATE_PRESSED); }",
+                     "else if(code == LV_EVENT_RELEASED) { lv_obj_remove_state(obj, LV_STATE_PRESSED);",
+                     "else if(code == LV_EVENT_PRESS_LOST) { lv_obj_remove_state(obj, LV_STATE_PRESSED); }"):
+            with self.subTest(lv_obj_event=line):
+                self.assertIn(line, event)
+        update = squeeze(c_function(obj, "static void update_obj_state(lv_obj_t * obj, lv_state_t new_state)\n{"))
+        for line in ("if(cmp_res == LV_STYLE_STATE_CMP_SAME) { obj->state = new_state;", "lv_obj_invalidate(obj); obj->state = new_state;",
+                     "if(cmp_res == LV_STYLE_STATE_CMP_DIFF_REDRAW) {", "lv_obj_refresh_style(obj, LV_PART_ANY, LV_STYLE_PROP_ANY);"):
+            with self.subTest(update_obj_state=line):
+                self.assertIn(line, update)
+        scroll = squeeze(code("src/indev/lv_indev_scroll.c"))
+        self.assertIn("lv_obj_remove_state(indev->pointer.act_obj, LV_STATE_PRESSED); "
+                      "lv_obj_send_event(scroll_obj, LV_EVENT_SCROLL_BEGIN, NULL);", scroll)
+        style = code("src/core/lv_obj_style.c")
+        core = squeeze(c_function(style, "static lv_style_res_t get_prop_core(const lv_obj_t * obj, lv_style_selector_t selector, "
+                                         "lv_style_prop_t prop,\n                                    lv_style_value_t * v)\n{"))
+        for line in ("if((state_act & state_inv)) continue;", "if((int32_t)state_act <= weight) continue;", "weight = state_act;"):
+            with self.subTest(get_prop_core=line):
+                self.assertIn(line, core)
+        compare = squeeze(c_function(style, "lv_style_state_cmp_t lv_obj_style_state_compare(lv_obj_t * obj, lv_state_t state1, "
+                                            "lv_state_t state2)\n{"))
+        self.assertIn("bool valid1 = state_act & (~state1) ? false : true; bool valid2 = state_act & (~state2) ? false : true; "
+                      "if(valid1 != valid2) {", compare)
+        refresh = squeeze(c_function(style, "static void refresh_children_style(lv_obj_t * obj)\n{"))
+        self.assertIn("lv_obj_invalidate(child);", refresh)
+        self.assertIn("lv_obj_remove_style(obj, NULL, LV_PART_ANY | LV_STATE_ANY);",
+                      c_function(style, "void lv_obj_remove_style_all(lv_obj_t * obj)\n{"))
+        default = squeeze(c_function(code("src/misc/lv_style.c"), "lv_style_value_t lv_style_prop_get_default(lv_style_prop_t prop)\n{"))
+        self.assertIn("case LV_STYLE_BG_COLOR: return (lv_style_value_t) { .color = white };", default)
+        self.assertNotIn("case LV_STYLE_BG_OPA:", default)  # so the default's: 0, transparent
+        self.assertIn("default: return (lv_style_value_t) { .ptr = NULL };", default)
+        harness = HARNESS.read_text()
+        for line in ("fake_set_state(o, (lv_state_t)(o->state | LV_STATE_PRESSED));",
+                     "} else if (!o->deleted && (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST)) {",
+                     "fake_set_state(pressed_obj, (lv_state_t)(pressed_obj->state & ~LV_STATE_PRESSED));  /* the scroll's, not a press */\n"
+                     "        fake_fire(o->id, LV_EVENT_SCROLL_BEGIN);",
+                     "if (differs) {\n        invalidate_tree(o);",
+                     "(state & ~(uint32_t)o->state) == 0 &&\n            (int32_t)state > weight)",
+                     "obj->n_styles = 0;  /* every part's and state's, the local ones too */",
+                     'return "#ffffff";', 'return "0";'):
             with self.subTest(fake=line):
                 self.assertIn(line, harness)
 

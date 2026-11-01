@@ -171,6 +171,12 @@ typedef enum {
     LV_PART_KNOB = 0x030000,
 } lv_part_t;
 
+/* lv_obj_style.h: the states a selector can name besides its part (the others aren't used). */
+typedef enum {
+    LV_STATE_DEFAULT = 0,
+    LV_STATE_PRESSED = 1 << 7,
+} lv_state_t;
+
 typedef enum {
     LV_EVENT_ALL = 0,
     LV_EVENT_PRESSED,
@@ -308,6 +314,7 @@ LV_FONT_DECLARE(lv_font_unscii_16)
 #define LV_SIZE_CONTENT ((LV_COORD_MAX) | (1 << 29))
 #define LV_RADIUS_CIRCLE 0x7FFF
 #define LV_OPA_TRANSP 0
+#define LV_OPA_30 76
 #define LV_OPA_COVER 255
 #define LV_ANIM_OFF false
 #define LV_ANIM_ON true

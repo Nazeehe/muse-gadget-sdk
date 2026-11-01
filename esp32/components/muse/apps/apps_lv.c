@@ -536,6 +536,29 @@ static void style_surface(const apps_widget_t *w, lv_obj_t *obj) {
     lv_obj_set_style_border_color(obj, colour(w->border_color), LV_PART_MAIN);
 }
 
+/* How a button shows the finger on it: LVGL gives an object LV_STATE_PRESSED from the press to the release (or to a drag
+ * that scrolls), and this style holds while it does. A background with a luma ((299 R + 587 G + 114 B) / 1000) under 128 is
+ * dark and moves 30% of the way to white; a light one moves 30% of the way to black. A button with no background is filled
+ * with its text colour at LV_OPA_30. Both properties are set every time, so a new background replaces the last one's. The
+ * state change redraws the button only (lv_obj_refresh_style: it and its label). */
+#define PRESSED_SHIFT_PCT 30
+static void style_pressed(const apps_widget_t *w, lv_obj_t *obj) {
+    const lv_style_selector_t pressed = LV_PART_MAIN | LV_STATE_PRESSED;
+    if (w->bg == APPS_COLOR_NONE) {
+        lv_obj_set_style_bg_color(obj, colour(w->color), pressed);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_30, pressed);
+        return;
+    }
+    uint32_t r = (w->bg >> 16) & 0xFF, g = (w->bg >> 8) & 0xFF, b = w->bg & 0xFF;
+    bool dark = (299 * r + 587 * g + 114 * b) / 1000 < 128;
+    uint32_t c[3] = {r, g, b};
+    for (int i = 0; i < 3; i++) {
+        c[i] = dark ? c[i] + (255 - c[i]) * PRESSED_SHIFT_PCT / 100 : c[i] - c[i] * PRESSED_SHIFT_PCT / 100;
+    }
+    lv_obj_set_style_bg_color(obj, colour(c[0] << 16 | c[1] << 8 | c[2]), pressed);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, pressed);
+}
+
 /* A bar's track (LV_PART_MAIN) or its indicator: a filled, rounded bar. */
 static void style_bar_part(lv_obj_t *obj, uint32_t rgb, int32_t radius, lv_style_selector_t part) {
     lv_obj_set_style_bg_color(obj, colour(rgb), part);
@@ -728,6 +751,7 @@ static void apply_style(pass_t *p, const apps_widget_t *w, node_t *n) {
             break;
         case APPS_W_BUTTON:
             style_surface(w, obj);
+            style_pressed(w, obj);
             style_text(w, n->label);  /* the text is the button's label's */
             break;
         case APPS_W_BOX:

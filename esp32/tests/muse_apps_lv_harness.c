@@ -625,6 +625,13 @@ struct lv_obj {
     int32_t arc_start, arc_end;  /* an arc's indicator angles, as lv_arc_set_start_angle and lv_arc_set_end_angle keep them */
     int arc_steps;               /* times either changed */
     uint32_t sp_ms, sp_sweep;    /* a spinner's lv_spinner_set_anim_params: duration (ms) and angle (degrees), 0 until set */
+    lv_state_t state;            /* LV_STATE_DEFAULT until a press (lv_obj_event): fake_set_state */
+    struct {                     /* its local style properties, each as its setter logs it, one for each property and selector */
+        const char *prop;
+        lv_style_selector_t sel;
+        char value[24];
+    } styles[24];
+    int n_styles;
 };
 
 struct lv_indev {
@@ -835,6 +842,7 @@ static const char *part_suffix(lv_style_selector_t sel) {
         case LV_PART_MAIN: return "";
         case LV_PART_INDICATOR: return " indicator";
         case LV_PART_KNOB: return " knob";
+        case LV_PART_MAIN | LV_STATE_PRESSED: return " pressed";
         default: return " ?part";
     }
 }
@@ -1081,6 +1089,13 @@ void lv_obj_remove_style(lv_obj_t *obj, const lv_style_t *style, lv_style_select
     if (style != NULL) {
         fake_error("lv_obj_remove_style with a style: the fake only knows to remove a part's");
     }
+    int kept = 0;  /* remove_style_core: those of exactly this part and state go */
+    for (int i = 0; i < obj->n_styles; i++) {
+        if (obj->styles[i].sel != selector) {
+            obj->styles[kept++] = obj->styles[i];
+        }
+    }
+    obj->n_styles = kept;
     logline("remove_style %d%s", obj->id, part_suffix(selector));
 }
 
@@ -1088,6 +1103,7 @@ void lv_obj_remove_style_all(lv_obj_t *obj) {
     if (use(obj, "lv_obj_remove_style_all", NULL) == NULL) {
         return;
     }
+    obj->n_styles = 0;  /* every part's and state's, the local ones too */
     logline("remove_style_all %d", obj->id);
 }
 
@@ -1290,6 +1306,18 @@ static void style_log(lv_obj_t *obj, const char *prop, lv_style_selector_t sel, 
     va_start(ap, fmt);
     vsnprintf(value, sizeof value, fmt, ap);
     va_end(ap);
+    int i = 0;
+    while (i < obj->n_styles && !(strcmp(obj->styles[i].prop, prop) == 0 && obj->styles[i].sel == sel)) {
+        i++;
+    }
+    if (i == (int)ARRAY_LEN(obj->styles)) {
+        fake_error("more than %d style properties on %d", (int)ARRAY_LEN(obj->styles), obj->id);
+    } else {
+        obj->styles[i].prop = prop;
+        obj->styles[i].sel = sel;
+        snprintf(obj->styles[i].value, sizeof obj->styles[i].value, "%s", value);
+        obj->n_styles += i == obj->n_styles ? 1 : 0;
+    }
     logline("%s %d %s%s", prop, obj->id, value, part_suffix(sel));
 }
 
@@ -1640,6 +1668,33 @@ static void fake_invalidate(lv_obj_t *o, lv_area_t a) {
 static void fake_inv_clear(lv_obj_t *o) {
     o->inv = (lv_area_t){0, 0, -1, -1};
     o->inv_widest = o->inv_tallest = 0;
+}
+
+/* An object and what is in it, invalidated: lv_obj_refresh_style for any property (refresh_children_style). */
+static void invalidate_tree(lv_obj_t *o) {
+    fake_invalidate(o, o->area);
+    for (int i = 0; i < n_objs; i++) {
+        if (objs[i]->parent == o && !objs[i]->deleted) {
+            invalidate_tree(objs[i]);
+        }
+    }
+}
+
+/* lv_obj_add_state and lv_obj_remove_state (update_obj_state, lv_obj.c): the object takes the new state, and when one of its styles
+ * holds for one of the two states and not the other (lv_obj_style_state_compare) it is redrawn, it and its children. */
+static void fake_set_state(lv_obj_t *o, lv_state_t state) {
+    if (o->state == state) {
+        return;
+    }
+    bool differs = false;
+    for (int i = 0; i < o->n_styles; i++) {
+        uint32_t s = o->styles[i].sel & 0xFFFFu;
+        differs = differs || ((s & ~(uint32_t)o->state) == 0) != ((s & ~(uint32_t)state) == 0);
+    }
+    o->state = state;
+    if (differs) {
+        invalidate_tree(o);
+    }
 }
 
 /* An image's turned area on the screen, invalidated: lv_image_set_rotation and lv_image_set_scale do it for the old angle
@@ -2501,6 +2556,7 @@ static void indev_scroll(void) {
         if (o == NULL) {
             return;
         }
+        fake_set_state(pressed_obj, (lv_state_t)(pressed_obj->state & ~LV_STATE_PRESSED));  /* the scroll's, not a press */
         fake_fire(o->id, LV_EVENT_SCROLL_BEGIN);
     }
     if (scroll_dir_now != LV_DIR_HOR) {
@@ -2714,6 +2770,34 @@ static bool fake_flag(int id, lv_obj_flag_t f) {
     return (fake_obj(id)->flags & (uint32_t)f) != 0;
 }
 
+static lv_state_t fake_state(int id) {
+    return fake_obj(id)->state;
+}
+
+/* What LVGL 9.5.0 draws for a property of an object's main part in the state it is in (get_prop_core, lv_obj_style.c): of its
+ * local styles for that part, those whose state is all in the object's, the highest state's; with none, the property's default
+ * (lv_style_prop_get_default: a white, transparent background). NULL for another property never set. */
+static const char *fake_style(int id, const char *prop) {
+    const lv_obj_t *o = fake_obj(id);
+    const char *found = NULL;
+    int32_t weight = -1;
+    for (int i = 0; i < o->n_styles; i++) {
+        uint32_t part = o->styles[i].sel & 0xFF0000u, state = o->styles[i].sel & 0xFFFFu;
+        if (part == LV_PART_MAIN && strcmp(o->styles[i].prop, prop) == 0 && (state & ~(uint32_t)o->state) == 0 &&
+            (int32_t)state > weight) {
+            found = o->styles[i].value;
+            weight = (int32_t)state;
+        }
+    }
+    if (found == NULL && strcmp(prop, "bg_color") == 0) {
+        return "#ffffff";
+    }
+    if (found == NULL && strcmp(prop, "bg_opa") == 0) {
+        return "0";
+    }
+    return found;
+}
+
 /* An object's area as a test wants it, whatever the layout says. */
 static void fake_place(int id, int x1, int y1, int x2, int y2) {
     lv_obj_t *o = fake_obj(id);
@@ -2724,14 +2808,20 @@ static void fake_place(int id, int x1, int y1, int x2, int y2) {
 static int arc_drags;  /* times the fake arc's own handler turned its value to a finger */
 
 /* Sends an event the way LVGL does, to a deleted object too (an event that was already on its way when the object
- * went): the callbacks flagged PREPROCESS first, then the class's own handler (an arc follows a finger that
- * presses it, and that is all the fake gives a class), then the other callbacks. A callback that stops the
- * processing ends it. */
+ * went): the callbacks flagged PREPROCESS first, then the class's own handler, then the other callbacks. A callback
+ * that stops the processing ends it. The handler is the base class's (lv_obj_event: PRESSED gives an object the
+ * pressed state, RELEASED and PRESS_LOST take it away), and an arc's own after it (it follows a finger that presses it);
+ * that is all the fake gives a class. */
 static void fake_fire(int id, lv_event_code_t code) {
     lv_obj_t *o = fake_obj(id);
     lv_event_t e = {code, NULL, o, false, NULL};
     for (int stage = 0; stage < 3 && !e.stopped; stage++) {
         if (stage == 1) {
+            if (!o->deleted && code == LV_EVENT_PRESSED) {
+                fake_set_state(o, (lv_state_t)(o->state | LV_STATE_PRESSED));
+            } else if (!o->deleted && (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST)) {
+                fake_set_state(o, (lv_state_t)(o->state & ~LV_STATE_PRESSED));
+            }
             if (strcmp(o->cls, "arc") == 0 && code == LV_EVENT_PRESSING) {
                 o->value++;
                 arc_drags++;
@@ -4409,6 +4499,71 @@ static void a_swipe_that_starts_on_a_widget_ends_its_press(void) {
     FINISH(&e);
 }
 
+/* P41: a button shows the finger on it. While it is pressed its background is 30% of the way to white (a dark one) or to black
+ * (a light one), and one with no background is filled with its text colour at LV_OPA_30; the release gives it back. The press
+ * redraws the button (its label is in it) and nothing else. */
+static void button_shows_its_pressed_state(void) {
+    env_t e;
+    scene(&e);
+    apps_lv_set_event_cb(on_event);
+    apps_lv_set_front(true);  /* a hidden layer invalidates nothing */
+    RUN(&e, "d = ui.button{text = 'dark', x = -140} d:on('tap', function() end)\n"
+            "l = ui.button{text = 'light', bg = '#ffffff', color = '#000000'} l:on('tap', function() end)\n"
+            "n = ui.button{text = 'none', bg = 'none', color = '#ffcc00', x = 140} n:on('tap', function() end)");
+    CHECK(APPLY(&e), "made");
+    const struct {
+        const char *name;
+        const char *colour, *opa;          /* its background, up */
+        const char *pressed, *pressed_opa; /* and down */
+    } want[] = {
+        {"dark", "#262626", "255", "#676767", "255"},
+        {"light", "#ffffff", "255", "#b3b3b3", "255"},  /* 255 - 255 * 30 / 100 */
+        {"none", "#ffffff", "0", "#ffcc00", "76"},  /* up: LVGL's white, transparent: nothing drawn */
+    };
+    for (int k = 0; k < (int)ARRAY_LEN(want); k++) {
+        int id = fake_nth("button", k);
+        CHECK(fake_state(id) == LV_STATE_DEFAULT && strcmp(fake_style(id, "bg_color"), want[k].colour) == 0 &&
+                  strcmp(fake_style(id, "bg_opa"), want[k].opa) == 0,
+              "%s, up: %s at %s", want[k].name, fake_style(id, "bg_color"), fake_style(id, "bg_opa"));
+        for (int i = 0; i < n_objs; i++) {
+            fake_inv_clear(objs[i]);
+        }
+        fake_press(id);
+        CHECK(fake_state(id) == LV_STATE_PRESSED && strcmp(fake_style(id, "bg_color"), want[k].pressed) == 0 &&
+                  strcmp(fake_style(id, "bg_opa"), want[k].pressed_opa) == 0,
+              "%s, down: %s at %s", want[k].name, fake_style(id, "bg_color"), fake_style(id, "bg_opa"));
+        const lv_obj_t *b = fake_obj(id);
+        CHECK(b->inv.x1 == b->area.x1 && b->inv.y1 == b->area.y1 && b->inv.x2 == b->area.x2 && b->inv.y2 == b->area.y2,
+              "%s: the press redraws the button (%d,%d)-(%d,%d)", want[k].name, (int)b->inv.x1, (int)b->inv.y1, (int)b->inv.x2,
+              (int)b->inv.y2);
+        for (int i = 0; i < n_objs; i++) {
+            const lv_obj_t *o = objs[i];
+            bool inside = o->inv.x1 >= b->area.x1 && o->inv.y1 >= b->area.y1 && o->inv.x2 <= b->area.x2 && o->inv.y2 <= b->area.y2;
+            CHECK(o == b || o->inv.x2 < o->inv.x1 || (o->parent == b && inside), "%s: the press redraws %d too", want[k].name, o->id);
+        }
+        fake_lift();
+        CHECK(fake_state(id) == LV_STATE_DEFAULT && strcmp(fake_style(id, "bg_color"), want[k].colour) == 0 &&
+                  strcmp(fake_style(id, "bg_opa"), want[k].opa) == 0,
+              "%s, up again: %s at %s", want[k].name, fake_style(id, "bg_color"), fake_style(id, "bg_opa"));
+    }
+
+    /* A new background gets its own pressed one: the dark button made light darkens, and the one with none, given one, is
+     * opaque down as up. */
+    RUN(&e, "d:set{bg = '#ffffff'} n:set{bg = '#000000'}");
+    CHECK(APPLY(&e), "restyled");
+    int d = fake_nth("button", 0), n = fake_nth("button", 2);
+    fake_press(d);
+    CHECK(strcmp(fake_style(d, "bg_color"), "#b3b3b3") == 0 && strcmp(fake_style(d, "bg_opa"), "255") == 0, "made light, down: %s at %s",
+          fake_style(d, "bg_color"), fake_style(d, "bg_opa"));
+    fake_lift();
+    fake_press(n);
+    CHECK(strcmp(fake_style(n, "bg_color"), "#4c4c4c") == 0 && strcmp(fake_style(n, "bg_opa"), "255") == 0, "given black, down: %s at %s",
+          fake_style(n, "bg_color"), fake_style(n, "bg_opa"));
+    fake_lift();
+    CHECK(strcmp(fake_style(n, "bg_color"), "#000000") == 0, "and up: %s", fake_style(n, "bg_color"));
+    FINISH(&e);
+}
+
 /* ---- Front and back, build and reset ---- */
 
 static void front_and_back(void) {
@@ -4536,8 +4691,13 @@ static const style_t STYLES[] = {
     {"ui.box{}", {"bg_opa 2 0", "radius 2 0", "border_width 2 0", "border_color 2 #ffffff", NULL}, {"bg_color 2", NULL}},
     {"ui.box{bg = '#112233', border = 4, border_color = 0xff0000}",
      {"bg_color 2 #112233", "bg_opa 2 255", "border_width 2 4", "border_color 2 #ff0000", NULL}, {NULL}},
-    {"ui.button{}", {"bg_color 2 #262626", "bg_opa 2 255", "radius 2 16", "border_width 2 0", NULL}, {NULL}},
-    {"ui.button{bg = 'none', radius = 'circle'}", {"bg_opa 2 0", "radius 2 32767", NULL}, {"bg_color 2", NULL}},
+    {"ui.button{}",
+     {"bg_color 2 #262626", "bg_opa 2 255", "radius 2 16", "border_width 2 0", "bg_color 2 #676767 pressed", "bg_opa 2 255 pressed",
+      NULL},
+     {NULL}},
+    {"ui.button{bg = 'none', radius = 'circle'}",
+     {"bg_opa 2 0", "radius 2 32767", "bg_color 2 #ffffff pressed", "bg_opa 2 76 pressed", NULL},
+     {"bg_color 2 #262626", NULL}},
     /* Flags. */
     {"ui.label{hidden = true}", {"add_flag 2 hidden", NULL}, {"remove_flag 2 hidden", NULL}},
     {"ui.label{hidden = false}", {"remove_flag 2 hidden", NULL}, {"add_flag 2 hidden", NULL}},
@@ -4671,6 +4831,8 @@ static void button_text_is_its_labels(void) {
         "radius 2 16\n"
         "border_width 2 0\n"
         "border_color 2 #ffffff\n"
+        "bg_color 2 #676767 pressed\n"
+        "bg_opa 2 255 pressed\n"
         "text_font 3 montserrat_20\n"
         "text_color 3 #ffffff\n"
         "text 3 \"Go\"\n"
@@ -8959,6 +9121,7 @@ int main(int argc, char **argv) {
         {"many_sets_while_dark_apply_once", many_sets_while_dark_apply_once},
         {"swipe_right_closes", swipe_right_closes},
         {"a_swipe_that_starts_on_a_widget_ends_its_press", a_swipe_that_starts_on_a_widget_ends_its_press},
+        {"button_shows_its_pressed_state", button_shows_its_pressed_state},
         {"front_and_back", front_and_back},
         {"reset_deletes_every_object", reset_deletes_every_object},
         {"stale_records_after_a_missed_reset", stale_records_after_a_missed_reset},

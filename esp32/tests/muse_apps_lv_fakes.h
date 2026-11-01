@@ -332,6 +332,8 @@ void lv_obj_move_to_index(lv_obj_t *obj, int32_t index);
 
 void lv_obj_remove_style(lv_obj_t *obj, const lv_style_t *style, lv_style_selector_t selector);
 void lv_obj_remove_style_all(lv_obj_t *obj);
+bool lv_obj_has_flag(const lv_obj_t *obj, lv_obj_flag_t f);
+lv_obj_t *lv_obj_get_parent(const lv_obj_t *obj);
 void lv_obj_add_flag(lv_obj_t *obj, lv_obj_flag_t f);
 void lv_obj_remove_flag(lv_obj_t *obj, lv_obj_flag_t f);
 

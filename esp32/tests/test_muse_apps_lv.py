@@ -499,9 +499,14 @@ class HarnessTest(unittest.TestCase):
         self.run_case("spinner_is_made_and_styled")
 
     def test_spinner_animates_only_while_shown(self):
-        # Task 8: LVGL's own animation, whose steps invalidate nothing while the spinner or a box above it is hidden; no spin count and
-        # no frame pairing (those are for images that spin).
+        # Task 8: LVGL's own animation, whose steps invalidate nothing while the spinner or a box above it is hidden; no spin count
+        # (pairing follows it: test_pairing_follows_a_shown_spinner).
         self.run_case("spinner_animates_only_while_shown")
+
+    def test_pairing_follows_a_shown_spinner(self):
+        # Task 8, R8a: the frame pairing is on while a spinner is shown on the layer in front (not hidden, no hidden box above, no
+        # launcher or card over it) and off when the last is hidden, deleted or behind. A spinner is still no spinning image.
+        self.run_case("pairing_follows_a_shown_spinner")
 
     def test_spinner_is_made_by_lvgl_alone(self):
         # Task 8: the animation is lv_spinner's (1,000 ms a turn, 200 degrees in 9.5.0), so apps_lv.c's only mention of a spinner is
@@ -787,7 +792,7 @@ class FakesTest(unittest.TestCase):
 
     def test_the_fakes_spinner_is_lvgl_9_5_0s(self):
         """Task 8: what the fake's lv_spinner (tests/muse_apps_lv_harness.c) follows, in lv_spinner.c's own lines: the defaults the
-        constructor passes (1,000 ms a turn, 200 degrees: not the 60 the brief's words name, which no 9.5.0 default is), the two animations
+        constructor passes (1,000 ms a turn, 200 degrees), the two animations
         lv_spinner_set_anim_params starts, the bezier path they use (lv_anim_path_custom_bezier3 over lv_cubic_bezier, with the
         constants of lv_math.c), the arc's start and end angles it moves, and an invalidated area that a hidden parent hides."""
         def code(path):

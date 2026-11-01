@@ -1091,6 +1091,14 @@ void lv_obj_remove_style_all(lv_obj_t *obj) {
     logline("remove_style_all %d", obj->id);
 }
 
+bool lv_obj_has_flag(const lv_obj_t *obj, lv_obj_flag_t f) {
+    return use((lv_obj_t *)obj, "lv_obj_has_flag", NULL) != NULL && (obj->flags & (uint32_t)f) != 0;
+}
+
+lv_obj_t *lv_obj_get_parent(const lv_obj_t *obj) {
+    return use((lv_obj_t *)obj, "lv_obj_get_parent", NULL) != NULL ? obj->parent : NULL;
+}
+
 void lv_obj_add_flag(lv_obj_t *obj, lv_obj_flag_t f) {
     if (use(obj, "lv_obj_add_flag", NULL) == NULL) {
         return;
@@ -8119,8 +8127,8 @@ static void spinner_is_made_and_styled(void) {
 
 /* The spinner's animation is LVGL's: it keeps stepping while the widget is hidden (the object is, as it is for any hidden
  * object), but a hidden spinner, and one in a hidden box, invalidates nothing, so a hidden spinner costs no refresh. A shown
- * one invalidates its box (at most) at each step. No call of apps_lv.c starts, stops or restarts it, so there is no pairing
- * (Task 7's, for spinning images) and no spin count either. */
+ * one invalidates its box (at most) at each step. No call of apps_lv.c starts, stops or restarts it, and it is no spin count;
+ * the frame pairing does follow a shown one (pairing_follows_a_shown_spinner). */
 static void spinner_animates_only_while_shown(void) {
     env_t e;
     scene(&e);
@@ -8145,7 +8153,7 @@ static void spinner_animates_only_while_shown(void) {
           (int)o->area.x1, (int)o->area.y1, (int)o->area.x2, (int)o->area.y2);
     CHECK(o->inv_widest <= 60 && o->inv_tallest <= 60, "no step is wider than the 60 px box: %d x %d", (int)o->inv_widest, (int)o->inv_tallest);
     refresh_after(33000);
-    CHECK(pairing_calls == 0, "a spinner doesn't turn the frame pairing on: %d calls", pairing_calls);
+    CHECK(pairing_calls == 1 && pairing_on, "a shown spinner turns the frame pairing on (R8a): %d calls", pairing_calls);
 
     /* Hidden: the object's own animation goes on, and nothing is invalidated. */
     RUN(&e, "s:set{hidden = true}");
@@ -8186,7 +8194,7 @@ static void spinner_animates_only_while_shown(void) {
     /* No spinner is counted as a spinning image, and none ends with the apply step's help: a delete takes both animations. */
     CHECK(stats_now().spinning == 0, "spinning %u", stats_now().spinning);
     refresh_after(33000);
-    CHECK(pairing_calls == 0, "still no pairing: %d", pairing_calls);
+    CHECK(pairing_calls >= 1, "pairing calls: %d", pairing_calls);
     RUN(&e, "box:delete()");
     CHECK(APPLY(&e), "the box deleted");
     CHECK(fake_anims_of(fake_nth("spinner", 1)) == 0 && fake_spins() == 0, "the box's delete took the spinner's animations: %d", fake_spins());
@@ -8207,6 +8215,103 @@ static void spinner_animates_only_while_shown(void) {
     frames(500, 15);
     apps_lv_set_pairing_cb(NULL);
     CHECK(display_obj.n_cbs == before + 1 || display_obj.n_cbs == before, "the display's callbacks: %d", display_obj.n_cbs);
+    FINISH(&e);
+}
+
+/* R8a: the board's frame pairing is on while at least one spinner is shown on the layer in front: not hidden, no hidden box above
+ * it, no launcher or card over the layer. It goes off when the last is hidden or deleted, or the layer goes behind. A spinner is not
+ * a spinning image: the spin count and the spin frame log stay as they were. */
+static void pairing_follows_a_shown_spinner(void) {
+    env_t e;
+    scene(&e);
+    apps_lv_set_pairing_cb(note_pairing);
+    pairing_calls = 0;
+    pairing_on = false;
+    apps_lv_set_front(true);
+    refresh_after(33000);
+    CHECK(pairing_calls == 0, "no spinner, no call: %d", pairing_calls);
+
+    RUN(&e, "s = ui.spinner{}");
+    CHECK(APPLY(&e), "made");
+    refresh_after(33000);
+    CHECK(pairing_calls == 1 && pairing_on, "a shown spinner turns it on: %d calls", pairing_calls);
+    CHECK(stats_now().spinning == 0, "and is no spinning image: %u", stats_now().spinning);
+    refresh_after(33000);
+    CHECK(pairing_calls == 1, "each change once: %d", pairing_calls);
+
+    RUN(&e, "s:set{hidden = true}");
+    CHECK(APPLY(&e), "hidden");
+    refresh_after(33000);
+    CHECK(pairing_calls == 2 && !pairing_on, "hidden: off: %d calls", pairing_calls);
+    RUN(&e, "s:set{hidden = false}");
+    CHECK(APPLY(&e), "shown");
+    refresh_after(33000);
+    CHECK(pairing_calls == 3 && pairing_on, "shown again: on: %d calls", pairing_calls);
+
+    RUN(&e, "s:delete() box = ui.box{w = 200, h = 200} t = ui.spinner{parent = box}");
+    CHECK(APPLY(&e), "in a box");
+    refresh_after(33000);
+    CHECK(pairing_on, "in a shown box it is on");
+    RUN(&e, "box:set{hidden = true}");
+    CHECK(APPLY(&e), "box hidden");
+    refresh_after(33000);
+    CHECK(!pairing_on, "a hidden box above it: off");
+    RUN(&e, "box:set{hidden = false}");
+    CHECK(APPLY(&e), "box shown");
+    refresh_after(33000);
+    CHECK(pairing_on, "the box shown: on");
+    RUN(&e, "u = ui.spinner{hidden = true}");
+    CHECK(APPLY(&e), "a second, hidden");
+    RUN(&e, "t:set{hidden = true}");
+    CHECK(APPLY(&e), "the first hidden");
+    refresh_after(33000);
+    CHECK(!pairing_on, "all hidden: off");
+    RUN(&e, "u:set{hidden = false}");
+    CHECK(APPLY(&e), "the second shown");
+    refresh_after(33000);
+    CHECK(pairing_on, "one shown is enough");
+    RUN(&e, "u:delete()");
+    CHECK(APPLY(&e), "deleted");
+    refresh_after(33000);
+    CHECK(!pairing_on, "the last shown deleted: off");
+
+    RUN(&e, "w = ui.spinner{}");
+    CHECK(APPLY(&e), "again");
+    refresh_after(33000);
+    CHECK(pairing_on, "on");
+    apps_lv_set_front(false);
+    refresh_after(33000);
+    CHECK(!pairing_on, "behind: off");
+    apps_lv_set_front(true);
+    refresh_after(33000);
+    CHECK(pairing_on, "in front: on");
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    refresh_after(33000);
+    CHECK(!pairing_on, "the launcher over it: off");
+    apps_lv_close_launcher();
+    refresh_after(33000);
+    CHECK(pairing_on, "the launcher closed: on");
+    apps_lv_show_crash("Spin", NULL);
+    refresh_after(33000);
+    CHECK(!pairing_on, "a card over it: off");
+    apps_lv_hide_cards();
+    refresh_after(33000);
+    CHECK(pairing_on, "the card gone: on");
+
+    /* An image that spins and a spinner share it: the pairing is on while either is. */
+    RUN(&e, "w:set{hidden = true} d = ui.image{src = 'a.bin', spin = 33}");
+    CHECK(APPLY(&e), "a spinning image");
+    refresh_after(33000);
+    CHECK(pairing_on && stats_now().spinning == 1, "the image keeps it on");
+    RUN(&e, "w:set{hidden = false} d:set{spin = 0}");
+    CHECK(APPLY(&e), "the image stops, the spinner shown");
+    refresh_after(33000);
+    CHECK(pairing_on, "the spinner keeps it on");
+    RUN(&e, "ui.clear()");
+    CHECK(APPLY(&e), "cleared");
+    refresh_after(33000);
+    CHECK(!pairing_on, "nothing left: off");
+    apps_lv_set_pairing_cb(NULL);
     FINISH(&e);
 }
 
@@ -8926,6 +9031,7 @@ int main(int argc, char **argv) {
         {"spin_ends_with_the_widget", spin_ends_with_the_widget},
         {"spin_frame_log", spin_frame_log},
         {"pairing_follows_the_spin", pairing_follows_the_spin},
+        {"pairing_follows_a_shown_spinner", pairing_follows_a_shown_spinner},
         {"spinner_is_made_and_styled", spinner_is_made_and_styled},
         {"spinner_animates_only_while_shown", spinner_animates_only_while_shown},
         {"crash_card_text_and_tap", crash_card_text_and_tap},

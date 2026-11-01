@@ -1474,11 +1474,37 @@ static bool spin_in_front(void) {
     return s_spinning > 0 && s_front && !s_launcher_shown && !s_crash_shown;
 }
 
-/* LV_EVENT_REFR_READY, once a pairing callback is set: the board's frame pairing on while an image spins in front, off when not,
- * each change once. A change takes effect from the next refresh (the board's pairing is read as LVGL flushes). */
+/* A spinner is shown on the layer in front, with no launcher or card over it: its own object is not hidden and no box above it is
+ * (lv_obj_has_flag up to the layer). Its two-band refreshes tear without the board's frame pairing (R8a), so it follows the spin.
+ * A spinner is not an image that spins: no spin cap and no spin frame log count it. */
+static bool spinner_in_front(void) {
+    if (s_state == NULL || !s_front || s_launcher_shown || s_crash_shown) {
+        return false;
+    }
+    for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
+        const node_t *n = &s_state->node[slot];
+        if (n->obj == NULL || n->kind != APPS_W_SPINNER) {
+            continue;
+        }
+        bool shown = true;
+        for (const lv_obj_t *o = n->obj; o != NULL && o != s_layer; o = lv_obj_get_parent(o)) {
+            if (lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) {
+                shown = false;
+                break;
+            }
+        }
+        if (shown) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* LV_EVENT_REFR_READY, once a pairing callback is set: the board's frame pairing on while an image spins in front or a spinner is
+ * shown there, off when not, each change once. A change takes effect from the next refresh (the board's pairing is read as LVGL flushes). */
 static void follow_spin(lv_event_t *e) {
     (void)e;
-    bool on = spin_in_front();
+    bool on = spin_in_front() || spinner_in_front();
     if (s_pairing_cb != NULL && on != s_paired) {
         s_paired = on;
         s_pairing_cb(on);

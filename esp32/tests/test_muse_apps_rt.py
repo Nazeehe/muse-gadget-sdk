@@ -1653,6 +1653,46 @@ class TallyOnAppHost(AppHostTestCase):
         self.assertEqual(host.events[-1], {"event": "state", "state": "running"})
         host.close()
 
+    def test_tally_clears_a_read_error_once_a_read_is_good(self):
+        # I5: an error of the data's read (here the hook hasn't written state/rev yet) shows until a read is good, and then
+        # goes: Muse copies the example, and a connected app mustn't keep a stale error over good data. What a command or an
+        # ask said stays: a read doesn't disprove it.
+        vm = self.vm_folder()
+        host = AppHostSession(self, self.apphost, "--vm", vm, "--script", "-", TALLY)
+        self.assertEqual(tally_screen(host.do("sync 1767225600000", "advance 1500", "dump")),
+                         {"count": "-", "status": "no such file on the VM: state/rev", "waiting": False})
+        (vm / "state").mkdir(exist_ok=True)
+        (vm / "state/count.json").write_text('{"count":5}')
+        (vm / "state/rev").write_text("1\n")
+        self.assertEqual(tally_screen(host.do("advance 1500", "dump")), {"count": "5", "status": "", "waiting": False})
+
+        # A command's refusal, then a good read: the refusal stays.
+        host.do('tap "Reset"', "advance 50")
+        (path,) = sorted((vm / "outbox").glob("cmd-*.json"))
+        seq = json.loads(path.read_text())["seq"]
+        path.unlink()
+        (vm / "state/acks.json").write_text(json.dumps({"acks": [{"seq": seq, "result": {"ok": False, "error": "busy"}}]}))
+        self.assertEqual(tally_screen(host.do("advance 1500", "dump"))["status"], "busy")
+        (vm / "state/count.json").write_text('{"count":6}')
+        (vm / "state/rev").write_text("2\n")
+        self.assertEqual(tally_screen(host.do("advance 1500", "dump")), {"count": "6", "status": "busy", "waiting": False})
+
+        # What an ask said (apphost has no Muse: "not set up"), then a good read: it stays too.
+        self.assertEqual(tally_screen(host.do('tap "Ask"', "advance 100", "dump"))["status"], "not set up")
+        (vm / "state/count.json").write_text('{"count":7}')
+        (vm / "state/rev").write_text("3\n")
+        self.assertEqual(tally_screen(host.do("advance 1500", "dump")), {"count": "7", "status": "not set up", "waiting": False})
+
+        # A read that fails (the state file gone) shows its error, and the next good one clears it.
+        (vm / "state/count.json").unlink()
+        (vm / "state/rev").write_text("4\n")
+        self.assertEqual(tally_screen(host.do("advance 1500", "dump"))["status"], "no such file on the VM: state/count.json")
+        (vm / "state/count.json").write_text('{"count":8}')
+        (vm / "state/rev").write_text("5\n")
+        self.assertEqual(tally_screen(host.do("advance 1500", "dump")), {"count": "8", "status": "", "waiting": False})
+        self.assertEqual([e for e in host.events if e["event"] in ("crash", "error", "warning")], [])
+        host.close()
+
     def test_the_fake_vm_is_a_folder(self):
         # --vm DIR: reads come from DIR (a missing file in the gadget's words, a .txt as text), writes land in it (outbox/ made
         # as needed), and a JPEG, which only the gadget decodes, is refused through the callback.

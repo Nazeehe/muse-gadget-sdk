@@ -12,6 +12,7 @@ local STATUS_MAX = 120                   -- a label holds 256 bytes: replies and
 
 local count, status, spinner, watch
 local waiting = 0                        -- commands and asks that wait: the spinner shows while there are any
+local read_error = false                 -- the status is an error of the count's read, which the next good read clears
 
 -- s cut to STATUS_MAX bytes at a character's start, with "..." when it was longer.
 local function fit(s)
@@ -22,26 +23,33 @@ local function fit(s)
   return s:sub(1, n) .. "..."
 end
 
-local function say(text) status:set{ text = fit(text) } end
+-- text on the status line; is_read_error: it is an error of the count's read. What a command or an ask said stays until
+-- the next one: a good read doesn't disprove it.
+local function say(text, is_read_error)
+  status:set{ text = fit(text) }
+  read_error = is_read_error == true
+end
 
 local function wait(delta)
   waiting = waiting + delta
   spinner:set{ hidden = waiting == 0 }
 end
 
--- The count from the hook's state, if it is one: the file is the hook's, so check it.
+-- The count from the hook's state, if it is one: the file is the hook's, so check it. Whether it was.
 local function show(v)
   if type(v) == "table" and math.type(v.count) == "integer" then
     count:set{ text = tostring(v.count) }
+    return true
   end
+  return false
 end
 
--- The hook changed its files: read the count.
+-- The hook changed its files: read the count. A good read clears an error of an earlier one.
 local function on_rev(rev, err)
-  if rev == nil then say(err) return end
+  if rev == nil then say(err, true) return end
   vm.read("state/count.json", function(v, why)
-    if v == nil then say(why) return end
-    show(v)
+    if v == nil then say(why, true) return end
+    if show(v) and read_error then say("") end
   end)
 end
 

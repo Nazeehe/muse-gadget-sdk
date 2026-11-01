@@ -687,14 +687,19 @@ class GuideAndSkill(unittest.TestCase):
 
     def test_guide_states_the_spin_cap(self):
         # connected apps Task 1, fix round 0 (R1): Images says how large a picture may spin (D12: from APPS_SPIN_SIDE_MAX), why, and
-        # what to do with a larger one. test_muse_apps_ui.py's test_spin_is_capped_at_200_px_drawn has the error itself.
+        # what to do with a larger one. test_muse_apps_ui.py's test_spin_is_capped_at_the_side_max_drawn has the error itself.
+        # Task 7 (R1b) lowered the cap to 180 px; the example of two pictures that fit and two that don't follows from the total:
+        # the largest multiple of 5 px that two fit in, and 5 more.
         side_max = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
         area_max = header_number("apps_ui.h", "APPS_SPIN_AREA_MAX")  # fix round 1 (R1a): what spins at once, together
+        fit = max(n for n in range(5, side_max + 1, 5) if 2 * n * n <= area_max)
+        self.assertGreater(2 * (fit + 5) ** 2, area_max)
         images = " ".join(guide_section(GUIDE.read_text(), "Images").split())
         for pattern in (rf"`spin` is for a picture of at most {side_max} x {side_max} px on screen", r"times `scale`",
                         r"about 1 µs for every pixel drawn", r"show it still and spin a smaller copy",
                         rf"[Pp]ictures that spin at once share that: together they may cover at most {area_max:,} px "
-                        rf"\(one {side_max} x {side_max}\)", r"[Aa] hidden one, or one in a hidden box, doesn't count"):
+                        rf"\(one {side_max} x {side_max}\)", r"[Aa] hidden one, or one in a hidden box, doesn't count",
+                        rf"so two of {fit} x {fit} fit and two of {fit + 5} x {fit + 5} don't"):
             with self.subTest(pattern):
                 self.assertRegex(images, pattern)
 
@@ -782,6 +787,7 @@ class GuideAndSkill(unittest.TestCase):
         # vm.read's opts example, as the call's own error has it.
         example = re.search(r'(?m)^#define OPTS_EXAMPLE "([^"]+)"$', (APPS / "apps_vmio.c").read_text()).group(1)
         example_max = int(re.fullmatch(r"\{circle = true, max = (\d+)\}", example).group(1))
+        self.assertLessEqual(example_max, header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX"), "the example's disc is one that may spin")
         # A .bin read is at most a package image's bytes.
         self.assertRegex((APPS / "apps_vmio.h").read_text(), r"(?m)^#define APPS_VM_BIN_MAX APPS_IMAGE_MAX$")
         image_kb = int(re.search(r"(?m)^#define APPS_IMAGE_MAX \((\d+) \* 1024\)", (APPS / "apps_pkg.h").read_text()).group(1))

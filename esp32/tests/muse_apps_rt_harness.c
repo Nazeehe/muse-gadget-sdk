@@ -4439,34 +4439,44 @@ static void images_at_the_end(void) {
     CHECK(apps_rt_images_take(NULL, blocks) == 0, "no runtime, no images");
 }
 
-/* P9: a runtime image is sized from its header, so its spin meets both caps as a package image's does: 200 px spins, 201 is the side
- * cap's error, and two that cover more than 40,000 px together are the total's. */
+/* P9: a runtime image is sized from its header, so its spin meets both caps as a package image's does: APPS_SPIN_SIDE_MAX px
+ * spins, one more is the side cap's error, and two that cover more than APPS_SPIN_AREA_MAX px together are the total's (two of
+ * `over`, the smallest multiple of 5 px that two of are past it, as the guide's example has it). */
 static void images_spin_caps(void) {
     apps_pkg_t *pkg;
     apps_rt_t *rt = launch(&pkg, "return {}");
     if (rt == NULL) {
         return;
     }
-    char err[256] = "";
-    CHECK(add_image(rt, CF_RGB565A8, 200, 200, err, sizeof err) == 0 && add_image(rt, CF_RGB565, 201, 201, err, sizeof err) == 1 &&
-              add_image(rt, CF_RGB565, 150, 150, err, sizeof err) == 2 && add_image(rt, CF_RGB565A8, 150, 150, err, sizeof err) == 3,
+    const int side = APPS_SPIN_SIDE_MAX;
+    int over = 5;
+    while (2 * over * over <= APPS_SPIN_AREA_MAX) {
+        over += 5;
+    }
+    char err[256] = "", side_err[160], total_err[160];
+    snprintf(side_err, sizeof side_err,
+             "t.lua:1: ui.image: spin: an image may spin only up to %d x %d px on screen (this one is %d x %d)", side, side,
+             side + 1, side + 1);
+    snprintf(total_err, sizeof total_err,
+             "t.lua:1: ui.image: spin: images spinning at once may cover at most %d x %d px together (these would cover %d px)",
+             side, side, 2 * over * over);
+    CHECK(add_image(rt, CF_RGB565A8, side, side, err, sizeof err) == 0 &&
+              add_image(rt, CF_RGB565, side + 1, side + 1, err, sizeof err) == 1 &&
+              add_image(rt, CF_RGB565, over, over, err, sizeof err) == 2 && add_image(rt, CF_RGB565A8, over, over, err, sizeof err) == 3,
           "adds: %s", err);
-    CHECK(push_image(rt, 0, "s200") && push_image(rt, 1, "s201") && push_image(rt, 2, "c") && push_image(rt, 3, "d"), "push");
-    CHUNK(rt, "x = ui.image{src = s200, spin = 30}");
-    CHUNK_FAILS(rt, "ui.image{src = s201, spin = 10}",
-                "t.lua:1: ui.image: spin: an image may spin only up to 200 x 200 px on screen (this one is 201 x 201)");
-    CHUNK(rt, "y = ui.image{src = s201}");
-    CHUNK_FAILS(rt, "y:set{spin = 10}", "t.lua:1: ui.image: spin: an image may spin only up to 200 x 200 px on screen (this one is 201 x 201)");
-    CHUNK_FAILS(rt, "x:set{src = s201}", "t.lua:1: ui.image: spin: an image may spin only up to 200 x 200 px on screen (this one is 201 x 201)");
-    CHUNK(rt, "x:set{scale = 50} x:set{src = s201}");  /* 101 x 101 */
+    CHECK(push_image(rt, 0, "full") && push_image(rt, 1, "bigger") && push_image(rt, 2, "c") && push_image(rt, 3, "d"), "push");
+    CHUNK(rt, "x = ui.image{src = full, spin = 30}");
+    CHUNK_FAILS(rt, "ui.image{src = bigger, spin = 10}", side_err);
+    CHUNK(rt, "y = ui.image{src = bigger}");
+    CHUNK_FAILS(rt, "y:set{spin = 10}", side_err);
+    CHUNK_FAILS(rt, "x:set{src = bigger}", side_err);
+    CHUNK(rt, "x:set{scale = 50} x:set{src = bigger}");  /* half the side, and a px */
     CHUNK(rt, "x:delete() y:delete()");
-    CHUNK(rt, "p = ui.image{src = c, spin = 10}");  /* 22,500 px */
-    CHUNK_FAILS(rt, "ui.image{src = d, spin = 10}",
-                "t.lua:1: ui.image: spin: images spinning at once may cover at most 200 x 200 px together (these would cover 45000 px)");
+    CHUNK(rt, "p = ui.image{src = c, spin = 10}");
+    CHUNK_FAILS(rt, "ui.image{src = d, spin = 10}", total_err);
     CHUNK(rt, "q = ui.image{src = d}");
-    CHUNK_FAILS(rt, "q:set{spin = 5}",
-                "t.lua:1: ui.image: spin: images spinning at once may cover at most 200 x 200 px together (these would cover 45000 px)");
-    CHUNK(rt, "q:set{spin = 5, scale = 80}");  /* 120 x 120: 14,400 + 22,500 */
+    CHUNK_FAILS(rt, "q:set{spin = 5}", total_err);
+    CHUNK(rt, "q:set{spin = 5, scale = 80}");  /* q at 80%: 0.64 of its area, and p's */
     CHUNK(rt, "p:set{spin = 0} q:set{scale = 100} p:delete() q:delete()");
     finish(rt, pkg);
 }

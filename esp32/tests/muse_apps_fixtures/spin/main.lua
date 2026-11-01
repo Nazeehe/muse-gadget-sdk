@@ -3,11 +3,12 @@
 
 -- The spin fixture (connected apps Tasks 1 and 7): the board's spin gate's app. Four layouts, each with a picture
 -- spinning at 33 turns a minute and a button under it:
--- - "disc" (the start): a 200 px record, an RGB565A8 image with a circular alpha, spinning whole (Task 1's gate).
+-- - "disc" (the start): a 180 px record, an RGB565A8 image with a circular alpha, spinning whole (Task 1's gate, at the
+--   180 px cap Task 7 set).
 -- - "body": the same record as Images teaches it, its grooves and sheen drawn still (body.bin) under an 80 px label
 --   that spins (label.bin).
--- - "cover": the 200 px record spinning over a still, dimmed 400 px picture (cover.bin), as a now-playing screen.
--- - "square": a 200 px square of spokes with no alpha (square.bin), whose corners swing as it spins: LVGL draws each step in
+-- - "cover": the 180 px record spinning over a still, dimmed 400 px picture (cover.bin), as a now-playing screen.
+-- - "square": a 180 px square of spokes with no alpha (square.bin), whose corners swing as it spins: LVGL draws each step in
 --   two bands, and a tear between them would break the spokes.
 -- The board's gate reads a bench build's "spin frame <ms> ms" and "tearing effect:" lines while it spins, and taps the
 -- button: each tap counts on the button and prints "tap <n> <time.mono()>", so the host can time its answer.
@@ -36,7 +37,7 @@ local function state()
     return {layout = layout, rotation = s:get("rotation"), spin = s:get("spin"), scale = s:get("scale"), taps = taps}
 end
 
--- Spinning pictures share 40,000 px: the one that stops goes first.
+-- Spinning pictures share 32,400 px: the one that stops goes first.
 local function show(name)
     local old, new = spinner(), spinners[name]
     if old ~= new then

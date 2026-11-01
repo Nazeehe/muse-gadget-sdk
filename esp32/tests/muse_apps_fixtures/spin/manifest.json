@@ -1,7 +1,7 @@
 {
   "id": "spin",
   "name": "Spin",
-  "version": "2",
+  "version": "3",
   "api": 1,
   "files": [
     "disc.bin",
@@ -15,10 +15,10 @@
   ],
   "memory_kb": 64,
   "messages": {
-    "layout": "data {name}: disc (the 200 px record spinning), body (its 80 px label spinning on it), cover (over a still 400 px picture) or square (spokes). Replies with state.",
+    "layout": "data {name}: disc (the 180 px record spinning), body (its 80 px label spinning on it), cover (over a still 400 px picture) or square (spokes). Replies with state.",
     "spin": "data {rpm}: the spinning picture's spin, 0 to 60 turns a minute (0 stops it where it is). Replies with state.",
     "rotation": "data {deg}: turns the spinning picture to deg, 0 to 359, spinning or not. Replies with state.",
-    "scale": "data {pct}: the spinning picture's scale, 10 to 400 percent (over 200 px on screen is an error while it spins). Replies with state.",
+    "scale": "data {pct}: the spinning picture's scale, 10 to 400 percent (over 180 px on screen is an error while it spins). Replies with state.",
     "state": "Change nothing. Replies {layout, rotation, spin, scale, taps}: get's values for the spinning picture, and the taps so far."
   }
 }

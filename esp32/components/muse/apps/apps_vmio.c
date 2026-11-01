@@ -52,7 +52,7 @@
 #define STR(x) STR_(x)
 
 #define PATH_RULE "(a-z 0-9 _ . / -, no '..', at most " STR(APPS_PATH_MAX) " characters)"
-#define OPTS_EXAMPLE "{circle = true, max = 200}"
+#define OPTS_EXAMPLE "{circle = true, max = 180}"
 #define OUTBOX "outbox/"
 #define ACKS_PATH "state/acks.json"
 #define BEAT_PATH "outbox/active.json"

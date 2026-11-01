@@ -721,135 +721,158 @@ class UiTest(UiTestCase):
             f"false\tui.image: {turns}, got string",
         ])
 
-    def test_spin_is_capped_at_200_px_drawn(self):
+    def test_spin_is_capped_at_the_side_max_drawn(self):
         # connected apps Task 1, fix round 0 (R1): an image spins only while both its sides as drawn (the header's w and h times scale,
         # to the nearest px as apps_lv.c's scaled_side has it) are at most APPS_SPIN_SIDE_MAX. The call that would break that is the
         # error: a create, a set of spin, or a set of scale or src while it spins. spin = 0 always goes, and a refused set changes
         # nothing. A picture too large itself is that error, before what spins at once (test_spin_total_area_is_capped) is counted.
+        # Task 7 (R1b) lowered the cap from 200 to 180 px: the pictures and scales here follow from it (D12).
         side_max = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
-        self.assertEqual(side_max, 200)
-        lines = self.lua_lines("""
+        self.assertEqual(side_max, 180)
+        self.assertEqual(side_max % 4, 0, "a quarter of the side at 400% is the side")
+
+        def drawn(side, scale):
+            return (side * scale + 50) // 100
+
+        s, double, mid, quarter = side_max, side_max * 3 // 5, side_max * 3 // 4, side_max // 4
+        self.assertGreater(drawn(double, 200), s)
+        self.assertGreater(drawn(mid, 150), s)
+        scale_ok = max(k for k in range(10, 401) if drawn(mid, k) <= s)  # mid's largest scale that may spin
+        lines = self.lua_lines(f"""
             local function try(f, ...) local ok, err = pcall(f, ...) print(ok, err) end
-            local a = ui.image{src = "s200.bin", spin = 33}
+            local a = ui.image{{src = "full.bin", spin = 33}}
             print(a:get("spin"))
-            try(ui.image, {src = "w201.bin", spin = 33})
-            local b = ui.image{src = "w201.bin"}
-            try(b.set, b, {spin = 10})
+            try(ui.image, {{src = "over.bin", spin = 33}})
+            local b = ui.image{{src = "over.bin"}}
+            try(b.set, b, {{spin = 10}})
             print(b:get("spin"))
-            try(ui.image, {src = "s120.bin", scale = 200, spin = 33})
-            local c = ui.image{src = "s120.bin", scale = 200}
-            try(c.set, c, {spin = 1})
-            a:set{spin = 0}  -- room for d among what spins at once (R1a)
-            local d = ui.image{src = "s150.bin", spin = 20}
-            try(d.set, d, {scale = 150})
+            try(ui.image, {{src = "double.bin", scale = 200, spin = 33}})
+            local c = ui.image{{src = "double.bin", scale = 200}}
+            try(c.set, c, {{spin = 1}})
+            a:set{{spin = 0}}  -- room for d among what spins at once (R1a)
+            local d = ui.image{{src = "mid.bin", spin = 20}}
+            try(d.set, d, {{scale = 150}})
             print(d:get("scale"), d:get("spin"))
-            d:set{scale = 133}
+            d:set{{scale = {scale_ok}}}
             print(d:get("scale"))
-            try(d.set, d, {scale = 134})
-            d:set{scale = 150, spin = 0}
+            try(d.set, d, {{scale = {scale_ok + 1}}})
+            d:set{{scale = 150, spin = 0}}
             print(d:get("scale"), d:get("spin"))
-            a:set{spin = 33}
-            try(a.set, a, {src = "w201.bin"})
+            a:set{{spin = 33}}
+            try(a.set, a, {{src = "over.bin"}})
             print(a:get("src"), a:get("spin"))
-            a:set{src = "w201.bin", spin = 0}
-            b:set{spin = 0}
-            local e = ui.image{src = "w201.bin", scale = 400, spin = 0}
+            a:set{{src = "over.bin", spin = 0}}
+            b:set{{spin = 0}}
+            local e = ui.image{{src = "over.bin", scale = 400, spin = 0}}
             print(a:get("src"), b:get("spin"), e:get("spin"))
-            local f = ui.image{src = "s120.bin", scale = 400}
-            f:set{src = "s50.bin", spin = 60}
+            local f = ui.image{{src = "double.bin", scale = 400}}
+            f:set{{src = "quarter.bin", spin = 60}}
             print(f:get("scale"), f:get("spin"))
-        """, files={"s200.bin": lvgl_image(200, 200), "w201.bin": lvgl_image(201, 200), "s120.bin": lvgl_image(120, 120),
-                    "s150.bin": lvgl_image(150, 150), "s50.bin": lvgl_image(50, 50)})
+        """, files={"full.bin": lvgl_image(s, s), "over.bin": lvgl_image(s + 1, s), "double.bin": lvgl_image(double, double),
+                    "mid.bin": lvgl_image(mid, mid), "quarter.bin": lvgl_image(quarter, quarter)})
 
         def refused(w, h):
             return f"false\tui.image: spin: an image may spin only up to {side_max} x {side_max} px on screen (this one is {w} x {h})"
 
         self.assertEqual(lines, [
             "33",
-            refused(201, 200),
-            refused(201, 200), "0",
-            refused(240, 240),
-            refused(240, 240),
-            refused(225, 225), "100\t20",  # a refused set changed nothing
-            "133",  # 150 px at 133% is 199.5, drawn as 200
-            refused(201, 201),
+            refused(s + 1, s),
+            refused(s + 1, s), "0",
+            refused(2 * double, 2 * double),
+            refused(2 * double, 2 * double),
+            refused(drawn(mid, 150), drawn(mid, 150)), "100\t20",  # a refused set changed nothing
+            str(scale_ok),  # mid at its largest scale is drawn at the side, to the nearest px
+            refused(drawn(mid, scale_ok + 1), drawn(mid, scale_ok + 1)),
             "150\t0",
-            refused(201, 200), "s200.bin\t33",
-            "w201.bin\t0\t0",
-            "400\t60",  # 50 px at 400% is 200
+            refused(s + 1, s), "full.bin\t33",
+            "over.bin\t0\t0",
+            "400\t60",  # a quarter of the side at 400% is the side
         ])
 
     def test_spin_total_area_is_capped(self):
         # connected apps Task 1, fix round 1 (R1a): the images that spin at once and show (not hidden, nor in a hidden box) cover at
         # most APPS_SPIN_AREA_MAX px together, their drawn w x h added up. A call that would raise the total past it is the error:
         # a spin made or given, a scale or src while it spins, or a hidden spinner (or the box it's in) shown. A refused call changes
-        # nothing; a delete, spin = 0 or a hide frees room.
+        # nothing; a delete, spin = 0 or a hide frees room. Task 7 (R1b): 180 px, 32,400 px together; the pictures follow from it,
+        # as the guide's example does (two of `fit` fit, two of `fit` + 5 don't).
         side_max = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
         area_max = header_number("apps_ui.h", "APPS_SPIN_AREA_MAX")
-        self.assertEqual(area_max, 40000)
+        self.assertEqual(area_max, 32400)
         self.assertEqual(area_max, side_max * side_max, "the message says the total as one picture's sides")
-        lines = self.lua_lines("""
+
+        def drawn(side, scale):
+            return (side * scale + 50) // 100
+
+        s, quarter = side_max, side_max // 4
+        fit = max(n for n in range(5, s + 1, 5) if 2 * n * n <= area_max)
+        over = fit + 5
+        self.assertGreater(2 * over * over, area_max)
+        self.assertGreater(fit * fit + over * over, area_max, "the src that grows e past the total")
+        grow = min(k for k in range(101, 401) if fit * fit + drawn(fit, k) ** 2 > area_max)  # e's smallest scale past it
+        self.assertLessEqual(drawn(fit, grow), s, "the total's error, not the side's")
+        self.assertGreater(3 * fit * fit, area_max)
+        lines = self.lua_lines(f"""
             local function try(f, ...) local ok, err = pcall(f, ...) print(ok, err) end
-            local a = ui.image{src = "s150.bin", spin = 10}
-            try(ui.image, {src = "s150.bin", spin = 10})
-            local b = ui.image{src = "s150.bin"}
-            try(b.set, b, {spin = 10})
+            local a = ui.image{{src = "over.bin", spin = 10}}
+            try(ui.image, {{src = "over.bin", spin = 10}})
+            local b = ui.image{{src = "over.bin"}}
+            try(b.set, b, {{spin = 10}})
             print(b:get("spin"))
             a:delete()
-            b:set{spin = 10}
+            b:set{{spin = 10}}
             print(b:get("spin"))
-            b:set{spin = 0}
-            local c = ui.image{src = "s200.bin", spin = 33}
-            try(ui.image, {src = "s50.bin", spin = 33})
-            c:set{spin = 0}
-            local d = ui.image{src = "s140.bin", spin = 20}
-            local e = ui.image{src = "s140.bin", spin = 20}
+            b:set{{spin = 0}}
+            local c = ui.image{{src = "full.bin", spin = 33}}
+            try(ui.image, {{src = "quarter.bin", spin = 33}})
+            c:set{{spin = 0}}
+            local d = ui.image{{src = "fit.bin", spin = 20}}
+            local e = ui.image{{src = "fit.bin", spin = 20}}
             print(d:get("spin"), e:get("spin"))
-            try(e.set, e, {scale = 110})
-            try(e.set, e, {src = "s150.bin"})
+            try(e.set, e, {{scale = {grow}}})
+            try(e.set, e, {{src = "over.bin"}})
             print(e:get("scale"), e:get("src"))
-            e:set{hidden = true}
-            local f = ui.image{src = "s140.bin", spin = 20}
-            try(e.set, e, {hidden = false})
+            e:set{{hidden = true}}
+            local f = ui.image{{src = "fit.bin", spin = 20}}
+            try(e.set, e, {{hidden = false}})
             print(e:get("hidden"))
-            local g = ui.image{src = "s140.bin", spin = 20, hidden = true}
-            local box = ui.box{hidden = true}
-            local h = ui.image{src = "s140.bin", spin = 20, parent = box}
-            try(box.set, box, {hidden = false})
+            local g = ui.image{{src = "fit.bin", spin = 20, hidden = true}}
+            local box = ui.box{{hidden = true}}
+            local h = ui.image{{src = "fit.bin", spin = 20, parent = box}}
+            try(box.set, box, {{hidden = false}})
             print(box:get("hidden"))
-            f:set{spin = 0}
-            e:set{hidden = false}
+            f:set{{spin = 0}}
+            e:set{{hidden = false}}
             print(e:get("hidden"))
-            d:set{spin = 0}
-            e:set{scale = 50}
-            box:set{hidden = false}
+            d:set{{spin = 0}}
+            e:set{{scale = 50}}
+            box:set{{hidden = false}}
             print(box:get("hidden"))
             ui.clear()
-            local i = ui.image{src = "s200.bin", spin = 60}
+            local i = ui.image{{src = "full.bin", spin = 60}}
             print(i:get("spin"))
-        """, files={"s200.bin": lvgl_image(200, 200), "s150.bin": lvgl_image(150, 150), "s140.bin": lvgl_image(140, 140),
-                    "s50.bin": lvgl_image(50, 50)})
+        """, files={"full.bin": lvgl_image(s, s), "over.bin": lvgl_image(over, over), "fit.bin": lvgl_image(fit, fit),
+                    "quarter.bin": lvgl_image(quarter, quarter)})
 
         def refused(kind, n):
             return (f"false\tui.{kind}: spin: images spinning at once may cover at most {side_max} x {side_max} px together "
                     f"(these would cover {n} px)")
 
         self.assertEqual(lines, [
-            refused("image", 45000),  # two 150 px
-            refused("image", 45000), "0",
+            refused("image", 2 * over * over),  # two of `over`
+            refused("image", 2 * over * over), "0",
             "10",  # a deleted spinner freed its area
-            refused("image", 42500),  # 200 px and 50 px
-            "20\t20",  # 140 px and 140 px: 39,200
-            refused("image", 19600 + 154 * 154),  # e grows while it spins
-            refused("image", 19600 + 22500),  # e's src grows while it spins
-            "100\ts140.bin",
-            refused("image", 3 * 19600),  # a hidden spinner shown: d, f and e
+            refused("image", s * s + quarter * quarter),  # the whole side and a quarter of it
+            "20\t20",  # two of `fit`
+            refused("image", fit * fit + drawn(fit, grow) ** 2),  # e grows while it spins
+            refused("image", fit * fit + over * over),  # e's src grows while it spins
+            f"100\tfit.bin",
+            refused("image", 3 * fit * fit),  # a hidden spinner shown: d, f and e
             "true",
-            refused("box", 3 * 19600),  # a box shown with a spinner in it (g is hidden itself): d, f and h
+            refused("box", 3 * fit * fit),  # a box shown with a spinner in it (g is hidden itself): d, f and h
             "true",
-            "false",  # f stopped, so e shows: d and e, 39,200
-            "false",  # d stopped and e at 70 px, so the box shows: e and h, 24,500
-            "60",  # ui.clear() freed it all: one 200 px
+            "false",  # f stopped, so e shows: d and e
+            "false",  # d stopped and e at 50%, so the box shows: e and h
+            "60",  # ui.clear() freed it all: one picture of the side
         ])
 
     def test_the_spin_fixture(self):  # connected apps Tasks 1 and 7: the board's spin gate's app, and its pictures
@@ -861,7 +884,7 @@ class UiTest(UiTestCase):
             return cf, w, h, data
 
         side = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
-        # disc.bin: 200 x 200 RGB565A8, the most an image may spin (APPS_SPIN_SIDE_MAX, fix round 0); its alpha a circle.
+        # disc.bin: RGB565A8 at the most an image may spin (APPS_SPIN_SIDE_MAX: 180 px since Task 7's R1b); its alpha a circle.
         # body.bin: the same record without its label, still; label.bin: 80 px, the label that spins on it (Task 7).
         for name, size in (("disc.bin", side), ("body.bin", side), ("label.bin", 80)):
             cf, w, h, data = image(name)
@@ -879,7 +902,7 @@ class UiTest(UiTestCase):
             colours = {data[12 + 2 * (y * w + x):14 + 2 * (y * w + x)] for x in range(w // 4, w * 3 // 4, 4)
                        for y in range(w // 4, w * 3 // 4, 4)}
             self.assertGreater(len(colours), 8, f"{name}: detail")
-        # cover.bin: R2's screen's still, dimmed picture, 400 px, no alpha; square.bin: 200 px of spokes, no alpha, whose corners
+        # cover.bin: R2's screen's still, dimmed picture, 400 px, no alpha; square.bin: spokes at the side, no alpha, whose corners
         # swing as it spins (LVGL draws it in two bands).
         self.assertEqual(image("cover.bin")[:3], (0x12, 400, 400))
         self.assertEqual(image("square.bin")[:3], (0x12, side, side))

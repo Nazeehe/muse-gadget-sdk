@@ -95,9 +95,9 @@
  *   ui.<kind>: parent can only be set when the widget is created
  *   ui.image: src is required (a .bin image of this app's manifest.json "files") | src '<s>' is not one of this
  *             app's images (manifest.json "files") | src image#<n> was freed
- *   ui.image: spin: an image may spin only up to 200 x 200 px on screen (this one is <w> x <h>) | spin: this
+ *   ui.image: spin: an image may spin only up to 180 x 180 px on screen (this one is <w> x <h>) | spin: this
  *             image's size is unknown
- *   ui.image: spin: images spinning at once may cover at most 200 x 200 px together (these would cover <n> px)
+ *   ui.image: spin: images spinning at once may cover at most 180 x 180 px together (these would cover <n> px)
  *                                                    (ui.box the same, for a box shown with a spinner in it)
  *   ui.<kind>: unknown method '<name>' (valid: set, get, on, delete)
  *   ui.<kind>: unknown event '<s>' (valid: tap, long_press, press, release)
@@ -190,8 +190,8 @@ typedef struct lua_State lua_State;
 #define APPS_UI_BOX_DEPTH_MAX 4
 #define APPS_UI_ASSETS_MAX 32      /* the package's most files */
 #define APPS_SPIN_RPM_MAX 60       /* ui.image's spin: the most turns a minute */
-#define APPS_SPIN_SIDE_MAX 200     /* ui.image spins only up to this many px a side as drawn (scale applied): the spin gate */
-#define APPS_SPIN_AREA_MAX 40000   /* the px the images spinning at once may cover together, drawn: one 200 x 200 */
+#define APPS_SPIN_SIDE_MAX 180     /* ui.image spins only up to this many px a side as drawn (scale applied): the spin gate */
+#define APPS_SPIN_AREA_MAX 32400   /* the px the images spinning at once may cover together, drawn: one 180 x 180 */
 #define APPS_COLOR_NONE 0xFF000000u
 
 typedef enum { APPS_W_LABEL, APPS_W_BUTTON, APPS_W_BOX, APPS_W_ARC, APPS_W_BAR, APPS_W_IMAGE } apps_wkind_t;

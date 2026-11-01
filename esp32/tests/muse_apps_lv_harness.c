@@ -7471,9 +7471,12 @@ static void image_spin_animates_and_stops_in_place(void) {
     FINISH(&e);
 }
 
-/* Pictures for Task 7's case: side x side, RGB565A8 whose alpha is 255 where a pixel's centre is strictly inside the circle
- * inscribed in the picture and 0 outside (apps_jpeg's circle), or RGB565 with no alpha (a square that is all picture). */
-static uint8_t CIRCLE_200[12 + 200 * 200 * 3], CIRCLE_100[12 + 100 * 100 * 3], SQUARE_200[12 + 200 * 200 * 2];
+/* Pictures for Task 7's case, at the most an image may spin (SPIN_PX) and half that: side x side, RGB565A8 whose alpha is 255 where
+ * a pixel's centre is strictly inside the circle inscribed in the picture and 0 outside (apps_jpeg's circle), or RGB565 with no
+ * alpha (a square that is all picture). */
+#define SPIN_PX APPS_SPIN_SIDE_MAX
+static uint8_t CIRCLE_FULL[12 + SPIN_PX * SPIN_PX * 3], CIRCLE_HALF[12 + (SPIN_PX / 2) * (SPIN_PX / 2) * 3],
+    SQUARE_FULL[12 + SPIN_PX * SPIN_PX * 2];
 
 static void make_picture(uint8_t *b, int side, bool circle) {
     const uint8_t head[12] = {0x19, circle ? 0x14 : 0x12, 0, 0, side & 0xFF, side >> 8, side & 0xFF, side >> 8,
@@ -7495,18 +7498,19 @@ static void make_picture(uint8_t *b, int side, bool circle) {
 }
 
 /* Task 7: what a turned picture invalidates. LVGL makes room past an image's box for its turned corners (lv_image's
- * LV_EVENT_REFR_EXT_DRAW_SIZE) and invalidates the turned box at every step of a spin: a 200 px square at 45 degrees is a 283 px
- * box. A picture whose alpha is a circle draws nothing outside its own box at any angle, so apps_lv caps the room at its
+ * LV_EVENT_REFR_EXT_DRAW_SIZE) and invalidates the turned box at every step of a spin: a square at 45 degrees is a box 1.41 times
+ * its side. A picture whose alpha is a circle draws nothing outside its own box at any angle, so apps_lv caps the room at its
  * farthest pixel that isn't transparent, drawn, plus 2 px: a spinning record invalidates its own square and looks the same.
  * A picture with corners keeps LVGL's room, and a scaled one gets the room its drawn picture needs, not LVGL's for the box
- * scaled again. */
+ * scaled again. The pictures are at the spin cap, SPIN_PX (180 px since Task 7's R1b), and half of it at 200%. */
 static void spin_invalidates_what_it_draws(void) {
-    make_picture(CIRCLE_200, 200, true);
-    make_picture(CIRCLE_100, 100, true);
-    make_picture(SQUARE_200, 200, false);
-    const apps_asset_t assets[] = {{"c.bin", CIRCLE_200, sizeof CIRCLE_200, 200, 200},
-                                   {"s.bin", SQUARE_200, sizeof SQUARE_200, 200, 200},
-                                   {"k.bin", CIRCLE_100, sizeof CIRCLE_100, 100, 100}};
+    make_picture(CIRCLE_FULL, SPIN_PX, true);
+    make_picture(CIRCLE_HALF, SPIN_PX / 2, true);
+    make_picture(SQUARE_FULL, SPIN_PX, false);
+    const apps_asset_t assets[] = {{"c.bin", CIRCLE_FULL, sizeof CIRCLE_FULL, SPIN_PX, SPIN_PX},
+                                   {"s.bin", SQUARE_FULL, sizeof SQUARE_FULL, SPIN_PX, SPIN_PX},
+                                   {"k.bin", CIRCLE_HALF, sizeof CIRCLE_HALF, SPIN_PX / 2, SPIN_PX / 2}};
+    const int diagonal = (int)(SPIN_PX * 1.41421356 + 0.5);  /* the square's turned box at 45 degrees */
     env_t e;
     scene_with(&e, assets, 3);
     RUN(&e, "c = ui.image{src = 'c.bin', spin = 30}");
@@ -7516,29 +7520,30 @@ static void spin_invalidates_what_it_draws(void) {
     fake_inv_clear(c);
     frames(2000, 10);  /* a whole turn */
     lv_area_t box = c->area;
-    CHECK(box.x2 - box.x1 == 199 && box.y2 - box.y1 == 199, "a 200 px box");
+    CHECK(box.x2 - box.x1 == SPIN_PX - 1 && box.y2 - box.y1 == SPIN_PX - 1, "a %d px box", SPIN_PX);
     CHECK(c->turns > 50 && c->inv.x1 >= box.x1 - 3 && c->inv.y1 >= box.y1 - 3 && c->inv.x2 <= box.x2 + 3 && c->inv.y2 <= box.y2 + 3,
           "the record invalidated (%d,%d)-(%d,%d) in %d turns: its box (%d,%d)-(%d,%d) and 3 px at most", (int)c->inv.x1,
           (int)c->inv.y1, (int)c->inv.x2, (int)c->inv.y2, c->turns, (int)box.x1, (int)box.y1, (int)box.x2, (int)box.y2);
-    CHECK(c->ext_draw <= 3 && c->inv_widest <= 206, "room %d, widest %d", (int)c->ext_draw, (int)c->inv_widest);
+    CHECK(c->ext_draw <= 3 && c->inv_widest <= SPIN_PX + 6, "room %d, widest %d", (int)c->ext_draw, (int)c->inv_widest);
 
-    /* All picture, no alpha: its corners swing out, and LVGL's room stays (the turned box, 283 px at 45 degrees). */
+    /* All picture, no alpha: its corners swing out, and LVGL's room stays (the turned box). */
     RUN(&e, "c:set{spin = 0, hidden = true} s = ui.image{src = 's.bin', spin = 30}");
     CHECK(APPLY(&e), "changed");
     lv_obj_t *sq = fake_obj(3);
     fake_inv_clear(sq);
     frames(2000, 10);
-    CHECK(sq->inv_widest >= 280 && sq->inv_widest <= 286, "the square: widest %d", (int)sq->inv_widest);
+    CHECK(sq->inv_widest >= diagonal - 3 && sq->inv_widest <= diagonal + 3, "the square: widest %d, its diagonal %d",
+          (int)sq->inv_widest, diagonal);
 
-    /* Scaled: a 100 px circle at 200% draws 200 px. LVGL turns the 200 px box at 200% (a 400 px square: 566 px at 45 degrees);
-     * the picture drawn needs its box and 4 px. */
+    /* Scaled: half the side at 200% draws the side. LVGL turns the box at 200% (a square of twice the side, 2.83 times it at 45
+     * degrees); the picture drawn needs its box and 4 px. */
     RUN(&e, "s:set{spin = 0, hidden = true} k = ui.image{src = 'k.bin', scale = 200, spin = 30}");
     CHECK(APPLY(&e), "changed");
     lv_obj_t *k = fake_obj(4);
     fake_inv_clear(k);
     frames(2000, 10);
     box = k->area;
-    CHECK(box.x2 - box.x1 == 199, "a box of 200 px: %d", (int)(box.x2 - box.x1 + 1));
+    CHECK(box.x2 - box.x1 == SPIN_PX - 1, "a box of %d px: %d", SPIN_PX, (int)(box.x2 - box.x1 + 1));
     CHECK(k->inv.x1 >= box.x1 - 4 && k->inv.y1 >= box.y1 - 4 && k->inv.x2 <= box.x2 + 4 && k->inv.y2 <= box.y2 + 4 &&
               k->ext_draw <= 4,
           "the scaled record invalidated (%d,%d)-(%d,%d), room %d", (int)k->inv.x1, (int)k->inv.y1, (int)k->inv.x2,
@@ -7550,7 +7555,7 @@ static void spin_invalidates_what_it_draws(void) {
     CHECK(k->ext_draw <= 3, "a still record at 45 degrees: room %d", (int)k->ext_draw);
     RUN(&e, "k:set{src = 's.bin'}");
     CHECK(APPLY(&e), "changed");
-    CHECK(k->ext_draw >= 40, "the square at 45 degrees: room %d", (int)k->ext_draw);
+    CHECK(k->ext_draw >= (diagonal - SPIN_PX) / 2 - 3, "the square at 45 degrees: room %d", (int)k->ext_draw);
     CHECK(log_count("add_event_cb 4 refr_ext_draw_size") == 1, "one cap an object\n%s", log_peek());
 
     /* Unturned images aren't capped, and get no callback. */

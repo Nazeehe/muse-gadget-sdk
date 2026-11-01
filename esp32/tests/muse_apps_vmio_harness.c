@@ -1092,7 +1092,7 @@ static void paths_are_confined(void) {
                   "false\tvm.read: max must be a whole number from 1 to 466",
                   "false\tvm.read: circle must be true or false, got number",
                   "false\tvm.read: unknown option 'bogus' (valid: circle, max)",
-                  "false\tvm.read: opts must be a table like {circle = true, max = 200}, got number",
+                  "false\tvm.read: opts must be a table like {circle = true, max = 180}, got number",
                   "false\tvm.write: path 'outbox/../x.json'" RULE, "false\tvm.write: path '../outbox/x.json'" RULE,
                   "false\tvm.watch: path '../state/rev'" RULE, "false\tvm.watch: path '/state/rev'" RULE,
                   "false\tvm.command: name must be 1-32 characters of a-z, 0-9 and _");

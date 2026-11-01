@@ -761,11 +761,12 @@ static void read_src(const ctx_t *x, prop_t p, int idx, change_t *c) {
     fail_kind(L, x->kind, "src '%s' is not one of this app's images (manifest.json \"files\")", show(&shown, s, len));
 }
 
-/* ---- The spin cap (connected apps Task 1: R1, R1a) ----
- * The board's spin gate drew a turned picture at about 1 us a pixel each step: one 200 px disc (40,000 px) held its frame rate,
- * 300 and 400 px didn't, and taps waited behind them. So a spinning picture is at most APPS_SPIN_SIDE_MAX a side as drawn, and
- * the pictures that spin at once and show cover at most APPS_SPIN_AREA_MAX together. The checks run on the app task, the table's
- * only writer, so they read it without the lock. */
+/* ---- The spin cap (connected apps Task 1: R1, R1a; Task 7: R1b) ----
+ * The board's spin gate drew a turned picture at about 1 us a pixel each step: 300 and 400 px didn't hold the frame rate, and
+ * taps waited behind them. Task 7 found Task 1's 200 px pass was a scaled picture LVGL drew less of; a whole 200 px record,
+ * drawn as its own square, takes 34 ms a frame, and 180 px (32,400 px) holds 30 a second. So a spinning picture is at most
+ * APPS_SPIN_SIDE_MAX a side as drawn, and the pictures that spin at once and show cover at most APPS_SPIN_AREA_MAX together.
+ * The checks run on the app task, the table's only writer, so they read it without the lock. */
 
 _Static_assert(APPS_SPIN_AREA_MAX == APPS_SPIN_SIDE_MAX * APPS_SPIN_SIDE_MAX, "the total's message names it as one picture's sides");
 

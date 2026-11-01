@@ -58,8 +58,8 @@ _Static_assert(IMAGES_ALL <= INT16_MAX, "a widget's image is an int16_t");
 
 /* ---- The names ---- */
 
-static const char *const apps_ui_kinds[] = {"label", "button", "box", "arc", "bar", "image"};
-_Static_assert(ARRAY_LEN(apps_ui_kinds) == APPS_W_IMAGE + 1, "a name for each kind");
+static const char *const apps_ui_kinds[] = {"label", "button", "box", "arc", "bar", "image", "spinner"};
+_Static_assert(ARRAY_LEN(apps_ui_kinds) == APPS_W_SPINNER + 1, "a name for each kind");
 
 static const char *const apps_ui_aligns[] = {"center",   "top",       "bottom",      "left",         "right",
                                              "top_left", "top_right", "bottom_left", "bottom_right"};
@@ -97,6 +97,9 @@ static const char *const apps_ui_props_bar[] = {
 static const char *const apps_ui_props_image[] = {
     "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "src", "scale", "rotation", "spin",
 };
+static const char *const apps_ui_props_spinner[] = {
+    "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "thickness", "color", "track_color",
+};
 
 static const struct {
     const char *const *names;
@@ -108,6 +111,7 @@ static const struct {
     [APPS_W_ARC] = {apps_ui_props_arc, ARRAY_LEN(apps_ui_props_arc)},
     [APPS_W_BAR] = {apps_ui_props_bar, ARRAY_LEN(apps_ui_props_bar)},
     [APPS_W_IMAGE] = {apps_ui_props_image, ARRAY_LEN(apps_ui_props_image)},
+    [APPS_W_SPINNER] = {apps_ui_props_spinner, ARRAY_LEN(apps_ui_props_spinner)},
 };
 
 /* ---- The properties ---- */
@@ -1197,6 +1201,9 @@ static int ui_bar(lua_State *L) {
 static int ui_image(lua_State *L) {
     return create(L, APPS_W_IMAGE);
 }
+static int ui_spinner(lua_State *L) {
+    return create(L, APPS_W_SPINNER);
+}
 
 /* ---- The module's helpers ---- */
 
@@ -1265,7 +1272,7 @@ static const struct {
 
 static const luaL_Reg apps_ui_funcs[] = {
     {"label", ui_label}, {"button", ui_button}, {"box", ui_box}, {"arc", ui_arc}, {"bar", ui_bar},
-    {"image", ui_image}, {"bg", ui_bg},         {"clear", ui_clear}, {"polar", ui_polar},
+    {"image", ui_image}, {"spinner", ui_spinner}, {"bg", ui_bg}, {"clear", ui_clear}, {"polar", ui_polar},
     {NULL, NULL},
 };
 

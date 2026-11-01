@@ -48,13 +48,14 @@ PROPS = {
     "arc": COMMON + ["min", "max", "value", "start_angle", "end_angle", "thickness", "color", "track_color"],
     "bar": COMMON + ["min", "max", "value", "color", "track_color", "radius"],
     "image": COMMON + ["src", "scale", "rotation", "spin"],
+    "spinner": COMMON + ["thickness", "color", "track_color"],
 }
 KINDS = list(PROPS)
 
 FONTS = "sans14, sans16, sans20, sans28, mono8, mono16, digits48, digits96"
 ALIGNS = "center, top, bottom, left, right, top_left, top_right, bottom_left, bottom_right"
 EVENTS = "tap, long_press, press, release"
-UI_HAS = "label, button, box, arc, bar, image, bg, clear, polar, W, H, R, SAFE"
+UI_HAS = "label, button, box, arc, bar, image, spinner, bg, clear, polar, W, H, R, SAFE"
 COLOUR_HINT = '(use "#rgb", "#rrggbb" or 0xRRGGBB)'
 QUOTA = "ui: no more than 128 widgets per app"
 QUOTA_PENDING = QUOTA + " (a deleted widget keeps its slot until the screen next updates)"
@@ -632,7 +633,7 @@ class UiTest(UiTestCase):
             self.assertIsNotNone(body, array)
             return re.findall(r'\{"(\w+)",', body.group(1))
 
-        self.assertEqual(reg("apps_ui_funcs"), ["label", "button", "box", "arc", "bar", "image", "bg", "clear", "polar"])
+        self.assertEqual(reg("apps_ui_funcs"), ["label", "button", "box", "arc", "bar", "image", "spinner", "bg", "clear", "polar"])
         self.assertEqual(reg("apps_ui_methods"), ["set", "get", "on", "delete"])
         self.assertEqual(strings("apps_ui_kinds"), KINDS)
         self.assertEqual(strings("apps_ui_events"), EVENTS.split(", "))
@@ -1052,6 +1053,51 @@ class UiTest(UiTestCase):
                 self.assertEqual(got[:len(names)], want)
                 self.assertEqual(got[len(names):], [["false", unknown_property(kind, "nothing")],
                                                     ["false", unknown_property(kind, "nothing")]])
+
+    def test_spinner_props_and_defaults(self):  # connected apps Task 8
+        # The brief's list: the common properties and thickness, color and track_color, with an arc's types, ranges and defaults;
+        # no min, max, value or angle (the spinner's animation is LVGL's own); w and h are nil until the app sets them, and the
+        # apply step sizes a missing side APPS_SPINNER_SIDE (the guide and test_muse_apps_lv.py pin that number).
+        self.assertEqual(header_number("apps_ui.h", "APPS_SPINNER_SIDE"), 48)
+        self.assertEqual(PROPS["spinner"], COMMON + ["thickness", "color", "track_color"])
+        lines = self.lua_lines("""
+            local s = ui.spinner{}
+            print(tostring(s), s:get("thickness"), s:get("color"), s:get("track_color"), s:get("w"), s:get("h"), s:get("hidden"))
+            local t = ui.spinner{thickness = 6, color = "#f80", track_color = 0x202020, w = 60, h = 70, hidden = true, opacity = 50,
+                                 align = "top", x = 3, y = -4}
+            print(t:get("thickness"), t:get("color"), t:get("track_color"), t:get("w"), t:get("h"), t:get("hidden"), t:get("opacity"),
+                  t:get("align"), t:get("x"), t:get("y"))
+            t:set{thickness = 1000, w = 0.4}
+            print(t:get("thickness"), t:get("w"))
+            t:set{thickness = -5}
+            print(t:get("thickness"))
+            print(pcall(t.set, t, {thickness = 0 / 0}))
+            print(pcall(t.set, t, {color = "red"}))
+            for _, name in ipairs({"value", "min", "max", "start_angle", "end_angle", "radius", "text", "src", "spin"}) do
+                local ok, err = pcall(ui.spinner, {[name] = 1})
+                print(name, ok, err)
+            end
+            print(pcall(t.get, t, "value"))
+            local box = ui.box{w = 100, h = 100}
+            print(tostring(ui.spinner{parent = box}), ui.spinner{parent = box}:get("parent") == box)
+            local taps = ui.spinner{}:on("tap", function() end)
+            print(tostring(taps), pcall(taps.on, taps, "release", function() end))
+        """)
+        valid = ", ".join(PROPS["spinner"])
+        self.assertEqual(lines[:3], [
+            "spinner#0\t12\t#ffffff\t#262626\tnil\tnil\tfalse",
+            "6\t#ff8800\t#202020\t60\t70\ttrue\t50\ttop\t3\t-4",
+            "64\t1",
+        ])
+        self.assertEqual(lines[3], "1")
+        self.assertIn("ui.spinner: ", lines[4])
+        self.assertIn("'thickness' must be a number, got NaN", lines[4])
+        self.assertEqual(lines[5], f"false\tui.spinner: color 'red' is not a colour {COLOUR_HINT}")
+        for name, line in zip(["value", "min", "max", "start_angle", "end_angle", "radius", "text", "src", "spin"], lines[6:15]):
+            self.assertEqual(line, f"{name}\tfalse\t{unknown_property('spinner', name)}")
+        self.assertRegex(lines[15], r"^false\t.*ui\.spinner: unknown property 'value'")
+        self.assertEqual(lines[16], "spinner#3\ttrue")
+        self.assertRegex(lines[17], r"^spinner#\d+\ttrue\t")
 
     # ---- Parent, nesting, methods, events (R9.4 to R9.7) ----
 

@@ -24,8 +24,8 @@
  * this module has not checked: LVGL asserts abort().
  *
  * The Lua module (the guide copies this).
- * - ui.label{...} ui.button{...} ui.box{...} ui.arc{...} ui.bar{...} ui.image{...} make a widget and return its
- *   handle. w:set{...} changes properties, w:get(name) reads one, w:on(event, fn) subscribes (fn nil removes it),
+ * - ui.label{...} ui.button{...} ui.box{...} ui.arc{...} ui.bar{...} ui.image{...} ui.spinner{...} make a widget and
+ *   return its handle. w:set{...} changes properties, w:get(name) reads one, w:on(event, fn) subscribes (fn nil removes it),
  *   w:delete() removes the widget and everything inside it. set and on return w, so calls chain. tostring(w) is
  *   "label#3": the kind and the slot. A widget is one object for as long as the app holds its handle, so a handle
  *   can be a table key and rawequal holds (a handle of a widget that is gone stays equal to itself, ==). The
@@ -37,7 +37,7 @@
  * - Properties. All: align x y w h hidden opacity parent. label: text font color text_align wrap. button: text
  *   font color bg radius border border_color. box: bg radius border border_color. arc: min max value start_angle
  *   end_angle thickness color track_color. bar: min max value color track_color radius. image: src scale rotation
- *   spin.
+ *   spin. spinner: thickness color track_color.
  *   (apps_ui_props_<kind> in apps_ui.c are the lists; the unknown-property message prints them.)
  * - Values. align is one of center top bottom left right top_left top_right bottom_left bottom_right, and x y are
  *   offsets from that anchor in the parent. Numbers are rounded to the nearest integer (halves away from zero)
@@ -66,7 +66,11 @@
  *   font sans20, text_align center, color white. button: bg "#262626", radius 16, font sans20, color white.
  *   box: bg none, radius 0. arc: min 0, max 100, value 0, start_angle 0, end_angle 360, thickness 12, color
  *   white, track_color "#262626". bar: min 0, max 100, value 0, color white, track_color "#262626", radius 0.
- *   image: scale 100, rotation 0, spin 0, and src is required.
+ *   image: scale 100, rotation 0, spin 0, and src is required. spinner: thickness 12, color white, track_color
+ *   "#262626"; w and h stay nil for the app, and a side it leaves out is drawn APPS_SPINNER_SIDE px.
+ * - A spinner is LVGL's own lv_spinner, an arc that turns by itself (about a turn a second, with lv_spinner's default
+ *   sweep) on the LVGL task alone: no value, no angles and no progress, no Lua running, and no automatic one from the
+ *   platform or from muse.ask. An app shows one while it waits and hides it in its callback.
  * - min < max is kept: a create or a set that would leave min >= max on an arc or a bar is an error, and value
  *   follows min and max (it is clamped again when they change).
  * - Events: tap (and click, the same), long_press, press and release, on a widget of any kind. A handler gets
@@ -106,7 +110,7 @@
  *                                                    slots, it ends " (a deleted widget keeps its slot until
  *                                                    the screen next updates)")
  *   widget was deleted                                        any use of a handle of a deleted widget
- *   ui.<name> doesn't exist (ui has: label, button, box, arc, bar, image, bg, clear, polar, W, H, R, SAFE)
+ *   ui.<name> doesn't exist (ui has: label, button, box, arc, bar, image, spinner, bg, clear, polar, W, H, R, SAFE)
  *   ui.bg: '<s>' is not a colour (...)
  * Text an app supplied is shown cut at 40 bytes and with its control bytes as '?'.
  *
@@ -192,9 +196,10 @@ typedef struct lua_State lua_State;
 #define APPS_SPIN_RPM_MAX 60       /* ui.image's spin: the most turns a minute */
 #define APPS_SPIN_SIDE_MAX 180     /* ui.image spins only up to this many px a side as drawn (scale applied): the spin gate */
 #define APPS_SPIN_AREA_MAX 32400   /* the px the images spinning at once may cover together, drawn: one 180 x 180 */
+#define APPS_SPINNER_SIDE 48       /* ui.spinner's side, px, where the app leaves out a w or an h (the apply step sizes it) */
 #define APPS_COLOR_NONE 0xFF000000u
 
-typedef enum { APPS_W_LABEL, APPS_W_BUTTON, APPS_W_BOX, APPS_W_ARC, APPS_W_BAR, APPS_W_IMAGE } apps_wkind_t;
+typedef enum { APPS_W_LABEL, APPS_W_BUTTON, APPS_W_BOX, APPS_W_ARC, APPS_W_BAR, APPS_W_IMAGE, APPS_W_SPINNER } apps_wkind_t;
 typedef enum {
     APPS_FONT_SANS14, APPS_FONT_SANS16, APPS_FONT_SANS20, APPS_FONT_SANS28,
     APPS_FONT_MONO8, APPS_FONT_MONO16, APPS_FONT_DIGITS48, APPS_FONT_DIGITS96

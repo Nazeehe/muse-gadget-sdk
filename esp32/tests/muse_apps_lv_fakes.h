@@ -32,7 +32,9 @@
  * scroll, a gesture or a click, and a fling's snap as an animation. The animations apps_lv.c starts itself (an image's spin)
  * run as lv_anim.c runs them: copied into a list at lv_anim_start, stepped by each frame's animation timer (the path, the
  * exec callback only when the value changes, a repeat), and deleted with lv_anim_delete or with their object (lv_obj_destructor),
- * the deleted callback called each time.
+ * the deleted callback called each time. LVGL's own widget with an animation, lv_spinner, is here as lv_spinner.c has it (the
+ * constructor's defaults, lv_spinner_set_anim_params's two animations with the bezier path) over an arc whose indicator angles
+ * invalidate the box of the arc, which is more than LVGL's changed sector, so what a test says of a spinner holds for LVGL too.
  */
 
 #include <stdarg.h>
@@ -291,6 +293,9 @@ struct _lv_anim_t {
 /* ---- lvgl.h: constants ---- */
 
 #define LV_ATTRIBUTE_EXTERN_DATA
+#define LV_BEZIER_VAL_SHIFT 10
+#define LV_BEZIER_VAL_MAX (1L << LV_BEZIER_VAL_SHIFT)
+#define LV_BEZIER_VAL_FLOAT(f) ((int32_t)((f) * LV_BEZIER_VAL_MAX))
 #define LV_FONT_DECLARE(font_name) LV_ATTRIBUTE_EXTERN_DATA extern const lv_font_t font_name;
 LV_FONT_DECLARE(lv_font_montserrat_14)
 LV_FONT_DECLARE(lv_font_montserrat_16)
@@ -317,6 +322,7 @@ lv_obj_t *lv_obj_create(lv_obj_t *parent);
 lv_obj_t *lv_label_create(lv_obj_t *parent);
 lv_obj_t *lv_button_create(lv_obj_t *parent);
 lv_obj_t *lv_arc_create(lv_obj_t *parent);
+lv_obj_t *lv_spinner_create(lv_obj_t *parent);
 lv_obj_t *lv_bar_create(lv_obj_t *parent);
 lv_obj_t *lv_image_create(lv_obj_t *parent);
 void lv_obj_delete(lv_obj_t *obj);
@@ -361,9 +367,13 @@ void lv_label_set_text(lv_obj_t *obj, const char *text);
 void lv_label_set_long_mode(lv_obj_t *obj, lv_label_long_mode_t long_mode);
 
 void lv_arc_set_rotation(lv_obj_t *obj, int32_t rotation);
+void lv_arc_set_start_angle(lv_obj_t *obj, lv_value_precise_t start);
+void lv_arc_set_end_angle(lv_obj_t *obj, lv_value_precise_t end);
 void lv_arc_set_bg_angles(lv_obj_t *obj, lv_value_precise_t start, lv_value_precise_t end);
 void lv_arc_set_range(lv_obj_t *obj, int32_t min, int32_t max);
 void lv_arc_set_value(lv_obj_t *obj, int32_t value);
+
+void lv_spinner_set_anim_params(lv_obj_t *obj, uint32_t t, uint32_t angle);
 
 void lv_bar_set_range(lv_obj_t *obj, int32_t min, int32_t max);
 void lv_bar_set_value(lv_obj_t *obj, int32_t value, lv_anim_enable_t anim);
@@ -382,6 +392,8 @@ void lv_anim_set_duration(lv_anim_t *a, uint32_t duration);
 void lv_anim_set_repeat_count(lv_anim_t *a, uint32_t cnt);
 void lv_anim_set_path_cb(lv_anim_t *a, lv_anim_path_cb_t path_cb);
 void lv_anim_set_deleted_cb(lv_anim_t *a, lv_anim_deleted_cb_t deleted_cb);
+void lv_anim_set_bezier3_param(lv_anim_t *a, int16_t x1, int16_t y1, int16_t x2, int16_t y2);
+int32_t lv_anim_path_custom_bezier3(const lv_anim_t *a);
 lv_anim_t *lv_anim_start(const lv_anim_t *a);
 bool lv_anim_delete(void *var, lv_anim_exec_xcb_t exec_cb);
 

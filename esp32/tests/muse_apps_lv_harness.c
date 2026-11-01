@@ -75,6 +75,8 @@ static int failures;
 #define CHECK(cond, ...) CHECK_AT(__LINE__, cond, __VA_ARGS__)
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+#define STR_(x) #x
+#define STR(x) STR_(x)
 
 /* ---- The port ---- */
 
@@ -620,6 +622,9 @@ struct lv_obj {
     lv_area_t inv;         /* what it invalidated since fake_inv_clear, as one box (empty: x2 < x1), on the screen */
     int32_t inv_widest;    /* the widest area of those, and the tallest */
     int32_t inv_tallest;
+    int32_t arc_start, arc_end;  /* an arc's indicator angles, as lv_arc_set_start_angle and lv_arc_set_end_angle keep them */
+    int arc_steps;               /* times either changed */
+    uint32_t sp_ms, sp_sweep;    /* a spinner's lv_spinner_set_anim_params: duration (ms) and angle (degrees), 0 until set */
 };
 
 struct lv_indev {
@@ -767,7 +772,8 @@ static lv_obj_t *use(lv_obj_t *o, const char *fn, const char *cls) {
         fake_error("%s on the deleted object %d", fn, o->id);
         return NULL;
     }
-    if (cls != NULL && strcmp(o->cls, cls) != 0) {
+    /* lv_spinner's base class is lv_arc: every arc call is good on a spinner. */
+    if (cls != NULL && strcmp(o->cls, cls) != 0 && !(strcmp(cls, "arc") == 0 && strcmp(o->cls, "spinner") == 0)) {
         fake_error("%s on %s %d, a %s call", fn, o->cls, o->id, cls);
         return NULL;
     }
@@ -1591,11 +1597,13 @@ static int32_t ext_of(lv_obj_t *o) {
     return s;
 }
 
-/* An area of o invalidated (lv_obj_invalidate_area): nothing if o is hidden; else cut to its box grown by its room
+/* An area of o invalidated (lv_obj_invalidate_area): nothing if o or a parent is hidden; else cut to its box grown by its room
  * (lv_obj_area_is_visible) and to the screen (lv_inv_area), and added to what o has invalidated. */
 static void fake_invalidate(lv_obj_t *o, lv_area_t a) {
-    if ((o->flags & LV_OBJ_FLAG_HIDDEN) != 0) {
-        return;
+    for (const lv_obj_t *up = o; up != NULL; up = up->parent) {  /* its own hide, and a parent's: "the child is hidden" */
+        if ((up->flags & LV_OBJ_FLAG_HIDDEN) != 0) {
+            return;
+        }
     }
     lv_area_t box = {o->area.x1 - o->ext_draw, o->area.y1 - o->ext_draw, o->area.x2 + o->ext_draw, o->area.y2 + o->ext_draw};
     a.x1 = a.x1 > box.x1 ? a.x1 : box.x1;
@@ -1961,9 +1969,179 @@ static void lv_anim_timer(int ms) {
     }
 }
 
+/* ---- lv_spinner (connected apps Task 8): lv_spinner.c's own lines over an arc ---- */
+
+/* lv_math.c's lv_cubic_bezier, as it is for CUBIC_PRECISION_BITS 10 and CUBIC_NEWTON_ITERATIONS 8: the y of a cubic bezier at x, both in
+ * 0..LV_BEZIER_VAL_MAX. */
+#define FAKE_CUBIC_NEWTON_ITERATIONS 8
+#define FAKE_CUBIC_PRECISION_BITS 10
+static int32_t fake_do_cubic_bezier(int32_t t, int32_t a, int32_t b, int32_t c) {
+    int32_t ret = a;
+    ret = (ret * t) >> FAKE_CUBIC_PRECISION_BITS;
+    ret = ((ret + b) * t) >> FAKE_CUBIC_PRECISION_BITS;
+    ret = ((ret + c) * t) >> FAKE_CUBIC_PRECISION_BITS;
+    return ret;
+}
+
+static int32_t fake_cubic_bezier(int32_t x, int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
+    int32_t ax, bx, cx, ay, by, cy;
+    int32_t tl, tr, t;
+    int32_t xs;
+    int32_t d;
+    if (x == 0 || x == LV_BEZIER_VAL_MAX) {
+        return x;
+    }
+    cx = 3 * x1;
+    bx = 3 * (x2 - x1) - cx;
+    ax = (1L << FAKE_CUBIC_PRECISION_BITS) - cx - bx;
+    cy = 3 * y1;
+    by = 3 * (y2 - y1) - cy;
+    ay = (1L << FAKE_CUBIC_PRECISION_BITS) - cy - by;
+    t = x;
+    for (int i = 0; i < FAKE_CUBIC_NEWTON_ITERATIONS; i++) {
+        xs = fake_do_cubic_bezier(t, ax, bx, cx) - x;
+        if (abs(xs) <= 1) {
+            return fake_do_cubic_bezier(t, ay, by, cy);
+        }
+        d = ax;
+        d = (3 * d * t) >> FAKE_CUBIC_PRECISION_BITS;
+        d = ((d + 2 * bx) * t) >> FAKE_CUBIC_PRECISION_BITS;
+        d += cx;
+        if (abs(d) <= 1) {
+            break;
+        }
+        d = (int32_t)(((int64_t)xs * (1L << FAKE_CUBIC_PRECISION_BITS)) / d);
+        if (d == 0) {
+            break;
+        }
+        t -= d;
+    }
+    tl = 0, tr = 1L << FAKE_CUBIC_PRECISION_BITS, t = x;
+    if (t < tl) {
+        return fake_do_cubic_bezier(tl, ay, by, cy);
+    }
+    if (t > tr) {
+        return fake_do_cubic_bezier(tr, ay, by, cy);
+    }
+    while (tl < tr) {
+        xs = fake_do_cubic_bezier(t, ax, bx, cx);
+        if (abs(xs - x) <= 1) {
+            break;
+        }
+        x > xs ? (tl = t) : (tr = t);
+        t = (tr - tl) / 2 + tl;
+        if (t == tl) {
+            break;
+        }
+    }
+    return fake_do_cubic_bezier(t, ay, by, cy);
+}
+
+void lv_anim_set_bezier3_param(lv_anim_t *a, int16_t x1, int16_t y1, int16_t x2, int16_t y2) {
+    fake_call("lv_anim_set_bezier3_param");
+    lv_anim_bezier3_para_t *para = &a->parameter.bezier3;
+    para->x1 = x1;
+    para->x2 = x2;
+    para->y1 = y1;
+    para->y2 = y2;
+}
+
+/* lv_anim_path_custom_bezier3 over lv_anim_path_cubic_bezier: the step from lv_map(act_time, 0, duration, 0, LV_BEZIER_VAL_MAX), then the
+ * share of the way from start to end. */
+int32_t lv_anim_path_custom_bezier3(const lv_anim_t *a) {
+    const lv_anim_bezier3_para_t *para = &a->parameter.bezier3;
+    int32_t at = a->act_time <= 0 ? 0 : a->act_time >= a->duration ? a->duration : a->act_time;
+    uint32_t t = a->duration > 0 ? (uint32_t)((int64_t)at * LV_BEZIER_VAL_MAX / a->duration) : (uint32_t)LV_BEZIER_VAL_MAX;
+    int32_t step = fake_cubic_bezier((int32_t)t, para->x1, para->y1, para->x2, para->y2);
+    int32_t new_value = step * (a->end_value - a->start_value);
+    new_value = new_value >> LV_BEZIER_VAL_SHIFT;
+    new_value += a->start_value;
+    return new_value;
+}
+
+/* An indicator angle set: past 360 it comes back 360; a change invalidates the arc's box (LVGL's inv_arc_area, the changed sector of it,
+ * and only while the arc is visible: its own hide and a parent's, as fake_invalidate has it). */
+static void fake_set_arc_angle(lv_obj_t *obj, bool end, lv_value_precise_t angle) {
+    if (angle > 360) {
+        angle -= 360;
+    }
+    int32_t *at = end ? &obj->arc_end : &obj->arc_start;
+    if (*at != angle) {
+        fake_invalidate(obj, obj->area);
+        obj->arc_steps++;
+    }
+    *at = angle;
+}
+
+void lv_arc_set_start_angle(lv_obj_t *obj, lv_value_precise_t start) {
+    if (use(obj, "lv_arc_set_start_angle", "arc") != NULL) {
+        fake_set_arc_angle(obj, false, start);
+    }
+}
+
+void lv_arc_set_end_angle(lv_obj_t *obj, lv_value_precise_t end) {
+    if (use(obj, "lv_arc_set_end_angle", "arc") != NULL) {
+        fake_set_arc_angle(obj, true, end);
+    }
+}
+
+static void spinner_start_angle(void *obj, int32_t v) {
+    lv_arc_set_start_angle(obj, (uint32_t)v);
+}
+
+static void spinner_end_angle(void *obj, int32_t v) {
+    lv_arc_set_end_angle(obj, (uint32_t)v);
+}
+
+/* lv_spinner_set_anim_params: the object's animations deleted, one of the end angle from angle to 360 + angle, linear, and one of the
+ * start angle from 0 to 360 on the bezier (0.42, 0.58, 0, 1), both t ms without end; then the arc's background and rotation. */
+void lv_spinner_set_anim_params(lv_obj_t *obj, uint32_t t, uint32_t angle) {
+    if (use(obj, "lv_spinner_set_anim_params", "spinner") == NULL) {
+        return;
+    }
+    obj->sp_ms = t;
+    obj->sp_sweep = angle;
+    lv_anim_delete(obj, NULL);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_exec_cb(&a, spinner_end_angle);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_duration(&a, t);
+    lv_anim_set_values(&a, (int32_t)angle, 360 + (int32_t)angle);
+    lv_anim_start(&a);
+    lv_anim_set_path_cb(&a, lv_anim_path_custom_bezier3);
+    lv_anim_set_bezier3_param(&a, LV_BEZIER_VAL_FLOAT(0.42), LV_BEZIER_VAL_FLOAT(0.58), LV_BEZIER_VAL_FLOAT(0), LV_BEZIER_VAL_FLOAT(1));
+    lv_anim_set_values(&a, 0, 360);
+    lv_anim_set_exec_cb(&a, spinner_start_angle);
+    lv_anim_start(&a);
+    lv_arc_set_bg_angles(obj, 0, 360);
+    lv_arc_set_rotation(obj, 270);
+}
+
+/* lv_spinner_create: an arc that is not clickable (lv_spinner_constructor), with DEF_TIME 1000 ms and DEF_ARC_ANGLE 200. */
+lv_obj_t *lv_spinner_create(lv_obj_t *parent) {
+    lv_obj_t *o = make_object("spinner", parent, "lv_spinner_create");
+    if (o != NULL) {
+        o->max = 100;
+        o->flags &= ~(uint32_t)LV_OBJ_FLAG_CLICKABLE;
+        lv_spinner_set_anim_params(o, 1000, 200);
+    }
+    return o;
+}
+
 /* The animations running now (lv_anim_count_running), and the one of the object id, or NULL. */
 static int fake_spins(void) {
     return n_lv_anims;
+}
+
+/* How many of the animations running belong to the object id. */
+static int fake_anims_of(int id) {
+    int n = 0;
+    for (int i = 0; i < n_lv_anims; i++) {
+        n += anim_var_id(lv_anims[i]->var) == id ? 1 : 0;
+    }
+    return n;
 }
 
 static const lv_anim_t *fake_anim_of(int id) {
@@ -3102,7 +3280,7 @@ typedef struct {
         stmt;                                         \
     }
 
-POKE(kind_past_the_last, w->kind = APPS_W_IMAGE + 1)
+POKE(kind_past_the_last, w->kind = APPS_W_SPINNER + 1)
 POKE(kind_255, w->kind = 255)
 POKE(align_past_the_last, w->align = 9)
 POKE(opacity_101, w->opacity = 101)
@@ -7523,6 +7701,7 @@ static void spin_invalidates_what_it_draws(void) {
     const int diagonal = (int)(SPIN_PX * 1.41421356 + 0.5);  /* the square's turned box at 45 degrees */
     env_t e;
     scene_with(&e, assets, 3);
+    apps_lv_set_front(true);  /* the layer shown: a hidden layer (or a hidden parent) invalidates nothing, as LVGL's visible check says */
     RUN(&e, "c = ui.image{src = 'c.bin', spin = 30}");
     CHECK(APPLY(&e), "made");
     lv_obj_t *c = fake_obj(2);
@@ -7854,6 +8033,180 @@ static void pairing_follows_the_spin(void) {
     CHECK(pairing_calls == 12 && !pairing_on, "the callback replaced: %d calls, on %d", pairing_calls, pairing_on);
     refresh_after(33000);
     CHECK(pairing_calls == 12, "none after: %d calls", pairing_calls);
+    FINISH(&e);
+}
+
+/* Task 8: ui.spinner is LVGL's own lv_spinner, made and styled as an arc is and then left alone: no range, value or angle from the
+ * app (the spinner sets its own), the size an app leaves out is APPS_SPINNER_SIDE, and the animation is the one lv_spinner_create
+ * starts, with the defaults (1,000 ms a turn, a sweep of 200 degrees in 9.5.0), without a call of apps_lv.c's. */
+static void spinner_is_made_and_styled(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "s = ui.spinner{}");
+    CHECK(APPLY(&e), "made");
+    int id = fake_nth("spinner", 0);
+    CHECK(id == 2, "the spinner is the layer's first widget: %d", id);
+    const char *got = log_peek();
+    const char *head =
+        "create spinner 2 in 1\n"
+        "anim_delete 2 none\n"
+        "anim_start 2 200 560 1000 ms repeat=inf\n"
+        "anim_start 2 0 360 1000 ms repeat=inf\n"
+        "arc_bg_angles 2 0 360\narc_rotation 2 270\n"
+        "remove_style_all 2\nremove_flag 2 scrollable\nremove_flag 2 clickable\n"
+        "remove_style 2 knob\n";
+    CHECK(strncmp(got, head, strlen(head)) == 0, "the log starts\n%.*s--- and was to start\n%s---", (int)strlen(head), got, head);
+    HAS("size 2 " STR(APPS_SPINNER_SIDE) " " STR(APPS_SPINNER_SIDE));
+    HAS("align 2 center 0 0");
+    HAS("arc_width 2 12");
+    HAS("arc_color 2 #262626");
+    HAS("arc_width 2 12 indicator");
+    HAS("arc_color 2 #ffffff indicator");
+    CHECK(log_count("arc_range") == 0 && log_count("arc_value") == 0 && log_count("arc_bg_angles") == 1 && log_count("arc_rotation") == 1,
+          "no range or value from the app, and the background and rotation only the spinner's own, once\n%s", log_peek());
+    CHECK(APPS_SPINNER_SIDE == 48, "the side is 48 px");
+    lv_obj_t *o = fake_obj(id);
+    CHECK(o->sp_ms == 1000 && o->sp_sweep == 200, "LVGL's defaults: %u ms, %u degrees", o->sp_ms, o->sp_sweep);
+    CHECK(fake_anims_of(id) == 2 && fake_spins() == 2, "its two animations (the start and the end of the arc): %d", fake_anims_of(id));
+    CHECK(o->area.x2 - o->area.x1 + 1 == APPS_SPINNER_SIDE && o->area.y2 - o->area.y1 + 1 == APPS_SPINNER_SIDE,
+          "laid out %dx%d", (int)(o->area.x2 - o->area.x1 + 1), (int)(o->area.y2 - o->area.y1 + 1));
+    CHECK(!fake_flag(id, LV_OBJ_FLAG_CLICKABLE) && !fake_flag(id, LV_OBJ_FLAG_SCROLLABLE) && o->n_cbs == 0, "not clickable, scrollable or subscribed");
+    CHECK(stats_now().spinning == 0, "a spinner isn't a spinning image: %u", stats_now().spinning);
+
+    /* A side the app gives is the side; the one it leaves out is APPS_SPINNER_SIDE. */
+    log_clear();
+    RUN(&e, "s:set{w = 100}");
+    CHECK(APPLY(&e), "w");
+    HAS("size 2 100 " STR(APPS_SPINNER_SIDE));
+    RUN(&e, "s:set{w = 0.4, h = 70}");
+    CHECK(APPLY(&e), "h");
+    HAS("size 2 1 70");
+    RUN(&e, "t = ui.spinner{h = 20}");
+    CHECK(APPLY(&e), "h only");
+    HAS("size 3 " STR(APPS_SPINNER_SIDE) " 20");
+    CHECK(fake_anims_of(3) == 2, "each spinner has its own two animations");
+
+    /* Its style is an arc's: a width and colour for the track and the indicator. */
+    log_clear();
+    RUN(&e, "s:set{thickness = 6, color = '#ff8800', track_color = 0x202020, opacity = 50}");
+    CHECK(APPLY(&e), "styled");
+    HAS("arc_width 2 6");
+    HAS("arc_color 2 #202020");
+    HAS("arc_width 2 6 indicator");
+    HAS("arc_color 2 #ff8800 indicator");
+    HAS("opa 2 127");
+    CHECK(log_count("size ") == 0 && log_count("anim_") == 0 && log_count("arc_") == 4, "a style change restarts nothing\n%s", log_peek());
+    CHECK(fake_anims_of(id) == 2 && o->sp_ms == 1000, "the same two animations");
+
+    /* An event makes it clickable, and a finger on it must not reach lv_arc's drag code (it divides by the radius: a spinner of
+     * 1 px has none): the guard is the arc's. */
+    RUN(&e, "s:on('tap', function() end) s:set{w = 1, h = 1}");
+    CHECK(APPLY(&e), "subscribed");
+    CHECK(fake_flag(id, LV_OBJ_FLAG_CLICKABLE) && o->n_cbs == 6, "clickable with the arc's guard: %d callbacks", o->n_cbs);
+    HAS("add_event_cb 2 pressing preprocess");
+    arc_drags = 0;
+    for (int i = 0; i < 3; i++) {
+        fake_fire(id, LV_EVENT_PRESSING);
+    }
+    CHECK(arc_drags == 0 && o->value == 0, "a finger doesn't turn it: dragged %d times", arc_drags);
+
+    /* It goes with its widget. */
+    RUN(&e, "s:delete() t:delete()");
+    CHECK(APPLY(&e), "deleted");
+    CHECK(fake_spins() == 0 && log_count("anim_delete") == 0, "its animations went with the object: %d\n%s", fake_spins(), log_peek());
+    FINISH(&e);
+}
+
+/* The spinner's animation is LVGL's: it keeps stepping while the widget is hidden (the object is, as it is for any hidden
+ * object), but a hidden spinner, and one in a hidden box, invalidates nothing, so a hidden spinner costs no refresh. A shown
+ * one invalidates its box (at most) at each step. No call of apps_lv.c starts, stops or restarts it, so there is no pairing
+ * (Task 7's, for spinning images) and no spin count either. */
+static void spinner_animates_only_while_shown(void) {
+    env_t e;
+    scene(&e);
+    int before = display_obj.n_cbs;
+    apps_lv_set_pairing_cb(note_pairing);
+    apps_lv_set_front(true);
+    pairing_calls = 0;
+    RUN(&e, "s = ui.spinner{w = 60, h = 60}");
+    CHECK(APPLY(&e), "made");
+    int id = fake_nth("spinner", 0);
+    lv_obj_t *o = fake_obj(id);
+    log_clear();
+
+    /* Shown: it steps, and what it invalidates is inside its box. A turn takes 1,000 ms. */
+    fake_inv_clear(o);
+    int steps = o->arc_steps;
+    frames(1000, 15);
+    CHECK(o->arc_steps - steps >= 60, "it steps every frame while shown: %d steps in a second", o->arc_steps - steps);
+    CHECK(o->inv.x2 >= o->inv.x1 && o->inv.x1 >= o->area.x1 && o->inv.x2 <= o->area.x2 && o->inv.y1 >= o->area.y1 &&
+              o->inv.y2 <= o->area.y2,
+          "it invalidated (%d,%d)-(%d,%d), inside its box (%d,%d)-(%d,%d)", (int)o->inv.x1, (int)o->inv.y1, (int)o->inv.x2, (int)o->inv.y2,
+          (int)o->area.x1, (int)o->area.y1, (int)o->area.x2, (int)o->area.y2);
+    CHECK(o->inv_widest <= 60 && o->inv_tallest <= 60, "no step is wider than the 60 px box: %d x %d", (int)o->inv_widest, (int)o->inv_tallest);
+    refresh_after(33000);
+    CHECK(pairing_calls == 0, "a spinner doesn't turn the frame pairing on: %d calls", pairing_calls);
+
+    /* Hidden: the object's own animation goes on, and nothing is invalidated. */
+    RUN(&e, "s:set{hidden = true}");
+    CHECK(APPLY(&e), "hidden");
+    fake_inv_clear(o);
+    steps = o->arc_steps;
+    frames(1000, 15);
+    CHECK(o->inv.x2 < o->inv.x1 && o->inv_widest == 0, "hidden, it invalidated (%d,%d)-(%d,%d)", (int)o->inv.x1, (int)o->inv.y1, (int)o->inv.x2,
+          (int)o->inv.y2);
+    CHECK(fake_anims_of(id) == 2, "LVGL's animation isn't touched by a hide: %d", fake_anims_of(id));
+    RUN(&e, "s:set{hidden = false}");
+    CHECK(APPLY(&e), "shown");
+    fake_inv_clear(o);
+    frames(1000, 15);
+    CHECK(o->inv.x2 >= o->inv.x1 && o->inv_widest > 0, "shown again, it invalidates");
+    CHECK(log_count("anim_") == 0 && log_count("arc_bg_angles") == 0 && log_count("arc_rotation") == 0,
+          "apps_lv.c started, stopped and restarted nothing\n%s", log_peek());
+
+    /* In a box: the box's hide hides it. */
+    RUN(&e, "s:delete() box = ui.box{w = 200, h = 200} t = ui.spinner{parent = box}");
+    CHECK(APPLY(&e), "in a box");
+    lv_obj_t *t = fake_obj(fake_nth("spinner", 1));
+    fake_inv_clear(t);
+    frames(500, 15);
+    CHECK(t->inv.x2 >= t->inv.x1, "in a shown box it invalidates");
+    RUN(&e, "box:set{hidden = true}");
+    CHECK(APPLY(&e), "box hidden");
+    fake_inv_clear(t);
+    frames(1000, 15);
+    CHECK(t->inv.x2 < t->inv.x1 && t->inv_widest == 0, "in a hidden box it invalidates nothing: (%d,%d)-(%d,%d)", (int)t->inv.x1, (int)t->inv.y1,
+          (int)t->inv.x2, (int)t->inv.y2);
+    RUN(&e, "box:set{hidden = false}");
+    CHECK(APPLY(&e), "box shown");
+    fake_inv_clear(t);
+    frames(500, 15);
+    CHECK(t->inv.x2 >= t->inv.x1, "the box shown, it invalidates again");
+
+    /* No spinner is counted as a spinning image, and none ends with the apply step's help: a delete takes both animations. */
+    CHECK(stats_now().spinning == 0, "spinning %u", stats_now().spinning);
+    refresh_after(33000);
+    CHECK(pairing_calls == 0, "still no pairing: %d", pairing_calls);
+    RUN(&e, "box:delete()");
+    CHECK(APPLY(&e), "the box deleted");
+    CHECK(fake_anims_of(fake_nth("spinner", 1)) == 0 && fake_spins() == 0, "the box's delete took the spinner's animations: %d", fake_spins());
+    frames(500, 15);
+
+    RUN(&e, "a = ui.spinner{} b = ui.spinner{}");
+    CHECK(APPLY(&e), "two");
+    CHECK(fake_spins() == 4, "two spinners, four animations: %d", fake_spins());
+    RUN(&e, "ui.clear()");
+    CHECK(APPLY(&e), "cleared");
+    CHECK(fake_spins() == 0, "ui.clear(): %d animations", fake_spins());
+    RUN(&e, "c = ui.spinner{}");
+    CHECK(APPLY(&e), "again");
+    CHECK(fake_spins() == 2, "one");
+    unpublish();
+    apps_lv_reset();
+    CHECK(fake_spins() == 0, "the reset: %d animations", fake_spins());
+    frames(500, 15);
+    apps_lv_set_pairing_cb(NULL);
+    CHECK(display_obj.n_cbs == before + 1 || display_obj.n_cbs == before, "the display's callbacks: %d", display_obj.n_cbs);
     FINISH(&e);
 }
 
@@ -8573,6 +8926,8 @@ int main(int argc, char **argv) {
         {"spin_ends_with_the_widget", spin_ends_with_the_widget},
         {"spin_frame_log", spin_frame_log},
         {"pairing_follows_the_spin", pairing_follows_the_spin},
+        {"spinner_is_made_and_styled", spinner_is_made_and_styled},
+        {"spinner_animates_only_while_shown", spinner_animates_only_while_shown},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},

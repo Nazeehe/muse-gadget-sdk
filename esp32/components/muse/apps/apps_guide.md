@@ -90,6 +90,7 @@ return app
 - `ui.arc{...}`: a ring, or part of one, filled from start_angle by value between min and max. Give it `w` and `h`: without them it draws nothing.
 - `ui.bar{...}`: a straight progress bar, value between min and max. Give it `w` and `h`: without them it draws nothing.
 - `ui.image{...}`: one of the app's images (`src`, a path of the manifest's files), which can be turned (`rotation`) or spun (`spin`).
+- `ui.spinner{...}`: a ring that turns by itself, about once a second, with no Lua running: show it while the app waits (see Waiting in Patterns). Without `w` and `h` it is 48 px square, and a side you give leaves the other at 48. It takes `thickness`, `color` and `track_color` as an arc does. It has no value and shows no progress, and nothing shows one for you: the gadget draws none of its own, and `muse.ask` shows none.
 - `ui.bg(color)`: the screen's background colour (black at first).
 - `ui.clear()`: removes every widget.
 - `ui.polar(deg, r)`: the x and y offsets, as integers, of the point r px from the centre at deg clock degrees, for a widget with `align = "center"`: `ui.polar(90, 100)` is `100, 0`, and `ui.polar(0, 100)` is `0, -100`.
@@ -101,6 +102,7 @@ return app
 - `ui.arc` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, start_angle, end_angle, thickness, color, track_color; events: tap, long_press, press, release
 - `ui.bar` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, color, track_color, radius; events: tap, long_press, press, release
 - `ui.image` properties: align, x, y, w, h, hidden, opacity, parent, src, scale, rotation, spin; events: tap, long_press, press, release
+- `ui.spinner` properties: align, x, y, w, h, hidden, opacity, parent, thickness, color, track_color; events: tap, long_press, press, release
 
 The values:
 
@@ -108,8 +110,8 @@ The values:
 - `w` and `h` are 1 to 466. Leave them out and the widget sizes to its content: a label to its text, an image to its picture, and a button with no `w` and `h` is only as big as its text, with no padding. An arc or a bar has no content of its own, so without `w` and `h` it draws nothing, with no error or warning. `w:get("w")` and `w:get("h")` are nil while the widget sizes to its content: `get` reads what the app set, not the laid-out size (an install's `ui` has that).
 - `hidden` and `wrap` are booleans (`wrap` breaks a label's text at its `w`). `opacity` is 0 to 100.
 - `text` is a string (or a number) of at most 256 bytes of UTF-8. `font` is one of sans14, sans16, sans20 (the default), sans28, mono8, mono16, digits48 and digits96; the two digit fonts hold only `0-9 : . - + %` and the space. `text_align` is left, center (the default) or right.
-- Colours (`color`, `bg`, `border_color`, `track_color`) are `"#rgb"`, `"#rrggbb"` or `0xRRGGBB`; `bg` also takes `"none"`. Text and arcs default to white, button backgrounds and tracks to `"#262626"`.
-- `radius` is 0 to 233, or `"circle"`. `border` is 0 to 20. `thickness` (of an arc) is 1 to 64, 12 by default.
+- Colours (`color`, `bg`, `border_color`, `track_color`) are `"#rgb"`, `"#rrggbb"` or `0xRRGGBB`; `bg` also takes `"none"`. Text, arcs and spinners default to white, button backgrounds and tracks to `"#262626"`.
+- `radius` is 0 to 233, or `"circle"`. `border` is 0 to 20. `thickness` (of an arc or a spinner) is 1 to 64, 12 by default.
 - `min`, `max` and `value` default to 0, 100 and 0, with min less than max; value is kept between them. `start_angle` and `end_angle` are clock degrees, 0 to 360: 0 is 12 o'clock, and they go clockwise.
 - `parent` is a box, and can be given only when the widget is made. Widgets inside a box lay out in its content area: a border moves them in by its width, and LVGL clips what sticks out of the box. A box may have three boxes above it; a label, button, arc, bar or image may go in the fourth. `scale` is a percentage, 10 to 400.
 - `rotation` (of an image) is clock degrees, 0 to 359, 0 by default: the picture turns clockwise about its centre. `spin` is turns a minute, 0 to 60, 0 (still) by default: the gadget turns the picture clockwise at that rate itself, with no Lua running. See Images.
@@ -245,6 +247,7 @@ The rest of Lua's `string`, `table`, `math` and `utf8` libraries is there, with 
 - Keep state in the store: `store.set` as it changes, and read it back in `start()`. A stop, a crash, a restart or a reinstall starts the app from `main.lua` again; only the store and the alarms remain. Check what you read: the store outlives a reinstall, so it may hold what an older version wrote.
 - Lay out with `align = "center"` and x, y offsets inside `ui.SAFE`. Place things on a ring with `ui.polar`, and make an edge ring with an arc of `w = 440, h = 440`. Install results warn of any widget that goes past the round edge.
 - Tick only while shown: start `timer.every` when the app is shown (in `start()` and in `show()`) and cancel it in `hide()`, as the timer example's `ticking()` does. An app behind needs no redraws.
+- Waiting: when the app starts a `muse.ask`, a `vm.command` or a slow `vm.read`, show a `ui.spinner{...}` and hide it in the callback with `hidden = true`, whether the call worked or not; if it failed, show the error's text in a label instead. A hidden spinner draws nothing, so keep one and show it again for the next wait.
 - Answer `message()` with a small table (`{state = "running", remaining = 290}`), and raise `error("...")` with what to send instead for an event or data you can't take.
 
 ## Images

@@ -146,8 +146,8 @@ static const char *TAG = "muse_apps";
 #define MSG_ASLEEP "layout not checked: the screen was asleep"
 #define MSG_EXITED "the app exited (sys.exit)"
 
-static const char *const KINDS[] = {"label", "button", "box", "arc", "bar", "image"};
-_Static_assert(ARRAY_LEN(KINDS) == APPS_W_IMAGE + 1, "a name for each kind of widget");
+static const char *const KINDS[] = {"label", "button", "box", "arc", "bar", "image", "spinner"};
+_Static_assert(ARRAY_LEN(KINDS) == APPS_W_SPINNER + 1, "a name for each kind of widget");
 
 /* ---- Requests ---- */
 

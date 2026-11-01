@@ -1,0 +1,15 @@
+{
+  "id": "spinner",
+  "name": "Spinner",
+  "version": "1",
+  "api": 1,
+  "files": [],
+  "permissions": [
+    "keep_awake"
+  ],
+  "memory_kb": 64,
+  "messages": {
+    "mode": "data {name}: shown (a 48 px spinner over the layout), hidden (the same spinner, hidden) or none (no spinner at all). Replies with state.",
+    "state": "Change nothing. Replies {mode, taps}."
+  }
+}

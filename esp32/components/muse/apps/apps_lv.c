@@ -186,7 +186,7 @@ static bool image_size(const pass_t *p, const apps_widget_t *w, uint16_t *iw, ui
  * checked again, field by field, because LVGL asserts abort() and a loop here would hang the UI. The text is
  * read at most APPS_UI_TEXT_MAX + 1 bytes in. */
 static const char *check_widget(const pass_t *p, int slot, const apps_widget_t *w) {
-    if (w->kind > APPS_W_IMAGE) {
+    if (w->kind > APPS_W_SPINNER) {
         return "kind";
     }
 
@@ -362,6 +362,7 @@ static lv_obj_t *new_object(uint8_t kind, lv_obj_t *parent, lv_obj_t **label) {
         case APPS_W_ARC: obj = lv_arc_create(parent); break;
         case APPS_W_BAR: obj = lv_bar_create(parent); break;
         case APPS_W_IMAGE: obj = lv_image_create(parent); break;
+        case APPS_W_SPINNER: obj = lv_spinner_create(parent); break;  /* LVGL's own animation, with its defaults */
         default: break;
     }
     if (obj == NULL) {
@@ -379,6 +380,8 @@ static lv_obj_t *new_object(uint8_t kind, lv_obj_t *parent, lv_obj_t **label) {
     if (kind == APPS_W_ARC) {
         lv_arc_set_rotation(obj, 270);  /* 0 is 12 o'clock, as for the app */
         lv_obj_remove_style(obj, NULL, LV_PART_KNOB);  /* no knob: there is nothing on it to grab */
+    } else if (kind == APPS_W_SPINNER) {
+        lv_obj_remove_style(obj, NULL, LV_PART_KNOB);  /* its rotation and angles are lv_spinner's own */
     } else if (kind == APPS_W_BUTTON) {
         lv_obj_t *text = lv_label_create(obj);
         if (text == NULL) {
@@ -502,6 +505,10 @@ static int32_t scaled_side(uint16_t side, uint16_t scale) {
  */
 static void apply_geom(const pass_t *p, const apps_widget_t *w, lv_obj_t *obj) {
     int32_t width = w->w < 0 ? LV_SIZE_CONTENT : w->w, height = w->h < 0 ? LV_SIZE_CONTENT : w->h;
+    if (w->kind == APPS_W_SPINNER) {  /* a ring has no content of its own: a side the app left out is APPS_SPINNER_SIDE */
+        width = w->w < 0 ? APPS_SPINNER_SIDE : width;
+        height = w->h < 0 ? APPS_SPINNER_SIDE : height;
+    }
     uint16_t iw, ih;
     if (w->kind == APPS_W_IMAGE && w->scale != 100 && image_size(p, w, &iw, &ih)) {
         width = w->w < 0 ? scaled_side(iw, w->scale) : width;
@@ -727,6 +734,7 @@ static void apply_style(pass_t *p, const apps_widget_t *w, node_t *n) {
             style_surface(w, obj);
             break;
         case APPS_W_ARC:
+        case APPS_W_SPINNER:
             lv_obj_set_style_arc_width(obj, w->thickness, LV_PART_MAIN);
             lv_obj_set_style_arc_color(obj, colour(w->track_color), LV_PART_MAIN);
             lv_obj_set_style_arc_width(obj, w->thickness, LV_PART_INDICATOR);
@@ -786,7 +794,7 @@ static void apply_events(int slot, const apps_widget_t *w, node_t *n) {
         lv_obj_add_event_cb(n->obj, on_touch, LV_EVENT_PRESSED, user);
         lv_obj_add_event_cb(n->obj, on_touch, LV_EVENT_RELEASED, user);
         lv_obj_add_event_cb(n->obj, on_touch, LV_EVENT_PRESS_LOST, user);
-        if (w->kind == APPS_W_ARC) {
+        if (w->kind == APPS_W_ARC || w->kind == APPS_W_SPINNER) {  /* a spinner is an lv_arc: the same guard */
             lv_obj_add_event_cb(n->obj, on_arc_press, (lv_event_code_t)(LV_EVENT_PRESSING | LV_EVENT_PREPROCESS), NULL);
         }
         n->subscribed = true;
@@ -938,10 +946,10 @@ static int16_t overflow_of(const pass_t *p, const apps_widget_t *w, int32_t x1, 
     int64_t far2 = 0;                /* the farthest distance, squared, doubled */
     int32_t two_r = 0;
     int32_t half = (rw < rh ? rw : rh) / 2;  /* the most LVGL rounds a corner by */
-    bool round_shape = w->kind == APPS_W_ARC || (w->kind == APPS_W_BOX && half > 0 && (w->radius < 0 || w->radius >= half));
+    bool round_shape = w->kind == APPS_W_ARC || w->kind == APPS_W_SPINNER || (w->kind == APPS_W_BOX && half > 0 && (w->radius < 0 || w->radius >= half));
     if (round_shape) {
         int64_t cx = 2 * (int64_t)x1 + rw, cy = 2 * (int64_t)y1 + rh;  /* the box's centre, doubled */
-        int64_t reach = w->kind == APPS_W_ARC ? 0 : (rw > rh ? rw - rh : rh - rw);
+        int64_t reach = w->kind == APPS_W_ARC || w->kind == APPS_W_SPINNER ? 0 : (rw > rh ? rw - rh : rh - rw);
         two_r = rw < rh ? rw : rh;
         for (int end = -1; end <= 1; end += 2) {
             int64_t ex = cx + (rw >= rh ? end * reach : 0), ey = cy + (rw >= rh ? 0 : end * reach);

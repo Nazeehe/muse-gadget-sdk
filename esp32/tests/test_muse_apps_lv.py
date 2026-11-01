@@ -495,6 +495,28 @@ class HarnessTest(unittest.TestCase):
     def test_a_spinning_circle_invalidates_its_square(self):  # Task 7: a record's room for its turn is its own; corners keep LVGL's
         self.run_case("spin_invalidates_what_it_draws")
 
+    def test_spinner_is_made_and_styled(self):  # connected apps Task 8: lv_spinner_create, an arc's style, APPS_SPINNER_SIDE, no value
+        self.run_case("spinner_is_made_and_styled")
+
+    def test_spinner_animates_only_while_shown(self):
+        # Task 8: LVGL's own animation, whose steps invalidate nothing while the spinner or a box above it is hidden; no spin count and
+        # no frame pairing (those are for images that spin).
+        self.run_case("spinner_animates_only_while_shown")
+
+    def test_spinner_is_made_by_lvgl_alone(self):
+        # Task 8: the animation is lv_spinner's (1,000 ms a turn, 200 degrees in 9.5.0), so apps_lv.c's only mention of a spinner is
+        # lv_spinner_create in new_object: it sets no animation parameters of its own, starts no lv_anim for it (the spin test above
+        # still holds: apply_turn and start_spin own every lv_anim_ call), and a spinner is no spinning image (s_spinning).
+        source = strip_c_comments(APPS_LV.read_text())
+        calls = re.findall(r"\blv_spinner_\w+", source)
+        self.assertEqual(calls, ["lv_spinner_create"], "the apply step only makes the spinner")
+        make = re.search(r"static lv_obj_t \*new_object\(.*?\n\}\n", source, re.S).group(0)
+        self.assertRegex(make, r"case APPS_W_SPINNER:\s*obj = lv_spinner_create\(parent\);")
+        self.assertRegex(make, r"kind == APPS_W_SPINNER")  # its knob is taken off, as an arc's is
+        for path in sorted(APPS.glob("*.c")):
+            if path != APPS_LV:
+                self.assertNotIn("lv_spinner", strip_c_comments(path.read_text()), path.name)
+
     def test_pairing_follows_the_spin(self):
         # Task 7, fix round 1 (R7a): the board's frame pairing is on only while an image spins on the layer in front (no launcher or
         # card over it): a spin turns it on, and the last spin stopped or deleted, the app behind, the launcher or a card turn it off.
@@ -684,6 +706,8 @@ class FakesTest(unittest.TestCase):
         offsetof(lv_image_dsc_t,header) offsetof(lv_image_dsc_t,data_size) offsetof(lv_image_dsc_t,data)
         offsetof(lv_area_t,x1) offsetof(lv_area_t,x2) offsetof(lv_area_t,y1) offsetof(lv_area_t,y2)
         sizeof(lv_point_t) offsetof(lv_point_t,x) offsetof(lv_point_t,y)
+        LV_BEZIER_VAL_SHIFT LV_BEZIER_VAL_MAX LV_BEZIER_VAL_FLOAT(0.42) LV_BEZIER_VAL_FLOAT(0.58) LV_BEZIER_VAL_FLOAT(1)
+        offsetof(lv_anim_t,parameter) sizeof(lv_anim_bezier3_para_t)
         LV_ANIM_REPEAT_INFINITE sizeof(lv_anim_t) offsetof(lv_anim_t,var) offsetof(lv_anim_t,exec_cb) offsetof(lv_anim_t,deleted_cb)
         offsetof(lv_anim_t,path_cb) offsetof(lv_anim_t,start_value) offsetof(lv_anim_t,current_value) offsetof(lv_anim_t,end_value)
         offsetof(lv_anim_t,duration) offsetof(lv_anim_t,act_time) offsetof(lv_anim_t,repeat_cnt) offsetof(lv_anim_t,last_timer_run)
@@ -758,6 +782,90 @@ class FakesTest(unittest.TestCase):
         for line in ("a->duration = 500;", "a->repeat_cnt = 1;", "a->early_apply = 1;", "a->current_value = INT32_MIN;",
                      "angle -= 3600;", "angle += 3600;", "if (new_value != a->current_value) {",
                      "a->act_time = over_time - (int32_t)a->repeat_delay;", "lv_anims_of_deleted(o);"):
+            with self.subTest(fake=line):
+                self.assertIn(line, harness)
+
+    def test_the_fakes_spinner_is_lvgl_9_5_0s(self):
+        """Task 8: what the fake's lv_spinner (tests/muse_apps_lv_harness.c) follows, in lv_spinner.c's own lines: the defaults the
+        constructor passes (1,000 ms a turn, 200 degrees: not the 60 the brief's words name, which no 9.5.0 default is), the two animations
+        lv_spinner_set_anim_params starts, the bezier path they use (lv_anim_path_custom_bezier3 over lv_cubic_bezier, with the
+        constants of lv_math.c), the arc's start and end angles it moves, and an invalidated area that a hidden parent hides."""
+        def code(path):
+            return _strip_comments((self.lvgl / path).read_text(errors="replace"))
+
+        def definition(text, signature):
+            return " ".join(c_function(text, signature + "\n{").split())
+
+        spinner = code("src/widgets/spinner/lv_spinner.c")
+        flat = " ".join(spinner.split())
+        for line in ("#define DEF_ARC_ANGLE 200", "#define DEF_TIME 1000"):
+            with self.subTest(line):
+                self.assertIn(line, flat)
+        constructor = " ".join(re.search(r"static void lv_spinner_constructor\([^)]*\)\s*\{.*?\n\}", spinner, re.S).group(0).split())
+        for line in ("lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);", "lv_spinner_set_anim_params(obj, DEF_TIME, DEF_ARC_ANGLE);"):
+            with self.subTest(constructor=line):
+                self.assertIn(line, constructor)
+        params = definition(spinner, "void lv_spinner_set_anim_params(lv_obj_t * obj, uint32_t t, uint32_t angle)")
+        ordered = ("spinner->duration = t;", "spinner->angle = angle;", "lv_anim_delete(obj, NULL);", "lv_anim_init(&a);",
+                   "lv_anim_set_var(&a, obj);", "lv_anim_set_exec_cb(&a, arc_anim_end_angle);",
+                   "lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);", "lv_anim_set_duration(&a, t);",
+                   "lv_anim_set_values(&a, angle, 360 + angle);", "lv_anim_start(&a);",
+                   "lv_anim_set_path_cb(&a, lv_anim_path_custom_bezier3);",
+                   "lv_anim_set_bezier3_param(&a, LV_BEZIER_VAL_FLOAT(0.42), LV_BEZIER_VAL_FLOAT(0.58), LV_BEZIER_VAL_FLOAT(0), "
+                   "LV_BEZIER_VAL_FLOAT(1));", "lv_anim_set_values(&a, 0, 360);", "lv_anim_set_exec_cb(&a, arc_anim_start_angle);",
+                   "lv_anim_start(&a);", "lv_arc_set_bg_angles(obj, 0, 360);", "lv_arc_set_rotation(obj, 270);")
+        at = -1
+        for line in ordered:
+            with self.subTest(params=line):
+                found = params.find(line, at + 1)
+                self.assertGreater(found, at, f"{line} is not in order in lv_spinner_set_anim_params")
+                at = found
+        self.assertIn("lv_arc_set_start_angle(obj, (uint32_t) v);", definition(spinner, "static void arc_anim_start_angle(void * obj, int32_t v)"))
+        self.assertIn("lv_arc_set_end_angle(obj, (uint32_t) v);", definition(spinner, "static void arc_anim_end_angle(void * obj, int32_t v)"))
+        self.assertIn("lv_spinner_class", spinner)
+        self.assertIn(".base_class = &lv_arc_class,", flat)  # so every arc call is good on a spinner
+
+        anim = code("src/misc/lv_anim.c")
+        self.assertIn("return lv_anim_path_cubic_bezier(a, para->x1, para->y1, para->x2, para->y2);",
+                      definition(anim, "int32_t lv_anim_path_custom_bezier3(const lv_anim_t * a)"))
+        cubic = definition(anim, "static int32_t lv_anim_path_cubic_bezier(const lv_anim_t * a, int32_t x1, int32_t y1, int32_t x2, int32_t y2)")
+        for line in ("uint32_t t = lv_map(a->act_time, 0, a->duration, 0, LV_BEZIER_VAL_MAX);",
+                     "int32_t step = lv_cubic_bezier(t, x1, y1, x2, y2);", "new_value = step * (a->end_value - a->start_value);",
+                     "new_value = new_value >> LV_BEZIER_VAL_SHIFT;", "new_value += a->start_value;"):
+            with self.subTest(cubic=line):
+                self.assertIn(line, cubic)
+        self.assertIn("lv_anim_set_bezier3_param(lv_anim_t * a, int16_t x1, int16_t y1, int16_t x2, int16_t y2)", " ".join(anim.split()))
+        math = code("src/misc/lv_math.c")
+        flat_math = " ".join(math.split())
+        self.assertIn("#define CUBIC_NEWTON_ITERATIONS 8", flat_math)
+        self.assertIn("#define CUBIC_PRECISION_BITS 10", flat_math)
+        bezier = definition(math, "int32_t lv_cubic_bezier(int32_t x, int32_t x1, int32_t y1, int32_t x2, int32_t y2)")
+        for line in ("if(x == 0 || x == LV_BEZIER_VAL_MAX) return x;", "cx = 3 * x1;", "bx = 3 * (x2 - x1) - cx;",
+                     "ax = (1L << CUBIC_PRECISION_BITS) - cx - bx;", "cy = 3 * y1;", "by = 3 * (y2 - y1) - cy;",
+                     "ay = (1L << CUBIC_PRECISION_BITS) - cy - by;", "xs = do_cubic_bezier(t, ax, bx, cx) - x;",
+                     "d = ((int64_t)xs * (1L << CUBIC_PRECISION_BITS)) / d;", "tl = 0, tr = 1L << CUBIC_PRECISION_BITS, t = x;",
+                     "x > xs ? (tl = t) : (tr = t);", "t = (tr - tl) / 2 + tl;"):
+            with self.subTest(bezier=line):
+                self.assertIn(line, bezier)
+        self.assertIn("ret = ((ret + c) * t) >> CUBIC_PRECISION_BITS;", definition(math, "static int32_t do_cubic_bezier(int32_t t, int32_t a, int32_t b, int32_t c)"))
+
+        arc = code("src/widgets/arc/lv_arc.c")
+        for name, var in (("start", "start"), ("end", "end")):
+            body = definition(arc, f"void lv_arc_set_{name}_angle(lv_obj_t * obj, lv_value_precise_t {var})")
+            with self.subTest(arc=name):
+                self.assertIn(f"if({var} > 360) {var} -= 360;", body)
+                self.assertIn(f"arc->indic_angle_{name} = {var};", body)
+                self.assertIn("else if(new_delta < old_delta) inv_arc_area(", body)
+        self.assertIn("if(lv_obj_is_visible(obj) == false) return;", definition(arc, "static void inv_arc_area(lv_obj_t * obj, lv_value_precise_t start_angle, lv_value_precise_t end_angle, lv_part_t part)"))
+        visible = definition(code("src/core/lv_obj_pos.c"), "bool lv_obj_area_is_visible(const lv_obj_t * obj, lv_area_t * area)")
+        self.assertIn("if(lv_obj_has_flag(parent, LV_OBJ_FLAG_HIDDEN)) return false;", visible)  # the child of a hidden parent is hidden
+        harness = HARNESS.read_text()
+        for line in ("lv_spinner_set_anim_params(o, 1000, 200);", "lv_anim_delete(obj, NULL);",
+                     "lv_anim_set_values(&a, (int32_t)angle, 360 + (int32_t)angle);", "lv_anim_set_values(&a, 0, 360);",
+                     "LV_BEZIER_VAL_FLOAT(0.42), LV_BEZIER_VAL_FLOAT(0.58), LV_BEZIER_VAL_FLOAT(0), LV_BEZIER_VAL_FLOAT(1)",
+                     "lv_arc_set_bg_angles(obj, 0, 360);", "lv_arc_set_rotation(obj, 270);", "#define FAKE_CUBIC_NEWTON_ITERATIONS 8",
+                     "#define FAKE_CUBIC_PRECISION_BITS 10", "o->flags &= ~(uint32_t)LV_OBJ_FLAG_CLICKABLE;",
+                     "if (angle > 360) {\n        angle -= 360;", "up = up->parent"):
             with self.subTest(fake=line):
                 self.assertIn(line, harness)
 

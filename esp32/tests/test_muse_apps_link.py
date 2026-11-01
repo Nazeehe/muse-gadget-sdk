@@ -244,7 +244,7 @@ class GuideAndSkill(unittest.TestCase):
         ui = strip_c_comments((APPS / "apps_ui.c").read_text())
         kinds = c_table(ui, "apps_ui_kinds")
         events = c_table(ui, "apps_ui_events")
-        self.assertEqual(kinds, ["label", "button", "box", "arc", "bar", "image"])
+        self.assertEqual(kinds, ["label", "button", "box", "arc", "bar", "image", "spinner"])
         lines = {kind: (props, evs) for kind, props, evs in
                  re.findall(r"^- `ui\.(\w+)` properties: ([^;\n]+); events: ([^\n]+)$", reference, re.M)}
         self.assertEqual(sorted(lines), sorted(kinds), "one properties line per kind")
@@ -685,6 +685,36 @@ class GuideAndSkill(unittest.TestCase):
                         r"circle into its alpha", r"--cf RGB565A8"):
             with self.subTest(pattern):
                 self.assertRegex(images, pattern)
+
+    def test_guide_teaches_the_spinner(self):
+        # connected apps Task 8: the widget list names ui.spinner with its size and what it is not (no value, no automatic one, none in
+        # muse.ask: the user's words, "that's an odd pattern"), the numbers are the header's (D12: APPS_SPINNER_SIDE), the properties
+        # line is the table's (test_guide_matches_bindings has the list), and Patterns has "Waiting": show it when the app starts a
+        # muse.ask, a vm.command or a slow vm.read, hide it in the callback, show the error's text on a failure.
+        side = header_number("apps_ui.h", "APPS_SPINNER_SIDE")
+        self.assertEqual(side, 48)
+        ui = " ".join(strip_c_comments((APPS / "apps_ui.c").read_text()).split())
+        self.assertIn('{"spinner", ui_spinner}', ui)
+        guide = " ".join(GUIDE.read_text().split())
+        reference = guide_section(GUIDE.read_text(), "API reference")
+        self.assertRegex(reference, r"(?m)^- `ui\.spinner\{\.\.\.\}`: a ring that turns by itself")
+        self.assertRegex(reference, r"(?m)^- `ui\.spinner` properties: align, x, y, w, h, hidden, opacity, parent, thickness, color, "
+                                    r"track_color; events: tap, long_press, press, release$")
+        for pattern in (rf"[Ww]ithout `w` and `h` it is {side} px square", r"about once a second", r"no Lua running",
+                        r"no value", r"shows no progress", r"nothing shows one for you", r"`muse\.ask` shows none",
+                        r"`thickness` \(of an arc or a spinner\)"):
+            with self.subTest(pattern):
+                self.assertRegex(guide, pattern)
+        patterns = guide_section(GUIDE.read_text(), "Patterns")
+        waiting = re.search(r"(?m)^- Waiting: (.*)$", patterns)  # one list item, as the others of Patterns are
+        self.assertIsNotNone(waiting, "Patterns has a Waiting item")
+        waiting = " ".join(waiting.group(1).split())
+        for pattern in (r"`ui\.spinner\{", r"`muse\.ask`", r"`vm\.command`", r"slow `vm\.read`", r"hide it in the callback",
+                        r"`hidden = true`", r"the error's text", r"[Aa] hidden spinner draws nothing"):
+            with self.subTest(pattern):
+                self.assertRegex(waiting, pattern)
+        skill = SKILL.read_text()
+        self.assertIn(guide_body(GUIDE.read_text()), skill)
 
     def test_guide_states_the_spin_cap(self):
         # connected apps Task 1, fix round 0 (R1): Images says how large a picture may spin (D12: from APPS_SPIN_SIDE_MAX), why, and

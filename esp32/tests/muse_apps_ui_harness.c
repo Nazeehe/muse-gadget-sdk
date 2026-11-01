@@ -231,7 +231,7 @@ static void check_invariants(int line, env_t *e) {
             continue;
         }
         alive++;
-        CHECK_AT(line, w->kind <= APPS_W_IMAGE, "slot %d: kind %d", i, w->kind);
+        CHECK_AT(line, w->kind <= APPS_W_SPINNER, "slot %d: kind %d", i, w->kind);
         CHECK_AT(line, (w->dirty & APPS_DIRTY_DELETE) == 0, "slot %d: alive and flagged DELETE", i);
         int depth = 0;
         for (int p = w->parent; p >= 0 && depth <= 5; p = apps_ui_slot(e->ui, p)->parent) {

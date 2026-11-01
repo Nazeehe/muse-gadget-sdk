@@ -637,8 +637,12 @@ Keep within the session's bounds:
   slow work, and any request that depends on its result, in a task of your
   own, as `on_ws_command()`'s asynchronous commands do. That includes waiting
   for a reply: `vm_file_read()`, `vm_file_read_all()` and `vm_file_write()` wait
-  for answers that only the session task delivers, so they must never run on it
-  (`vm_file_open()` and `vm_file_close()` wait for nothing and can).
+  for answers that only the session task delivers, so they must never run on it.
+  `vm_file_close()` waits for nothing and can. So does `vm_file_open()` in a
+  build without the apps; with `CONFIG_MUSE_APPS` an open may wait, up to
+  `VM_FILE_APP_WAIT_MS`, for an app's request to let go of the reader, so on
+  the session task only the image download's open runs, and it never waits
+  (`main/vm_file.h`).
 
 ## Video from a phone
 
@@ -717,8 +721,12 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   launcher's icons, read on the I/O worker), `apps_install.c` (the one
   install pipeline), `apps_alarm.c`, `apps_console.c` (the console's
   `>app.*`), `apps_control.c` (`app.api`, `app.control`), `apps_snapshot.c`
-  (JPEG snapshots) and the digit fonts (`fonts/`); `main/apps_link.c` (the Link
-  commands); `tools/muse/app.py` and `tools/muse/apphost/` (the host runner).
+  (JPEG snapshots), `apps_vmio.c` (the `vm` module), `apps_net.c` (the network
+  worker, which runs the `vm` module's requests over the VM ops),
+  `apps_ask.c` (`muse.ask`), `apps_jpeg.c` (runtime JPEGs), the examples
+  (`examples/`) and the digit fonts (`fonts/`); `main/apps_link.c` (the Link
+  commands and the VM ops); `tools/muse/app.py` and `tools/muse/apphost/`
+  (the host runner).
   `components/muse/apps/apps_guide.md` is the guide Muse reads, and
   `skills/gadget-muse-apps/SKILL.md` holds it for an agent.
 - **Using it:** a long press on the pocket watch opens the launcher, a
@@ -796,7 +804,9 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   app, and a call that hasn't returned after 3 s marks it hung.
 - **Memory:** PSRAM holds the app task's 56 KB stack, the running app's Lua
   heap (its manifest's `memory_kb`, at most `MUSE_APPS_HEAP_MAX_KB`), the I/O
-  worker's 8 KB stack and, while one is taken, a snapshot. The apps always
+  worker's 8 KB stack, the network worker's 8 KB stack (`APPS_NET_STACK`; it is
+  made by an app's first `vm` request and stays) and, while one is taken, a
+  snapshot. The apps always
   leave 1 MB of PSRAM to the rest of the gadget (`APPS_RAM_RESERVE`,
   `apps_pkg.h`): Muse's session takes about 430 KB while it is up and about
   630 KB at the peak of a turn, and LVGL aborts when it can't allocate. So
@@ -860,7 +870,7 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   or without the apps, in the Link's own setup: that floor is an open item of
   the Link's.
   The deepest stacks seen: the app task 13,012 bytes free of 57,344, the I/O
-  worker 4,340 of 8,192, and the LVGL task 1,240 free
+  worker 3,968 of 8,192, and the LVGL task 1,240 free
   after 128 widgets, Settings, the launcher, a crash card, a snapshot and a
   `display.draw_file`.
 - **Storage:** `partitions_muse_apps.csv` is `partitions_muse.csv` with two
@@ -891,6 +901,34 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   `tests/test_muse_apps_hook.py` runs that hook under bash 4 or later with a
   stand-in for the VM's hook runtime, and `apphost --vm DIR` runs an app
   against a folder that stands in for its folder on the VM.
+- **Connected apps, measured** on the 1.75C on 2026-11-01 (apps+bench build,
+  with Muse on the user's VM):
+  - `app.api` wrote the guide and its examples, 164,689 bytes, to the VM in
+    1.3 s, well inside its 20 s (`MUSE_APPS_GUIDE_WRITE_MS`).
+  - The tally, installed by Muse from the guide: "+1" was on screen 2.0 to
+    2.7 s after the tap (the command's write, the hook's next check and the
+    gadget's next read of the acks), "Ask" brought Muse's reply in about
+    13 s, and the Lua heap peaked at 43 KB of its 64. With the app behind,
+    each hook run ended at the in-front gate in 26 to 37 ms, every 5 s, with
+    no connector call.
+  - A VM read opens only while internal and DMA RAM each keep the Link's
+    16 KB TX margin plus 4 KB (`VM_RESERVE_BYTES`, `main/vm_file.c`) and the
+    request free, about 20.6 KB; below that the app's read gets "the gadget is
+    short of memory". DMA free is 23.6 to 26.3 KB with an app watching or
+    spinning, but on one boot it stayed at 20,419 bytes for hours after the
+    Link lost its session and came back, and a watch read failed so. A
+    restart gave 26,699.
+  - A still picture under a spinning one: show it at scale 100. Each step of
+    the spin redraws what is under the turning picture, and a scaled picture
+    is drawn there through the same slow path as a turning one, about 18 to
+    20 ms more a frame at any opacity. With a 180 px record spinning over the
+    picture: unscaled (300 px, or 440 px) 32 to 33 ms frames (median; p95 35
+    to 44) and taps of 148 to 170 ms; scaled to fill the screen (105% or 155%)
+    51 to 53 ms and 182 to 216 ms; with no picture under it 29 ms and 134 ms.
+    Reading a 300 px JPEG from the VM and decoding it took 564 ms, and 616 ms
+    at 440 px.
+  - A typed turn and a voice press both work while an app watches: the voice
+    turn hides the app, and the app comes back in front when the turn ends.
 - **Test** with `tests/test_muse_apps_*.py` (the VM and the sandbox, JSON,
   packages, widgets and the apply step, the services, the runtime and its duty
   cycle, the app task, the store, the install, the console and `app.py`, the

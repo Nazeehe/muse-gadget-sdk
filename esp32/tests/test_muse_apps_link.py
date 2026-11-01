@@ -477,6 +477,14 @@ class GuideAndSkill(unittest.TestCase):
 
         task_stack = header_number("apps_task.c", "APPS_TASK_STACK")
         io_stack = header_number("apps_io.h", "APPS_IO_STACK")
+        net_stack = header_number("apps_net.h", "APPS_NET_STACK")  # connected apps Task 6 (M22): the network worker's
+        # Connected apps Task 6: the measured paragraph's code constants (app.api's write deadline, the VM reader's reserve
+        # beside the Link's TX margin, and the spin cap its record spun at).
+        guide_write = re.search(r"^#define\s+MUSE_APPS_GUIDE_WRITE_MS\s+(\d+)", (MUSE / "muse_apps.h").read_text(), re.M)
+        self.assertIsNotNone(guide_write, "no #define MUSE_APPS_GUIDE_WRITE_MS in muse_apps.h")
+        guide_write_s = int(guide_write.group(1)) / 1000
+        vm_reserve_kb = define_kb(MAIN / "vm_file.c", "VM_RESERVE_BYTES")
+        spin_side = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
         reserve_mb = define_kb(APPS / "apps_pkg.h", "APPS_RAM_RESERVE") / 1024
         # N1: the snapshot's one block at each scale (apps_snapshot.c's block_of, for the 466 x 466 screen), the encoder's
         # allowance and the app task's wait for it.
@@ -516,6 +524,10 @@ class GuideAndSkill(unittest.TestCase):
                 f"PSRAM holds the app task's {kb(task_stack)} KB stack",
                 f"free of {task_stack:,}",
                 f"the I/O worker's {kb(io_stack)} KB stack",
+                f"the network worker's {kb(net_stack)} KB stack (`APPS_NET_STACK`;",
+                f"well inside its {guide_write_s:g} s (`MUSE_APPS_GUIDE_WRITE_MS`)",
+                f"keep the Link's {tx_margin_kb} KB TX margin plus {vm_reserve_kb} KB (`VM_RESERVE_BYTES`, `main/vm_file.c`)",
+                f"With a {spin_side} px record spinning over the picture",
                 f"of {io_stack:,}, and the LVGL task",
                 f"JPEG's room: {block1:,} bytes at scale 1 and {block2:,} at scale 2, with {encoder1_kb} KB and {encoder2_kb} KB",
                 f"waits for the snapshot, up to {wait_s:g} s",

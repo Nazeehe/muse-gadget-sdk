@@ -480,6 +480,7 @@ static struct {
     bool hold;                  /* ops wait while it is set, until it is let go or their deadline comes */
     size_t drop_after;          /* a read drops after this many bytes: SIZE_MAX for never */
     const char *write_code, *write_err;  /* the writes fail so, while set */
+    int64_t read_ms;            /* each read takes this long on the harness clock: the clock moves by it as the read ends */
     int in_op, max_in_op, started, wrong_thread;
     int64_t last_deadline_us;
 } vm = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .drop_after = SIZE_MAX};
@@ -670,6 +671,10 @@ static bool vm_read(const char *path, size_t max, bool (*sink)(void *user, const
             }
         }
     }
+    if (vm.read_ms > 0) {
+        int64_t at = atomic_fetch_add(&clock_ms, vm.read_ms) + vm.read_ms;  /* the time the read took, before its answer */
+        note("vm read done %s at %lld", rel_of(path), (long long)at);
+    }
     vm.in_op--;
     pthread_mutex_unlock(&vm.mu);
     return ok;
@@ -699,7 +704,7 @@ static bool vm_write(const char *path, const void *data, size_t len, int64_t dea
     return ok;
 }
 
-static const muse_apps_vm_ops_t VM_OPS = {vm_read, vm_write};
+static const muse_apps_vm_ops_t VM_OPS = {vm_read, vm_write, vm_read};  /* the apps' reads come as app_read */
 
 const muse_apps_vm_ops_t *muse_apps_vm_ops(void) {
     return atomic_load(&no_ops) ? NULL : &VM_OPS;
@@ -1421,13 +1426,85 @@ static void one_request_in_flight_and_queue_of_8(void) {
     expect_no_logs();
     vm_set_hold(false);
     settle();
-    expect_logged("a\ta\tnil", "rev\t1\tnil", "b\tb\tnil", "c\tc\tnil", "d\td\tnil", "e\te\tnil", "f\tf\tnil", "g\tg\tnil", "h\th\tnil",
+    /* R3a: after a its turn is a poll's (the heartbeat), then b's, then the watch's first read, then the rest (no poll is due). */
+    expect_logged("a\ta\tnil", "b\tb\tnil", "rev\t1\tnil", "c\tc\tnil", "d\td\tnil", "e\te\tnil", "f\tf\tnil", "g\tg\tnil", "h\th\tnil",
                   "i\ti\tnil");
     CHECK(vm.max_in_op == 1, "%d at once", vm.max_in_op);
     CHECK(count_notes("vm write outbox/active.json") == 1, "the heartbeat went too");
     call("more");
     settle();
     expect_logged("again\ta\tnil");
+    finish();
+}
+
+/* R3a: the module's polls and the app's own requests take turns, so a request waits behind one poll at most, however many polls are
+ * due. Four 1 s watches whose reads take 400 ms each on the harness clock keep a poll due at every turn: before the turns alternated
+ * the reads of the app never went. Each own read's answer comes within (one poll + its read) of the one before it. */
+#define STARVE_READ_MS 400
+static void own_requests_are_never_starved_by_polls(void) {
+    for (int i = 1; i <= 4; i++) {
+        char rel[16];
+        snprintf(rel, sizeof rel, "state/r%d", i);
+        vm_put_text(rel, "1");
+    }
+    vm_put_text("a.json", "7");
+    start_app(APP("T.watch = function() for i = 1, 4 do vm.watch('state/r' .. i, 1, function() end) end end\n"
+                  "T.read = function() for i = 1, 3 do vm.read('a.json', cb('a' .. i)) end end\n"));
+    pthread_mutex_lock(&vm.mu);
+    vm.read_ms = STARVE_READ_MS;
+    pthread_mutex_unlock(&vm.mu);
+    call("watch");
+    /* The polls alone, for a while: a watch is due whenever the worker comes free. */
+    int64_t until = apps_port_mono_ms() + 3000;
+    while (apps_port_mono_ms() < until) {
+        round_once();
+        usleep(100);
+    }
+    CHECK(count_notes("vm read state/r") >= 6, "the watches poll: %d reads", count_notes("vm read state/r"));
+    int64_t asked = apps_port_mono_ms();
+    pthread_mutex_lock(&notes_mu);
+    int from = notes_n;
+    pthread_mutex_unlock(&notes_mu);
+    call("read");
+    until = asked + 20000;
+    while (logged_n < 3 && apps_port_mono_ms() < until) {
+        round_once();
+        usleep(100);
+    }
+    expect_logged("a1\t7\tnil", "a2\t7\tnil", "a3\t7\tnil");
+    /* The ops since the call, in order: the app's reads never two in a row (a poll is due at every turn), and one poll at most
+     * before each; and each read's end within one poll and its read of the last (on the harness clock). */
+    int own = 0, polls_before = 0;
+    int64_t last = asked;
+    pthread_mutex_lock(&notes_mu);
+    for (int i = from; i < notes_n && own < 3; i++) {
+        const char *n = notes[i];
+        long long at = 0;
+        if (sscanf(n, "vm read done a.json at %lld", &at) == 1) {
+            CHECK(at - last <= 2 * STARVE_READ_MS, "read %d came %lld ms after the last (at most one poll and its read)", own + 1,
+                  at - last);
+            last = at;
+            own++;
+        } else if (strncmp(n, "vm read a.json", 14) == 0) {
+            CHECK(polls_before <= 1, "read %d waited behind %d polls", own + 1, polls_before);
+            polls_before = 0;
+        } else if (strncmp(n, "vm read state/", 14) == 0 || strncmp(n, "vm write ", 9) == 0) {
+            polls_before++;
+        }
+    }
+    pthread_mutex_unlock(&notes_mu);
+    CHECK(own == 3, "%d of the reads ended", own);
+    /* And the polls go on. */
+    int reads = count_notes("vm read state/r");
+    until = apps_port_mono_ms() + 3000;
+    while (apps_port_mono_ms() < until) {
+        round_once();
+        usleep(100);
+    }
+    CHECK(count_notes("vm read state/r") >= reads + 6, "the watches poll still");
+    pthread_mutex_lock(&vm.mu);
+    vm.read_ms = 0;
+    pthread_mutex_unlock(&vm.mu);
     finish();
 }
 
@@ -1679,7 +1756,8 @@ static void no_vm_ops_is_not_connected(void) {
     atomic_store(&no_ops, true);
     call("go");
     settle();
-    expect_logged("rev\tnil\tthe VM is not connected", "a\tnil\tthe VM is not connected", "w\tfalse\tthe VM is not connected",
+    /* Turns alternate (R3a): the heartbeat's write, a, the watch's first read, w, then cmd (no poll is due). */
+    expect_logged("a\tnil\tthe VM is not connected", "rev\tnil\tthe VM is not connected", "w\tfalse\tthe VM is not connected",
                   "cmd\tfalse\tthe VM is not connected");
     advance(5000);
     expect_no_logs();  /* the watch says it once */
@@ -1687,7 +1765,7 @@ static void no_vm_ops_is_not_connected(void) {
     vm.offline = true;  /* ops, but no session */
     call("go");
     settle();
-    expect_logged("rev\tnil\tthe VM is not connected", "a\tnil\tthe VM is not connected", "w\tfalse\tthe VM is not connected",
+    expect_logged("a\tnil\tthe VM is not connected", "rev\tnil\tthe VM is not connected", "w\tfalse\tthe VM is not connected",
                   "cmd\tfalse\tthe VM is not connected");
     vm.offline = false;
     finish();
@@ -1730,6 +1808,7 @@ int main(int argc, char **argv) {
         {"watch_pauses_when_behind_or_dark", watch_pauses_when_behind_or_dark},
         {"heartbeat_every_10_s_while_watching", heartbeat_every_10_s_while_watching},
         {"one_request_in_flight_and_queue_of_8", one_request_in_flight_and_queue_of_8},
+        {"own_requests_are_never_starved_by_polls", own_requests_are_never_starved_by_polls},
         {"busy_reader_retries_then_fails", busy_reader_retries_then_fails},
         {"vm_session_drop_mid_read", vm_session_drop_mid_read},
         {"vm_result_after_the_app_ended_is_dropped", vm_result_after_the_app_ended_is_dropped},

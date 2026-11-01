@@ -34,9 +34,10 @@
  *   that, or one whose job the floor refuses, is an early answer: its callback and what to tell it go into the callbacks' table, and
  *   the next callbacks to run are those.
  * - The watches, the acks' poll and the heartbeat are the module's own polls: a due time each, and nothing queued. Each round's tick,
- *   when nothing is at the worker, sends one thing: an acks poll that is due, then the heartbeat, then the watch due first (only while
- *   active), then the app's oldest waiting request. So one job is at the worker at a time, the polls coalesce (a due poll is sent once
- *   when the turn comes), and the app's requests can't starve them.
+ *   when nothing is at the worker, sends one thing, and turns alternate (R3a): after a poll the app's oldest waiting request, after a
+ *   request a due poll (an acks poll, then the heartbeat, then the watch due first, only while active); either kind goes twice in a
+ *   row only when the other has nothing waiting. So one job is at the worker at a time, the polls coalesce (a due poll is sent once
+ *   when the turn comes), a request waits behind one poll at most, and the requests can't starve the polls either.
  * - A job comes back to apps_vmio_take, which files it: a request's result waits for its callback (in the order the results came), a
  *   watch's calls back only for a change of outcome, an acks read answers the commands it lists. Its epoch says which books it was
  *   made from: one sent before a release (a stop) is freed.
@@ -104,6 +105,7 @@ struct apps_vmio {
     uint32_t next_done;    /* the last result's place in the order */
     bool active;           /* in front and lit, at the last tick */
     bool running;          /* a job is at the worker */
+    bool last_was_poll;    /* the last job sent was a poll of the module's, not one of the app's requests (R3a) */
     req_t reqs[REQS_MAX];
     watch_t watches[APPS_VM_WATCHES_MAX];
     uint32_t watch_gen;
@@ -482,6 +484,32 @@ static req_t *oldest_waiting(apps_vmio_t *v) {
     return pick;
 }
 
+/* The module's poll that is due first, in their order: the acks, the heartbeat, then the watch due first (only while active). NULL
+ * when none is due, or the floor refused its job (it is tried again: the acks' and the watch's a period on, the heartbeat's next). */
+static apps_vm_job_t *next_poll(apps_vmio_t *v, int64_t now_ms, bool active, int watches) {
+    watch_t *w;
+    if (v->acks_due <= now_ms) {
+        apps_vm_job_t *job = new_job(v, K_ACKS, APPS_VM_READ, ACKS_PATH, APPS_VM_JSON_MAX);
+        v->acks_due = job != NULL ? INT64_MAX : now_ms + APPS_VM_ACK_POLL_MS;  /* set again when it comes back */
+        return job;
+    }
+    if (v->beating && v->beat_due <= now_ms) {
+        v->beat_due = now_ms + APPS_VM_HEARTBEAT_MS;
+        return beat_job(v, watches);
+    }
+    if (active && (w = due_watch(v, now_ms)) != NULL) {
+        apps_vm_job_t *job = new_job(v, K_WATCH, APPS_VM_READ, w->rel, APPS_VM_WATCH_MAX);
+        if (job != NULL) {
+            job->req = w->gen;
+            job->slot = (uint8_t)(w - v->watches);
+        } else {
+            w->due = now_ms + (int64_t)w->every_s * 1000;
+        }
+        return job;
+    }
+    return NULL;
+}
+
 void apps_vmio_tick(apps_rt_t *rt, int64_t now_ms, bool active) {
     apps_vmio_t *v = apps_rt_vmio(rt);
     if (v == NULL || apps_rt_state(rt) != APPS_STATE_RUNNING) {
@@ -513,27 +541,20 @@ void apps_vmio_tick(apps_rt_t *rt, int64_t now_ms, bool active) {
     if (v->running) {
         return;
     }
+    /* Turns alternate (R3a): after a poll the app's oldest waiting request goes, and after one of its requests a due poll; either
+     * goes twice in a row only when the other has nothing waiting. So a request waits behind one poll at most. */
+    req_t *r = oldest_waiting(v);
     apps_vm_job_t *job = NULL;
-    watch_t *w;
-    req_t *r;
-    if (v->acks_due <= now_ms) {
-        job = new_job(v, K_ACKS, APPS_VM_READ, ACKS_PATH, APPS_VM_JSON_MAX);
-        v->acks_due = job != NULL ? INT64_MAX : now_ms + APPS_VM_ACK_POLL_MS;  /* set again when it comes back */
-    } else if (v->beating && v->beat_due <= now_ms) {
-        job = beat_job(v, watches);
-        v->beat_due = now_ms + APPS_VM_HEARTBEAT_MS;
-    } else if (active && (w = due_watch(v, now_ms)) != NULL) {
-        job = new_job(v, K_WATCH, APPS_VM_READ, w->rel, APPS_VM_WATCH_MAX);
-        if (job != NULL) {
-            job->req = w->gen;
-            job->slot = (uint8_t)(w - v->watches);
-        } else {
-            w->due = now_ms + (int64_t)w->every_s * 1000;
-        }
-    } else if ((r = oldest_waiting(v)) != NULL) {
+    if (r == NULL || !v->last_was_poll) {
+        job = next_poll(v, now_ms, active, watches);
+    }
+    if (job != NULL) {
+        v->last_was_poll = true;
+    } else if (r != NULL) {
         job = r->job;
         r->job = NULL;
         r->state = R_RUNNING;
+        v->last_was_poll = false;
     }
     if (job != NULL) {
         send(v, job, now_ms);

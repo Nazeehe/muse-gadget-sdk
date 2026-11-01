@@ -770,7 +770,7 @@ static bool vm_read(const char *path, size_t max, bool (*sink)(void *, const uin
     return false;
 }
 
-static const muse_apps_vm_ops_t VM_OPS = {vm_read, vm_write};
+static const muse_apps_vm_ops_t VM_OPS = {vm_read, vm_write, NULL};
 static const muse_apps_vm_ops_t *vm_ops = &VM_OPS;
 
 const muse_apps_vm_ops_t *muse_apps_vm_ops(void) {

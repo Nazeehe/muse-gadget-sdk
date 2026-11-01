@@ -1796,7 +1796,7 @@ static void forget_writes(void) {
     vm_writes = 0;
 }
 
-static const muse_apps_vm_ops_t FAKE_VM = {fake_vm_read, fake_vm_write};
+static const muse_apps_vm_ops_t FAKE_VM = {fake_vm_read, fake_vm_write, NULL};
 
 /* The done callback: how often it ran, with what, and whether the install's hold was let go before it. */
 static int dones;

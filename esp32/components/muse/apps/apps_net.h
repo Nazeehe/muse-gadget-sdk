@@ -17,7 +17,8 @@
 
 /*
  * The network worker of Muse apps (connected apps Task 3): one task, "muse_apps_net", that runs the apps' VM requests (apps_vmio.h's
- * jobs) one at a time, in the order they came, through the VM ops (muse_apps_vm_ops, main/apps_link.c: vm_file). It is the only task
+ * jobs) one at a time, in the order they came, through the VM ops (muse_apps_vm_ops, main/apps_link.c: vm_file; a read as app_read,
+ * which yields the reader to the firmware's own: R3b). It is the only task
  * that waits on the VM for an app: not the Noise session's task (whose frames the VM ops wait for), not the I/O worker (whose jobs
  * would wait behind a stalled read), not the app task and never the LVGL task. A JPEG is decoded here too (apps_jpeg.h), into the
  * image block the app task adds (P2).

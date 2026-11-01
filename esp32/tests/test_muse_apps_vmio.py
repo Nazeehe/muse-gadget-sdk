@@ -100,6 +100,9 @@ class VmioHarness(unittest.TestCase):
     def test_one_request_in_flight_and_queue_of_8(self):  # P11: the worker's polls take no place among the 8
         self.run_case("one_request_in_flight_and_queue_of_8")
 
+    def test_own_requests_are_never_starved_by_polls(self):  # R3a: turns alternate, on a clock that moves during the reads
+        self.run_case("own_requests_are_never_starved_by_polls")
+
     def test_busy_reader_retries_then_fails(self):
         self.run_case("busy_reader_retries_then_fails")
 
@@ -158,6 +161,13 @@ class VmioStatic(unittest.TestCase):
         queue = call_arguments(net, "xQueueCreateWithCaps")
         self.assertEqual([queue[0], queue[2]], ["APPS_NET_JOBS", "MALLOC_CAP_SPIRAM"])
         self.assertNotIn("apps_io_submit", net, "VM requests never run on the I/O worker")
+        # R3b: an app's reads are app_read, which yields the reader to the firmware's own (main/apps_link.c: VM_FILE_OWNER_APP).
+        self.assertIn("ops->app_read(", net)
+        self.assertNotRegex(net, r"ops->read\(")
+        link = strip_c_comments((ROOT / "main/apps_link.c").read_text())
+        self.assertIn("static const muse_apps_vm_ops_t VM_OPS = {vm_read, vm_write, vm_app_read};", link)
+        self.assertIn("return read_as(VM_FILE_OWNER_APP,", c_function(link, "static bool vm_app_read("))
+        self.assertIn("return read_as(VM_FILE_OWNER_INSTALL,", c_function(link, "static bool vm_read("))
         for name in ("apps_vmio.c", "apps_task.c"):
             self.assertNotIn("muse_apps_vm_ops()", strip_c_comments((APPS / name).read_text()), f"{name} never calls the VM itself")
 
@@ -251,9 +261,9 @@ class VmOnAppHost(AppHostTestCase):
         app = self.make_app("scratch", main, manifest={"permissions": ["vm"]})
         run = self.host(app, script=["sync 1767225600000", "message go", "advance 10", "advance 5000"])
         no = "the VM is not connected"
-        # Nothing during the call; then the watch's first read (it goes before the app's own), and the requests in order. The
-        # watch's next reads fail the same way, so they are quiet.
-        self.assertEqual(run.logs(), ["asked", f"watch\tnil\t{no}", f"read\tnil\t{no}", f"write\tfalse\t{no}",
+        # Nothing during the call; then turns alternate (R3a): the heartbeat's write, the read, the watch's first read, the
+        # write and the command. The watch's next reads fail the same way, so they are quiet.
+        self.assertEqual(run.logs(), ["asked", f"read\tnil\t{no}", f"watch\tnil\t{no}", f"write\tfalse\t{no}",
                                       f"command\tfalse\t{no}"])
         self.assertEqual([k for k in run.kinds() if k in ("warning", "error", "crash")], [], run.events)
 

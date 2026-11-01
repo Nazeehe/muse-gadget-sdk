@@ -54,7 +54,8 @@
  * a command awaiting its ack among them; one past that gets "too many vm requests at once" through its callback. The polls of the
  * watches and of the acks and the heartbeat's writes are the module's: they share the one turn at the VM, one at a time, and
  * coalesce (one pending a watch, one acks read for every command that waits, one heartbeat), so they never take a place among the
- * 8 and the 8 never refuse them. Every request has APPS_VM_REQUEST_MS on the worker, and a busy file reader or writer is tried again
+ * 8 and the 8 never refuse them. The turns alternate (R3a), so a request of the app's waits behind one poll at most, and the
+ * requests never starve the polls. Every request has APPS_VM_REQUEST_MS on the worker, and a busy file reader or writer is tried again
  * APPS_VM_BUSY_RETRIES times, APPS_VM_BUSY_WAIT_MS apart.
  *
  * Errors (P10). A mistake in a call's own arguments is raised at the call, "vm.<name>: ...", and makes no request: a bad path or
@@ -180,8 +181,9 @@ void apps_vmio_free(apps_vmio_t *v);
 void apps_vmio_take(apps_rt_t *rt, apps_vm_job_t *job, int64_t now_ms);
 
 /* The app task, each round, outside a call, for a RUNNING app (P12): active is "in front and lit". The commands that time out, the
- * heartbeat's start and stop, and, when nothing is at the worker, the next request: an acks poll, the heartbeat, a watch that is due
- * (only while active), then the app's own, in order. It runs no app code. */
+ * heartbeat's start and stop, and, when nothing is at the worker, the next request. Turns alternate (R3a): after a poll the app's
+ * oldest waiting request, after one of its requests a due poll (an acks poll, the heartbeat, a watch that is due only while active,
+ * in that order); a kind goes twice in a row only when the other has nothing waiting. It runs no app code. */
 void apps_vmio_tick(apps_rt_t *rt, int64_t now_ms, bool active);
 
 /* The monotonic time the loop should come back by for the module: now (0) when a callback waits or a request is ready to go; else

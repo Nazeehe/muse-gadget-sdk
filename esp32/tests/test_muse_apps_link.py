@@ -763,6 +763,10 @@ class GuideAndSkill(unittest.TestCase):
 
         side = header_number("apps_rt.h", "APPS_RT_IMAGE_SIDE_MAX")
         images = header_number("apps_rt.h", "APPS_RT_IMAGES_MAX")
+        path_max = header_number("apps_pkg.h", "APPS_PATH_MAX")
+        # vm.read's opts example, as the call's own error has it.
+        example = re.search(r'(?m)^#define OPTS_EXAMPLE "([^"]+)"$', (APPS / "apps_vmio.c").read_text()).group(1)
+        example_max = int(re.fullmatch(r"\{circle = true, max = (\d+)\}", example).group(1))
         # A .bin read is at most a package image's bytes.
         self.assertRegex((APPS / "apps_vmio.h").read_text(), r"(?m)^#define APPS_VM_BIN_MAX APPS_IMAGE_MAX$")
         image_kb = int(re.search(r"(?m)^#define APPS_IMAGE_MAX \((\d+) \* 1024\)", (APPS / "apps_pkg.h").read_text()).group(1))
@@ -772,11 +776,15 @@ class GuideAndSkill(unittest.TestCase):
         vm = " ".join(reference[reference.index("\n### vm\n"):].split("\n### ", 2)[1].split())
         for pattern in (
                 r"These need the `vm` permission",
+                rf"`a-z 0-9 _ \. / -`, at most {path_max} characters",
+                re.escape(f"`{example}`"),
+                # R3a: turns alternate, so a request waits behind one of the module's polls at most.
+                r"after one of them a waiting request goes next, so a request waits behind one of them at most",
                 rf"`\.json` the decoded value \(the file at most {kb('APPS_VM_JSON_MAX')} KB\)",
                 rf"`\.txt` a string \(at most {kb('APPS_VM_TXT_MAX')} KB\)",
                 rf"`\.jpg` or `\.jpeg` a `muse\.image` \(at most {kb('APPS_VM_JPEG_MAX')} KB; baseline, not progressive\)",
                 rf"`\.bin` a `muse\.image` \(an LVGL image of at most {side} x {side} px and {image_kb} KB",
-                rf"decodes it to fit 200 px \(1 to {side}, {side} if left out\)",
+                rf"decodes it to fit {example_max} px \(1 to {side}, {side} if left out\)",
                 rf"writes value as JSON \(at most {whole(number('APPS_VM_WRITE_MAX'), 1024)} KB\) to path, which must be in `outbox/`",
                 rf"reads `state/acks\.json` every {whole(number('APPS_VM_ACK_POLL_MS'), 1000)} s until the hook lists seq",
                 rf"`cb\(false, \"timed out\"\)` after {whole(number('APPS_VM_ACK_MS'), 1000)} s",
@@ -805,6 +813,19 @@ class GuideAndSkill(unittest.TestCase):
                 rf"keeps its place among the {images} until the screen lights again"):
             with self.subTest(pattern):
                 self.assertRegex(vm, pattern)
+        # R3c: the numbers the Common errors entries of the vm module quote are the headers' too.
+        errors = " ".join(guide_section(guide, "Common errors").split())
+        for pattern in (
+                rf"`too many vm requests at once`: wait for callbacks before sending more: {number('APPS_VM_QUEUE')} wait at most",
+                rf"`timed out`: the VM didn't answer in {whole(number('APPS_VM_REQUEST_MS'), 1000)} s, or a command's ack didn't "
+                rf"come in {whole(number('APPS_VM_ACK_MS'), 1000)} s",
+                rf"`vm\.watch: no more than {number('APPS_VM_WATCHES_MAX')} watches per app`",
+                rf"`no more than {images} images at once: free one with img:free\(\)`"):
+            with self.subTest(pattern):
+                self.assertRegex(errors, pattern)
+        self.assertIn('"vm.watch: no more than " STR(APPS_VM_WATCHES_MAX) " watches per app"', (APPS / "apps_vmio.c").read_text())
+        self.assertIn('#define APPS_VM_MSG_TOO_MANY "too many vm requests at once"', (APPS / "apps_vmio.h").read_text())
+        self.assertIn('#define APPS_VM_MSG_TIMED_OUT "timed out"', (APPS / "apps_vmio.h").read_text())
         jpeg = (APPS / "apps_jpeg.h").read_text()
         messages = re.findall(r'#define APPS_JPEG_MSG_\w+ "([^"]+)"', jpeg)
         self.assertEqual(len(messages), 5, "the decoder's five messages")

@@ -117,7 +117,7 @@ static void run(apps_vm_job_t *job) {
     const int64_t deadline_ms = apps_port_mono_ms() + APPS_VM_REQUEST_MS;
     job->ok = false;
     job->err[0] = '\0';
-    if (ops == NULL || (read ? ops->read == NULL : ops->write == NULL)) {
+    if (ops == NULL || (read ? ops->app_read == NULL : ops->write == NULL)) {
         snprintf(job->err, sizeof job->err, "%s", APPS_VM_MSG_NOT_CONNECTED);
         return;
     }
@@ -131,7 +131,7 @@ static void run(apps_vm_job_t *job) {
         if (read) {
             apps_port_free(s.buf);
             s = (sink_t){.job = job};
-            ok = ops->read(job->path, job->max, sink, &s, deadline_ms * 1000, &code, why, sizeof why);
+            ok = ops->app_read(job->path, job->max, sink, &s, deadline_ms * 1000, &code, why, sizeof why);  /* it yields (R3b) */
         } else {
             ok = ops->write(job->path, job->data, job->len, deadline_ms * 1000, &code, why, sizeof why);
         }

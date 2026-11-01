@@ -129,6 +129,11 @@ typedef struct muse_apps_vm_ops {
                  int64_t deadline_us, const char **code, char *err, size_t err_len);
     bool (*write)(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
                   size_t err_len);
+    /* read, for a running app's own request (its vm module: apps_net.c), which yields to the firmware's (connected apps Task 3,
+     * R3b): it never waits for the reader, and is MUSE_APPS_VM_BUSY at once while anyone else holds it or waits for it, while an
+     * install's read waits for an app's to end (main/vm_file.h: VM_FILE_OWNER_APP). */
+    bool (*app_read)(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                     int64_t deadline_us, const char **code, char *err, size_t err_len);
 } muse_apps_vm_ops_t;
 
 /* The VM's files from now on (NULL: none). ops is kept, not copied: a static table. Any task, before or after muse_apps_start. */

@@ -28,9 +28,11 @@
 //   if (!vm_file_read_all(f, max, sink, user, deadline_us)) text = vm_file_error(f, msg, sizeof(msg));
 //   vm_file_close(f);
 //
-// vm_file_open and vm_file_close make no request and wait for nothing, so any task can call them,
-// the Noise session's included. Reading and writing wait for the VM's answer, which only the session's
-// task delivers: they must never run on it (see vm_file_read, vm_file_read_all and vm_file_write).
+// vm_file_open and vm_file_close make no request, so any task can call them, the Noise session's
+// included; with the apps (CONFIG_MUSE_APPS) an open may wait for an app's request, but never the image
+// download's, which is the one that opens on the session's task (see vm_file_open). Reading and writing
+// wait for the VM's answer, which only the session's task delivers: they must never run on it (see
+// vm_file_read, vm_file_read_all and vm_file_write).
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -51,6 +53,23 @@ typedef struct vm_file vm_file_t;
 #define VM_FILE_OWNER_IMAGE   "an image download"
 #define VM_FILE_OWNER_INSTALL "an app install"
 
+#if CONFIG_MUSE_APPS
+// A running app's own request (its vm module, on the apps' network worker).
+// The apps' VM use yields to the firmware's own (connected apps Task 3, R3b):
+// - An opener with another tag that finds the reader held by an app's request
+//   waits for it, trying again every VM_FILE_WAIT_POLL_MS for up to
+//   VM_FILE_APP_WAIT_MS: an app's request never holds the reader past its own
+//   deadline of 10 s. Meanwhile an app's open is refused, so the next free
+//   moment is the waiter's. The image download doesn't wait: display.draw_file
+//   opens on the Noise session's task, which must never wait.
+// - An open with this tag never waits: it is refused at once while anyone
+//   else holds the reader (the apps try again on their own).
+// - vm_file_write waits for a busy writer within its own timeout_ms.
+#define VM_FILE_OWNER_APP     "an app's vm request"
+#define VM_FILE_APP_WAIT_MS   11000
+#define VM_FILE_WAIT_POLL_MS  100
+#endif
+
 // Gets each range of the file: data is valid only during the call. Returns
 // false to stop reading.
 typedef bool (*vm_file_sink_t)(void *user, const uint8_t *data, size_t len);
@@ -68,6 +87,9 @@ typedef bool (*vm_file_sink_t)(void *user, const uint8_t *data, size_t len);
 //
 // Returns NULL with a code and a message (both literals) if it can't:
 //   busy            another reader is open: "the VM file reader is busy (<owner>)"
+//                   (with the apps, once an app's request has held it for
+//                   VM_FILE_APP_WAIT_MS, or at once for an app's open and the
+//                   image download's: see VM_FILE_OWNER_APP)
 //   out_of_memory   "failed to allocate"
 //   invalid_params  "path names no file" (it is empty), or
 //                   "vm_file_open: bad path" (absolute, or with a ".." folder)
@@ -157,7 +179,8 @@ void vm_file_close(vm_file_t *f);
 //   "write timed out", "the VM connection dropped",
 //   "the VM sent a frame too large for this board",
 //   "could not send the request to the VM"
-//   "the VM file writer is busy" (one write at a time)
+//   "the VM file writer is busy" (one write at a time: with the apps, the
+//     writer was busy for the whole of timeout_ms, which a write waits out)
 //   "vm_file_write: bad path" (absolute, or with a ".." folder),
 //   "path names no file" (empty, or ending in a slash), "path is too long"
 //   "no data to write" (len but no data), "out of memory"

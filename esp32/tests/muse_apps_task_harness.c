@@ -53,6 +53,7 @@
 
 #ifdef HARNESS_CONSOLE
 #include "apps_install.h"
+#include "cJSON.h"
 #endif
 #include "apps_alarm.h"
 #include "apps_io.h"
@@ -1198,6 +1199,59 @@ static const uint8_t VMF_JPEG[] = {'F', 'J', 'P', 'G', 'B', 1, 1, 0, 200, 0, 100
 /* A 2 x 1 RGB565 LVGL image. */
 static const uint8_t VMF_BIN[] = {0x19, 0x12, 0, 0, 2, 0, 1, 0, 4, 0, 0, 0, 0x11, 0x22, 0x33, 0x44};
 
+/* An app to install (app_install_while_a_watch_polls): its two files. */
+static const char VMF_MANIFEST[] = "{\"id\":\"inst\",\"name\":\"Inst\",\"api\":1}";
+static const char VMF_MAIN[] = "local app = {}\nreturn app\n";
+
+/* vm_file's one reader, as R3b has it (main/vm_file.h): an install's read (read) that finds an app's request (app_read) holding it
+ * waits for it, for up to VM_FILE_APP_WAIT_MS (here 11 s of real time); an app's read never waits, and is busy while anyone else holds
+ * it. With vmf_collide, the app's read of state/rev holds the reader until an install's read has come for it, so the two meet. */
+enum { VMF_FREE, VMF_APP, VMF_INSTALL };
+static int vmf_reader;
+static bool vmf_collide, vmf_install_came;
+
+static bool vmf_take(int who, const char *rel, const char **code, char *err, size_t err_len) {
+    bool install_file = strcmp(rel, "manifest.json") == 0 || strcmp(rel, "main.lua") == 0;
+    pthread_mutex_lock(&vmf_mu);
+    if (install_file) {
+        vmf_install_came = true;
+        pthread_cond_broadcast(&vmf_cv);
+    }
+    bool told = false;
+    for (int64_t until = real_ms() + 11000; vmf_reader != VMF_FREE;) {
+        if (who == VMF_APP || vmf_reader != VMF_APP || real_ms() >= until) {
+            event("vm reader busy for %s", who == VMF_APP ? "an app" : "an install");
+            snprintf(err, err_len, "the VM file reader is busy (%s)", vmf_reader == VMF_APP ? "an app's vm request" : "an app install");
+            *code = MUSE_APPS_VM_BUSY;
+            pthread_mutex_unlock(&vmf_mu);
+            return false;
+        }
+        if (!told) {
+            event("vm reader: an install waits for an app's request");
+            told = true;
+        }
+        struct timespec ts = deadline_in(2);
+        pthread_cond_timedwait(&vmf_cv, &vmf_mu, &ts);
+    }
+    vmf_reader = who;
+    if (vmf_collide && strcmp(rel, "state/rev") == 0) {
+        event("vm reader held by %s", who == VMF_APP ? "an app" : "an install");
+        for (int64_t until = real_ms() + 3000; !vmf_install_came && real_ms() < until;) {
+            struct timespec ts = deadline_in(2);
+            pthread_cond_timedwait(&vmf_cv, &vmf_mu, &ts);
+        }
+    }
+    pthread_mutex_unlock(&vmf_mu);
+    return true;
+}
+
+static void vmf_give(void) {
+    pthread_mutex_lock(&vmf_mu);
+    vmf_reader = VMF_FREE;
+    pthread_cond_broadcast(&vmf_cv);
+    pthread_mutex_unlock(&vmf_mu);
+}
+
 static const char *vmf_rel(const char *path) {
     const char *rel = strncmp(path, APPS_VM_DIR, strlen(APPS_VM_DIR)) == 0 ? strchr(path + strlen(APPS_VM_DIR), '/') : NULL;
     return rel != NULL ? rel + 1 : path;
@@ -1215,10 +1269,8 @@ static bool vmf_wait(int64_t deadline_us) {
     return true;
 }
 
-static bool vmf_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
-                     int64_t deadline_us, const char **code, char *err, size_t err_len) {
-    const char *rel = vmf_rel(path);
-    event("vm read %s", rel);
+static bool vmf_read_body(const char *rel, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                          int64_t deadline_us, const char **code, char *err, size_t err_len) {
     pthread_mutex_lock(&vmf_mu);
     bool waited = vmf_wait(deadline_us);
     char rev[sizeof vmf_rev];
@@ -1237,6 +1289,10 @@ static bool vmf_read(const char *path, size_t max, bool (*sink)(void *user, cons
         data = VMF_BIN, len = sizeof VMF_BIN;
     } else if (strcmp(rel, "state/rev") == 0) {
         data = (const uint8_t *)rev, len = strlen(rev);
+    } else if (strcmp(rel, "manifest.json") == 0) {
+        data = (const uint8_t *)VMF_MANIFEST, len = strlen(VMF_MANIFEST);
+    } else if (strcmp(rel, "main.lua") == 0) {
+        data = (const uint8_t *)VMF_MAIN, len = strlen(VMF_MAIN);
     }
     if (data == NULL) {
         *code = MUSE_APPS_VM_NOT_FOUND;
@@ -1254,6 +1310,29 @@ static bool vmf_read(const char *path, size_t max, bool (*sink)(void *user, cons
         return false;
     }
     return true;
+}
+
+/* An install's read (the ops' read), and a running app's own (app_read), on the one reader. */
+static bool vmf_read_as(int who, const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                        int64_t deadline_us, const char **code, char *err, size_t err_len) {
+    const char *rel = vmf_rel(path);
+    event("vm read %s", rel);
+    if (!vmf_take(who, rel, code, err, err_len)) {
+        return false;
+    }
+    bool ok = vmf_read_body(rel, max, sink, user, deadline_us, code, err, err_len);
+    vmf_give();
+    return ok;
+}
+
+static bool vmf_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                     int64_t deadline_us, const char **code, char *err, size_t err_len) {
+    return vmf_read_as(VMF_INSTALL, path, max, sink, user, deadline_us, code, err, err_len);
+}
+
+static bool vmf_app_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                         int64_t deadline_us, const char **code, char *err, size_t err_len) {
+    return vmf_read_as(VMF_APP, path, max, sink, user, deadline_us, code, err, err_len);
 }
 
 static bool vmf_write(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
@@ -1277,7 +1356,7 @@ static void vmf_set_hold(bool hold) {
     pthread_mutex_unlock(&vmf_mu);
 }
 
-static const muse_apps_vm_ops_t VMF_OPS = {vmf_read, vmf_write};
+static const muse_apps_vm_ops_t VMF_OPS = {vmf_read, vmf_write, vmf_app_read};
 static atomic_bool vmf_on;  /* the VM's ops are set */
 
 /* The cases that use the VM set its ops: apps_console.c keeps them in a build that has it, and this harness without it. */
@@ -7469,6 +7548,55 @@ static void vm_watch_pauses_behind_or_dark(void) {
     WAIT(back, "vm read state/rev");
 }
 
+#ifdef HARNESS_CONSOLE
+/* R3b: the development loop, Muse installing while the running app watches. The app's watch read holds the reader when the install's
+ * first read comes: an app's reads are app_read, which yields, so the install's read waits for it and the install succeeds. (Before,
+ * the app's reads were the install's own kind, and the install failed at once: "the VM file reader is busy".) */
+static atomic_int install_dones;
+static char install_said[256];
+
+static void on_install_done(void *ctx, cJSON *result) {
+    (void)ctx;
+    const cJSON *ok = cJSON_GetObjectItemCaseSensitive(result, "ok");
+    const cJSON *payload = cJSON_GetObjectItemCaseSensitive(result, "payload");
+    const cJSON *error = cJSON_GetObjectItemCaseSensitive(result, "error");
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(payload, "state");
+    const cJSON *message = cJSON_GetObjectItemCaseSensitive(error, "message");
+    snprintf(install_said, sizeof install_said, "%s %s", cJSON_IsTrue(ok) ? "ok" : "failed",
+             cJSON_IsString(state) ? state->valuestring : cJSON_IsString(message) ? message->valuestring : "?");
+    cJSON_Delete(result);
+    event("install done %s", install_said);
+    atomic_fetch_add(&install_dones, 1);
+}
+
+static void app_install_while_a_watch_polls(void) {
+    use_vm_files();
+    char err[200];
+    int from = mark();
+    CHECK(apps_task_run(with_perms(make_pkg("vmwatch", "VM watch", VMWATCH, 1), APPS_PERM_VM), true, 100, NULL, err, sizeof err),
+          "run: %s", err);
+    WAIT(from, "print vmwatch rev\t1");
+    pthread_mutex_lock(&vmf_mu);
+    vmf_collide = true;
+    pthread_mutex_unlock(&vmf_mu);
+    int held = WAIT(mark(), "vm reader held by ");  /* the watch's next read has the reader, and keeps it until the install's read */
+    const char *code = NULL, *why = NULL;
+    CHECK(muse_apps_install("inst", false, on_install_done, NULL, &code, &why), "not queued: %s: %s", code, why);
+    WAIT(held, "install done ");
+    CHECK(strcmp(install_said, "ok installed") == 0, "the install: %s", install_said);
+    WAIT(held - 1, "vm reader held by an app");  /* an app's request, */
+    WAIT(held, "vm reader: an install waits for an app's request");  /* which the install's read waited for */
+    ABSENT(held, "vm reader busy for an install");
+    ORDERED(held, "vm read manifest.json", "vm read main.lua");
+    pthread_mutex_lock(&vmf_mu);
+    vmf_collide = false;
+    pthread_mutex_unlock(&vmf_mu);
+    int after = mark();
+    WAIT(after, "vm read state/rev");  /* and the watch goes on */
+    on_worker(empty_store_job, NULL);
+}
+#endif
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -7597,6 +7725,7 @@ int main(int argc, char **argv) {
         {"vm_result_for_an_ended_app_is_dropped", vm_result_for_an_ended_app_is_dropped},
         {"vm_watch_pauses_behind_or_dark", vm_watch_pauses_behind_or_dark},
 #ifdef HARNESS_CONSOLE
+        {"app_install_while_a_watch_polls", app_install_while_a_watch_polls},
         {"a_pick_runs_a_stored_app_that_stopped", a_pick_runs_a_stored_app_that_stopped},
         {"a_refused_launch_logs_once", a_refused_launch_logs_once},
         {"a_refused_launch_closes_the_launcher", a_refused_launch_closes_the_launcher},

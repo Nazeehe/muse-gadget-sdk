@@ -475,7 +475,7 @@ static bool fake_vm_write(const char *path, const void *data, size_t len, int64_
     fail_at(__LINE__, "an install wrote to the VM");
 }
 
-static const muse_apps_vm_ops_t VM = {fake_vm_read, fake_vm_write};
+static const muse_apps_vm_ops_t VM = {fake_vm_read, fake_vm_write, NULL};
 
 static void vm_reset(void) {
     vm_paths[0] = '\0';
@@ -1172,7 +1172,7 @@ static void vm_paths_built_on_device(void) {
     CHECK(logged_count(from, "W muse_apps: install Timer? from vm done: failed (0 files, 0 ms)") == 1, "no summary line");
 
     /* No VM to read: unavailable, and nothing else is tried. */
-    static const muse_apps_vm_ops_t NO_READ = {NULL, fake_vm_write};
+    static const muse_apps_vm_ops_t NO_READ = {NULL, fake_vm_write, NULL};
     EXPECT_FAILURE(show(apps_install_from_vm("hello", true, NULL, &OPS)), APPS_ERR_UNAVAILABLE, "the gadget can't read files on the VM");
     EXPECT_FAILURE(show(apps_install_from_vm("hello", true, &NO_READ, &OPS)), APPS_ERR_UNAVAILABLE,
                    "the gadget can't read files on the VM");

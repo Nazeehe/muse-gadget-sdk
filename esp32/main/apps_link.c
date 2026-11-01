@@ -43,10 +43,12 @@
 // worker of at most MUSE_APPS_CONTROL_WAIT_MS (D20).
 //
 // The VM's files. The apps read Muse's VM through muse_apps_vm_ops_t, which this
-// file puts vm_file behind: a read opens the one reader for the install, with
-// no keep (the worker's stack and its blocks are PSRAM), reads the file whole
-// into the caller's sink and closes it; its refusals are the apps' codes. They
-// run on the worker, never on the session's task.
+// file puts vm_file behind: a read opens the one reader, with no keep (the
+// worker's stack and its blocks are PSRAM), as the install (read) or as a
+// running app's own request (app_read, which yields to the firmware's: vm_file.h),
+// reads the file whole into the caller's sink and closes it; its refusals are
+// the apps' codes. They run on the I/O worker or the apps' network worker,
+// never on the session's task.
 
 #define INSTALL_TIMEOUT_MS 120000  // the VM's wait for app.install's result: over the gadget's 90 s deadline and a run's settle
 #define API_TIMEOUT_MS 30000       // app.api's: the guide's writes (MUSE_APPS_GUIDE_WRITE_MS) and the answer
@@ -88,10 +90,11 @@ static bool not_found(const char *why) {
 
 // ---- The VM's files, behind muse_apps_vm_ops_t ----
 
-static bool vm_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
-                    int64_t deadline_us, const char **code, char *err, size_t err_len) {
+// A read for owner: an install's (VM_FILE_OWNER_INSTALL) or a running app's own (VM_FILE_OWNER_APP, which yields: vm_file.h).
+static bool read_as(const char *owner, const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n),
+                    void *user, int64_t deadline_us, const char **code, char *err, size_t err_len) {
     const char *open_code = NULL, *message = NULL;
-    vm_file_t *f = vm_file_open(path, 0, VM_FILE_OWNER_INSTALL, &open_code, &message);
+    vm_file_t *f = vm_file_open(path, 0, owner, &open_code, &message);
     if (!f) {
         bool busy = open_code && strcmp(open_code, "busy") == 0;
         bool no_memory = open_code && strcmp(open_code, "out_of_memory") == 0;
@@ -114,6 +117,16 @@ static bool vm_read(const char *path, size_t max, bool (*sink)(void *user, const
     return ok;
 }
 
+static bool vm_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                    int64_t deadline_us, const char **code, char *err, size_t err_len) {
+    return read_as(VM_FILE_OWNER_INSTALL, path, max, sink, user, deadline_us, code, err, err_len);
+}
+
+static bool vm_app_read(const char *path, size_t max, bool (*sink)(void *user, const uint8_t *d, size_t n), void *user,
+                        int64_t deadline_us, const char **code, char *err, size_t err_len) {
+    return read_as(VM_FILE_OWNER_APP, path, max, sink, user, deadline_us, code, err, err_len);
+}
+
 static bool vm_write(const char *path, const void *data, size_t len, int64_t deadline_us, const char **code, char *err,
                      size_t err_len) {
     int64_t left_ms = (deadline_us - esp_timer_get_time()) / 1000;
@@ -132,7 +145,7 @@ static bool vm_write(const char *path, const void *data, size_t len, int64_t dea
     return false;
 }
 
-static const muse_apps_vm_ops_t VM_OPS = {vm_read, vm_write};
+static const muse_apps_vm_ops_t VM_OPS = {vm_read, vm_write, vm_app_read};
 
 void apps_link_init(void) {
     muse_apps_set_vm_ops(&VM_OPS);

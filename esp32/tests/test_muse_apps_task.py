@@ -565,6 +565,11 @@ class AppTaskStoreTest(HarnessCase):
     def setUpClass(cls):
         cls.harness = build_harness(cls, "muse_apps_task_store_harness", console=True)
 
+    # ---- Connected apps Task 3, fix round 1 (R3b) ----
+
+    def test_app_install_while_a_watch_polls(self):  # the app's reads yield: the install's read waits for the watch's, and succeeds
+        self.run_case("app_install_while_a_watch_polls")
+
     # ---- Task 13's pre-review fix ----
 
     def test_a_pick_runs_a_stored_app_that_stopped(self):  # P2: the launcher lists it; the worker runs it

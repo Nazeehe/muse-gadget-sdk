@@ -275,6 +275,12 @@ static bool vm_allocate_body(vm_file_t *f, size_t caller_keep) {
 // What the tag of the reader's owner reads as to the opener it refused. The
 // texts are literals, so a refused caller can keep the pointer.
 static const char *busy_message(const char *owner) {
+#if CONFIG_MUSE_APPS
+    if (!owner) return "the VM file reader is busy";  // the tag of a waiter that has just gone
+    if (strcmp(owner, VM_FILE_OWNER_APP) == 0) {
+        return "the VM file reader is busy (" VM_FILE_OWNER_APP ")";
+    }
+#endif
     if (strcmp(owner, VM_FILE_OWNER_IMAGE) == 0) {
         return "the VM file reader is busy (" VM_FILE_OWNER_IMAGE ")";
     }
@@ -294,6 +300,54 @@ static bool path_stays_inside(const char *path) {
         if (!segment[n]) return true;
         segment += n + 1;
     }
+}
+
+#if CONFIG_MUSE_APPS
+// The openers waiting for an app's request to let go of the reader, and the tag
+// of the last of them: while one waits, an app's open is refused in its name.
+static atomic_int s_app_waiters;
+static _Atomic(const char *) s_app_waiter;
+
+static bool is_app(const char *owner) {
+    return owner && strcmp(owner, VM_FILE_OWNER_APP) == 0;
+}
+
+// The ticks of one wait, at most VM_FILE_WAIT_POLL_MS and never none.
+static TickType_t wait_ticks(int64_t left_ms) {
+    TickType_t ticks = pdMS_TO_TICKS(left_ms < VM_FILE_WAIT_POLL_MS ? left_ms : VM_FILE_WAIT_POLL_MS);
+    return ticks ? ticks : 1;
+}
+#endif
+
+// Takes the reader for owner: true, or false with *held_by the tag of who has
+// it (for an app's open refused while another opener waits, the waiter's).
+// With the apps, an opener that finds an app's request holding the reader waits
+// for it (VM_FILE_OWNER_APP in vm_file.h); the image download never waits.
+static bool take_reader(const char *owner, const char **held_by) {
+#if CONFIG_MUSE_APPS
+    if (is_app(owner) && atomic_load(&s_app_waiters) > 0) {
+        *held_by = atomic_load(&s_app_waiter);
+        return false;
+    }
+#endif
+    *held_by = NULL;
+    if (atomic_compare_exchange_strong(&s_owner, held_by, owner)) return true;
+#if CONFIG_MUSE_APPS
+    if (is_app(owner) || strcmp(owner, VM_FILE_OWNER_IMAGE) == 0 || !is_app(*held_by)) return false;
+    atomic_store(&s_app_waiter, owner);
+    atomic_fetch_add(&s_app_waiters, 1);
+    int64_t until = esp_timer_get_time() + (int64_t)VM_FILE_APP_WAIT_MS * 1000;
+    bool taken = false;
+    for (int64_t left; !taken && is_app(*held_by) && (left = (until - esp_timer_get_time()) / 1000) > 0;) {
+        vTaskDelay(wait_ticks(left));
+        *held_by = NULL;
+        taken = atomic_compare_exchange_strong(&s_owner, held_by, owner);
+    }
+    atomic_fetch_sub(&s_app_waiters, 1);
+    return taken;
+#else
+    return false;
+#endif
 }
 
 // The handle of the open reader, or false for NULL, a closed reader and
@@ -319,7 +373,7 @@ vm_file_t *vm_file_open(const char *path, size_t keep, const char *owner,
     }
     if (!owner) owner = "";
     const char *held_by = NULL;
-    if (!atomic_compare_exchange_strong(&s_owner, &held_by, owner)) {
+    if (!take_reader(owner, &held_by)) {
         *code = "busy";
         *message = busy_message(held_by);
         return NULL;
@@ -967,7 +1021,22 @@ bool vm_file_write(const char *path, const void *data, size_t len, int timeout_m
     if (len && !data) return write_failed(err, err_len, "no data to write");
     bool expected = false;
     if (!atomic_compare_exchange_strong(&s_writing, &expected, true)) {
+#if CONFIG_MUSE_APPS
+        // A busy writer is waited for, within timeout_ms (R3b): an app's writes are short, and
+        // app.api's guide or a snapshot waits one out rather than failing.
+        int64_t until = esp_timer_get_time() + (int64_t)(timeout_ms > 0 ? timeout_ms : 0) * 1000;
+        bool taken = false;
+        for (int64_t left; !taken && (left = (until - esp_timer_get_time()) / 1000) > 0;) {
+            vTaskDelay(wait_ticks(left));
+            expected = false;
+            taken = atomic_compare_exchange_strong(&s_writing, &expected, true);
+        }
+        if (!taken) return write_failed(err, err_len, "the VM file writer is busy");
+        int64_t left_ms = (until - esp_timer_get_time()) / 1000;
+        timeout_ms = left_ms > 0 ? (int)left_ms : 0;  // the wait came out of the call's time
+#else
         return write_failed(err, err_len, "the VM file writer is busy");
+#endif
     }
     bool ok = write_all(path, data, len, timeout_ms, err, err_len);
     atomic_store(&s_writing, false);

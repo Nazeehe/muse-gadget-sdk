@@ -24,7 +24,9 @@ test_link_image_fetch.py builds image_fetch.c, with its allocations going throug
 allocator, once with PSRAM and once without. A third build adds image_fetch.c, for the cases where it and
 the reader meet: who holds the reader, and what a download says when a later range doesn't come. A fourth adds
 image_fetch.c as an apps build has it (CONFIG_MUSE_APPS), where a file from the VM is drawn by a task whose
-stack, like the download's buffers, is in PSRAM, so that it starts with the Link up on an idle 1.75C.
+stack, like the download's buffers, is in PSRAM, so that it starts with the Link up on an idle 1.75C. A fifth is
+vm_file.c alone as an apps build has it, where the apps' own requests yield the reader and the writer to the
+firmware's (connected apps Task 3, R3b).
 """
 
 import re
@@ -65,6 +67,16 @@ IDF_ADDITIONS = ('#pragma once\n#include "freertos/FreeRTOS.h"\n#include "freert
                  "void vTaskDeleteWithCaps(TaskHandle_t task);\n")
 # The allocator hooks of image_fetch's wrapper: malloc, free and the others go to the harness's counting ones.
 WRAPPER = '#include "image_fetch_alloc.h"\n#include "{source}"\n'
+VM_FILE_H = (MAIN / "vm_file.h").read_text()
+
+
+def header_number(name):
+    """A number vm_file.h defines."""
+    match = re.search(rf"(?m)^#define {name}\s+(\d+)\b", VM_FILE_H)
+    assert match, name
+    return int(match.group(1))
+
+
 PIECE = 8192            # the file's pieces on a board with PSRAM, the most its session takes in one send
 PIECE_NO_PSRAM = 4096   # and on a Muse board without it
 HEAD_MAX = 4096         # the head of the form is one send of at most this, whatever the pieces
@@ -194,7 +206,7 @@ class VmFileTest(unittest.TestCase):
         wrapped_image.write_text(WRAPPER.format(source=MAIN / "image_fetch.c"))
         cls.binaries = {}
         for name, spiram, image, apps in (("psram", 1, 0, 0), ("nopsram", 0, 0, 0), ("image", 1, 1, 0),
-                                          ("image_apps", 1, 1, 1)):
+                                          ("image_apps", 1, 1, 1), ("apps", 1, 0, 1)):
             cls.binaries[name] = apps_host.build(
                 f"vm_file_harness_{name}", [HARNESS, wrapped, *([wrapped_image] if image else [])], root,
                 include_dirs=[staged, TESTS / "image_fetch_fakes", TESTS / "link_fakes", MAIN],
@@ -453,6 +465,40 @@ class VmFileTest(unittest.TestCase):
         out = self.run_case("write_one_at_a_time")
         self.assertEqual(out.one("second"), "0 the VM file writer is busy")
         self.assertEqual(out.one("first"), "1")
+
+    # ---- With the apps (CONFIG_MUSE_APPS): their requests yield to the firmware's own (R3b) ----
+
+    def test_the_waits_and_the_app_tag(self):
+        self.assertEqual(header_number("VM_FILE_APP_WAIT_MS"), 11000)  # past an app request's own deadline of 10 s
+        self.assertEqual(header_number("VM_FILE_WAIT_POLL_MS"), 100)
+        self.assertIn('#define VM_FILE_OWNER_APP     "an app\'s vm request"', VM_FILE_H)
+        # All of it is the apps' (X5): the plain build has neither the tag nor the waits.
+        source = (MAIN / "vm_file.c").read_text()
+        for text in ("take_reader(owner, &held_by)", "vTaskDelay(wait_ticks(left));"):
+            self.assertIn(text, source)
+        self.assertEqual(source.count("vTaskDelay(wait_ticks(left));"), 2)  # the reader's wait and the writer's
+        for name in ("psram", "nopsram", "image"):
+            with self.subTest(name):
+                done = apps_host.run(self.binaries[name], "an_open_waits_for_an_apps_request", text=False, timeout=60)
+                self.assertEqual(done.returncode, 2, "an app case in a build without the apps")
+
+    def test_an_open_waits_for_an_apps_request(self):  # and has the reader once it is let go; the image download doesn't wait
+        out = self.run_case("an_open_waits_for_an_apps_request", board="apps")
+        self.assertEqual(out.one("waited"), f"{5 * header_number('VM_FILE_WAIT_POLL_MS') * 1000} 5")  # five polls of 100 ms
+
+    def test_the_wait_for_an_app_ends_after_11_s(self):
+        out = self.run_case("the_wait_for_an_app_ends_after_11_s", board="apps")
+        self.assertEqual(out.one("gave_up"), str(header_number("VM_FILE_APP_WAIT_MS") * 1000))
+        self.assertEqual(out.one("ended"), str(header_number("VM_FILE_WAIT_POLL_MS") * 1000))  # the first poll saw the image's
+
+    def test_an_apps_open_never_waits(self):
+        out = self.run_case("an_apps_open_never_waits", board="apps")
+        self.assertEqual(out.one("took"), "0")
+
+    def test_a_write_waits_for_a_busy_writer(self):  # within its timeout, sending nothing, then fails at the timeout
+        out = self.run_case("a_write_waits_for_a_busy_writer", board="apps")
+        self.assertEqual(out.one("second"), "0 the VM file writer is busy|1000000 0")
+        # Without the apps it is refused at once, as it always was (test_write_is_one_at_a_time).
 
     def test_a_reader_and_a_writer_do_not_share_a_reply(self):
         out = self.run_case("reader_and_writer_are_independent")

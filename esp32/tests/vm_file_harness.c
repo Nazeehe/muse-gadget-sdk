@@ -2902,6 +2902,125 @@ static void case_image_task_parks(void) {
 
 // ---- Main --------------------------------------------------------------------
 
+#if CONFIG_MUSE_APPS
+// ---- With the apps: their requests yield to the firmware's own (R3b) ----
+
+static vm_file_t *g_app_reader;
+static int g_wait_turns;
+
+// The turns of a wait for an app's reader: on the fifth an app's open is refused in the waiter's
+// name, and the app's request lets go of the reader.
+static void app_lets_go_on_the_fifth_turn(void) {
+    if (++g_wait_turns < 5) {
+        g_turn_hook = app_lets_go_on_the_fifth_turn;
+        return;
+    }
+    expect_refusal("c.bin", 0, VM_FILE_OWNER_APP, "busy", "the VM file reader is busy (an app install)");
+    vm_file_close(g_app_reader);
+    g_app_reader = NULL;
+}
+
+// An app's request has the reader: an install's open waits for it, polling every 100 ms, and
+// has the reader once it is let go; meanwhile an app's open is refused. The image download
+// doesn't wait (display.draw_file opens on the Noise session's task).
+static void case_an_open_waits_for_an_apps_request(void) {
+    reset_vm(100);
+    g_app_reader = open_ok("a.bin", 0, VM_FILE_OWNER_APP);
+    g_wait_turns = 0;
+    g_turn_hook = app_lets_go_on_the_fifth_turn;
+    int64_t start = g_now_us;
+    vm_file_t *f = open_ok("b.bin", 0, VM_FILE_OWNER_INSTALL);
+    printf("@waited %lld %d\n", (long long)(g_now_us - start), g_wait_turns);
+    CHECK(!g_app_reader, "the app's reader is still open");
+    // The install has it: an app's open is refused at once, in its name.
+    start = g_now_us;
+    expect_refusal("c.bin", 0, VM_FILE_OWNER_APP, "busy", "the VM file reader is busy (an app install)");
+    CHECK(g_now_us == start, "an app's open waited");
+    uint8_t buf[100];
+    CHECK(vm_file_read(f, buf, sizeof(buf), deadline()) == 100, "the install can't read: %s", error_of(f));
+    vm_file_close(f);
+    // The image download is refused at once, in the app's name; so is another app's open.
+    g_app_reader = open_ok("a.bin", 0, VM_FILE_OWNER_APP);
+    start = g_now_us;
+    expect_refusal("b.bin", 0, VM_FILE_OWNER_IMAGE, "busy", "the VM file reader is busy (an app's vm request)");
+    expect_refusal("b.bin", 0, VM_FILE_OWNER_APP, "busy", "the VM file reader is busy (an app's vm request)");
+    CHECK(g_now_us == start, "the image download or an app waited");
+    vm_file_close(g_app_reader);
+    g_app_reader = NULL;
+    finish();
+}
+
+// The image download takes the reader the app let go of while an install waits: the wait ends, busy in its name.
+static void image_takes_it(void) {
+    vm_file_close(g_app_reader);
+    g_app_reader = open_ok("i.bin", 0, VM_FILE_OWNER_IMAGE);
+}
+
+// The wait has a bound: an app's request that keeps the reader for VM_FILE_APP_WAIT_MS has the
+// opener refused then, in the app's name. A reader another opener takes meanwhile ends the wait.
+static void case_the_wait_for_an_app_ends_after_11_s(void) {
+    reset_vm(100);
+    vm_file_t *app = open_ok("a.bin", 0, VM_FILE_OWNER_APP);
+    int64_t start = g_now_us;
+    expect_refusal("b.bin", 0, VM_FILE_OWNER_INSTALL, "busy", "the VM file reader is busy (an app's vm request)");
+    printf("@gave_up %lld\n", (long long)(g_now_us - start));
+    // No one waits now: an app's open is refused for the app's reader alone, and works once it is free.
+    expect_refusal("c.bin", 0, VM_FILE_OWNER_APP, "busy", "the VM file reader is busy (an app's vm request)");
+    vm_file_close(app);
+    vm_file_close(open_ok("c.bin", 0, VM_FILE_OWNER_APP));
+    g_app_reader = open_ok("a.bin", 0, VM_FILE_OWNER_APP);
+    g_turn_hook = image_takes_it;
+    start = g_now_us;
+    expect_refusal("b.bin", 0, VM_FILE_OWNER_INSTALL, "busy", "the VM file reader is busy (an image download)");
+    printf("@ended %lld\n", (long long)(g_now_us - start));
+    vm_file_close(g_app_reader);
+    g_app_reader = NULL;
+    finish();
+}
+
+// An app's open never waits: whoever else has the reader, it is refused at once. And an install
+// waits for an app's request alone: an image download's reader refuses it at once, as without the apps.
+static void case_an_apps_open_never_waits(void) {
+    reset_vm(100);
+    vm_file_t *f = open_ok("a.bin", 0, VM_FILE_OWNER_INSTALL);
+    int64_t start = g_now_us;
+    expect_refusal("b.bin", 0, VM_FILE_OWNER_APP, "busy", "the VM file reader is busy (an app install)");
+    vm_file_close(f);
+    f = open_ok("a.bin", 0, VM_FILE_OWNER_IMAGE);
+    expect_refusal("b.bin", 0, VM_FILE_OWNER_APP, "busy", "the VM file reader is busy (an image download)");
+    expect_refusal("b.bin", 0, VM_FILE_OWNER_INSTALL, "busy", "the VM file reader is busy (an image download)");
+    vm_file_close(f);
+    printf("@took %lld\n", (long long)(g_now_us - start));
+    finish();
+}
+
+static bool g_second_ok;
+static char g_second_err[96];
+static int64_t g_second_took;
+static int g_second_posts;
+
+static void write_again_and_wait(void) {
+    int64_t start = g_now_us;
+    int posts = g_posts;
+    g_second_ok = vm_file_write("workspace/apps/x/other.bin", "y", 1, 1000, g_second_err, sizeof(g_second_err));
+    g_second_took = g_now_us - start;
+    g_second_posts = g_posts - posts;
+}
+
+// A write while another is out waits for the writer within its own timeout, polling every 100 ms,
+// and fails at its timeout if the writer is still busy; it sends nothing meanwhile. (The first
+// write can't end while the second, called from within it, waits: that is the harness's one thread.)
+static void case_a_write_waits_for_a_busy_writer(void) {
+    char err[96];
+    reset_vm(0);
+    g_turn_hook = write_again_and_wait;      // while the first write waits for its answer
+    g_cfg.delay_turns = 2;
+    CHECK(vm_file_write(FILE_PATH, "x", 1, 30000, err, sizeof(err)), "first: %s", err);
+    printf("@second %d %s|%lld %d\n", g_second_ok, g_second_err, (long long)g_second_took, g_second_posts);
+    finish_write();
+}
+#endif
+
 typedef struct {
     const char *name;
     void (*run)(void);
@@ -2950,6 +3069,12 @@ static const test_case_t cases[] = {
     CASE(read_opens_while_a_write_streams),
     CASE(write_error_message),
     CASE(write_cancel_is_retried),
+#if CONFIG_MUSE_APPS
+    CASE(an_open_waits_for_an_apps_request),
+    CASE(the_wait_for_an_app_ends_after_11_s),
+    CASE(an_apps_open_never_waits),
+    CASE(a_write_waits_for_a_busy_writer),
+#endif
 #if WITH_IMAGE_FETCH
     CASE(image_refused_while_an_install_reads),
     CASE(install_refused_while_an_image_downloads),

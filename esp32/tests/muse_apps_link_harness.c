@@ -1193,6 +1193,26 @@ static void vm_ops_are_vm_file(void) {
     error_in_msg = false;
     CHECK(closes == 9 && open_now == 0, "every read closed: %d", closes);
 
+    /* app_read: the same read, opened as a running app's own request (R3b: it yields, vm_file.h); read opens as the install. */
+    CHECK(vm_ops->app_read != NULL, "the apps' read");
+    file_text = "7";
+    read_bytes = 1;
+    sunk_len = 0;
+    sunk[0] = '\0';
+    CHECK(vm_ops->app_read("workspace/apps/hello/state/rev", 1024, keep_sunk, sunk, 91000000, &code, err, sizeof err), "an app's read");
+    CHECK(strcmp(sunk, "7") == 0 && opened_owner != NULL && strcmp(opened_owner, VM_FILE_OWNER_APP) == 0 && read_max == 1024 &&
+              closes == 10 && open_now == 0,
+          "opened as %s", opened_owner ? opened_owner : "(null)");
+    open_code = "busy";
+    open_message = "the VM file reader is busy (an app install)";
+    CHECK(!vm_ops->app_read("workspace/apps/hello/state/rev", 1024, keep_sunk, sunk, 1, &code, err, sizeof err), "busy");
+    CHECK(strcmp(code, MUSE_APPS_VM_BUSY) == 0 && strcmp(err, "the VM file reader is busy (an app install)") == 0, "%s: %s", code,
+          err);
+    open_code = NULL;
+    CHECK(vm_read("workspace/apps/hello/main.lua", 100, 1, &code, err, sizeof err) &&
+              strcmp(opened_owner, VM_FILE_OWNER_INSTALL) == 0 && closes == 11,
+          "the install's read is the install's");
+
     /* write: the time left to the deadline, in ms. */
     now_us = 5000000;
     CHECK(vm_ops->write("workspace/apps/_guide/guide.md", "abc", 3, 5000000 + 12345678, &code, err, sizeof err), "a write");

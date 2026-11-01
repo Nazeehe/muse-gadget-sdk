@@ -67,8 +67,8 @@ fetch_state() {
 
 # run_command NAME ARGS carries out one of the app's commands and sets RESULT, the ack's result: {"ok":true,...}, or
 # {"ok":false,"error":"..."} for one it can't carry out. It must never end the run (set -e): the command's seq is saved
-# before it runs, so a run that dies here never repeats it, but the app hears nothing. A connector app makes each call to
-# the connector's CLI through connector_call, by its full path, always with "|| return 0":
+# before it runs, so a run that dies here never repeats it, and on_exit acks it "the hook failed", but the run fails. A
+# connector app makes each call to the connector's CLI through connector_call, by its full path, always with "|| return 0":
 #     connector_call /full/path/to/cli <args...> || return 0     # its RESULT is set, and on exit 3 the run ends
 #     RESULT='{"ok":true}'                                         # or what OUT, the CLI's output, says
 # What a connector returns stays out of files its rules forbid (the guide's Rules: "Connector rules are binding").
@@ -247,6 +247,21 @@ heartbeat_fresh() {   # NOW
     (($1 - mtime <= HEARTBEAT_MAX_AGE_S))
 }
 
+# on_exit, the run's EXIT trap: a run that ends non-zero (set -e, or any failure) while a command is in flight (INFLIGHT,
+# its seq, from when it is saved until it is acked) acks it {"ok":false,"error":"the hook failed"}, so the app hears at
+# once instead of timing out. It prints nothing on stdout (the run has no result line, and gets none) and keeps the exit
+# status, so the failed run still fails closed. A dry run serves no command, and ack writes nothing on one.
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    if ((rc != 0)) && [[ -n "$INFLIGHT" ]]; then
+        set +e
+        ack "$INFLIGHT" '{"ok":false,"error":"the hook failed"}' >/dev/null 2>&1
+        log "the hook failed with a command in flight: acked it failed" "{\"seq\":$INFLIGHT,\"exit\":$rc}"
+    fi
+    exit "$rc"
+}
+
 # serve_commands NOW: the waiting commands in seq order, as numbers, each once (its seq saved before it runs), with one
 # read after each. Commands are always served, and their calls logged, while the run is inside LOOP_S: the rest wait for
 # the next run. A command older than CMD_MAX_AGE_S is acked {"ok":false,"error":"expired"} and removed without running:
@@ -283,10 +298,12 @@ serve_commands() {
         RESULT='{"ok":false,"error":"not a command"}'
         LAST_SEQ=$seq
         save_state   # before it runs: at most once, even if the run dies in it
+        INFLIGHT=$seq
         if [[ -n "$name" ]]; then run_command "$name" "$args"; fi
         COMMANDS=$((COMMANDS + 1))
         if [[ -z "$STOP" ]]; then read_now "$now"; fi
         ack "$seq" "$RESULT"
+        INFLIGHT=""
         remove_file "$file"
         log "applied a command" "{\"seq\":$seq}"
         if [[ -n "$STOP" ]]; then return 0; fi
@@ -298,6 +315,7 @@ PUBLISHED=$(jq -cS . "$STATE_FILE" 2>/dev/null || true)
 READS=0
 COMMANDS=0
 STOP=""
+INFLIGHT=""
 
 if dry_run; then
     # A dry run reads once (a connector's approval card comes up now, even with the app closed) and writes nothing.
@@ -307,6 +325,7 @@ if dry_run; then
     silent "dry run" "{\"exit\":$rc}"
 fi
 
+trap on_exit EXIT
 start=$(date +%s)
 if ! heartbeat_fresh "$start"; then
     silent "idle: the app is not in front"

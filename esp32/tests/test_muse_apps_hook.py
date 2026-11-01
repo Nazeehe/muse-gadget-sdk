@@ -709,6 +709,46 @@ class TallyHook(HookTestCase):
         self.assertEqual(self.lines(cli_calls), ["call"])
         self.assertEqual((self.hook_state()["calls"], self.hook_state()["last_seq"]), ([T0 + 10], SEQ0 + 1))
 
+    def test_a_crash_mid_command_acks_it_failed(self):
+        # P42: a run that dies while a command is in flight (here a jq that fails under set -e in run_command) acks it
+        # {"ok":false,"error":"the hook failed"} on its way out, so the app hears at once, not "timed out" 15 s later. The run
+        # still fails, with no result line (the contract fails it closed), and the seq stays saved: the next run doesn't run it.
+        failed = {"ok": False, "error": "the hook failed"}
+        crash = "count=$(jq -er '.missing' <<<'{}')\nRESULT='{\"ok\":true}'"
+        self.install(stub_function(HOOK.read_text(), "run_command", crash))
+        self.command(SEQ0 + 1, "add", {"n": 1})
+        self.last_tick()
+        done = self.run_hook(fails=True)
+        self.assertEqual([line for line in done.stdout.splitlines() if line.startswith("HATCH_HOOK_RESULT:")], [])
+        self.assertEqual(done.stdout, "", "nothing on stdout")
+        self.assertIsNotNone(self.read("state/acks.json"), "the command in flight is acked")
+        self.assertEqual(self.acks()["acks"], [{"seq": SEQ0 + 1, "result": failed}])
+        self.assertEqual(self.hook_state()["last_seq"], SEQ0 + 1)
+        self.install(HOOK.read_text())
+        self.last_tick()
+        self.run_hook()
+        self.assertEqual(self.acks()["acks"], [{"seq": SEQ0 + 1, "result": failed}], "not run again, nor acked twice")
+        self.assertFalse((self.app / f"outbox/cmd-{SEQ0 + 1}.json").exists())
+        self.assertIn(self.read("state/count.json"), (None, '{"count":0}\n'), "never added")
+
+        # Once a command is acked it is no longer in flight: a run that dies after its ack (here in removing its file) acks
+        # nothing more.
+        self.install(stub_function(HOOK.read_text(), "remove_file", "return 1"))
+        self.command(SEQ0 + 2, "add", {"n": 2})
+        self.last_tick()
+        done = self.run_hook(fails=True)
+        self.assertEqual(done.stdout, "")
+        self.assertEqual(self.acks()["acks"][-1], {"seq": SEQ0 + 2, "result": {"ok": True, "count": 2}})
+        self.assertEqual(len(self.acks()["acks"]), 2)
+
+        # A dry run serves no command, so its trap has nothing to ack: it writes nothing, and ends with its one result.
+        self.install(stub_function(HOOK.read_text(), "run_command", crash))
+        self.command(SEQ0 + 3, "add", {"n": 1})
+        self.heartbeat(kept=True)
+        before = self.tree()
+        self.assertEqual(self.run_hook(dry=True).result["action"], "silent")
+        self.assertEqual(self.tree(), before)
+
     def test_a_bare_name_is_a_file(self):
         # write_file makes a missing folder, and only a folder: a bare name (no "/"), such as now.json at the app's root, is
         # written as a file there.
@@ -877,6 +917,19 @@ class HookText(unittest.TestCase):
         self.assertGreater(len(functions), 5)
         for name, body in functions:
             self.assertNotRegex(body, r"\b(silent|wake)\b", f"{name} ends the run")
+
+
+    @unittest.skipIf(BASH is None, "no bash 4 or later on PATH")
+    def test_a_json_default_is_quoted(self):
+        # P42's addendum: in ${X:-{"a":1}} the first } ends the expansion, so a set X gets a stray } and jq fails. The guide's
+        # quoted form, run as bash runs it, gives the default when X is empty and X itself when set; the tally has no bare one.
+        guide = (HOOK.parents[2] / "apps_guide.md").read_text()
+        form = re.search(r"Quote a JSON default in a parameter expansion: `([^`]+)`", guide).group(1)
+        for x, want in (("", '{"a":1}'), ('{"b":2}', '{"b":2}')):
+            with self.subTest(x=x):
+                done = subprocess.run([BASH, "-c", f'X=$1; y={form}; printf "%s" "$y"', "bash", x], capture_output=True, text=True)
+                self.assertEqual(done.stdout, want)
+        self.assertNotRegex(HOOK.read_text(), r"\$\{\w+:?[-=+?]\{")
 
 
 if __name__ == "__main__":

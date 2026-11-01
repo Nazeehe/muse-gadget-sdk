@@ -1093,6 +1093,9 @@ class GuideAndSkill(unittest.TestCase):
             r"call that fails ends the run under `set -e`\. `connector_call` logs the call in the budget, acks a failure as "
             r"`\{\"ok\":false,\.\.\.\}`, and on exit 3 acks `not authorized` and ends the run",
             r"The hook saves a command's seq before it runs, so a command runs at most once",
+            # P42: the hook's EXIT trap acks a command in flight; the JSON default the Spotify hook got wrong.
+            r"If the hook fails while running a command, it acks it failed, so the app hears at once",
+            r"Quote a JSON default in a parameter expansion: `\$\{X:-'\{\"a\":1\}'\}`; a bare `\}` ends the expansion",
             r"`fetch_state` is the one function that reads the data source",
             # Connectors in hooks, their results, the output.
             r"Connector CLIs work inside hooks", r"exits 0, with `\{\"ok\":false,\.\.\.\}`: check `\.ok`",

@@ -1011,7 +1011,7 @@ class GuideAndSkill(unittest.TestCase):
             return int(match.group(1))
 
         n = {name: hook_number(name) for name in ("HEARTBEAT_MAX_AGE_S", "TICK_S", "LOOP_S", "CALLS_MAX", "WINDOW_S", "FAST_S",
-                                                  "SLOW_S", "EASE_AT", "LOW_AT", "LOG_KEEP", "ACKS_KEEP")}
+                                                  "EASE_AT", "SPREAD_MIN_S", "LOG_KEEP", "ACKS_KEEP")}
         self.assertEqual(n["WINDOW_S"], 3600, "a rolling hour")
         self.assertLessEqual(n["LOG_KEEP"] * len("1800000000,"), 16 * 1024 - 1024, "the log fits hook_state's 16 KB")
         heartbeat_s = header_number("apps_vmio.h", "APPS_VM_HEARTBEAT_MS") // 1000
@@ -1041,11 +1041,12 @@ class GuideAndSkill(unittest.TestCase):
             r"Set `script_timeout_secs` to 60", r"serves the waiting commands first, in seq order, with one read of the data source after each",
             rf"The hook makes at most {n['CALLS_MAX']} connector calls in any rolling hour: it keeps the times of its calls of the last "
             r"hour in its `hook_state`, and its reads use only what is left",
-            rf"After each read the next one waits {n['FAST_S']} s while {n['EASE_AT']} or more calls remain in the hour; from "
-            rf"{n['EASE_AT']} down to {n['LOW_AT']} remaining the wait grows evenly to {n['SLOW_S']} s; below {n['LOW_AT']} it is the "
-            rf"longer of {n['SLOW_S']} s and the time until the oldest call leaves the hour; with none left, until the oldest call leaves",
-            r"A command's calls and its read are always served, and logged too, so only commands take the hook past "
-            rf"{n['CALLS_MAX']} in an hour", rf"the tally's log keeps at most {n['LOG_KEEP']} times",
+            rf"After each read the next one waits {n['FAST_S']} s while {n['EASE_AT']} or more calls remain in the hour; below "
+            rf"{n['EASE_AT']} it spreads the calls left evenly over the time until the oldest call leaves the hour, at least "
+            rf"{n['SPREAD_MIN_S']} s apart; with none left, it waits until the oldest call leaves",
+            r"A command's calls and its read are always served, and logged too, so only commands take the hook past its budget",
+            rf"the tally's log keeps at most {n['LOG_KEEP']} times",
+            r"Send `vm\.command` from the user's actions, never from a timer",
             r"logs each call in the budget with `note_call`",
             r"`fetch_state` is the one function that reads the data source",
             # Connectors in hooks, their results, the output.
@@ -1078,7 +1079,7 @@ class GuideAndSkill(unittest.TestCase):
         # Each of the pattern's numbers is stated once in the guide.
         for phrase in (f"written {n['HEARTBEAT_MAX_AGE_S']} s ago or less", f"for at most {n['LOOP_S']} s",
                        f"at most {n['CALLS_MAX']} connector calls in any rolling hour", f"waits {n['FAST_S']} s while",
-                       f"evenly to {n['SLOW_S']} s", f"at most {n['LOG_KEEP']} times"):
+                       f"leaves the hour, at least {n['SPREAD_MIN_S']} s apart", f"at most {n['LOG_KEEP']} times"):
             with self.subTest(phrase):
                 self.assertEqual(" ".join(guide.split()).count(phrase), 1)
         # The hook's numbers are the ones its loop and budget use.

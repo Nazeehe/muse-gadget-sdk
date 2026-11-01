@@ -42,9 +42,8 @@ ACKS_KEEP=16                  # the acks state/acks.json keeps, newest last
 CALLS_MAX=100
 WINDOW_S=3600
 FAST_S=5                      # the wait after a read while EASE_AT or more calls remain
-SLOW_S=30                     # growing evenly to this at LOW_AT; below LOW_AT, this or until the oldest call leaves
 EASE_AT=50
-LOW_AT=10
+SPREAD_MIN_S=30               # below EASE_AT, the calls left spread evenly until the oldest leaves, at least this far apart
 LOG_KEEP=1000                 # the log keeps at most this many times, so hook_state stays under 16 KB
 
 dry_run() {
@@ -130,8 +129,16 @@ ack() {   # SEQ RESULT
 # CALLS holds the times of the calls to the data source in the last WINDOW_S, oldest first; NEXT_POLL is when the next
 # read may go.
 
-prune() {   # NOW: the calls that have left the window go
-    local k=0
+# prune NOW: the calls that have left the window go. After the clock steps back, so do the calls logged after NOW, and the
+# next read, scheduled on the old clock, is due (as it is when NEXT_POLL is more than WINDOW_S on, which no schedule gives).
+prune() {
+    local k=0 n=${#CALLS[@]}
+    while ((n > 0)) && ((CALLS[n - 1] > $1)); do n=$((n - 1)); done
+    if ((n < ${#CALLS[@]})); then
+        CALLS=("${CALLS[@]:0:n}")
+        NEXT_POLL=$1
+    fi
+    if ((NEXT_POLL > $1 + WINDOW_S)); then NEXT_POLL=$1; fi
     while ((k < ${#CALLS[@]})) && ((CALLS[k] <= $1 - WINDOW_S)); do k=$((k + 1)); done
     if ((k > 0)); then CALLS=("${CALLS[@]:k}"); fi
 }
@@ -141,18 +148,17 @@ note_call() {   # NOW: one call to the data source, logged
     if ((${#CALLS[@]} > LOG_KEEP)); then CALLS=("${CALLS[@]:${#CALLS[@]}-LOG_KEEP}"); fi
 }
 
-# schedule NOW: after a read at NOW, when the next may go: FAST_S while EASE_AT or more calls remain in the window, growing
-# evenly to SLOW_S at LOW_AT; below that the longer of SLOW_S and the time until the oldest call leaves; with none left,
-# when the log is back under CALLS_MAX.
+# schedule NOW: after a read at NOW, when the next may go. While EASE_AT or more calls remain in the window, FAST_S on.
+# Below that, the calls left spread evenly over the time until the oldest call leaves, at least SPREAD_MIN_S apart, so the
+# app never goes long without a read. With none left, when the log is back under CALLS_MAX (when the oldest leaves, unless
+# commands took it past).
 schedule() {
     local now=$1 remaining=$((CALLS_MAX - ${#CALLS[@]})) wait
     if ((remaining >= EASE_AT)); then
         NEXT_POLL=$((now + FAST_S))
-    elif ((remaining >= LOW_AT)); then
-        NEXT_POLL=$((now + FAST_S + (EASE_AT - remaining) * (SLOW_S - FAST_S) / (EASE_AT - LOW_AT)))
     elif ((remaining > 0)); then
-        wait=$((CALLS[0] + WINDOW_S - now))
-        if ((wait < SLOW_S)); then wait=$SLOW_S; fi
+        wait=$(((CALLS[0] + WINDOW_S - now) / remaining))
+        if ((wait < SPREAD_MIN_S)); then wait=$SPREAD_MIN_S; fi
         NEXT_POLL=$((now + wait))
     else
         NEXT_POLL=$((CALLS[${#CALLS[@]} - CALLS_MAX] + WINDOW_S))

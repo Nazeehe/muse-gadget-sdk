@@ -47,6 +47,8 @@ TALLY = ROOT / "components/muse/apps/examples/tally"
 HOOK = TALLY / "hook.sh"
 
 T0 = 1_800_000_000  # the fake clock's start, epoch seconds
+SEQ0 = T0 * 1000     # a command's seq at T0: the gadget's clock in epoch ms (vm.command)
+CMD_MAX_AGE_S = 60   # a command older than this is acked "expired" and not run (the final review's I3)
 
 # The budget and the loop (rulings P21a and P21b, the guide's Connected apps): a model the hook's timing is checked against.
 CALLS_MAX = 100        # calls to the data source in any rolling WINDOW_S
@@ -320,7 +322,7 @@ class TallyHook(HookTestCase):
     def test_idle_when_the_heartbeat_is_stale(self):
         # The in-front gate: no heartbeat, or one older than 15 s, and the run ends at once (no sleep, no time passing) with
         # nothing written: no state, no acks, no hook state.
-        self.command(1, "add", {"n": 1})
+        self.command(SEQ0 + 1, "add", {"n": 1})
         for age in (None, HEARTBEAT_MAX_AGE_S + 1, 3600):
             with self.subTest(age=age):
                 if age is not None:
@@ -329,7 +331,7 @@ class TallyHook(HookTestCase):
                 self.assertEqual(run.result["action"], "silent")
                 self.assertFalse((self.app / "state").exists())
                 self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()),
-                                 ([] if age is None else ["active.json"]) + ["cmd-1.json"])
+                                 ([] if age is None else ["active.json"]) + [f"cmd-{SEQ0 + 1}.json"])
                 self.assertIsNone(self.hook_state())
                 self.assertEqual(self.now(), T0, "no time passed")
                 self.assertEqual(self.lines(self.sleeps), [])
@@ -341,7 +343,9 @@ class TallyHook(HookTestCase):
 
     def test_applies_commands_in_seq_order_once(self):
         # Commands go in seq order, as numbers (cmd-10 after cmd-9), each once: applied, its seq kept in the hook's state,
-        # acked, and its file removed. The same files again (a re-read) change nothing; a new seq still goes.
+        # acked, and its file removed. The same files again (a re-read) change nothing; a new seq still goes. (The clock is 30 s
+        # past the epoch here, so that seqs of one and two digits, in ms, are fresh: a real seq always has 13.)
+        self.set_clock(30)
         commands = [(9, "add", {"n": 3}), (10, "reset", None), (11, "add", {"n": 4})]
         for seq, name, args in commands:
             self.command(seq, name, args)
@@ -366,18 +370,18 @@ class TallyHook(HookTestCase):
 
     def test_unknown_or_bad_commands_are_acked_with_an_error(self):
         # A command the hook doesn't know, or bad args, is acked with ok false and why, so the app's callback hears at once.
-        self.command(1, "jump", None)
-        self.command(2, "add", {"n": "five"})
+        self.command(SEQ0 + 1, "jump", None)
+        self.command(SEQ0 + 2, "add", {"n": "five"})
         self.last_tick()
         self.run_hook()
-        self.assertEqual([(a["seq"], a["result"]["ok"]) for a in self.acks()["acks"]], [(1, False), (2, False)])
+        self.assertEqual([(a["seq"], a["result"]["ok"]) for a in self.acks()["acks"]], [(SEQ0 + 1, False), (SEQ0 + 2, False)])
         self.assertEqual(self.count(), 0)
 
     def test_writes_rev_after_every_state_change(self):
         # Every change to the app's state file is followed by a new state/rev (after the file, so an app that sees the new
         # rev reads the new state), and a run that changes nothing writes no rev.
-        self.command(1, "add", {"n": 1})
-        self.command(2, "add", {"n": 2})
+        self.command(SEQ0 + 1, "add", {"n": 1})
+        self.command(SEQ0 + 2, "add", {"n": 2})
         self.last_tick()
         self.run_hook()
         moved = self.lines(self.moves)  # the hook's paths, relative to its folder
@@ -408,16 +412,16 @@ class TallyHook(HookTestCase):
 
     def test_acks_list_applied_seqs(self):
         # state/acks.json is {"acks":[{"seq":<int>,"result":<any JSON>}, ...]}, newest last, the last 16 applied (P3).
-        for seq in range(101, 119):
+        for seq in range(SEQ0 + 101, SEQ0 + 119):
             self.command(seq, "add", {"n": 1})
         self.last_tick()
         self.run_hook()
         acks = self.acks()
         self.assertEqual(list(acks), ["acks"])
-        self.assertEqual([a["seq"] for a in acks["acks"]], list(range(103, 119)))
+        self.assertEqual([a["seq"] for a in acks["acks"]], list(range(SEQ0 + 103, SEQ0 + 119)))
         for a in acks["acks"]:
             self.assertEqual(sorted(a), ["result", "seq"])
-            self.assertEqual(a["result"], {"ok": True, "count": a["seq"] - 100})
+            self.assertEqual(a["result"], {"ok": True, "count": a["seq"] - SEQ0 - 100})
 
     def test_dry_run_has_no_side_effects(self):
         # A dry run writes nothing (no state, no acks, no removed commands, no hook state) and applies no command, but its
@@ -457,8 +461,9 @@ class TallyHook(HookTestCase):
         self.calls.write_text("")
         self.install(stub_fetch_state(HOOK.read_text(), self.calls))
         scripts = self.shim / "sleep"
-        scripts.write_text(scripts.read_text() + f'if [[ $t -eq {T0 + 1002} ]]; then echo \'{{"seq":5,"name":"add","args":{{"n":2}}}}\' '
-                                                 f'> "{self.app}/outbox/cmd-5.json"; fi\n')
+        seq = (T0 + 1002) * 1000  # the gadget's clock when it writes the command
+        scripts.write_text(scripts.read_text() + f'if [[ $t -eq {T0 + 1002} ]]; then echo \'{{"seq":{seq},"name":"add","args":{{"n":2}}}}\' '
+                                                 f'> "{self.app}/outbox/cmd-{seq}.json"; fi\n')
         self.run_hook()
         self.assertEqual(self.count(), 2)
         self.assertEqual([int(t) for t in self.lines(self.calls)], [T0 + 1000, T0 + 1002, T0 + 1007, T0 + 1012],
@@ -631,20 +636,20 @@ class TallyHook(HookTestCase):
         self.assertEqual((self.count(), self.read("state/rev").strip()), (0, "1"))
         shutil.rmtree(self.app / "state")
         self.state_dir.joinpath("tally.json").unlink()
-        self.command(1, "add", {"n": 2})
+        self.command(SEQ0 + 1, "add", {"n": 2})
         self.last_tick()
         self.run_hook()
-        self.assertEqual(self.acks()["acks"], [{"seq": 1, "result": {"ok": True, "count": 2}}])
+        self.assertEqual(self.acks()["acks"], [{"seq": SEQ0 + 1, "result": {"ok": True, "count": 2}}])
         self.assertEqual(self.count(), 2)
 
     def test_whole_numbers_in_any_form(self):
         # I1: the gadget's json.encode prints a whole float as 1.0 ({n = 2/2}), and JSON allows 1e3. A whole number counts in
         # any form; 1.5 is refused with an ack; and the run goes on (later commands served, none left behind).
-        for seq, n in ((1, "1.0"), (2, "1e3"), (3, "1.5"), (4, "-2.0"), (5, "2")):
-            self.command(seq, "add", raw=f'{{"seq":{seq},"name":"add","args":{{"n":{n}}}}}')
+        for k, n in ((1, "1.0"), (2, "1e3"), (3, "1.5"), (4, "-2.0"), (5, "2")):
+            self.command(SEQ0 + k, "add", raw=f'{{"seq":{SEQ0 + k},"name":"add","args":{{"n":{n}}}}}')
         self.last_tick()
         run = self.run_hook()
-        self.assertEqual([(a["seq"], a["result"]) for a in self.acks()["acks"]],
+        self.assertEqual([(a["seq"] - SEQ0, a["result"]) for a in self.acks()["acks"]],
                          [(1, {"ok": True, "count": 1}), (2, {"ok": True, "count": 1001}),
                           (3, {"ok": False, "error": "add takes {n = a whole number}"}),
                           (4, {"ok": True, "count": 999}), (5, {"ok": True, "count": 1001})])
@@ -668,15 +673,15 @@ class TallyHook(HookTestCase):
                 text = stub_fetch_state(HOOK.read_text(), self.calls)
                 self.install(stub_function(text, "run_command", f"connector_call {cli} {exit_code} '{out}' || return 0\n"
                                                                  'RESULT=\'{"ok":true}\''))
-                self.command(1, "skip", None)
+                self.command(SEQ0 + 1, "skip", None)
                 self.last_tick()
                 run = self.run_hook()
-                self.assertEqual(self.acks()["acks"][-1], {"seq": 1, "result": {"ok": False, "error": "the connector failed"}})
+                self.assertEqual(self.acks()["acks"][-1], {"seq": SEQ0 + 1, "result": {"ok": False, "error": "the connector failed"}})
                 self.assertEqual(run.result["reason"], "the app went behind", "the run went on")
                 self.assertEqual(self.lines(cli_calls), ["call"])
                 self.assertEqual(self.lines(self.calls), [str(T0)], "the read after the command")
                 self.assertEqual(self.hook_state()["calls"], [T0, T0], "the connector call and the read, both logged")
-                self.command(1, "skip", None)  # read again: not run twice
+                self.command(SEQ0 + 1, "skip", None)  # read again: not run twice
                 self.last_tick()
                 self.run_hook()
                 self.assertEqual(self.lines(cli_calls), ["call"])
@@ -684,36 +689,36 @@ class TallyHook(HookTestCase):
         cli_calls.write_text("")
         self.hook_state({"calls": [], "next_poll": T0 + 100, "last_seq": 0})
         self.install(stub_function(HOOK.read_text(), "run_command", f"note_call \"$now\"\n{cli} 1 x >/dev/null\nRESULT=\'{{}}\'"))
-        self.command(1, "skip", None)
+        self.command(SEQ0 + 1, "skip", None)
         self.last_tick()
         self.run_hook(fails=True)
-        self.assertEqual(self.hook_state()["last_seq"], 1)
+        self.assertEqual(self.hook_state()["last_seq"], SEQ0 + 1)
         self.last_tick()
         self.run_hook()
         self.assertEqual(self.lines(cli_calls), ["call"], "at most once")
-        self.assertFalse((self.app / "outbox/cmd-1.json").exists())
+        self.assertFalse((self.app / f"outbox/cmd-{SEQ0 + 1}.json").exists())
         # connector_call called bare (no "|| return 0") is a misuse: when the call fails, set -e ends the run. The call is
         # still in the log, so the budget counts it.
         cli_calls.write_text("")
         self.set_clock(T0 + 10)
         self.hook_state({"calls": [], "next_poll": T0 + 100, "last_seq": 0})
         self.install(stub_function(HOOK.read_text(), "run_command", f"connector_call {cli} 1 ''\nRESULT=\'{{}}\'"))
-        self.command(1, "skip", None)
+        self.command(SEQ0 + 1, "skip", None)
         self.last_tick()
         self.run_hook(fails=True)
         self.assertEqual(self.lines(cli_calls), ["call"])
-        self.assertEqual((self.hook_state()["calls"], self.hook_state()["last_seq"]), ([T0 + 10], 1))
+        self.assertEqual((self.hook_state()["calls"], self.hook_state()["last_seq"]), ([T0 + 10], SEQ0 + 1))
 
     def test_a_bare_name_is_a_file(self):
         # write_file makes a missing folder, and only a folder: a bare name (no "/"), such as now.json at the app's root, is
         # written as a file there.
         self.install(stub_function(HOOK.read_text(), "run_command", "write_file now.json '{\"t\":1}'\nRESULT=\'{\"ok\":true}\'"))
-        self.command(1, "mark", None)
+        self.command(SEQ0 + 1, "mark", None)
         self.last_tick()
         self.run_hook()
         self.assertTrue((self.app / "now.json").is_file())
         self.assertEqual(json.loads(self.read("now.json")), {"t": 1})
-        self.assertEqual(self.acks()["acks"], [{"seq": 1, "result": {"ok": True}}])
+        self.assertEqual(self.acks()["acks"], [{"seq": SEQ0 + 1, "result": {"ok": True}}])
 
     def test_exit_3_is_not_authorized_and_silent(self):
         # Exit 3 means not authorized: from fetch_state, the run logs it and ends silent at once (no more reads, though the app
@@ -735,13 +740,13 @@ class TallyHook(HookTestCase):
         self.hook_state({"calls": [], "next_poll": T0 + 100, "last_seq": 0})
         text = stub_fetch_state(HOOK.read_text(), self.calls)
         self.install(stub_function(text, "run_command", f"connector_call {cli} || return 0\nRESULT=\'{{\"ok\":true}}\'"))
-        self.command(1, "skip", None)
-        self.command(2, "skip", None)
+        self.command(SEQ0 + 1, "skip", None)
+        self.command(SEQ0 + 2, "skip", None)
         run = self.run_hook()
         self.assertEqual((run.result["action"], run.result["reason"]), ("silent", "not authorized"))
-        self.assertEqual(self.acks()["acks"], [{"seq": 1, "result": {"ok": False, "error": "not authorized"}}])
+        self.assertEqual(self.acks()["acks"], [{"seq": SEQ0 + 1, "result": {"ok": False, "error": "not authorized"}}])
         self.assertEqual(self.lines(self.calls), [], "no read after it")
-        self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()), ["active.json", "cmd-2.json"])
+        self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()), ["active.json", f"cmd-{SEQ0 + 2}.json"])
         self.assertEqual(self.hook_state()["calls"], [T0], "the connector call, logged")
 
     def test_commands_stop_at_the_loop_limit(self):
@@ -750,16 +755,57 @@ class TallyHook(HookTestCase):
         self.install(stub_function(HOOK.read_text(), "fetch_state",
                                    f'read -r t < "{self.clock}"\necho "$t" >> "{self.calls}"\necho $((t + 20)) > "{self.clock}"\n'
                                    'if [[ -f "$STATE_FILE" ]]; then cat "$STATE_FILE"; else printf \'{"count":0}\\n\'; fi'))
-        for seq in range(1, 6):
+        seqs = [(T0 + 10 * i) * 1000 for i in range(5)]  # five taps 10 s apart, all waiting when the run starts
+        for seq in seqs:
             self.command(seq, "add", {"n": 1})
         self.heartbeat(kept=True)
         self.run_hook()
-        self.assertEqual([a["seq"] for a in self.acks()["acks"]], [1, 2, 3], "served at 0, 20 and 40 s; at 60 s it stops")
-        self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()), ["active.json", "cmd-4.json", "cmd-5.json"])
+        self.assertEqual([a["seq"] for a in self.acks()["acks"]], seqs[:3], "served at 0, 20 and 40 s; at 60 s it stops")
+        self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()),
+                         ["active.json", f"cmd-{seqs[3]}.json", f"cmd-{seqs[4]}.json"])
         self.assertLess(self.now() - T0, 60 + LOOP_S)
         self.heartbeat(kept=True)
         self.run_hook()
-        self.assertEqual([a["seq"] for a in self.acks()["acks"]], [1, 2, 3, 4, 5])
+        self.assertEqual([a["seq"] for a in self.acks()["acks"]], seqs)
+        self.assertEqual(self.count(), 5)
+
+    def test_a_stale_command_is_expired_not_run(self):
+        # I3: a seq is the gadget's clock in ms when the app sent the command. One older than 60 s (the hook was disabled or failing,
+        # or the VM asleep, while the user tapped; the app said "timed out" after 15 s) is acked {"ok":false,"error":"expired"} and
+        # removed, never run: no skips or plays the user didn't ask for now. Its seq is saved like any other's, so it never runs
+        # later either; a command at 60 s exactly still runs, and fresh ones after a stale one run as ever, each with its read.
+        self.calls.write_text("")
+        self.install(stub_fetch_state(HOOK.read_text(), self.calls))
+        old, edge, fresh = (T0 - CMD_MAX_AGE_S - 1) * 1000 + 999, (T0 - CMD_MAX_AGE_S) * 1000, SEQ0 - 5000
+        self.command(old - 3600 * 1000, "add", {"n": 100})  # an hour old
+        self.command(old, "reset", None)                     # 61 s old (its last ms)
+        self.command(edge, "add", {"n": 2})                  # 60 s old: runs
+        self.command(fresh, "add", {"n": 3})
+        self.last_tick()
+        run = self.run_hook()
+        self.assertEqual([(a["seq"], a["result"]) for a in self.acks()["acks"]],
+                         [(old - 3600 * 1000, {"ok": False, "error": "expired"}), (old, {"ok": False, "error": "expired"}),
+                          (edge, {"ok": True, "count": 2}), (fresh, {"ok": True, "count": 5})])
+        self.assertEqual(self.count(), 5, "the stale add and reset never ran")
+        self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()), ["active.json"])
+        self.assertEqual(self.hook_state()["last_seq"], fresh)
+        self.assertEqual(self.lines(self.calls), [str(T0)] * 2, "a read after each command that ran, none after an expired one")
+        self.assertEqual(run.result["payload"]["commands"], 2)
+        self.assertEqual([e for e in run.logs if e["message"] == "expired a command"],
+                         [{"message": "expired a command", "fields": {"seq": old - 3600 * 1000}},
+                          {"message": "expired a command", "fields": {"seq": old}}])
+        # The same stale file again: at or below the last seq, removed with no second ack.
+        self.command(old, "reset", None)
+        self.last_tick()
+        self.run_hook()
+        self.assertEqual(len(self.acks()["acks"]), 4)
+        self.assertEqual(self.count(), 5)
+        # Alone, a stale command's seq is kept too, as any applied one's.
+        self.hook_state({"calls": [], "next_poll": T0 + 100, "last_seq": 0})
+        self.command(old, "reset", None)
+        self.last_tick()
+        self.run_hook()
+        self.assertEqual((self.hook_state()["last_seq"], self.acks()["acks"][-1]), (old, {"seq": old, "result": {"ok": False, "error": "expired"}}))
         self.assertEqual(self.count(), 5)
 
     def test_a_bad_state_file_is_logged_not_printed(self):
@@ -782,16 +828,16 @@ class TallyHook(HookTestCase):
                 self.hook_state({"calls": calls, "next_poll": T0, "last_seq": 0})
                 shutil.rmtree(self.app / "state", ignore_errors=True)
                 self.install(stub_fetch_state(HOOK.read_text(), self.calls))
-                self.command(1, "add", {"n": 1})
+                self.command(SEQ0 + 1, "add", {"n": 1})
                 self.last_tick()
                 self.run_hook()
-                self.assertEqual(self.acks()["acks"], [{"seq": 1, "result": {"ok": True, "count": 1}}])
+                self.assertEqual(self.acks()["acks"], [{"seq": SEQ0 + 1, "result": {"ok": True, "count": 1}}])
                 self.assertEqual(self.lines(self.calls), [str(T0)], "the command's read, and no poll after it")
                 self.assertEqual(self.hook_state()["calls"], calls + [T0])
         # The log keeps at most 1000 times (hook_state under 16 KB); the newest stay.
         self.set_clock(T0)
-        self.hook_state({"calls": [T0 - 3000 + i for i in range(LOG_KEEP)], "next_poll": T0, "last_seq": 1})
-        self.command(2, "reset", None)
+        self.hook_state({"calls": [T0 - 3000 + i for i in range(LOG_KEEP)], "next_poll": T0, "last_seq": SEQ0 + 1})
+        self.command(SEQ0 + 2, "reset", None)
         self.last_tick()
         self.run_hook()
         state = self.hook_state()

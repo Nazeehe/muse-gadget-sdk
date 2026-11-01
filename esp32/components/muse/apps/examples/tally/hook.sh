@@ -36,6 +36,7 @@ HEARTBEAT_MAX_AGE_S=15        # the in-front gate: the gadget writes the heartbe
 TICK_S=1                      # how often a run checks outbox/
 LOOP_S=50                     # how long one run goes on (script_timeout_secs is 60)
 ACKS_KEEP=16                  # the acks state/acks.json keeps, newest last
+CMD_MAX_AGE_S=60              # a command older than this (its seq: the gadget clock, in ms) is acked "expired", not run
 
 # The call budget: at most CALLS_MAX calls to the data source in any rolling WINDOW_S, from a log of their times in
 # hook_state. The wait after a read depends on how many calls remain in the window.
@@ -248,7 +249,8 @@ heartbeat_fresh() {   # NOW
 
 # serve_commands NOW: the waiting commands in seq order, as numbers, each once (its seq saved before it runs), with one
 # read after each. Commands are always served, and their calls logged, while the run is inside LOOP_S: the rest wait for
-# the next run.
+# the next run. A command older than CMD_MAX_AGE_S is acked {"ok":false,"error":"expired"} and removed without running:
+# the app said "timed out" long before (the hook was off or failing, or the VM asleep), and a tap from then must not act now.
 serve_commands() {
     local now=$1 file seq name args files=(outbox/cmd-*.json)
     if ((${#files[@]} > 1)); then mapfile -t files < <(printf '%s\n' "${files[@]}" | sort -t- -k2,2n); fi
@@ -261,6 +263,14 @@ serve_commands() {
         seq=${seq%.json}
         if ! [[ "$seq" =~ ^[0-9]+$ ]] || ((seq <= LAST_SEQ)); then
             remove_file "$file"   # applied before (or not a command): never twice
+            continue
+        fi
+        if ((seq / 1000 < now - CMD_MAX_AGE_S)); then
+            LAST_SEQ=$seq
+            save_state
+            ack "$seq" '{"ok":false,"error":"expired"}'
+            remove_file "$file"
+            log "expired a command" "{\"seq\":$seq}"
             continue
         fi
         # NAME then ARGS (compact JSON, the rest of the line); nothing for a file that isn't this seq's command.

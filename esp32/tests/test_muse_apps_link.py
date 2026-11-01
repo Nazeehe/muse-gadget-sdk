@@ -1043,7 +1043,7 @@ class GuideAndSkill(unittest.TestCase):
             return int(match.group(1))
 
         n = {name: hook_number(name) for name in ("HEARTBEAT_MAX_AGE_S", "TICK_S", "LOOP_S", "CALLS_MAX", "WINDOW_S", "FAST_S",
-                                                  "EASE_AT", "SPREAD_MIN_S", "LOG_KEEP", "ACKS_KEEP")}
+                                                  "EASE_AT", "SPREAD_MIN_S", "LOG_KEEP", "ACKS_KEEP", "CMD_MAX_AGE_S")}
         self.assertEqual(n["WINDOW_S"], 3600, "a rolling hour")
         self.assertLessEqual(n["LOG_KEEP"] * len("1800000000,"), 16 * 1024 - 1024, "the log fits hook_state's 16 KB")
         heartbeat_s = header_number("apps_vmio.h", "APPS_VM_HEARTBEAT_MS") // 1000
@@ -1061,6 +1061,9 @@ class GuideAndSkill(unittest.TestCase):
             r"applies the commands in seq order, as numbers, each once", r"keeps the last seq it applied in its `hook_state`",
             r'`\{"acks":\[\{"seq":<seq>,"result":\.\.\.\}\]\}`, newest last, the last ' + str(n["ACKS_KEEP"]),
             rf"The gadget reads the acks every {ack_poll_s} s",
+            # I3: a stale command is expired, never run.
+            rf"A command older than {n['CMD_MAX_AGE_S']} s \(its seq is the gadget's clock in ms\) is acked "
+            r"`\{\"ok\":false,\"error\":\"expired\"\}` and removed without running",
             # When to use which.
             r"Use `muse\.ask` for what needs your judgement, and for a connector whose rules forbid keeping its data in files",
             # The hook: where it lives (P7), its start and end.
@@ -1113,7 +1116,9 @@ class GuideAndSkill(unittest.TestCase):
         found = [next(i for i, (_, step) in enumerate(steps) if re.search(pattern, step)) for pattern in order]
         self.assertEqual(found, sorted(found), "hooks.add, the dry run, the update, enable, install, snapshot")
         # Each of the pattern's numbers is stated once in the guide.
+        self.assertGreater(n["CMD_MAX_AGE_S"], header_number("apps_vmio.h", "APPS_VM_ACK_MS") // 1000, "after the app's timed out")
         for phrase in (f"written {n['HEARTBEAT_MAX_AGE_S']} s ago or less", f"for at most {n['LOOP_S']} s",
+                       f"A command older than {n['CMD_MAX_AGE_S']} s",
                        f"at most {n['CALLS_MAX']} connector calls in any rolling hour", f"waits {n['FAST_S']} s while",
                        f"it waits at least {n['SPREAD_MIN_S']} s, spreading", f"at most {n['LOG_KEEP']} times"):
             with self.subTest(phrase):

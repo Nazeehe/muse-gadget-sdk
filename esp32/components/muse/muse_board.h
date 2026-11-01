@@ -126,13 +126,15 @@ typedef struct {
      */
     void (*draw_frame)(int x1, int y1, int x2, int y2, int rows,
                        void (*fill)(uint8_t *dst, int stride, int row, int rows, void *arg), void *arg);
+#if CONFIG_MUSE_APPS
     /*
      * Whether a refresh LVGL draws in two bands goes to the panel whole,
      * clear of its scan (muse_lcd_bands_set_pairing). Apps turn it on while
-     * a picture spins in front (CONFIG_MUSE_APPS), on the LVGL task. NULL:
-     * the board sends each band on its own.
+     * a picture spins or a spinner shows in front, on the LVGL task. NULL:
+     * the board sends each band on its own. Only with the apps.
      */
     void (*frame_pairing)(bool on);
+#endif
 
     /* Codec handles for one duplex, 2-slot I2S bus, not yet opened. */
     esp_err_t (*audio_init)(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic);

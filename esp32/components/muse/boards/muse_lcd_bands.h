@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 #include "esp_lv_adapter.h"
+#include "sdkconfig.h"
 
 /*
  * LVGL on a QSPI panel, drawn in a few tall bands in PSRAM.
@@ -67,9 +68,20 @@ void muse_lcd_bands_run(void (*fn)(void *arg), void *arg);
  * the refresh period, and how many bands it held or couldn't keep clear,
  * every 1000 bands. Call it after muse_lcd_bands_register. Frames drawn with
  * muse_lcd_bands_frame are timed the same way.
+ *
+ * With the apps (CONFIG_MUSE_APPS) the hold is connected apps Task 7's: a
+ * band waits for the first moment that keeps it clear for every start up
+ * to 1 ms late and every write from half to one and a half times its
+ * estimate (and 400 us more), on a one-shot timer to the microsecond (in
+ * ticks if the timer couldn't be made), and the two bands of a pair
+ * (muse_lcd_bands_set_pairing) are timed together. The 1000-band line then
+ * ends "<n> of <m> refreshes torn": refreshes of LVGL's that a scan read
+ * some rows of before their write and some after. Without the apps the
+ * hold is the one from before Task 7, which sleeps in ticks.
  */
 void muse_lcd_bands_set_te(int gpio);
 
+#if CONFIG_MUSE_APPS
 /*
  * Whether a refresh LVGL draws in exactly two bands goes to the panel whole:
  * off until turned on. On, the first band is held, its flush left open,
@@ -83,6 +95,7 @@ void muse_lcd_bands_set_te(int gpio);
  * (muse_board_t frame_pairing).
  */
 void muse_lcd_bands_set_pairing(bool on);
+#endif
 
 /*
  * Draws the rectangle (x1, y1)-(x2, y2) (end exclusive) without LVGL, in

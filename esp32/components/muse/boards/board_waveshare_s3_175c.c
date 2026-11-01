@@ -276,7 +276,9 @@ static const muse_board_t s_board = {
     .panel_sleep = panel_sleep,
     .display_pause = display_pause,
     .draw_frame = muse_lcd_bands_frame,
+#if CONFIG_MUSE_APPS
     .frame_pairing = muse_lcd_bands_set_pairing,   /* measured here only (connected apps Task 7) */
+#endif
     .audio_init = audio_init,
     .mic_slot = -1,
     .set_mic_gain = set_mic_gain,

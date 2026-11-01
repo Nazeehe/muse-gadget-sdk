@@ -15,7 +15,11 @@
 """Compile muse_lcd_bands.c's tearing-effect timing on the host and check it against the CO5300's measured scan (16.8 to
 17.0 ms refresh, 0.6 ms blanking, 466 rows): te_meets (one band against the scan), frame_meets (a refresh's bands
 against it: torn if a scan reads some of its rows before their write and some after), frame_clear_in (when a refresh's
-bands, sent back to back, stay clear of every scan) and refresh_parts (how many bands LVGL draws a refresh in)."""
+bands, sent back to back, stay clear of every scan) and refresh_parts (how many bands LVGL draws a refresh in).
+
+Those are connected apps Task 7's, built only with the apps (CONFIG_MUSE_APPS): a build without them sends as 7e59ee0 did
+(PlainBuildTest)."""
+import hashlib
 import math
 from pathlib import Path
 import re
@@ -25,6 +29,49 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "components/muse/boards/muse_lcd_bands.c"
+HEADER = ROOT / "components/muse/boards/muse_lcd_bands.h"
+BOARD_H = ROOT / "components/muse/muse_board.h"
+BOARD_175C = ROOT / "components/muse/boards/board_waveshare_s3_175c.c"
+
+
+def lines_by_build(source):
+    """Each line of source with whether a build without the apps has it and whether one with them does: every #if
+    CONFIG_MUSE_APPS, #if !CONFIG_MUSE_APPS, #else and #endif resolved (those directive lines in neither), every other
+    directive kept as a line both builds have when its region does."""
+    out, stack = [], []
+    for line in source.splitlines(keepends=True):
+        text = line.strip()
+        guard = re.match(r"#\s*if\s+(!?)\s*CONFIG_MUSE_APPS\s*$", text)
+        if guard:
+            stack.append(["apps", not guard.group(1)])  # its lines are the apps build's (True) or the plain build's
+            continue
+        under_apps = bool(stack) and stack[-1][0] == "apps"
+        if re.match(r"#\s*if", text):
+            stack.append(["other", None])
+        elif under_apps and re.match(r"#\s*elif\b", text):
+            raise ValueError("#elif under a CONFIG_MUSE_APPS guard")
+        elif under_apps and re.match(r"#\s*else\b", text):
+            stack[-1][1] = not stack[-1][1]
+            continue
+        elif re.match(r"#\s*endif\b", text):
+            if stack.pop()[0] == "apps":
+                continue
+        apps = [taken for kind, taken in stack if kind == "apps"]
+        out.append((line, not any(apps), all(apps)))
+    assert not stack, "an #if without its #endif"
+    return out
+
+
+def variant(source, apps):
+    """source as the preprocessor leaves it with CONFIG_MUSE_APPS 1 (apps) or 0, its other directives as they are."""
+    return "".join(line for line, plain, with_apps in lines_by_build(source) if (with_apps if apps else plain))
+
+
+def strip_c(source):
+    """The code of a C source: comments and string literals gone."""
+    source = re.sub(r"/\*.*?\*/", " ", source, flags=re.S)
+    source = re.sub(r"//[^\n]*", " ", source)
+    return re.sub(r'"(?:\\.|[^"\\\n])*"', '""', source)
 
 
 def function(source, name):
@@ -133,7 +180,7 @@ class Harness:
 
     @classmethod
     def build(cls, tmp):
-        source = SOURCE.read_text()
+        source = variant(SOURCE.read_text(), apps=True)
         parts = [typedef(source, "write_t"), typedef(source, "pace_t"), re.search(r"^#define PACE_VAR_MIN .*$", source, re.M).group(0)]
         parts += [function(source, name) for name in
                   ("te_meets", "floor_div", "frame_meets", "frame_clear_in", "refresh_parts", "pace_learn", "pace_est",
@@ -312,7 +359,7 @@ class FrameTest(unittest.TestCase):
         self.assertEqual(Harness.ask([clear_query(whole, now, 300, 0, P2, SCAN2) for now in (0, 5000, 10000)]), [-1, -1, -1])
         sent = [(y1, y2, 10000 + i * 6700, w) for i, (y1, y2, w) in enumerate(whole)]
         self.assertEqual(Harness.ask([frame_query(sent, 0, P2, SCAN2)]), [1])
-        done = function(SOURCE.read_text(), "frame_done")
+        done = function(variant(SOURCE.read_text(), apps=True), "frame_done")
         self.assertRegex(done, r"bool torn = judged && frame_meets\(")
         self.assertIn("s_frame.torn += torn;", done)
 
@@ -349,7 +396,7 @@ class RefreshPartsTest(unittest.TestCase):
         self.assertEqual(self.parts((20, 20, 99, 59, 1), (132, 132, 333, 333, 0)), 1)
 
     def test_the_rule_is_lvgls(self):
-        source = SOURCE.read_text()
+        source = variant(SOURCE.read_text(), apps=True)
         self.assertIn("buf_bytes / ((uint32_t)w * 2)", function(source, "refresh_parts"))
         self.assertIn("& ~1", function(source, "refresh_parts"))
         from test_muse_apps_lv import lvgl_dir  # LVGL 9.5.0 on this machine, if a device build has fetched it
@@ -460,6 +507,176 @@ class PaceTest(unittest.TestCase):
             with self.subTest(after=100 * (k + 1), est=est):
                 self.assertLessEqual(est * (100 - SPREAD) // 100, small)
                 self.assertGreaterEqual(est * (100 + SPREAD) // 100 + 400, small + 500)
+
+
+# The holds of both builds, compiled from their variants of muse_lcd_bands.c over a fake clock: vTaskDelay moves it on by its
+# ticks (1 ms each). One query a line: hold now fall p scan y1 y2 est; the answer is the time the hold took and whether it counted
+# the band as held. The apps build's hold has no timer here (its esp_timer couldn't be made: M32), so it sleeps in ticks.
+HOLD = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+typedef int TickType_t;
+typedef void *SemaphoreHandle_t;
+typedef void *esp_timer_handle_t;
+#define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+#define pdTRUE 1
+#define ESP_OK 0
+static int64_t g_now;
+static int64_t esp_timer_get_time(void) { return g_now; }
+static void vTaskDelay(TickType_t ticks) { g_now += (int64_t)ticks * 1000; }
+static int xSemaphoreTake(SemaphoreHandle_t s, TickType_t ticks) { (void)s; (void)ticks; return pdTRUE; }
+static int esp_timer_start_once(esp_timer_handle_t t, uint64_t us) { (void)t; (void)us; abort(); }
+static int esp_timer_stop(esp_timer_handle_t t) { (void)t; abort(); }
+static SemaphoreHandle_t s_wake;
+static esp_timer_handle_t s_wake_timer;   /* none */
+static bool s_te_on = true;
+static int s_rows = 466;
+static volatile int64_t s_te_rise, s_te_fall, s_te_period, s_te_blank;
+%s
+int main(void)
+{
+    char cmd[8];
+    long long now, fall, p, scan, y1, y2, est;
+    while (scanf("%%7s %%lld %%lld %%lld %%lld %%lld %%lld %%lld", cmd, &now, &fall, &p, &scan, &y1, &y2, &est) == 8) {
+        te_stats_t st = { "UI band", 0, 0, 0, 0 };
+        g_now = now;
+        s_te_fall = fall;
+        s_te_period = p;
+        s_te_blank = p - scan;
+        HOLD_ONE;
+        printf("%%lld %%u\n", (long long)(g_now - now), (unsigned)st.held);
+    }
+    return 0;
+}
+'''
+
+# connected apps Task 7's names in muse_lcd_bands.c (7e59ee0..b9d8070): its types, state, functions and constants, and the IDF and
+# LVGL calls it added. A build without the apps has none of them.
+TASK7_NAMES = ["write_t", "hold_t", "pace_t", "PACE_VAR_MIN", "s_pace", "FRAME_HOLD_MAX", "TE_SPREAD", "TE_JITTER_US", "PAIR_WAIT_MS",
+               "s_pairing", "s_parts", "s_flushed", "s_drawn", "s_drawn_area", "s_drawn_sem", "s_follows", "s_follow_y1", "s_follow_y2",
+               "s_gap_us", "s_wake_timer", "s_wake", "FRAME_WRITES_MAX", "s_frame", "FRAME_BATCH", "s_batch", "s_render_t0",
+               "s_render_waited", "s_wait_t0", "refresh_parts", "band_pairs", "on_render_event", "floor_div", "frame_meets",
+               "frame_clear_in", "wake_send", "sleep_until", "pace_learn", "pace_est", "band_gone", "wait_drawn", "frame_done",
+               "muse_lcd_bands_set_pairing", "esp_timer_create", "esp_timer_start_once", "esp_timer_stop", "lv_display_add_event_cb",
+               "lv_display_flush_is_last", "LV_EVENT_RENDER_START", "LV_EVENT_FLUSH_WAIT_START", "LV_EVENT_FLUSH_WAIT_FINISH",
+               "uxTaskGetStackHighWaterMark", "xTaskGetTickCount"]
+
+# sha256 of esp32/components/muse/boards/muse_lcd_bands.c at 7e59ee0, the connected apps' base: what a build without the apps
+# compiles. On a mismatch, diff variant(SOURCE, apps=False) with `git show 7e59ee0:esp32/components/muse/boards/muse_lcd_bands.c`.
+PLAIN_SHA256 = "058c9a2e4f76a56f2d15096a29cbc04dda748abf2bd17d161c03c4636768a530"
+
+
+class PlainBuildTest(unittest.TestCase):
+    """The final review's I8 (the user's decision, "Only with apps"): Task 7's display changes are built only with the apps. Without
+    CONFIG_MUSE_APPS, muse_lcd_bands.c is 7e59ee0's, byte for byte: the per-band hold that sleeps in ticks, no esp_timer, no pairing
+    and no display callbacks of its own, and a 2560 B send stack. With it the code is Task 7's, its hold's timer no longer needed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        Harness.build(cls.tmp.name)
+        cls.source = SOURCE.read_text()
+        cls.plain, cls.apps = variant(cls.source, False), variant(cls.source, True)
+        cls.holds = {}
+
+    def hold(self, build, queries):
+        """Each query's answer from the hold of the build ("plain" or "apps"), compiled from its variant the first time."""
+        if build not in self.holds:
+            text = self.apps if build == "apps" else self.plain
+            parts = [typedef(text, "te_stats_t")]
+            if build == "apps":
+                parts += [typedef(text, "write_t")]
+                parts += [re.search(rf"^#define {macro} .*$", text, re.M).group(0) for macro in ("FRAME_HOLD_MAX", "TE_JITTER_US")]
+                parts += [function(text, f) for f in ("te_meets", "floor_div", "frame_meets", "frame_clear_in", "te_now", "sleep_until",
+                                                      "te_hold")]
+                one = "const write_t w = { (int)y1, (int)y2, 0, est }; te_hold(&st, &w, 1, 0, 50)"
+            else:
+                parts += [function(text, f) for f in ("te_meets", "te_now", "te_hold")]
+                one = "te_hold(&st, (int)y1, (int)y2, est, 50)"
+            src = Path(self.tmp.name) / f"hold_{build}.c"
+            src.write_text(HOLD.replace("HOLD_ONE", one) % "\n".join(parts))
+            exe = Path(self.tmp.name) / f"hold_{build}"
+            subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", "-Wno-unused-function", "-Wno-unused-variable", "-o", str(exe),
+                            str(src)], check=True)
+            self.holds[build] = exe
+        out = subprocess.run([str(self.holds[build])], input="\n".join(queries) + "\n", check=True, capture_output=True,
+                             text=True).stdout
+        return [tuple(int(v) for v in line.split()) for line in out.splitlines()]
+
+    def test_the_plain_build_is_7e59ee0s(self):
+        self.assertEqual(hashlib.sha256(self.plain.encode()).hexdigest(), PLAIN_SHA256,
+                         "muse_lcd_bands.c without the apps isn't 7e59ee0's")
+        # What that means, said plainly: 7e59ee0's queue item, its hold, its stack, and nothing of Task 7's.
+        code = strip_c(self.plain)
+        self.assertRegex(code, r"typedef struct \{\s*const uint8_t \*data;\s*int x1, y1, x2, y2;\s*\} band_t;")
+        self.assertRegex(code, r"static void te_hold\(te_stats_t \*st, int y1, int y2, int64_t w, int spread\)")
+        self.assertRegex(code, r'xTaskCreatePinnedToCore\(send_bands, "", 2560,')
+        self.assertRegex(code, r"vTaskDelay\(pdMS_TO_TICKS\(\(d \+ 999\) / 1000\)\);")
+
+    def test_every_task7_name_is_inside_the_apps_guard(self):
+        plain, apps = strip_c(self.plain), strip_c(self.apps)
+        for name in TASK7_NAMES:
+            with self.subTest(name):
+                self.assertRegex(apps, rf"\b{name}\b", "the apps build lost it")
+                self.assertNotRegex(plain, rf"\b{name}\b", "outside the CONFIG_MUSE_APPS guard")
+        self.assertIn('xTaskCreatePinnedToCore(send_bands, "", 3072,', apps)
+        self.assertNotIn("lv_display_private.h", self.plain)
+        # The switch, the board's op and the 1.75C's setting of it are apps-only too (AGENTS.md: .frame_pairing is the apps').
+        for path, names in ((HEADER, ["muse_lcd_bands_set_pairing"]), (BOARD_H, ["frame_pairing"]),
+                            (BOARD_175C, ["frame_pairing", "muse_lcd_bands_set_pairing"])):
+            text = path.read_text()
+            for name in names:
+                with self.subTest(path.name, name=name):
+                    self.assertRegex(strip_c(variant(text, True)), rf"\b{name}\b")
+                    self.assertNotRegex(strip_c(variant(text, False)), rf"\b{name}\b")
+        self.assertIn('#include "sdkconfig.h"', HEADER.read_text(), "the header's guard reads the option")
+
+    def test_the_holds_compiled_both_ways(self):
+        # The board's torn single band (test_the_old_hold_started_its_check_too_early): rows 178-288, 1.93 ms expected, sent 6.27 ms
+        # into the refresh. 7e59ee0's hold checks a start 300 us early, finds it clear and sends at once: the plain build keeps
+        # that. Task 7's waits for a moment every start it can have is clear at.
+        query = f"hold 6267 0 {P2} {SCAN2} 178 288 1927"
+        self.assertEqual(self.hold("plain", [query]), [(0, 0)])
+        (waited, held), = self.hold("apps", [query])
+        self.assertEqual(held, 1)
+        delay = Harness.ask([clear_query([(178, 288, 1927)], 6267, 0, 0, P2, SCAN2)])[0]
+        self.assertGreater(delay, 0)
+        self.assertGreaterEqual(waited, delay)
+
+    def test_the_apps_hold_needs_no_timer(self):
+        # M32: without its esp_timer the apps build still registers (its absence isn't a failure) and each hold sleeps in ticks,
+        # from its delay to 2 ms past it, as sleep_until's fallback rounds it up.
+        register = strip_c(function_text(self.apps, "lv_display_t *muse_lcd_bands_register("))
+        refusal = re.search(r"if \(([^{]*?)xTaskCreatePinnedToCore\(send_bands", register, re.S).group(1)
+        self.assertIn("!s_drawn_sem", refusal)
+        self.assertNotIn("s_wake_timer", refusal)
+        self.assertRegex(function(self.apps, "sleep_until"), r"if \(!s_wake_timer \|\| esp_timer_start_once\(")
+        nows = list(range(100000, 100000 + P2, 500))
+        bands = [(178, 288, 1927), (90, 374, 6000)]
+        queries = [f"hold {now} 100000 {P2} {SCAN2} {y1} {y2} {est}" for now in nows for y1, y2, est in bands]
+        delays = Harness.ask([clear_query([band], now, 0, 100000, P2, SCAN2) for now in nows for band in bands])
+        for query, (waited, held), delay in zip(queries, self.hold("apps", queries), delays):
+            with self.subTest(query):
+                if delay <= 0:
+                    self.assertEqual((waited, held), (0, 0))
+                else:
+                    self.assertEqual(held, 1)
+                    self.assertGreaterEqual(waited, delay)
+                    self.assertLess(waited, delay + 2000)
+
+
+def function_text(source, head):
+    """The function of source that starts with the line head, through its closing brace."""
+    start = source.index("\n" + head) + 1
+    brace = source.index("\n{", start) + 1
+    depth, end = 1, brace + 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[start:end]
 
 
 if __name__ == "__main__":

@@ -16,7 +16,6 @@
 
 #include "muse_lcd_bands.h"
 
-#include <stdio.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -31,16 +30,22 @@
 #include "freertos/task.h"
 
 #include "muse_mem.h"
+#if CONFIG_MUSE_APPS
+#include <stdio.h>
 #include "src/display/lv_display_private.h"   /* a refresh's areas and the band being drawn, for the pair (on_render_event) */
+#endif
 
 typedef struct {
     const uint8_t *data;   /* NULL: run s_call instead */
     int x1, y1, x2, y2;
+#if CONFIG_MUSE_APPS
     bool last;             /* the refresh's last band (lv_display_flush_is_last) */
     bool pair;             /* the first of a refresh of two: held until LVGL has drawn the second, then sent with it */
     uint32_t drawn;        /* s_drawn as LVGL flushed it */
     int32_t render_us;     /* the last band's: LVGL's drawing of the refresh, its waits for the wire left out (bench) */
+#endif
 } band_t;
+#if CONFIG_MUSE_APPS
 
 /* A write of the panel's rows [y1, y2), started at t0 and taking w (us). */
 typedef struct {
@@ -54,6 +59,7 @@ typedef struct {
     int how;
     int64_t est;
 } hold_t;
+#endif
 #endif
 
 static const char *TAG = "lcd_bands";
@@ -86,6 +92,7 @@ typedef struct {
 } te_stats_t;
 static te_stats_t s_te_ui = { .what = "UI band" }, s_te_video = { .what = "video frame" };
 static int s_rows;                       /* the panel's */
+#if CONFIG_MUSE_APPS
 /* A band's write, learned from the ones before (pace_learn): about fixed_us +
  * bytes * ns_per_kb / 1024000, a smoothed least-squares line over the size. */
 typedef struct {
@@ -94,10 +101,17 @@ typedef struct {
 } pace_t;
 #define PACE_VAR_MIN 100.0f   /* KB^2: the sizes' spread, about 10 KB, a slope is learned from */
 static pace_t s_pace;
+#else
+/* A band's write, learned from the ones before: about s_fixed_us + bytes *
+ * s_ns_per_kb / 1024000 (a smoothed least-squares line over the size). */
+static float s_mean_kb, s_mean_us, s_var_kb, s_cov;
+static int64_t s_fixed_us, s_ns_per_kb;
+#endif
 static volatile int64_t s_band_end;      /* when the last band's last piece went */
 static int64_t s_band_start, s_band_fall, s_band_p, s_band_scan;
 static int s_band_y1, s_band_y2;
 static size_t s_band_bytes;
+#if CONFIG_MUSE_APPS
 
 /*
  * A refresh's bands go out as LVGL draws them, and a scan that comes between two of them shows one refresh's top
@@ -144,6 +158,7 @@ static struct {
     uint32_t n, torn, bands, paired;
     int64_t render, render_max, held, held_max, wire, wire_max, span, span_max;
 } s_batch;
+#endif
 #endif
 
 /* A piece has gone, or failed to; true if it was the band's last. */
@@ -197,6 +212,7 @@ static void wire_idle(int held)
         xSemaphoreGive(s_chunk_free);
     }
 }
+#if CONFIG_MUSE_APPS
 
 /*
  * How many bands LVGL 9.5.0 draws a refresh in (lv_refr.c: refr_invalid_areas and get_max_row): each of its areas
@@ -232,12 +248,17 @@ static bool band_pairs(bool pairing, int flushed, int parts, bool last)
 {
     return pairing && flushed == 0 && parts == 2 && !last;   /* two: LVGL draws the second in its other buffer */
 }
+#endif
 
 static esp_err_t queue_band(lv_display_t *disp, esp_lcd_panel_handle_t panel, int x1, int y1, int x2, int y2,
                             const void *data, void *ctx)
 {
+#if !CONFIG_MUSE_APPS
+    (void)disp;
+#endif
     (void)panel;
     (void)ctx;
+#if CONFIG_MUSE_APPS
     band_t b = { data, x1, y1, x2, y2, lv_display_flush_is_last(disp), false, s_drawn, 0 };
     b.pair = band_pairs(s_pairing, s_flushed++, s_parts, b.last);
 #if CONFIG_MUSE_BENCH
@@ -245,8 +266,12 @@ static esp_err_t queue_band(lv_display_t *disp, esp_lcd_panel_handle_t panel, in
         b.render_us = (int32_t)(esp_timer_get_time() - s_render_t0 - s_render_waited);
     }
 #endif
+#else
+    band_t b = { data, x1, y1, x2, y2 };
+#endif
     return xQueueSend(s_bands, &b, 0) == pdTRUE ? ESP_OK : ESP_FAIL;
 }
+#if CONFIG_MUSE_APPS
 
 /*
  * On the LVGL task. LV_EVENT_RENDER_START: the refresh's areas are settled, so how many bands it takes. And
@@ -291,6 +316,7 @@ static void on_render_event(lv_event_t *e)
         break;
     }
 }
+#endif
 
 /*
  * The panel reads its memory top to bottom once a refresh, starting as TE
@@ -314,6 +340,7 @@ static bool te_meets(int64_t t0, int64_t w, int y1, int y2, int64_t fall, int64_
     }
     return false;
 }
+#if CONFIG_MUSE_APPS
 
 /* floor(a / b) for b > 0. */
 static int64_t floor_div(int64_t a, int64_t b)
@@ -387,6 +414,7 @@ static int64_t frame_clear_in(const write_t *w, int n, int64_t gap, int spread, 
     }
     return -1;
 }
+#endif
 
 /* The scan timing, read whole (the interrupt writes each value as two words). */
 static bool te_now(int64_t *fall, int64_t *p, int64_t *scan)
@@ -402,6 +430,7 @@ static bool te_now(int64_t *fall, int64_t *p, int64_t *scan)
     return s_te_on && s_rows && q && esp_timer_get_time() - f < 4 * q;   /* else no TE: the panel is asleep */
 }
 
+#if CONFIG_MUSE_APPS
 static void wake_send(void *arg)
 {
     (void)arg;
@@ -417,7 +446,7 @@ static void sleep_until(int64_t t)
         return;
     }
     xSemaphoreTake(s_wake, 0);   /* a wake left from a sleep that gave up */
-    if (esp_timer_start_once(s_wake_timer, (uint64_t)us) != ESP_OK) {
+    if (!s_wake_timer || esp_timer_start_once(s_wake_timer, (uint64_t)us) != ESP_OK) {   /* no timer: in ticks */
         vTaskDelay(pdMS_TO_TICKS((us + 999) / 1000) + 1);
         return;
     }
@@ -446,6 +475,36 @@ static int te_hold(te_stats_t *st, const write_t *w, int n, int64_t gap, int spr
     sleep_until(now + d);
     return 1;
 }
+#else
+/*
+ * Before a write of rows [y1, y2) expected to take w, give or take
+ * spread percent: waits for the first moment it would stay clear of every
+ * scan (now, usually; looked for in half-millisecond steps over two
+ * refreshes). A write that meets a scan wherever it starts isn't held.
+ */
+static void te_hold(te_stats_t *st, int y1, int y2, int64_t w, int spread)
+{
+    for (int tries = 0; tries < 3; tries++) {
+        int64_t fall, p, scan, now = esp_timer_get_time();
+        if (!te_now(&fall, &p, &scan)) {
+            return;
+        }
+        /* The write starts a little after this (the first piece is copied
+         * first) and may take more or less than w: clear for all of it. */
+        int64_t lo = w * (100 - spread) / 100 + 400, hi = w * (100 + spread) / 100 + 400, d = 0;
+        while (d < 2 * p && (te_meets(now + d - 300, lo, y1, y2, fall, p, scan) ||
+                             te_meets(now + d - 300, (lo + hi) / 2, y1, y2, fall, p, scan) ||
+                             te_meets(now + d - 300, hi, y1, y2, fall, p, scan))) {
+            d += 500;
+        }
+        if (d == 0 || d >= 2 * p) {
+            return;   /* clear now, or never */
+        }
+        vTaskDelay(pdMS_TO_TICKS((d + 999) / 1000));   /* then check again */
+        st->held += tries == 0;
+    }
+}
+#endif
 
 /* After the write of rows [y1, y2) that started at t0 and took w, the scans
  * then as te_now gave them: did one meet it? */
@@ -454,13 +513,20 @@ static void te_done(te_stats_t *st, int y1, int y2, int64_t t0, int64_t w, int64
     st->sum_us += w;
     st->torn += te_meets(t0, w, y1, y2, fall, p, scan);
     if (++st->n % 1000 == 1) {
+#if CONFIG_MUSE_APPS
         ESP_LOGI(TAG, "tearing effect: refresh %d us (blank %d us); %s %d us avg (%d us + %d us/KB), %u of %u held "
                  "for the scan, %u met it; %u of %u refreshes torn", (int)p, (int)(p - scan), st->what,
                  (int)(st->sum_us / st->n), (int)s_pace.fixed_us, (int)(s_pace.ns_per_kb / 1000), (unsigned)st->held,
                  (unsigned)st->n, (unsigned)st->torn, (unsigned)s_frame.torn, (unsigned)s_frame.frames);
+#else
+        ESP_LOGI(TAG, "tearing effect: refresh %d us (blank %d us); %s %d us avg (%d us + %d us/KB), %u of %u held "
+                 "for the scan, %u met it", (int)p, (int)(p - scan), st->what, (int)(st->sum_us / st->n),
+                 (int)s_fixed_us, (int)(s_ns_per_kb / 1000), (unsigned)st->held, (unsigned)st->n, (unsigned)st->torn);
+#endif
     }
 }
 
+#if CONFIG_MUSE_APPS
 /* A band of `bytes` took w (us): the line learned from it. */
 static void pace_learn(pace_t *pc, size_t bytes, int64_t w)
 {
@@ -663,6 +729,48 @@ static void frame_done(const band_t *b)
     s_frame.p = 0;
     s_frame.held_us = 0;
 }
+#else
+/*
+ * Each band LVGL sends has been drawn whole, so its write takes its size at
+ * the wire's pace, learned from the bands before (the interrupt notes when
+ * each band's last piece went): hold it until it stays clear of the scan.
+ * Bands of one refresh go out one at a time as LVGL draws them, so a band
+ * boundary can still show for a refresh: each band is whole, though.
+ */
+static void te_band(int y1, int y2, size_t bytes)
+{
+    if (s_band_bytes) {
+        int64_t w = s_band_end - s_band_start;
+        if (w > 0) {
+            if (s_band_p) {
+                te_done(&s_te_ui, s_band_y1, s_band_y2, s_band_start, w, s_band_fall, s_band_p, s_band_scan);
+            }
+            float kb = s_band_bytes / 1024.0f, us = (float)w, a = s_mean_kb ? 1 / 16.0f : 1;
+            s_mean_kb += a * (kb - s_mean_kb);
+            s_mean_us += a * (us - s_mean_us);
+            s_var_kb += a * ((kb - s_mean_kb) * (kb - s_mean_kb) - s_var_kb);
+            s_cov += a * ((kb - s_mean_kb) * (us - s_mean_us) - s_cov);
+            float slope = s_var_kb > 0.01f ? s_cov / s_var_kb : s_mean_us / s_mean_kb;
+            slope = slope > 1 ? slope : 1;
+            float fixed = s_mean_us - slope * s_mean_kb;
+            s_fixed_us = fixed > 0 ? (int64_t)fixed : 0;
+            s_ns_per_kb = (int64_t)(slope * 1000);
+        }
+        s_band_bytes = 0;
+    }
+    if (!s_te_on) {
+        return;
+    }
+    if (s_ns_per_kb) {
+        te_hold(&s_te_ui, y1, y2, s_fixed_us + (int64_t)bytes * s_ns_per_kb / 1024 / 1000, 50);
+    }
+    s_band_p = te_now(&s_band_fall, &s_band_p, &s_band_scan) ? s_band_p : 0;
+    s_band_start = esp_timer_get_time();
+    s_band_y1 = y1;
+    s_band_y2 = y2;
+    s_band_bytes = bytes;
+}
+#endif
 
 /*
  * The panel's draw waits for the piece before to finish, so each piece is
@@ -680,13 +788,19 @@ static void send_bands(void *arg)
             wire_idle(0);
             s_call(s_call_arg);
             xSemaphoreGive(s_call_done);
+#if CONFIG_MUSE_APPS
             s_follows = false;   /* a pair's second after this isn't on time */
+#endif
             continue;
         }
         size_t row = (size_t)(b.x2 - b.x1) * 2;
+#if CONFIG_MUSE_APPS
         lv_area_t next;
         bool pair = b.pair && wait_drawn(&b, &next);
         te_band(b.y1, b.y2, row * (size_t)(b.y2 - b.y1), pair ? &next : NULL);
+#else
+        te_band(b.y1, b.y2, row * (size_t)(b.y2 - b.y1));
+#endif
         int rows = s_chunk_bytes / row & ~1;
         /* LVGL sends no more until this band is done, so nothing is still
          * counting down. */
@@ -705,9 +819,11 @@ static void send_bands(void *arg)
             }
             k ^= 1;
         }
+#if CONFIG_MUSE_APPS
         if (b.last) {
             frame_done(&b);
         }
+#endif
     }
 }
 
@@ -723,21 +839,33 @@ lv_display_t *muse_lcd_bands_register(esp_lv_adapter_display_config_t cfg, int l
     s_call_lock = xSemaphoreCreateMutex();
     s_call_done = xSemaphoreCreateBinary();
     s_chunk_free = xSemaphoreCreateCounting(2, 2);
+#if CONFIG_MUSE_APPS
     s_drawn_sem = xSemaphoreCreateBinary();
     s_wake = xSemaphoreCreateBinary();
+    /* The hold's timer. Without it each hold sleeps in ticks instead (sleep_until), up to 2 ms late. */
     const esp_timer_create_args_t wake = { .callback = wake_send, .name = "lcd_hold" };
-    if (esp_timer_create(&wake, &s_wake_timer) != ESP_OK) {
+    esp_err_t timer_err = esp_timer_create(&wake, &s_wake_timer);
+    if (timer_err != ESP_OK) {
         s_wake_timer = NULL;
+        ESP_LOGW(TAG, "the hold's timer: %s; holds sleep in ticks", esp_err_to_name(timer_err));
     }
+#endif
     /* 16-byte aligned: video fills them with the S3's SIMD stores (muse_lcd_bands_frame). */
     s_chunk[0] = heap_caps_aligned_alloc(16, chunk_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     s_chunk[1] = heap_caps_aligned_alloc(16, chunk_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+#if CONFIG_MUSE_APPS
     /* The send task's stack: 2560 B left 180 B free on the board with the bench's lines (vprintf is the deepest). */
-    if (!s_bands || !s_call_lock || !s_call_done || !s_chunk_free || !s_drawn_sem || !s_wake || !s_wake_timer ||
+    if (!s_bands || !s_call_lock || !s_call_done || !s_chunk_free || !s_drawn_sem || !s_wake ||
         !s_chunk[0] || !s_chunk[1] ||
         xTaskCreatePinnedToCore(send_bands, "lcd_send", 3072, NULL, MUSE_UI_PRIORITY + 1, NULL, MUSE_UI_CORE) != pdPASS) {
         return NULL;
     }
+#else
+    if (!s_bands || !s_call_lock || !s_call_done || !s_chunk_free || !s_chunk[0] || !s_chunk[1] ||
+        xTaskCreatePinnedToCore(send_bands, "lcd_send", 2560, NULL, MUSE_UI_PRIORITY + 1, NULL, MUSE_UI_CORE) != pdPASS) {
+        return NULL;
+    }
+#endif
     const esp_lcd_panel_io_callbacks_t io_cbs = { .on_color_trans_done = on_chunk_sent };
     esp_lcd_panel_io_register_event_callbacks(cfg.panel_io, &io_cbs, NULL);
     esp_lv_adapter_set_default_display_idf_callback_registration_enabled(false);
@@ -753,10 +881,12 @@ lv_display_t *muse_lcd_bands_register(esp_lv_adapter_display_config_t cfg, int l
     lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
     const esp_lv_adapter_draw_bitmap_callbacks_t draw_cbs = { .custom_draw_bitmap = queue_band };
     esp_lv_adapter_set_draw_bitmap_callbacks(s_disp, &draw_cbs, NULL);
+#if CONFIG_MUSE_APPS
     lv_display_add_event_cb(s_disp, on_render_event, LV_EVENT_RENDER_START, NULL);
     lv_display_add_event_cb(s_disp, on_render_event, LV_EVENT_FLUSH_WAIT_START, NULL);
 #if CONFIG_MUSE_BENCH
     lv_display_add_event_cb(s_disp, on_render_event, LV_EVENT_FLUSH_WAIT_FINISH, NULL);
+#endif
 #endif
     return s_disp;
 }
@@ -815,8 +945,12 @@ static void send_frame(void *arg)
      * 1.75C): it stays clear started within a few ms of a scan's start. */
     static int64_t avg;
     if (s_te_on && avg) {
+#if CONFIG_MUSE_APPS
         const write_t frame = { j->y1, j->y2, 0, avg };
         te_hold(&s_te_video, &frame, 1, 0, 3);   /* steady: the same size each time */
+#else
+        te_hold(&s_te_video, j->y1, j->y2, avg, 3);   /* steady: the same size each time */
+#endif
     }
     int64_t fall = 0, p = 0, scan = 0;
     bool timed = te_now(&fall, &p, &scan);
@@ -891,11 +1025,13 @@ void muse_lcd_bands_set_te(int gpio)
     }
     s_te_on = true;
 }
+#if CONFIG_MUSE_APPS
 
 void muse_lcd_bands_set_pairing(bool on)
 {
     s_pairing = on;
 }
+#endif
 
 void muse_lcd_bands_frame(int x1, int y1, int x2, int y2, int rows, muse_lcd_fill_fn fill, void *arg)
 {

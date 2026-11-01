@@ -932,6 +932,14 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   - A typed turn works while an app watches. A voice press records and
     sends, hides the app, and brings it back in front when the turn ends;
     only silent presses were tried, so the reply side is untested.
+- **The tearing fix is apps-only.** Connected apps Task 7's changes to
+  `boards/muse_lcd_bands.c` (the hold that times each band clear of the
+  panel's scan to the microsecond, the pairing of a refresh's two bands, the
+  torn-refresh counts and the bench's `tearing effect:` lines) are built only
+  with `CONFIG_MUSE_APPS`, and so is `muse_board_t`'s `.frame_pairing`, which
+  only the 1.75C sets. A build without the apps sends exactly as before the
+  connected apps (7e59ee0): `tests/test_lcd_tearing_effect.py` checks that
+  its `muse_lcd_bands.c` is that commit's, byte for byte.
 - **Test** with `tests/test_muse_apps_*.py` (the VM and the sandbox, JSON,
   packages, widgets and the apply step, the services, the runtime and its duty
   cycle, the app task, the store, the install, the console and `app.py`, the

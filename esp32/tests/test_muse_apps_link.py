@@ -1047,8 +1047,9 @@ class GuideAndSkill(unittest.TestCase):
             r"A command's calls and its read are always served, and logged too, so only commands take the hook past its budget",
             rf"the tally's log keeps at most {n['LOG_KEEP']} times",
             r"Send `vm\.command` from the user's actions, never from a timer",
-            r"through `connector_call`, which logs the call in the budget, acks a failure as `\{\"ok\":false,\.\.\.\}` without "
-            r"ending the run, and on exit 3 acks `not authorized` and ends the run",
+            r"calls the connector in `run_command` as `connector_call <cli> <args\.\.\.> \|\| return 0`, never bare, since a bare "
+            r"call that fails ends the run under `set -e`\. `connector_call` logs the call in the budget, acks a failure as "
+            r"`\{\"ok\":false,\.\.\.\}`, and on exit 3 acks `not authorized` and ends the run",
             r"The hook saves a command's seq before it runs, so a command runs at most once",
             r"`fetch_state` is the one function that reads the data source",
             # Connectors in hooks, their results, the output.

@@ -692,6 +692,28 @@ class TallyHook(HookTestCase):
         self.run_hook()
         self.assertEqual(self.lines(cli_calls), ["call"], "at most once")
         self.assertFalse((self.app / "outbox/cmd-1.json").exists())
+        # connector_call called bare (no "|| return 0") is a misuse: when the call fails, set -e ends the run. The call is
+        # still in the log, so the budget counts it.
+        cli_calls.write_text("")
+        self.set_clock(T0 + 10)
+        self.hook_state({"calls": [], "next_poll": T0 + 100, "last_seq": 0})
+        self.install(stub_function(HOOK.read_text(), "run_command", f"connector_call {cli} 1 ''\nRESULT=\'{{}}\'"))
+        self.command(1, "skip", None)
+        self.last_tick()
+        self.run_hook(fails=True)
+        self.assertEqual(self.lines(cli_calls), ["call"])
+        self.assertEqual((self.hook_state()["calls"], self.hook_state()["last_seq"]), ([T0 + 10], 1))
+
+    def test_a_bare_name_is_a_file(self):
+        # write_file makes a missing folder, and only a folder: a bare name (no "/"), such as now.json at the app's root, is
+        # written as a file there.
+        self.install(stub_function(HOOK.read_text(), "run_command", "write_file now.json '{\"t\":1}'\nRESULT=\'{\"ok\":true}\'"))
+        self.command(1, "mark", None)
+        self.last_tick()
+        self.run_hook()
+        self.assertTrue((self.app / "now.json").is_file())
+        self.assertEqual(json.loads(self.read("now.json")), {"t": 1})
+        self.assertEqual(self.acks()["acks"], [{"seq": 1, "result": {"ok": True}}])
 
     def test_exit_3_is_not_authorized_and_silent(self):
         # Exit 3 means not authorized: from fetch_state, the run logs it and ends silent at once (no more reads, though the app
@@ -748,7 +770,6 @@ class TallyHook(HookTestCase):
         self.last_tick()
         run = self.run_hook()
         self.assertEqual([entry["message"] for entry in run.logs], ["the data source failed"])
-
 
     def test_commands_are_always_served_and_logged(self):
         # Commands are always served first, each with one read of the data source after it, and their reads are logged too:

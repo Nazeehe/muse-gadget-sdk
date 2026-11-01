@@ -50,9 +50,9 @@ dry_run() {
     [[ "${HATCH_HOOK_DRY_RUN:-0}" == "1" ]]
 }
 
-# ---- The data source: the one function to replace -------------------------------------------------------------------
+# ---- The data source: fetch_state is the one read to replace, run_command the commands; connector_call is plumbing ----
 # fetch_state prints the app's state as one JSON object on stdout, or returns non-zero when it can't read it (3: not
-# authorized). It is the only function that calls the data source. For a connector app, call the connector's CLI here
+# authorized). It is the only function that reads the data source. For a connector app, call the connector's CLI here
 # by its full path, with its stderr to /dev/null: keep its exit status (3 means not authorized), check .ok in what it
 # prints (a connector-side error exits 0 with {"ok":false,...}: return 2), and print only what the app needs. Tally has
 # no connector: its source is its own state file.
@@ -67,9 +67,10 @@ fetch_state() {
 # run_command NAME ARGS carries out one of the app's commands and sets RESULT, the ack's result: {"ok":true,...}, or
 # {"ok":false,"error":"..."} for one it can't carry out. It must never end the run (set -e): the command's seq is saved
 # before it runs, so a run that dies here never repeats it, but the app hears nothing. A connector app makes each call to
-# the connector's CLI through connector_call, by its full path:
+# the connector's CLI through connector_call, by its full path, always with "|| return 0":
 #     connector_call /full/path/to/cli <args...> || return 0     # its RESULT is set, and on exit 3 the run ends
 #     RESULT='{"ok":true}'                                         # or what OUT, the CLI's output, says
+# What a connector returns stays out of files its rules forbid (the guide's Rules: "Connector rules are binding").
 # Tally's commands change its own state file.
 run_command() {
     local name=$1 args=$2 current='{"count":0}' count n
@@ -98,12 +99,15 @@ run_command() {
     RESULT="{\"ok\":true,\"count\":$count}"
 }
 
-# connector_call CLI ARGS...: one call to a connector's CLI for a command (run_command's), logged in the budget first, its
-# stderr to /dev/null, and never ending the run. Sets OUT to what it printed and returns 0 when it says {"ok":true,...};
-# else sets RESULT to the ack's {"ok":false,...} and returns 1, and on exit 3 (not authorized) also sets STOP.
+# connector_call CLI ARGS...: one call to a connector's CLI for a command (run_command's), logged and saved in the budget
+# first, its stderr to /dev/null. Sets OUT to what it printed and returns 0 when it says {"ok":true,...}; else sets RESULT
+# to the ack's {"ok":false,...} and returns 1, and on exit 3 (not authorized) also sets STOP. Call it as
+# "connector_call CLI ARGS... || return 0", never bare: under set -e a bare call that fails ends the run (the call stays
+# counted, but the command is never acked).
 connector_call() {
     local rc=0
     note_call "$now"   # the now of serve_commands
+    save_state
     OUT=$("$@" 2>/dev/null) || rc=$?
     if ((rc == 3)); then
         log "a connector says not authorized: re-approve with hooks.run" '{"exit":3}'
@@ -121,7 +125,7 @@ connector_call() {
 # ---- Files: every write goes through these, and a dry run writes nothing --------------------------------------------
 write_file() {   # PATH TEXT: replaced whole (a reader sees the old file or the new one), its folder made when missing
     if dry_run; then return 0; fi
-    [[ -d "${1%/*}" ]] || mkdir -p "${1%/*}"
+    [[ "$1" != */* || -d "${1%/*}" ]] || mkdir -p "${1%/*}"
     printf '%s\n' "$2" > "$1.tmp"
     mv "$1.tmp" "$1"
 }

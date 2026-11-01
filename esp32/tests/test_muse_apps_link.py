@@ -1010,9 +1010,10 @@ class GuideAndSkill(unittest.TestCase):
             self.assertIsNotNone(match, f"hook.sh has no {name}")
             return int(match.group(1))
 
-        n = {name: hook_number(name) for name in ("HEARTBEAT_MAX_AGE_S", "TICK_S", "LOOP_S", "TOKENS_MAX", "TOKEN_EVERY_S",
-                                                  "FAST_S", "SLOW_S", "EASE_AT", "LOW_AT", "TOKENS_FLOOR", "ACKS_KEEP")}
-        self.assertEqual(n["TOKENS_MAX"] * n["TOKEN_EVERY_S"], 3600, "one hour's worth of tokens")
+        n = {name: hook_number(name) for name in ("HEARTBEAT_MAX_AGE_S", "TICK_S", "LOOP_S", "CALLS_MAX", "WINDOW_S", "FAST_S",
+                                                  "SLOW_S", "EASE_AT", "LOW_AT", "LOG_KEEP", "ACKS_KEEP")}
+        self.assertEqual(n["WINDOW_S"], 3600, "a rolling hour")
+        self.assertLessEqual(n["LOG_KEEP"] * len("1800000000,"), 16 * 1024 - 1024, "the log fits hook_state's 16 KB")
         heartbeat_s = header_number("apps_vmio.h", "APPS_VM_HEARTBEAT_MS") // 1000
         ack_poll_s = header_number("apps_vmio.h", "APPS_VM_ACK_POLL_MS") // 1000
         self.assertGreater(n["HEARTBEAT_MAX_AGE_S"], heartbeat_s, "the gate outlasts the gadget's period")
@@ -1038,11 +1039,14 @@ class GuideAndSkill(unittest.TestCase):
             rf"more than {n['HEARTBEAT_MAX_AGE_S']} s, and it ends at once, `silent`, having written nothing",
             rf"checks `outbox/` every {n['TICK_S']} s, for at most {n['LOOP_S']} s, then ends",
             r"Set `script_timeout_secs` to 60", r"serves the waiting commands first, in seq order, with one read of the data source after each",
-            rf"{n['TOKENS_MAX']} tokens at most, one back every {n['TOKEN_EVERY_S']} s \({n['TOKENS_MAX']} an hour\), one taken by each call",
-            rf"With {n['EASE_AT']} tokens or more it reads every {n['FAST_S']} s; from {n['EASE_AT']} down to {n['LOW_AT']} the gap grows "
-            rf"evenly to {n['SLOW_S']} s; below {n['LOW_AT']} it is {n['SLOW_S']} s or the time to the next token, if that is longer; "
-            r"with none left it reads nothing until one is back",
-            rf"down to {n['TOKENS_FLOOR']} tokens", r"under the 120 calls an hour",
+            rf"The hook makes at most {n['CALLS_MAX']} connector calls in any rolling hour: it keeps the times of its calls of the last "
+            r"hour in its `hook_state`, and its reads use only what is left",
+            rf"After each read the next one waits {n['FAST_S']} s while {n['EASE_AT']} or more calls remain in the hour; from "
+            rf"{n['EASE_AT']} down to {n['LOW_AT']} remaining the wait grows evenly to {n['SLOW_S']} s; below {n['LOW_AT']} it is the "
+            rf"longer of {n['SLOW_S']} s and the time until the oldest call leaves the hour; with none left, until the oldest call leaves",
+            r"A command's calls and its read are always served, and logged too, so only commands take the hook past "
+            rf"{n['CALLS_MAX']} in an hour", rf"the tally's log keeps at most {n['LOG_KEEP']} times",
+            r"logs each call in the budget with `note_call`",
             r"`fetch_state` is the one function that reads the data source",
             # Connectors in hooks, their results, the output.
             r"Connector CLIs work inside hooks", r"exits 0, with `\{\"ok\":false,\.\.\.\}`: check `\.ok`",
@@ -1073,7 +1077,8 @@ class GuideAndSkill(unittest.TestCase):
         self.assertEqual(found, sorted(found), "hooks.add, the dry run, the update, enable, install, snapshot")
         # Each of the pattern's numbers is stated once in the guide.
         for phrase in (f"written {n['HEARTBEAT_MAX_AGE_S']} s ago or less", f"for at most {n['LOOP_S']} s",
-                       f"one back every {n['TOKEN_EVERY_S']} s", f"evenly to {n['SLOW_S']} s", f"down to {n['TOKENS_FLOOR']} tokens"):
+                       f"at most {n['CALLS_MAX']} connector calls in any rolling hour", f"waits {n['FAST_S']} s while",
+                       f"evenly to {n['SLOW_S']} s", f"at most {n['LOG_KEEP']} times"):
             with self.subTest(phrase):
                 self.assertEqual(" ".join(guide.split()).count(phrase), 1)
         # The hook's numbers are the ones its loop and budget use.

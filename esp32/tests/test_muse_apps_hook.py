@@ -48,55 +48,57 @@ HOOK = TALLY / "hook.sh"
 
 T0 = 1_800_000_000  # the fake clock's start, epoch seconds
 
-# The budget and the loop (ruling P21, the guide's Connected apps): a model the hook's timing is checked against.
-TOKENS_MAX = 100       # the bucket holds at most this many calls
-TOKEN_EVERY_S = 36     # and gets one back this often: 100 an hour
-FAST_S = 5             # the gap between reads with EASE_AT tokens or more
+# The budget and the loop (ruling P21a, the guide's Connected apps): a model the hook's timing is checked against.
+CALLS_MAX = 100        # calls to the data source in any rolling WINDOW_S
+WINDOW_S = 3600
+FAST_S = 5             # the wait after a read while EASE_AT or more calls remain
 SLOW_S = 30            # growing evenly to this at LOW_AT
 EASE_AT = 50
 LOW_AT = 10
-FLOOR = -20            # commands may take the bucket this low
+LOG_KEEP = 1000        # the log keeps at most this many times
 LOOP_S = 50            # a run checks outbox/ for this long at most
 TICK_S = 1             # this often
 HEARTBEAT_MAX_AGE_S = 15
 
 
-def refill(tokens, at, now):
-    """The bucket at now: one token back for every TOKEN_EVERY_S since at, up to TOKENS_MAX (a full bucket's at is now)."""
-    at = min(at, now)
-    if tokens >= TOKENS_MAX:
-        return TOKENS_MAX, now
-    gained = (now - at) // TOKEN_EVERY_S
-    if gained <= 0:
-        return tokens, at
-    tokens += gained
-    if tokens >= TOKENS_MAX:
-        return TOKENS_MAX, now
-    return tokens, at + gained * TOKEN_EVERY_S
+def window(calls, now):
+    """The log at now: the calls of the last WINDOW_S, oldest first."""
+    return sorted(t for t in calls if t > now - WINDOW_S)
 
 
-def gap(tokens, now, at):
-    """The least time between two reads of the data source with this many tokens (P21)."""
-    if tokens >= EASE_AT:
-        return FAST_S
-    if tokens >= LOW_AT:
-        return FAST_S + (EASE_AT - tokens) * (SLOW_S - FAST_S) // (EASE_AT - LOW_AT)
-    return max(SLOW_S, at + TOKEN_EVERY_S - now)
+def schedule(calls, now):
+    """When the next read may go after one at now, with calls (that read included) in the window (P21a): FAST_S while EASE_AT or
+    more calls remain, growing evenly to SLOW_S at LOW_AT; below that the longer of SLOW_S and the time until the oldest call
+    leaves; with none left, when the log is back under CALLS_MAX."""
+    remaining = CALLS_MAX - len(calls)
+    if remaining >= EASE_AT:
+        return now + FAST_S
+    if remaining >= LOW_AT:
+        return now + FAST_S + (EASE_AT - remaining) * (SLOW_S - FAST_S) // (EASE_AT - LOW_AT)
+    if remaining > 0:
+        return now + max(SLOW_S, calls[0] + WINDOW_S - now)
+    return calls[len(calls) - CALLS_MAX] + WINDOW_S
 
 
-def model_reads(start, tokens, at, last_poll, ticks=LOOP_S // TICK_S):
-    """The times one run reads the data source, from start with that bucket, with no commands, for that many ticks (all of
-    LOOP_S while the heartbeat stays fresh; HEARTBEAT_MAX_AGE_S + 1 when it was fresh at the start and ages): each tick, the
-    bucket is refilled, and a read goes when a token is left and its gap has passed. Returns the times and the bucket after
-    the run (tokens, at, last_poll)."""
+def model_reads(start, calls, next_poll, ticks=LOOP_S // TICK_S):
+    """The times one run reads the data source, from start with that log, with no commands, for that many ticks (all of LOOP_S
+    while the heartbeat stays fresh; HEARTBEAT_MAX_AGE_S + 1 when it was fresh at the start and ages): each tick the log drops
+    what left the window, and a read goes when the window has room and its time has come. Returns the times, the log and
+    next_poll after the run."""
     reads = []
     for now in range(start, start + ticks * TICK_S, TICK_S):
-        tokens, at = refill(tokens, at, now)
-        if tokens > 0 and now - last_poll >= gap(tokens, now, at):
-            tokens -= 1
-            last_poll = now
+        calls = window(calls, now)
+        if len(calls) < CALLS_MAX and now >= next_poll:
+            calls.append(now)
             reads.append(now)
-    return reads, tokens, at, last_poll
+            next_poll = schedule(calls, now)
+    return reads, calls, next_poll
+
+
+def most_in_an_hour(times):
+    """The most of times in any WINDOW_S."""
+    times = sorted(times)
+    return max((sum(1 for u in times if t - WINDOW_S < u <= t) for t in times), default=0)
 
 
 def find_bash():
@@ -389,7 +391,7 @@ class TallyHook(HookTestCase):
         (self.app / "state/count.json").write_text('{"count":7}')
         (self.app / "state/rev").write_text("4\n")
         (self.app / "state/acks.json").write_text('{"acks":[{"seq":1,"result":{"ok":true,"count":7}}]}')
-        self.hook_state({"tokens": 40, "at": T0 - 10, "last_poll": T0 - 100, "last_seq": 1})
+        self.hook_state({"calls": [T0 - 100, T0 - 10], "next_poll": T0 - 5, "last_seq": 1})
         self.command(2, "add", {"n": 1})
         self.command(3, "reset", None)
         self.heartbeat(kept=True)  # the app in front
@@ -428,54 +430,110 @@ class TallyHook(HookTestCase):
                          "the read after the command at once, then the polls 5 s on")
 
     def test_budget_backs_off(self):
-        # The call budget (P21): a bucket of 100 calls that gets one back every 36 s, in the hook's state. With 50 or more
-        # tokens the hook reads every 5 s; from 50 down to 10 the gap grows evenly to 30 s; below 10 it is 30 s or the time
-        # to the next token, if longer; with none left reads wait for a token. Checked against the model above, on a copy
-        # whose fetch_state counts its calls: a run whose heartbeat ages out (16 ticks), and one the app stays in front for.
-        self.assertEqual([gap(t, 0, 0) for t in (100, 50, 30, 10)], [5, 5, 17, 30])
-        self.assertEqual(gap(9, 0, 0), 36, "below 10: the time to the next token, when longer than 30 s")
-        self.assertEqual(gap(5, 20, 0), 30)
+        # The call budget (P21a): at most 100 calls to the data source in any rolling hour, from a log of their times in the hook's
+        # state. After each read the next waits 5 s while 50 or more calls remain; from 50 down to 10 the wait grows evenly to
+        # 30 s; below 10 it is the longer of 30 s and the time until the oldest call leaves; with none left, until the oldest
+        # leaves. Checked against the model above on a copy whose fetch_state counts its calls: one tick, whose read sets the
+        # next read's time, or the 16 ticks of a heartbeat that ages out.
+        def log(n, oldest):
+            """n calls, the first at oldest, the rest after it, each 10 s apart, all inside the window at T0."""
+            return [oldest + 10 * i for i in range(n)]
+
+        self.assertEqual([schedule(log(CALLS_MAX - r, T0 - 3000), T0) - T0 for r in (100, 50, 30, 10)], [5, 5, 17, 30])
+        self.assertEqual(schedule(log(96, T0 - 3560), T0) - T0, 40, "4 left: until the oldest leaves, when longer than 30 s")
+        self.assertEqual(schedule(log(96, T0 - 3590), T0) - T0, 30)
+        self.assertEqual(schedule(log(100, T0 - 3500), T0) - T0, 100, "none left: when the oldest leaves")
+        one = 1
         short = HEARTBEAT_MAX_AGE_S + 1
-        cases = {
-            "full": ({}, short),  # a new hook: a full bucket
-            "easing": ({"tokens": 46, "at": T0, "last_poll": 0}, short),
-            "low": ({"tokens": 8, "at": T0, "last_poll": T0 - 25}, short),
-            "refilled": ({"tokens": 90, "at": T0 - 3600, "last_poll": 0}, short),  # an hour away refills it, to 100 at most
-            "empty": ({"tokens": 0, "at": T0 - 30, "last_poll": T0 - 60}, LOOP_S // TICK_S),
+        cases = {  # name: (the log before, next_poll before, ticks, the wait after the first read)
+            "empty": ([], 0, short, FAST_S),
+            "50 left": (log(49, T0 - 3000), 0, one, FAST_S),
+            "30 left": (log(69, T0 - 3000), 0, one, 17),
+            "10 left": (log(89, T0 - 3000), 0, one, SLOW_S),
+            "4 left, oldest in 40 s": (log(95, T0 - 3560), 0, one, 40),
+            "none left": (log(99, T0 - 3500), 0, one, 100),
+            "a full log": (log(100, T0 - 3594), 0, short, None),  # no read until the oldest leaves, at T0 + 6
+            "not yet": (log(10, T0 - 3000), T0 + 7, short, None),
+            "an hour old": (log(100, T0 - 3600 - 990), 0, one, FAST_S),  # every call has left: an empty window
         }
-        for name, (seed, ticks) in cases.items():
+        for name, (calls, next_poll, ticks, wait) in cases.items():
             with self.subTest(name):
                 self.set_clock(T0)
                 self.calls.write_text("")
-                if seed:
-                    self.hook_state({**seed, "last_seq": 0})
-                elif (self.state_dir / "tally.json").exists():
-                    (self.state_dir / "tally.json").unlink()
+                self.hook_state({"calls": calls, "next_poll": next_poll, "last_seq": 0})
                 self.install(stub_fetch_state(HOOK.read_text(), self.calls))
-                self.heartbeat(kept=ticks > short)
+                self.heartbeat(HEARTBEAT_MAX_AGE_S if ticks == one else 0)
                 self.run_hook()
                 self.assertEqual(self.now(), T0 + ticks * TICK_S)
-                reads, tokens, at, last_poll = model_reads(T0, seed.get("tokens", TOKENS_MAX), seed.get("at", 0),
-                                                           seed.get("last_poll", 0), ticks)
+                reads, log_after, next_after = model_reads(T0, calls, next_poll, ticks)
                 self.assertEqual([int(t) for t in self.lines(self.calls)], reads)
                 state = self.hook_state()
-                self.assertEqual((state["tokens"], state["at"], state["last_poll"]), (tokens, at, last_poll))
+                self.assertEqual((state["calls"], state["next_poll"]), (log_after, next_after))
+                if wait is not None:
+                    self.assertEqual((reads[0], next_after - reads[-1] if ticks == one else reads[1] - reads[0]), (T0, wait))
                 self.assertLessEqual(len(json.dumps(state)), 16 * 1024)
-        self.assertEqual(model_reads(T0, TOKENS_MAX, 0, 0)[0], list(range(T0, T0 + LOOP_S, FAST_S)))
-        self.assertEqual(model_reads(T0, 46, T0, 0, short)[0], [T0, T0 + 8], "8 s at 45 tokens: the gap grows as they go")
-        self.assertEqual(model_reads(T0, 8, T0, T0 - 25, short)[0], [T0 + 6], "30 s once the next token is 30 s away")
-        self.assertEqual(model_reads(T0, 0, T0 - 30, T0 - 60)[0], [T0 + 6, T0 + 42], "each read waits for its token")
+        self.assertEqual(model_reads(T0, log(100, T0 - 3594), 0, short)[0], [T0 + 6], "the read waits for the oldest to leave")
+        self.assertEqual(model_reads(T0, [], 0)[0], list(range(T0, T0 + LOOP_S, FAST_S)))
 
-    def test_commands_are_served_down_to_the_floor(self):
-        # Commands are always served first, with one read of the data source after each, and their reads may take the bucket
-        # down to -20 (headroom under the host's 120 an hour). At -20 the command is still applied (tally's need no call)
-        # but its read waits; the polls wait for tokens.
-        # tokens before -> (reads, tokens after): the command's read takes one unless at the floor.
-        for tokens, (reads, after) in {-19: (1, FLOOR), FLOOR: (0, FLOOR), 0: (1, -1)}.items():
-            with self.subTest(tokens=tokens):
+    def test_never_more_than_100_polls_in_any_hour(self):
+        # P21a's promise: the polls never make more than 100 calls in any rolling hour. The hook's own budget functions (its
+        # "The budget" section, bash alone) are driven second by second over 4 hours of a fake clock, as its loop drives them,
+        # from an empty log, a full one and a half-full one, and with commands every 90 s, whose reads are logged and served
+        # whatever the log holds. The polls of the log before count too.
+        text = HOOK.read_text()
+        budget = text[text.index("# ---- The budget"):text.index("\n# ---- ", text.index("# ---- The budget") + 1)]
+        constants = "\n".join(re.findall(r"(?m)^(?:CALLS_MAX|WINDOW_S|FAST_S|SLOW_S|EASE_AT|LOW_AT|LOG_KEEP)=\S+", text))
+        self.assertEqual(len(constants.splitlines()), 7)
+        hours = 4
+        scenarios = {
+            "empty": ([], 0),
+            "full": ([T0 - WINDOW_S + 1 + 36 * i for i in range(100)], 0),
+            "half": ([T0 - WINDOW_S + 1 + 72 * i for i in range(50)], 0),
+            "half, with commands": ([T0 - WINDOW_S + 1 + 72 * i for i in range(50)], 90),
+        }
+        for name, (seed, every) in scenarios.items():
+            with self.subTest(name):
+                driver = (f"set -euo pipefail\n{constants}\n{budget}\nCALLS=({' '.join(map(str, seed))})\nNEXT_POLL=0\n"
+                          f"for ((now = {T0}; now < {T0 + hours * 3600}; now++)); do\n"
+                          "    prune \"$now\"\n"
+                          + (f"    if (((now - {T0}) % {every} == 0)); then take_read \"$now\"; echo \"c $now\"; fi\n" if every else "")
+                          + "    if read_due \"$now\"; then take_read \"$now\"; echo \"p $now\"; fi\n"
+                          f"    if ((${{#CALLS[@]}} > {LOG_KEEP})); then echo overflow; fi\n"
+                          "done\n")
+                done = subprocess.run([BASH, "-c", driver], capture_output=True, text=True, timeout=300)
+                self.assertEqual((done.returncode, done.stderr), (0, ""))
+                events = [line.split() for line in done.stdout.splitlines()]
+                self.assertNotIn(["overflow"], events)
+                polls = [int(t) for kind, t in events if kind == "p"]
+                commands = [int(t) for kind, t in events if kind == "c"]
+                self.assertLessEqual(most_in_an_hour(seed + polls), CALLS_MAX)
+                last_hour = [t for t in polls + commands if t >= T0 + (hours - 1) * 3600]
+                self.assertGreaterEqual(len(last_hour), CALLS_MAX - LOW_AT, "the budget is used, not only kept")
+                if every:
+                    self.assertGreater(most_in_an_hour(seed + polls + commands), CALLS_MAX,
+                                       "the commands are served even when the polls have used the hour")
+                # The same polls as the model's.
+                calls, next_poll, expected = list(seed), 0, []
+                for now in range(T0, T0 + hours * 3600):
+                    calls = window(calls, now)
+                    if every and (now - T0) % every == 0:
+                        calls.append(now)
+                        next_poll = schedule(calls, now)
+                    if len(calls) < CALLS_MAX and now >= next_poll:
+                        calls.append(now)
+                        expected.append(now)
+                        next_poll = schedule(calls, now)
+                self.assertEqual(polls, expected)
+
+    def test_commands_are_always_served_and_logged(self):
+        # Commands are always served first, each with one read of the data source after it, and their reads are logged too:
+        # with the hour's 100 calls used, a command still gets its read (101 in the hour), and the polls wait.
+        for used in (0, 99, 100, 130):
+            with self.subTest(used=used):
                 self.set_clock(T0)
                 self.calls.write_text("")
-                self.hook_state({"tokens": tokens, "at": T0, "last_poll": T0, "last_seq": 0})
+                calls = [T0 - 3000 + i for i in range(used)]
+                self.hook_state({"calls": calls, "next_poll": T0, "last_seq": 0})
                 for f in (self.app / "state").iterdir():
                     f.unlink()
                 self.install(stub_fetch_state(HOOK.read_text(), self.calls))
@@ -483,8 +541,17 @@ class TallyHook(HookTestCase):
                 self.last_tick()
                 self.run_hook()
                 self.assertEqual(self.acks()["acks"], [{"seq": 1, "result": {"ok": True, "count": 1}}])
-                self.assertEqual(len(self.lines(self.calls)), reads, "and no poll: no token")
-                self.assertEqual(self.hook_state()["tokens"], after)
+                self.assertEqual(self.lines(self.calls), [str(T0)], "the command's read, and no poll after it")
+                self.assertEqual(self.hook_state()["calls"], calls + [T0])
+        # The log keeps at most 1000 times (hook_state under 16 KB); the newest stay.
+        self.set_clock(T0)
+        self.hook_state({"calls": [T0 - 3000 + i for i in range(LOG_KEEP)], "next_poll": T0, "last_seq": 1})
+        self.command(2, "reset", None)
+        self.last_tick()
+        self.run_hook()
+        state = self.hook_state()
+        self.assertEqual(state["calls"], [T0 - 3000 + i for i in range(1, LOG_KEEP)] + [T0])
+        self.assertLessEqual(len(json.dumps(state)), 16 * 1024)
 
 
 class HookText(unittest.TestCase):
@@ -519,6 +586,7 @@ class HookText(unittest.TestCase):
         self.assertGreater(len(functions), 5)
         for name, body in functions:
             self.assertNotRegex(body, r"\b(silent|wake)\b", f"{name} ends the run")
+
 
 if __name__ == "__main__":
     unittest.main()

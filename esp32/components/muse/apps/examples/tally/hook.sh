@@ -17,8 +17,9 @@
 # runs it every 5 s through the wrapper ~/hooks/scripts/tally.sh, with no model in the loop. While the app is in front
 # (its heartbeat, outbox/active.json, written 15 s ago or less) one run checks outbox/ every 1 s for at most 50 s:
 # it applies the app's commands (outbox/cmd-<seq>.json) in seq order, each once, acks them in state/acks.json, reads
-# the data source within the call budget, and publishes the app's state (state/count.json, then state/rev) when it
-# changes. To adapt it: replace fetch_state (the one call to the data source) and run_command, and set STATE_FILE.
+# the data source within the call budget (at most 100 calls in any rolling hour), and publishes the app's state
+# (state/count.json, then state/rev) when it changes. To adapt it: replace fetch_state (the one call to the data
+# source) and run_command, and set STATE_FILE.
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -36,14 +37,15 @@ TICK_S=1                      # how often a run checks outbox/
 LOOP_S=50                     # how long one run goes on (script_timeout_secs is 60)
 ACKS_KEEP=16                  # the acks state/acks.json keeps, newest last
 
-# The call budget: a token bucket in hook_state, one token for each call to the data source.
-TOKENS_MAX=100                # the bucket holds at most this many
-TOKEN_EVERY_S=36              # and gets one back this often: 100 an hour
-FAST_S=5                      # the gap between reads with EASE_AT tokens or more
-SLOW_S=30                     # growing evenly to this at LOW_AT; below LOW_AT, this or the time to the next token
+# The call budget: at most CALLS_MAX calls to the data source in any rolling WINDOW_S, from a log of their times in
+# hook_state. The wait after a read depends on how many calls remain in the window.
+CALLS_MAX=100
+WINDOW_S=3600
+FAST_S=5                      # the wait after a read while EASE_AT or more calls remain
+SLOW_S=30                     # growing evenly to this at LOW_AT; below LOW_AT, this or until the oldest call leaves
 EASE_AT=50
 LOW_AT=10
-TOKENS_FLOOR=-20              # commands are served down to this: headroom under the 120 calls an hour a host allows
+LOG_KEEP=1000                 # the log keeps at most this many times, so hook_state stays under 16 KB
 
 dry_run() {
     [[ "${HATCH_HOOK_DRY_RUN:-0}" == "1" ]]
@@ -64,8 +66,8 @@ fetch_state() {
 }
 
 # run_command NAME ARGS carries out one of the app's commands and sets RESULT, the ack's result: {"ok":true,...}, or
-# {"ok":false,"error":"..."} for one it can't carry out. A connector app calls the connector's write here, after
-# take_command_token for each call (refused at the floor: ack that). Tally's commands change its own state file.
+# {"ok":false,"error":"..."} for one it can't carry out. A connector app calls the connector's write here, and logs each
+# call with note_call "$now". Tally's commands change its own state file.
 run_command() {
     local name=$1 args=$2 current='{"count":0}' count n
     if [[ -n "${PUBLISHED:-}" ]]; then current=$PUBLISHED; fi
@@ -124,62 +126,67 @@ ack() {   # SEQ RESULT
     write_file "$ACKS_FILE" "$acks"
 }
 
-# ---- The budget ---------------------------------------------------------------------------------------------------
-load_state() {   # TOKENS AT LAST_POLL LAST_SEQ from hook_state, a full bucket when there is none
-    local state
+# ---- The budget: bash alone, no other process ----------------------------------------------------------------------
+# CALLS holds the times of the calls to the data source in the last WINDOW_S, oldest first; NEXT_POLL is when the next
+# read may go.
+
+prune() {   # NOW: the calls that have left the window go
+    local k=0
+    while ((k < ${#CALLS[@]})) && ((CALLS[k] <= $1 - WINDOW_S)); do k=$((k + 1)); done
+    if ((k > 0)); then CALLS=("${CALLS[@]:k}"); fi
+}
+
+note_call() {   # NOW: one call to the data source, logged
+    CALLS+=("$1")
+    if ((${#CALLS[@]} > LOG_KEEP)); then CALLS=("${CALLS[@]:${#CALLS[@]}-LOG_KEEP}"); fi
+}
+
+# schedule NOW: after a read at NOW, when the next may go: FAST_S while EASE_AT or more calls remain in the window, growing
+# evenly to SLOW_S at LOW_AT; below that the longer of SLOW_S and the time until the oldest call leaves; with none left,
+# when the log is back under CALLS_MAX.
+schedule() {
+    local now=$1 remaining=$((CALLS_MAX - ${#CALLS[@]})) wait
+    if ((remaining >= EASE_AT)); then
+        NEXT_POLL=$((now + FAST_S))
+    elif ((remaining >= LOW_AT)); then
+        NEXT_POLL=$((now + FAST_S + (EASE_AT - remaining) * (SLOW_S - FAST_S) / (EASE_AT - LOW_AT)))
+    elif ((remaining > 0)); then
+        wait=$((CALLS[0] + WINDOW_S - now))
+        if ((wait < SLOW_S)); then wait=$SLOW_S; fi
+        NEXT_POLL=$((now + wait))
+    else
+        NEXT_POLL=$((CALLS[${#CALLS[@]} - CALLS_MAX] + WINDOW_S))
+    fi
+}
+
+take_read() {   # NOW: a read of the data source, logged and the next one scheduled
+    note_call "$1"
+    schedule "$1"
+}
+
+read_due() {   # NOW: whether a poll may read now: its time has come and the window has room
+    ((${#CALLS[@]} < CALLS_MAX && $1 >= NEXT_POLL))
+}
+
+# ---- The hook's state -----------------------------------------------------------------------------------------------
+load_state() {   # CALLS, NEXT_POLL and LAST_SEQ from hook_state (none: an empty log)
+    local state calls
     state=$(hook_state_get)
-    read -r TOKENS AT LAST_POLL LAST_SEQ < <(jq -r --argjson max "$TOKENS_MAX" \
-        '[(.tokens // $max), (.at // 0), (.last_poll // 0), (.last_seq // 0)]
-         | map(if type == "number" then floor else 0 end) | @tsv' <<<"$state")
+    { read -r NEXT_POLL LAST_SEQ; read -r calls; } < <(jq -r '
+        ([(.next_poll // 0), (.last_seq // 0)] | map(if type == "number" then floor else 0 end) | @tsv),
+        ((.calls // []) | map(select(type == "number") | floor) | sort | map(tostring) | join(" "))' <<<"$state")
+    read -ra CALLS <<<"$calls"
 }
 
 save_state() {
-    hook_state_set "{\"tokens\":$TOKENS,\"at\":$AT,\"last_poll\":$LAST_POLL,\"last_seq\":$LAST_SEQ}"
+    local IFS=,
+    hook_state_set "{\"calls\":[${CALLS[*]-}],\"next_poll\":$NEXT_POLL,\"last_seq\":$LAST_SEQ}"
 }
 
-refill() {   # NOW: a token back for each TOKEN_EVERY_S since AT, up to TOKENS_MAX
-    local now=$1 gained
-    if ((now < AT)); then AT=$now; fi
-    if ((TOKENS >= TOKENS_MAX)); then
-        TOKENS=$TOKENS_MAX
-        AT=$now
-        return 0
-    fi
-    gained=$(((now - AT) / TOKEN_EVERY_S))
-    if ((gained <= 0)); then return 0; fi
-    TOKENS=$((TOKENS + gained))
-    if ((TOKENS >= TOKENS_MAX)); then
-        TOKENS=$TOKENS_MAX
-        AT=$now
-    else
-        AT=$((AT + gained * TOKEN_EVERY_S))
-    fi
-}
-
-read_due() {   # NOW: whether the gap for the tokens left has passed (none left: no read until one is back)
-    local now=$1 gap
-    if ((TOKENS <= 0)); then return 1; fi
-    if ((TOKENS >= EASE_AT)); then
-        gap=$FAST_S
-    elif ((TOKENS >= LOW_AT)); then
-        gap=$((FAST_S + (EASE_AT - TOKENS) * (SLOW_S - FAST_S) / (EASE_AT - LOW_AT)))
-    else
-        gap=$((AT + TOKEN_EVERY_S - now))
-        if ((gap < SLOW_S)); then gap=$SLOW_S; fi
-    fi
-    ((now - LAST_POLL >= gap))
-}
-
-take_command_token() {   # for each call of a command: refused at the floor
-    if ((TOKENS <= TOKENS_FLOOR)); then return 1; fi
-    TOKENS=$((TOKENS - 1))
-}
-
-# read_now NOW: one read of the data source (its token already taken), published. Sets STOP when the source says not
-# authorized.
+# read_now NOW: one read of the data source, logged and published. Sets STOP when the source says not authorized.
 read_now() {
     local state rc=0
-    LAST_POLL=$1
+    take_read "$1"
     READS=$((READS + 1))
     state=$(fetch_state) || rc=$?
     save_state
@@ -201,7 +208,8 @@ heartbeat_fresh() {   # NOW
     (($1 - mtime <= HEARTBEAT_MAX_AGE_S))
 }
 
-# serve_commands NOW: the waiting commands in seq order, as numbers, each once, with one read after each.
+# serve_commands NOW: the waiting commands in seq order, as numbers, each once, with one read after each. Commands are
+# always served, and their calls logged.
 serve_commands() {
     local now=$1 file seq name args files=(outbox/cmd-*.json)
     if ((${#files[@]} > 1)); then mapfile -t files < <(printf '%s\n' "${files[@]}" | sort -t- -k2,2n); fi
@@ -223,7 +231,7 @@ serve_commands() {
         if [[ -n "$name" ]]; then run_command "$name" "$args"; fi
         LAST_SEQ=$seq
         COMMANDS=$((COMMANDS + 1))
-        if take_command_token; then read_now "$now"; else save_state; fi
+        read_now "$now"
         ack "$seq" "$RESULT"
         remove_file "$file"
         log "applied a command" "{\"seq\":$seq}"
@@ -259,12 +267,9 @@ while :; do
         why="the app went behind"
         break
     fi
-    refill "$now"
+    prune "$now"
     serve_commands "$now"
-    if [[ -z "$STOP" ]] && read_due "$now"; then
-        TOKENS=$((TOKENS - 1))
-        read_now "$now"
-    fi
+    if [[ -z "$STOP" ]] && read_due "$now"; then read_now "$now"; fi
     if [[ -n "$STOP" ]]; then
         why=$STOP
         break
@@ -273,4 +278,4 @@ while :; do
 done
 
 save_state
-silent "$why" "{\"reads\":$READS,\"commands\":$COMMANDS,\"tokens\":$TOKENS}"
+silent "$why" "{\"reads\":$READS,\"commands\":$COMMANDS,\"calls_in_window\":${#CALLS[@]}}"

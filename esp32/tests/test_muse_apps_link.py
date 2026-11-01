@@ -770,6 +770,31 @@ class GuideAndSkill(unittest.TestCase):
             with self.subTest(pattern):
                 self.assertRegex(images, pattern)
 
+    def test_guide_says_how_to_show_pictures_cheaply(self):
+        # I1: Muse scaled a still 300 px picture under a spinning one and its frames went to 47-66 ms: a still picture under a
+        # spin is redrawn at each step, through the transform when it is scaled. Images and Rules: Pictures both say so. I6: a
+        # packaged picture until the VM's comes, and when there is none, in Rules: Pictures and in Making a connected app.
+        # The minors: ui.image's src takes a muse.image too, and the circle in a packaged picture's alpha is ffmpeg's
+        # (the VM has no Pillow).
+        guide = " ".join(GUIDE.read_text().split())
+        still = ("A still picture under a spinning one is redrawn at every step: show it at scale 100, written at the size "
+                 "it's shown (a hook can resize it with ffmpeg); a scaled one costs as much as the spin.")
+        fallback = "Show a packaged picture until the VM's arrives, and when there is none."
+        self.assertEqual(guide.count(still), 2)
+        self.assertIn(still, " ".join(guide_section(GUIDE.read_text(), "Images").split()))
+        connected = GUIDE.read_text().split("\n## Connected apps\n", 1)[1]
+        rules = " ".join(connected.split("\n### Rules\n", 1)[1].split("\n## ", 1)[0].split())
+        flow = " ".join(connected.split("\n### Making a connected app\n", 1)[1].split("\n### ", 1)[0].split())
+        for name, part in (("Rules", rules), ("Making a connected app", flow)):
+            with self.subTest(name):
+                self.assertIn(fallback, part)
+        self.assertIn(still, rules)
+        self.assertEqual(guide.count(fallback), 2)
+        self.assertIn("(`src`, a path of the manifest's files, or a `muse.image`)", guide)
+        self.assertNotIn("Pillow", guide)
+        self.assertIn("a='255*lte(hypot(X-(W-1)/2,Y-(H-1)/2),W/2)'", guide)
+        self.assertIn("A JPEG from the VM needs none of this: read it with `circle = true`", guide)
+
     def test_guide_teaches_a_still_body_under_a_spinning_label(self):
         # Task 7 (the user's item 4): Images teaches the pattern that keeps a spin cheap and tear-free: what looks the same at any
         # angle (a record's grooves, the light on it) is drawn still, and only a smaller label spins over it. And why a circle
@@ -1054,6 +1079,7 @@ class GuideAndSkill(unittest.TestCase):
         self.assertEqual(n["WINDOW_S"], 3600, "a rolling hour")
         self.assertLessEqual(n["LOG_KEEP"] * len("1800000000,"), 16 * 1024 - 1024, "the log fits hook_state's 16 KB")
         heartbeat_s = header_number("apps_vmio.h", "APPS_VM_HEARTBEAT_MS") // 1000
+        json_kb = int(re.search(r"(?m)^#define APPS_VM_JSON_MAX \((\d+) \* 1024\)", (APPS / "apps_vmio.h").read_text()).group(1))
         ack_poll_s = header_number("apps_vmio.h", "APPS_VM_ACK_POLL_MS") // 1000
         self.assertGreater(n["HEARTBEAT_MAX_AGE_S"], heartbeat_s, "the gate outlasts the gadget's period")
         self.assertLess(n["LOOP_S"], 60, "a run ends inside script_timeout_secs")
@@ -1094,6 +1120,12 @@ class GuideAndSkill(unittest.TestCase):
             r"`\{\"ok\":false,\.\.\.\}`, and on exit 3 acks `not authorized` and ends the run",
             r"The hook saves a command's seq before it runs, so a command runs at most once",
             # P42: the hook's EXIT trap acks a command in flight; the JSON default the Spotify hook got wrong.
+            # The acks' size: the file is read under the JSON cap, so every result small.
+            rf"Keep each ack's result small, under 1 KB: the gadget reads `state/acks\.json` as any JSON file, at most "
+            rf"{json_kb} KB, and a larger file makes every command `timed out`",
+            # The creation flow (T6-2): every host in the dry run; a card mid-turn is silence to the gadget.
+            r"The dry run should fetch from every host the hook may use, pictures too, so their cards come up then",
+            r"A turn that runs tools on the VM can raise an approval card mid-turn; the gadget only sees silence",
             r"If the hook fails while running a command, it acks it failed, so the app hears at once",
             r"Quote a JSON default in a parameter expansion: `\$\{X:-'\{\"a\":1\}'\}`; a bare `\}` ends the expansion",
             r"`fetch_state` is the one function that reads the data source",
@@ -1127,6 +1159,8 @@ class GuideAndSkill(unittest.TestCase):
         self.assertEqual(found, sorted(found), "hooks.add, the dry run, the update, enable, install, snapshot")
         # Each of the pattern's numbers is stated once in the guide.
         self.assertGreater(n["CMD_MAX_AGE_S"], header_number("apps_vmio.h", "APPS_VM_ACK_MS") // 1000, "after the app's timed out")
+        # ACKS_KEEP results of 1 KB, with their seqs and the brackets, fit the JSON cap the acks are read under.
+        self.assertLess(n["ACKS_KEEP"] * (1024 + len('{"seq":1800000000000,"result":},')) + len('{"acks":[]}'), json_kb * 1024)
         for phrase in (f"written {n['HEARTBEAT_MAX_AGE_S']} s ago or less", f"for at most {n['LOOP_S']} s",
                        f"A command older than {n['CMD_MAX_AGE_S']} s",
                        f"at most {n['CALLS_MAX']} connector calls in any rolling hour", f"waits {n['FAST_S']} s while",

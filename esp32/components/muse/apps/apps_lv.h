@@ -170,8 +170,9 @@ void apps_lv_set_event_cb(apps_lv_event_cb_t cb);
 void apps_lv_set_close_cb(void (*cb)(void));
 
 /* The board's frame pairing (muse_board_t frame_pairing; NULL: none), after apps_lv_build. The layer calls it with true while an
- * image spins on it in front with no launcher or card over it, and with false when that stops (a spin stopped or deleted, the app
- * behind, the launcher or a card shown), each change once, at the end of the refresh that saw it. */
+ * image spins on it in front, or a spinner is shown there (it and every box above it not hidden: its refreshes tear too, R8a),
+ * with no launcher or card over it, and with false when neither is so (a spin stopped or deleted, the spinner hidden or deleted,
+ * the app behind, the launcher or a card shown), each change once, at the end of the refresh that saw it. */
 void apps_lv_set_pairing_cb(void (*cb)(bool on));
 
 /*

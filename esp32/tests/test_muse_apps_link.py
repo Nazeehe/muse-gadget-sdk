@@ -1041,9 +1041,9 @@ class GuideAndSkill(unittest.TestCase):
             r"Set `script_timeout_secs` to 60", r"serves the waiting commands first, in seq order, with one read of the data source after each",
             rf"The hook makes at most {n['CALLS_MAX']} connector calls in any rolling hour: it keeps the times of its calls of the last "
             r"hour in its `hook_state`, and its reads use only what is left",
-            rf"After each read the next one waits {n['FAST_S']} s while {n['EASE_AT']} or more calls remain in the hour; below "
-            rf"{n['EASE_AT']} it spreads the calls left evenly over the time until the oldest call leaves the hour, at least "
-            rf"{n['SPREAD_MIN_S']} s apart; with none left, it waits until the oldest call leaves",
+            rf"After each read the next one waits {n['FAST_S']} s while {n['EASE_AT']} or more calls remain in the hour\. Below "
+            rf"{n['EASE_AT']} it waits at least {n['SPREAD_MIN_S']} s, spreading the calls left evenly over the time until the oldest "
+            r"call leaves the hour; with none left, it waits for the oldest call to leave",
             r"A command's calls and its read are always served, and logged too, so only commands take the hook past its budget",
             rf"the tally's log keeps at most {n['LOG_KEEP']} times",
             r"Send `vm\.command` from the user's actions, never from a timer",
@@ -1079,7 +1079,7 @@ class GuideAndSkill(unittest.TestCase):
         # Each of the pattern's numbers is stated once in the guide.
         for phrase in (f"written {n['HEARTBEAT_MAX_AGE_S']} s ago or less", f"for at most {n['LOOP_S']} s",
                        f"at most {n['CALLS_MAX']} connector calls in any rolling hour", f"waits {n['FAST_S']} s while",
-                       f"leaves the hour, at least {n['SPREAD_MIN_S']} s apart", f"at most {n['LOG_KEEP']} times"):
+                       f"it waits at least {n['SPREAD_MIN_S']} s, spreading", f"at most {n['LOG_KEEP']} times"):
             with self.subTest(phrase):
                 self.assertEqual(" ".join(guide.split()).count(phrase), 1)
         # The hook's numbers are the ones its loop and budget use.

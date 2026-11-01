@@ -72,16 +72,16 @@ def prune(calls, next_poll, now):
 
 
 def schedule(calls, now):
-    """When the next read may go after one at now, with calls (that read included) in the window (P21b): FAST_S on while
+    """When the next read may go after one at now, with calls (that read included) in the window (P21b, P21c): FAST_S on while
     EASE_AT or more calls remain; below that the calls left (R) spread evenly over the time until the oldest call leaves (T),
     T / R apart and at least SPREAD_MIN_S; with none left, when the log is back under CALLS_MAX (when the oldest leaves,
-    unless commands took it past)."""
+    unless commands took it past), and at least SPREAD_MIN_S on."""
     remaining = CALLS_MAX - len(calls)
     if remaining >= EASE_AT:
         return now + FAST_S
     if remaining > 0:
         return now + max(SPREAD_MIN_S, (calls[0] + WINDOW_S - now) // remaining)
-    return calls[len(calls) - CALLS_MAX] + WINDOW_S
+    return max(now + SPREAD_MIN_S, calls[len(calls) - CALLS_MAX] + WINDOW_S)
 
 
 def model_reads(start, calls, next_poll, ticks=LOOP_S // TICK_S):
@@ -99,15 +99,15 @@ def model_reads(start, calls, next_poll, ticks=LOOP_S // TICK_S):
     return reads, calls, next_poll
 
 
-def model_use(seed, every, seconds):
-    """Continuous use from T0 for that many seconds, from the log seed, with a command every that many seconds (0: none), as the
-    hook's loop runs the budget: each second the log is pruned, a command's read is taken whatever the log holds, then a poll
-    when one is due. Returns the polls as (time, calls left, seconds until the oldest call leaves) just after each, and the
-    commands' times."""
-    calls, next_poll, polls, commands = list(seed), 0, [], []
+def model_use(seed, taps, seconds):
+    """Continuous use from T0 for that many seconds, from the log seed, with a command at each time in taps, as the hook's loop
+    runs the budget: each second the log is pruned, a command's read is taken whatever the log holds, then a poll when one is
+    due. Returns the polls as (time, calls left, seconds until the oldest call leaves) just after each, and the commands'
+    times."""
+    calls, next_poll, polls, commands, taps = list(seed), 0, [], [], set(taps)
     for now in range(T0, T0 + seconds):
         calls, next_poll = prune(calls, next_poll, now)
-        if every and (now - T0) % every == 0:
+        if now in taps:
             calls.append(now)
             commands.append(now)
             next_poll = schedule(calls, now)
@@ -452,7 +452,7 @@ class TallyHook(HookTestCase):
         self.assertEqual([int(t) for t in self.lines(self.calls)], [T0 + 1000, T0 + 1002, T0 + 1007, T0 + 1012],
                          "the read after the command at once, then the polls 5 s on")
 
-    def drive(self, seed, every, seconds):
+    def drive(self, seed, taps, seconds):
         """The hook's own budget functions (its "The budget" section, bash alone, with its constants) driven second by second
         from T0, as model_use runs the model, the way the hook's loop drives them. Returns what model_use returns (each test
         checks its promise first, then that the hook's budget is the model's)."""
@@ -462,9 +462,10 @@ class TallyHook(HookTestCase):
         constants = "\n".join(re.findall(r"(?m)^(?:CALLS_MAX|WINDOW_S|FAST_S|EASE_AT|SPREAD_MIN_S|LOG_KEEP)=\S+", text))
         self.assertEqual(len(constants.splitlines()), 6)
         driver = (f"set -euo pipefail\n{constants}\n{budget}\nCALLS=({' '.join(map(str, seed))})\nNEXT_POLL=0\n"
+                  f"declare -A TAPS=({' '.join(f'[{t}]=1' for t in taps)})\n"
                   f"for ((now = {T0}; now < {T0 + seconds}; now++)); do\n"
                   "    prune \"$now\"\n"
-                  + (f"    if (((now - {T0}) % {every} == 0)); then take_read \"$now\"; echo \"c $now\"; fi\n" if every else "")
+                  "    if [[ -n \"${TAPS[$now]-}\" ]]; then take_read \"$now\"; echo \"c $now\"; fi\n"
                   + "    if read_due \"$now\"; then\n"
                   "        take_read \"$now\"\n"
                   "        echo \"p $now $((CALLS_MAX - ${#CALLS[@]})) $((CALLS[0] + WINDOW_S - now))\"\n"
@@ -483,7 +484,7 @@ class TallyHook(HookTestCase):
         # The call budget (P21a, P21b): at most 100 calls to the data source in any rolling hour, from a log of their times in
         # the hook's state. After each read the next waits 5 s while 50 or more calls remain; below that the calls left (R) are
         # spread evenly over the time until the oldest call leaves (T): T / R, at least 30 s; with none left, until the oldest
-        # leaves. Checked against the model above on a copy whose fetch_state counts its calls: one tick, whose read sets the
+        # leaves, at least 30 s (P21c). Checked against the model above on a copy whose fetch_state counts its calls: one tick, whose read sets the
         # next read's time, or the 16 ticks of a heartbeat that ages out.
         def log(n, oldest, step=10):
             """n calls, the first at oldest, the rest after it, step s apart."""
@@ -497,6 +498,7 @@ class TallyHook(HookTestCase):
         self.assertEqual(schedule(log(69, T0 - 3590) + [T0], T0) - T0, SPREAD_MIN_S, "30 left, the oldest leaving in 10 s")
         self.assertEqual(schedule(log(98, T0 - 3560) + [T0], T0) - T0, 40, "1 left: until the oldest leaves")
         self.assertEqual(schedule(log(99, T0 - 3500) + [T0], T0) - T0, 100, "none left: until the oldest leaves")
+        self.assertEqual(schedule(log(99, T0 - 3599) + [T0], T0) - T0, SPREAD_MIN_S, "none left, the oldest leaving in 1 s")
         one = 1
         short = HEARTBEAT_MAX_AGE_S + 1
         cases = {  # name: (the log before, next_poll before, ticks, the wait after the first read)
@@ -507,6 +509,7 @@ class TallyHook(HookTestCase):
             "30 left, the oldest leaving in 10 s": (log(69, T0 - 3590), 0, one, SPREAD_MIN_S),
             "1 left": (log(98, T0 - 3560), 0, one, 40),
             "none left": (log(99, T0 - 3500), 0, one, 100),
+            "none left, the oldest leaving in 1 s": (log(99, T0 - 3599), 0, one, SPREAD_MIN_S),
             "a full log": (log(100, T0 - 3594), 0, short, None),  # no read until the oldest leaves, at T0 + 6
             "not yet": (log(10, T0 - 3000), T0 + 7, short, None),
             "an hour old": (log(100, T0 - 3600 - 990), 0, one, FAST_S),  # every call has left: an empty window
@@ -535,33 +538,54 @@ class TallyHook(HookTestCase):
         # hours of a fake clock (drive), from an empty log, a full one and a half-full one, and with commands every 90 s, whose
         # reads are logged and served whatever the log holds. The polls of the log before count too.
         hours = 4
-        for name, seed, every in (("empty", [], 0), ("full", FULL_LOG, 0), ("half", HALF_LOG, 0),
-                                  ("half, with commands", HALF_LOG, 90)):
+        every_90_s = range(T0, T0 + hours * WINDOW_S, 90)
+        for name, seed, taps in (("empty", [], ()), ("full", FULL_LOG, ()), ("half", HALF_LOG, ()),
+                                 ("half, with commands", HALF_LOG, every_90_s)):
             with self.subTest(name):
-                driven = self.drive(seed, every, hours * WINDOW_S)
+                driven = self.drive(seed, taps, hours * WINDOW_S)
                 polls, commands = [t for t, _, _ in driven[0]], driven[1]
                 self.assertLessEqual(most_in_an_hour(seed + polls), CALLS_MAX)
                 last_hour = [t for t in polls + commands if t >= T0 + (hours - 1) * WINDOW_S]
                 self.assertGreaterEqual(len(last_hour), CALLS_MAX * 9 // 10, "the budget is used, not only kept")
-                if every:
+                if taps:
                     self.assertGreater(most_in_an_hour(seed + polls + commands), CALLS_MAX,
                                        "the commands are served even when the polls have used the hour")
-                self.assertEqual(driven, model_use(seed, every, hours * WINDOW_S), "the hook's budget is the model's")
+                self.assertEqual(driven, model_use(seed, taps, hours * WINDOW_S), "the hook's budget is the model's")
 
     def test_never_stale_longer_than_the_spread(self):
         # P21b: below 50 calls left, the calls left are spread over the time until the oldest call leaves, so the screen never
         # goes long without a read. Continuous use for 3 hours from an empty log, a full one and a half-full one: no gap between
         # two polls is longer than max(30 s, T / R), with T the time until the oldest call leaves and R the calls left when the
-        # gap was chosen (with none left, T), and once the first hour is past every gap is under 120 s.
+        # gap was chosen (with none left, max(30 s, T)), and once the first hour is past every gap is under 120 s.
         for name, seed in (("empty", []), ("full", FULL_LOG), ("half", HALF_LOG)):
             with self.subTest(name):
-                polls, _ = self.drive(seed, 0, 3 * WINDOW_S)
-                for (a, left, until_oldest), (b, _, _) in zip(polls, polls[1:]):
-                    allowed = max(SPREAD_MIN_S, until_oldest / left) if left > 0 else until_oldest
-                    self.assertLessEqual(b - a, allowed, f"the gap after the poll at T0 + {a - T0} s")
+                polls, _ = self.drive(seed, (), 3 * WINDOW_S)
+                self.assert_spread(polls)
                 after = [b[0] - a[0] for a, b in zip(polls, polls[1:]) if a[0] >= T0 + WINDOW_S]
                 self.assertLess(max(after), 120)
-                self.assertEqual((polls, []), model_use(seed, 0, 3 * WINDOW_S), "the hook's budget is the model's")
+                self.assertEqual((polls, []), model_use(seed, (), 3 * WINDOW_S), "the hook's budget is the model's")
+
+    def assert_spread(self, polls):
+        """No gap between two polls is longer than the spread allowed when it was chosen."""
+        for (a, left, until_oldest), (b, _, _) in zip(polls, polls[1:]):
+            allowed = max(SPREAD_MIN_S, until_oldest / left if left > 0 else until_oldest)
+            self.assertLessEqual(b - a, allowed, f"the gap after the poll at T0 + {a - T0} s")
+
+    def test_a_burst_of_taps_does_not_replay(self):
+        # P21c: a burst of 100 taps' commands in 100 s fills the hour. An hour later its calls leave one a second, and the polls
+        # must not take each freed call at once (100 polls in 100 s, then nearly an hour with none, every hour): with none left
+        # the wait is at least 30 s. For 3 hours from an empty log: the 100 cap holds with the taps counted, no gap is longer
+        # than the spread allows, and after the first hour no two polls are closer than 5 s and every gap is under 120 s.
+        taps = range(T0, T0 + 100)
+        polls, commands = self.drive([], taps, 3 * WINDOW_S)
+        self.assertEqual(commands, list(taps), "every tap is served")
+        times = [t for t, _, _ in polls]
+        self.assertLessEqual(most_in_an_hour(times + commands), CALLS_MAX)
+        self.assert_spread(polls)
+        after = [b - a for a, b in zip(times, times[1:]) if a >= T0 + WINDOW_S]
+        self.assertGreaterEqual(min(after), FAST_S, "no burst again")
+        self.assertLess(max(after), 120)
+        self.assertEqual((polls, commands), model_use([], taps, 3 * WINDOW_S), "the hook's budget is the model's")
 
     def test_a_clock_step_back_drops_future_entries(self):
         # After the VM's clock steps back, the calls logged after now leave the log (they would hold the window for up to the

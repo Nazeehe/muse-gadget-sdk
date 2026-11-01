@@ -43,7 +43,7 @@ CALLS_MAX=100
 WINDOW_S=3600
 FAST_S=5                      # the wait after a read while EASE_AT or more calls remain
 EASE_AT=50
-SPREAD_MIN_S=30               # below EASE_AT, the calls left spread evenly until the oldest leaves, at least this far apart
+SPREAD_MIN_S=30               # below EASE_AT, the least wait: the calls left spread evenly until the oldest leaves
 LOG_KEEP=1000                 # the log keeps at most this many times, so hook_state stays under 16 KB
 
 dry_run() {
@@ -151,7 +151,7 @@ note_call() {   # NOW: one call to the data source, logged
 # schedule NOW: after a read at NOW, when the next may go. While EASE_AT or more calls remain in the window, FAST_S on.
 # Below that, the calls left spread evenly over the time until the oldest call leaves, at least SPREAD_MIN_S apart, so the
 # app never goes long without a read. With none left, when the log is back under CALLS_MAX (when the oldest leaves, unless
-# commands took it past).
+# commands took it past), and at least SPREAD_MIN_S on, so that a burst of calls an hour ago does not come back as a burst.
 schedule() {
     local now=$1 remaining=$((CALLS_MAX - ${#CALLS[@]})) wait
     if ((remaining >= EASE_AT)); then
@@ -162,6 +162,7 @@ schedule() {
         NEXT_POLL=$((now + wait))
     else
         NEXT_POLL=$((CALLS[${#CALLS[@]} - CALLS_MAX] + WINDOW_S))
+        if ((NEXT_POLL < now + SPREAD_MIN_S)); then NEXT_POLL=$((now + SPREAD_MIN_S)); fi
     fi
 }
 

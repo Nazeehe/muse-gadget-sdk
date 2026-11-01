@@ -170,6 +170,7 @@ typedef enum {
     APPS_EV_WAKE,       /* the LVGL task ran a reset the app task waits for, or the screen was lit: the round's housekeeping */
     APPS_EV_ALARM_LAUNCH,  /* the I/O worker's launch for an app's alarms is over: code the outcome (apps_alarm_launch_t), app_gen its identity */
     APPS_EV_VM_DONE,       /* the network worker has results (apps_net.h): brings the loop round, whose housekeeping takes them; no payload */
+    APPS_EV_ASK_DONE,      /* a muse.ask turn has ended (apps_ask.h): brings the loop round, whose housekeeping takes the results; no payload */
 } apps_event_type_t;
 
 typedef struct {
@@ -363,3 +364,11 @@ bool apps_task_current(void);
  */
 struct apps_vm_job;
 bool apps_task_vm_submit(struct apps_vm_job *job);
+
+/*
+ * The `muse` module's asks (connected apps Task 4, apps_ask.h). A turn's end comes back by APPS_EV_ASK_DONE (P29: posted as VM_DONE is,
+ * with no payload, its result on the module's list, so a post that finds no room loses nothing). The loop takes the list in its
+ * housekeeping and gives each result to the app that runs (apps_ask_take), which keeps it only while its ask waits for it; any other is
+ * freed and never runs (Review Focus 1). Each round, after the vm module's, it lets go of an ask whose time has run out (P19) and runs one
+ * callback, a call of the app like any other. Each ask's outcome is one line of the log under the apps' tag.
+ */

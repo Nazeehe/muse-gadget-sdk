@@ -42,7 +42,7 @@ TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_install_harness.c"
 SOURCES = [HARNESS, APPS / "apps_install.c", APPS / "apps_result.c", APPS / "apps_pkg.c", APPS / "apps_json.c",
            APPS / "apps_vm.c", APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_svc.c",
-           APPS / "apps_vmio.c", ROOT / "tools/muse/apphost/sha256.c"]
+           APPS / "apps_vmio.c", APPS / "apps_ask.c", ROOT / "tools/muse/apphost/sha256.c"]
 SDKCONFIG = "#pragma once\n#define CONFIG_MUSE_APPS 1\n#define CONFIG_MUSE_APPS_HEAP_MAX_KB 1024\n"
 # What muse_apps.h (the VM's ops, for apps_install_from_vm) includes of ESP-IDF and LVGL, as the little it uses.
 ESP_ERR = "#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_ERR_NO_MEM 0x101\n"

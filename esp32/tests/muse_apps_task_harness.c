@@ -56,6 +56,7 @@
 #include "cJSON.h"
 #endif
 #include "apps_alarm.h"
+#include "apps_ask.h"
 #include "apps_io.h"
 #include "apps_lv.h"
 #include "apps_pkg.h"
@@ -1188,6 +1189,15 @@ bool apps_port_vm_submit(struct apps_vm_job *job) {
     return apps_task_vm_submit(job);
 }
 
+/* muse.ask's turns (connected apps Task 4): the platform's side is a fake. Each turn is an event, "ask <text>", and the case plays the
+ * chat task through the module's sink (apps_ask_piece, apps_ask_done) from its own thread, as the gadget's chat task calls it. */
+static _Atomic(void *) ask_user;
+
+void apps_port_ask(const char *msg, size_t len, void *user) {
+    event("ask %.*s", (int)len, msg);
+    atomic_store(&ask_user, user);
+}
+
 /* The VM's files for the cases that use it: a picture, an image file and a rev, any app's. An op can be held until the case lets it go
  * (or its deadline comes), and every op is an event: "vm read <path>", "vm write <path>". */
 static pthread_mutex_t vmf_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -1446,8 +1456,9 @@ static const char *const EVENT_NAMES[] = {
     [APPS_EV_WAKE] = "WAKE",
     [APPS_EV_ALARM_LAUNCH] = "ALARM_LAUNCH",
     [APPS_EV_VM_DONE] = "VM_DONE",
+    [APPS_EV_ASK_DONE] = "ASK_DONE",
 };
-_Static_assert(ARRAY_LEN(EVENT_NAMES) == APPS_EV_VM_DONE + 1, "a name for each event");
+_Static_assert(ARRAY_LEN(EVENT_NAMES) == APPS_EV_ASK_DONE + 1, "a name for each event");
 
 static void note_send(const void *item, size_t item_size, TickType_t wait) {
     _Atomic(TickType_t) *longest = on_lvgl_task()            ? &lvgl_longest_send
@@ -7510,6 +7521,55 @@ static void vm_result_for_an_ended_app_is_dropped(void) {
     ABSENT(from, "print vmpic failed");
 }
 
+static const char APP_ASK[] =
+    "local app = {}\n"
+    "function app.start()\n"
+    "  ui.button{text = 'Ask'}:on('tap', function() muse.ask('Hi', function(r, e) print('reply', r, e) end) end)\n"
+    "end\n"
+    "return app\n";
+static const file_t ASK[] = {LUA("main.lua", APP_ASK)};
+
+/* Task 4, on the real app task: an ask after a tap goes as a turn, and its end comes back by APPS_EV_ASK_DONE, posted with no wait from
+ * the chat task's side, whose round runs the callback after the module's line in the log (the reply's text never in it). */
+static void an_ask_comes_back_by_its_event(void) {
+    char err[200];
+    int from = mark();
+    CHECK(apps_task_run(with_perms(make_pkg("askapp", "Ask", ASK, 1), APPS_PERM_MUSE), true, 100, NULL, err, sizeof err), "run: %s",
+          err);
+    WAIT(from, "front 1");
+    TAP(0);
+    WAIT(from, "ask (app askapp) Hi");
+    void *user = atomic_load(&ask_user);
+    apps_ask_piece(user, "Hello", 5);
+    apps_ask_done(user, NULL);
+    int said = WAIT(from, "log I ask askapp: done (5 bytes)");
+    int reply = WAIT(from, "print askapp reply\tHello\tnil");
+    CHECK(said < reply, "the line comes before the callback: %d, %d", said, reply);
+    ORDERED(from, "queue ASK_DONE wait 0", "print askapp reply");
+    ABSENT(from, "log I Hello");
+}
+
+/* Review Focus 1, on the real app task: the app ends while its ask is out; the turn's end comes back by the event, and the app task frees
+ * the result, running nothing (finish() checks that no byte is left). */
+static void ask_result_for_an_ended_app_is_dropped(void) {
+    char err[200];
+    int from = mark();
+    CHECK(apps_task_run(with_perms(make_pkg("askapp", "Ask", ASK, 1), APPS_PERM_MUSE), true, 100, NULL, err, sizeof err), "run: %s",
+          err);
+    WAIT(from, "front 1");
+    TAP(0);
+    WAIT(from, "ask (app askapp) Hi");
+    void *user = atomic_load(&ask_user);
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    int stopped = mark();
+    apps_ask_piece(user, "late", 4);
+    apps_ask_done(user, NULL);
+    WAIT(stopped, "queue ASK_DONE wait 0");
+    FIFO_SYNC();
+    ABSENT(from, "print askapp reply");
+    ABSENT(from, "log I ask askapp");
+}
+
 static const char APP_VMWATCH[] =
     "local app = {}\n"
     "function app.start() vm.watch('state/rev', 1, function(t, e) print('rev', t, e) end) end\n"
@@ -7729,6 +7789,8 @@ int main(int argc, char **argv) {
         {"vm_images_go_after_the_reset", vm_images_go_after_the_reset},
         {"vm_images_park_when_the_reset_is_late", vm_images_park_when_the_reset_is_late},
         {"vm_result_for_an_ended_app_is_dropped", vm_result_for_an_ended_app_is_dropped},
+        {"an_ask_comes_back_by_its_event", an_ask_comes_back_by_its_event},
+        {"ask_result_for_an_ended_app_is_dropped", ask_result_for_an_ended_app_is_dropped},
         {"vm_watch_pauses_behind_or_dark", vm_watch_pauses_behind_or_dark},
 #ifdef HARNESS_CONSOLE
         {"app_install_while_a_watch_polls", app_install_while_a_watch_polls},

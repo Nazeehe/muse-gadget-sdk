@@ -40,8 +40,8 @@ MUSE = ROOT / "components/muse"
 APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_vmio_harness.c"
-SOURCES = [HARNESS, TESTS / "fake_tjpgd.c", APPS / "apps_vmio.c", APPS / "apps_net.c", APPS / "apps_jpeg.c", APPS / "apps_rt.c",
-           APPS / "apps_svc.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c", APPS / "apps_pkg.c",
+SOURCES = [HARNESS, TESTS / "fake_tjpgd.c", APPS / "apps_vmio.c", APPS / "apps_ask.c", APPS / "apps_net.c", APPS / "apps_jpeg.c",
+           APPS / "apps_rt.c", APPS / "apps_svc.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c", APPS / "apps_pkg.c",
            APPS / "apps_suggest.c"]
 # What apps_net.c and muse_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one a line that includes the task harness's fakes.
 FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/idf_additions.h", "freertos/queue.h", "freertos/semphr.h", "freertos/task.h",

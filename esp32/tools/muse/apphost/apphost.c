@@ -171,6 +171,7 @@
 #include "apphost_esp.h"
 #include "apphost_port.h"
 #include "apps_alarm.h"
+#include "apps_ask.h"
 #include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
@@ -923,6 +924,27 @@ static void run_vm(app_t *app, int64_t now) {
     }
 }
 
+/* The muse module's results and callback, after the vm module's, as the app task's round has them (apps_task.c: take_ask_results,
+ * run_ask). apphost has no Muse: its port ends every ask at once, "not set up" (apphost_port.c), and the callback runs here. */
+static void run_ask(app_t *app, int64_t now) {
+    for (apps_ask_result_t *r = apps_ask_results(); r != NULL;) {
+        apps_ask_result_t *next = r->next;
+        apps_ask_take(app->rt, r);  /* kept by the app that runs, if its ask waits for it; freed otherwise */
+        r = next;
+    }
+    if (app->rt == NULL) {
+        return;
+    }
+    apps_ask_tick(app->rt, now);
+    if (apps_ask_has_work(app->rt)) {
+        bool was_crashed = crashed(app);
+        apps_ask_run_one(app->rt);
+        flush_warnings(app);
+        report_crash(app, was_crashed);
+        end_if_exited(app);
+    }
+}
+
 /* advance MS: the clock moves in steps and after each one the timers that are due run (apps_rt_run_timers: what the app task's
  * loop does, on the same clock), and the screen is applied, as the LVGL task's frame follows a callback. At least one step,
  * so `advance 0` is a pass. Every step is a command as far as the UI lock goes (end_of_command). */
@@ -949,6 +971,7 @@ static void cmd_advance(app_t *app, long ms) {
                 }
             }
             run_vm(app, now);
+            run_ask(app, now);
             end_of_command(app);
         }
     } while (done < ms);

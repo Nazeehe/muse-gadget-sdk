@@ -46,12 +46,15 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "psa/crypto.h"
+#include "sdkconfig.h"  /* before muse_chat.h, whose typed turns for apps are CONFIG_MUSE_APPS's */
 
 #include "apps_alarm.h"
+#include "apps_ask.h"
 #include "apps_echo.h"
 #include "apps_pkg.h"
 #include "apps_task.h"
 #include "apps_values.h"
+#include "muse_chat.h"
 #include "muse_mem.h"
 #include "muse_sntp.h"
 #include "muse_state.h"
@@ -495,6 +498,20 @@ void apps_port_exit(void) {
 /* The vm module's requests go to the network worker, stamped with the app that runs (apps_task.h). */
 bool apps_port_vm_submit(struct apps_vm_job *job) {
     return apps_task_vm_submit(job);
+}
+
+/* muse.ask's turn goes to Muse's chat, its reply to the module's sink. The text is copied into PSRAM: under 4 KB, malloc would take
+ * internal RAM (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL), and the chat frees it with free(), which takes any heap's block. */
+void apps_port_ask(const char *msg, size_t len, void *user) {
+    char *text = heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (text == NULL) {
+        apps_ask_done(user, APPS_ASK_MSG_NO_MEMORY);
+        return;
+    }
+    memcpy(text, msg, len);
+    text[len] = '\0';
+    const muse_hatch_text_sink_t sink = {apps_ask_piece, apps_ask_done, user};
+    muse_hatch_text_turn_to(text, &sink);
 }
 
 /* PSA's SHA-256 (C21): IDF v6's mbedTLS is PSA, as main/link_pairing.c uses it. psa_crypto_init is cheap once it has

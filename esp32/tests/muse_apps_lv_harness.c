@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "apps_ask.h"
 #include "apps_icons.h"
 #include "apps_io.h"
 #include "apps_json.h"
@@ -300,6 +301,12 @@ void apps_port_exit(void) {}
 bool apps_port_vm_submit(struct apps_vm_job *job) {
     (void)job;
     return false;
+}
+
+/* No Muse here (tests/muse_apps_ask_harness.c is the muse module's): an ask's turn ends at once, as apphost's does. */
+void apps_port_ask(const char *msg, size_t len, void *user) {
+    (void)msg, (void)len;
+    apps_ask_done(user, "not set up");
 }
 
 /* ---- The I/O worker and the store, for the launcher's icons ---- */

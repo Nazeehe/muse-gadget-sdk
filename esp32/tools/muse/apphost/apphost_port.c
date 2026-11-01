@@ -40,6 +40,7 @@
 #include "apphost_esp.h"
 #include "apphost_port.h"
 #include "apps_alarm.h"
+#include "apps_ask.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_vmio.h"
@@ -263,6 +264,13 @@ void apps_port_exit(void) {
 bool apps_port_vm_submit(struct apps_vm_job *job) {
     snprintf(job->err, sizeof job->err, "%s", APPS_VM_MSG_NOT_CONNECTED);
     return false;
+}
+
+/* apphost has no Muse: every ask's turn ends at once, in the words the gadget uses when Muse isn't set up (muse_chat.h), and its
+ * callback runs on the next `advance` (apphost.c: run_ask). */
+void apps_port_ask(const char *msg, size_t len, void *user) {
+    (void)msg, (void)len;
+    apps_ask_done(user, "not set up");
 }
 
 bool apphost_take_exit(void) {

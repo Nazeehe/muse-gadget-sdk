@@ -134,6 +134,34 @@ size_t muse_hatch_turn_audio_wait(const int16_t *pcm, size_t frames, int wait_ms
 void muse_hatch_text_turn(char *text);
 void muse_hatch_text_cancel(void);
 
+#if CONFIG_MUSE_APPS
+/* ---- Typed turns from Muse apps (CONFIG_MUSE_APPS: muse.ask, components/muse/apps/apps_ask.h) ---- */
+
+/*
+ * Where an app's typed turn sends its reply, in place of the console. Both functions are called on the chat task (done may come at
+ * once on the caller's, below): piece with each piece of the reply's text as it streams in (len bytes, not NUL-terminated; a later
+ * message of the reply starts with a piece of "\n\n", as tools/muse/chat.py joins them), then done once, with err NULL when the
+ * reply is in, or why the turn failed: MUSE_HATCH_SINK_INTERRUPTED (a voice press, or another typed turn, ended it),
+ * MUSE_HATCH_SINK_BUSY (a voice turn runs: refused, as the console's is), MUSE_HATCH_SINK_NOT_SET_UP, or the turn's own words
+ * ("CAN'T REACH MUSE", "NO REPLY FROM MUSE", ...). Nothing of the turn goes to the console. Both functions must be given.
+ */
+typedef struct {
+    void (*piece)(void *user, const char *text, size_t len);
+    void (*done)(void *user, const char *err);
+    void *user;
+} muse_hatch_text_sink_t;
+
+#define MUSE_HATCH_SINK_INTERRUPTED "interrupted"
+#define MUSE_HATCH_SINK_BUSY "busy with a voice turn"
+#define MUSE_HATCH_SINK_NOT_SET_UP "not set up"
+
+/*
+ * As muse_hatch_text_turn, with the reply going to sink (copied) instead of the console. Takes text (malloc'd) and frees it. It never
+ * waits: when the turn can't be queued (Muse not set up, or the chat's queue full: "BUSY"), done comes at once, on the caller's task.
+ */
+void muse_hatch_text_turn_to(char *text, const muse_hatch_text_sink_t *sink);
+#endif
+
 /*
  * Prints one "@chat" line per call (more if `text` is long): the type, then the
  * printf-style `fields` (JSON members, or NULL), then `text` escaped (or none).

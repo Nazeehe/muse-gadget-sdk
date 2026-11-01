@@ -151,6 +151,10 @@ struct cmd_t {
     cmd_type_t type;
     uint32_t gen;
     char *text;              /* CMD_TEXT: malloc'd, freed by the session task */
+#if CONFIG_MUSE_APPS
+    /* CMD_TEXT from an app (muse_hatch_text_turn_to): where its reply goes. None (done NULL) for the console's. */
+    muse_hatch_text_sink_t sink{};
+#endif
 };
 
 struct ev_t {
@@ -260,6 +264,12 @@ struct turn_t {
     resampler_t down;
     int kbps;
     int down_rate;
+#if CONFIG_MUSE_APPS
+    /* An app's typed turn (text_to): where its reply goes, in place of the console; and the message its last piece was of, plus
+     * one (0 before the first piece). */
+    muse_hatch_text_sink_t sink;
+    int sink_msg;
+#endif
 };
 
 /* 10 KB, most of it the MP3 decoder: in PSRAM on boards that let static data go
@@ -990,9 +1000,49 @@ static void turn_finish(void)
     s_turn.mp3_len = 0;
 }
 
+#if CONFIG_MUSE_APPS
+/* ---- An app's typed turn (muse.ask: muse_hatch_text_turn_to) ----
+ *
+ * It is a typed turn whose reply goes to the app's sink instead of the console: its text pieces, then its end, once. A voice press
+ * ends it and a voice turn refuses it, as they do the console's, and nothing of it is printed. */
+
+/* The sink text_to gives the turn that turn_start begins next. */
+static muse_hatch_text_sink_t s_next_sink;
+
+/* An app's typed turn ends: its sink hears it once, err NULL when the reply is in, in muse_chat.h's words. */
+static void sink_end(const char *why)
+{
+    muse_hatch_text_sink_t sink = s_turn.sink;
+    s_turn.sink = {};
+    if (why && !strcmp(why, "INTERRUPTED")) {
+        why = MUSE_HATCH_SINK_INTERRUPTED;
+    } else if (why && !strcmp(why, "MUSE NOT SET UP")) {
+        why = MUSE_HATCH_SINK_NOT_SET_UP;
+    }
+    sink.done(sink.user, why);
+}
+
+/* A piece of an app's typed turn's reply, of message i: a later message starts with a blank line, as tools/muse/chat.py joins them. */
+static void sink_piece(int i, const char *text, size_t len)
+{
+    if (s_turn.sink_msg && s_turn.sink_msg != i + 1) {
+        s_turn.sink.piece(s_turn.sink.user, "\n\n", 2);
+    }
+    s_turn.sink_msg = i + 1;
+    s_turn.sink.piece(s_turn.sink.user, text, len);
+}
+#endif
+
 static void turn_fail(const char *why)
 {
     ESP_LOGW(TAG, "turn failed: %s", why);
+#if CONFIG_MUSE_APPS
+    if (s_turn.sink.done) {
+        sink_end(why);   /* an app's typed turn: its sink, not the console */
+        turn_finish();
+        return;
+    }
+#endif
     if (s_turn.text) {
         muse_hatch_console("error", why, nullptr);
     }
@@ -1003,6 +1053,13 @@ static void turn_fail(const char *why)
 /* Ends the turn once its reply is in; `complete` is false when it was cut off. */
 static void turn_done(bool complete)
 {
+#if CONFIG_MUSE_APPS
+    if (s_turn.sink.done) {
+        sink_end(nullptr);   /* an app's typed turn: the reply is in, as far as it came (complete is false at the turn's cap) */
+        turn_finish();
+        return;
+    }
+#endif
     if (s_turn.text) {
         muse_hatch_console("done", nullptr, "\"messages\":%d,\"complete\":%s", s_turn.nmsgs,
                            complete ? "true" : "false");
@@ -1030,6 +1087,10 @@ static bool turn_start(uint32_t gen, bool text)
     s_turn.texts = texts;
     s_turn.gen = gen;
     s_turn.text = text;
+#if CONFIG_MUSE_APPS
+    s_turn.sink = s_next_sink;   /* an app's typed turn (text_to): its sink; none for the console's or a voice turn */
+    s_next_sink = {};
+#endif
     s_turn.tts_msg = -1;
     memset(s_marks, 0, sizeof(s_marks));
     s_reply_shown[0] = '\0';
@@ -1256,9 +1317,28 @@ static void text_begin(const char *text)
     send_chat(text, "text");
     if (s_turn.phase == P_WAIT_REPLY) {
         mark(M_SENT);
+#if CONFIG_MUSE_APPS
+        if (s_turn.sink.done) {
+            return;   /* an app's typed turn says nothing on the console */
+        }
+#endif
         muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(text));
     }
 }
+
+#if CONFIG_MUSE_APPS
+/* An app's typed turn (muse_hatch_text_turn_to): refused while a voice turn runs, as the console's is; otherwise a typed turn whose
+ * reply goes to sink. */
+static void text_to(const char *text, const muse_hatch_text_sink_t &sink)
+{
+    if (s_turn.phase != P_IDLE && !s_turn.text) {
+        sink.done(sink.user, MUSE_HATCH_SINK_BUSY);
+        return;
+    }
+    s_next_sink = sink;
+    text_begin(text);
+}
+#endif
 
 static void on_dictation_line(cJSON *line)
 {
@@ -1405,6 +1485,17 @@ static void message_done(int i, const char *final_text)
     }
     m.done = true;
     mark(M_DONE);
+#if CONFIG_MUSE_APPS
+    if (s_turn.sink.done) {
+        /* An app's typed turn: a message that came whole, with no pieces, is one piece now (the sink only adds). */
+        if (!m.len && final_text && final_text[0]) {
+            m.len = strlen(final_text);
+            sink_piece(i, final_text, m.len);
+        }
+        ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)m.len);
+        return;
+    }
+#endif
     if (s_turn.text) {
         /* The whole text if the pieces didn't add up to it (a line skipped, say): the reader uses it instead. */
         size_t n = m.len;
@@ -1465,6 +1556,11 @@ static void on_event(cJSON *line)
         } else if (status) {
             s_turn.agent_busy = status[0] && strcmp(status, "completed") && strcmp(status, "failed");
         }
+#if CONFIG_MUSE_APPS
+        if (s_turn.sink.done) {
+            was = s_turn.agent_busy;   /* an app's typed turn says nothing on the console */
+        }
+#endif
         if (s_turn.text && s_turn.agent_busy != was) {
             muse_hatch_console("busy", nullptr, "\"on\":%s", s_turn.agent_busy ? "true" : "false");
         }
@@ -1487,6 +1583,14 @@ static void on_event(cJSON *line)
     msg_t &m = s_turn.msgs[i];
     if (append) {
         const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "text"));
+#if CONFIG_MUSE_APPS
+        if (text && text[0] && s_turn.sink.done) {
+            mark(M_TEXT);
+            m.len += strlen(text);
+            sink_piece(i, text, strlen(text));   /* an app's typed turn: to its sink, not the console */
+            return;
+        }
+#endif
         if (text && text[0] && s_turn.text) {
             mark(M_TEXT);
             m.len += strlen(text);
@@ -1995,6 +2099,13 @@ static void handle(const cmd_t &cmd)
         }
         break;
     case CMD_TEXT:
+#if CONFIG_MUSE_APPS
+        if (cmd.sink.done) {
+            text_to(cmd.text, cmd.sink);   /* an app's */
+            free(cmd.text);
+            break;
+        }
+#endif
         if (s_turn.phase != P_IDLE && !s_turn.text) {
             muse_hatch_console("error", "BUSY WITH A VOICE TURN", nullptr);
         } else {
@@ -2273,6 +2384,22 @@ extern "C" void muse_hatch_text_cancel(void)
 {
     post(CMD_TEXT_CANCEL, 0);
 }
+
+#if CONFIG_MUSE_APPS
+/* An app's typed turn (muse.ask): as muse_hatch_text_turn, its reply to sink. The app task calls it inside a call of the app, so it
+ * never waits: a refusal is the sink's done, at once. */
+extern "C" void muse_hatch_text_turn_to(char *text, const muse_hatch_text_sink_t *sink)
+{
+    cmd_t cmd{ CMD_TEXT, 0, text, *sink };
+    if (!s_cmds || !muse_hatch_configured()) {
+        free(text);
+        sink->done(sink->user, MUSE_HATCH_SINK_NOT_SET_UP);
+    } else if (xQueueSend(s_cmds, &cmd, 0) != pdTRUE) {
+        free(text);
+        sink->done(sink->user, "BUSY");
+    }
+}
+#endif
 
 extern "C" muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap)
 {

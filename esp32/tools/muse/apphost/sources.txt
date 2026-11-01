@@ -15,6 +15,7 @@ components/muse/apps/apps_ui.c
 components/muse/apps/apps_svc.c
 components/muse/apps/apps_alarm.c
 components/muse/apps/apps_vmio.c
+components/muse/apps/apps_ask.c
 tools/muse/apphost/apphost.c
 tools/muse/apphost/apphost_esp.c
 tools/muse/apphost/apphost_port.c

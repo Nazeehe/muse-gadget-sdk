@@ -115,8 +115,8 @@
  *                         second included); otherwise `sys.show: allowed only in message() or alarm(), or within 10 s of a tap`
  *   sys.keep_awake(on)    true keeps the screen lit while the app is in front, false lets it sleep again. Needs the "keep_awake"
  *                         permission: `sys: add "keep_awake" to "permissions" in manifest.json`; on must be true or false
- *   sys.has(name)         whether the gadget has that module: true for ui time timer alarm store sound json sys vm, false for any
- *                         other name (net, secrets and muse aren't there yet; nor is log). name must be a string
+ *   sys.has(name)         whether the gadget has that module: true for ui time timer alarm store sound json sys vm muse, false for
+ *                         any other name (net and secrets aren't there yet; nor is log). name must be a string
  *   sys.api               1, the api of manifest.json it speaks
  *   sys.mem()             {used_kb, peak_kb, limit_kb} of the Lua heap (rounded up, as the status has them), limit_kb the manifest's
  *   sys.exit()            the app ends once this callback has returned: it runs to its end, stop() runs, the store is saved
@@ -127,8 +127,8 @@
 
 typedef struct lua_State lua_State;
 
-/* Installs `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` into L's globals, and the `vm` module beside them (apps_vmio.h:
- * apps_vmio_open), for the app of rt, which must outlive L. It runs under lua_pcall, so a
+/* Installs `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` into L's globals, and the `vm` and `muse` modules beside them
+ * (apps_vmio.h: apps_vmio_open; apps_ask.h: apps_ask_open), for the app of rt, which must outlive L. It runs under lua_pcall, so a
  * heap that refuses ends the app out of memory at its next call rather than aborting. Called by apps_rt_new, before
  * main.lua's top level runs. */
 void apps_svc_open(lua_State *L, apps_rt_t *rt);

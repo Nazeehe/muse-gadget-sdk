@@ -44,7 +44,7 @@ TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_console_harness.c"
 SOURCES = [HARNESS, APPS / "apps_console.c", APPS / "apps_install.c", APPS / "apps_pkg.c", APPS / "apps_json.c",
            APPS / "apps_vm.c", APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_svc.c",
-           APPS / "apps_vmio.c", APPS / "apps_control.c", APPS / "apps_result.c", ROOT / "tools/muse/apphost/sha256.c"]
+           APPS / "apps_vmio.c", APPS / "apps_ask.c", APPS / "apps_control.c", APPS / "apps_result.c", ROOT / "tools/muse/apphost/sha256.c"]
 
 # The files the firmware embeds for app.api (components/muse/CMakeLists.txt's EMBED_FILES), as the symbols IDF makes of their
 # names: _binary_<name>_start and _end.

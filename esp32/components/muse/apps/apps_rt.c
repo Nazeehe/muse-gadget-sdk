@@ -45,6 +45,7 @@
 #include "apps_svc.h"
 #include "apps_ui.h"
 #include "apps_vm.h"
+#include "apps_ask.h"
 #include "apps_vmio.h"
 #include "lauxlib.h"
 #include "lua.h"
@@ -151,6 +152,8 @@ struct apps_rt {
     uint32_t image_gen;
     /* The vm module's books (apps_vmio.h), in this block after the struct (RT_BLOCK): their size is apps_vmio.c's. */
     apps_vmio_t *vmio;
+    /* The muse module's (apps_ask.h): the ask that waits, and its callback's reference. */
+    apps_ask_app_t ask;
     /* apps_vm_call writes its error here. It is the crash record while the state is CRASHED (and nothing runs
      * after that), and the scratch of a call that fails the message alone otherwise. */
     char err[APPS_ERROR_MAX];
@@ -525,12 +528,13 @@ static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t b
 }
 
 /* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. Its timers go, its vm callbacks and
- * requests too, and what it had written to its store is saved. */
+ * requests too, its ask's callback (the turn is let go of), and what it had written to its store is saved. */
 static void crash(apps_rt_t *rt) {
     apps_text_clean(rt->err, strlen(rt->err), true);
     rt->state = APPS_STATE_CRASHED;
     timers_disarm(rt);
     apps_vmio_release(rt->vmio, apps_vm_lua(rt->vm));
+    apps_ask_release(&rt->ask, apps_vm_lua(rt->vm));
     store_flush_final(rt);
 }
 
@@ -1046,6 +1050,7 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
     memset(rt, 0, sizeof *rt);
     rt->vmio = (apps_vmio_t *)((char *)rt + RT_BLOCK);
     apps_vmio_init(rt->vmio, rt);
+    apps_ask_init(&rt->ask);
     rt->pkg = pkg;
     rt->state = APPS_STATE_STOPPED;
     for (int h = 0; h < H_COUNT; h++) {
@@ -1168,6 +1173,7 @@ void apps_rt_stop(apps_rt_t *rt) {
         rt->state = APPS_STATE_STOPPED;
         timers_disarm(rt);
         apps_vmio_release(rt->vmio, apps_vm_lua(rt->vm));  /* no vm callback runs after stop(), and no request goes */
+        apps_ask_release(&rt->ask, apps_vm_lua(rt->vm));    /* nor an ask's: its turn is let go of */
         store_flush_final(rt);  /* what stop() wrote too */
     }
 }
@@ -1779,6 +1785,7 @@ void apps_rt_free(apps_rt_t *rt) {
         store_clear(rt);
         apps_port_free(rt->store);
         apps_vmio_free(rt->vmio);  /* the requests and results it still holds (a job at the worker comes back to a freed app, and goes) */
+        apps_ask_free(&rt->ask);   /* an ask's turn is let go of: its end comes back to nobody, and goes */
         /* The VM goes first: no app code runs after it, so no handle to the table is left to use. */
         apps_vm_free(rt->vm);
         apps_ui_free(rt->ui);
@@ -1837,6 +1844,17 @@ apps_ui_t *apps_rt_ui(apps_rt_t *rt) {
 
 apps_vmio_t *apps_rt_vmio(const apps_rt_t *rt) {
     return rt != NULL ? rt->vmio : NULL;
+}
+
+apps_ask_app_t *apps_rt_ask(const apps_rt_t *rt) {
+    return rt != NULL ? (apps_ask_app_t *)&rt->ask : NULL;
+}
+
+bool apps_rt_tapped(const apps_rt_t *rt, int64_t *at_ms) {
+    if (rt->touched) {
+        *at_ms = rt->touch_ms;
+    }
+    return rt->touched;
 }
 
 bool apps_rt_callback(apps_rt_t *rt, int (*fn)(lua_State *L), void *arg) {

@@ -2096,7 +2096,7 @@ class SysTest(DeviceTestCase):
         ])
 
     def test_sys_has_api_mem(self):
-        names = ["ui", "time", "timer", "alarm", "store", "sound", "json", "sys", "vm", "net", "secrets", "muse", "log", "os",
+        names = ["ui", "time", "timer", "alarm", "store", "sound", "json", "sys", "vm", "muse", "net", "secrets", "log", "os",
                  "string", "math", "bogus", ""]
         run = self.device_app("""
             function app.message(event, data)
@@ -2111,7 +2111,7 @@ class SysTest(DeviceTestCase):
             end
         """, manifest={"memory_kb": 256}, script=["message names " + json.dumps(names)])
         reply = replies(run)[0]
-        self.assertEqual(reply["has"], [True] * 9 + [False] * 9)  # ui time timer alarm store sound json sys vm, and nothing else
+        self.assertEqual(reply["has"], [True] * 10 + [False] * 8)  # ui time timer alarm store sound json sys vm muse, nothing else
         self.assertEqual((reply["api"], reply["api_type"]), (1, "integer"))
         before, after, later = reply["before"], reply["after"], reply["later"]
         for mem in (before, after, later):

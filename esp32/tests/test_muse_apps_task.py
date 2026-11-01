@@ -42,6 +42,7 @@ HARNESS = TESTS / "muse_apps_task_harness.c"
 SOURCES = [HARNESS, TESTS / "muse_apps_fake_esp_timer.c", APPS / "apps_task.c", APPS / "apps_io.c", APPS / "apps_alarm.c",
            APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c", APPS / "apps_pkg.c",
            APPS / "apps_suggest.c", APPS / "apps_svc.c", APPS / "apps_vmio.c", APPS / "apps_net.c", APPS / "apps_jpeg.c",
+           APPS / "apps_ask.c",
            TESTS / "fake_tjpgd.c"]
 CONSOLE_SOURCES = [APPS / "apps_console.c", APPS / "apps_install.c", APPS / "apps_result.c"]
 
@@ -149,6 +150,12 @@ class AppTaskTest(HarnessCase):
 
     def test_a_vm_result_for_an_ended_app_is_dropped(self):  # Review Focus 1: freed by its generation, never run
         self.run_case("vm_result_for_an_ended_app_is_dropped")
+
+    def test_an_ask_comes_back_by_its_event(self):  # Task 4 (P29): APPS_EV_ASK_DONE, no wait; the line, then the callback
+        self.run_case("an_ask_comes_back_by_its_event")
+
+    def test_an_ask_result_for_an_ended_app_is_dropped(self):  # Review Focus 1: freed, never run
+        self.run_case("ask_result_for_an_ended_app_is_dropped")
 
     def test_vm_watches_pause_behind_or_dark(self):  # Review Focus 4: the app task's own "in front and lit"
         self.run_case("vm_watch_pauses_behind_or_dark", timeout=180)

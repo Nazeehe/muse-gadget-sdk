@@ -31,6 +31,7 @@
 #include "freertos/task.h"
 
 #include "apps_alarm.h"
+#include "apps_ask.h"
 #include "apps_io.h"
 #include "apps_json.h"
 #include "apps_lv.h"
@@ -223,6 +224,7 @@ static atomic_bool s_alarm_posted;     /* the esp_timer task posted APPS_EV_ALAR
 static atomic_bool s_list_changed;     /* the store gave a new list: the LVGL task shows the launcher again if it is up */
 static atomic_bool s_vm_posted;        /* the network worker posted APPS_EV_VM_DONE and the loop hasn't taken the results since */
 static atomic_uint s_vm_gen;           /* the app whose vm requests are wanted (its app_gen), 0 when none: the worker skips the rest */
+static atomic_bool s_ask_posted;       /* a turn's end posted APPS_EV_ASK_DONE and the loop hasn't taken the results since */
 
 /* ---- The app task's own ---- (plain state of one task: PSRAM, I2) */
 
@@ -1231,8 +1233,8 @@ static void handle(const apps_event_t *ev) {
         on_alarm_launch(ev->code, ev->app_gen);
         break;
     default:
-        break;  /* WAKE: the round's housekeeping is the work. ALARM too: deliver_alarms, every round, is the delivery. VM_DONE too:
-                 * housekeeping took the results (take_vm_results). */
+        break;  /* WAKE: the round's housekeeping is the work. ALARM too: deliver_alarms, every round, is the delivery. VM_DONE and
+                 * ASK_DONE too: housekeeping took the results (take_vm_results, take_ask_results). */
     }
 }
 
@@ -1423,6 +1425,24 @@ static bool vm_alive(uint32_t app_gen) {
     return app_gen != 0 && atomic_load(&s_vm_gen) == app_gen;
 }
 
+/* A muse.ask turn has ended (apps_ask.h, on the chat task, or at once on this one when it couldn't go): APPS_EV_ASK_DONE, posted as
+ * VM_DONE is: once while the loop hasn't taken the results, never into the last REQ_ROOM slots, and never waiting. A post that doesn't
+ * go in loses nothing: the result waits on the module's list for the round that comes within a second. */
+static void ask_done(void) {
+    if (atomic_exchange(&s_ask_posted, true)) {
+        return;
+    }
+    apps_event_t ev = {.type = APPS_EV_ASK_DONE};
+    if (!(uxQueueSpacesAvailable(s_queue) > REQ_ROOM && xQueueSend(s_queue, &ev, 0) == pdTRUE)) {
+        atomic_store(&s_ask_posted, false);
+    }
+}
+
+/* An ask's one line (its outcome, never its text or its reply's), on this task, under the apps' tag. */
+static void ask_log(const char *line) {
+    ESP_LOGI(TAG, "%s", line);
+}
+
 bool apps_task_vm_submit(struct apps_vm_job *job) {
     job->app_gen = T.gen;
     if (apps_net_submit(job)) {
@@ -1474,6 +1494,17 @@ static void take_vm_results(void) {
     }
 }
 
+/* The muse module's results (apps_ask.h): each goes to the app that runs, which keeps it only while its ask waits for it; any other (an
+ * app that has ended, an ask that timed out) is freed and never runs (Review Focus 1). Every round, so a lost post loses nothing. */
+static void take_ask_results(void) {
+    atomic_store(&s_ask_posted, false);  /* before the take: a result after it posts again */
+    for (apps_ask_result_t *r = apps_ask_results(); r != NULL;) {
+        apps_ask_result_t *next = r->next;
+        apps_ask_take(app_runs(T.gen) ? T.rt : NULL, r);
+        r = next;
+    }
+}
+
 static void housekeeping(void) {
     if (atomic_load(&s_rec->hung)) {
         abandon();  /* marked when its call had already come back */
@@ -1481,6 +1512,7 @@ static void housekeeping(void) {
     roll_window();
     free_parked();
     take_vm_results();
+    take_ask_results();
     try_publish();
     if (T.pending != NULL && apps_port_mono_ms() >= T.settle_until) {
         finish_run();
@@ -1528,6 +1560,8 @@ static int receive_ms(void) {
         int64_t due = apps_rt_next_deadline(T.rt);
         int64_t vm_due = apps_vmio_next_deadline(T.rt);  /* a callback that waits, a poll, a command's time */
         due = vm_due < due ? vm_due : due;
+        int64_t ask_due = apps_ask_next_deadline(T.rt);  /* an ask's callback that waits, or its time (P19) */
+        due = ask_due < due ? ask_due : due;
         if (due != INT64_MAX) {
             int64_t until = due - now < 1 ? 1 : due - now;
             wait = until < wait ? until : wait;
@@ -1578,6 +1612,20 @@ static void run_vm(void) {
     }
 }
 
+/* The muse module's round (P19): an ask whose time has run out is let go of, then one callback that waits, a call of the app like any
+ * other, behind or in front, lit or dark. */
+static void run_ask(void) {
+    if (T.rt == NULL || T.abandoned || apps_rt_state(T.rt) != APPS_STATE_RUNNING) {
+        return;
+    }
+    apps_ask_tick(T.rt, apps_port_mono_ms());
+    if (apps_ask_has_work(T.rt)) {
+        call_begin();
+        (void)apps_ask_run_one(T.rt);
+        (void)call_end();
+    }
+}
+
 static void apps_task(void *arg) {
     (void)arg;
     apps_io_register_op_task();  /* the store's loads and saves are ops of the I/O worker, and only this task submits them (apps_io.h) */
@@ -1597,6 +1645,7 @@ static void apps_task(void *arg) {
         T.run_alarm = false;  /* the delivery round that followed a run for alarms is over: a crash from here on is only a crash */
         run_timers();
         run_vm();
+        run_ask();
     }
 }
 
@@ -2424,6 +2473,7 @@ esp_err_t muse_apps_start(void) {
     apps_io_set_first(apps_store_mount_once);  /* the worker mounts the store before its first job or op (apps_store.h) */
     apps_values_init();  /* the lock of the write budget and of the failures' notices, before the worker or this task runs */
     apps_net_init(vm_done, vm_alive);  /* the network worker's hooks: it is made by the first vm request */
+    apps_ask_setup(ask_done, ask_log);  /* the muse module's: before any app runs */
     if (!console_added) {
         /* Even if the task can't be made below: the console then says that Muse apps aren't running. */
         muse_input_add_console_hook(muse_apps_console);

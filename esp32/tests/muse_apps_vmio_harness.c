@@ -45,6 +45,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "apps_ask.h"
 #include "apps_net.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
@@ -747,6 +748,12 @@ bool apps_port_vm_submit(struct apps_vm_job *job) {
     }
     atomic_fetch_add(&submitted, 1);
     return true;
+}
+
+/* No Muse here (tests/muse_apps_ask_harness.c is the muse module's): an ask's turn ends at once, as apphost's does. */
+void apps_port_ask(const char *msg, size_t len, void *user) {
+    (void)msg, (void)len;
+    apps_ask_done(user, "not set up");
 }
 
 static bool vm_alive(uint32_t app_gen) {

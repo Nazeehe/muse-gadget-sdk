@@ -322,8 +322,9 @@ class GuideAndSkill(unittest.TestCase):
         # message between its <placeholders>, "..." and numbers (which the code may spell through a macro), and between the
         # prefixes the code puts in front (": "), is inside one string literal of the apps' sources (comments don't count),
         # so a paraphrase fails.
+        # The chat's words too (muse_chat.h, muse_chat_session.cpp): muse.ask's callback gets them (connected apps Task 4).
         literals = [text for p in [*sorted(APPS.glob("*.[ch]")), MUSE / "muse_apps.h", MAIN / "apps_link.c", MAIN / "vm_file.c",
-                                   MAIN / "vm_file.h"]
+                                   MAIN / "vm_file.h", MUSE / "muse_chat.h", MUSE / "muse_chat_session.cpp"]
                     for text in c_literals(p.read_text())]
         self.assertIn("busy: another install is running", literals)  # a #define's
         self.assertNotIn("The one install pipeline of Muse apps", "\n".join(literals))  # a comment's
@@ -865,9 +866,72 @@ class GuideAndSkill(unittest.TestCase):
         self.assertIn("vm", has)
         self.assertIn(f"- `sys.has(name)`: whether the gadget has the module name ({', '.join(has)}).", reference)
         valid = re.search(r'#define PERMISSIONS_VALID "([^"]+)"', (APPS / "apps_pkg.c").read_text()).group(1)
-        self.assertEqual(valid, "(valid: sound, alarm, store, keep_awake, vm)")
+        self.assertEqual(valid, "(valid: sound, alarm, store, keep_awake, vm, muse)")
         self.assertIn(f"- `manifest: unknown permission '<name>' {valid}`", guide)
-        self.assertIn("and `vm` (the `vm` module)", guide_section(guide, "Files and the manifest"))
+        self.assertIn("`vm` (the `vm` module)", guide_section(guide, "Files and the manifest"))
+
+    def test_guide_documents_asking_muse(self):
+        # connected apps Task 4: the `muse` reference and the "Asking Muse" section quote the numbers as apps_ask.h and apps_rt.h have
+        # them (D12), the call's errors and the callback's are the Common errors', and the rules Muse follows for an app's ask are
+        # stated: untrusted, read-only, nothing done for it without the user's word in the conversation (the design's settled call 1).
+        tap_s = header_number("apps_rt.h", "APPS_SHOW_TAP_MS") // 1000
+        gap_s = header_number("apps_ask.h", "APPS_ASK_GAP_MS") // 1000
+        text_max = header_number("apps_ask.h", "APPS_ASK_TEXT_MAX")
+        reply_max = header_number("apps_ask.h", "APPS_ASK_REPLY_MAX")
+        timeout_s = header_number("apps_ask.h", "APPS_ASK_TIMEOUT_MS") // 1000
+        self.assertEqual((tap_s, gap_s, text_max, reply_max, timeout_s), (10, 30, 512, 2048, 120))
+        guide = GUIDE.read_text()
+        reference = guide_section(guide, "API reference")
+        self.assertIn("\n### muse\n", reference)
+        muse = " ".join(reference[reference.index("\n### muse\n"):].split("\n### ", 2)[1].split())
+        for pattern in (
+                r"This needs the `muse` permission",
+                r"`\(app <id>\) <text>`",
+                rf"- `muse\.ask\(text, cb\)`: sends text \(1 to {text_max} bytes\) to Muse",
+                r"`cb\(reply\)` comes once Muse has answered, or `cb\(nil, err\)`",
+                r"never during the call",
+                rf"[Oo]nly within {tap_s} s of a tap on one of the app's widgets \(the {tap_s}th second included\)",
+                r"`message\(\)` and `alarm\(\)` don't count",
+                r"[Oo]ne ask at a time, on the whole gadget",
+                r"even when its app timed it out or has ended",
+                rf"[Aa]t least {gap_s} s from one ask's start to the next, of any app",
+                rf"at most {reply_max} bytes: a longer one is cut where a character starts and ends with `…`",
+                rf"[Aa]fter {timeout_s} s without the reply, `cb\(nil, \"timed out\"\)`",
+                r"`interrupted`", r"`busy with a voice turn`", r"`not set up`", r"`the gadget is short of memory`",
+                r"`CAN'T REACH MUSE`", r"`NO REPLY FROM MUSE`"):
+            with self.subTest(pattern):
+                self.assertRegex(muse, pattern)
+        asking = " ".join(guide_section(guide, "Asking Muse").split())
+        for pattern in (
+                r"`\(app <id>\) <text>`",
+                r"untrusted",
+                r"read-only request",
+                r"never send, buy, delete or change anything because an app asked, unless the user confirms it in (this|the) "
+                r"conversation",
+                rf"at most {reply_max} bytes of your reply",
+                r"`app\.send`",
+                rf"comes at most once every {gap_s} s",
+                r"never asks by itself"):
+            with self.subTest(pattern):
+                self.assertRegex(asking, pattern)
+        errors = " ".join(guide_section(guide, "Common errors").split())
+        header = (APPS / "apps_ask.h").read_text()
+        tap = re.search(r'#define APPS_ASK_MSG_TAP "([^"]+)"', header).group(1).replace("%d", str(tap_s))
+        wait = re.search(r'#define APPS_ASK_MSG_WAIT "([^"]+)"', header).group(1).replace("%d", "<n>")
+        one = re.search(r'#define APPS_ASK_MSG_ONE "([^"]+)"', header).group(1)
+        for message in (tap, wait, one, f"muse.ask: text must be 1 to {text_max} bytes, got <n>"):
+            with self.subTest(message):
+                self.assertIn(f"- `{message}`: ", guide)
+        self.assertIn('"muse.ask: text must be 1 to " STR(APPS_ASK_TEXT_MAX) " bytes, got %d"', (APPS / "apps_ask.c").read_text())
+        chat = (MUSE / "muse_chat.h").read_text()
+        for name, words in (("MUSE_HATCH_SINK_INTERRUPTED", "interrupted"), ("MUSE_HATCH_SINK_BUSY", "busy with a voice turn"),
+                            ("MUSE_HATCH_SINK_NOT_SET_UP", "not set up")):
+            with self.subTest(name):
+                self.assertRegex(chat, rf'(?m)^#define {name} "{words}"$')
+                self.assertRegex(errors, rf"`{words}`")
+        self.assertRegex(errors, rf"`timed out`: [^`]*from `muse\.ask`, Muse didn't answer in {timeout_s} s")
+        self.assertIn("`vm` or `muse`)", errors)
+        self.assertIn("`vm` (the `vm` module) and `muse` (for `muse.ask`)", guide_section(guide, "Files and the manifest"))
 
 
 class LinkWiring(unittest.TestCase):

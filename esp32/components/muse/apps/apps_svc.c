@@ -28,6 +28,7 @@
 #include <time.h>
 
 #include "apps_alarm.h"
+#include "apps_ask.h"
 #include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
@@ -837,7 +838,7 @@ static int sys_keep_awake(lua_State *L) {
 }
 
 /* The gadget's own modules, what sys.has says yes to: not Lua's libraries, and none of the ones that aren't there yet. */
-static const char *const HAS[] = {"ui", "time", "timer", "alarm", "store", "sound", "json", "sys", "vm"};
+static const char *const HAS[] = {"ui", "time", "timer", "alarm", "store", "sound", "json", "sys", "vm", "muse"};
 
 /* sys.has(name): whether the gadget has the module of that name. */
 static int sys_has(lua_State *L) {
@@ -1013,6 +1014,7 @@ static int open_svc(lua_State *L) {
     lua_setglobal(L, "sys");
 
     apps_vmio_open(L, rt);  /* `vm` and its watch handle's metatable */
+    apps_ask_open(L, rt);   /* `muse` (apps_ask.h) */
     return 0;
 }
 

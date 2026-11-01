@@ -45,6 +45,7 @@
 #endif
 
 #include "apps_alarm.h"
+#include "apps_ask.h"
 #include "apps_echo.h"
 #include "apps_io.h"
 #include "apps_pkg.h"
@@ -53,6 +54,8 @@
 #include "apps_task.h"
 #include "apps_values.h"
 #include "muse_apps_task_fakes.h"
+#include "sdkconfig.h"  /* muse_chat.h's app turns are under CONFIG_MUSE_APPS, which it doesn't include */
+#include "muse_chat.h"
 #include "muse_sntp.h"
 #include "muse_state.h"
 #include "muse_ui.h"
@@ -645,6 +648,30 @@ static bool vm_submit_answer = true;
 bool apps_task_vm_submit(struct apps_vm_job *job) {
     vm_submitted = job;
     return vm_submit_answer;
+}
+
+/* muse.ask's turns (connected apps Task 4): the chat's typed turn, and the module's sink, as the port hands them on. */
+static int turns, ask_dones;
+static char turn_text[64];
+static muse_hatch_text_sink_t turn_sink;
+static void *done_user;
+static char done_err[64];
+
+void muse_hatch_text_turn_to(char *text, const muse_hatch_text_sink_t *sink) {
+    turns++;
+    snprintf(turn_text, sizeof turn_text, "%s", text);
+    turn_sink = *sink;
+    heap_caps_free(text);  /* the session's free(), which takes any heap's block */
+}
+
+void apps_ask_piece(void *user, const char *text, size_t len) {
+    (void)user, (void)text, (void)len;
+}
+
+void apps_ask_done(void *user, const char *err) {
+    ask_dones++;
+    done_user = user;
+    snprintf(done_err, sizeof done_err, "%s", err != NULL ? err : "(null)");
 }
 
 static int restamps;
@@ -2291,11 +2318,32 @@ static void show_keep_awake_and_exit_go_to_the_app_task(void) {
     CHECK(!apps_port_vm_submit(job), "and its refusal comes back");
 }
 
+/* muse.ask (connected apps Task 4): the port copies the text into a PSRAM block of its own, NUL-terminated, and hands it to the chat as a
+ * typed turn whose sink is the module's, carrying the ask's generation; a copy the heap refuses ends the ask at once, short of memory. */
+static void ask_sends_a_typed_turn(void) {
+    int held = live_blocks();
+    int internal = atomic_load(&internal_requests);
+    static const char msg[] = "(app tally) hi there";
+    apps_port_ask(msg, 13, (void *)(uintptr_t)7);
+    CHECK(turns == 1 && strcmp(turn_text, "(app tally) h") == 0, "%d turns, '%s'", turns, turn_text);
+    CHECK(turn_sink.piece == apps_ask_piece && turn_sink.done == apps_ask_done && turn_sink.user == (void *)(uintptr_t)7,
+          "the module's sink, with the ask's generation");
+    CHECK(atomic_load(&internal_requests) == internal, "the copy asked for internal RAM");
+    CHECK(live_blocks() == held, "the copy leaked: %d blocks, %d before", live_blocks(), held);
+    CHECK(ask_dones == 0, "the sink's done came for a turn that went");
+    alloc_fail_in = 0;
+    apps_port_ask(msg, sizeof msg - 1, (void *)(uintptr_t)8);
+    CHECK(turns == 1, "a turn went without its copy");
+    CHECK(ask_dones == 1 && done_user == (void *)(uintptr_t)8 && strcmp(done_err, "the gadget is short of memory") == 0, "%d, '%s'",
+          ask_dones, done_err);
+}
+
 static const struct {
     const char *name;
     void (*run)(void);
 } CASES[] = {
     {"echo_bucket", echo_bucket},
+    {"ask_sends_a_typed_turn", ask_sends_a_typed_turn},
     {"echo_lines", echo_lines},
     {"echo_queues_until_the_drain", echo_queues_until_the_drain},
     {"echo_queue_is_bounded", echo_queue_is_bounded},

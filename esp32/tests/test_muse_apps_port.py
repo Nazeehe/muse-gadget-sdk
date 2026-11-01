@@ -57,7 +57,7 @@ def stage_fakes(directory):
         (directory / name).write_text('#include "muse_apps_task_fakes.h"\n')
     (directory / "psa").mkdir(parents=True, exist_ok=True)
     (directory / "psa/crypto.h").write_text(PSA)
-    (directory / "sdkconfig.h").write_text("#define CONFIG_SPIRAM 1\n")
+    (directory / "sdkconfig.h").write_text("#define CONFIG_SPIRAM 1\n#define CONFIG_MUSE_APPS 1\n")
     return directory
 
 
@@ -170,6 +170,9 @@ class AppPortTest(unittest.TestCase):
 
     def test_show_keep_awake_and_exit_are_the_app_tasks(self):  # C10, C11
         self.run_case("show_keep_awake_and_exit_go_to_the_app_task")
+
+    def test_ask_sends_a_typed_turn(self):  # connected apps Task 4: a PSRAM copy, the module's sink; a refused copy ends the ask
+        self.run_case("ask_sends_a_typed_turn")
 
     # ---- Task 20: the values' backend picked by the store's mode, its failures, the alarms' records ----
 

@@ -166,3 +166,313 @@ int main(int argc, char **argv) {
 
     def test_rejection_capacity_preserves_correlation(self):
         self.run_case(2)
+
+
+# The production typed-turn code (turn_start, turn_fail, turn_done, text_begin, the reply's handlers and, with the apps, the app's sink
+# and muse_hatch_text_turn_to), built with CONFIG_MUSE_APPS off and on, over host stubs of the rest of the session. The console's
+# muse_hatch_console records every line it is given.
+TYPED_TURNS = r'''
+#include <cassert>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+#include "host_compat.h"
+#include "cJSON.h"
+#include "minimp3.h"
+#include "muse_chat_priv.h"
+#define ESP_LOGI(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
+@CONSTANTS@
+@COMMANDS@
+@TYPES@
+static turn_t s_turn;
+static char s_reply_shown[EV_TEXT];
+static int64_t s_last_seq, s_marks[4];
+enum mark_t { M_SENT, M_TEXT, M_DONE };
+static void mark(mark_t) {}
+static int64_t now_us() { return 12345; }
+static std::vector<std::string> said;   /* what the console printed, and what an app's sink heard */
+static void emit(muse_hatch_ev_t, const char *) {}
+void muse_hatch_console(const char *type, const char *text, const char *fields, ...) {
+    char f[256] = "";
+    if (fields) {
+        va_list ap;
+        va_start(ap, fields);
+        vsnprintf(f, sizeof f, fields, ap);
+        va_end(ap);
+    }
+    said.push_back(std::string("console ") + type + " [" + (text ? text : "") + "] " + f);
+}
+void muse_hatch_tail_words(const char *text, char *out, size_t cap) { strlcpy(out, text, cap); }
+bool muse_hatch_caption_at(const char *text, size_t, char *out, size_t cap) { strlcpy(out, text, cap); return text[0]; }
+static void turn_finish() { s_turn.phase = P_IDLE; }
+static bool connects = true, configured = true, chat_fails;
+static bool ensure_connected() { return connects; }
+bool muse_hatch_configured() { return configured; }
+static void resampler_init(resampler_t *, int, int) {}
+@TURNS@
+static void send_chat(const char *, const char *) {
+    s_turn.chat_posted = true;
+    if (chat_fails) {
+        turn_fail("CAN'T REACH MUSE");
+        return;
+    }
+    s_turn.phase = P_WAIT_REPLY;
+}
+@TEXT_BEGIN@
+@HANDLERS@
+static void acked() {
+    s_turn.acked = true;
+    strlcpy(s_turn.user_ids[0], "note", sizeof(s_turn.user_ids[0]));
+}
+static void event(const char *kind, const char *id, const char *parent = "", const char *text = "") {
+    cJSON *root = cJSON_CreateObject(), *payload = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "event");
+    cJSON_AddStringToObject(root, "event", kind);
+    cJSON_AddItemToObject(root, "payload", payload);
+    cJSON_AddStringToObject(payload, "message_id", id);
+    if (parent[0]) cJSON_AddStringToObject(payload, "reply_to_message_id", parent);
+    cJSON_AddStringToObject(payload, "text", text);
+    cJSON_AddStringToObject(payload, "display_text", text);
+    on_event(root);
+    cJSON_Delete(root);
+}
+static void status(const char *code) {
+    cJSON *root = cJSON_CreateObject(), *payload = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "event");
+    cJSON_AddStringToObject(root, "event", "agent.status");
+    cJSON_AddItemToObject(root, "payload", payload);
+    cJSON_AddStringToObject(payload, "activity_code", code);
+    on_event(root);
+    cJSON_Delete(root);
+}
+/* A reply of two messages: pieces that fall short of the first one's whole text, and a second that comes whole, with the agent busy
+ * between. */
+static void reply() {
+    acked();
+    status("thinking");
+    event("delta.message_start", "reply", "note");
+    event("delta.text_append", "reply", "", "Hi ");
+    event("delta.text_append", "reply", "", "there");
+    event("delta.message_done", "reply", "", "Hi there!");
+    status("idle");
+    event("message.assistant", "second", "note", "Bye");
+    turn_done(true);
+}
+/* The console's typed turn, start to end. */
+static void console_turn() {
+    text_begin("hello");
+    reply();
+    text_begin("again");
+    turn_fail("NO REPLY FROM MUSE");
+}
+@APPS@
+int main(int argc, char **argv) {
+    assert(argc == 2);
+    if (!strcmp(argv[1], "console")) {
+        console_turn();
+    } else if (!run_apps(argv[1])) {
+        return 2;
+    }
+    for (const std::string &line : said) {
+        printf("%s\n", line.c_str());
+    }
+}
+'''
+
+# The app's side, in the build with the apps: its sink records what it hears, the chat's queue is a stub that takes one command, and
+# each case prints what was said.
+APPS_CASES = r'''
+static void piece(void *user, const char *text, size_t len) {
+    std::string shown;
+    for (size_t i = 0; i < len; i++) {
+        shown += text[i] == '\n' ? std::string("\\n") : std::string(1, text[i]);
+    }
+    said.push_back(std::string("piece ") + (const char *)user + " [" + shown + "]");
+}
+static void done(void *user, const char *err) {
+    said.push_back(std::string("done ") + (const char *)user + " " + (err ? err : "(null)"));
+}
+static char app_name[] = "app";
+static const muse_hatch_text_sink_t SINK = {piece, done, app_name};
+static void app_turn() {
+    text_to("q", SINK);
+}
+/* muse_hatch_text_turn_to over a stub of the chat's queue. */
+typedef int BaseType_t;
+#define pdTRUE 1
+#define pdFALSE 0
+static int queue_room = 1;
+static cmd_t queued;
+static void *s_cmds = &queue_room;
+static BaseType_t xQueueSend(void *, const cmd_t *cmd, int wait) {
+    assert(wait == 0);   /* it never waits: the app task calls it inside a call */
+    if (!queue_room) return pdFALSE;
+    queue_room--;
+    queued = *cmd;
+    return pdTRUE;
+}
+@TURN_TO@
+static char *dup(const char *s) {
+    char *p = (char *)malloc(strlen(s) + 1);
+    strcpy(p, s);
+    return p;
+}
+static bool run_apps(const char *name) {
+    std::string n = name;
+    if (n == "app_reply") {            /* the pieces and the end go to the sink, and nothing to the console */
+        app_turn();
+        reply();
+    } else if (n == "voice_press") {   /* a voice press ends an app's turn: "interrupted" */
+        app_turn();
+        acked();
+        event("delta.text_append", "reply", "note", "Sure");
+        turn_start(7, false);
+        assert(!s_turn.text && s_turn.gen == 7 && !s_turn.sink.done);
+    } else if (n == "voice_turn") {    /* a voice turn refuses an app's turn: "busy with a voice turn", and goes on */
+        turn_start(3, false);
+        s_turn.phase = P_LISTEN;
+        app_turn();
+        assert(s_turn.phase == P_LISTEN && !s_turn.text && s_turn.gen == 3);
+        said.push_back("voice turn goes on");
+    } else if (n == "console_over_app") {  /* a console turn ends an app's ("interrupted"), and prints as ever */
+        app_turn();
+        console_turn();
+    } else if (n == "app_over_console") {  /* an app's turn ends a console turn, which says so as ever */
+        text_begin("hello");
+        app_turn();
+        reply();
+    } else if (n == "unreachable") {   /* the turn's own errors, and "not set up" */
+        connects = false;
+        app_turn();
+        configured = false;
+        app_turn();
+        connects = configured = true;
+        chat_fails = true;
+        app_turn();
+    } else if (n == "turn_to") {       /* refused at once on the caller's task, or queued with a copy of the sink */
+        configured = false;
+        muse_hatch_text_turn_to(dup("a"), &SINK);
+        configured = true;
+        muse_hatch_text_turn_to(dup("b"), &SINK);
+        assert(queued.type == CMD_TEXT && !strcmp(queued.text, "b"));
+        free(queued.text);
+        muse_hatch_text_turn_to(dup("c"), &SINK);   /* the queue is full now */
+        muse_hatch_text_sink_t mine = SINK;
+        queue_room = 1;
+        static char other[] = "other";
+        mine.user = other;
+        muse_hatch_text_turn_to(dup("d"), &mine);
+        mine.user = app_name;                         /* the queued command kept its own copy */
+        assert(queued.type == CMD_TEXT && !strcmp(queued.text, "d") && queued.sink.user == other);
+        assert(queued.sink.piece == piece && queued.sink.done == done);
+        free(queued.text);
+    } else {
+        return false;
+    }
+    return true;
+}
+'''
+
+
+class AppTypedTurns(unittest.TestCase):
+    """Review Focus 5, the session's side: an app's typed turn (muse.ask, CONFIG_MUSE_APPS) and voice share the session. A voice press
+    ends it ("interrupted"), a voice turn refuses it ("busy with a voice turn"), its reply goes to its sink and none of it to the
+    console, and the console's typed turns print what they always printed: the same lines, byte for byte, built with the apps or
+    without."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        out = Path(cls.tmp.name)
+        source = (ROOT / 'components/muse/muse_chat_session.cpp').read_text()
+
+        def between(start, end):
+            return source[source.index(start):source.index(end, source.index(start))]
+
+        parts = {
+            '@CONSTANTS@': between('#define MIC_RATE', '/* ---- Voice task'),
+            '@COMMANDS@': between('enum cmd_type_t', 'struct ev_t'),
+            '@TYPES@': between('enum phase_t', '/* 10 KB'),
+            '@TURNS@': between('static void turn_fail(', 'static void turn_begin('),
+            '@TEXT_BEGIN@': between('static void text_begin(', 'static void on_dictation_line('),
+            '@HANDLERS@': between('static int find_msg(', 'static void on_chat_ack('),
+        }
+        cjson = out / 'cjson.o'
+        flags = ['-Wall', '-Wextra', '-Werror', '-I', str(JSON), '-I', str(ROOT / 'tests'), '-I', str(ROOT / 'components/muse'),
+                 '-I', str(ROOT / 'components/minimp3/include')]
+        cls.compile([*shlex.split(os.environ.get('CC', 'cc')), '-std=c11', *flags, '-c', str(JSON / 'cJSON.c'), '-o', str(cjson)])
+        cls.binaries = {}
+        # With the apps, the app's sink (its helpers come just before turn_fail) and muse_hatch_text_turn_to.
+        helpers = between('#if CONFIG_MUSE_APPS\n/* ---- An app\'s typed turn', 'static void turn_fail(')
+        turn_to = between('extern "C" void muse_hatch_text_turn_to(', '\n}\n') + '\n}\n'
+        for apps in (False, True):
+            code = TYPED_TURNS
+            for marker, text in parts.items():
+                code = code.replace(marker, helpers + text if apps and marker == '@TURNS@' else text)
+            if apps:
+                code = '#define CONFIG_MUSE_APPS 1\n' + code.replace('@APPS@', APPS_CASES.replace('@TURN_TO@', turn_to))
+            else:
+                code = code.replace('@APPS@', 'static bool run_apps(const char *) { return false; }\n')
+            name = 'apps' if apps else 'plain'
+            (out / f'{name}.cpp').write_text(code)
+            cls.compile([*shlex.split(os.environ.get('CXX', 'c++')), '-std=gnu++17', *flags, str(out / f'{name}.cpp'), str(cjson),
+                         '-o', str(out / name)])
+            cls.binaries[apps] = out / name
+
+    @staticmethod
+    def compile(command):
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            raise AssertionError(result.stdout + result.stderr)
+
+    def said(self, case, apps=True):
+        result = subprocess.run([str(self.binaries[apps]), case], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout.splitlines()
+
+    CONSOLE = [
+        'console sent [] "bytes":5',
+        'console busy [] "on":true',
+        'console text [Hi ] "msg":0',
+        'console text [there] "msg":0',
+        'console final [Hi there!] "msg":0',
+        'console message_done [] "msg":0,"bytes":9',
+        'console busy [] "on":false',
+        'console final [Bye] "msg":1',
+        'console message_done [] "msg":1,"bytes":3',
+        'console done [] "messages":2,"complete":true',
+        'console sent [] "bytes":5',
+        'console error [NO REPLY FROM MUSE] ',
+    ]
+
+    def test_the_console_path_is_unchanged(self):
+        # The console's typed turn prints the same lines with the apps built in as without, and they are the lines it printed before.
+        self.assertEqual(self.said('console', apps=False), self.CONSOLE)
+        self.assertEqual(self.said('console', apps=True), self.CONSOLE)
+
+    def test_ask_and_voice_share_the_session(self):
+        # An app's reply: its pieces (a second message after a blank line, a message that came whole as one piece) and its end go to
+        # the sink, and the console hears nothing of it.
+        self.assertEqual(self.said('app_reply'), ['piece app [Hi ]', 'piece app [there]', 'piece app [\\n\\n]', 'piece app [Bye]',
+                                                  'done app (null)'])
+        # A voice press ends an app's turn, which hears "interrupted"; a voice turn refuses one, "busy with a voice turn", and goes on.
+        self.assertEqual(self.said('voice_press'), ['piece app [Sure]', 'done app interrupted'])
+        self.assertEqual(self.said('voice_turn'), ['done app busy with a voice turn', 'voice turn goes on'])
+        # A console turn ends an app's turn, and prints its own lines as ever; an app's turn ends a console turn, which says so as ever.
+        self.assertEqual(self.said('console_over_app'), ['done app interrupted', *self.CONSOLE])
+        self.assertEqual(self.said('app_over_console'), ['console sent [] "bytes":5', 'console error [INTERRUPTED] ',
+                                                         'piece app [Hi ]', 'piece app [there]', 'piece app [\\n\\n]',
+                                                         'piece app [Bye]', 'done app (null)'])
+
+    def test_an_apps_turn_fails_in_the_chats_words(self):
+        self.assertEqual(self.said('unreachable'), ["done app CAN'T REACH MUSE", 'done app not set up', "done app CAN'T REACH MUSE"])
+
+    def test_muse_hatch_text_turn_to_never_waits(self):
+        # Refused at once, on the caller's task, when Muse isn't set up or the chat's queue is full; queued with its own copy of the sink.
+        self.assertEqual(self.said('turn_to'), ['done app not set up', 'done app BUSY'])

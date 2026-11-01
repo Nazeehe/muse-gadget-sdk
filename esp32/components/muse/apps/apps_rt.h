@@ -401,6 +401,11 @@ apps_vm_t *apps_rt_vm(apps_rt_t *rt);
 struct apps_vmio;
 struct apps_vmio *apps_rt_vmio(const apps_rt_t *rt);
 
+/* The muse module's books (apps_ask.h), which live in the runtime from apps_rt_new to apps_rt_free; NULL for NULL. A crash and a stop
+ * that stopped release them (apps_ask_release, as the timers are disarmed), so no ask's callback runs after either. */
+struct apps_ask_app;
+struct apps_ask_app *apps_rt_ask(const apps_rt_t *rt);
+
 /* A callback of a module that answers later: fn(arg) runs as one call of the app with APPS_BUDGET_CALL, through the runtime's one way
  * into the app (the duty cycle books it), for a RUNNING app; fn pushes what it calls and calls it. True when it returned; false, with
  * nothing run, for an app that isn't RUNNING, and false, with the app CRASHED (as a timer's error crashes it), when it failed. The app
@@ -454,6 +459,11 @@ void apps_rt_store_tick(apps_rt_t *rt, int64_t now_ms);
 
 /* Whether sys.show() may be called now: inside message() or alarm(), or within APPS_SHOW_TAP_MS of the last touch (apps_rt_touch). */
 bool apps_rt_show_allowed(const apps_rt_t *rt);
+
+/* Whether a touch (a tap on one of the app's widgets: apps_rt_touch) has come since the runtime was made, and when, in *at_ms
+ * (apps_port_mono_ms; left alone when none has). muse.ask's gate (apps_ask.h): message() and alarm() don't open it, as they do
+ * sys.show(). */
+bool apps_rt_tapped(const apps_rt_t *rt, int64_t *at_ms);
 
 /* The manifest's memory_kb, the limit sys.mem() reports. */
 unsigned apps_rt_memory_kb(const apps_rt_t *rt);

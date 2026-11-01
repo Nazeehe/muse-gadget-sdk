@@ -30,12 +30,19 @@
  * The store's objects are kept in the process, one for each app (a plain malloc: not the apps' heap, which a leak check counts),
  * and given back by apphost_store_clear; a load returns a copy from the apps' heap, which the runtime frees. The battery and the
  * Wi-Fi are fixed, so that a run is the same everywhere; show is told to the sink; the exit is a flag apphost.c takes.
+ *
+ * The VM: none, unless apphost_set_vm gives a folder that stands in for the app's folder on the VM (apphost --vm DIR).
  */
 
+/* mkdir comes with POSIX: a C library that hides what C11 doesn't name declares it only when asked (as apphost.c says). */
+#define _DEFAULT_SOURCE 1
+
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "apphost_esp.h"
 #include "apphost_port.h"
@@ -260,10 +267,98 @@ void apps_port_exit(void) {
     exit_asked = true;
 }
 
-/* apphost has no VM: every vm request is refused, in the words the gadget uses for a VM it can't reach (apps_vmio.h). */
+/*
+ * The VM. Without a folder apphost has none: every vm request is refused, in the words the gadget uses for a VM it can't reach
+ * (apps_vmio.h). With one (apphost --vm DIR), the folder stands in for the app's folder on the VM, workspace/apps/<id>/: a request
+ * runs at once, as the network worker would run it, and its result waits for apphost_vm_take, as the worker's results wait for the
+ * app task. A read gives the file's bytes (the gadget's words for a missing file or one over the kind's limit), and a write
+ * replaces the file whole, making its folders. A JPEG isn't decoded here (the gadget's decoder is the ROM's): it is refused.
+ */
+#define VM_PATH_MAX 4096
+
+static const char *vm_dir;
+static struct apps_vm_job *vm_done, **vm_done_tail = &vm_done;
+
+void apphost_set_vm(const char *dir) {
+    vm_dir = dir;
+}
+
+struct apps_vm_job *apphost_vm_take(void) {
+    struct apps_vm_job *list = vm_done;
+    vm_done = NULL;
+    vm_done_tail = &vm_done;
+    return list;
+}
+
+static void vm_read(apps_vm_job_t *job, const char *path, const char *rel) {
+    if (job->as == APPS_VM_AS_JPEG) {
+        snprintf(job->err, sizeof job->err, "apphost doesn't decode JPEGs: read %s on the gadget", rel);
+        return;
+    }
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        snprintf(job->err, sizeof job->err, APPS_VM_MSG_NO_FILE, rel);
+        return;
+    }
+    long n = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    uint8_t *data = NULL;
+    if (n < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        snprintf(job->err, sizeof job->err, "apphost can't read %s: %s", rel, strerror(errno));
+    } else if ((unsigned long)n > job->max) {
+        snprintf(job->err, sizeof job->err, APPS_VM_MSG_TOO_LARGE, rel, (unsigned)(job->max / 1024));
+    } else if (n > 0 && (data = apps_port_realloc(NULL, (size_t)n)) == NULL) {
+        snprintf(job->err, sizeof job->err, "%s", APPS_VM_MSG_NO_MEMORY);
+    } else if (n > 0 && fread(data, 1, (size_t)n, f) != (size_t)n) {
+        snprintf(job->err, sizeof job->err, "apphost can't read %s", rel);
+        apps_port_free(data);
+    } else {
+        job->data = data;  /* NULL for an empty file, as the worker gives it */
+        job->len = (size_t)n;
+        job->ok = true;
+    }
+    fclose(f);
+}
+
+static void vm_write(apps_vm_job_t *job, const char *path, const char *rel) {
+    char dir[VM_PATH_MAX], tmp[VM_PATH_MAX + 8];
+    for (const char *slash = strchr(rel, '/'); slash != NULL; slash = strchr(slash + 1, '/')) {
+        snprintf(dir, sizeof dir, "%s/%.*s", vm_dir, (int)(slash - rel), rel);
+        if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+            snprintf(job->err, sizeof job->err, "apphost can't make %s: %s", dir, strerror(errno));
+            return;
+        }
+    }
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    bool ok = f != NULL && fwrite(job->data, 1, job->len, f) == job->len;
+    ok = (f != NULL && fclose(f) == 0) && ok && rename(tmp, path) == 0;
+    if (!ok) {
+        snprintf(job->err, sizeof job->err, "apphost can't write %s: %s", rel, strerror(errno));
+        remove(tmp);
+        return;
+    }
+    job->ok = true;
+}
+
 bool apps_port_vm_submit(struct apps_vm_job *job) {
-    snprintf(job->err, sizeof job->err, "%s", APPS_VM_MSG_NOT_CONNECTED);
-    return false;
+    if (vm_dir == NULL) {
+        snprintf(job->err, sizeof job->err, "%s", APPS_VM_MSG_NOT_CONNECTED);
+        return false;
+    }
+    const char *rel = job->path + job->rel;
+    char path[VM_PATH_MAX];
+    snprintf(path, sizeof path, "%s/%s", vm_dir, rel);
+    job->ok = false;
+    job->err[0] = '\0';
+    if (job->op == APPS_VM_READ) {
+        vm_read(job, path, rel);
+    } else {
+        vm_write(job, path, rel);
+    }
+    job->next = NULL;
+    *vm_done_tail = job;
+    vm_done_tail = &job->next;
+    return true;
 }
 
 /* apphost has no Muse: every ask's turn ends at once, in the words the gadget uses when Muse isn't set up (muse_chat.h), and its

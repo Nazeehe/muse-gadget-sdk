@@ -261,11 +261,23 @@ def run(binary: str | Path, *args: object, input: str | bytes | None = None, tim
     added to the environment the binary gets (this process's, otherwise as it is): a test that must
     hold on any machine sets what the machine could have set differently, TZ for one.
     """
+    options = {"text": True, "errors": "replace"} if text else {}
+    return subprocess.run([str(binary), *map(str, args)], cwd=ROOT, input=input,
+                          capture_output=True, timeout=timeout, env=_environment(binary, env), **options)
+
+
+def popen(binary: str | Path, *args: object, env: dict[str, str] | None = None) -> subprocess.Popen:
+    """Starts a harness built by build() with pipes to its stdin, stdout and stderr (bytes), in the environment run()
+    gives it: for a test that talks to it a line at a time and changes files between its lines."""
+    return subprocess.Popen([str(binary), *map(str, args)], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=_environment(binary, env))
+
+
+def _environment(binary: str | Path, env: dict[str, str] | None) -> dict[str, str]:
+    """This process's environment plus env, and the sanitizers' options for a sanitized binary."""
     sanitized, leaks = _built.get(Path(binary).resolve(), (False, False))
     environment = {**os.environ, **(env or {})}
     if sanitized:
         environment["ASAN_OPTIONS"] = f"detect_leaks={int(leaks)}:abort_on_error=1"
         environment["UBSAN_OPTIONS"] = "print_stacktrace=1"
-    options = {"text": True, "errors": "replace"} if text else {}
-    return subprocess.run([str(binary), *map(str, args)], cwd=ROOT, input=input,
-                          capture_output=True, timeout=timeout, env=environment, **options)
+    return environment

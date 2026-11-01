@@ -49,7 +49,10 @@ SOURCES = [HARNESS, APPS / "apps_console.c", APPS / "apps_install.c", APPS / "ap
 # The files the firmware embeds for app.api (components/muse/CMakeLists.txt's EMBED_FILES), as the symbols IDF makes of their
 # names: _binary_<name>_start and _end.
 EMBEDDED = {"apps_guide_md": APPS / "apps_guide.md", "manifest_json": APPS / "examples/timer/manifest.json",
-            "main_lua": APPS / "examples/timer/main.lua", "icon_bin": APPS / "examples/timer/icon.bin"}
+            "main_lua": APPS / "examples/timer/main.lua", "icon_bin": APPS / "examples/timer/icon.bin",
+            # The tally's, embedded through copies named tally_<name> (IDF names the symbols after a file's name alone).
+            "tally_manifest_json": APPS / "examples/tally/manifest.json", "tally_main_lua": APPS / "examples/tally/main.lua",
+            "tally_hook_sh": APPS / "examples/tally/hook.sh"}
 
 # What apps_console.c and muse_apps.h include of ESP-IDF and LVGL, staged as the little they use.
 STAGED = {
@@ -419,6 +422,9 @@ class Console(unittest.TestCase):
 
     def test_guide_written_or_inline(self):  # D2, D3: the firmware's bytes to the VM, or inline when a write is refused
         self.run_case("guide_written_or_inline")
+
+    def test_app_api_writes_the_tally_example(self):  # connected apps Task 5: the tally (its app and its hook) after the timer
+        self.run_case("app_api_writes_the_tally_example")
 
     def test_api_room_follows_free_psram(self):  # C1: limits.room_kb, free PSRAM less the reserve, derived and not quoted
         self.run_case("api_room_follows_free_psram")

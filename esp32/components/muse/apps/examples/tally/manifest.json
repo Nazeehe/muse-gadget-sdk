@@ -1,0 +1,9 @@
+{
+  "id": "tally",
+  "name": "Tally",
+  "version": "1.0.0",
+  "api": 1,
+  "main": "main.lua",
+  "permissions": ["vm", "muse"],
+  "memory_kb": 64
+}

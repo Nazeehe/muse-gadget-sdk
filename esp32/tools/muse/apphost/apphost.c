@@ -19,7 +19,7 @@
  * does here is what it does there: the same Lua, the same sandbox, budgets, messages and crash rules. It is
  * the development loop's runner and the tests' (tests/test_muse_apps_rt.py).
  *
- *   apphost [--no-compile] [--mem-kb N] [--script FILE|-] APP_DIR
+ *   apphost [--no-compile] [--mem-kb N] [--vm DIR] [--script FILE|-] APP_DIR
  *   apphost [--mem-kb N] --cycles N APP_DIR
  *   apphost --sha256 TEXT|-
  *
@@ -29,7 +29,9 @@
  * (apps_rt_compile, which the app task's compile calls too: every .lua file, main first and the others in the
  * package's order, each loaded and not run, in a scratch VM with the manifest's memory limit), so that a package this
  * runs is a package the install accepts. Then the runtime is made and start() is called, and the script's lines run, if
- * there is one. --mem-kb N sets the heap in KB, whatever the manifest says (1 to 65535). --no-compile leaves the
+ * there is one. --mem-kb N sets the heap in KB, whatever the manifest says (1 to 65535). --vm DIR gives the app a VM: DIR, a folder
+ * that exists, stands in for its folder on the VM (workspace/apps/<id>/), and its vm calls read and write the files there
+ * (apphost_port.h), as a hook on the VM would find and leave them; without it every vm request is "the VM is not connected". --no-compile leaves the
  * compile out: it is for the runtime's own tests of a module that doesn't compile when it is required, which the
  * install never lets in.
  *
@@ -166,6 +168,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "apphost_esp.h"
@@ -188,7 +191,7 @@
 #define DUMP_MAX_BYTES 4000000
 
 #define USAGE                                                                           \
-    "usage: apphost [--no-compile] [--mem-kb N] [--script FILE|-] APP_DIR\n"            \
+    "usage: apphost [--no-compile] [--mem-kb N] [--vm DIR] [--script FILE|-] APP_DIR\n" \
     "       apphost [--mem-kb N] --cycles N APP_DIR\n"                                  \
     "       apphost --sha256 TEXT|-\n"
 
@@ -905,11 +908,27 @@ static void end_of_command(const app_t *app);
 /* Bounds one step's vm work: each request the port refuses is a callback, so the app's 8 and its watches, and their callbacks. */
 #define VM_PASSES_MAX (2 * (APPS_VM_QUEUE + APPS_VM_WATCHES_MAX + 2))
 
-/* The vm module's requests and callbacks, after the timers, as the app task's round has them (apps_task.c: run_vm). apphost has no
- * VM: its port refuses every request, "the VM is not connected" (apphost_port.c), and the callback runs here, one call at a time. */
+/* The fake VM's results (--vm): each to the app that runs, as the app task's housekeeping hands it the worker's (apps_task.c:
+ * take_vm_results); freed when the app doesn't run. The port runs a request as the tick sends it, so none waits past the tick. */
+static void take_vm_results(app_t *app, int64_t now) {
+    for (struct apps_vm_job *job = apphost_vm_take(); job != NULL;) {
+        struct apps_vm_job *next = job->next;
+        if (app->rt != NULL && apps_rt_state(app->rt) == APPS_STATE_RUNNING) {
+            apps_vmio_take(app->rt, job, now);
+        } else {
+            apps_vm_job_free(job);
+        }
+        job = next;
+    }
+}
+
+/* The vm module's requests and callbacks, after the timers, as the app task's round has them (apps_task.c: run_vm). Without --vm,
+ * apphost has no VM: its port refuses every request, "the VM is not connected" (apphost_port.c). With it, the port runs each request
+ * against the folder as the tick sends it, and its result is taken here. The callbacks run here, one call at a time. */
 static void run_vm(app_t *app, int64_t now) {
     for (int pass = 0; pass < VM_PASSES_MAX; pass++) {
         apps_vmio_tick(app->rt, now, !apps_port_dark());
+        take_vm_results(app, now);
         if (!apps_vmio_has_work(app->rt)) {
             if (apps_vmio_next_deadline(app->rt) > now) {
                 break;
@@ -1354,7 +1373,7 @@ static int run_cycles(const apps_pkg_t *pkg, int cycles) {
 /* ---- The command line ---- */
 
 typedef struct {
-    const char *folder, *script, *sha256;
+    const char *folder, *script, *sha256, *vm;
     long mem_kb, cycles;
     bool no_compile;
 } options_t;
@@ -1379,13 +1398,22 @@ static bool parse_args(int argc, char **argv, options_t *o) {
         const char *value = i + 1 < argc ? argv[i + 1] : NULL;
         if (strcmp(a, "--no-compile") == 0) {
             o->no_compile = true;
-        } else if (strcmp(a, "--mem-kb") == 0 || strcmp(a, "--cycles") == 0 || strcmp(a, "--script") == 0) {
+        } else if (strcmp(a, "--mem-kb") == 0 || strcmp(a, "--cycles") == 0 || strcmp(a, "--script") == 0 ||
+                   strcmp(a, "--vm") == 0) {
             if (value == NULL) {
                 return usage("needs a value:", a);
             }
             i++;
             if (strcmp(a, "--script") == 0) {
                 o->script = value;
+                continue;
+            }
+            if (strcmp(a, "--vm") == 0) {
+                struct stat st;
+                if (stat(value, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                    return usage("--vm takes a folder that exists, not", value);
+                }
+                o->vm = value;
                 continue;
             }
             bool is_mem = strcmp(a, "--mem-kb") == 0;
@@ -1489,6 +1517,7 @@ int main(int argc, char **argv) {
     }
     char name_buf[PATH_MAX + 1], err[APPS_ERROR_MAX];
     int status = 1;
+    apphost_set_vm(o.vm);
     if (load_package(o.folder, folder_name(o.folder, name_buf, sizeof name_buf), pkg, err, sizeof err)) {
         if (o.mem_kb > 0) {
             pkg->manifest.memory_kb = (uint16_t)o.mem_kb;

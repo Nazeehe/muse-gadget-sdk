@@ -55,8 +55,9 @@
  * watches and of the acks and the heartbeat's writes are the module's: they share the one turn at the VM, one at a time, and
  * coalesce (one pending a watch, one acks read for every command that waits, one heartbeat), so they never take a place among the
  * 8 and the 8 never refuse them. The turns alternate (R3a), so a request of the app's waits behind one poll at most, and the
- * requests never starve the polls. Every request has APPS_VM_REQUEST_MS on the worker, and a busy file reader or writer is tried again
- * APPS_VM_BUSY_RETRIES times, APPS_VM_BUSY_WAIT_MS apart.
+ * requests never starve the polls. Every request has APPS_VM_REQUEST_MS on the worker. A busy file reader is tried again
+ * APPS_VM_BUSY_RETRIES times, APPS_VM_BUSY_WAIT_MS apart; a write waits for a busy writer within that time (vm_file_write, R3b) and
+ * comes back "timed out" when the time runs out, with the worker serving nothing else meanwhile.
  *
  * Errors (P10). A mistake in a call's own arguments is raised at the call, "vm.<name>: ...", and makes no request: a bad path or
  * ending, a write outside outbox/ (APPS_VM_MSG_OUTBOX), a value that won't encode or encodes too large, a bad command name or args,
@@ -90,7 +91,7 @@
 #define APPS_VM_ACK_MS 15000         /* a command's wait for its ack */
 #define APPS_VM_ACK_POLL_MS 1000     /* how often state/acks.json is read while a command waits */
 #define APPS_VM_HEARTBEAT_MS 10000   /* how often outbox/active.json is written while watching */
-#define APPS_VM_BUSY_RETRIES 3       /* a busy file reader or writer is tried again this many times */
+#define APPS_VM_BUSY_RETRIES 3       /* a busy file reader is tried again this many times (a write waits for the writer) */
 #define APPS_VM_BUSY_WAIT_MS 500     /* this far apart */
 #define APPS_VM_WATCH_MAX 1024       /* a watched file's bytes */
 #define APPS_VM_WRITE_MAX 8192       /* a written value's JSON */

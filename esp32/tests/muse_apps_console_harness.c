@@ -2733,7 +2733,7 @@ static void guide_written_or_inline(void) {
     size_t lowest = dma_lowest;
     run_jobs();
     CHECK(dones == 1 && done_ctx == &tag, "done once, with its ctx");
-    CHECK(vm_writes == 4, "four files: %d", vm_writes);
+    CHECK(vm_writes == 7, "seven files: the guide, the timer's three and the tally's three: %d", vm_writes);
     static const char *const paths[] = {"workspace/apps/_guide/README.md", "workspace/apps/_guide/timer/manifest.json",
                                         "workspace/apps/_guide/timer/main.lua", "workspace/apps/_guide/timer/icon.bin"};
     const char *const bytes[] = {guide, manifest, main_lua, icon};
@@ -2748,9 +2748,9 @@ static void guide_written_or_inline(void) {
     }
     char want[160];
     snprintf(want, sizeof want, "DMA free %zu, lowest %zu", dma_free, lowest);
-    const char *at = logged("app.api: writing the guide and the timer to workspace/apps/_guide/");
+    const char *at = logged("app.api: writing the guide and its examples to workspace/apps/_guide/");
     CHECK(at != NULL && strstr(at, want) != NULL, "the DMA reading before: %s", at != NULL ? at : last_log);
-    snprintf(want, sizeof want, "DMA free %zu, lowest %zu", dma_free, lowest - 4 * 512);
+    snprintf(want, sizeof want, "DMA free %zu, lowest %zu", dma_free, lowest - 7 * 512);
     at = logged("app.api: the guide is on the VM");
     CHECK(at != NULL && strstr(at, want) != NULL, "the DMA reading after: %s", at != NULL ? at : last_log);
     CHECK_AT(done_result, "ok", "true");
@@ -2794,9 +2794,9 @@ static void guide_written_or_inline(void) {
     const cJSON *text = cJSON_GetObjectItemCaseSensitive(payload, "guide_text");
     const cJSON *files = cJSON_GetObjectItemCaseSensitive(payload, "example_files");
     CHECK(cJSON_IsString(text) && strcmp(text->valuestring, guide) == 0, "the guide inline");
-    CHECK(cJSON_GetArraySize(files) == 2 &&
+    CHECK(cJSON_GetArraySize(files) == 5 &&
               strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(files, "main.lua")), main_lua) == 0,
-          "the timer inline: two files, main.lua as it is");
+          "the timer inline: two files (and the tally's three), main.lua as it is");
     /* The inline manifest is the embedded one less its icon (no "icon" key, no icon.bin in files), and installs as it is. */
     const char *inline_manifest = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(files, "manifest.json"));
     CHECK(inline_manifest != NULL && strstr(inline_manifest, "icon") == NULL, "no icon in the inline manifest: %s",
@@ -2872,6 +2872,67 @@ static void guide_written_or_inline(void) {
     free(guide);
     free(manifest);
     free(main_lua);
+}
+
+/*
+ * Connected apps Task 5: app.api writes the tally example as well (a connected app: its app and its hook), the firmware's own bytes
+ * (EMBED_FILES, under names of their own: IDF names an embedded file's symbols after its name alone, and the timer's have the same
+ * names), after the timer's, to workspace/apps/_guide/tally/. Inline, its three files are in example_files as "tally/<name>", as
+ * they are. Its manifest is one the install takes as it is: id tally, the vm and muse permissions, no warning.
+ */
+static void app_api_writes_the_tally_example(void) {
+    const char *code = NULL, *err = NULL;
+    muse_apps_set_vm_ops(&FAKE_VM);
+    static const char *const names[] = {"manifest.json", "main.lua", "hook.sh"};
+    char *bytes[3];
+    size_t lens[3];
+    for (int i = 0; i < 3; i++) {
+        char rel[64];
+        snprintf(rel, sizeof rel, "examples/tally/%s", names[i]);
+        bytes[i] = apps_file(rel, &lens[i]);
+    }
+    CHECK(muse_apps_write_guide(on_done, NULL, &code, &err), "not queued: %s: %s", code, err);
+    run_jobs();
+    CHECK(vm_writes == 7, "the guide, the timer's three files and the tally's three: %d", vm_writes);
+    for (int i = 0; i < 3; i++) {
+        char path[96];
+        snprintf(path, sizeof path, "workspace/apps/_guide/tally/%s", names[i]);
+        CHECK(strcmp(written[4 + i].path, path) == 0, "write %d: %s", 4 + i, written[4 + i].path);
+        CHECK(written[4 + i].len == lens[i] && memcmp(written[4 + i].data, bytes[i], lens[i]) == 0, "the firmware's bytes of %s",
+              path);
+    }
+    CHECK(logged("app.api: writing the guide and its examples to workspace/apps/_guide/") != NULL, "the line before: %s", last_log);
+    CHECK_AT(done_result, "payload.delivered", "vm");
+    CHECK_AT(done_result, "payload.example", "workspace/apps/_guide/timer/");
+    forget_writes();
+
+    apps_manifest_t *m = calloc(1, sizeof *m);
+    char why[256] = "";
+    CHECK(m != NULL && apps_manifest_parse(bytes[0], lens[0], "tally", 1024, m, why, sizeof why), "the manifest parses: %s", why);
+    CHECK(m->perms == (APPS_PERM_VM | APPS_PERM_MUSE) && m->warnings[0] == '\0' && m->icon[0] == '\0',
+          "vm and muse, no warning: perms %u, warnings '%s'", (unsigned)m->perms, m->warnings);
+    apps_manifest_clear(m, NULL);
+    free(m);
+
+    write_fails_at = 1;  /* the VM refuses the guide: the answer carries the files */
+    CHECK(muse_apps_write_guide(on_done, NULL, &code, &err), "queued");
+    run_jobs();
+    CHECK_AT(done_result, "payload.delivered", "inline");
+    const cJSON *files = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(done_result, "payload"), "example_files");
+    CHECK(cJSON_GetArraySize(files) == 5, "the timer's two and the tally's three: %d", cJSON_GetArraySize(files));
+    for (int i = 0; i < 3; i++) {
+        char key[32];
+        snprintf(key, sizeof key, "tally/%s", names[i]);
+        const char *text = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(files, key));
+        CHECK(text != NULL && strcmp(text, bytes[i]) == 0, "%s inline, as it is", key);
+    }
+    write_fails_at = 0;
+    forget_writes();
+    cJSON_Delete(done_result);
+    done_result = NULL;
+    for (int i = 0; i < 3; i++) {
+        free(bytes[i]);
+    }
 }
 
 /* F6: the stage holds what was put and a small slack beyond it (with its own block, under 64 KB), so at most 2 MB and
@@ -3030,6 +3091,7 @@ int main(int argc, char **argv) {
         {"control_send_deadline", control_send_deadline},
         {"json_object_valid", json_object_valid},
         {"guide_written_or_inline", guide_written_or_inline},
+        {"app_api_writes_the_tally_example", app_api_writes_the_tally_example},
         {"api_room_follows_free_psram", api_room_follows_free_psram},
         {"the_stage_is_bounded", the_stage_is_bounded},
         {"empty_and_missing_files", empty_and_missing_files},

@@ -49,9 +49,9 @@
  * comes second frees the block (and the job its answer). launch, stop, remove and the guide are asynchronous: the job
  * calls the caller's done once with the result, as Link's install does.
  *
- * The guide. The firmware carries the guide and the timer example (EMBED_FILES, under CONFIG_MUSE_APPS), and app.api's
- * job writes those bytes to MUSE_APPS_GUIDE_DIR on the VM through the VM ops (vm_file's writer: whole files, in 8 KB
- * pieces), one deadline for the three. The writer is not the reader, so a display.draw_file that holds the reader doesn't
+ * The guide. The firmware carries the guide, the timer example and the tally example (a connected app: its app and its
+ * hook) (EMBED_FILES, under CONFIG_MUSE_APPS), and app.api's job writes those bytes to MUSE_APPS_GUIDE_DIR on the VM
+ * through the VM ops (vm_file's writer: whole files, in 8 KB pieces), one deadline for them all. The writer is not the reader, so a display.draw_file that holds the reader doesn't
  * stop it. Each send takes DMA RAM in the session's task, so the job logs the DMA heap's free and lowest marks before and
  * after the writes.
  */
@@ -73,8 +73,9 @@ static const char *TAG = "muse_apps";
 /* The ui module's fonts (apps_ui.c's apps_ui_fonts[], in its order: tests/test_muse_apps_console.py compares them). */
 static const char *const FONTS[] = {"sans14", "sans16", "sans20", "sans28", "mono8", "mono16", "digits48", "digits96"};
 
-/* The firmware's copies of the guide and the timer: IDF names each pair of symbols after the file's name. The asm labels
- * keep the names exactly, whatever prefix the C compiler gives its own. */
+/* The firmware's copies of the guide, the timer and the tally: IDF names each pair of symbols after the file's name alone, so
+ * the tally's files, which have the timer's names, are embedded through copies named tally_<name> (CMakeLists.txt). The asm
+ * labels keep the names exactly, whatever prefix the C compiler gives its own. */
 extern const uint8_t guide_start[] __asm__("_binary_apps_guide_md_start");
 extern const uint8_t guide_end[] __asm__("_binary_apps_guide_md_end");
 extern const uint8_t timer_manifest_start[] __asm__("_binary_manifest_json_start");
@@ -83,9 +84,15 @@ extern const uint8_t timer_main_start[] __asm__("_binary_main_lua_start");
 extern const uint8_t timer_main_end[] __asm__("_binary_main_lua_end");
 extern const uint8_t timer_icon_start[] __asm__("_binary_icon_bin_start");
 extern const uint8_t timer_icon_end[] __asm__("_binary_icon_bin_end");
+extern const uint8_t tally_manifest_start[] __asm__("_binary_tally_manifest_json_start");
+extern const uint8_t tally_manifest_end[] __asm__("_binary_tally_manifest_json_end");
+extern const uint8_t tally_main_start[] __asm__("_binary_tally_main_lua_start");
+extern const uint8_t tally_main_end[] __asm__("_binary_tally_main_lua_end");
+extern const uint8_t tally_hook_start[] __asm__("_binary_tally_hook_sh_start");
+extern const uint8_t tally_hook_end[] __asm__("_binary_tally_hook_sh_end");
 
-/* How an inline answer carries a file: the guide as guide_text, text as it is, the timer's manifest without its icon, and
- * not at all (binary: the upload carries it, the JSON answer can't). */
+/* How an inline answer carries a file: the guide as guide_text, text as it is (in example_files, under its name), the timer's
+ * manifest without its icon, and not at all (binary: the upload carries it, the JSON answer can't). */
 typedef enum { GF_GUIDE, GF_TEXT, GF_MANIFEST, GF_BINARY } guide_kind_t;
 
 typedef struct {
@@ -100,6 +107,9 @@ static const guide_file_t GUIDE_FILES[] = {
     {MUSE_APPS_GUIDE_DIR "timer/manifest.json", "manifest.json", GF_MANIFEST, timer_manifest_start, timer_manifest_end},
     {MUSE_APPS_GUIDE_DIR "timer/main.lua", "main.lua", GF_TEXT, timer_main_start, timer_main_end},
     {MUSE_APPS_GUIDE_DIR "timer/icon.bin", NULL, GF_BINARY, timer_icon_start, timer_icon_end},
+    {MUSE_APPS_GUIDE_DIR "tally/manifest.json", "tally/manifest.json", GF_TEXT, tally_manifest_start, tally_manifest_end},
+    {MUSE_APPS_GUIDE_DIR "tally/main.lua", "tally/main.lua", GF_TEXT, tally_main_start, tally_main_end},
+    {MUSE_APPS_GUIDE_DIR "tally/hook.sh", "tally/hook.sh", GF_TEXT, tally_hook_start, tally_hook_end},
 };
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
@@ -472,7 +482,7 @@ static char *manifest_without_icon(const guide_file_t *f) {
     return out;
 }
 
-/* The guide and the timer, inline: guide_text and example_files. */
+/* The guide and the examples, inline: guide_text and example_files (the timer's under their names, the tally's as tally/<name>). */
 static bool add_inline(cJSON *p) {
     cJSON *files = cJSON_AddObjectToObject(p, "example_files");
     bool ok = files != NULL;
@@ -555,7 +565,7 @@ static bool add_facts(cJSON *p) {
 static cJSON *guide_result(const muse_apps_vm_ops_t *vm) {
     const int64_t started = apps_port_mono_ms();
     const int64_t deadline_us = (started + MUSE_APPS_GUIDE_WRITE_MS) * 1000;
-    log_dma("writing the guide and the timer to " MUSE_APPS_GUIDE_DIR, "");
+    log_dma("writing the guide and its examples to " MUSE_APPS_GUIDE_DIR, "");
     char why[192] = "";
     const char *code = NULL;
     size_t done = 0, bytes = 0;

@@ -27,13 +27,16 @@ at 0 bytes, and apphost's --cycles does the same for whole launches.
 import atexit
 import hashlib
 import json
+import os
 import random
 import re
+import select
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -42,6 +45,7 @@ import apps_host
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
 FIXTURES = ROOT / "tests/muse_apps_fixtures"
+TALLY = APPS / "examples/tally"
 HARNESS_SOURCES = [ROOT / "tests/muse_apps_rt_harness.c", APPS / "apps_rt.c", APPS / "apps_vm.c",
                    APPS / "apps_json.c", APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_ui.c",
                    APPS / "apps_svc.c", APPS / "apps_vmio.c", APPS / "apps_ask.c"]
@@ -1517,6 +1521,153 @@ class HarnessTest(unittest.TestCase):
         # P2: the add and the push are the app task's, and the header says so.
         header = (APPS / "apps_rt.h").read_text()
         self.assertRegex(header, r"(?s)apps_rt_image_add.{0,600}app task|app task.{0,600}apps_rt_image_add")
+
+
+class AppHostSession:
+    """apphost talked to a line at a time, for a test that changes the fake VM's files between commands, as a hook does on the VM:
+    `do` sends script lines, then `state` as a mark, and returns the events the lines printed, the mark's own excepted."""
+
+    def __init__(self, test, binary, *args):
+        self.test = test
+        self.proc = apps_host.popen(binary, *args)
+        self.buf = b""
+        self.events = []
+        test.addCleanup(self.kill)
+
+    def do(self, *lines, timeout=60):
+        self.proc.stdin.write("".join(f"{line}\n" for line in [*lines, "state"]).encode())
+        self.proc.stdin.flush()
+        events = []
+        while True:
+            event = json.loads(self.line(timeout))
+            self.events.append(event)
+            if event["event"] == "state":
+                return events
+            events.append(event)
+
+    def line(self, timeout):
+        deadline = time.monotonic() + timeout
+        while b"\n" not in self.buf:
+            left = deadline - time.monotonic()
+            self.test.assertGreater(left, 0, "apphost said nothing in time")
+            if select.select([self.proc.stdout], [], [], left)[0]:
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+                if not chunk:
+                    self.test.fail(f"apphost ended: {self.proc.stderr.read().decode(errors='replace')}")
+                self.buf += chunk
+        line, _, self.buf = self.buf.partition(b"\n")
+        return line.decode("utf-8")  # strictly
+
+    def close(self):
+        """Ends the script; apphost exits 0 with nothing on stderr."""
+        out, err = self.proc.communicate(timeout=60)
+        self.test.assertEqual((self.proc.returncode, err), (0, b""), err.decode(errors="replace"))
+        return [json.loads(line) for line in out.decode("utf-8").splitlines()]
+
+    def kill(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.communicate()
+
+
+def tally_screen(events):
+    """The tally's screen in a dump: the count, the status line, whether the spinner is hidden."""
+    (dump,) = [e for e in events if e["event"] == "dump"]
+    widgets = dump["widgets"]
+    labels = [w["text"] or "" for w in widgets if w["kind"] == "label"]
+    (spinner,) = [w for w in widgets if w["kind"] == "spinner"]
+    return {"count": labels[0], "status": labels[1], "waiting": not spinner["hidden"]}
+
+
+class TallyOnAppHost(AppHostTestCase):
+    """The tally example (components/muse/apps/examples/tally), the guide's connected app, on apphost with --vm: a folder that
+    stands in for the app's folder on the VM (workspace/apps/tally/). The app's reads, watches, writes and commands go to it
+    as they go to the VM from the gadget; the test plays the hook's part between the app's steps (test_muse_apps_hook.py runs
+    the hook itself)."""
+
+    def vm_folder(self, files=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        for rel, text in (files or {}).items():
+            (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+            (folder / rel).write_text(text)
+        return folder
+
+    def test_tally_runs_against_a_fake_vm(self):
+        vm = self.vm_folder({"state/count.json": '{"count":41}', "state/rev": "7\n"})
+        host = AppHostSession(self, self.apphost, "--vm", vm, "--script", "-", TALLY)
+        # It watches state/rev and reads the count when the rev comes; the heartbeat says it's in front.
+        self.assertEqual(tally_screen(host.do("sync 1767225600000", "advance 1500", "dump")),
+                         {"count": "41", "status": "", "waiting": False})
+        self.assertEqual(json.loads((vm / "outbox/active.json").read_text()), {"app": "tally", "n": 1})
+
+        def sent(name):
+            (path,) = sorted((vm / "outbox").glob("cmd-*.json"))
+            doc = json.loads(path.read_text())
+            self.assertEqual((doc["name"], doc["seq"]), (name, int(path.stem[4:])))
+            path.unlink()  # the hook takes it
+            return doc
+
+        def ack(seq, result, count=None, rev=None):
+            if count is not None:
+                (vm / "state/count.json").write_text(json.dumps({"count": count}))
+                (vm / "state/rev").write_text(f"{rev}\n")
+            (vm / "state/acks.json").write_text(json.dumps({"acks": [{"seq": seq, "result": result}]}))
+
+        # "+1" is a command: the spinner shows until the hook's ack, whose result shows; the rev's change reads the same.
+        self.assertTrue(tally_screen(host.do('tap "+1"', "advance 50", "dump"))["waiting"])
+        doc = sent("add")
+        self.assertEqual(doc["args"], {"n": 1})
+        ack(doc["seq"], {"ok": True, "count": 42}, count=42, rev=8)
+        self.assertEqual(tally_screen(host.do("advance 2500", "dump")), {"count": "42", "status": "", "waiting": False})
+
+        # "Reset" (no args) refused by the hook: its error shows, cut to fit a label at a character's start.
+        host.do('tap "Reset"', "advance 50")
+        doc = sent("reset")
+        self.assertIsNone(doc["args"])
+        ack(doc["seq"], {"ok": False, "error": "é" * 200})
+        screen = tally_screen(host.do("advance 1500", "dump"))
+        self.assertEqual((screen["count"], screen["waiting"]), ("42", False))
+        self.assertTrue(screen["status"].startswith("éé") and screen["status"].endswith("..."), screen["status"])
+        self.assertLessEqual(len(screen["status"].encode()), 128)
+
+        # No ack: "timed out" after 15 s.
+        host.do('tap "+1"', "advance 50")
+        sent("add")
+        self.assertEqual(tally_screen(host.do("advance 15500", "dump")), {"count": "42", "status": "timed out", "waiting": False})
+
+        # "Ask": apphost has no Muse, so the callback says "not set up"; asked again within 30 s, the call itself refuses, and
+        # the app shows that rather than crashing (the guide's pcall).
+        self.assertEqual(tally_screen(host.do('tap "Ask"', "advance 100", "dump"))["status"], "not set up")
+        screen = tally_screen(host.do('tap "Ask"', "advance 100", "dump"))
+        self.assertRegex(screen["status"], r"^muse\.ask: wait \d+ s between asks$")
+        self.assertFalse(screen["waiting"])
+        self.assertEqual([e for e in host.events if e["event"] in ("crash", "error", "warning")], [])
+        self.assertEqual(host.events[-1], {"event": "state", "state": "running"})
+        host.close()
+
+    def test_the_fake_vm_is_a_folder(self):
+        # --vm DIR: reads come from DIR (a missing file in the gadget's words, a .txt as text), writes land in it (outbox/ made
+        # as needed), and a JPEG, which only the gadget decodes, is refused through the callback.
+        vm = self.vm_folder({"note.txt": "hi"})
+        main = """
+            local app = {}
+            function app.message(event)
+                vm.read("note.txt", function(v, err) print("txt", v, err) end)
+                vm.read("state/none.json", function(v, err) print("json", v, err) end)
+                vm.read("cover.jpg", function(v, err) print("jpg", v, err ~= nil) end)
+                vm.write("outbox/x.json", {n = 1}, function(ok, err) print("write", ok, err) end)
+            end
+            return app
+        """
+        app = self.make_app("scratch", main, manifest={"permissions": ["vm"]})
+        done = apps_host.run(self.apphost, "--vm", vm, "--script", "-", app, input=b"message go\nadvance 100\n", text=False)
+        self.assertEqual((done.returncode, done.stderr), (0, b""), done.stderr)
+        run = Run(done)
+        self.assertEqual(run.logs(), ["txt\thi\tnil", "json\tnil\tno such file on the VM: state/none.json", "jpg\tnil\ttrue",
+                                      "write\ttrue\tnil"])
+        self.assertEqual(json.loads((vm / "outbox/x.json").read_text()), {"n": 1})
 
 
 if __name__ == "__main__":

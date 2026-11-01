@@ -82,9 +82,15 @@ if(CONFIG_MUSE_ENABLED)
             "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/apps_snapshot.c"
             "apps/apps_result.c" "apps/apps_icons.c" "apps/apps_jpeg.c" "apps/apps_vmio.c" "apps/apps_net.c" "apps/apps_ask.c"
             "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
-        # What app.api writes to Muse's VM (apps_control.c): the app guide and the timer example.
+        # What app.api writes to Muse's VM (apps_control.c): the app guide, the timer example and the tally example (a
+        # connected app and its hook). IDF names an embedded file's symbols, and its generated .S, after the file's name
+        # alone, so the tally's files, which have the timer's names, are embedded through copies named tally_<name> here.
         list(APPEND embed "apps/apps_guide.md" "apps/examples/timer/manifest.json" "apps/examples/timer/main.lua"
             "apps/examples/timer/icon.bin")
+        foreach(name manifest.json main.lua hook.sh)
+            configure_file("${COMPONENT_DIR}/apps/examples/tally/${name}" "${CMAKE_CURRENT_BINARY_DIR}/tally_${name}" COPYONLY)
+            list(APPEND embed "${CMAKE_CURRENT_BINARY_DIR}/tally_${name}")
+        endforeach()
     endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
     # avatar when avatar/muse_pixel.c exists here; this avatar/ is gitignored. The

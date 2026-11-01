@@ -98,3 +98,11 @@ bool apphost_take_exit(void);
 
 /* Frees the objects the port kept. */
 void apphost_store_clear(void);
+
+/* The fake VM (apphost --vm DIR): dir stands in for the app's folder on the VM, workspace/apps/<id>/, and must outlive the run.
+ * NULL (the start) is no VM: every vm request is refused, "the VM is not connected". With one, apps_port_vm_submit runs each request at
+ * once against the folder and keeps its result, in order, for apphost_vm_take, which hands over every result kept since its last call
+ * (a list through each job's next), for apps_vmio_take or apps_vm_job_free. */
+struct apps_vm_job;
+void apphost_set_vm(const char *dir);
+struct apps_vm_job *apphost_vm_take(void);

@@ -729,8 +729,8 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   the tap the launcher stays up, taking no touch, until the app's first frame,
   for at most 3 s (`APPS_LV_LAUNCH_HOLD_MS`), so the watch doesn't flash
   between them. Muse uses four Link commands:
-  `app.api` (writes the guide and a timer example to
-  `workspace/apps/_guide/` on its VM and returns the gadget's limits),
+  `app.api` (writes the guide, a timer example and the tally connected
+  example to `workspace/apps/_guide/` on its VM and returns the gadget's limits),
   `app.install` (the gadget reads `workspace/apps/<id>/`
   from the VM, checks, compiles, stores and runs it), `app.control` (list,
   status, logs, launch, stop, remove, snapshot) and `app.send` (an event to the
@@ -872,6 +872,25 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   results say `"storage":"ram"` with the hint "reflash over USB once to keep
   apps". A build directory made before the overlay keeps its old table in its
   own `sdkconfig`: delete that file.
+- **Connected apps:** an app can show data from Muse's VM and its
+  connectors and act on it. The `vm` module (`apps_vmio.c`, whose requests the
+  network worker `apps_net.c` runs over the VM ops) reads, watches and writes
+  the app's folder on the VM, `workspace/apps/<id>/`; `muse.ask` (`apps_ask.c`)
+  puts a question to Muse as a typed turn in the user's chat; `vm.read` of a
+  JPEG (`apps_jpeg.c`) gives a runtime image, which `ui.image` can turn or spin.
+  On the VM, a bash event hook that Muse writes with the app keeps the folder's
+  `state/` current from the connectors and applies the app's commands, with no
+  model in the loop. The guide's "Connected apps" section teaches the pattern:
+  the folder, the heartbeat and the rev file, commands and acks, the hook
+  template (the in-front gate, the loop, the call budget, dry runs) and the
+  creation flow with its approvals. Its example is
+  `components/muse/apps/examples/tally` (an app and its `hook.sh`, with no
+  connector), which `app.api` writes to `workspace/apps/_guide/tally/` beside
+  the timer; the build embeds it through copies named `tally_<name>`, since IDF
+  names an embedded file's symbols after its name alone.
+  `tests/test_muse_apps_hook.py` runs that hook under bash 4 or later with a
+  stand-in for the VM's hook runtime, and `apphost --vm DIR` runs an app
+  against a folder that stands in for its folder on the VM.
 - **Test** with `tests/test_muse_apps_*.py` (the VM and the sandbox, JSON,
   packages, widgets and the apply step, the services, the runtime and its duty
   cycle, the app task, the store, the install, the console and `app.py`, the

@@ -65,6 +65,7 @@ SKILLS = ROOT.parent / "skills"
 SKILL = SKILLS / "gadget-muse-apps/SKILL.md"
 APPS = MUSE / "apps"
 TIMER = APPS / "examples/timer"
+TALLY = APPS / "examples/tally"
 # The headings every skill of the repo has, in order (skills/*/SKILL.md; D21).
 SKILL_HEADINGS = ["Identify the Device", "Prerequisites", "Workflow", "Verify the Result", "Limits", "Sources"]
 
@@ -284,6 +285,9 @@ class GuideAndSkill(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in SKILL.parent.iterdir()), ["SKILL.md"], "Markdown only")
         for name, words in (("the guide", guide), ("the skill", skill)):
             with self.subTest(name):
+                # The hook runtime's two variables, which a connected app's hook must use, are the VM's names (esp32/AGENTS.md:
+                # the name stays only where the server depends on it); nothing else may say it.
+                words = re.sub(r"\bHATCH_HOOK_(RUNTIME|DRY_RUN)\b", "", words)
                 self.assertNotRegex(words, re.compile("hatch", re.I), "say Muse, never Hatch")
         # One entry in the catalog, in its format, and the count line counts it.
         catalog = (SKILLS / "CATALOG.md").read_text()
@@ -294,28 +298,41 @@ class GuideAndSkill(unittest.TestCase):
         self.assertEqual(count, len(re.findall(r"^- \[[^\]]+\]\(gadget-[\w-]+/SKILL\.md\)", catalog, re.M)))
 
     def test_guide_and_timer_are_embedded(self):
-        # The firmware carries the guide and Task 19's timer (EMBED_FILES under the option), and app.api writes those bytes:
-        # the symbols apps_control.c reads are the ones the build makes of the three files' names, which no other embedded file
-        # of the component shares.
+        # The firmware carries the guide, Task 19's timer and the connected apps' tally (EMBED_FILES under the option), and app.api
+        # writes those bytes: the symbols apps_control.c reads are the ones the build makes of the files' names, which no other
+        # embedded file of the component shares. The tally's files have the timer's names, so the build embeds copies of them named
+        # tally_<name> in its own directory (IDF names an embedded file's symbols after its name alone, and its .S file too).
         cmake = (MUSE / "CMakeLists.txt").read_text()
         block = cmake[cmake.index("    if(CONFIG_MUSE_APPS)\n"):]
-        block = block[:block.index("    endif()")]
+        block = block[:block.index("\n    endif()")]
         files = ["apps/apps_guide.md", "apps/examples/timer/manifest.json", "apps/examples/timer/main.lua",
                  "apps/examples/timer/icon.bin"]
         self.assertIn('list(APPEND embed ' + " ".join(f'"{f}"' for f in files) + ")", " ".join(block.split()))
+        tally = ["manifest.json", "main.lua", "hook.sh"]
+        one_line = " ".join(block.split())
+        self.assertIn("foreach(name " + " ".join(tally) + ")", one_line)
+        self.assertIn('configure_file("${COMPONENT_DIR}/apps/examples/tally/${name}" "${CMAKE_CURRENT_BINARY_DIR}/tally_${name}" '
+                      'COPYONLY)', one_line)
+        self.assertIn('list(APPEND embed "${CMAKE_CURRENT_BINARY_DIR}/tally_${name}")', one_line)
         embedded = re.findall(r'list\(APPEND embed ([^)]*)\)', cmake)
         names = [Path(f).name for line in embedded for f in re.findall(r'"([^"]+)"', line)]
-        for f in files:
-            self.assertEqual(names.count(Path(f).name), 1, f"another embedded file makes {f}'s symbols")
+        names = [n.replace("${name}", t) for n in names for t in (tally if "${name}" in n else [n])]
+        for name in [Path(f).name for f in files] + [f"tally_{t}" for t in tally]:
+            self.assertEqual(names.count(name), 1, f"another embedded file makes {name}'s symbols")
         control = (APPS / "apps_control.c").read_text()
-        for f in files:
-            symbol = "_binary_" + re.sub(r"[^A-Za-z0-9]", "_", Path(f).name)
+        for name in [Path(f).name for f in files] + [f"tally_{t}" for t in tally]:
+            symbol = "_binary_" + re.sub(r"[^A-Za-z0-9]", "_", name)
             for end in ("start", "end"):
                 self.assertIn(f'__asm__("{symbol}_{end}")', control)
+        table = re.search(r"static const guide_file_t GUIDE_FILES\[\] = \{(.*?)\};", control, re.S).group(1)
+        self.assertEqual(re.findall(r'MUSE_APPS_GUIDE_DIR "([^"]+)"', table),
+                         ["README.md", "timer/manifest.json", "timer/main.lua", "timer/icon.bin", "tally/manifest.json",
+                          "tally/main.lua", "tally/hook.sh"])
         for f in files:
             self.assertTrue((MUSE / f).is_file(), f)
         self.assertEqual(sorted(p.name for p in TIMER.iterdir()), ["icon.bin", "main.lua", "manifest.json"],
                          "the timer is two files and its icon, all three embedded for app.api")
+        self.assertEqual(sorted(p.name for p in TALLY.iterdir()), sorted(tally), "the tally is its app and its hook, all embedded")
 
     def test_common_errors_are_the_firmwares_words(self):
         # The guide's "Common errors" quote the gadget's messages, each item "- `<message>`: <the fix>": every piece of each
@@ -852,7 +869,11 @@ class GuideAndSkill(unittest.TestCase):
                 r'`\{"acks":\[\{"seq":<seq>,"result":\.\.\.\}, \.\.\.\]\}`',
                 rf"one at the VM at a time and at most {number('APPS_VM_QUEUE')} more waiting",
                 rf"Each has {whole(number('APPS_VM_REQUEST_MS'), 1000)} s",
-                rf"tried again {number('APPS_VM_BUSY_RETRIES')} times, {number('APPS_VM_BUSY_WAIT_MS')} ms apart",
+                rf"[Aa] read that finds the VM file reader busy \(an install, a picture\) is tried again "
+                rf"{number('APPS_VM_BUSY_RETRIES')} times, {number('APPS_VM_BUSY_WAIT_MS')} ms apart",
+                # M25 (R3b): vm_file waits out a busy writer within the write's time, so an app's write gets "timed out".
+                rf"a write that finds the VM file writer busy waits for it, and gets `timed out` if it is still busy when its "
+                rf"{whole(number('APPS_VM_REQUEST_MS'), 1000)} s are up",
                 r"even while the app is behind or the screen is dark",
                 # muse.image
                 r"`ui\.image\{src = img\}` and `w:set\{src = img\}` show it",
@@ -968,6 +989,112 @@ class GuideAndSkill(unittest.TestCase):
         self.assertRegex(errors, r"- `muse\.ask: one ask at a time`: another ask, of this app or another app, is still running")
         self.assertIn("`vm` or `muse`)", errors)
         self.assertIn("`vm` (the `vm` module) and `muse` (for `muse.ask`)", guide_section(guide, "Files and the manifest"))
+
+    def test_guide_teaches_connected_apps(self):
+        # connected apps Task 5: the guide's "Connected apps" section, which Muse builds a connected app from with no other recipe
+        # (none of a connector's: the design's settled call 2). It states the hook contract as the VM has it (the wrapper's three
+        # lines, the preamble, one silent or wake, connector CLIs inside hooks, exit 3, .ok, output), the creation flow (P8), the
+        # rules, and the pattern's numbers: once each, the gadget's from the headers (D12) and the hook's from the tally's hook.sh,
+        # which runs them (test_muse_apps_hook.py).
+        guide = GUIDE.read_text()
+        section = guide_section(guide, "Connected apps")
+        text = " ".join(section.replace("**", "").split())  # the words, without the bold of the lead-ins
+        self.assertLess(guide.index("\n## Asking Muse\n"), guide.index("\n## Connected apps\n"))
+        self.assertLess(guide.index("\n## Connected apps\n"), guide.index("\n## Common errors\n"))
+        self.assertNotIn("spotify", guide.lower(), "no connector's recipe")
+        self.assertNotIn("/opt/", guide)
+        hook = (TALLY / "hook.sh").read_text()
+
+        def hook_number(name):
+            match = re.search(rf"(?m)^{name}=(-?\d+)(?:\s+#.*)?$", hook)
+            self.assertIsNotNone(match, f"hook.sh has no {name}")
+            return int(match.group(1))
+
+        n = {name: hook_number(name) for name in ("HEARTBEAT_MAX_AGE_S", "TICK_S", "LOOP_S", "TOKENS_MAX", "TOKEN_EVERY_S",
+                                                  "FAST_S", "SLOW_S", "EASE_AT", "LOW_AT", "TOKENS_FLOOR", "ACKS_KEEP")}
+        self.assertEqual(n["TOKENS_MAX"] * n["TOKEN_EVERY_S"], 3600, "one hour's worth of tokens")
+        heartbeat_s = header_number("apps_vmio.h", "APPS_VM_HEARTBEAT_MS") // 1000
+        ack_poll_s = header_number("apps_vmio.h", "APPS_VM_ACK_POLL_MS") // 1000
+        self.assertGreater(n["HEARTBEAT_MAX_AGE_S"], heartbeat_s, "the gate outlasts the gadget's period")
+        self.assertLess(n["LOOP_S"], 60, "a run ends inside script_timeout_secs")
+        facts = [
+            # The folder, the rev file and the heartbeat.
+            r"`state/`: what the hook writes for the app", r"`cache/`: pictures the hook makes", r"`outbox/`: what the gadget writes",
+            r"`hook\.sh`: the hook", r"it then writes `state/rev`, a short text under 64 bytes that is new each time",
+            r'`vm\.watch\("state/rev", 1, cb\)`',
+            rf"the gadget writes `outbox/active\.json` every {heartbeat_s} s",
+            rf"unless that file was written {n['HEARTBEAT_MAX_AGE_S']} s ago or less",
+            # Commands and acks (P3).
+            r"applies the commands in seq order, as numbers, each once", r"keeps the last seq it applied in its `hook_state`",
+            r'`\{"acks":\[\{"seq":<seq>,"result":\.\.\.\}\]\}`, newest last, the last ' + str(n["ACKS_KEEP"]),
+            rf"The gadget reads the acks every {ack_poll_s} s",
+            # When to use which.
+            r"Use `muse\.ask` for what needs your judgement, and for a connector whose rules forbid keeping its data in files",
+            # The hook: where it lives (P7), its start and end.
+            r"`~/hooks/scripts/<hook-id>\.sh`", r"workspace/apps/<app-id>/hook\.sh",
+            r'`hook\.sh` begins `#!/usr/bin/env bash`, then `set -euo pipefail`, then `source "\$HATCH_HOOK_RUNTIME"`',
+            r"Every run ends with exactly one `silent` or `wake`, at the top level of the script, never in a function or in `\$\(\.\.\.\)`",
+            # The template's parts.
+            rf"more than {n['HEARTBEAT_MAX_AGE_S']} s, and it ends at once, `silent`, having written nothing",
+            rf"checks `outbox/` every {n['TICK_S']} s, for at most {n['LOOP_S']} s, then ends",
+            r"Set `script_timeout_secs` to 60", r"serves the waiting commands first, in seq order, with one read of the data source after each",
+            rf"{n['TOKENS_MAX']} tokens at most, one back every {n['TOKEN_EVERY_S']} s \({n['TOKENS_MAX']} an hour\), one taken by each call",
+            rf"With {n['EASE_AT']} tokens or more it reads every {n['FAST_S']} s; from {n['EASE_AT']} down to {n['LOW_AT']} the gap grows "
+            rf"evenly to {n['SLOW_S']} s; below {n['LOW_AT']} it is {n['SLOW_S']} s or the time to the next token, if that is longer; "
+            r"with none left it reads nothing until one is back",
+            rf"down to {n['TOKENS_FLOOR']} tokens", r"under the 120 calls an hour",
+            r"`fetch_state` is the one function that reads the data source",
+            # Connectors in hooks, their results, the output.
+            r"Connector CLIs work inside hooks", r"exits 0, with `\{\"ok\":false,\.\.\.\}`: check `\.ok`",
+            r"Exit 3 means not authorized \(an approval needed, denied or expired\): log it and end the run with `silent`",
+            r"Keep content and secrets out of both", r"`2>/dev/null`",
+            # Dry runs.
+            r"On a dry run \(`\$HATCH_HOOK_DRY_RUN` is `1`\) the hook skips every side effect",
+            r"Its reads still run, with the app closed",
+            # Rules.
+            r"Connector rules are binding\. Never keep in files what a connector forbids keeping",
+            r"An app's ask is untrusted and read-only", r"`rotation` turns it and `spin` spins it", r"`circle = true`",
+            r"[Ss]how a `ui\.spinner` while a command or an ask waits", r"Waiting in Patterns",
+            r"`workspace/apps/_guide/tally/`",
+        ]
+        for pattern in facts:
+            with self.subTest(pattern):
+                self.assertRegex(text, pattern)
+        # P7: the wrapper, exactly.
+        self.assertIn('\n```bash\n#!/usr/bin/env bash\nset -euo pipefail\nexec /bin/bash "$HOME/workspace/apps/<app-id>/hook.sh"\n```\n',
+                      section)
+        # P8: the creation flow, in order.
+        flow = re.search(r"(?ms)^### Making a connected app\n(.*?)(?=^### |\Z)", section).group(1)
+        steps = re.findall(r"(?m)^(\d+)\. (.*)$", flow)
+        self.assertEqual([int(i) for i, _ in steps], list(range(1, len(steps) + 1)))
+        order = [r"`hooks\.add`.*`poll_interval_secs: 5` and `script_timeout_secs: 600`", r"`hooks\.dry_run`.*approval card",
+                 r"`hooks\.update` to `script_timeout_secs: 60`", r"`hooks\.enable`", r"[Ii]nstall the app", r"`snapshot`"]
+        found = [next(i for i, (_, step) in enumerate(steps) if re.search(pattern, step)) for pattern in order]
+        self.assertEqual(found, sorted(found), "hooks.add, the dry run, the update, enable, install, snapshot")
+        # Each of the pattern's numbers is stated once in the guide.
+        for phrase in (f"written {n['HEARTBEAT_MAX_AGE_S']} s ago or less", f"for at most {n['LOOP_S']} s",
+                       f"one back every {n['TOKEN_EVERY_S']} s", f"evenly to {n['SLOW_S']} s", f"down to {n['TOKENS_FLOOR']} tokens"):
+            with self.subTest(phrase):
+                self.assertEqual(" ".join(guide.split()).count(phrase), 1)
+        # The hook's numbers are the ones its loop and budget use.
+        for line in ("STATE_FILE=state/count.json", "HEARTBEAT=outbox/active.json"):
+            self.assertRegex(hook, rf"(?m)^{re.escape(line)}(\s+#.*)?$")
+        # The pcall around muse.ask (M46): the call's own refusals are raised, and a tap handler would crash on them.
+        muse = " ".join(guide_section(guide, "API reference").split("\n### muse\n", 1)[1].split("\n### ", 1)[0].split())
+        self.assertIn("```lua local ok, err = pcall(muse.ask, text, on_reply) if not ok then status:set{text = err} end ```", muse)
+        self.assertIn("pcall", (TALLY / "main.lua").read_text())
+        # The skill holds it all (test_skill_is_the_guide), and its own sections name the tally.
+        skill = SKILL.read_text()
+        self.assertIn(guide_body(guide), skill)
+        self.assertIn("workspace/apps/_guide/tally/", skill.replace(guide_body(guide), ""))
+
+    def test_agents_md_has_the_connected_apps_paragraph(self):
+        agents = " ".join((ROOT / "AGENTS.md").read_text().split())
+        for pattern in (r"\*\*Connected apps:\*\*", r"`apps_vmio\.c`", r"`apps_net\.c`", r"`apps_ask\.c`", r"`apps_jpeg\.c`",
+                        r"examples/tally", r"`workspace/apps/_guide/tally/`", r"tally_<name>", r"tests/test_muse_apps_hook\.py",
+                        r"apphost --vm DIR", r"\"Connected apps\" section"):
+            with self.subTest(pattern):
+                self.assertRegex(agents, pattern)
 
 
 class LinkWiring(unittest.TestCase):

@@ -698,6 +698,21 @@ class GuideAndSkill(unittest.TestCase):
             with self.subTest(pattern):
                 self.assertRegex(images, pattern)
 
+    def test_guide_teaches_a_still_body_under_a_spinning_label(self):
+        # Task 7 (the user's item 4): Images teaches the pattern that keeps a spin cheap and tear-free: what looks the same at any
+        # angle (a record's grooves, the light on it) is drawn still, and only a smaller label spins over it. And why a circle
+        # in the alpha matters: the gadget redraws a picture with a circle in its alpha as its own square each step (apps_lv.c
+        # caps LVGL's room for the turn at its farthest visible pixel), one with corners as the turned square, 1.4 times its
+        # side at 45 degrees.
+        images = " ".join(guide_section(GUIDE.read_text(), "Images").split())
+        for pattern in (r"grooves and the light on it look the same at any angle", r"draw the record still",
+                        r"spin only its label", r"redraws only the label's square", r"a circle in its alpha",
+                        r"as its own square", r"1\.4 times its side"):
+            with self.subTest(pattern):
+                self.assertRegex(images, pattern)
+        lv = (APPS / "apps_lv.c").read_text()
+        self.assertIn("lv_obj_add_event_cb(obj, cap_turn, LV_EVENT_REFR_EXT_DRAW_SIZE,", lv)
+
     def test_guide_states_the_layout_and_alarm_facts(self):
         # Facts an app goes wrong without, with no error to tell it (fix round 1, A and B), each still true of the code and said
         # in the guide in words a reader finds: the guide's text for each must match every pattern of its fact.

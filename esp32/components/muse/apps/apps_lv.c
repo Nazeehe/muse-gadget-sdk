@@ -16,10 +16,12 @@
 
 #include "apps_lv.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_attr.h"
@@ -76,6 +78,8 @@ typedef struct {
     uint8_t spin;      /* an image's: the turns a minute its spin animation runs at; 0: it has none */
     uint8_t runtime;   /* an image's: 1 + the slot of the runtime image its src was last set to; 0: none (a package image's) */
     uint32_t rotation_sets;  /* an image's: the widget's rotation_sets when its angle was last applied */
+    bool capped;       /* an image's: cap_turn is on obj */
+    float reach;       /* a turned image's: how far from its centre its picture draws, in px on the screen; 0: no cap */
 } node_t;
 
 /* The records of the app on the layer, and the descriptors its images are drawn from: one block, from the apps'
@@ -470,6 +474,8 @@ static made_t make_object(pass_t *p, int slot, int depth) {
     n->spin = 0;            /* a new image is at LVGL's angle, 0, and still */
     n->runtime = 0;
     n->rotation_sets = 0;
+    n->capped = false;
+    n->reach = 0;
     w->dirty = (w->dirty & ~(uint32_t)APPS_DIRTY_CREATE) | groups_of_new(w);
     p->changed = true;
     return MADE;
@@ -524,7 +530,68 @@ static void style_bar_part(lv_obj_t *obj, uint32_t rgb, int32_t radius, lv_style
     lv_obj_set_style_radius(obj, radius, part);
 }
 
-/* An image's picture: its descriptor, its scale and the A8 recolor. */
+/*
+ * How far from its centre a picture draws, in its own px: to the outer corner of its farthest pixel that isn't
+ * transparent, by the alpha of an RGB565A8 picture (a plane after the colour, stride / 2 a row) or an A8 one. A
+ * picture with no alpha, or whose alpha isn't all there, fills its rectangle to the corners. Each row is read from
+ * both ends to its first pixel that shows.
+ */
+static float picture_reach(const lv_image_dsc_t *dsc) {
+    uint32_t w = dsc->header.w, h = dsc->header.h, stride = dsc->header.stride;
+    const uint8_t *alpha = NULL;
+    if (dsc->header.cf == LV_COLOR_FORMAT_RGB565A8 && (uint64_t)stride * h + (uint64_t)(stride / 2) * h <= dsc->data_size) {
+        alpha = dsc->data + (size_t)stride * h;
+        stride /= 2;
+    } else if (dsc->header.cf == LV_COLOR_FORMAT_A8 && (uint64_t)stride * h <= dsc->data_size) {
+        alpha = dsc->data;
+    }
+    if (alpha == NULL || stride < w) {
+        return sqrtf((float)w * w + (float)h * h) / 2;
+    }
+    uint32_t far = 0;  /* the farthest corner's (2 dx)^2 + (2 dy)^2, dx and dy its px from the centre */
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *row = alpha + (size_t)y * stride;
+        uint32_t l = 0, r = w;
+        while (l < w && row[l] == 0) {
+            l++;
+        }
+        if (l == w) {
+            continue;
+        }
+        while (row[r - 1] == 0) {
+            r--;
+        }
+        /* The row's pixels that show lie in [l, r) and [y, y + 1): its corners farthest out are at those edges. */
+        int32_t dl = abs((int32_t)(2 * l) - (int32_t)w), dr = abs((int32_t)(2 * r) - (int32_t)w);
+        int32_t dt = abs((int32_t)(2 * y) - (int32_t)h), db = abs((int32_t)(2 * y + 2) - (int32_t)h);
+        uint32_t dx = (uint32_t)(dl > dr ? dl : dr), dy = (uint32_t)(dt > db ? dt : db);
+        far = dx * dx + dy * dy > far ? dx * dx + dy * dy : far;
+    }
+    return sqrtf((float)far) / 2;
+}
+
+/*
+ * LV_EVENT_REFR_EXT_DRAW_SIZE of a turned image, after lv_image's own handler, which makes room past the box for the
+ * box turned (and for a scaled image, the box scaled again): no more room than the picture draws in, and 2 px. LVGL
+ * invalidates and draws a turned image within its box and that room, so a picture with a circle in its alpha redraws
+ * its own square at each step of a spin, not the turned square around it, and nothing it draws is cut.
+ */
+static void cap_turn(lv_event_t *e) {
+    uintptr_t slot = (uintptr_t)lv_event_get_user_data(e);
+    lv_obj_t *obj = lv_event_get_target_obj(e);
+    if (s_state == NULL || slot >= APPS_UI_SLOTS || s_state->node[slot].obj != obj || s_state->node[slot].reach <= 0) {
+        return;
+    }
+    int32_t w = lv_obj_get_width(obj), h = lv_obj_get_height(obj);
+    float room = s_state->node[slot].reach + 2 - (float)(w < h ? w : h) / 2;
+    int32_t cap = room > 0 ? (int32_t)ceilf(room) : 0;
+    int32_t *s = lv_event_get_param(e);
+    if (*s > cap) {
+        *s = cap;
+    }
+}
+
+/* An image's picture: its descriptor, its scale and the A8 recolor; and, turned, how far it draws (cap_turn). */
 static void apply_image(pass_t *p, const apps_widget_t *w, node_t *n) {
     lv_obj_t *obj = n->obj;
     const apps_asset_t *asset = apps_ui_asset(p->ui, w->image);
@@ -560,6 +627,7 @@ static void apply_image(pass_t *p, const apps_widget_t *w, node_t *n) {
         lv_obj_set_style_image_recolor_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
         n->recolored = false;
     }
+    n->reach = w->rotation != 0 || w->spin != 0 ? picture_reach(dsc) * w->scale / 100 : 0;
 }
 
 /*
@@ -665,6 +733,13 @@ static void apply_style(pass_t *p, const apps_widget_t *w, node_t *n) {
         case APPS_W_IMAGE:
             apply_image(p, w, n);
             apply_turn(w, n);  /* the object's own angle, whatever its picture's descriptor came from */
+            if (n->reach > 0 && !n->capped) {
+                lv_obj_add_event_cb(obj, cap_turn, LV_EVENT_REFR_EXT_DRAW_SIZE, (void *)(uintptr_t)(n - p->st->node));
+                n->capped = true;
+            }
+            if (n->capped) {
+                lv_obj_refresh_ext_draw_size(obj);  /* the room for this picture, at this scale, now */
+            }
             break;
         default:
             break;

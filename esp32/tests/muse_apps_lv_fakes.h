@@ -188,6 +188,7 @@ typedef enum {
     LV_EVENT_SCROLL,
     LV_EVENT_GESTURE,
     LV_EVENT_KEY,
+    LV_EVENT_REFR_EXT_DRAW_SIZE = 27,  /* an object's: its param is the int32_t room it needs past its box, to raise (or cap) */
     LV_EVENT_REFR_READY = 59,  /* a display's: the end of each refresh, drawn or not (the codes between aren't used) */
     LV_EVENT_PREPROCESS = 0x8000,
 } lv_event_code_t;
@@ -211,6 +212,7 @@ typedef enum {
 /* lv_color.h and lv_image_dsc.h: what an image's header says (only what apps_lv.c reads). */
 enum {
     LV_COLOR_FORMAT_A8 = 0x0E,
+    LV_COLOR_FORMAT_RGB565A8 = 0x14,  /* the colour, then a plane of alpha (stride / 2 a row) */
 };
 enum {
     LV_IMAGE_FLAGS_PREMULTIPLIED = 0x0001,
@@ -384,11 +386,16 @@ lv_anim_t *lv_anim_start(const lv_anim_t *a);
 bool lv_anim_delete(void *var, lv_anim_exec_xcb_t exec_cb);
 
 void *lv_event_get_user_data(lv_event_t *e);
+void *lv_event_get_param(lv_event_t *e);
+lv_obj_t *lv_event_get_target_obj(lv_event_t *e);
 lv_event_code_t lv_event_get_code(lv_event_t *e);
 void lv_event_stop_processing(lv_event_t *e);
 lv_event_dsc_t *lv_obj_add_event_cb(lv_obj_t *obj, lv_event_cb_t event_cb, lv_event_code_t filter, void *user_data);
 
 lv_display_t *lv_obj_get_display(const lv_obj_t *obj);
+int32_t lv_obj_get_width(const lv_obj_t *obj);
+int32_t lv_obj_get_height(const lv_obj_t *obj);
+void lv_obj_refresh_ext_draw_size(lv_obj_t *obj);
 void lv_display_add_event_cb(lv_display_t *disp, lv_event_cb_t event_cb, lv_event_code_t filter, void *user_data);
 
 lv_indev_t *lv_indev_active(void);

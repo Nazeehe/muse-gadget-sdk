@@ -1,15 +1,24 @@
 {
   "id": "spin",
   "name": "Spin",
-  "version": "1",
+  "version": "2",
   "api": 1,
-  "files": ["disc.bin"],
-  "permissions": ["keep_awake"],
+  "files": [
+    "disc.bin",
+    "body.bin",
+    "label.bin",
+    "cover.bin",
+    "square.bin"
+  ],
+  "permissions": [
+    "keep_awake"
+  ],
   "memory_kb": 64,
   "messages": {
-    "spin": "data {rpm}: the disc's spin, 0 to 60 turns a minute (0 stops it where it is). Replies {rotation, spin, scale, taps}.",
-    "rotation": "data {deg}: turns the disc to deg, 0 to 359, spinning or not. Replies {rotation, spin, scale, taps}.",
-    "scale": "data {pct}: the disc's scale, 10 to 400 percent (100: 200 px; over 100 is an error while it spins). Replies {rotation, spin, scale, taps}.",
-    "state": "Change nothing. Replies {rotation, spin, scale, taps}: what get says, and the taps so far."
+    "layout": "data {name}: disc (the 200 px record spinning), body (its 80 px label spinning on it), cover (over a still 400 px picture) or square (spokes). Replies with state.",
+    "spin": "data {rpm}: the spinning picture's spin, 0 to 60 turns a minute (0 stops it where it is). Replies with state.",
+    "rotation": "data {deg}: turns the spinning picture to deg, 0 to 359, spinning or not. Replies with state.",
+    "scale": "data {pct}: the spinning picture's scale, 10 to 400 percent (over 200 px on screen is an error while it spins). Replies with state.",
+    "state": "Change nothing. Replies {layout, rotation, spin, scale, taps}: get's values for the spinning picture, and the taps so far."
   }
 }

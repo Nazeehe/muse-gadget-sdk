@@ -36,6 +36,7 @@
  */
 
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -605,6 +606,10 @@ struct lv_obj {
     fake_cb_t cbs[8];
     int n_cbs;
     int order;             /* where it is among its parent's children (lv_obj_get_index): made last, unless moved */
+    int32_t ext_draw;      /* the room past its box it draws in and is invalidated in (LV_EVENT_REFR_EXT_DRAW_SIZE): 0 until refreshed */
+    lv_area_t inv;         /* what it invalidated since fake_inv_clear, as one box (empty: x2 < x1), on the screen */
+    int32_t inv_widest;    /* the widest area of those, and the tallest */
+    int32_t inv_tallest;
 };
 
 struct lv_indev {
@@ -622,6 +627,7 @@ struct lv_event {
     void *ud;
     lv_obj_t *target;
     bool stopped;
+    void *param;           /* lv_event_get_param: LV_EVENT_REFR_EXT_DRAW_SIZE's int32_t */
 };
 
 #define FAKE_OBJS_MAX 4096
@@ -801,6 +807,7 @@ static const char *code_name(lv_event_code_t c) {
         case LV_EVENT_RELEASED: return "released";
         case LV_EVENT_SCROLL: return "scroll";
         case LV_EVENT_GESTURE: return "gesture";
+        case LV_EVENT_REFR_EXT_DRAW_SIZE: return "refr_ext_draw_size";
         case LV_EVENT_REFR_READY: return "refr_ready";
         default: break;
     }
@@ -873,6 +880,7 @@ static lv_obj_t *make_object(const char *cls, lv_obj_t *parent, const char *fn) 
     o->scale = 256;
     o->turn_gap_ms = -1;
     o->area = (lv_area_t){0, 0, -1, -1};
+    o->inv = (lv_area_t){0, 0, -1, -1};
     o->scroll_dir = LV_DIR_ALL;
     o->scrollbar_mode = LV_SCROLLBAR_MODE_AUTO;
     /* The flags LVGL 9.5.0's constructors leave: lv_obj is clickable, scrollable and snappable (every class keeps
@@ -1123,6 +1131,8 @@ static int32_t px_of(int32_t v, int32_t whole, int32_t content) {
     return v;
 }
 
+static int32_t ext_of(lv_obj_t *o);
+
 static void content_size(lv_obj_t *o, int32_t *w, int32_t *h) {
     *w = *h = 0;
     if (strcmp(o->cls, "label") == 0) {
@@ -1169,7 +1179,11 @@ static void layout_one(lv_obj_t *o) {
     }
     x1 += o->x;
     y1 += o->y;
+    bool resized = o->area.x2 - o->area.x1 + 1 != w || o->area.y2 - o->area.y1 + 1 != h;
     o->area = (lv_area_t){x1, y1, x1 + w - 1, y1 + h - 1};
+    if (resized && strcmp(o->cls, "image") == 0) {
+        o->ext_draw = ext_of(o);  /* lv_obj_refr_size sends for the room again whenever the size changes */
+    }
 }
 
 void lv_obj_update_layout(const lv_obj_t *obj) {
@@ -1448,6 +1462,8 @@ void lv_bar_set_value(lv_obj_t *obj, int32_t value, lv_anim_enable_t anim) {
     }
 }
 
+static void invalidate_turned(lv_obj_t *o);
+
 void lv_image_set_src(lv_obj_t *obj, const void *src) {
     if (use(obj, "lv_image_set_src", "image") == NULL) {
         return;
@@ -1491,8 +1507,15 @@ void lv_image_set_scale(lv_obj_t *obj, uint32_t zoom) {
         fake_error("lv_image_set_scale(%d, 0)", obj->id);
         return;
     }
-    obj->scale = zoom;
     logline("image_scale %d %u", obj->id, (unsigned)zoom);
+    if (zoom == obj->scale) {
+        return;  /* LVGL returns early for the same scale */
+    }
+    /* scale_update (lv_image.c): as lv_image_set_rotation does for an angle. */
+    invalidate_turned(obj);
+    obj->scale = zoom;
+    obj->ext_draw = ext_of(obj);
+    invalidate_turned(obj);
 }
 
 void lv_image_set_inner_align(lv_obj_t *obj, lv_image_align_t align) {
@@ -1505,6 +1528,135 @@ void lv_image_set_inner_align(lv_obj_t *obj, lv_image_align_t align) {
     }
     obj->inner_align = align;
     logline("image_inner_align %d %s", obj->id, align == LV_IMAGE_ALIGN_CENTER ? "center" : "default");
+}
+
+/* ---- An image's room for its turn, and what it invalidates (connected apps Task 7) ---- */
+
+static void fake_layout(void);
+
+/* LVGL 9.5.0's lv_image_buf_get_transformed_area (lv_draw_image.c), relative to the box: the box (the object's size, w x h)
+ * turned by angle (0.1 degrees) and scaled (256 = 1) about its pivot, LV_PCT(50) of each side (lv_image_constructor), the
+ * scale first (lv_point_transform's zoom_first); the corners' extremes, the right and bottom less 1. LVGL turns in integer
+ * steps of its sine table, the fake in doubles: within a px of it. */
+static lv_area_t turned_area(const lv_obj_t *o, int32_t angle, uint32_t scale) {
+    int32_t w = o->area.x2 - o->area.x1 + 1, h = o->area.y2 - o->area.y1 + 1;
+    if (angle == 0 && scale == 256) {
+        return (lv_area_t){0, 0, w - 1, h - 1};
+    }
+    double c = cos(angle * M_PI / 1800.0), sn = sin(angle * M_PI / 1800.0), k = scale / 256.0;
+    double px = w * 50 / 100, py = h * 50 / 100, x_lo = 1e9, x_hi = -1e9, y_lo = 1e9, y_hi = -1e9;
+    const double corner[4][2] = {{0, 0}, {w, 0}, {0, h}, {w, h}};
+    for (int i = 0; i < 4; i++) {
+        double x = (corner[i][0] - px) * k, y = (corner[i][1] - py) * k;
+        double xr = c * x - sn * y + px, yr = sn * x + c * y + py;
+        x_lo = xr < x_lo ? xr : x_lo;
+        x_hi = xr > x_hi ? xr : x_hi;
+        y_lo = yr < y_lo ? yr : y_lo;
+        y_hi = yr > y_hi ? yr : y_hi;
+    }
+    return (lv_area_t){(int32_t)floor(x_lo), (int32_t)floor(y_lo), (int32_t)floor(x_hi) - 1, (int32_t)floor(y_hi) - 1};
+}
+
+/* LV_EVENT_REFR_EXT_DRAW_SIZE as LVGL 9.5.0 sends it (lv_obj_refresh_ext_draw_size, lv_obj_draw.c): from 0, the class's
+ * handler first (event_send_core: lv_obj_event_base before the object's own callbacks) and lv_image's raises it to the
+ * turned box's overhang when the image is turned or scaled (lv_image_event), then the object's callbacks. */
+static int32_t ext_of(lv_obj_t *o) {
+    int32_t s = 0;
+    if (strcmp(o->cls, "image") == 0 && (o->rotation != 0 || o->scale != 256)) {
+        lv_area_t a = turned_area(o, o->rotation, o->scale);
+        int32_t w = o->area.x2 - o->area.x1 + 1, h = o->area.y2 - o->area.y1 + 1;
+        s = -a.x1 > s ? -a.x1 : s;
+        s = -a.y1 > s ? -a.y1 : s;
+        s = a.x2 - w > s ? a.x2 - w : s;
+        s = a.y2 - h > s ? a.y2 - h : s;
+    }
+    lv_event_t e = {LV_EVENT_REFR_EXT_DRAW_SIZE, NULL, o, false, &s};
+    for (int i = 0; i < o->n_cbs && !e.stopped; i++) {
+        lv_event_code_t f = (lv_event_code_t)(o->cbs[i].filter & ~LV_EVENT_PREPROCESS);
+        if (f == LV_EVENT_ALL || f == LV_EVENT_REFR_EXT_DRAW_SIZE) {
+            e.ud = o->cbs[i].ud;
+            o->cbs[i].cb(&e);
+        }
+    }
+    return s;
+}
+
+/* An area of o invalidated (lv_obj_invalidate_area): nothing if o is hidden; else cut to its box grown by its room
+ * (lv_obj_area_is_visible) and to the screen (lv_inv_area), and added to what o has invalidated. */
+static void fake_invalidate(lv_obj_t *o, lv_area_t a) {
+    if ((o->flags & LV_OBJ_FLAG_HIDDEN) != 0) {
+        return;
+    }
+    lv_area_t box = {o->area.x1 - o->ext_draw, o->area.y1 - o->ext_draw, o->area.x2 + o->ext_draw, o->area.y2 + o->ext_draw};
+    a.x1 = a.x1 > box.x1 ? a.x1 : box.x1;
+    a.y1 = a.y1 > box.y1 ? a.y1 : box.y1;
+    a.x2 = a.x2 < box.x2 ? a.x2 : box.x2;
+    a.y2 = a.y2 < box.y2 ? a.y2 : box.y2;
+    a.x1 = a.x1 > 0 ? a.x1 : 0;
+    a.y1 = a.y1 > 0 ? a.y1 : 0;
+    a.x2 = a.x2 < 465 ? a.x2 : 465;
+    a.y2 = a.y2 < 465 ? a.y2 : 465;
+    if (a.x2 < a.x1 || a.y2 < a.y1) {
+        return;
+    }
+    if (o->inv.x2 < o->inv.x1) {
+        o->inv = a;
+    } else {
+        o->inv.x1 = a.x1 < o->inv.x1 ? a.x1 : o->inv.x1;
+        o->inv.y1 = a.y1 < o->inv.y1 ? a.y1 : o->inv.y1;
+        o->inv.x2 = a.x2 > o->inv.x2 ? a.x2 : o->inv.x2;
+        o->inv.y2 = a.y2 > o->inv.y2 ? a.y2 : o->inv.y2;
+    }
+    o->inv_widest = a.x2 - a.x1 + 1 > o->inv_widest ? a.x2 - a.x1 + 1 : o->inv_widest;
+    o->inv_tallest = a.y2 - a.y1 + 1 > o->inv_tallest ? a.y2 - a.y1 + 1 : o->inv_tallest;
+}
+
+static void fake_inv_clear(lv_obj_t *o) {
+    o->inv = (lv_area_t){0, 0, -1, -1};
+    o->inv_widest = o->inv_tallest = 0;
+}
+
+/* An image's turned area on the screen, invalidated: lv_image_set_rotation and lv_image_set_scale do it for the old angle
+ * and scale and again for the new (lv_image.c). */
+static void invalidate_turned(lv_obj_t *o) {
+    lv_area_t a = turned_area(o, o->rotation, o->scale);
+    fake_invalidate(o, (lv_area_t){a.x1 + o->area.x1, a.y1 + o->area.y1, a.x2 + o->area.x1, a.y2 + o->area.y1});
+}
+
+void *lv_event_get_param(lv_event_t *e) {
+    return e->param;
+}
+
+lv_obj_t *lv_event_get_target_obj(lv_event_t *e) {
+    return e->target;
+}
+
+int32_t lv_obj_get_width(const lv_obj_t *obj) {
+    if (use((lv_obj_t *)obj, "lv_obj_get_width", NULL) == NULL) {
+        return 0;
+    }
+    return obj->area.x2 - obj->area.x1 + 1;
+}
+
+int32_t lv_obj_get_height(const lv_obj_t *obj) {
+    if (use((lv_obj_t *)obj, "lv_obj_get_height", NULL) == NULL) {
+        return 0;
+    }
+    return obj->area.y2 - obj->area.y1 + 1;
+}
+
+/* LVGL 9.5.0's (lv_obj_draw.c): the room sent for again, kept, and the object invalidated with it when it changed. */
+void lv_obj_refresh_ext_draw_size(lv_obj_t *obj) {
+    if (use(obj, "lv_obj_refresh_ext_draw_size", NULL) == NULL) {
+        return;
+    }
+    logline("refresh_ext_draw_size %d", obj->id);
+    int32_t s = ext_of(obj);
+    bool changed = s != obj->ext_draw;
+    obj->ext_draw = s;
+    if (changed) {
+        fake_invalidate(obj, obj->area);
+    }
 }
 
 /* LVGL 9.5.0's lv_image_set_rotation (lv_image.c): 0.1 degrees, brought into 0..3599, about the pivot (the image's centre, LVGL's
@@ -1528,7 +1680,13 @@ void lv_image_set_rotation(lv_obj_t *obj, int32_t angle) {
         long gap = anim_clock_ms - obj->turned_ms;
         obj->turn_gap_ms = obj->turn_gap_ms < 0 || gap < obj->turn_gap_ms ? gap : obj->turn_gap_ms;
     }
+    /* LVGL: the layout brought up to date, the old turned area invalidated, the angle set, the room sent for again with
+     * invalidation off, and the new turned area invalidated. */
+    fake_layout();
+    invalidate_turned(obj);
     obj->rotation = angle;
+    obj->ext_draw = ext_of(obj);
+    invalidate_turned(obj);
     obj->turns++;
     obj->turned_ms = anim_clock_ms;
 }
@@ -1857,7 +2015,7 @@ void lv_display_add_event_cb(lv_display_t *disp, lv_event_cb_t event_cb, lv_even
 /* One refresh of the display as lv_display_refr_timer ends it (lv_refr.c): LV_EVENT_REFR_READY to the display's callbacks, sent
  * whether or not anything was drawn. LVGL runs it at most every LV_DEF_REFR_PERIOD while something is invalid; a case says when. */
 static void fake_refresh(void) {
-    lv_event_t e = {LV_EVENT_REFR_READY, NULL, NULL, false};
+    lv_event_t e = {LV_EVENT_REFR_READY, NULL, NULL, false, NULL};
     for (int i = 0; i < display_obj.n_cbs && !e.stopped; i++) {
         if (display_obj.cbs[i].filter == LV_EVENT_ALL || display_obj.cbs[i].filter == LV_EVENT_REFR_READY) {
             e.ud = display_obj.cbs[i].ud;
@@ -2375,7 +2533,7 @@ static int arc_drags;  /* times the fake arc's own handler turned its value to a
  * processing ends it. */
 static void fake_fire(int id, lv_event_code_t code) {
     lv_obj_t *o = fake_obj(id);
-    lv_event_t e = {code, NULL, o, false};
+    lv_event_t e = {code, NULL, o, false, NULL};
     for (int stage = 0; stage < 3 && !e.stopped; stage++) {
         if (stage == 1) {
             if (strcmp(o->cls, "arc") == 0 && code == LV_EVENT_PRESSING) {
@@ -7313,6 +7471,95 @@ static void image_spin_animates_and_stops_in_place(void) {
     FINISH(&e);
 }
 
+/* Pictures for Task 7's case: side x side, RGB565A8 whose alpha is 255 where a pixel's centre is strictly inside the circle
+ * inscribed in the picture and 0 outside (apps_jpeg's circle), or RGB565 with no alpha (a square that is all picture). */
+static uint8_t CIRCLE_200[12 + 200 * 200 * 3], CIRCLE_100[12 + 100 * 100 * 3], SQUARE_200[12 + 200 * 200 * 2];
+
+static void make_picture(uint8_t *b, int side, bool circle) {
+    const uint8_t head[12] = {0x19, circle ? 0x14 : 0x12, 0, 0, side & 0xFF, side >> 8, side & 0xFF, side >> 8,
+                              (side * 2) & 0xFF, (side * 2) >> 8, 0, 0};
+    memcpy(b, head, sizeof head);
+    for (int i = 0; i < side * side; i++) {
+        b[12 + 2 * i] = (uint8_t)i;
+        b[13 + 2 * i] = (uint8_t)(i >> 8);
+    }
+    if (circle) {
+        uint8_t *alpha = b + 12 + side * side * 2;
+        for (int y = 0; y < side; y++) {
+            for (int x = 0; x < side; x++) {
+                long dx = 2L * x + 1 - side, dy = 2L * y + 1 - side;
+                alpha[y * side + x] = dx * dx + dy * dy < (long)side * side ? 255 : 0;
+            }
+        }
+    }
+}
+
+/* Task 7: what a turned picture invalidates. LVGL makes room past an image's box for its turned corners (lv_image's
+ * LV_EVENT_REFR_EXT_DRAW_SIZE) and invalidates the turned box at every step of a spin: a 200 px square at 45 degrees is a 283 px
+ * box. A picture whose alpha is a circle draws nothing outside its own box at any angle, so apps_lv caps the room at its
+ * farthest pixel that isn't transparent, drawn, plus 2 px: a spinning record invalidates its own square and looks the same.
+ * A picture with corners keeps LVGL's room, and a scaled one gets the room its drawn picture needs, not LVGL's for the box
+ * scaled again. */
+static void spin_invalidates_what_it_draws(void) {
+    make_picture(CIRCLE_200, 200, true);
+    make_picture(CIRCLE_100, 100, true);
+    make_picture(SQUARE_200, 200, false);
+    const apps_asset_t assets[] = {{"c.bin", CIRCLE_200, sizeof CIRCLE_200, 200, 200},
+                                   {"s.bin", SQUARE_200, sizeof SQUARE_200, 200, 200},
+                                   {"k.bin", CIRCLE_100, sizeof CIRCLE_100, 100, 100}};
+    env_t e;
+    scene_with(&e, assets, 3);
+    RUN(&e, "c = ui.image{src = 'c.bin', spin = 30}");
+    CHECK(APPLY(&e), "made");
+    lv_obj_t *c = fake_obj(2);
+    CHECK(log_count("add_event_cb 2 refr_ext_draw_size") == 1, "the cap is on the image\n%s", log_peek());
+    fake_inv_clear(c);
+    frames(2000, 10);  /* a whole turn */
+    lv_area_t box = c->area;
+    CHECK(box.x2 - box.x1 == 199 && box.y2 - box.y1 == 199, "a 200 px box");
+    CHECK(c->turns > 50 && c->inv.x1 >= box.x1 - 3 && c->inv.y1 >= box.y1 - 3 && c->inv.x2 <= box.x2 + 3 && c->inv.y2 <= box.y2 + 3,
+          "the record invalidated (%d,%d)-(%d,%d) in %d turns: its box (%d,%d)-(%d,%d) and 3 px at most", (int)c->inv.x1,
+          (int)c->inv.y1, (int)c->inv.x2, (int)c->inv.y2, c->turns, (int)box.x1, (int)box.y1, (int)box.x2, (int)box.y2);
+    CHECK(c->ext_draw <= 3 && c->inv_widest <= 206, "room %d, widest %d", (int)c->ext_draw, (int)c->inv_widest);
+
+    /* All picture, no alpha: its corners swing out, and LVGL's room stays (the turned box, 283 px at 45 degrees). */
+    RUN(&e, "c:set{spin = 0, hidden = true} s = ui.image{src = 's.bin', spin = 30}");
+    CHECK(APPLY(&e), "changed");
+    lv_obj_t *sq = fake_obj(3);
+    fake_inv_clear(sq);
+    frames(2000, 10);
+    CHECK(sq->inv_widest >= 280 && sq->inv_widest <= 286, "the square: widest %d", (int)sq->inv_widest);
+
+    /* Scaled: a 100 px circle at 200% draws 200 px. LVGL turns the 200 px box at 200% (a 400 px square: 566 px at 45 degrees);
+     * the picture drawn needs its box and 4 px. */
+    RUN(&e, "s:set{spin = 0, hidden = true} k = ui.image{src = 'k.bin', scale = 200, spin = 30}");
+    CHECK(APPLY(&e), "changed");
+    lv_obj_t *k = fake_obj(4);
+    fake_inv_clear(k);
+    frames(2000, 10);
+    box = k->area;
+    CHECK(box.x2 - box.x1 == 199, "a box of 200 px: %d", (int)(box.x2 - box.x1 + 1));
+    CHECK(k->inv.x1 >= box.x1 - 4 && k->inv.y1 >= box.y1 - 4 && k->inv.x2 <= box.x2 + 4 && k->inv.y2 <= box.y2 + 4 &&
+              k->ext_draw <= 4,
+          "the scaled record invalidated (%d,%d)-(%d,%d), room %d", (int)k->inv.x1, (int)k->inv.y1, (int)k->inv.x2,
+          (int)k->inv.y2, (int)k->ext_draw);
+
+    /* Still, at an angle: capped the same. Its picture changed to one with corners: LVGL's room again, at once. */
+    RUN(&e, "k:set{spin = 0, rotation = 45, scale = 100}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(k->ext_draw <= 3, "a still record at 45 degrees: room %d", (int)k->ext_draw);
+    RUN(&e, "k:set{src = 's.bin'}");
+    CHECK(APPLY(&e), "changed");
+    CHECK(k->ext_draw >= 40, "the square at 45 degrees: room %d", (int)k->ext_draw);
+    CHECK(log_count("add_event_cb 4 refr_ext_draw_size") == 1, "one cap an object\n%s", log_peek());
+
+    /* Unturned images aren't capped, and get no callback. */
+    RUN(&e, "u = ui.image{src = 'c.bin', scale = 50}");
+    CHECK(APPLY(&e), "made");
+    CHECK(log_count("add_event_cb 5 ") == 0, "an image that doesn't turn\n%s", log_peek());
+    FINISH(&e);
+}
+
 /* Setting rotation turns the image to it, spinning or not, and a spin goes on from there: the same value again too, once the image
  * has spun away from it. */
 static void rotation_sets_the_angle_a_spin_continues_from(void) {
@@ -8225,6 +8472,7 @@ int main(int argc, char **argv) {
         {"launcher_frame_log", launcher_frame_log},
         {"image_rotation_applies", image_rotation_applies},
         {"image_spin_animates_and_stops_in_place", image_spin_animates_and_stops_in_place},
+        {"spin_invalidates_what_it_draws", spin_invalidates_what_it_draws},
         {"rotation_sets_the_angle_a_spin_continues_from", rotation_sets_the_angle_a_spin_continues_from},
         {"spin_ends_with_the_widget", spin_ends_with_the_widget},
         {"spin_frame_log", spin_frame_log},

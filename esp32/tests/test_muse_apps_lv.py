@@ -485,6 +485,9 @@ class HarnessTest(unittest.TestCase):
     def test_rotation_sets_the_angle_a_spin_continues_from(self):
         self.run_case("rotation_sets_the_angle_a_spin_continues_from")
 
+    def test_a_spinning_circle_invalidates_its_square(self):  # Task 7: a record's room for its turn is its own; corners keep LVGL's
+        self.run_case("spin_invalidates_what_it_draws")
+
     # ---- Connected apps Task 2: runtime images ----
 
     def test_runtime_image_shows_in_ui_image(self):  # drawn from its block in place; rotation, spin and scale as a package image's
@@ -650,12 +653,12 @@ class FakesTest(unittest.TestCase):
         LV_SCROLL_SNAP_NONE LV_SCROLL_SNAP_START LV_SCROLL_SNAP_END LV_SCROLL_SNAP_CENTER LV_DIR_HOR LV_DIR_VER LV_DIR_ALL
         LV_PART_MAIN LV_PART_INDICATOR LV_PART_KNOB
         LV_EVENT_ALL LV_EVENT_PRESSED LV_EVENT_PRESSING LV_EVENT_PRESS_LOST LV_EVENT_SHORT_CLICKED
-        LV_EVENT_SINGLE_CLICKED LV_EVENT_DOUBLE_CLICKED LV_EVENT_TRIPLE_CLICKED LV_EVENT_LONG_PRESSED
+        LV_EVENT_SINGLE_CLICKED LV_EVENT_DOUBLE_CLICKED LV_EVENT_TRIPLE_CLICKED LV_EVENT_LONG_PRESSED LV_EVENT_REFR_EXT_DRAW_SIZE
         LV_EVENT_LONG_PRESSED_REPEAT LV_EVENT_CLICKED LV_EVENT_RELEASED LV_EVENT_SCROLL_BEGIN
         LV_EVENT_SCROLL_THROW_BEGIN LV_EVENT_SCROLL_END LV_EVENT_SCROLL LV_EVENT_GESTURE LV_EVENT_KEY
         LV_EVENT_REFR_READY LV_EVENT_PREPROCESS
         LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_COVER LV_ANIM_OFF LV_ANIM_ON
-        LV_IMAGE_ALIGN_DEFAULT LV_IMAGE_ALIGN_CENTER LV_COLOR_FORMAT_A8 LV_IMAGE_FLAGS_PREMULTIPLIED
+        LV_IMAGE_ALIGN_DEFAULT LV_IMAGE_ALIGN_CENTER LV_COLOR_FORMAT_A8 LV_COLOR_FORMAT_RGB565A8 LV_IMAGE_FLAGS_PREMULTIPLIED
         sizeof(lv_image_header_t) sizeof(lv_image_dsc_t) sizeof(lv_color_t) sizeof(lv_area_t)
         offsetof(lv_image_dsc_t,header) offsetof(lv_image_dsc_t,data_size) offsetof(lv_image_dsc_t,data)
         offsetof(lv_area_t,x1) offsetof(lv_area_t,x2) offsetof(lv_area_t,y1) offsetof(lv_area_t,y2)
@@ -734,6 +737,71 @@ class FakesTest(unittest.TestCase):
         for line in ("a->duration = 500;", "a->repeat_cnt = 1;", "a->early_apply = 1;", "a->current_value = INT32_MIN;",
                      "angle -= 3600;", "angle += 3600;", "if (new_value != a->current_value) {",
                      "a->act_time = over_time - (int32_t)a->repeat_delay;", "lv_anims_of_deleted(o);"):
+            with self.subTest(fake=line):
+                self.assertIn(line, harness)
+
+    def test_the_fakes_turned_room_and_invalidation_are_lvgl_9_5_0s(self):
+        """Task 7: what the fake's turned images invalidate (tests/muse_apps_lv_harness.c), in LVGL 9.5.0's own lines: the turned
+        box (the object's size turned and scaled about the pivot, the right and bottom less 1), an image's room for it
+        (LV_EVENT_REFR_EXT_DRAW_SIZE from 0, the class's handler before the object's callbacks), lv_image_set_rotation's and
+        scale_update's invalidations of the old and new turned areas with the room sent for between them, and an invalidated
+        area cut to the box grown by the room."""
+        def code(path):
+            return _strip_comments((self.lvgl / path).read_text(errors="replace"))
+
+        def definition(text, signature):
+            return " ".join(c_function(text, signature + "\n{").split())
+
+        image = code("src/widgets/image/lv_image.c")
+        event = " ".join(re.search(r"else if\(code == LV_EVENT_REFR_EXT_DRAW_SIZE\) \{.*?\n    \}", image, re.S).group(0).split())
+        for line in ("if(img->rotation || img->scale_x != LV_SCALE_NONE || img->scale_y != LV_SCALE_NONE) {",
+                     "int32_t w = lv_obj_get_width(obj);",
+                     "lv_image_buf_get_transformed_area(&a, w, h, img->rotation, img->scale_x, img->scale_y, &pivot_px);",
+                     "*s = LV_MAX(*s, -a.x1);", "*s = LV_MAX(*s, -a.y1);", "*s = LV_MAX(*s, a.x2 - w);", "*s = LV_MAX(*s, a.y2 - h);"):
+            with self.subTest(line):
+                self.assertIn(line, event)
+        rotation = definition(image, "void lv_image_set_rotation(lv_obj_t * obj, int32_t angle)")
+        steps = ["lv_obj_update_layout(obj);", "lv_obj_invalidate_area(obj, &a);", "img->rotation = angle;",
+                 "lv_display_enable_invalidation(disp, false);", "lv_obj_refresh_ext_draw_size(obj);",
+                 "lv_display_enable_invalidation(disp, true);", "lv_obj_invalidate_area(obj, &a);"]
+        at = 0
+        for line in steps:
+            with self.subTest(rotation=line):
+                at = rotation.index(line, at) + len(line)
+        scale = definition(image, "static void scale_update(lv_obj_t * obj, int32_t scale_x, int32_t scale_y)")
+        for line in ("lv_obj_invalidate_area(obj, &a);", "img->scale_x = scale_x;", "lv_obj_refresh_ext_draw_size(obj);"):
+            with self.subTest(scale=line):
+                self.assertIn(line, scale)
+        self.assertIn("if(zoom == img->scale_x && zoom == img->scale_y) return;", definition(image, "void lv_image_set_scale(lv_obj_t * obj, uint32_t zoom)"))
+        transformed = " ".join(re.search(r"void lv_image_buf_get_transformed_area\(.*?\n\}", code("src/draw/lv_draw_image.c"),
+                                         re.S).group(0).split())
+        for line in ("lv_point_transform(&p[0], angle, scale_x, scale_y, pivot, true);",
+                     "res->x2 = LV_MAX4(p[0].x, p[1].x, p[2].x, p[3].x) - 1;", "res->y1 = LV_MIN4(p[0].y, p[1].y, p[2].y, p[3].y);"):
+            with self.subTest(transformed=line):
+                self.assertIn(line, transformed)
+        self.assertRegex(re.search(r"static void lv_image_constructor\([^)]*\)\s*\{.*?\n\}", image, re.S).group(0),
+                         r"lv_point_set\(&img->pivot, LV_PCT\(50\), LV_PCT\(50\)\);")
+        draw = code("src/core/lv_obj_draw.c")
+        refresh = definition(draw, "void lv_obj_refresh_ext_draw_size(lv_obj_t * obj)")
+        for line in ("int32_t s_new = 0;", "lv_obj_send_event(obj, LV_EVENT_REFR_EXT_DRAW_SIZE, &s_new);",
+                     "if(s_new != s_old) lv_obj_invalidate(obj);"):
+            with self.subTest(refresh=line):
+                self.assertIn(line, refresh)
+        send = definition(code("src/core/lv_obj_event.c"), "static lv_result_t event_send_core(lv_event_t * e)")
+        self.assertLess(send.index("res = lv_event_send(list, e, true);"), send.index("res = lv_obj_event_base(NULL, e);"))
+        self.assertLess(send.index("res = lv_obj_event_base(NULL, e);"), send.index("res = lv_event_send(list, e, false);"))
+        visible = definition(code("src/core/lv_obj_pos.c"), "bool lv_obj_area_is_visible(const lv_obj_t * obj, lv_area_t * area)")
+        for line in ("if(lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) return false;", "int32_t ext_size = lv_obj_get_ext_draw_size(obj);",
+                     "lv_area_increase(&obj_coords, ext_size, ext_size);", "if(!lv_area_intersect(area, area, &obj_coords)) return false;"):
+            with self.subTest(visible=line):
+                self.assertIn(line, visible)
+        self.assertIn("lv_obj_refresh_ext_draw_size(obj);", definition(code("src/core/lv_obj_pos.c"), "bool lv_obj_refr_size(lv_obj_t * obj)"))
+        redraw = definition(code("src/core/lv_refr.c"), "void lv_obj_redraw(lv_layer_t * layer, lv_obj_t * obj)")
+        self.assertIn("lv_area_increase(&obj_coords_ext, ext_draw_size, ext_draw_size);", redraw)  # and the draw is cut there too
+        harness = HARNESS.read_text()
+        for line in ("double px = w * 50 / 100, py = h * 50 / 100", "(int32_t)floor(x_hi) - 1", "lv_event_t e = {LV_EVENT_REFR_EXT_DRAW_SIZE, NULL, o, false, &s};",
+                     "if (changed) {", "invalidate_turned(obj);\n    obj->rotation = angle;\n    obj->ext_draw = ext_of(obj);\n    invalidate_turned(obj);",
+                     "if (zoom == obj->scale) {", "o->ext_draw = ext_of(o);  /* lv_obj_refr_size"):
             with self.subTest(fake=line):
                 self.assertIn(line, harness)
 

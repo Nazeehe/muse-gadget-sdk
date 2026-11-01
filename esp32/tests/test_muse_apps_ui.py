@@ -852,31 +852,54 @@ class UiTest(UiTestCase):
             "60",  # ui.clear() freed it all: one 200 px
         ])
 
-    def test_the_spin_fixture(self):  # connected apps Task 1: the board's spin gate's app, and its disc
-        disc = (FIXTURES / "spin/disc.bin").read_bytes()
-        magic, cf, flags, w, h, stride, _ = struct.unpack_from("<BBHHHHH", disc)
-        # 200 x 200: the most an image may spin (APPS_SPIN_SIDE_MAX, fix round 0); the gate's 400 px runs are in task-1-report.md.
+    def test_the_spin_fixture(self):  # connected apps Tasks 1 and 7: the board's spin gate's app, and its pictures
+        def image(name):
+            data = (FIXTURES / "spin" / name).read_bytes()
+            magic, cf, flags, w, h, stride, _ = struct.unpack_from("<BBHHHHH", data)
+            self.assertEqual((magic, flags, stride), (0x19, 0, w * 2), name)
+            self.assertEqual(len(data), 12 + w * h * (3 if cf == 0x14 else 2), name)
+            return cf, w, h, data
+
         side = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
-        self.assertEqual((magic, cf, flags, w, h, stride), (0x19, 0x14, 0, side, side, side * 2), "a 200 x 200 RGB565A8 image")
-        self.assertEqual(len(disc), 12 + side * side * 3)
-        alpha = disc[12 + side * side * 2:]
+        # disc.bin: 200 x 200 RGB565A8, the most an image may spin (APPS_SPIN_SIDE_MAX, fix round 0); its alpha a circle.
+        # body.bin: the same record without its label, still; label.bin: 80 px, the label that spins on it (Task 7).
+        for name, size in (("disc.bin", side), ("body.bin", side), ("label.bin", 80)):
+            cf, w, h, data = image(name)
+            self.assertEqual((cf, w, h), (0x14, size, size), f"{name}: a {size} x {size} RGB565A8 image")
+            alpha = data[12 + w * h * 2:]
 
-        def a(x, y):
-            return alpha[y * side + x]
+            def a(x, y):
+                return alpha[y * w + x]
 
-        self.assertEqual([a(0, 0), a(199, 0), a(0, 199), a(199, 199), a(15, 15), a(185, 185)], [0] * 6, "the corners are clear")
-        self.assertEqual([a(100, 100), a(100, 3), a(3, 100), a(196, 100), a(100, 196)], [255] * 5, "the disc is whole")
-        colours = {disc[12 + 2 * (y * side + x):14 + 2 * (y * side + x)] for x in range(50, 150, 4) for y in range(50, 150, 4)}
-        self.assertGreater(len(colours), 8, "the disc has detail to show its angle")
+            last, mid = w - 1, w // 2
+            self.assertEqual([a(0, 0), a(last, 0), a(0, last), a(last, last), a(w * 15 // 200, w * 15 // 200)], [0] * 5,
+                             f"{name}: the corners are clear")
+            self.assertEqual([a(mid, mid), a(mid, 3), a(3, mid), a(last - 3, mid), a(mid, last - 3)], [255] * 5,
+                             f"{name}: the disc is whole")
+            colours = {data[12 + 2 * (y * w + x):14 + 2 * (y * w + x)] for x in range(w // 4, w * 3 // 4, 4)
+                       for y in range(w // 4, w * 3 // 4, 4)}
+            self.assertGreater(len(colours), 8, f"{name}: detail")
+        # cover.bin: R2's screen's still, dimmed picture, 400 px, no alpha; square.bin: 200 px of spokes, no alpha, whose corners
+        # swing as it spins (LVGL draws it in two bands).
+        self.assertEqual(image("cover.bin")[:3], (0x12, 400, 400))
+        self.assertEqual(image("square.bin")[:3], (0x12, side, side))
         run = self.host(FIXTURES / "spin", script=['tap "0"', 'tap "1"', 'message state', 'message spin {"rpm": 0}',
                                                    'message rotation {"deg": 90}', 'message spin {"rpm": 99}',
-                                                   'message scale {"pct": 50}'])
-        self.assertEqual(run.kinds(), ["keep_awake", "started", "log", "log"] + ["reply"] * 5)
+                                                   'message scale {"pct": 50}', 'message layout {"name": "body"}',
+                                                   'message layout {"name": "cover"}', 'message layout {"name": "square"}',
+                                                   'message layout {"name": "disc"}'])
+        self.assertEqual(run.kinds(), ["keep_awake", "started", "log", "log"] + ["reply"] * 9)
         self.assertRegex(run.logs()[1], r"^tap 2 \d+$")
         self.assertEqual([e["data"] for e in run.of("reply")], [
-            {"rotation": 0, "spin": 33, "scale": 100, "taps": 2}, {"rotation": 0, "spin": 0, "scale": 100, "taps": 2},
-            {"rotation": 90, "spin": 0, "scale": 100, "taps": 2}, {"rotation": 90, "spin": 60, "scale": 100, "taps": 2},
-            {"rotation": 90, "spin": 60, "scale": 50, "taps": 2}])
+            {"layout": "disc", "rotation": 0, "spin": 33, "scale": 100, "taps": 2},
+            {"layout": "disc", "rotation": 0, "spin": 0, "scale": 100, "taps": 2},
+            {"layout": "disc", "rotation": 90, "spin": 0, "scale": 100, "taps": 2},
+            {"layout": "disc", "rotation": 90, "spin": 60, "scale": 100, "taps": 2},
+            {"layout": "disc", "rotation": 90, "spin": 60, "scale": 50, "taps": 2},
+            {"layout": "body", "rotation": 0, "spin": 33, "scale": 100, "taps": 2},
+            {"layout": "cover", "rotation": 90, "spin": 33, "scale": 50, "taps": 2},
+            {"layout": "square", "rotation": 0, "spin": 33, "scale": 100, "taps": 2},
+            {"layout": "disc", "rotation": 90, "spin": 33, "scale": 50, "taps": 2}])
 
     def test_types_other_than_numbers(self):  # R9.2
         lines = self.lua_lines("""

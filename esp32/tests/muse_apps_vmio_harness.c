@@ -1008,7 +1008,7 @@ static void read_json_text_jpg_bin(void) {
     put_jpeg("big.jpg", 200, 100, 'B', 0, APPS_VM_JPEG_MAX + 1 - 18);
     put_filled("big.bin", APPS_VM_BIN_MAX + 1, 0, "", "");
     vm_put_text("bad.bin", "not an image");
-    put_jpeg("prog.jpg", 200, 100, 'P', 0, 0);
+    put_jpeg("fmt3.jpg", 200, 100, 'P', 0, 0);  /* one the ROM refuses (JDR_FMT3), not an SOF2: apps_jpeg.c says how to write it */
     put_jpeg("pic.jpeg", 200, 100, 'B', 0, 0);
     put_jpeg("more.jpg", 20, 10, 'B', 0, 0);
     start_app(APP(
@@ -1031,7 +1031,7 @@ static void read_json_text_jpg_bin(void) {
         "  vm.read('big.jpg', cb('big.jpg'))\n"
         "  vm.read('big.bin', cb('big.bin'))\n"
         "  vm.read('bad.bin', cb('bad.bin'))\n"
-        "  vm.read('prog.jpg', cb('prog.jpg'))\n"
+        "  vm.read('fmt3.jpg', cb('fmt3.jpg'))\n"
         "  vm.read('pic.jpeg', nil, keep('pic.jpeg'))\n"
         "  vm.read('more.jpg', cb('more.jpg'))\n"
         "end\n"));
@@ -1052,7 +1052,8 @@ static void read_json_text_jpg_bin(void) {
     expect_logged("edge.json\tstring\t32766\tnil", "edge.txt\t16384\tnil", "big.jpg\tnil\tbig.jpg is larger than 256 KB",
                   "big.bin\tnil\tbig.bin is larger than 512 KB",
                   "bad.bin\tnil\timage: not an LVGL v9 image file (use LVGLImage.py --ofmt BIN)",
-                  "prog.jpg\tnil\tunsupported JPEG: use baseline, not progressive", "pic.jpeg\timage#3 200x100\tnil",
+                  "fmt3.jpg\tnil\tunsupported JPEG: write baseline with 4:2:0 colour (ffmpeg -pix_fmt yuvj420p)",
+                  "pic.jpeg\timage#3 200x100\tnil",
                   "more.jpg\tnil\tno more than 4 images at once: free one with img:free()");
     finish();
 }

@@ -453,10 +453,17 @@ class HarnessTest(unittest.TestCase):
 
     def test_the_frame_log_is_the_bench_builds_alone(self):
         # Every part of it is inside #if CONFIG_MUSE_BENCH: the callback, its state, the line and the registration in apps_lv_build.
+        # The one exception is Task 7's frame pairing (R7a), which follows the spin in every build, but registers its refresh callback
+        # only once the board gives one (apps_lv_set_pairing_cb): a build with neither adds nothing to the display.
         source = APPS_LV.read_text()
         self.assertIn('#include "sdkconfig.h"', source)
+        pairing_start = source.index("/* An image spins on the layer in front, with no launcher or card over it:")
+        watch_spin = c_function(source, "static void watch_spin(lv_obj_t *screen) {")
+        pairing_end = source.index(watch_spin) + len(watch_spin)
+        self.assertIn("s_pairing_cb != NULL && screen != NULL ? lv_obj_get_display(screen) : NULL", watch_spin)
         mentions = [m.start() for m in re.finditer(r"on_refresh|watch_frames|s_frames|launcher frame|spin frame|LV_EVENT_REFR_READY|"
-                                                   r"lv_display_add_event_cb|lv_obj_get_display", source)]
+                                                   r"lv_display_add_event_cb|lv_obj_get_display", source)
+                    if not pairing_start <= m.start() < pairing_end]
         self.assertGreaterEqual(len(mentions), 7)
         self.assertIn("spin frame", " ".join(source[i:i + 12] for i in mentions))
         for index in mentions:
@@ -487,6 +494,20 @@ class HarnessTest(unittest.TestCase):
 
     def test_a_spinning_circle_invalidates_its_square(self):  # Task 7: a record's room for its turn is its own; corners keep LVGL's
         self.run_case("spin_invalidates_what_it_draws")
+
+    def test_pairing_follows_the_spin(self):
+        # Task 7, fix round 1 (R7a): the board's frame pairing is on only while an image spins on the layer in front (no launcher or
+        # card over it): a spin turns it on, and the last spin stopped or deleted, the app behind, the launcher or a card turn it off.
+        self.run_case("pairing_follows_the_spin")
+        # And only the 1.75C pairs, the board it was measured on: muse_ui.c hands the app layer the board's op, the 1.75C's is
+        # muse_lcd_bands_set_pairing, and no other board has one, so the plain build and the other boards send band by band.
+        ui = (ROOT / "components/muse/muse_ui.c").read_text()
+        self.assertRegex(ui, r"muse_apps_ui_build\(scr\);\s*muse_apps_ui_pairing\(muse_board->frame_pairing\);")
+        boards = {path.name: path.read_text() for path in (ROOT / "components/muse/boards").glob("board_*.c")}
+        pairing = sorted(name for name, text in boards.items() if ".frame_pairing" in text)
+        self.assertEqual(pairing, ["board_waveshare_s3_175c.c"])
+        self.assertIn(".frame_pairing = muse_lcd_bands_set_pairing,", boards["board_waveshare_s3_175c.c"])
+        self.assertIn("apps_lv_set_pairing_cb(pairing);", (APPS / "apps_task.c").read_text())
 
     # ---- Connected apps Task 2: runtime images ----
 

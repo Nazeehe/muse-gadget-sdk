@@ -109,6 +109,7 @@ static size_t s_band_bytes;
 #define TE_SPREAD 50                     /* a band's write, as a percentage of its estimate, either way */
 #define TE_JITTER_US 1000                /* how late a held write may start after its moment */
 #define PAIR_WAIT_MS 200                 /* for LVGL to draw a pair's second band, at most */
+static bool s_pairing;                   /* LVGL task: muse_lcd_bands_set_pairing; off, each band is held on its own */
 static int s_parts, s_flushed;           /* LVGL task: the refresh's bands (refresh_parts), and those flushed so far */
 static volatile uint32_t s_drawn;        /* LV_EVENT_FLUSH_WAIT_START's count: LVGL has drawn a band */
 static lv_area_t s_drawn_area;           /* the band it has drawn (under s_lock) */
@@ -222,13 +223,23 @@ static int refresh_parts(const lv_area_t *areas, const uint8_t *joined, int n, u
     return parts;
 }
 
+/*
+ * Whether the band LVGL is flushing, the refresh's `flushed`th (from 0) of `parts`, is a pair's first: held until the band after
+ * it is drawn, and sent with it. Only with pairing on (muse_lcd_bands_set_pairing), and only the first band of a refresh of
+ * exactly two that isn't the refresh's last (a count that was wrong can't hold a band for one that never comes).
+ */
+static bool band_pairs(bool pairing, int flushed, int parts, bool last)
+{
+    return pairing && flushed == 0 && parts == 2 && !last;   /* two: LVGL draws the second in its other buffer */
+}
+
 static esp_err_t queue_band(lv_display_t *disp, esp_lcd_panel_handle_t panel, int x1, int y1, int x2, int y2,
                             const void *data, void *ctx)
 {
     (void)panel;
     (void)ctx;
     band_t b = { data, x1, y1, x2, y2, lv_display_flush_is_last(disp), false, s_drawn, 0 };
-    b.pair = s_flushed++ == 0 && s_parts == FRAME_HOLD_MAX && !b.last;
+    b.pair = band_pairs(s_pairing, s_flushed++, s_parts, b.last);
 #if CONFIG_MUSE_BENCH
     if (b.last) {
         b.render_us = (int32_t)(esp_timer_get_time() - s_render_t0 - s_render_waited);
@@ -250,8 +261,9 @@ static void on_render_event(lv_event_t *e)
 #endif
     switch (lv_event_get_code(e)) {
     case LV_EVENT_RENDER_START:
-        s_parts = refresh_parts(s_disp->inv_areas, s_disp->inv_area_joined, (int)s_disp->inv_p,
-                                s_disp->buf_act->data_size);
+        s_parts = s_pairing ? refresh_parts(s_disp->inv_areas, s_disp->inv_area_joined, (int)s_disp->inv_p,
+                                            s_disp->buf_act->data_size)
+                            : 0;
         s_flushed = 0;
 #if CONFIG_MUSE_BENCH
         s_render_t0 = now;
@@ -259,11 +271,13 @@ static void on_render_event(lv_event_t *e)
 #endif
         break;
     case LV_EVENT_FLUSH_WAIT_START:
-        portENTER_CRITICAL(&s_lock);
-        s_drawn_area = s_disp->refreshed_area;
-        s_drawn++;
-        portEXIT_CRITICAL(&s_lock);
-        xSemaphoreGive(s_drawn_sem);
+        if (s_pairing) {
+            portENTER_CRITICAL(&s_lock);
+            s_drawn_area = s_disp->refreshed_area;
+            s_drawn++;
+            portEXIT_CRITICAL(&s_lock);
+            xSemaphoreGive(s_drawn_sem);
+        }
 #if CONFIG_MUSE_BENCH
         s_wait_t0 = now;
 #endif
@@ -876,6 +890,11 @@ void muse_lcd_bands_set_te(int gpio)
         return;
     }
     s_te_on = true;
+}
+
+void muse_lcd_bands_set_pairing(bool on)
+{
+    s_pairing = on;
 }
 
 void muse_lcd_bands_frame(int x1, int y1, int x2, int y2, int rows, muse_lcd_fill_fn fill, void *arg)

@@ -48,6 +48,7 @@ def typedef(source, name):
 #   parts buf_bytes n (x1 y1 x2 y2 joined)*n
 #   pace n (bytes us)*n bytes: the samples learned (pace_learn, on one pace_t kept from query to query), then pace_est
 #   pacenew: a new pace_t
+#   pairs pairing flushed parts last: band_pairs
 HARNESS = r'''
 #include <stdbool.h>
 #include <stddef.h>
@@ -65,7 +66,10 @@ int main(void)
     static pace_t pace;
     while (scanf("%%15s", cmd) == 1) {
         long long a[8];
-        if (strcmp(cmd, "pacenew") == 0) {
+        if (strcmp(cmd, "pairs") == 0) {
+            for (int i = 0; i < 4; i++) scanf("%%lld", &a[i]);
+            printf("%%d\n", band_pairs(a[0] != 0, (int)a[1], (int)a[2], a[3] != 0));
+        } else if (strcmp(cmd, "pacenew") == 0) {
             memset(&pace, 0, sizeof pace);
         } else if (strcmp(cmd, "pace") == 0) {
             int n;
@@ -132,7 +136,8 @@ class Harness:
         source = SOURCE.read_text()
         parts = [typedef(source, "write_t"), typedef(source, "pace_t"), re.search(r"^#define PACE_VAR_MIN .*$", source, re.M).group(0)]
         parts += [function(source, name) for name in
-                  ("te_meets", "floor_div", "frame_meets", "frame_clear_in", "refresh_parts", "pace_learn", "pace_est")]
+                  ("te_meets", "floor_div", "frame_meets", "frame_clear_in", "refresh_parts", "pace_learn", "pace_est",
+                   "band_pairs")]
         src = Path(tmp) / "te.c"
         src.write_text(HARNESS % "\n".join(parts))
         cls.exe = Path(tmp) / "te"
@@ -357,6 +362,52 @@ class RefreshPartsTest(unittest.TestCase):
         self.assertIn("int32_t max_row = (uint32_t)(disp->buf_act->data_size - overhead) / stride;", refr)
         self.assertIn("if(max_row > area_h) max_row = area_h;", refr)
         self.assertIn("if(disp_refr->inv_area_joined[i]) continue;", refr)
+
+
+class PairingTest(unittest.TestCase):
+    """Task 7, fix round 1 (R7a): pairing is a switch (muse_lcd_bands_set_pairing), off until the apps turn it on while a picture
+    spins. Off, a refresh of two bands goes out as f0204bd sent it, each band held on its own as LVGL sends it; on, the first is
+    held for the second and both go in one clear moment."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        Harness.build(cls.tmp.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_only_the_first_band_of_two_pairs_and_only_with_pairing_on(self):
+        cases = [(pairing, flushed, parts, last) for pairing in (0, 1) for flushed in range(4) for parts in range(5)
+                 for last in (0, 1)]
+        answers = Harness.ask([f"pairs {p} {f} {n} {l}" for p, f, n, l in cases])
+        for (pairing, flushed, parts, last), pairs in zip(cases, answers):
+            with self.subTest(pairing=pairing, flushed=flushed, parts=parts, last=last):
+                self.assertEqual(pairs, int(pairing == 1 and flushed == 0 and parts == 2 and last == 0))
+
+    def test_off_holds_each_band_alone_and_on_holds_the_pair(self):
+        # The board's two-band refresh (the turned 200 px record, before the cap): LVGL flushes A, draws B meanwhile and
+        # flushes it once A has gone and B is drawn, 15 ms after A was flushed. Off, each band is held on its own as it comes, and
+        # some refreshes are torn although each band is clear; on, the two are held together and none is.
+        a, b, render, gap = (90, 282, 8300), (282, 374, 4100), 15000, 300
+        nows = list(range(0, P2, 250))
+        holds_a = Harness.ask([clear_query([a], now, gap, 0, P2, SCAN2) for now in nows])
+        off = []
+        for now, da in zip(nows, holds_a):
+            start_a = now + max(da, 0)
+            ready_b = max(start_a + a[2] + gap, now + render)
+            off.append((start_a, ready_b))
+        holds_b = Harness.ask([clear_query([b], ready_b, gap, 0, P2, SCAN2) for _, ready_b in off])
+        off_frames = [frame_query([(a[0], a[1], start_a, a[2]), (b[0], b[1], ready_b + max(db, 0), b[2])], 0, P2, SCAN2)
+                      for (start_a, ready_b), db in zip(off, holds_b)]
+        holds_ab = Harness.ask([clear_query([a, b], now + render, gap, 0, P2, SCAN2) for now in nows])
+        on_frames = [frame_query([(a[0], a[1], now + render + d, a[2]), (b[0], b[1], now + render + d + a[2] + gap, b[2])], 0, P2,
+                                 SCAN2) for now, d in zip(nows, holds_ab)]
+        self.assertTrue(all(d >= 0 for d in holds_ab), "the pair always has a clear moment")
+        off_torn, on_torn = sum(Harness.ask(off_frames)), sum(Harness.ask(on_frames))
+        self.assertGreater(off_torn, 0, "off: each band is clear, but some refreshes are torn (f0204bd)")
+        self.assertEqual(on_torn, 0, "on: none is")
 
 
 class PaceTest(unittest.TestCase):

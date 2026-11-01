@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -68,6 +69,20 @@ void muse_lcd_bands_run(void (*fn)(void *arg), void *arg);
  * muse_lcd_bands_frame are timed the same way.
  */
 void muse_lcd_bands_set_te(int gpio);
+
+/*
+ * Whether a refresh LVGL draws in exactly two bands goes to the panel whole:
+ * off until turned on. On, the first band is held, its flush left open,
+ * until LVGL has drawn the second into its other buffer; then both go out
+ * back to back at a moment that keeps them clear of the panel's scan
+ * (muse_lcd_bands_set_te), so no scan shows one band's new picture over the
+ * other's old one. It costs the overlap of the first band's write with the
+ * second's drawing: on the 1.75C a turning 200 px square went from 43 to 51
+ * ms a frame. Off, each band is held on its own as LVGL sends it. On the
+ * LVGL task; the apps turn it on while a picture spins in front
+ * (muse_board_t frame_pairing).
+ */
+void muse_lcd_bands_set_pairing(bool on);
 
 /*
  * Draws the rectangle (x1, y1)-(x2, y2) (end exclusive) without LVGL, in

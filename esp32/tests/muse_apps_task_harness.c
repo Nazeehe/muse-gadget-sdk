@@ -1751,6 +1751,12 @@ void apps_lv_set_close_cb(void (*cb)(void)) {
     lv_close_cb = cb;
 }
 
+/* The board's frame pairing (Task 7, R7a): muse_apps_ui_pairing hands it on, on the LVGL task. */
+void apps_lv_set_pairing_cb(void (*cb)(bool on)) {
+    lvgl_only("apps_lv_set_pairing_cb");
+    event("pairing cb %s", cb != NULL ? "set" : "NULL");
+}
+
 void apps_lv_set_ui(apps_ui_t *ui) {
     if (!ui_held_by_me()) {
         error("apps_lv_set_ui without the UI lock");

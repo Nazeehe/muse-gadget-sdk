@@ -1877,6 +1877,10 @@ void muse_apps_ui_build(lv_obj_t *screen) {
     apps_lv_set_close_cb(on_close);
 }
 
+void muse_apps_ui_pairing(void (*pairing)(bool on)) {
+    apps_lv_set_pairing_cb(pairing);
+}
+
 void muse_apps_ui_supervise(void) {
     if (!atomic_load(&s_up)) {
         return;

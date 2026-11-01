@@ -322,6 +322,10 @@ bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void 
  * page dots and before the downloaded image, under the display lock and before the frame timer exists. */
 void muse_apps_ui_build(lv_obj_t *screen);
 
+/* The board's frame pairing (muse_board_t frame_pairing; NULL: none), which the app layer turns on while an image spins in front
+ * (apps_lv_set_pairing_cb). After muse_apps_ui_build, under the same lock. */
+void muse_apps_ui_pairing(void (*pairing)(bool on));
+
 /* The LVGL task, every frame, before update_sleep(): the hang supervisor (a call into the app that has run more than
  * APPS_TASK_HUNG_MS), the reset of an app that ended (before any apply in the frame), the front and back the app task
  * asked for (a front once the app's table is published), the layer's place after a voice turn has ended, and the

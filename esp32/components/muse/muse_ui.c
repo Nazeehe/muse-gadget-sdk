@@ -1202,6 +1202,7 @@ static void build_overlays(void)
 #if CONFIG_MUSE_APPS
     /* Muse apps' full-screen layer: over the pages and their dots, under the downloaded image. */
     muse_apps_ui_build(scr);
+    muse_apps_ui_pairing(muse_board->frame_pairing);   /* on while an image spins in front */
 #endif
 
     /* A downloaded image: over everything on the screen (and in snapshots),

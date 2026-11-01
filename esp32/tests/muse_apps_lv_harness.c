@@ -7766,6 +7766,87 @@ static void spin_frame_log(void) {
     FINISH(&e);
 }
 
+/* Task 7 (R7a): the board's frame pairing, which the layer turns on while an image spins on it in front with no launcher or card
+ * over it, and off when that stops: a spin stopped or deleted, the app behind, the launcher or a card shown. Each change once, at
+ * the end of the refresh that saw it; one callback on the display once a pairing callback is set, and none before. */
+static int pairing_calls;
+static bool pairing_on;
+static void note_pairing(bool on) {
+    pairing_calls++;
+    pairing_on = on;
+}
+
+static void pairing_follows_the_spin(void) {
+    env_t e;
+    scene(&e);
+    int before = display_obj.n_cbs;
+    apps_lv_set_pairing_cb(note_pairing);
+    apps_lv_set_pairing_cb(note_pairing);  /* set again: still one callback */
+    CHECK(display_obj.n_cbs == before + 1 && display_obj.cbs[before].filter == LV_EVENT_REFR_READY,
+          "one refresh callback for the pairing: %d, %d before", display_obj.n_cbs, before);
+    apps_lv_set_front(true);
+    refresh_after(33000);
+    refresh_after(33000);
+    CHECK(pairing_calls == 0, "no spin, no call: %d", pairing_calls);
+
+    RUN(&e, "d = ui.image{src = 'a.bin', spin = 33}");
+    CHECK(APPLY(&e), "made");
+    refresh_after(33000);
+    CHECK(pairing_calls == 1 && pairing_on, "the first spin turns it on: %d calls, on %d", pairing_calls, pairing_on);
+    refresh_after(33000);
+    CHECK(pairing_calls == 1, "each change once: %d calls", pairing_calls);
+
+    RUN(&e, "d:set{spin = 0}");
+    CHECK(APPLY(&e), "stopped");
+    refresh_after(33000);
+    CHECK(pairing_calls == 2 && !pairing_on, "the last spin stopped turns it off: %d calls, on %d", pairing_calls, pairing_on);
+
+    RUN(&e, "d:set{spin = 10}");
+    CHECK(APPLY(&e), "again");
+    refresh_after(33000);
+    CHECK(pairing_calls == 3 && pairing_on, "spinning again: %d calls, on %d", pairing_calls, pairing_on);
+    RUN(&e, "d:delete()");
+    CHECK(APPLY(&e), "deleted");
+    refresh_after(33000);
+    CHECK(pairing_calls == 4 && !pairing_on, "the last spinner deleted: %d calls, on %d", pairing_calls, pairing_on);
+
+    RUN(&e, "d = ui.image{src = 'a.bin', spin = 33} k = ui.image{src = 'b.bin', spin = 20}");
+    CHECK(APPLY(&e), "two");
+    refresh_after(33000);
+    CHECK(pairing_calls == 5 && pairing_on, "two spinning: %d calls, on %d", pairing_calls, pairing_on);
+    RUN(&e, "d:set{spin = 0}");
+    CHECK(APPLY(&e), "one stopped");
+    refresh_after(33000);
+    CHECK(pairing_calls == 5 && pairing_on, "one still spins: %d calls, on %d", pairing_calls, pairing_on);
+
+    apps_lv_set_front(false);  /* the app behind (another page, or the screen dark) */
+    refresh_after(33000);
+    CHECK(pairing_calls == 6 && !pairing_on, "behind: %d calls, on %d", pairing_calls, pairing_on);
+    apps_lv_set_front(true);
+    refresh_after(33000);
+    CHECK(pairing_calls == 7 && pairing_on, "in front again: %d calls, on %d", pairing_calls, pairing_on);
+
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    refresh_after(33000);
+    CHECK(pairing_calls == 8 && !pairing_on, "the launcher over it: %d calls, on %d", pairing_calls, pairing_on);
+    apps_lv_close_launcher();
+    refresh_after(33000);
+    CHECK(pairing_calls == 9 && pairing_on, "the launcher closed: %d calls, on %d", pairing_calls, pairing_on);
+
+    apps_lv_show_crash("Spin", NULL);
+    refresh_after(33000);
+    CHECK(pairing_calls == 10 && !pairing_on, "a card over it: %d calls, on %d", pairing_calls, pairing_on);
+    apps_lv_hide_cards();
+    refresh_after(33000);
+    CHECK(pairing_calls == 11 && pairing_on, "the card gone: %d calls, on %d", pairing_calls, pairing_on);
+
+    apps_lv_set_pairing_cb(NULL);  /* replaced: the old one is left off */
+    CHECK(pairing_calls == 12 && !pairing_on, "the callback replaced: %d calls, on %d", pairing_calls, pairing_on);
+    refresh_after(33000);
+    CHECK(pairing_calls == 12, "none after: %d calls", pairing_calls);
+    FINISH(&e);
+}
+
 static void crash_card_text_and_tap(void) {
     cards_scene();
     apps_lv_show_crash("Timer", "main.lua:3: boom");
@@ -8481,6 +8562,7 @@ int main(int argc, char **argv) {
         {"rotation_sets_the_angle_a_spin_continues_from", rotation_sets_the_angle_a_spin_continues_from},
         {"spin_ends_with_the_widget", spin_ends_with_the_widget},
         {"spin_frame_log", spin_frame_log},
+        {"pairing_follows_the_spin", pairing_follows_the_spin},
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},

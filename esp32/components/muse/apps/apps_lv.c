@@ -111,6 +111,12 @@ static EXT_RAM_BSS_ATTR volatile uint32_t s_spinning;
 /* The cards' parent (made at the first show): the screen the layer is on. The cards themselves are with the launcher, below. */
 static lv_obj_t *s_screen;
 static void forget_cards(void);
+/* The board's frame pairing (apps_lv_set_pairing_cb): the callback, whether it was last told on, and the display its refreshes are
+ * followed on. The LVGL task's. */
+static void (*s_pairing_cb)(bool on);
+static bool s_paired;
+static lv_display_t *s_pairing_display;
+static void watch_spin(lv_obj_t *screen);
 #if CONFIG_MUSE_BENCH
 static void watch_frames(lv_obj_t *screen);
 #endif
@@ -1126,6 +1132,7 @@ void apps_lv_build(lv_obj_t *screen) {
     s_front = false;
     s_screen = screen;
     forget_cards();
+    watch_spin(screen);
 #if CONFIG_MUSE_BENCH
     watch_frames(screen);
 #endif
@@ -1154,6 +1161,15 @@ void apps_lv_set_event_cb(apps_lv_event_cb_t cb) {
 
 void apps_lv_set_close_cb(void (*cb)(void)) {
     s_close_cb = cb;
+}
+
+void apps_lv_set_pairing_cb(void (*cb)(bool on)) {
+    if (s_pairing_cb != NULL && s_paired) {
+        s_pairing_cb(false);  /* the one replaced is left off */
+    }
+    s_pairing_cb = cb;
+    s_paired = false;
+    watch_spin(s_screen);
 }
 
 void apps_lv_reset(void) {
@@ -1444,6 +1460,31 @@ static void on_carousel_scroll(lv_event_t *e) {
     update_carousel();
 }
 
+/* An image spins on the layer in front, with no launcher or card over it: what the board's frame pairing and the bench's spin frame
+ * log follow. */
+static bool spin_in_front(void) {
+    return s_spinning > 0 && s_front && !s_launcher_shown && !s_crash_shown;
+}
+
+/* LV_EVENT_REFR_READY, once a pairing callback is set: the board's frame pairing on while an image spins in front, off when not,
+ * each change once. A change takes effect from the next refresh (the board's pairing is read as LVGL flushes). */
+static void follow_spin(lv_event_t *e) {
+    (void)e;
+    bool on = spin_in_front();
+    if (s_pairing_cb != NULL && on != s_paired) {
+        s_paired = on;
+        s_pairing_cb(on);
+    }
+}
+
+static void watch_spin(lv_obj_t *screen) {
+    lv_display_t *display = s_pairing_cb != NULL && screen != NULL ? lv_obj_get_display(screen) : NULL;
+    if (display != NULL && display != s_pairing_display) {
+        lv_display_add_event_cb(display, follow_spin, LV_EVENT_REFR_READY, NULL);
+        s_pairing_display = display;
+    }
+}
+
 #if CONFIG_MUSE_BENCH
 /* The frame gates' measurements, in a bench build only. LVGL sends LV_EVENT_REFR_READY at the end of every refresh, drawn or not, and
  * refreshes at most every LV_DEF_REFR_PERIOD while something is invalid, so while something moves the gap between two is the frame's
@@ -1463,7 +1504,7 @@ static EXT_RAM_BSS_ATTR struct {
 static void on_refresh(lv_event_t *e) {
     (void)e;
     bool scrolling = s_launcher_shown && C.row != NULL && lv_obj_is_scrolling(C.row);
-    bool spinning = s_spinning > 0 && s_front && !s_launcher_shown && !s_crash_shown;
+    bool spinning = spin_in_front();
     if (!scrolling && !spinning) {
         s_frames.last_us = s_frames.spin_last_us = 0;
         return;

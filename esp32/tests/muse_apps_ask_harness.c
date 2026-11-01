@@ -777,6 +777,88 @@ static void reply_pieces_reach_the_callback(void) {
     finish();
 }
 
+/* I7 (M47): a message whose pieces fell short of its whole text (a piece skipped) gets the whole text at its end (apps_ask_final, the
+ * sink's final): it replaces that message's pieces, the last `given` bytes the pieces gave, whatever the reply kept of them; the blank
+ * line before it stays. And M52: the reply is cleaned at the turn's end, as the ask's text is, so a callback never gets bytes that
+ * aren't UTF-8 (newlines and tabs kept). */
+static void a_final_text_replaces_its_messages_pieces(void) {
+    words();
+    const char *src = APP("T.go = function() try(muse.ask, 'q', cb('r')) end\n"
+                          "T.long = function() try(muse.ask, 'q', function(r, e) print('long', #r, r:sub(-8), e) end) end\n"
+                          "T.bytes = function() try(muse.ask, 'q', function(r, e)\n"
+                          "  print('bytes', #r, utf8.len(r) ~= nil, r:byte(4), r:byte(6), r:byte(9), r:byte(-1), e) end) end\n");
+    start_app(src);
+    /* "Hi there!" for the pieces "Hi " and "there"; then a second message, its middle piece skipped. */
+    apps_rt_touch(rt, 7, 1, APPS_UI_TAP);
+    call("go");
+    expect_logged("true\tnil");
+    chat_piece("Hi ");
+    chat_piece("there");
+    apps_ask_final(asked_user, "Hi there!", 9, 8);
+    chat_piece("\n\n");
+    chat_piece("One, ");
+    chat_piece("three.");
+    apps_ask_final(asked_user, "One, two, three.", 16, 11);
+    chat_done(NULL);
+    settle();
+    expect_logged("r\t[Hi there!||One, two, three.]\tnil");
+    expect_said("ask app: done (27 bytes)");
+    /* Past the most: a message that ran past APPS_ASK_REPLY_MAX in its pieces, whose whole text is shorter, is whole again, and the
+     * reply isn't cut; one whose whole text is longer is cut again where a character starts. */
+    char big[APPS_ASK_REPLY_MAX + 101];
+    memset(big, 'b', sizeof big - 1);
+    big[sizeof big - 1] = '\0';
+    clock_ms += APPS_ASK_GAP_MS;
+    apps_rt_touch(rt, 7, 1, APPS_UI_TAP);
+    call("long");
+    expect_logged("true\tnil");
+    chat_piece("head\n\n");
+    chat_piece(big);
+    apps_ask_final(asked_user, "short at last", 13, strlen(big));
+    chat_done(NULL);
+    settle();
+    expect_logged("long\t19\t at last\tnil");
+    expect_said("ask app: done (19 bytes)");
+    clock_ms += APPS_ASK_GAP_MS;
+    apps_rt_touch(rt, 7, 1, APPS_UI_TAP);
+    call("long");
+    expect_logged("true\tnil");
+    chat_piece("head\n\n");
+    chat_piece("bbb");
+    apps_ask_final(asked_user, big, strlen(big), 3);
+    chat_done(NULL);
+    settle();
+    expect_logged("long\t2051\tbbbbb\xe2\x80\xa6\tnil");
+    expect_said("ask app: done (2051 bytes)");
+    /* A message that began past the cut: nothing of it was kept, nor is now; the reply stays cut. */
+    clock_ms += APPS_ASK_GAP_MS;
+    apps_rt_touch(rt, 7, 1, APPS_UI_TAP);
+    call("long");
+    expect_logged("true\tnil");
+    chat_piece(big);
+    chat_piece("\n\n");
+    chat_piece("late");
+    apps_ask_final(asked_user, "later", 5, 4);
+    chat_done(NULL);
+    settle();
+    expect_logged("long\t2051\tbbbbb\xe2\x80\xa6\tnil");
+    expect_said("ask app: done (2051 bytes)");
+    /* M52: bytes that aren't clean UTF-8, from the pieces or a final, come out cleaned: '?' for each, newlines and tabs kept. */
+    clock_ms += APPS_ASK_GAP_MS;
+    apps_rt_touch(rt, 7, 1, APPS_UI_TAP);
+    call("bytes");
+    expect_logged("true\tnil");
+    chat_piece("caf\xc3 \x07ok\r");
+    chat_piece("\n\n");
+    chat_piece("x");
+    apps_ask_final(asked_user, "\tend\xff", 5, 1);
+    chat_done(NULL);
+    settle();
+    expect_logged("bytes\t16\ttrue\t63\t63\t63\t63\tnil");  /* "caf? ?ok?\n\n\tend?": UTF-8, each '?' a byte that wasn't */
+    expect_said("ask app: done (16 bytes)");
+    finish();
+}
+
 /* Review Focus 5, the app's side: a voice press ends the turn ("interrupted"), a voice turn refuses it ("busy with a voice turn"), and
  * a gadget without Muse set up refuses it at once, on the app task ("not set up"): each comes to the callback in the next round. The
  * session's side (and the console's turns, unchanged) is tests/test_muse_chat_session.py's. */
@@ -1033,6 +1115,7 @@ int main(int argc, char **argv) {
         {"text_and_reply_limits", text_and_reply_limits},
         {"ask_text_line_breaks_are_flattened", ask_text_line_breaks_are_flattened},
         {"reply_pieces_reach_the_callback", reply_pieces_reach_the_callback},
+        {"a_final_text_replaces_its_messages_pieces", a_final_text_replaces_its_messages_pieces},
         {"ask_and_voice_share_the_session", ask_and_voice_share_the_session},
         {"ask_reply_after_the_app_ended_is_dropped", ask_reply_after_the_app_ended_is_dropped},
         {"muse_permission", muse_permission},

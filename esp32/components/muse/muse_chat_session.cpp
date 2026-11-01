@@ -1491,10 +1491,16 @@ static void message_done(int i, const char *final_text)
     mark(M_DONE);
 #if CONFIG_MUSE_APPS
     if (s_turn.sink.done) {
-        /* An app's typed turn: a message that came whole, with no pieces, is one piece now (the sink only adds). */
-        if (!m.len && final_text && final_text[0]) {
-            m.len = strlen(final_text);
-            sink_piece(i, final_text, m.len);
+        /* An app's typed turn. A message that came whole, with no pieces, is one piece now. One whose pieces didn't add up to its
+         * whole text (a line skipped, say) gets the whole text, which replaces its pieces, as the console's reader takes it: only
+         * when its pieces came last, so they are the sink's last bytes. */
+        size_t n = final_text ? strlen(final_text) : 0;
+        if (n && !m.len) {
+            m.len = n;
+            sink_piece(i, final_text, n);
+        } else if (n && n != m.len && s_turn.sink_msg == i + 1) {
+            s_turn.sink.final(s_turn.sink.user, final_text, n, m.len);
+            m.len = n;
         }
         ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)m.len);
         return;
@@ -2414,9 +2420,9 @@ extern "C" void muse_hatch_text_turn_to(char *text, const muse_hatch_text_sink_t
 /* A detached ask's turn (P30): from the app task, which never waits for the chat, so a full queue drops it. */
 extern "C" void muse_hatch_text_cancel_to(void *user)
 {
-    cmd_t cmd{ CMD_SINK_CANCEL, 0, nullptr, { nullptr, nullptr, user } };
-    if (s_cmds) {
-        (void)xQueueSend(s_cmds, &cmd, 0);
+    cmd_t cmd{ CMD_SINK_CANCEL, 0, nullptr, { nullptr, nullptr, user, nullptr } };
+    if (s_cmds && xQueueSend(s_cmds, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "an app's ask cancel was dropped: the chat's queue is full");   /* its turn ends by the session's limits */
     }
 }
 #endif

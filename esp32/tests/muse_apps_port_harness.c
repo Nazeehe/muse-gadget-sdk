@@ -676,6 +676,10 @@ void apps_ask_piece(void *user, const char *text, size_t len) {
     (void)user, (void)text, (void)len;
 }
 
+void apps_ask_final(void *user, const char *text, size_t len, size_t given) {
+    (void)user, (void)text, (void)len, (void)given;
+}
+
 void apps_ask_done(void *user, const char *err) {
     ask_dones++;
     done_user = user;
@@ -2334,7 +2338,8 @@ static void ask_sends_a_typed_turn(void) {
     static const char msg[] = "(app tally) hi there";
     apps_port_ask(msg, 13, (void *)(uintptr_t)7);
     CHECK(turns == 1 && strcmp(turn_text, "(app tally) h") == 0, "%d turns, '%s'", turns, turn_text);
-    CHECK(turn_sink.piece == apps_ask_piece && turn_sink.done == apps_ask_done && turn_sink.user == (void *)(uintptr_t)7,
+    CHECK(turn_sink.piece == apps_ask_piece && turn_sink.done == apps_ask_done && turn_sink.final == apps_ask_final &&
+              turn_sink.user == (void *)(uintptr_t)7,
           "the module's sink, with the ask's generation");
     CHECK(atomic_load(&internal_requests) == internal, "the copy asked for internal RAM");
     CHECK(live_blocks() == held, "the copy leaked: %d blocks, %d before", live_blocks(), held);

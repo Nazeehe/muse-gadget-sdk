@@ -975,6 +975,9 @@ class GuideAndSkill(unittest.TestCase):
                 r"and the user may tap again at once",
                 r"Muse's answer may still appear in the user's chat, but never reaches the app",
                 r"`interrupted`", r"`busy with a voice turn`", r"`not set up`", r"`the gadget is short of memory`",
+                # M48, M57: the session's own words that reach an app's callback too.
+                r"`CANCELLED` \(a cancel on the gadget's console, which ends an app's ask too\)",
+                r"`BUSY` \(the gadget's chat had too much waiting\)",
                 r"`CAN'T REACH MUSE`", r"`NO REPLY FROM MUSE`"):
             with self.subTest(pattern):
                 self.assertRegex(muse, pattern)
@@ -1011,6 +1014,12 @@ class GuideAndSkill(unittest.TestCase):
         # P30: "one ask at a time" means another ask, of any app, is running; its own callback has come by the time this app can ask.
         self.assertRegex(errors, r"- `muse\.ask: one ask at a time`: another ask, of this app or another app, is still running")
         self.assertIn("`vm` or `muse`)", errors)
+        session = (MUSE / "muse_chat_session.cpp").read_text()
+        self.assertRegex(session, r'case CMD_TEXT_CANCEL:\s*if \(s_turn\.text && s_turn\.phase != P_IDLE\) \{\s*turn_fail\("CANCELLED"\);')
+        self.assertIn('sink->done(sink->user, "BUSY");', session)
+        for words in ("CANCELLED", "BUSY"):
+            with self.subTest(words):
+                self.assertIn(f"- `{words}`: from `muse.ask`, ", guide)
         self.assertIn("`vm` (the `vm` module) and `muse` (for `muse.ask`)", guide_section(guide, "Files and the manifest"))
 
     def test_guide_teaches_connected_apps(self):

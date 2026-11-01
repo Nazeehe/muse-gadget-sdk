@@ -510,7 +510,7 @@ void apps_port_ask(const char *msg, size_t len, void *user) {
     }
     memcpy(text, msg, len);
     text[len] = '\0';
-    const muse_hatch_text_sink_t sink = {apps_ask_piece, apps_ask_done, user};
+    const muse_hatch_text_sink_t sink = {apps_ask_piece, apps_ask_done, user, apps_ask_final};
     muse_hatch_text_turn_to(text, &sink);
 }
 

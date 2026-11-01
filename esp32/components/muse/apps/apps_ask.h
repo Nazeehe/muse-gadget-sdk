@@ -33,11 +33,13 @@
  *   alarm()), an ask that waits already (APPS_ASK_MSG_ONE), and less than APPS_ASK_GAP_MS since the last accepted ask began
  *   (APPS_ASK_MSG_WAIT, with the seconds left rounded up).
  * - Through the callback: the reply, or the gadget short of memory (APPS_ASK_MSG_NO_MEMORY), the turn's end in the chat's words
- *   (muse_chat.h: "interrupted", "busy with a voice turn", "not set up", or the turn's own, like "CAN'T REACH MUSE"), and the
- *   time running out (APPS_ASK_MSG_TIMED_OUT, after APPS_ASK_TIMEOUT_MS: P19).
+ *   (muse_chat.h: "interrupted", "busy with a voice turn", "not set up", "CANCELLED" when the console's cancel ended it, "BUSY"
+ *   when the chat's queue was full, or the turn's own, like "CAN'T REACH MUSE"), and the time running out (APPS_ASK_MSG_TIMED_OUT,
+ *   after APPS_ASK_TIMEOUT_MS: P19).
  * - The reply is the turn's text, its messages joined by a blank line, at most APPS_ASK_REPLY_MAX bytes: one that runs past them is
- *   cut where a character starts, and ends with "…" (U+2026). Text that isn't clean UTF-8 is cleaned before it goes (apps_text_clean,
- *   newlines and tabs kept).
+ *   cut where a character starts, and ends with "…" (U+2026). A message whose pieces fell short of its whole text has the whole text
+ *   (the sink's final). At the turn's end the reply is cleaned to UTF-8 (apps_text_clean, newlines and tabs kept), as the ask's
+ *   text is, so the callback and a label:set never get bytes that aren't.
  * - The gap and the one at a time are the gadget's, not the app's: the last accepted ask's start, of any app, and a turn still at
  *   the chat, of any app, count (P17).
  *
@@ -99,6 +101,7 @@ typedef struct apps_ask_result {
     bool ok;                            /* it ended with no error: text is the reply */
     bool cut;                           /* the reply ran past APPS_ASK_REPLY_MAX: cut, and "…" added */
     uint16_t len;                       /* text's bytes */
+    size_t got;                         /* the bytes the pieces gave, kept or not (apps_ask_final finds a message's start by it) */
     char err[APPS_ASK_ERR_MAX];         /* why it failed */
     char text[APPS_ASK_REPLY_MAX + 4];  /* the reply: APPS_ASK_REPLY_MAX bytes, then room for "…" and a NUL */
 } apps_ask_result_t;
@@ -132,11 +135,14 @@ void apps_ask_free(apps_ask_app_t *a);
 
 /*
  * The sink (muse_chat.h's muse_hatch_text_sink_t, with user the ask's generation): on the chat task, or done at once on the app task
- * when the platform can't send the turn. piece adds text[0, len) to the reply, while the ask is still wanted; done ends the turn with
- * err NULL (the reply is in) or why, puts the block on the results list, clears the in-flight flag and calls the notify hook.
+ * when the platform can't send the turn. piece adds text[0, len) to the reply, while the ask is still wanted; final gives the whole
+ * text of the message whose pieces came last, when they fell short of it, and it replaces those `given` bytes (I7); done ends the
+ * turn with err NULL (the reply is in) or why, cleans the reply's text (apps_text_clean, newlines and tabs kept), puts the block on
+ * the results list, clears the in-flight flag and calls the notify hook.
  */
 void apps_ask_piece(void *user, const char *text, size_t len);
 void apps_ask_done(void *user, const char *err);
+void apps_ask_final(void *user, const char *text, size_t len, size_t given);
 
 /* ---- The app task's loop (apps_task.c; apphost too) ---- */
 

@@ -138,17 +138,23 @@ void muse_hatch_text_cancel(void);
 /* ---- Typed turns from Muse apps (CONFIG_MUSE_APPS: muse.ask, components/muse/apps/apps_ask.h) ---- */
 
 /*
- * Where an app's typed turn sends its reply, in place of the console. Both functions are called on the chat task (done may come at
+ * Where an app's typed turn sends its reply, in place of the console. The functions are called on the chat task (done may come at
  * once on the caller's, below): piece with each piece of the reply's text as it streams in (len bytes, not NUL-terminated; a later
  * message of the reply starts with a piece of "\n\n", as tools/muse/chat.py joins them), then done once, with err NULL when the
  * reply is in, or why the turn failed: MUSE_HATCH_SINK_INTERRUPTED (a voice press, or another typed turn, ended it),
- * MUSE_HATCH_SINK_BUSY (a voice turn runs: refused, as the console's is), MUSE_HATCH_SINK_NOT_SET_UP, or the turn's own words
- * ("CAN'T REACH MUSE", "NO REPLY FROM MUSE", ...). Nothing of the turn goes to the console. Both functions must be given.
+ * MUSE_HATCH_SINK_BUSY (a voice turn runs: refused, as the console's is), MUSE_HATCH_SINK_NOT_SET_UP, "CANCELLED" (the console's
+ * cancel, muse_hatch_text_cancel, ends an app's typed turn too, as does muse_hatch_text_cancel_to), "BUSY" (the chat's queue was
+ * full: muse_hatch_text_turn_to), or the turn's own words ("CAN'T REACH MUSE", "NO REPLY FROM MUSE", ...).
+ * final comes at a message's end when the message's pieces fell short of its whole text (a piece skipped; the console's reader
+ * takes the whole text then too): text[0, len) replaces that message's pieces, the last `given` bytes the pieces gave (its "\n\n"
+ * before it stays). Only for the message whose pieces came last; a message that came whole, with no pieces, is one piece instead.
+ * Nothing of the turn goes to the console. All three functions must be given.
  */
 typedef struct {
     void (*piece)(void *user, const char *text, size_t len);
     void (*done)(void *user, const char *err);
     void *user;
+    void (*final)(void *user, const char *text, size_t len, size_t given);
 } muse_hatch_text_sink_t;
 
 #define MUSE_HATCH_SINK_INTERRUPTED "interrupted"
@@ -165,7 +171,7 @@ void muse_hatch_text_turn_to(char *text, const muse_hatch_text_sink_t *sink);
  * Cancels an app's typed turn: the turn in progress ends as the console's cancel ends a typed turn, its sink's done hearing
  * "CANCELLED", only when it is the sink turn whose sink's user is user (an ask's generation, apps_ask.h). Any other turn (the
  * console's, a voice turn, another ask's) is left as it is, and a cancel whose turn has ended already does nothing. It never waits:
- * when the chat's queue is full the cancel is dropped, and the turn ends by the session's own limits.
+ * when the chat's queue is full the cancel is dropped, with a warning in the log, and the turn ends by the session's own limits.
  */
 void muse_hatch_text_cancel_to(void *user);
 #endif

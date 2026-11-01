@@ -127,11 +127,18 @@ void apps_ask_free(apps_ask_app_t *a) {
 
 /* ---- The sink (the chat task's) ---- */
 
-void apps_ask_piece(void *user, const char *text, size_t len) {
+/* The turn's block while user's ask still wants its pieces; NULL once it is detached (timed out, or its app ended): dropped. */
+static apps_ask_result_t *wanted(void *user) {
     apps_ask_result_t *r = s_slot.turn;
     uint32_t gen = (uint32_t)(uintptr_t)user;
-    if (r == NULL || r->gen != gen || atomic_load(&s_slot.want) != gen || r->cut) {
-        return;  /* detached (timed out, or its app ended), or cut already: dropped */
+    return r != NULL && r->gen == gen && atomic_load(&s_slot.want) == gen ? r : NULL;
+}
+
+/* text[0, len) onto the reply, counted in r->got whether it is kept or not; past APPS_ASK_REPLY_MAX it is cut. */
+static void append(apps_ask_result_t *r, const char *text, size_t len) {
+    r->got += len;
+    if (r->cut) {
+        return;  /* cut already: dropped */
     }
     size_t room = APPS_ASK_REPLY_MAX - r->len;
     if (len <= room) {
@@ -148,6 +155,33 @@ void apps_ask_piece(void *user, const char *text, size_t len) {
     memcpy(r->text + r->len + keep, ELLIPSIS, ELLIPSIS_LEN);
     r->len = (uint16_t)(r->len + keep + ELLIPSIS_LEN);
     r->cut = true;
+}
+
+void apps_ask_piece(void *user, const char *text, size_t len) {
+    apps_ask_result_t *r = wanted(user);
+    if (r != NULL) {
+        append(r, text, len);
+    }
+}
+
+/* I7: the message whose pieces came last, given bytes of them, is text[0, len) whole. Its start, in the bytes the pieces gave, is
+ * got - given; the reply holds them up to the cut (all of them, uncut). A start the reply holds: the reply goes back to it, uncut, and
+ * takes the whole text (cut again if it runs past). A start past the cut: none of it was kept, and none is. */
+void apps_ask_final(void *user, const char *text, size_t len, size_t given) {
+    apps_ask_result_t *r = wanted(user);
+    if (r == NULL || given > r->got) {
+        return;
+    }
+    size_t start = r->got - given;
+    size_t kept = r->cut ? (size_t)r->len - ELLIPSIS_LEN : r->len;
+    if (start > kept) {
+        r->got = start + len;
+        return;
+    }
+    r->len = (uint16_t)start;
+    r->cut = false;
+    r->got = start;
+    append(r, text, len);
 }
 
 /* A block onto the results list (one pusher at a time: the turn's end). */
@@ -170,6 +204,7 @@ void apps_ask_done(void *user, const char *err) {
         size_t len = n < 0 ? 0 : (size_t)n < sizeof r->err ? (size_t)n : sizeof r->err - 1;
         r->err[apps_text_clean(r->err, len, false)] = '\0';  /* the chat's words, printed by the log hook */
     }
+    r->len = (uint16_t)apps_text_clean(r->text, r->len, true);  /* M52: UTF-8 for the callback and label:set, newlines and tabs kept */
     r->text[r->len] = '\0';
     push(r);
     atomic_store(&s_slot.in_flight, false);
@@ -210,7 +245,7 @@ void apps_ask_take(apps_rt_t *rt, apps_ask_result_t *r) {
 void apps_ask_tick(apps_rt_t *rt, int64_t now_ms) {
     apps_ask_app_t *a = apps_rt_ask(rt);
     if (a != NULL && a->ref != LUA_NOREF && a->gen != 0 && a->ready == NULL && a->why == NULL && now_ms >= a->until) {
-        detach(a);  /* P19: the turn runs on, and its end comes back to nobody */
+        detach(a);  /* P30: its turn, while it is out, is cancelled, and its end comes back to nobody */
         a->why = APPS_ASK_MSG_TIMED_OUT;
     }
 }

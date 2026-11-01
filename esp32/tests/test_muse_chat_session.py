@@ -298,8 +298,11 @@ static void piece(void *user, const char *text, size_t len) {
 static void done(void *user, const char *err) {
     said.push_back(std::string("done ") + (const char *)user + " " + (err ? err : "(null)"));
 }
+static void final_text(void *user, const char *text, size_t len, size_t given) {
+    said.push_back(std::string("final ") + (const char *)user + " [" + std::string(text, len) + "] " + std::to_string(given));
+}
 static char app_name[] = "app";
-static const muse_hatch_text_sink_t SINK = {piece, done, app_name};
+static const muse_hatch_text_sink_t SINK = {piece, done, app_name, final_text};
 static void app_turn() {
     text_to("q", SINK);
 }
@@ -335,7 +338,12 @@ static void turn_begin(uint32_t gen) {
     }
 }
 @HANDLE@
+/* M56: a cancel the full queue drops is a warning in the log. */
+#undef ESP_LOGW
+#define ESP_LOGW(tag, fmt, ...) said.push_back(std::string("warn ") + (fmt))
 @CANCEL_TO@
+#undef ESP_LOGW
+#define ESP_LOGW(...) ((void)0)
 /* A command as the chat's queue carries it: what muse_hatch_text_turn_to or muse_hatch_text_cancel_to queued, then handled. */
 static void queue_and_handle_text(const muse_hatch_text_sink_t *sink) {
     queue_room = 1;
@@ -404,10 +412,31 @@ static bool run_apps(const char *name) {
         handle(press);
         queue_and_handle_cancel(app_name);
         if (s_turn.phase == P_LISTEN && !s_turn.text && s_turn.gen == 5) said.push_back("voice turn goes on");
-        queue_room = 0;                     /* a full queue: dropped, never waited for */
+        queue_room = 0;                     /* a full queue: dropped, never waited for, and said */
         queued = cmd_t{ CMD_WAKE, 0, nullptr };
         muse_hatch_text_cancel_to(app_name);
         assert(queued.type == CMD_WAKE);
+    } else if (n == "final_text") {    /* I7: a message whose pieces fell short gets its whole text, as the console's reader does */
+        app_turn();
+        acked();
+        event("delta.message_start", "one", "note");
+        event("delta.text_append", "one", "", "Hi ");
+        event("delta.text_append", "one", "", "there");
+        event("delta.message_done", "one", "", "Hi there");     /* the pieces add up: nothing more */
+        event("delta.message_start", "two", "note");
+        event("delta.text_append", "two", "", "a");
+        event("delta.text_append", "two", "", "c");
+        event("delta.message_done", "two", "", "abc");          /* a piece skipped: its whole text, for its 2 bytes */
+        event("delta.message_start", "three", "note");
+        event("delta.text_append", "three", "", "long piece");
+        event("delta.message_done", "three", "", "short");      /* shorter: the whole text all the same */
+        event("delta.message_start", "four", "note");
+        event("delta.text_append", "four", "", "x");
+        event("delta.message_start", "five", "note");
+        event("delta.text_append", "five", "", "y");
+        event("delta.message_done", "four", "", "xyz");         /* not the message whose pieces came last: its pieces stand */
+        event("delta.message_done", "five", "", "y");
+        turn_done(true);
     } else if (n == "turn_to") {       /* refused at once on the caller's task, or queued with a copy of the sink */
         configured = false;
         muse_hatch_text_turn_to(dup("a"), &SINK);
@@ -517,16 +546,16 @@ class AppTypedTurns(unittest.TestCase):
     def test_ask_and_voice_share_the_session(self):
         # An app's reply: its pieces (a second message after a blank line, a message that came whole as one piece) and its end go to
         # the sink, and the console hears nothing of it.
-        self.assertEqual(self.said('app_reply'), ['piece app [Hi ]', 'piece app [there]', 'piece app [\\n\\n]', 'piece app [Bye]',
-                                                  'done app (null)'])
+        self.assertEqual(self.said('app_reply'), ['piece app [Hi ]', 'piece app [there]', 'final app [Hi there!] 8',
+                                                  'piece app [\\n\\n]', 'piece app [Bye]', 'done app (null)'])
         # A voice press ends an app's turn, which hears "interrupted"; a voice turn refuses one, "busy with a voice turn", and goes on.
         self.assertEqual(self.said('voice_press'), ['piece app [Sure]', 'done app interrupted'])
         self.assertEqual(self.said('voice_turn'), ['done app busy with a voice turn', 'voice turn goes on'])
         # A console turn ends an app's turn, and prints its own lines as ever; an app's turn ends a console turn, which says so as ever.
         self.assertEqual(self.said('console_over_app'), ['done app interrupted', *self.CONSOLE])
         self.assertEqual(self.said('app_over_console'), ['console sent [] "bytes":5', 'console error [INTERRUPTED] ',
-                                                         'piece app [Hi ]', 'piece app [there]', 'piece app [\\n\\n]',
-                                                         'piece app [Bye]', 'done app (null)'])
+                                                         'piece app [Hi ]', 'piece app [there]', 'final app [Hi there!] 8',
+                                                         'piece app [\\n\\n]', 'piece app [Bye]', 'done app (null)'])
 
     def test_an_apps_turn_fails_in_the_chats_words(self):
         self.assertEqual(self.said('unreachable'), ["done app CAN'T REACH MUSE", 'done app not set up', "done app CAN'T REACH MUSE"])
@@ -537,7 +566,19 @@ class AppTypedTurns(unittest.TestCase):
         # A stale cancel (its turn over, or another ask's generation), a console turn and a voice turn are left as they were.
         self.assertEqual(self.said('sink_cancel'), ['done app CANCELLED', 'app turn goes on', 'done app CANCELLED',
                                                     'console sent [] "bytes":5', 'console turn goes on',
-                                                    'console error [NO REPLY FROM MUSE] ', 'voice turn goes on'])
+                                                    'console error [NO REPLY FROM MUSE] ', 'voice turn goes on',
+                                                    "warn an app's ask cancel was dropped: the chat's queue is full"])
+
+    def test_a_message_whose_pieces_fell_short_gets_its_whole_text(self):
+        # I7 (M47): at a message's end, when the pieces the sink was given don't add up to the message's whole text, the sink gets
+        # the whole text with the count of those pieces' bytes (final), and replaces them; when they add up, nothing more. Only for
+        # the message whose pieces came last: an earlier one's pieces stand.
+        self.assertEqual(self.said('final_text'), [
+            'piece app [Hi ]', 'piece app [there]',
+            'piece app [\\n\\n]', 'piece app [a]', 'piece app [c]', 'final app [abc] 2',
+            'piece app [\\n\\n]', 'piece app [long piece]', 'final app [short] 10',
+            'piece app [\\n\\n]', 'piece app [x]', 'piece app [\\n\\n]', 'piece app [y]',
+            'done app (null)'])
 
     def test_muse_hatch_text_turn_to_never_waits(self):
         # Refused at once, on the caller's task, when Muse isn't set up or the chat's queue is full; queued with its own copy of the sink.

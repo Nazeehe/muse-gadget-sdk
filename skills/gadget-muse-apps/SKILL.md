@@ -249,7 +249,7 @@ local ok, err = pcall(muse.ask, text, on_reply)
 if not ok then status:set{text = err} end
 ```
 
-The reply is the text of Muse's messages in that turn, joined by a blank line, at most 2048 bytes: a longer one is cut where a character starts and ends with `…`. After 120 s without the reply, `cb(nil, "timed out")`: the gadget stops waiting and cancels the turn, and the user may tap again at once (30 s have passed since the ask began). Muse's answer may still appear in the user's chat, but never reaches the app. A reply can be longer than a label takes: cut it to fit before you show it, as the tally's `fit` does. The other errors that come through the callback: `interrupted` (a voice press, or a typed turn, ended Muse's turn), `busy with a voice turn` (the user was talking to Muse), `not set up` (the gadget has no Muse to ask), `the gadget is short of memory`, and the turn's own words, as the gadget shows them after a voice turn: `CAN'T REACH MUSE`, `NO REPLY FROM MUSE`, `LOST CONNECTION TO MUSE` and the like. Show the user what happened, and let them tap again.
+The reply is the text of Muse's messages in that turn, joined by a blank line, at most 2048 bytes: a longer one is cut where a character starts and ends with `…`. After 120 s without the reply, `cb(nil, "timed out")`: the gadget stops waiting and cancels the turn, and the user may tap again at once (30 s have passed since the ask began). Muse's answer may still appear in the user's chat, but never reaches the app. A reply can be longer than a label takes: cut it to fit before you show it, as the tally's `fit` does. The other errors that come through the callback: `interrupted` (a voice press, or a typed turn, ended Muse's turn), `busy with a voice turn` (the user was talking to Muse), `not set up` (the gadget has no Muse to ask), `CANCELLED` (a cancel on the gadget's console, which ends an app's ask too), `BUSY` (the gadget's chat had too much waiting), `the gadget is short of memory`, and the turn's own words, as the gadget shows them after a voice turn: `CAN'T REACH MUSE`, `NO REPLY FROM MUSE`, `LOST CONNECTION TO MUSE` and the like. Show the user what happened, and let them tap again.
 
 ### sys
 
@@ -473,6 +473,8 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `interrupted`: from `muse.ask`, a voice press or a typed turn ended Muse's turn: let the user tap again.
 - `busy with a voice turn`: from `muse.ask`, the user was talking to Muse: let them tap again once that turn is done.
 - `not set up`: from `muse.ask`, the gadget has no Muse to ask: the user sets Muse up on the gadget first.
+- `CANCELLED`: from `muse.ask`, a cancel on the gadget's console ended Muse's turn (it ends an app's ask too): let the user tap again.
+- `BUSY`: from `muse.ask`, the gadget's chat had too much waiting to take the turn: let the user tap again in a moment.
 - `CAN'T REACH MUSE`, `NO REPLY FROM MUSE`, `LOST CONNECTION TO MUSE`: from `muse.ask`, the turn's own end, as the gadget shows it after a voice turn: show it, and let the user tap again later.
 - `alarm: no more than 4 alarms per app`: cancel one first, or reuse its name.
 - `alarm: the gadget has no free alarm slots (8 in all); cancel one`: other apps hold the rest: cancel one of this app's, or try later.

@@ -77,6 +77,9 @@ class AskHarness(unittest.TestCase):
     def test_reply_pieces_reach_the_callback(self):  # pieces on the chat task's thread, the callback once, its error a crash
         self.run_case("reply_pieces_reach_the_callback")
 
+    def test_a_final_text_replaces_its_messages_pieces(self):  # I7 (M47) and M52: the whole text of a short message; a clean reply
+        self.run_case("a_final_text_replaces_its_messages_pieces")
+
     def test_ask_and_voice_share_the_session(self):  # Review Focus 5, the app's side: interrupted, busy, not set up
         self.run_case("ask_and_voice_share_the_session")
 
@@ -205,7 +208,7 @@ class AskStatic(unittest.TestCase):
         body = c_function(port, "void apps_port_ask(const char *msg, size_t len, void *user)")
         self.assertIn("heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)", body)
         self.assertIn("apps_ask_done(user, APPS_ASK_MSG_NO_MEMORY);", body)
-        self.assertIn("const muse_hatch_text_sink_t sink = {apps_ask_piece, apps_ask_done, user};", body)
+        self.assertIn("const muse_hatch_text_sink_t sink = {apps_ask_piece, apps_ask_done, user, apps_ask_final};", body)
         self.assertIn("muse_hatch_text_turn_to(text, &sink);", body)
         # P30: a detached ask's cancel goes to the chat as is, the ask's generation the sink's user it matches.
         cancel = c_function(port, "void apps_port_ask_cancel(void *user)")

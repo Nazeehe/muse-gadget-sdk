@@ -1127,7 +1127,9 @@ class GuideAndSkill(unittest.TestCase):
             r"The dry run should fetch from every host the hook may use, pictures too, so their cards come up then",
             r"A turn that runs tools on the VM can raise an approval card mid-turn; the gadget only sees silence",
             r"If the hook fails while running a command, it acks it failed, so the app hears at once",
-            r"Quote a JSON default in a parameter expansion: `\$\{X:-'\{\"a\":1\}'\}`; a bare `\}` ends the expansion",
+            r"Give a JSON default through a variable: `default='\{\"a\":1\}'`, then `\"\$\{X:-\$default\}\"`\. A bare `\}` "
+            r"ends the expansion, and a single-quoted default inside a double-quoted expansion keeps its quotes and loses its "
+            r"inner double quotes",
             r"`fetch_state` is the one function that reads the data source",
             # Connectors in hooks, their results, the output.
             r"Connector CLIs work inside hooks", r"exits 0, with `\{\"ok\":false,\.\.\.\}`: check `\.ok`",

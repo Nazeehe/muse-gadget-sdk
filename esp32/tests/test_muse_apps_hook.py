@@ -921,14 +921,21 @@ class HookText(unittest.TestCase):
 
     @unittest.skipIf(BASH is None, "no bash 4 or later on PATH")
     def test_a_json_default_is_quoted(self):
-        # P42's addendum: in ${X:-{"a":1}} the first } ends the expansion, so a set X gets a stray } and jq fails. The guide's
-        # quoted form, run as bash runs it, gives the default when X is empty and X itself when set; the tally has no bare one.
+        # P42's addendum: in ${X:-{"a":1}} the first } ends the expansion, so a set X gets a stray } and jq fails, and in
+        # "${X:-'{"a":1}'}" the single quotes stay and the inner double quotes go ('{a:1}'). The guide's form, a default in a
+        # variable, run as bash runs it, in an assignment, unquoted and in double quotes, gives the default when X is empty and
+        # X itself when set; the tally has no bare one.
         guide = (HOOK.parents[2] / "apps_guide.md").read_text()
-        form = re.search(r"Quote a JSON default in a parameter expansion: `([^`]+)`", guide).group(1)
+        match = re.search(r"Give a JSON default through a variable: `([^`]+)`, then `([^`]+)`", guide)
+        self.assertIsNotNone(match, "the guide's JSON default")
+        default, expansion = match.groups()
+        self.assertEqual((default, expansion), ("default='{\"a\":1}'", '"${X:-$default}"'))
         for x, want in (("", '{"a":1}'), ('{"b":2}', '{"b":2}')):
-            with self.subTest(x=x):
-                done = subprocess.run([BASH, "-c", f'X=$1; y={form}; printf "%s" "$y"', "bash", x], capture_output=True, text=True)
-                self.assertEqual(done.stdout, want)
+            for context in (f"y={expansion}", f"y={expansion[1:-1]}", f"y=$(printf '%s' {expansion})", f"y=x{expansion}; y=${{y#x}}"):
+                with self.subTest(x=x, context=context):
+                    script = f'X=$1; {default}; {context}; printf "%s" "$y"'
+                    done = subprocess.run([BASH, "-c", script, "bash", x], capture_output=True, text=True)
+                    self.assertEqual(done.stdout, want)
         self.assertNotRegex(HOOK.read_text(), r"\$\{\w+:?[-=+?]\{")
 
 

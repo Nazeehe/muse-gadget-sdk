@@ -905,30 +905,33 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   with Muse on the user's VM):
   - `app.api` wrote the guide and its examples, 164,689 bytes, to the VM in
     1.3 s, well inside its 20 s (`MUSE_APPS_GUIDE_WRITE_MS`).
-  - The tally, installed by Muse from the guide: "+1" was on screen 2.0 to
-    2.7 s after the tap (the command's write, the hook's next check and the
-    gadget's next read of the acks), "Ask" brought Muse's reply in about
-    13 s, and the Lua heap peaked at 43 KB of its 64. With the app behind,
-    each hook run ended at the in-front gate in 26 to 37 ms, every 5 s, with
-    no connector call.
+  - The tally, installed by Muse from the guide: "+1" was on screen 1.96 to
+    3.07 s after the tap, one tap bounded only between 0.87 and 4.04 s (the
+    command's write, the hook's next check and the gadget's next read of the
+    acks), "Ask" brought Muse's reply in about 13 s, and the Lua heap peaked
+    at 43 KB of its 64. With the app behind, each hook run ended at the
+    in-front gate in 26 to 37 ms, every 5 s, with no connector call.
   - A VM read opens only while internal and DMA RAM each keep the Link's
     16 KB TX margin plus 4 KB (`VM_RESERVE_BYTES`, `main/vm_file.c`) and the
     request free, about 20.6 KB; below that the app's read gets "the gadget is
-    short of memory". DMA free is 23.6 to 26.3 KB with an app watching or
+    short of memory". DMA free is 23.5 to 26.3 KB with an app watching or
     spinning, but on one boot it stayed at 20,419 bytes for hours after the
     Link lost its session and came back, and a watch read failed so. A
     restart gave 26,699.
   - A still picture under a spinning one: show it at scale 100. Each step of
     the spin redraws what is under the turning picture, and a scaled picture
-    is drawn there through the same slow path as a turning one, about 18 to
-    20 ms more a frame at any opacity. With a 180 px record spinning over the
+    is drawn there through the same slow path as a turning one, about 17 to
+    19 ms more a frame, dimmed or not. With a 180 px record spinning over the
     picture: unscaled (300 px, or 440 px) 32 to 33 ms frames (median; p95 35
     to 44) and taps of 148 to 170 ms; scaled to fill the screen (105% or 155%)
     51 to 53 ms and 182 to 216 ms; with no picture under it 29 ms and 134 ms.
-    Reading a 300 px JPEG from the VM and decoding it took 564 ms, and 616 ms
-    at 440 px.
-  - A typed turn and a voice press both work while an app watches: the voice
-    turn hides the app, and the app comes back in front when the turn ends.
+    Muse's Spotify app ran at 47 ms (p95 66) with its 300 px cover scaled to
+    155% behind the record, and at 30 ms (p95 43, none torn) once its hook
+    made a 466 px copy that the app shows at scale 100. Reading a 300 px JPEG
+    from the VM and decoding it took 564 ms, and 616 ms at 440 px.
+  - A typed turn works while an app watches. A voice press records and
+    sends, hides the app, and brings it back in front when the turn ends;
+    only silent presses were tried, so the reply side is untested.
 - **Test** with `tests/test_muse_apps_*.py` (the VM and the sandbox, JSON,
   packages, widgets and the apply step, the services, the runtime and its duty
   cycle, the app task, the store, the install, the console and `app.py`, the

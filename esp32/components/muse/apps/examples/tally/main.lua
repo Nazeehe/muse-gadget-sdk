@@ -51,7 +51,7 @@ local function command(name, args)
   local ok, err = pcall(vm.command, name, args, function(acked, result)
     wait(-1)
     if not acked then say(result) return end              -- "timed out", or the VM's words
-    if type(result) == "table" and result.ok == false then say(result.error) return end
+    if type(result) == "table" and result.ok == false then say(result.error or "the hook could not do that") return end
     show(result)
     say("")
   end)

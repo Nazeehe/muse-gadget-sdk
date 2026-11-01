@@ -1632,6 +1632,12 @@ class TallyOnAppHost(AppHostTestCase):
         self.assertTrue(screen["status"].startswith("éé") and screen["status"].endswith("..."), screen["status"])
         self.assertLessEqual(len(screen["status"].encode()), 128)
 
+        # A refusal with no error in it: a plain text, never "nil".
+        host.do('tap "+1"', "advance 50")
+        ack(sent("add")["seq"], {"ok": False})
+        self.assertEqual(tally_screen(host.do("advance 1500", "dump")), {"count": "42", "status": "the hook could not do that",
+                                                                         "waiting": False})
+
         # No ack: "timed out" after 15 s.
         host.do('tap "+1"', "advance 50")
         sent("add")

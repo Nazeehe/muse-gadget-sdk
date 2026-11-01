@@ -18,8 +18,8 @@
 # (its heartbeat, outbox/active.json, written 15 s ago or less) one run checks outbox/ every 1 s for at most 50 s:
 # it applies the app's commands (outbox/cmd-<seq>.json) in seq order, each once, acks them in state/acks.json, reads
 # the data source within the call budget (at most 100 calls in any rolling hour), and publishes the app's state
-# (state/count.json, then state/rev) when it changes. To adapt it: replace fetch_state (the one call to the data
-# source) and run_command, and set STATE_FILE.
+# (state/count.json, then state/rev) when it changes. To adapt it: replace fetch_state (the one read of the data
+# source) and run_command (whose connector calls go through connector_call), and set STATE_FILE.
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -58,23 +58,29 @@ dry_run() {
 # no connector: its source is its own state file.
 fetch_state() {
     if [[ -f "$STATE_FILE" ]]; then
-        jq -c '{count: (if (.count | type) == "number" then (.count | floor) else 0 end)}' "$STATE_FILE"
+        jq -c '{count: (if (.count | type) == "number" then (.count | floor) else 0 end)}' "$STATE_FILE" 2>/dev/null
     else
         printf '{"count":0}\n'
     fi
 }
 
 # run_command NAME ARGS carries out one of the app's commands and sets RESULT, the ack's result: {"ok":true,...}, or
-# {"ok":false,"error":"..."} for one it can't carry out. A connector app calls the connector's write here, and logs each
-# call with note_call "$now". Tally's commands change its own state file.
+# {"ok":false,"error":"..."} for one it can't carry out. It must never end the run (set -e): the command's seq is saved
+# before it runs, so a run that dies here never repeats it, but the app hears nothing. A connector app makes each call to
+# the connector's CLI through connector_call, by its full path:
+#     connector_call /full/path/to/cli <args...> || return 0     # its RESULT is set, and on exit 3 the run ends
+#     RESULT='{"ok":true}'                                         # or what OUT, the CLI's output, says
+# Tally's commands change its own state file.
 run_command() {
     local name=$1 args=$2 current='{"count":0}' count n
     if [[ -n "${PUBLISHED:-}" ]]; then current=$PUBLISHED; fi
     count=$(jq -r '(.count // 0) | if type == "number" then floor else 0 end' <<<"$current")
     case "$name" in
         add)
+            # A whole number in any form (1, 1.0, 1e3) as digits: bash can't add 1.0.
             if ! n=$(jq -er '(.n // 1) as $n | if ($n | type) == "number" and $n == ($n | floor) and ($n | fabs) <= 1000000
-                             then $n else error("bad n") end' <<<"$args" 2>/dev/null); then
+                             then $n | floor | tostring else error("bad n") end' <<<"$args" 2>/dev/null) ||
+               ! [[ "$n" =~ ^-?[0-9]+$ ]]; then
                 RESULT='{"ok":false,"error":"add takes {n = a whole number}"}'
                 return 0
             fi
@@ -92,9 +98,30 @@ run_command() {
     RESULT="{\"ok\":true,\"count\":$count}"
 }
 
+# connector_call CLI ARGS...: one call to a connector's CLI for a command (run_command's), logged in the budget first, its
+# stderr to /dev/null, and never ending the run. Sets OUT to what it printed and returns 0 when it says {"ok":true,...};
+# else sets RESULT to the ack's {"ok":false,...} and returns 1, and on exit 3 (not authorized) also sets STOP.
+connector_call() {
+    local rc=0
+    note_call "$now"   # the now of serve_commands
+    OUT=$("$@" 2>/dev/null) || rc=$?
+    if ((rc == 3)); then
+        log "a connector says not authorized: re-approve with hooks.run" '{"exit":3}'
+        RESULT='{"ok":false,"error":"not authorized"}'
+        STOP="not authorized"
+        return 1
+    fi
+    if ((rc != 0)) || ! jq -e '.ok == true' >/dev/null 2>&1 <<<"$OUT"; then
+        log "a connector call failed" "{\"exit\":$rc}"
+        RESULT='{"ok":false,"error":"the connector failed"}'
+        return 1
+    fi
+}
+
 # ---- Files: every write goes through these, and a dry run writes nothing --------------------------------------------
-write_file() {   # PATH TEXT: replaced whole (a reader sees the old file or the new one)
+write_file() {   # PATH TEXT: replaced whole (a reader sees the old file or the new one), its folder made when missing
     if dry_run; then return 0; fi
+    [[ -d "${1%/*}" ]] || mkdir -p "${1%/*}"
     printf '%s\n' "$2" > "$1.tmp"
     mv "$1.tmp" "$1"
 }
@@ -215,12 +242,17 @@ heartbeat_fresh() {   # NOW
     (($1 - mtime <= HEARTBEAT_MAX_AGE_S))
 }
 
-# serve_commands NOW: the waiting commands in seq order, as numbers, each once, with one read after each. Commands are
-# always served, and their calls logged.
+# serve_commands NOW: the waiting commands in seq order, as numbers, each once (its seq saved before it runs), with one
+# read after each. Commands are always served, and their calls logged, while the run is inside LOOP_S: the rest wait for
+# the next run.
 serve_commands() {
     local now=$1 file seq name args files=(outbox/cmd-*.json)
     if ((${#files[@]} > 1)); then mapfile -t files < <(printf '%s\n' "${files[@]}" | sort -t- -k2,2n); fi
     for file in ${files[@]+"${files[@]}"}; do
+        if ((${#files[@]} > 1)); then
+            now=$(date +%s)
+            if ((now - start >= LOOP_S)); then return 0; fi
+        fi
         seq=${file#outbox/cmd-}
         seq=${seq%.json}
         if ! [[ "$seq" =~ ^[0-9]+$ ]] || ((seq <= LAST_SEQ)); then
@@ -235,10 +267,11 @@ serve_commands() {
             args=null
         fi
         RESULT='{"ok":false,"error":"not a command"}'
-        if [[ -n "$name" ]]; then run_command "$name" "$args"; fi
         LAST_SEQ=$seq
+        save_state   # before it runs: at most once, even if the run dies in it
+        if [[ -n "$name" ]]; then run_command "$name" "$args"; fi
         COMMANDS=$((COMMANDS + 1))
-        read_now "$now"
+        if [[ -z "$STOP" ]]; then read_now "$now"; fi
         ack "$seq" "$RESULT"
         remove_file "$file"
         log "applied a command" "{\"seq\":$seq}"

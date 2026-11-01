@@ -181,6 +181,13 @@ def stub_fetch_state(text, calls):
     return text[:start] + stub + text[end:]
 
 
+def stub_function(text, name, body):
+    """hook.sh's text with the function name's body replaced by body (its lines, indented)."""
+    start = text.index(f"\n{name}() {{\n") + 1
+    end = text.index("\n}\n", start) + 3
+    return text[:start] + f"{name}() {{\n" + "".join(f"    {line}\n" for line in body.strip("\n").splitlines()) + "}\n" + text[end:]
+
+
 class Result:
     def __init__(self, test, done):
         test.assertEqual(done.returncode, 0, f"the run failed: {done.stdout}\n{done.stderr}")
@@ -203,9 +210,7 @@ class HookTestCase(unittest.TestCase):
         self.home = self.root / "home"
         self.workspace = self.home / "workspace"
         self.app = self.workspace / "apps/tally"
-        self.app.mkdir(parents=True)
-        (self.app / "state").mkdir()
-        (self.app / "outbox").mkdir()
+        self.app.mkdir(parents=True)  # only the app's files: the hook makes state/, the gadget outbox/ with its first write
         self.state_dir = self.home / "hooks/state"
         self.state_dir.mkdir(parents=True)
         self.shim = self.root / "shim"
@@ -255,6 +260,7 @@ class HookTestCase(unittest.TestCase):
         """outbox/active.json written age s ago, as the gadget writes it; kept: the gadget goes on writing it as time passes
         (the app stays in front), else it ages."""
         path = self.app / "outbox/active.json"
+        path.parent.mkdir(exist_ok=True)
         path.write_text('{"app":"tally","n":1}')
         t = self.now() - age
         os.utime(path, (t, t))
@@ -263,9 +269,11 @@ class HookTestCase(unittest.TestCase):
         elif self.beat.exists():
             self.beat.unlink()
 
-    def command(self, seq, name, args=None):
-        (self.app / f"outbox/cmd-{seq}.json").write_text(json.dumps({"seq": seq, "name": name, "args": args},
-                                                                    separators=(",", ":")))
+    def command(self, seq, name, args=None, *, raw=None):
+        """outbox/cmd-<seq>.json as the gadget writes it; raw: the file's text as given (numbers as the gadget prints them)."""
+        (self.app / "outbox").mkdir(exist_ok=True)
+        text = raw if raw is not None else json.dumps({"seq": seq, "name": name, "args": args}, separators=(",", ":"))
+        (self.app / f"outbox/cmd-{seq}.json").write_text(text)
 
     def hook_state(self, value=None):
         path = self.state_dir / "tally.json"
@@ -273,13 +281,16 @@ class HookTestCase(unittest.TestCase):
             path.write_text(json.dumps(value))
         return json.loads(path.read_text()) if path.exists() else None
 
-    def run_hook(self, *, dry=False):
+    def run_hook(self, *, dry=False, fails=False):
         env = {"PATH": f"{self.shim}:/usr/bin:/bin", "HOME": str(self.home), "LANG": "C",
                "HATCH_HOOK_RUNTIME": str(self.runtime), "HATCH_HOOK_ID": "tally", "HATCH_HOOK_INVOCATION_ID": "test-1",
                "HATCH_HOOK_SCRIPT_PATH": str(self.home / "hooks/scripts/tally.sh"),
                "HATCH_HOOK_STATE_DIR": str(self.state_dir), "HATCH_HOOK_DRY_RUN": "1" if dry else "0"}
         done = subprocess.run([BASH, str(self.app / "hook.sh")], cwd=self.workspace, env=env, capture_output=True,
                               text=True, timeout=120)
+        if fails:  # a run the test makes fail: what it printed, unchecked
+            self.assertNotEqual(done.returncode, 0)
+            return done
         return Result(self, done)
 
     def read(self, rel):
@@ -316,7 +327,7 @@ class TallyHook(HookTestCase):
                     self.heartbeat(age)
                 run = self.run_hook()
                 self.assertEqual(run.result["action"], "silent")
-                self.assertEqual(sorted(p.name for p in (self.app / "state").iterdir()), [])
+                self.assertFalse((self.app / "state").exists())
                 self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()),
                                  ([] if age is None else ["active.json"]) + ["cmd-1.json"])
                 self.assertIsNone(self.hook_state())
@@ -411,6 +422,7 @@ class TallyHook(HookTestCase):
     def test_dry_run_has_no_side_effects(self):
         # A dry run writes nothing (no state, no acks, no removed commands, no hook state) and applies no command, but its
         # read of the data source still runs, so a connector's approval card comes up in that turn, even with the app closed.
+        (self.app / "state").mkdir()
         (self.app / "state/count.json").write_text('{"count":7}')
         (self.app / "state/rev").write_text("4\n")
         (self.app / "state/acks.json").write_text('{"acks":[{"seq":1,"result":{"ok":true,"count":7}}]}')
@@ -609,6 +621,135 @@ class TallyHook(HookTestCase):
                 self.assertEqual((state["calls"], state["next_poll"]), (kept, T0 + FAST_S))
                 self.assertEqual(model_reads(T0, calls, next_poll, 1), ([T0], kept, T0 + FAST_S))
 
+    def test_a_fresh_folder_works(self):
+        # C1: the app's folder holds only its files at first (the gadget makes outbox/ with the heartbeat). The first run makes
+        # state/ and publishes count 0 and rev 1, and a command in it is applied and acked.
+        self.assertEqual(sorted(p.name for p in self.app.iterdir()), ["hook.sh"])
+        self.last_tick()
+        run = self.run_hook()
+        self.assertEqual(run.result["action"], "silent")
+        self.assertEqual((self.count(), self.read("state/rev").strip()), (0, "1"))
+        shutil.rmtree(self.app / "state")
+        self.state_dir.joinpath("tally.json").unlink()
+        self.command(1, "add", {"n": 2})
+        self.last_tick()
+        self.run_hook()
+        self.assertEqual(self.acks()["acks"], [{"seq": 1, "result": {"ok": True, "count": 2}}])
+        self.assertEqual(self.count(), 2)
+
+    def test_whole_numbers_in_any_form(self):
+        # I1: the gadget's json.encode prints a whole float as 1.0 ({n = 2/2}), and JSON allows 1e3. A whole number counts in
+        # any form; 1.5 is refused with an ack; and the run goes on (later commands served, none left behind).
+        for seq, n in ((1, "1.0"), (2, "1e3"), (3, "1.5"), (4, "-2.0"), (5, "2")):
+            self.command(seq, "add", raw=f'{{"seq":{seq},"name":"add","args":{{"n":{n}}}}}')
+        self.last_tick()
+        run = self.run_hook()
+        self.assertEqual([(a["seq"], a["result"]) for a in self.acks()["acks"]],
+                         [(1, {"ok": True, "count": 1}), (2, {"ok": True, "count": 1001}),
+                          (3, {"ok": False, "error": "add takes {n = a whole number}"}),
+                          (4, {"ok": True, "count": 999}), (5, {"ok": True, "count": 1001})])
+        self.assertEqual(self.count(), 1001)
+        self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()), ["active.json"])
+        self.assertEqual(run.result["payload"]["commands"], 5)
+
+    def test_a_failing_command_runs_once_and_is_counted(self):
+        # I2: a command's connector call goes through connector_call: logged in the budget, its failure acked {"ok":false,...}
+        # without ending the run, and its seq saved before it runs, so it never runs twice, even when the run dies in it.
+        cli = self.shim / "fake-connector"
+        cli.write_text(f'#!/bin/bash\necho call >> "{self.root}/cli-calls"\nprintf \'%s\\n\' "$2"\nexit "$1"\n')
+        cli.chmod(0o755)
+        cli_calls = self.root / "cli-calls"
+        for name, (exit_code, out) in {"exit 1": (1, ""), "exit 0, not ok": (0, '{"ok":false,"error":"busy"}')}.items():
+            with self.subTest(name):
+                self.set_clock(T0)
+                cli_calls.write_text("")
+                self.calls.write_text("")
+                self.hook_state({"calls": [], "next_poll": T0 + 100, "last_seq": 0})
+                text = stub_fetch_state(HOOK.read_text(), self.calls)
+                self.install(stub_function(text, "run_command", f"connector_call {cli} {exit_code} '{out}' || return 0\n"
+                                                                 'RESULT=\'{"ok":true}\''))
+                self.command(1, "skip", None)
+                self.last_tick()
+                run = self.run_hook()
+                self.assertEqual(self.acks()["acks"][-1], {"seq": 1, "result": {"ok": False, "error": "the connector failed"}})
+                self.assertEqual(run.result["reason"], "the app went behind", "the run went on")
+                self.assertEqual(self.lines(cli_calls), ["call"])
+                self.assertEqual(self.lines(self.calls), [str(T0)], "the read after the command")
+                self.assertEqual(self.hook_state()["calls"], [T0, T0], "the connector call and the read, both logged")
+                self.command(1, "skip", None)  # read again: not run twice
+                self.last_tick()
+                self.run_hook()
+                self.assertEqual(self.lines(cli_calls), ["call"])
+        # A run_command that lets set -e end the run: the run fails, but its seq was saved first, so the next run skips it.
+        cli_calls.write_text("")
+        self.hook_state({"calls": [], "next_poll": T0 + 100, "last_seq": 0})
+        self.install(stub_function(HOOK.read_text(), "run_command", f"note_call \"$now\"\n{cli} 1 x >/dev/null\nRESULT=\'{{}}\'"))
+        self.command(1, "skip", None)
+        self.last_tick()
+        self.run_hook(fails=True)
+        self.assertEqual(self.hook_state()["last_seq"], 1)
+        self.last_tick()
+        self.run_hook()
+        self.assertEqual(self.lines(cli_calls), ["call"], "at most once")
+        self.assertFalse((self.app / "outbox/cmd-1.json").exists())
+
+    def test_exit_3_is_not_authorized_and_silent(self):
+        # Exit 3 means not authorized: from fetch_state, the run logs it and ends silent at once (no more reads, though the app
+        # is in front); from a command's connector call, the command is acked "not authorized", no read follows, the run ends
+        # silent, and the next command waits for the next run.
+        self.install(stub_function(HOOK.read_text(), "fetch_state", f'date +%s >> "{self.calls}"\nreturn 3'))
+        self.heartbeat(kept=True)
+        run = self.run_hook()
+        self.assertEqual((run.result["action"], run.result["reason"]), ("silent", "not authorized"))
+        self.assertEqual(self.lines(self.calls), [str(T0)])
+        self.assertEqual(self.now(), T0, "ended at once")
+        self.assertIn({"message": "the data source says not authorized: re-approve with hooks.run", "fields": {"exit": 3}},
+                      run.logs)
+
+        cli = self.shim / "fake-connector"
+        cli.write_text("#!/bin/bash\nexit 3\n")
+        cli.chmod(0o755)
+        self.calls.write_text("")
+        self.hook_state({"calls": [], "next_poll": T0 + 100, "last_seq": 0})
+        text = stub_fetch_state(HOOK.read_text(), self.calls)
+        self.install(stub_function(text, "run_command", f"connector_call {cli} || return 0\nRESULT=\'{{\"ok\":true}}\'"))
+        self.command(1, "skip", None)
+        self.command(2, "skip", None)
+        run = self.run_hook()
+        self.assertEqual((run.result["action"], run.result["reason"]), ("silent", "not authorized"))
+        self.assertEqual(self.acks()["acks"], [{"seq": 1, "result": {"ok": False, "error": "not authorized"}}])
+        self.assertEqual(self.lines(self.calls), [], "no read after it")
+        self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()), ["active.json", "cmd-2.json"])
+        self.assertEqual(self.hook_state()["calls"], [T0], "the connector call, logged")
+
+    def test_commands_stop_at_the_loop_limit(self):
+        # Commands are served while the run is inside its 50 s; what is left waits for the next run, so a long queue can't
+        # hold a run past its timeout. Here each read takes 20 s.
+        self.install(stub_function(HOOK.read_text(), "fetch_state",
+                                   f'read -r t < "{self.clock}"\necho "$t" >> "{self.calls}"\necho $((t + 20)) > "{self.clock}"\n'
+                                   'if [[ -f "$STATE_FILE" ]]; then cat "$STATE_FILE"; else printf \'{"count":0}\\n\'; fi'))
+        for seq in range(1, 6):
+            self.command(seq, "add", {"n": 1})
+        self.heartbeat(kept=True)
+        self.run_hook()
+        self.assertEqual([a["seq"] for a in self.acks()["acks"]], [1, 2, 3], "served at 0, 20 and 40 s; at 60 s it stops")
+        self.assertEqual(sorted(p.name for p in (self.app / "outbox").iterdir()), ["active.json", "cmd-4.json", "cmd-5.json"])
+        self.assertLess(self.now() - T0, 60 + LOOP_S)
+        self.heartbeat(kept=True)
+        self.run_hook()
+        self.assertEqual([a["seq"] for a in self.acks()["acks"]], [1, 2, 3, 4, 5])
+        self.assertEqual(self.count(), 5)
+
+    def test_a_bad_state_file_is_logged_not_printed(self):
+        # fetch_state's jq errors go to /dev/null: a state file that isn't JSON is a failed read in the log, never jq's words
+        # on stderr (Result checks stderr holds only the runtime's log lines).
+        (self.app / "state").mkdir()
+        (self.app / "state/count.json").write_text("not json")
+        self.last_tick()
+        run = self.run_hook()
+        self.assertEqual([entry["message"] for entry in run.logs], ["the data source failed"])
+
+
     def test_commands_are_always_served_and_logged(self):
         # Commands are always served first, each with one read of the data source after it, and their reads are logged too:
         # with the hour's 100 calls used, a command still gets its read (101 in the hour), and the polls wait.
@@ -618,8 +759,7 @@ class TallyHook(HookTestCase):
                 self.calls.write_text("")
                 calls = [T0 - 3000 + i for i in range(used)]
                 self.hook_state({"calls": calls, "next_poll": T0, "last_seq": 0})
-                for f in (self.app / "state").iterdir():
-                    f.unlink()
+                shutil.rmtree(self.app / "state", ignore_errors=True)
                 self.install(stub_fetch_state(HOOK.read_text(), self.calls))
                 self.command(1, "add", {"n": 1})
                 self.last_tick()

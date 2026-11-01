@@ -39,6 +39,7 @@ SOURCES = [TESTS / "muse_apps_jpeg_harness.c", TESTS / "fake_tjpgd.c", APPS / "a
 
 # The errors, exactly (apps_jpeg.h).
 PROGRESSIVE = "unsupported JPEG: use baseline, not progressive"
+UNSUPPORTED = "unsupported JPEG: write baseline with 4:2:0 colour (ffmpeg -pix_fmt yuvj420p)"
 INVALID = "not a valid JPEG"
 NO_MEMORY = "the gadget is short of memory"
 
@@ -54,6 +55,25 @@ def too_thin(n):
 def fake_jpeg(w, h, mode=b"B", msx=1, msy=1, skip=0, tail=b"END!"):
     """A picture in the fake TJpgDec's format (tests/fake_tjpgd.h)."""
     return b"FJPG" + mode + bytes([msx, msy, 0]) + struct.pack("<HHH", w, h, skip) + b"\x5a" * skip + tail
+
+
+def segment(marker, body):
+    """A JPEG marker segment: FF, the marker, its length (2 more than the body), big-endian, and the body."""
+    return bytes([0xFF, marker]) + struct.pack(">H", len(body) + 2) + body
+
+
+def real_jpeg(w, h, sof=0xC0, sampling=(0x22, 0x11, 0x11), before=b"", between=b"", after=b"END!"):
+    """A JPEG's header as an encoder writes one (SOI, APP0 JFIF, the quantization tables, the frame, the Huffman tables, the scan),
+    which the fake TJpgDec reads as the ROM's jd_prepare does for what it refuses (tests/fake_tjpgd.h); then after, the scan's data
+    (to the fake, "END!" and the picture it makes). sof is the frame's marker (C0 baseline, C2 progressive), sampling each
+    component's (one value: a grey picture); before goes between APP0 and the frame, between after the frame. ffmpeg 9.0.1 writes
+    its 4:2:0 (-pix_fmt yuvj420p) as 22 11 11, its 4:4:4 (its default for a colour picture) as 12 12 12 and its 4:2:2 as 22 12 12."""
+    components = b"".join(bytes([i + 1, s, 0 if i == 0 else 1]) for i, s in enumerate(sampling))
+    frame = bytes([8]) + struct.pack(">HH", h, w) + bytes([len(sampling)]) + components
+    scan = bytes([len(sampling)]) + b"".join(bytes([i + 1, 0x00 if i == 0 else 0x11]) for i in range(len(sampling))) + bytes([0, 63, 0])
+    return (b"\xff\xd8" + segment(0xE0, b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00") + before +
+            segment(0xDB, bytes([0]) + bytes(range(1, 65))) + segment(sof, frame) + between + segment(0xC4, bytes([0]) + bytes(16) + b"") +
+            segment(0xDA, scan) + after)
 
 
 def source_rgb(x, y):
@@ -205,8 +225,35 @@ class JpegTest(unittest.TestCase):
         self.assertEqual([alpha[x] for x in range(6)], [0, 0, 255, 255, 0, 0])
 
     def test_progressive_is_refused_with_its_message(self):
-        self.assert_error(self.decode(fake_jpeg(800, 600, mode=b"P")), PROGRESSIVE)
-        self.assert_error(self.decode(fake_jpeg(800, 600, mode=b"P"), circle=True), PROGRESSIVE)
+        # The final review's I2 (M7): TJpgDec's JDR_FMT3 says "use baseline, not progressive" only for a JPEG whose frame is SOF2.
+        for jpg in (real_jpeg(800, 600, sof=0xC2), real_jpeg(800, 600, sof=0xC2, before=segment(0xFE, b"a comment")),
+                    real_jpeg(40, 30, sof=0xC2, sampling=(0x22, 0x22, 0x22))):
+            for circle in (False, True):
+                with self.subTest(jpg=jpg[:40], circle=circle):
+                    self.assert_error(self.decode(jpg, circle=circle), PROGRESSIVE)
+
+    def test_any_other_unsupported_jpeg_is_told_the_recipe_that_works(self):
+        # Every other JDR_FMT3 gets the recipe that works: a baseline JPEG in 4:2:0. ffmpeg's default JPEG of a colour picture is
+        # 4:4:4, written as a baseline (SOF0) frame the ROM refuses; and so are its 4:2:2, a grey picture, another process (SOF1
+        # extended, SOF3 lossless), and an SOF2 that only the scan's data holds (the first frame marker is what counts).
+        for name, jpg in (("ffmpeg's 4:4:4", real_jpeg(300, 300, sampling=(0x12, 0x12, 0x12))),
+                          ("4:4:4 as 2x2", real_jpeg(300, 300, sampling=(0x22, 0x22, 0x22))),
+                          ("Cr sampled 2x2", real_jpeg(300, 300, sampling=(0x11, 0x11, 0x22))),
+                          ("ffmpeg's 4:2:2", real_jpeg(300, 300, sampling=(0x22, 0x12, 0x12))),
+                          ("grey", real_jpeg(300, 300, sampling=(0x11,))),
+                          ("SOF1", real_jpeg(300, 300, sof=0xC1)), ("SOF3", real_jpeg(300, 300, sof=0xC3)),
+                          ("an SOF2 after the frame", real_jpeg(300, 300, sampling=(0x22, 0x22, 0x22),
+                                                                between=segment(0xC2, bytes(15)))),
+                          ("an SOF2 in the scan", real_jpeg(300, 300, sampling=(0x22, 0x22, 0x22), after=b"\xff\xc2\x00\x11END!")),
+                          ("the fake's own", fake_jpeg(800, 600, mode=b"P"))):
+            for circle in (False, True):
+                with self.subTest(name, circle=circle):
+                    self.assert_error(self.decode(jpg, circle=circle), UNSUPPORTED)
+        # The recipe's JPEG decodes: a baseline 4:2:0 frame, and a 4:2:2 the ROM takes (Y 2x1, Cb and Cr 1x1).
+        self.assert_ok(self.decode(real_jpeg(300, 200)), 300, 200, 0)
+        self.assert_ok(self.decode(real_jpeg(64, 32, sampling=(0x21, 0x11, 0x11))), 64, 32, 0)
+        # The message is the header's, beside the other five.
+        self.assertIn(f'#define APPS_JPEG_MSG_UNSUPPORTED "{UNSUPPORTED}"', (APPS / "apps_jpeg.h").read_text())
 
     def test_a_refused_block_is_a_clean_error(self):
         # The pool (TJpgDec's 3,100 bytes), then the block: either refused by the floor is the same clean error, with nothing
@@ -221,6 +268,8 @@ class JpegTest(unittest.TestCase):
 
     def test_what_is_no_jpeg_is_not_a_valid_jpeg(self):
         for name, jpg in (("garbage", b"\xff\xd8\xff\xe0 not really"), ("one byte", b"F"), ("empty", b""),
+                          ("a JPEG cut in its header", real_jpeg(40, 30)[:30]), ("no frame before the scan", b"\xff\xd8" +
+                                                                                    segment(0xDA, bytes([3, 1, 0, 2, 17, 3, 17, 0, 63, 0]))),
                           ("cut in its header", fake_jpeg(40, 30)[:9]), ("cut in what it skips", fake_jpeg(40, 30, skip=100)[:60]),
                           ("cut before the data", fake_jpeg(40, 30)[:-2]), ("no data", fake_jpeg(40, 30, tail=b"NOPE")),
                           ("broken after its first MCU", fake_jpeg(40, 30, mode=b"C")), ("an MCU of 24 px", fake_jpeg(40, 30, msx=3)),

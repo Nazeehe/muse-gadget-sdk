@@ -40,9 +40,15 @@
  * session (about 130 bytes) and TJpgDec's own frames; the pool is in the heap.
  *
  * Errors (exact, and the guide's):
- *   unsupported JPEG: use baseline, not progressive    TJpgDec's JDR_FMT3: progressive, or another JPEG process it doesn't do
- *   not a valid JPEG                                   anything else TJpgDec refuses: not a JPEG, cut short, damaged, a sampling it
- *                                                      doesn't take, tables too big for its pool; and no bytes at all
+ *   unsupported JPEG: use baseline, not progressive    TJpgDec's JDR_FMT3 for a progressive JPEG: its first frame marker,
+ *                                                      walking the markers from SOI before the scan, is SOF2
+ *   unsupported JPEG: write baseline with 4:2:0 colour (ffmpeg -pix_fmt yuvj420p)
+ *                                                      any other JDR_FMT3: another JPEG process (SOF1, SOF3, ...), a grey picture,
+ *                                                      or a sampling the ROM doesn't take (ffmpeg's 4:4:4, its default for a
+ *                                                      colour picture, and its 4:2:2); it takes Y 1x1, 2x1 or 2x2 with Cb and
+ *                                                      Cr 1x1, as ffmpeg's 4:2:0 (yuvj420p) is
+ *   not a valid JPEG                                   anything else TJpgDec refuses: not a JPEG, cut short, damaged, tables too
+ *                                                      big for its pool; and no bytes at all
  *   the picture is larger than <n> px even at 1/8      a side over max_side at 1/8; <n> is max_side
  *   the picture is too thin to scale down to <n> px    the scale that fits max_side leaves a side of 0 px (1000 x 3 at 1/4)
  *   the gadget is short of memory                      the floor or the heap refused the pool or the block
@@ -56,6 +62,7 @@
 #define APPS_JPEG_POOL_BYTES 3100
 
 #define APPS_JPEG_MSG_PROGRESSIVE "unsupported JPEG: use baseline, not progressive"
+#define APPS_JPEG_MSG_UNSUPPORTED "unsupported JPEG: write baseline with 4:2:0 colour (ffmpeg -pix_fmt yuvj420p)"
 #define APPS_JPEG_MSG_INVALID "not a valid JPEG"
 #define APPS_JPEG_MSG_TOO_LARGE "the picture is larger than %d px even at 1/8"
 #define APPS_JPEG_MSG_TOO_THIN "the picture is too thin to scale down to %d px"

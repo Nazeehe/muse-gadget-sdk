@@ -55,6 +55,78 @@ static bool take(JDEC *jd, BYTE *buf, UINT n) {
     return true;
 }
 
+static UINT be16(const BYTE *p) {
+    return (UINT)p[0] << 8 | (UINT)p[1];
+}
+
+/* After SOI: a JPEG's markers, as the ROM's jd_prepare reads them for what it refuses (fake_tjpgd.h). */
+static JRESULT prepare_markers(JDEC *jd) {
+    BYTE seg[JD_SZBUF];
+    for (;;) {
+        if (!take(jd, seg, 4)) {
+            return JDR_INP;
+        }
+        UINT marker = seg[1], len = be16(seg + 2);
+        if (seg[0] != 0xFF || len <= 2) {
+            return JDR_FMT1;
+        }
+        len -= 2;
+        switch (marker) {
+        case 0xC0:  /* SOF0 (baseline JPEG) */
+            if (len > JD_SZBUF) {
+                return JDR_MEM2;
+            }
+            if (!take(jd, seg, len)) {
+                return JDR_INP;
+            }
+            if (len < 15 || seg[5] != 3) {
+                return JDR_FMT3;  /* Y, Cb and Cr only */
+            }
+            for (int i = 0; i < 3; i++) {
+                BYTE b = seg[7 + 3 * i];
+                if (i == 0) {
+                    if (b != 0x11 && b != 0x22 && b != 0x21) {
+                        return JDR_FMT3;  /* 4:4:4, 4:2:0 or 4:2:2 only */
+                    }
+                    jd->msx = b >> 4;
+                    jd->msy = b & 15;
+                } else if (b != 0x11) {
+                    return JDR_FMT3;  /* Cb and Cr sampled 1x1 */
+                }
+                if (seg[8 + 3 * i] > 3) {
+                    return JDR_FMT3;
+                }
+            }
+            jd->height = be16(seg + 1);
+            jd->width = be16(seg + 3);
+            break;
+        case 0xDA:  /* SOS: the header ends */
+            if (len > JD_SZBUF) {
+                return JDR_MEM2;
+            }
+            if (!take(jd, seg, len)) {
+                return JDR_INP;
+            }
+            if (jd->width == 0 || jd->height == 0) {
+                return JDR_FMT1;
+            }
+            if (seg[0] != 3) {
+                return JDR_FMT3;
+            }
+            ((fake_session_t *)jd->pool)->mode = 'B';
+            return JDR_OK;
+        case 0xC1: case 0xC2: case 0xC3: case 0xC5: case 0xC6: case 0xC7:
+        case 0xC9: case 0xCA: case 0xCB: case 0xCD: case 0xCE: case 0xCF:
+        case 0xD9:
+            return JDR_FMT3;  /* another JPEG process (SOF2 is progressive), or EOI */
+        default:
+            if (!take(jd, NULL, len)) {
+                return JDR_INP;
+            }
+        }
+    }
+}
+
 JRESULT jd_prepare(JDEC *jd, UINT (*infunc)(JDEC *, BYTE *, UINT), void *pool, UINT sz_pool, void *dev) {
     if (jd == NULL || infunc == NULL || pool == NULL) {
         return JDR_PAR;
@@ -69,7 +141,13 @@ JRESULT jd_prepare(JDEC *jd, UINT (*infunc)(JDEC *, BYTE *, UINT), void *pool, U
     }
     memset(pool, 0xA5, sz_pool);  /* every byte of the pool given is the decoder's: a short one is AddressSanitizer's */
     BYTE head[HEAD];
-    if (!take(jd, head, HEAD)) {
+    if (!take(jd, head, 2)) {
+        return JDR_INP;
+    }
+    if (head[0] == 0xFF && head[1] == 0xD8) {
+        return prepare_markers(jd);
+    }
+    if (!take(jd, head + 2, HEAD - 2)) {
         return JDR_INP;
     }
     if (memcmp(head, "FJPG", 4) != 0) {

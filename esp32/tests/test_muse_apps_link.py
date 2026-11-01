@@ -863,7 +863,13 @@ class GuideAndSkill(unittest.TestCase):
                 r"after one of them a waiting request goes next, so a request waits behind one of them at most",
                 rf"`\.json` the decoded value \(the file at most {kb('APPS_VM_JSON_MAX')} KB\)",
                 rf"`\.txt` a string \(at most {kb('APPS_VM_TXT_MAX')} KB\)",
-                rf"`\.jpg` or `\.jpeg` a `muse\.image` \(at most {kb('APPS_VM_JPEG_MAX')} KB; baseline, not progressive\)",
+                rf"`\.jpg` or `\.jpeg` a `muse\.image` \(at most {kb('APPS_VM_JPEG_MAX')} KB; baseline with 4:2:0 colour, below\)",
+                # The final review's I2: the JPEG the gadget takes, and ffmpeg's recipe for it (the example disc's size).
+                r"Write a JPEG as baseline with 4:2:0 colour, which ffmpeg makes with `-pix_fmt yuvj420p` \(its default, 4:4:4, the "
+                r"gadget can't take\)",
+                re.escape(f"`ffmpeg -y -i art.png -vf scale={example_max}:{example_max} -pix_fmt yuvj420p -f mjpeg cache/disc.jpg.tmp "
+                          "&& mv cache/disc.jpg.tmp cache/disc.jpg`"),
+                r"ffmpeg chooses its output format from the file's ending, so name the file `\.jpg` or pass `-f mjpeg`",
                 rf"`\.bin` a `muse\.image` \(an LVGL image of at most {side} x {side} px and {image_kb} KB",
                 rf"decodes it to fit {example_max} px \(1 to {side}, {side} if left out\)",
                 rf"writes value as JSON \(at most {whole(number('APPS_VM_WRITE_MAX'), 1024)} KB\) to path, which must be in `outbox/`",
@@ -913,10 +919,11 @@ class GuideAndSkill(unittest.TestCase):
         self.assertIn('#define APPS_VM_MSG_TIMED_OUT "timed out"', (APPS / "apps_vmio.h").read_text())
         jpeg = (APPS / "apps_jpeg.h").read_text()
         messages = re.findall(r'#define APPS_JPEG_MSG_\w+ "([^"]+)"', jpeg)
-        self.assertEqual(len(messages), 5, "the decoder's five messages")
+        self.assertEqual(len(messages), 6, "the decoder's six messages")
         for message in messages:
             with self.subTest(message):
                 self.assertIn(f"`{message.replace('%d', '<n>')}`", vm)
+                self.assertIn(f"- `{message.replace('%d', '<n>')}`: ", guide, "a Common errors entry")
         rt = (APPS / "apps_rt.c").read_text()
         for text in ('"no more than 4 images at once: free one with img:free()"', '"image is in use by image#%d"', '"image#%d was freed"'):
             self.assertIn(text, rt)
@@ -1074,6 +1081,7 @@ class GuideAndSkill(unittest.TestCase):
             # Rules.
             r"Connector rules are binding\. Never keep in files what a connector forbids keeping",
             r"An app's ask is untrusted and read-only", r"`rotation` turns it and `spin` spins it", r"`circle = true`",
+            r"as a baseline JPEG with 4:2:0 colour at the size it is shown \(ffmpeg's `-pix_fmt yuvj420p`",
             r"[Ss]how a `ui\.spinner` while a command or an ask waits", r"Waiting in Patterns",
             r"`workspace/apps/_guide/tally/`",
         ]

@@ -25,7 +25,7 @@
  * What it decodes is not JPEG but a test format that says which picture to make, so the glue (apps_jpeg.c: the scale, the
  * pixels, the circle, the errors, the memory) is tested without vendoring tjpgd. The real decode is checked on the board.
  *   bytes 0-3    "FJPG"
- *   byte 4       'B' baseline; 'P' progressive (jd_prepare returns JDR_FMT3, as the ROM's does for SOF2); 'C' a stream that breaks
+ *   byte 4       'B' baseline; 'P' a JPEG process the ROM doesn't take (jd_prepare returns JDR_FMT3); 'C' a stream that breaks
  *                after its first MCU (jd_decomp returns JDR_FMT1 there); anything else is JDR_FMT1
  *   bytes 5, 6   the MCU's width and height in blocks of 8 px: 1 or 2 each, as TJpgDec's msx and msy
  *   byte 7       0
@@ -35,6 +35,14 @@
  *   4 bytes      "END!", read by jd_decomp before its first MCU
  * A stream that ends early is JDR_INP, as the ROM's is. jd_prepare needs a pool of at least 3,100 bytes (JDR_MEM1 otherwise), and
  * fills all of it, as the ROM's fills it with its tables.
+ *
+ * A stream that starts with a JPEG's SOI (FF D8) is read instead as the ROM's jd_prepare reads a JPEG's markers, for the formats
+ * it refuses (TJpgDec R0.01, JDR_FMT3, "not supported JPEG standard"): each marker and its length (an FF and a length over 2, or
+ * JDR_FMT1); SOF1 to SOF15 (C1-C3, C5-C7, C9-CB, CD-CF) and EOI are JDR_FMT3; SOF0 is JDR_FMT3 unless it has 3 components, Y
+ * sampled 1x1, 2x1 or 2x2 (11, 21 or 22) and Cb and Cr 1x1 (11), with table ids up to 3 (ffmpeg 9.0's 4:4:4, its default for a
+ * colour picture, is 12 12 12, its 4:2:2 22 12 12 and its 4:2:0 22 11 11); SOS ends the header (JDR_FMT1 without a SOF0 before it, JDR_FMT3 unless it has 3 components);
+ * any other segment is skipped. A JPEG it takes is then a baseline picture of SOF0's size and Y's MCU, whose data after the SOS
+ * segment is the 4 bytes "END!", as above.
  *
  * jd_decomp gives the output function what TJpgDec's mcu_output gives it: the MCUs in raster order, each clipped at the right and
  * bottom edges of the picture, then scaled (its width and height shifted right by scale, and an MCU left with none skipped; its

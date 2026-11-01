@@ -88,6 +88,40 @@ static void put_le16(uint8_t *p, unsigned v) {
     p[1] = (uint8_t)(v >> 8);
 }
 
+/* Whether the JPEG's frame is progressive: walking its markers from SOI, the first frame marker (SOFn) is SOF2, before any scan.
+ * TJpgDec's JDR_FMT3 covers that and every other JPEG it doesn't take (another process, a grey picture, or a sampling other than
+ * Y 1x1, 2x1 or 2x2 over Cb and Cr 1x1), which want a different word. */
+static bool progressive(const uint8_t *jpg, size_t len) {
+    if (len < 4 || jpg[0] != 0xFF || jpg[1] != 0xD8) {
+        return false;
+    }
+    size_t at = 2;
+    while (at + 4 <= len && jpg[at] == 0xFF) {
+        uint8_t marker = jpg[at + 1];
+        if (marker == 0xC2) {
+            return true;
+        }
+        bool frame = marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+        if (frame || marker == 0xDA || marker == 0xD9) {
+            return false;  /* another frame, the scan or the end, before any SOF2 */
+        }
+        size_t seg = (size_t)jpg[at + 2] << 8 | jpg[at + 3];  /* its length, which counts itself */
+        if (seg < 2) {
+            return false;
+        }
+        at += 2 + seg;
+    }
+    return false;
+}
+
+/* TJpgDec's refusal rc as the decoder's words: JDR_FMT3 is "unsupported", told how (progressive or not); anything else invalid. */
+static const char *refusal(JRESULT rc, const uint8_t *jpg, size_t len) {
+    if (rc != JDR_FMT3) {
+        return APPS_JPEG_MSG_INVALID;
+    }
+    return progressive(jpg, len) ? APPS_JPEG_MSG_PROGRESSIVE : APPS_JPEG_MSG_UNSUPPORTED;
+}
+
 /* message into err, cut to err_len (the messages are ASCII), and false. */
 static bool fail(char *err, size_t err_len, const char *message) {
     if (err != NULL && err_len > 0) {
@@ -124,7 +158,7 @@ bool apps_jpeg_decode(const uint8_t *jpg, size_t len, int max_side, bool circle,
     JRESULT rc = jd_prepare(&jd, read_jpeg, pool, APPS_JPEG_POOL_BYTES, &d);
     if (rc != JDR_OK) {
         apps_port_free(pool);
-        return fail(err, err_len, rc == JDR_FMT3 ? APPS_JPEG_MSG_PROGRESSIVE : APPS_JPEG_MSG_INVALID);
+        return fail(err, err_len, refusal(rc, jpg, len));
     }
     /* The largest scale (the least reduction) at which both sides fit: never larger than the picture. */
     BYTE scale = 0;
@@ -164,7 +198,7 @@ bool apps_jpeg_decode(const uint8_t *jpg, size_t len, int max_side, bool circle,
     apps_port_free(pool);
     if (rc != JDR_OK) {
         apps_port_free(block);
-        return fail(err, err_len, rc == JDR_FMT3 ? APPS_JPEG_MSG_PROGRESSIVE : APPS_JPEG_MSG_INVALID);
+        return fail(err, err_len, refusal(rc, jpg, len));
     }
     if (circle) {
         fill_circle(block + HEADER + colour, ow, oh);

@@ -495,6 +495,19 @@ class VmFileTest(unittest.TestCase):
         out = self.run_case("an_apps_open_never_waits", board="apps")
         self.assertEqual(out.one("took"), "0")
 
+    def test_an_apps_refusals_for_memory_log_the_heap_once(self):  # I9
+        out = self.run_case("an_apps_refusals_for_memory_log_the_heap_once", board="apps")
+        line = ("W muse_apps: an app's VM read was refused for memory: internal {} B free, DMA {} B free, "
+                "largest internal block {} B")
+        self.assertEqual(out.one("image"), "0", "an image download's refusal is not an app's")
+        # Three refusals of an app's open in a row, and one line: what the heap had (the fake's 200000 B of internal RAM,
+        # its 100000 B block).
+        self.assertEqual(out.one("first"), "1 " + line.format(200000, 20 * 1024, 100000))
+        self.assertEqual(out.one("after_image"), "1", "an image's open that got its memory doesn't end the app's run")
+        self.assertEqual(out.one("good"), "1")
+        # After an app's open that got its memory, the next refusal is a new run: one more line.
+        self.assertEqual(out.one("again"), "2 " + line.format(200000, 19 * 1024, 100000))
+
     def test_a_write_waits_for_a_busy_writer(self):  # within its timeout, sending nothing, then fails at the timeout
         out = self.run_case("a_write_waits_for_a_busy_writer", board="apps")
         self.assertEqual(out.one("second"), "0 the VM file writer is busy|1000000 0")

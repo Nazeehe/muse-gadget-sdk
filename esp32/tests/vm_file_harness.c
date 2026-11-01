@@ -314,6 +314,17 @@ static bool log_has(const char *text) {
     return log_count(text) != 0;
 }
 
+#if WITH_IMAGE_FETCH || CONFIG_MUSE_APPS
+// The one log line that holds `text`, or "".
+static const char *log_line(const char *text) {
+    const char *found = "";
+    for (unsigned i = 0; i < 32 && i < g_log_lines; i++) {
+        if (strstr(g_log[i], text)) found = g_log[i];
+    }
+    return found;
+}
+#endif
+
 // The writer's boundary comes from four words of this: a sequence, so a case knows the boundaries to come.
 uint32_t esp_random(void) {
     return 0x0A0B0C0Du + 0x01010101u * g_random_calls++;
@@ -2793,15 +2804,6 @@ static void case_image_needs_a_block_for_its_tcb(void) {
     }
 }
 
-// The one log line that holds `text`, or "".
-static const char *log_line(const char *text) {
-    const char *found = "";
-    for (unsigned i = 0; i < 32 && i < g_log_lines; i++) {
-        if (strstr(g_log[i], text)) found = g_log[i];
-    }
-    return found;
-}
-
 // An idle 1.75C with the Link up has 23.7 to 25.0 KB of DMA RAM free (Task 21): the least of those. A download
 // that starts keeps the Link's margin all the way (open_get checks it at each range, and the lowest is kept).
 static void case_image_on_an_idle_board(void) {
@@ -2994,6 +2996,35 @@ static void case_an_apps_open_never_waits(void) {
     finish();
 }
 
+// I9: an app's open refused for memory logs the heap, under the apps' tag (the log allowlist's), at the first refusal of
+// a run of them, not at each: an app retries every second or so. Another owner's refusals and opens are no part of it,
+// and an app's open that gets its memory ends the run.
+static void case_an_apps_refusals_for_memory_log_the_heap_once(void) {
+    reset_vm(100);
+    g_log_lines = 0;
+    g_dma_free = 20 * 1024;  // under the session's 16 KB margin, the request and the 4 KB reserve
+    expect_refusal("a.bin", 0, VM_FILE_OWNER_IMAGE, "out_of_memory", "failed to allocate");
+    printf("@image %u\n", log_count("W muse_apps: "));
+    for (int i = 0; i < 3; i++) {
+        expect_refusal("a.bin", 0, VM_FILE_OWNER_APP, "out_of_memory", "failed to allocate");
+    }
+    printf("@first %u %s\n", log_count("W muse_apps: "), log_line("W muse_apps: "));
+    g_dma_free = 200000;
+    vm_file_close(open_ok("a.bin", 0, VM_FILE_OWNER_IMAGE));
+    g_dma_free = 20 * 1024;
+    expect_refusal("a.bin", 0, VM_FILE_OWNER_APP, "out_of_memory", "failed to allocate");
+    printf("@after_image %u\n", log_count("W muse_apps: "));
+    g_dma_free = 200000;
+    vm_file_close(open_ok("a.bin", 0, VM_FILE_OWNER_APP));
+    printf("@good %u\n", log_count("W muse_apps: "));
+    g_dma_free = 19 * 1024;
+    expect_refusal("a.bin", 0, VM_FILE_OWNER_APP, "out_of_memory", "failed to allocate");
+    expect_refusal("a.bin", 0, VM_FILE_OWNER_APP, "out_of_memory", "failed to allocate");
+    printf("@again %u %s\n", log_count("W muse_apps: "), log_line("W muse_apps: "));
+    CHECK(log_count("W link.vm_file: ") == 0, "the reader's own tag logged a refusal");
+    finish();
+}
+
 static bool g_second_ok;
 static char g_second_err[96];
 static int64_t g_second_took;
@@ -3073,6 +3104,7 @@ static const test_case_t cases[] = {
     CASE(an_open_waits_for_an_apps_request),
     CASE(the_wait_for_an_app_ends_after_11_s),
     CASE(an_apps_open_never_waits),
+    CASE(an_apps_refusals_for_memory_log_the_heap_once),
     CASE(a_write_waits_for_a_busy_writer),
 #endif
 #if WITH_IMAGE_FETCH

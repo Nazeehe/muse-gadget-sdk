@@ -312,6 +312,26 @@ static bool is_app(const char *owner) {
     return owner && strcmp(owner, VM_FILE_OWNER_APP) == 0;
 }
 
+// The apps' tag: the board's log allowlist passes it, and not this file's own.
+static const char *APPS_TAG = "muse_apps";
+// An app's last open was refused for memory. The heap is logged at the first
+// refusal of a run of them, not at each (an app retries every second or so),
+// and an app's open that gets its memory ends the run. Only the reader's
+// holder touches it.
+static bool s_app_short;
+
+// After an app's open: refused for memory or not.
+static void note_app_open(const char *owner, bool refused_for_memory) {
+    if (!is_app(owner)) return;
+    if (refused_for_memory && !s_app_short) {
+        ESP_LOGW(APPS_TAG, "an app's VM read was refused for memory: internal %u B free, DMA %u B free, "
+                 "largest internal block %u B", (unsigned)internal_free(),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_largest_free_block(BYTE_CAPS));
+    }
+    s_app_short = refused_for_memory;
+}
+
 // The ticks of one wait, at most VM_FILE_WAIT_POLL_MS and never none.
 static TickType_t wait_ticks(int64_t left_ms) {
     TickType_t ticks = pdMS_TO_TICKS(left_ms < VM_FILE_WAIT_POLL_MS ? left_ms : VM_FILE_WAIT_POLL_MS);
@@ -388,11 +408,17 @@ vm_file_t *vm_file_open(const char *path, size_t keep, const char *owner,
         free(f->body);
         free(f->url);
         memset(f, 0, sizeof(*f));
+#if CONFIG_MUSE_APPS
+        note_app_open(owner, true);  // the heap as the refusal leaves it
+#endif
         atomic_store(&s_owner, NULL);
         *code = "out_of_memory";
         *message = "failed to allocate";
         return NULL;
     }
+#if CONFIG_MUSE_APPS
+    note_app_open(owner, false);
+#endif
     return f;
 }
 

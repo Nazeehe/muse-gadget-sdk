@@ -145,7 +145,11 @@ static_assert(MP3_BUF > MP3_POLL_ROOM + MP3_HOLD, "reads would stall with the MP
 
 /* ---- Voice task <-> session task ---- */
 
-enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE };
+enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE,
+#if CONFIG_MUSE_APPS
+                            CMD_SINK_CANCEL,   /* an app's typed turn, matched by its sink's user (muse_hatch_text_cancel_to) */
+#endif
+};
 
 struct cmd_t {
     cmd_type_t type;
@@ -2120,6 +2124,13 @@ static void handle(const cmd_t &cmd)
         break;
     case CMD_WAKE:   /* only ends hatch_task's resting wait */
         break;
+#if CONFIG_MUSE_APPS
+    case CMD_SINK_CANCEL:   /* that ask's turn only: a console turn, a voice turn or another ask's goes on; a stale one does nothing */
+        if (s_turn.text && s_turn.phase != P_IDLE && s_turn.sink.done && s_turn.sink.user == cmd.sink.user) {
+            turn_fail("CANCELLED");
+        }
+        break;
+#endif
     }
 }
 
@@ -2397,6 +2408,15 @@ extern "C" void muse_hatch_text_turn_to(char *text, const muse_hatch_text_sink_t
     } else if (xQueueSend(s_cmds, &cmd, 0) != pdTRUE) {
         free(text);
         sink->done(sink->user, "BUSY");
+    }
+}
+
+/* A detached ask's turn (P30): from the app task, which never waits for the chat, so a full queue drops it. */
+extern "C" void muse_hatch_text_cancel_to(void *user)
+{
+    cmd_t cmd{ CMD_SINK_CANCEL, 0, nullptr, { nullptr, nullptr, user } };
+    if (s_cmds) {
+        (void)xQueueSend(s_cmds, &cmd, 0);
     }
 }
 #endif

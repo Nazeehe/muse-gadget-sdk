@@ -893,10 +893,13 @@ class GuideAndSkill(unittest.TestCase):
                 rf"[Oo]nly within {tap_s} s of a tap on one of the app's widgets \(the {tap_s}th second included\)",
                 r"`message\(\)` and `alarm\(\)` don't count",
                 r"[Oo]ne ask at a time, on the whole gadget",
-                r"even when its app timed it out or has ended",
+                # P30: an ask that timed out, or whose app ended, is cancelled: out of the way at once, its answer maybe in the chat.
+                r"[Aa]n ask that timed out, or whose app ended, has its turn cancelled",
                 rf"[Aa]t least {gap_s} s from one ask's start to the next, of any app",
                 rf"at most {reply_max} bytes: a longer one is cut where a character starts and ends with `…`",
-                rf"[Aa]fter {timeout_s} s without the reply, `cb\(nil, \"timed out\"\)`",
+                rf"[Aa]fter {timeout_s} s without the reply, `cb\(nil, \"timed out\"\)`: the gadget stops waiting and cancels the turn, "
+                r"and the user may tap again at once",
+                r"Muse's answer may still appear in the user's chat, but never reaches the app",
                 r"`interrupted`", r"`busy with a voice turn`", r"`not set up`", r"`the gadget is short of memory`",
                 r"`CAN'T REACH MUSE`", r"`NO REPLY FROM MUSE`"):
             with self.subTest(pattern):
@@ -929,7 +932,10 @@ class GuideAndSkill(unittest.TestCase):
             with self.subTest(name):
                 self.assertRegex(chat, rf'(?m)^#define {name} "{words}"$')
                 self.assertRegex(errors, rf"`{words}`")
-        self.assertRegex(errors, rf"`timed out`: [^`]*from `muse\.ask`, Muse didn't answer in {timeout_s} s")
+        self.assertRegex(errors, rf"`timed out`: [^`]*from `muse\.ask`, Muse didn't answer in {timeout_s} s and the gadget cancelled the "
+                                 r"turn \(Muse's answer may still appear in the user's chat\): show it, and let the user tap again")
+        # P30: "one ask at a time" means another ask, of any app, is running; its own callback has come by the time this app can ask.
+        self.assertRegex(errors, r"- `muse\.ask: one ask at a time`: another ask, of this app or another app, is still running")
         self.assertIn("`vm` or `muse`)", errors)
         self.assertIn("`vm` (the `vm` module) and `muse` (for `muse.ask`)", guide_section(guide, "Files and the manifest"))
 

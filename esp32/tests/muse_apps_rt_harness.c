@@ -393,6 +393,9 @@ void apps_port_ask(const char *msg, size_t len, void *user) {
     (void)msg, (void)len;
     apps_ask_done(user, "not set up");
 }
+void apps_port_ask_cancel(void *user) {
+    (void)user;  /* every turn ended at once: none to cancel */
+}
 
 void apps_port_ui_lock(void) {}
 

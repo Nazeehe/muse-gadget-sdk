@@ -287,6 +287,7 @@ int main(int argc, char **argv) {
 # The app's side, in the build with the apps: its sink records what it hears, the chat's queue is a stub that takes one command, and
 # each case prints what was said.
 APPS_CASES = r'''
+#include <atomic>
 static void piece(void *user, const char *text, size_t len) {
     std::string shown;
     for (size_t i = 0; i < len; i++) {
@@ -322,6 +323,36 @@ static char *dup(const char *s) {
     strcpy(p, s);
     return p;
 }
+/* The session's real handle(), with stubs for what its other commands use. */
+static std::atomic<uint32_t> s_gen{0};
+static int64_t s_auto_next_us, s_auto_backoff_us = AUTO_RETRY_MIN_US;
+static bool call_busy() { return false; }
+static void disconnect(const char *) {}
+static void forget_vm() {}
+static void turn_begin(uint32_t gen) {
+    if (turn_start(gen, false)) {
+        s_turn.phase = P_LISTEN;
+    }
+}
+@HANDLE@
+@CANCEL_TO@
+/* A command as the chat's queue carries it: what muse_hatch_text_turn_to or muse_hatch_text_cancel_to queued, then handled. */
+static void queue_and_handle_text(const muse_hatch_text_sink_t *sink) {
+    queue_room = 1;
+    if (sink) {
+        muse_hatch_text_turn_to(dup("hello"), sink);
+    } else {
+        cmd_t cmd{ CMD_TEXT, 0, dup("hello") };   /* the console's (muse_hatch_text_turn) */
+        queued = cmd;
+    }
+    handle(queued);
+}
+static void queue_and_handle_cancel(void *user) {
+    queue_room = 1;
+    muse_hatch_text_cancel_to(user);
+    assert(queued.type == CMD_SINK_CANCEL && queued.sink.user == user && !queued.text);
+    handle(queued);
+}
 static bool run_apps(const char *name) {
     std::string n = name;
     if (n == "app_reply") {            /* the pieces and the end go to the sink, and nothing to the console */
@@ -354,6 +385,29 @@ static bool run_apps(const char *name) {
         connects = configured = true;
         chat_fails = true;
         app_turn();
+    } else if (n == "sink_cancel") {   /* P30: an ask's cancel ends that ask's turn, and nothing else */
+        static char other[] = "other";
+        queue_and_handle_text(&SINK);       /* its own: ended with the console's word, once */
+        queue_and_handle_cancel(app_name);
+        assert(s_turn.phase == P_IDLE && !s_turn.sink.done);
+        queue_and_handle_cancel(app_name);  /* stale: its turn has ended already */
+        queue_and_handle_text(&SINK);       /* another ask's generation: this turn goes on, then its own ends it */
+        queue_and_handle_cancel(other);
+        if (s_turn.phase == P_WAIT_REPLY && s_turn.sink.user == app_name) said.push_back("app turn goes on");
+        queue_and_handle_cancel(app_name);
+        queue_and_handle_text(nullptr);     /* a console turn: untouched */
+        queue_and_handle_cancel(app_name);
+        if (s_turn.phase == P_WAIT_REPLY && s_turn.text && !s_turn.sink.done) said.push_back("console turn goes on");
+        turn_fail("NO REPLY FROM MUSE");
+        s_gen = 5;                          /* a voice turn: untouched */
+        cmd_t press{ CMD_BEGIN, 5, nullptr };
+        handle(press);
+        queue_and_handle_cancel(app_name);
+        if (s_turn.phase == P_LISTEN && !s_turn.text && s_turn.gen == 5) said.push_back("voice turn goes on");
+        queue_room = 0;                     /* a full queue: dropped, never waited for */
+        queued = cmd_t{ CMD_WAKE, 0, nullptr };
+        muse_hatch_text_cancel_to(app_name);
+        assert(queued.type == CMD_WAKE);
     } else if (n == "turn_to") {       /* refused at once on the caller's task, or queued with a copy of the sink */
         configured = false;
         muse_hatch_text_turn_to(dup("a"), &SINK);
@@ -411,12 +465,16 @@ class AppTypedTurns(unittest.TestCase):
         # With the apps, the app's sink (its helpers come just before turn_fail) and muse_hatch_text_turn_to.
         helpers = between('#if CONFIG_MUSE_APPS\n/* ---- An app\'s typed turn', 'static void turn_fail(')
         turn_to = between('extern "C" void muse_hatch_text_turn_to(', '\n}\n') + '\n}\n'
+        # P30: the sink's own cancel, through the session's real handle() (its other commands' helpers are stubs in APPS_CASES).
+        cancel_to = between('extern "C" void muse_hatch_text_cancel_to(', '\n}\n') + '\n}\n'
+        handle = between('static void handle(const cmd_t &cmd)', 'static void hatch_task(')
         for apps in (False, True):
             code = TYPED_TURNS
             for marker, text in parts.items():
                 code = code.replace(marker, helpers + text if apps and marker == '@TURNS@' else text)
             if apps:
-                code = '#define CONFIG_MUSE_APPS 1\n' + code.replace('@APPS@', APPS_CASES.replace('@TURN_TO@', turn_to))
+                code = '#define CONFIG_MUSE_APPS 1\n' + code.replace(
+                    '@APPS@', APPS_CASES.replace('@TURN_TO@', turn_to).replace('@CANCEL_TO@', cancel_to).replace('@HANDLE@', handle))
             else:
                 code = code.replace('@APPS@', 'static bool run_apps(const char *) { return false; }\n')
             name = 'apps' if apps else 'plain'
@@ -472,6 +530,14 @@ class AppTypedTurns(unittest.TestCase):
 
     def test_an_apps_turn_fails_in_the_chats_words(self):
         self.assertEqual(self.said('unreachable'), ["done app CAN'T REACH MUSE", 'done app not set up', "done app CAN'T REACH MUSE"])
+
+    def test_a_sink_cancel_ends_only_its_own_turn(self):
+        # P30: muse_hatch_text_cancel_to queues the session's CMD_SINK_CANCEL (never waiting, dropped when the queue is full), and the
+        # real handle() ends the turn in progress only when it is that ask's sink turn (its sink's user): once, with the console's word.
+        # A stale cancel (its turn over, or another ask's generation), a console turn and a voice turn are left as they were.
+        self.assertEqual(self.said('sink_cancel'), ['done app CANCELLED', 'app turn goes on', 'done app CANCELLED',
+                                                    'console sent [] "bytes":5', 'console turn goes on',
+                                                    'console error [NO REPLY FROM MUSE] ', 'voice turn goes on'])
 
     def test_muse_hatch_text_turn_to_never_waits(self):
         # Refused at once, on the caller's task, when Muse isn't set up or the chat's queue is full; queued with its own copy of the sink.

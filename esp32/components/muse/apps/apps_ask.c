@@ -36,7 +36,8 @@
  * 3. The app task's loop takes the list (apps_ask_results) and gives each result to the app that runs (apps_ask_take), which keeps it
  *    while its ask waits for that generation; then runs the callback (apps_ask_run_one). Its time running out (apps_ask_tick) detaches
  *    the ask, and its callback is due with "timed out"; a stop, a crash or the runtime's end detaches it too, and drops its callback.
- *    A result nobody wants is freed.
+ *    A detached ask whose turn is still out has it cancelled (apps_port_ask_cancel, P30): the session's done for it comes promptly,
+ *    and clears the flag. A result nobody wants is freed.
  */
 
 #define STR_(x) #x
@@ -85,11 +86,15 @@ void apps_ask_init(apps_ask_app_t *a) {
     a->ref = LUA_NOREF;
 }
 
-/* The app lets go of its turn: its pieces aren't wanted any more, and its end comes back to nobody. The turn runs on (P17). */
+/* The app lets go of its turn: its pieces aren't wanted any more, and its end comes back to nobody. While the turn is still out it is
+ * cancelled (P30, amending P17): the session ends it only while it is this ask's, and the done that follows clears the flag. */
 static void detach(apps_ask_app_t *a) {
     unsigned gen = a->gen;
     if (gen != 0) {
         (void)atomic_compare_exchange_strong(&s_slot.want, &gen, 0u);
+        if (atomic_load(&s_slot.in_flight)) {
+            apps_port_ask_cancel((void *)(uintptr_t)a->gen);
+        }
     }
     a->gen = 0;
 }

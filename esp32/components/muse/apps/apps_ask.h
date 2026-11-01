@@ -37,12 +37,13 @@
  * - The gap and the one at a time are the gadget's, not the app's: the last accepted ask's start, of any app, and a turn still at
  *   the chat, of any app, count (P17).
  *
- * The turn and the app (P17). The slot below is the module's, static, and the runtime doesn't own it: the chat task may answer after
- * the ask has timed out or its app has ended, and finds valid memory then. One turn of the apps' is at the chat at a time: the slot's
- * in-flight flag is set when the turn goes, and cleared only by the turn's end (apps_ask_done), never by a timeout, so an ask while a
- * turn the apps have let go of still runs is "one ask at a time". A timeout or the app's end only detaches the app: the turn isn't
- * cancelled, its later pieces are dropped (its generation is no longer the one wanted), and its end comes back as a result that the
- * app task frees.
+ * The turn and the app (P17, P30). The slot below is the module's, static, and the runtime doesn't own it: the chat task may answer
+ * after the ask has timed out or its app has ended, and finds valid memory then. One turn of the apps' is at the chat at a time: the
+ * slot's in-flight flag is set when the turn goes, and cleared only by the turn's end (apps_ask_done), never by a timeout, so an ask
+ * while a turn the apps have let go of still runs is "one ask at a time". A timeout or the app's end detaches the app, and cancels the
+ * turn while it is out (apps_port_ask_cancel: the session ends that ask's turn only, P30): its later pieces are dropped (its generation
+ * is no longer the one wanted), and its end, which the cancel brings promptly, comes back as a result that the app task frees. Muse may
+ * still answer in the user's chat; the app never gets that answer.
  *
  * What the chat task and the app task share has one writer each, so no lock is needed: the in-flight flag (the app task sets it
  * while no turn is out, the turn's end clears it), the generation wanted (the app task's), the turn's block (the app task hands it

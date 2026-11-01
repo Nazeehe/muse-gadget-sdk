@@ -307,6 +307,9 @@ void apps_port_ask(const char *msg, size_t len, void *user) {
     (void)msg, (void)len;
     apps_ask_done(user, "not set up");
 }
+void apps_port_ask_cancel(void *user) {
+    (void)user;  /* every turn ended at once: none to cancel */
+}
 
 /* The store's room: plenty (tests/test_muse_apps_install.py has the budget), unless a case says otherwise (app.api's room_kb). */
 static size_t psram_free = (size_t)64 << 20;

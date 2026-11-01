@@ -91,6 +91,14 @@ class AskHarness(unittest.TestCase):
     def test_the_deadline_and_the_wait(self):  # P19: the app task's loop times it out, and its wait honours the deadline
         self.run_case("the_deadline_and_the_wait")
 
+    # ---- Fix round 1: P30, amending P17 ----
+
+    def test_a_timed_out_ask_is_cancelled_and_the_next_one_may_start(self):  # cancelled once; the next ask goes once its done comes
+        self.run_case("a_timed_out_ask_is_cancelled_and_the_next_one_may_start")
+
+    def test_an_ended_apps_ask_is_cancelled(self):  # stopped, crashed, freed: cancelled once; no turn out, or one ended: none
+        self.run_case("an_ended_apps_ask_is_cancelled")
+
     def test_every_case_of_the_harness_has_a_test(self):
         cases = set(re.findall(r'^\s*\{"(\w+)", \w+\},$', HARNESS.read_text(), re.M))
         tested = set(re.findall(r'self\.run_case\("(\w+)"', Path(__file__).read_text()))
@@ -190,6 +198,9 @@ class AskStatic(unittest.TestCase):
         self.assertIn("apps_ask_done(user, APPS_ASK_MSG_NO_MEMORY);", body)
         self.assertIn("const muse_hatch_text_sink_t sink = {apps_ask_piece, apps_ask_done, user};", body)
         self.assertIn("muse_hatch_text_turn_to(text, &sink);", body)
+        # P30: a detached ask's cancel goes to the chat as is, the ask's generation the sink's user it matches.
+        cancel = c_function(port, "void apps_port_ask_cancel(void *user)")
+        self.assertEqual(cancel.split("{", 1)[1].rsplit("}", 1)[0].strip(), "muse_hatch_text_cancel_to(user);")
 
 
 class AskOnAppHost(AppHostTestCase):
@@ -216,6 +227,8 @@ class AskOnAppHost(AppHostTestCase):
         port = strip_c_comments((ROOT / "tools/muse/apphost/apphost_port.c").read_text())
         body = c_function(port, "void apps_port_ask(const char *msg, size_t len, void *user)")
         self.assertIn('apps_ask_done(user, "not set up");', body)
+        # Its asks end at once, so there's never a turn to cancel (P30).
+        self.assertIn("void apps_port_ask_cancel(void *user)", port)
 
 
 if __name__ == "__main__":

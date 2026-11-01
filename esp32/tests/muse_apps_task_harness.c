@@ -1198,6 +1198,11 @@ void apps_port_ask(const char *msg, size_t len, void *user) {
     atomic_store(&ask_user, user);
 }
 
+/* P30: a detached ask's cancel, an event too: "ask cancel" when it is for the turn the last ask sent. */
+void apps_port_ask_cancel(void *user) {
+    event(user == atomic_load(&ask_user) ? "ask cancel" : "ask cancel of another");
+}
+
 /* The VM's files for the cases that use it: a picture, an image file and a rev, any app's. An op can be held until the case lets it go
  * (or its deadline comes), and every op is an event: "vm read <path>", "vm write <path>". */
 static pthread_mutex_t vmf_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -7561,6 +7566,7 @@ static void ask_result_for_an_ended_app_is_dropped(void) {
     WAIT(from, "ask (app askapp) Hi");
     void *user = atomic_load(&ask_user);
     CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    WAIT(from, "ask cancel");  /* P30: the app's end cancels its turn */
     int stopped = mark();
     apps_ask_piece(user, "late", 4);
     apps_ask_done(user, NULL);
@@ -7568,6 +7574,7 @@ static void ask_result_for_an_ended_app_is_dropped(void) {
     FIFO_SYNC();
     ABSENT(from, "print askapp reply");
     ABSENT(from, "log I ask askapp");
+    ABSENT(from, "ask cancel of another");
 }
 
 static const char APP_VMWATCH[] =

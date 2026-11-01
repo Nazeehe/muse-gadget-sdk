@@ -514,6 +514,11 @@ void apps_port_ask(const char *msg, size_t len, void *user) {
     muse_hatch_text_turn_to(text, &sink);
 }
 
+/* P30: the chat ends that ask's turn only (its sink's user, the ask's generation), and never waits. */
+void apps_port_ask_cancel(void *user) {
+    muse_hatch_text_cancel_to(user);
+}
+
 /* PSA's SHA-256 (C21): IDF v6's mbedTLS is PSA, as main/link_pairing.c uses it. psa_crypto_init is cheap once it has
  * run. */
 void apps_port_sha256(const void *data, size_t len, uint8_t out[32]) {

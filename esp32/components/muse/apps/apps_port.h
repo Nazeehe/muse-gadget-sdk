@@ -238,3 +238,11 @@ bool apps_port_vm_submit(struct apps_vm_job *job);
  * apphost has no Muse: every turn ends at once, "not set up". The app task, inside the call of muse.ask.
  */
 void apps_port_ask(const char *msg, size_t len, void *user);
+
+/*
+ * P30: the turn apps_port_ask sent with user is let go of (its ask timed out, or its app ended): the device asks the chat task to
+ * cancel it (muse_hatch_text_cancel_to), which ends it only while it is that turn, and its sink's done follows, on the chat task. A
+ * turn that has ended, or any other turn, is left as it is. It never waits; a cancel the chat's queue has no room for is dropped. The
+ * app task, outside any call of the app.
+ */
+void apps_port_ask_cancel(void *user);

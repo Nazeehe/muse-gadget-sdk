@@ -273,6 +273,11 @@ void apps_port_ask(const char *msg, size_t len, void *user) {
     apps_ask_done(user, "not set up");
 }
 
+/* Every turn ended at once above, so there is never one to cancel (P30). */
+void apps_port_ask_cancel(void *user) {
+    (void)user;
+}
+
 bool apphost_take_exit(void) {
     bool asked = exit_asked;
     exit_asked = false;

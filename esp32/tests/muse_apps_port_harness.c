@@ -664,6 +664,14 @@ void muse_hatch_text_turn_to(char *text, const muse_hatch_text_sink_t *sink) {
     heap_caps_free(text);  /* the session's free(), which takes any heap's block */
 }
 
+static int turn_cancels;
+static void *cancel_user;
+
+void muse_hatch_text_cancel_to(void *user) {
+    turn_cancels++;
+    cancel_user = user;
+}
+
 void apps_ask_piece(void *user, const char *text, size_t len) {
     (void)user, (void)text, (void)len;
 }
@@ -2336,6 +2344,10 @@ static void ask_sends_a_typed_turn(void) {
     CHECK(turns == 1, "a turn went without its copy");
     CHECK(ask_dones == 1 && done_user == (void *)(uintptr_t)8 && strcmp(done_err, "the gadget is short of memory") == 0, "%d, '%s'",
           ask_dones, done_err);
+    /* P30: a detached ask's cancel goes to the chat with the ask's generation, the sink's user it matches. */
+    apps_port_ask_cancel((void *)(uintptr_t)7);
+    CHECK(turn_cancels == 1 && cancel_user == (void *)(uintptr_t)7, "%d cancels", turn_cancels);
+    CHECK(turns == 1 && ask_dones == 1, "a cancel sent a turn or ended one itself");
 }
 
 static const struct {

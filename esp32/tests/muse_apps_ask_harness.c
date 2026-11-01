@@ -310,6 +310,16 @@ void apps_port_ask(const char *msg, size_t len, void *user) {
     }
 }
 
+/* P30: the module asks the platform to cancel a detached ask's turn (a timeout, its app's end). The fake notes it; a case then plays
+ * the session's answer, the sink's done for that turn, as handle() gives it (CMD_SINK_CANCEL: "CANCELLED"). */
+static int cancels;           /* cancels asked for */
+static void *cancel_user;     /* the last one's generation */
+
+void apps_port_ask_cancel(void *user) {
+    cancels++;
+    cancel_user = user;
+}
+
 static void chat_piece(const char *text) {
     apps_ask_piece(asked_user, text, strlen(text));
 }
@@ -889,6 +899,98 @@ static void the_deadline_and_the_wait(void) {
     finish();
 }
 
+/* ---- Fix round 1 (P30, amending P17) ---- */
+
+/* A timed-out ask's turn is cancelled, once, for that ask's generation. Its turn counts as the one at the chat until the session's done
+ * for it comes (P17's flag, which only done clears), and that done runs nothing; then the next ask goes at once, the 30 s gap having
+ * passed in the 120 s. An ask whose reply came is never cancelled. */
+static void a_timed_out_ask_is_cancelled_and_the_next_one_may_start(void) {
+    words();
+    start_app(ASK_APP);
+    tap();
+    CHECK(asks == 1, "sent %d", asks);
+    void *first = asked_user;
+    clock_ms += APPS_ASK_TIMEOUT_MS - 1;
+    round_once();
+    CHECK(cancels == 0, "cancelled before its time: %d", cancels);
+    clock_ms += 1;
+    settle();
+    expect_logged("reply\tnil\t[timed out]");
+    expect_said("ask app: timed out");
+    CHECK(cancels == 1 && cancel_user == first, "the timed-out turn wasn't cancelled: %d", cancels);
+    /* Until the session's done comes, its turn is the one at the chat. A tap on no widget opens the gate without the button's ask. */
+    apps_rt_touch(rt, 7, 1, APPS_UI_TAP);
+    call("again");
+    expect_logged(ok_one);
+    CHECK(asks == 1, "an ask went while the cancelled turn was out: %d", asks);
+    chat_done("CANCELLED");
+    settle();
+    expect_no_logs();
+    expect_nothing_said();
+    CHECK(taken == 1, "the cancelled turn's result wasn't taken: %d", taken);
+    /* The next ask goes at once. */
+    tap();
+    CHECK(asks == 2 && asked_user != first, "the next ask didn't go with a generation of its own: %d", asks);
+    chat_piece("Yes.");
+    chat_done(NULL);
+    settle();
+    expect_logged("reply\t[Yes.]\tnil");
+    expect_said("ask app: done (4 bytes)");
+    CHECK(cancels == 1, "an ask that came back was cancelled: %d", cancels);
+    finish();
+    CHECK(cancels == 1, "the app's end cancelled an ask that had come back: %d", cancels);
+}
+
+/* An app that ends with its ask out, by a stop, a crash or the runtime's end, has that ask's turn cancelled, once; the session's done
+ * that follows runs nothing. An app with no turn out, or whose turn has ended (its result not yet taken), asks for no cancel. */
+static void an_ended_apps_ask_is_cancelled(void) {
+    /* Stopped. */
+    start_app(ASK_APP);
+    tap();
+    void *user = asked_user;
+    apps_rt_stop(rt);
+    CHECK(cancels == 1 && cancel_user == user, "the stopped app's turn wasn't cancelled: %d", cancels);
+    chat_done("CANCELLED");
+    settle();
+    finish();
+    CHECK(cancels == 1, "cancelled again at the runtime's end: %d", cancels);
+    /* Crashed, by a timer's error. */
+    clock_ms += APPS_ASK_GAP_MS;
+    start_app(APP("T.tap = function() muse.ask('q', cb('r')) timer.after(40, function() error('down') end) end\n"));
+    tap();
+    user = asked_user;
+    clock_ms += 40;
+    (void)apps_rt_run_one_timer(rt, apps_port_mono_ms());
+    CHECK(apps_rt_state(rt) == APPS_STATE_CRASHED, "it didn't crash");
+    CHECK(cancels == 2 && cancel_user == user, "the crashed app's turn wasn't cancelled: %d", cancels);
+    chat_done("CANCELLED");
+    settle();
+    finish();
+    CHECK(cancels == 2, "cancelled again at the runtime's end: %d", cancels);
+    /* Freed with it out, with no stop. */
+    clock_ms += APPS_ASK_GAP_MS;
+    start_app(ASK_APP);
+    tap();
+    user = asked_user;
+    end_app();
+    CHECK(cancels == 3 && cancel_user == user, "the freed app's turn wasn't cancelled: %d", cancels);
+    chat_done("CANCELLED");
+    finish();
+    /* No turn out, or its turn ended: no cancel. */
+    start_app(ASK_APP);
+    apps_rt_stop(rt);
+    finish();
+    clock_ms += APPS_ASK_GAP_MS;
+    start_app(ASK_APP);
+    tap();
+    chat_done(NULL);  /* the turn has ended; its result waits for the next round */
+    apps_rt_stop(rt);
+    finish();
+    CHECK(cancels == 3, "a turn that had ended, or none, was cancelled: %d", cancels);
+    expect_no_logs();
+    expect_nothing_said();
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -903,6 +1005,8 @@ int main(int argc, char **argv) {
         {"muse_permission", muse_permission},
         {"a_refused_block_is_a_clean_error", a_refused_block_is_a_clean_error},
         {"the_deadline_and_the_wait", the_deadline_and_the_wait},
+        {"a_timed_out_ask_is_cancelled_and_the_next_one_may_start", a_timed_out_ask_is_cancelled_and_the_next_one_may_start},
+        {"an_ended_apps_ask_is_cancelled", an_ended_apps_ask_is_cancelled},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

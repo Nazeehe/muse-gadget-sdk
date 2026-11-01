@@ -160,6 +160,14 @@ typedef struct {
  * waits: when the turn can't be queued (Muse not set up, or the chat's queue full: "BUSY"), done comes at once, on the caller's task.
  */
 void muse_hatch_text_turn_to(char *text, const muse_hatch_text_sink_t *sink);
+
+/*
+ * Cancels an app's typed turn: the turn in progress ends as the console's cancel ends a typed turn, its sink's done hearing
+ * "CANCELLED", only when it is the sink turn whose sink's user is user (an ask's generation, apps_ask.h). Any other turn (the
+ * console's, a voice turn, another ask's) is left as it is, and a cancel whose turn has ended already does nothing. It never waits:
+ * when the chat's queue is full the cancel is dropped, and the turn ends by the session's own limits.
+ */
+void muse_hatch_text_cancel_to(void *user);
 #endif
 
 /*

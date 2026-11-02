@@ -9774,8 +9774,16 @@ static void column_stacks_children_with_gap_and_pad(void) {
     FINISH(&e);
 }
 
-/* items: where a column puts each child across, as LVGL places it in the column's one track, which is as wide as its widest child and
- * starts at the column's left (the track's place is LV_FLEX_ALIGN_START): lined up on the widest child. */
+/* items: where a column puts each child across the box. The column's one track is as wide as its widest child, and items is the
+ * track's place as well as each child's in it (lv_obj_set_flex_align's cross and track cross places: children_repos and
+ * place_content), so a child lands across the box's content: at its left, centred in it (to the half px LVGL rounds down), or ending
+ * at its right content edge, whatever the other children's widths. A box with no w is as wide as its widest child and its padding,
+ * and LVGL keeps its track at the start (flex_update), which comes to the same. */
+static bool centred_in(const apps_widget_t *child, int32_t x1, int32_t width) {
+    int32_t off = 2 * (child->rx - x1) + child->rw - width;  /* twice the child's centre less the content's */
+    return off >= -1 && off <= 1;
+}
+
 static void items_place_children_across(void) {
     env_t e;
     scene(&e);
@@ -9784,13 +9792,23 @@ static void items_place_children_across(void) {
             "b = ui.box{parent = col, w = 100, h = 20}\n"
             "c = ui.box{parent = col, w = 51, h = 20}");
     CHECK(APPLY(&e), "made");
-    HAS("flex_align 2 start center start");
-    CHECK(W(&e, 1)->rx == 83 && W(&e, 2)->rx == 133 && W(&e, 3)->rx == 157, "center: %d %d %d", W(&e, 1)->rx, W(&e, 2)->rx,
+    HAS("flex_align 2 start center center");
+    CHECK(W(&e, 0)->rx == 83 && W(&e, 0)->rw == 300, "the box's content is x 83 to 382: %d, %d wide", W(&e, 0)->rx, W(&e, 0)->rw);
+    for (int slot = 1; slot <= 3; slot++) {
+        CHECK(centred_in(W(&e, slot), 83, 300), "center: slot %d at %d, %d wide, isn't centred in the box", slot, W(&e, slot)->rx,
+              W(&e, slot)->rw);
+    }
+    CHECK(W(&e, 1)->rx == 133 && W(&e, 2)->rx == 183 && W(&e, 3)->rx == 207, "center: %d %d %d", W(&e, 1)->rx, W(&e, 2)->rx,
           W(&e, 3)->rx);
     RUN(&e, "col:set{items = 'end'}");
     CHECK(APPLY(&e), "end");
-    HAS("flex_align 2 start end start");
-    CHECK(W(&e, 1)->rx == 83 && W(&e, 2)->rx == 183 && W(&e, 3)->rx == 232, "end: %d %d %d", W(&e, 1)->rx, W(&e, 2)->rx, W(&e, 3)->rx);
+    HAS("flex_align 2 start end end");
+    for (int slot = 1; slot <= 3; slot++) {
+        CHECK(W(&e, slot)->rx + W(&e, slot)->rw == 83 + 300, "end: slot %d ends at %d, not at the box's right edge, 382", slot,
+              W(&e, slot)->rx + W(&e, slot)->rw - 1);
+    }
+    CHECK(W(&e, 1)->rx == 183 && W(&e, 2)->rx == 283 && W(&e, 3)->rx == 332, "end: %d %d %d", W(&e, 1)->rx, W(&e, 2)->rx,
+          W(&e, 3)->rx);
     RUN(&e, "col:set{items = 'start'}");
     CHECK(APPLY(&e), "start");
     CHECK(W(&e, 1)->rx == 83 && W(&e, 2)->rx == 83 && W(&e, 3)->rx == 83, "start: %d %d %d", W(&e, 1)->rx, W(&e, 2)->rx, W(&e, 3)->rx);
@@ -9804,11 +9822,32 @@ static void items_place_children_across(void) {
     RUN(&e, "col:set{layout = 'column'}");
     CHECK(APPLY(&e), "a column again");
     HAS("flex_flow 2 column");
-    HAS("flex_align 2 start center start");
-    /* A child as wide as the box puts the others across the whole box. */
-    RUN(&e, "ui.box{parent = col, w = 300, h = 20}");
-    CHECK(APPLY(&e), "a full row");
-    CHECK(W(&e, 2)->rx == 183, "b in the middle of the box: %d", W(&e, 2)->rx);
+    HAS("flex_align 2 start center center");
+    CHECK(W(&e, 1)->rx == 133 && W(&e, 2)->rx == 183 && W(&e, 3)->rx == 207, "center again: %d %d %d", W(&e, 1)->rx, W(&e, 2)->rx,
+          W(&e, 3)->rx);
+    /* Padding narrows the content: x 93 to 372. */
+    RUN(&e, "col:set{pad = 10, items = 'end'}");
+    CHECK(APPLY(&e), "padded");
+    for (int slot = 1; slot <= 3; slot++) {
+        CHECK(W(&e, slot)->rx + W(&e, slot)->rw == 83 + 300 - 10, "end, padded: slot %d ends at %d, not at 372", slot,
+              W(&e, slot)->rx + W(&e, slot)->rw - 1);
+    }
+    RUN(&e, "col:set{items = 'center'}");
+    CHECK(APPLY(&e), "padded, centred");
+    for (int slot = 1; slot <= 3; slot++) {
+        CHECK(centred_in(W(&e, slot), 93, 280), "center, padded: slot %d at %d isn't centred in the content", slot, W(&e, slot)->rx);
+    }
+    /* A box with no w: as wide as its widest child and its padding, and the children across that. */
+    RUN(&e, "auto = ui.box{layout = 'column', items = 'end', pad = 4, y = 180}\n"
+            "ui.box{parent = auto, w = 120, h = 10}\n"
+            "ui.box{parent = auto, w = 40, h = 10}");
+    CHECK(APPLY(&e), "a box to its content");
+    CHECK(W(&e, 4)->rw == 128 && W(&e, 5)->rx == W(&e, 4)->rx + 4 && W(&e, 6)->rx + 40 == W(&e, 4)->rx + 128 - 4,
+          "end, in a box to its content: box %d, %d wide; children at %d and %d", W(&e, 4)->rx, W(&e, 4)->rw, W(&e, 5)->rx,
+          W(&e, 6)->rx);
+    RUN(&e, "auto:set{items = 'center'}");
+    CHECK(APPLY(&e), "centred in a box to its content");
+    CHECK(centred_in(W(&e, 6), W(&e, 4)->rx + 4, 120), "center, in a box to its content: %d", W(&e, 6)->rx);
     FINISH(&e);
 }
 
@@ -10045,7 +10084,8 @@ static void layout_none_undoes_the_column(void) {
             "a = ui.box{parent = col, w = 100, h = 50, align = 'bottom_right', x = -5, y = -5}\n"
             "b = ui.box{parent = col, w = 60, h = 50}");
     CHECK(APPLY(&e), "made");
-    CHECK(W(&e, 1)->rx == 103 && W(&e, 1)->ry == 103 && W(&e, 2)->rx == 123 && W(&e, 2)->ry == 163, "the column: a %d,%d b %d,%d",
+    /* Centred across the content, x 103 to 362. */
+    CHECK(W(&e, 1)->rx == 183 && W(&e, 1)->ry == 103 && W(&e, 2)->rx == 203 && W(&e, 2)->ry == 163, "the column: a %d,%d b %d,%d",
           W(&e, 1)->rx, W(&e, 1)->ry, W(&e, 2)->rx, W(&e, 2)->ry);
     log_clear();
     RUN(&e, "col:set{layout = 'none'}");
@@ -10065,8 +10105,8 @@ static void layout_none_undoes_the_column(void) {
     RUN(&e, "col:set{layout = 'column'}");
     CHECK(APPLY(&e), "a column again");
     HAS("flex_flow 2 column");
-    HAS("flex_align 2 start center start");
-    CHECK(W(&e, 1)->rx == 83 && W(&e, 1)->ry == 83 && W(&e, 2)->rx == 103 && W(&e, 2)->ry == 133, "the column again: a %d,%d b %d,%d",
+    HAS("flex_align 2 start center center");
+    CHECK(W(&e, 1)->rx == 183 && W(&e, 1)->ry == 83 && W(&e, 2)->rx == 203 && W(&e, 2)->ry == 133, "the column again: a %d,%d b %d,%d",
           W(&e, 1)->rx, W(&e, 1)->ry, W(&e, 2)->rx, W(&e, 2)->ry);
 
     RUN(&e, "s = ui.box{w = 200, h = 100, scroll = 'y', layout = 'column', y = 150}\n"

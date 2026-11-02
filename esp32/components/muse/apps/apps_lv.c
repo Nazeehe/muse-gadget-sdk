@@ -770,7 +770,7 @@ static lv_flex_align_t items_of(uint8_t items) {
  * with lv_obj_remove_style_all), and the elastic edge and the throw lv_obj_constructor gave it; it is clickable whatever its
  * handlers, so a drag that begins on its own area finds it (LVGL's hit test passes over an object that isn't). "none" brings the
  * content back to the top first, and leaves it clickable only for a handler. layout = "column" is LVGL's flex column (it sets
- * LV_LAYOUT_FLEX), the children in their track by items; "none" is no layout, which puts them back by their align, x and y. gap is
+ * LV_LAYOUT_FLEX), the children across the box by items; "none" is no layout, which puts them back by their align, x and y. gap is
  * the column's pad_row, pad the four sides' padding (their declared setters: pad_all is inline).
  */
 static void style_box(const apps_widget_t *w, node_t *n) {
@@ -798,7 +798,9 @@ static void style_box(const apps_widget_t *w, node_t *n) {
         if (n->layout != APPS_LAYOUT_COLUMN) {
             lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_COLUMN);
         }
-        lv_obj_set_flex_align(obj, LV_FLEX_ALIGN_START, items_of(w->items), LV_FLEX_ALIGN_START);
+        /* items is the track's place too: a column is one track, as wide as its widest child, so the track goes across the box
+         * as each child goes across the track, and a child lands at the box's start, middle or end (lv_flex.c place_content). */
+        lv_obj_set_flex_align(obj, LV_FLEX_ALIGN_START, items_of(w->items), items_of(w->items));
     } else if (w->layout == APPS_LAYOUT_NONE && n->layout != APPS_LAYOUT_NONE) {
         lv_obj_set_layout(obj, LV_LAYOUT_NONE);
     }

@@ -1106,8 +1106,9 @@ class FakesTest(unittest.TestCase):
         scrolls by the difference, bounded; a vertical animation runs at half the display's height a second; a drag past an end moves a
         quarter as far (elastic_diff without snapping); a throw loses LV_INDEV_DEF_SCROLL_THROW % a step and is slowed the same way past
         an end; after a layout, content scrolled in past its bottom comes back (lv_obj_readjust_scroll), which a deleted child and a size
-        change ask for; a column puts its children across in its track (place_content's cross_pos) and is as tall as they are with the
-        gaps (calc_min_size)."""
+        change ask for; a column puts its one track across the box (place_content, the track at the start in a box sized to its
+        content) and each child across the track (children_repos' cross_pos), and is as tall as they are with the gaps
+        (calc_min_size)."""
         harness = HARNESS.read_text()
 
         def source(path):
@@ -1158,6 +1159,18 @@ class FakesTest(unittest.TestCase):
             self.assertIn(line, flex)
         self.assertIn("return place == LV_FLEX_ALIGN_CENTER ? (((track + 1) & ~1) - size) / 2 : place == LV_FLEX_ALIGN_END ? track - size : 0;",
                       harness)
+        content = function(flex, "static void place_content(lv_flex_align_t place, int32_t max_size, int32_t content_size, int32_t item_cnt,\n"
+                                 "                          int32_t * start_pos, int32_t * gap)\n{")
+        for line in ("*start_pos += (max_size - content_size) / 2;", "*start_pos += max_size - content_size;"):
+            self.assertIn(line, content)
+        for line in ("(!f.row && w_set == LV_SIZE_CONTENT && cont->w_layout == 0)) {", "track_cross_place = LV_FLEX_ALIGN_START;",
+                     "int32_t max_cross_size = (f.row ? lv_obj_get_content_height(cont) : lv_obj_get_content_width(cont));",
+                     "place_content(track_cross_place, max_cross_size, total_track_cross_size, track_cnt, cross_pos, &gap);"):
+            self.assertIn(line, flex)
+        for line in ("return place == LV_FLEX_ALIGN_CENTER ? (max - size) / 2 : place == LV_FLEX_ALIGN_END ? max - size : 0;",
+                     "lv_flex_align_t track_place = o->w == LV_SIZE_CONTENT ? LV_FLEX_ALIGN_START : o->flex_track;",
+                     "abs_x += place_start(track_place, max_cross, track);"):
+            self.assertIn(line, harness)
 
     def test_apps_lv_compiles_against_the_real_headers(self):
         """The device build compiles apps_lv.c against these: every name, type and argument it uses is checked, a bench build's

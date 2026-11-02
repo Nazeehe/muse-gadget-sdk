@@ -381,8 +381,8 @@ class GuideAndSkill(unittest.TestCase):
                 'A box\'s `scroll` is `"none"` (the default) or `"y"`',
                 '`layout` is `"none"` (the default: each widget by its align, x and y) or `"column"`',
                 f"`gap` is the space between them and `pad` the space inside the box's edges, 0 to {space} px, 0 by default.",
-                '`items` places them across the column: `"start"` (the default, on the left), `"center"` or `"end"`, lined up on the '
-                'widest of them.',
+                '`items` places each of them across the box: `"start"` (the default, at its left), `"center"` (in its middle) or '
+                '`"end"` (at its right).',
                 '- `w:scroll_to(where, animate)` scrolls a box with `scroll = "y"`: where is `"start"`, `"end"` or a number of px',
                 'A drag up or down that begins on a widget in a box with `scroll = "y"` scrolls the box: the widget hears press, then '
                 'release, and no tap.'):
@@ -393,8 +393,11 @@ class GuideAndSkill(unittest.TestCase):
         self.assertIsNotNone(lists, "no Lists pattern")
         for phrase in ('one box with `scroll = "y", layout = "column"`', "a row box for each item, with a `w` and no `h`",
                        '`align = "left"` or `align = "right"`', "`wrap = true`", "2 to 3 widgets an item",
-                       f"an app has {slots} widgets", "show the last 30 to 40 items", "delete the oldest rows as new ones come",
-                       'Call `list:scroll_to("end")` after adding rows.', "Widgets in a scroll box get no round-edge warning"):
+                       f"an app has {slots} widgets", "show the last 30 to 40 items",
+                       'Call `list:scroll_to("end")` after adding rows.',
+                       'Deleting rows above what the user is reading moves the list, so delete the oldest rows only right before '
+                       '`scroll_to("end")`, for example when new items arrive and you jump to them.',
+                       "Widgets in a scroll box get no round-edge warning"):
             with self.subTest(phrase):
                 self.assertIn(phrase, lists.group(0))
 

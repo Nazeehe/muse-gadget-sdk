@@ -25,7 +25,7 @@
  *
  * APP_DIR holds manifest.json and the files it lists (the folder's name is the app's id). The package is read
  * the way the install pipeline reads one (apps_pkg: the manifest, the size limits, .lua files that aren't compiled
- * chunks, .json files that must parse, .bin files that must be LVGL images) and compiled the way it compiles one
+ * chunks, .json files that must parse, .bin files that must be LVGL images, .wav files that must be 16 kHz mono 16-bit PCM) and compiled the way it compiles one
  * (apps_rt_compile, which the app task's compile calls too: every .lua file, main first and the others in the
  * package's order, each loaded and not run, in a scratch VM with the manifest's memory limit), so that a package this
  * runs is a package the install accepts. Then the runtime is made and start() is called, and the script's lines run, if
@@ -366,6 +366,7 @@ static size_t kind_max(apps_file_kind_t kind) {
     switch (kind) {
         case APPS_FILE_LUA: return APPS_LUA_MAX;
         case APPS_FILE_JSON: return APPS_JSON_FILE_MAX;
+        case APPS_FILE_SOUND: return APPS_SOUND_MAX;
         default: return APPS_IMAGE_MAX;
     }
 }
@@ -374,12 +375,14 @@ static size_t kind_max(apps_file_kind_t kind) {
  * Reads the package in folder into pkg (zeroed): the manifest (for the app id `id`), then every file it
  * lists, each checked the way the install pipeline checks it. On failure pkg is empty again and err says why:
  *   reading util.lua: No such file or directory
- *   main.lua is larger than 256 KB        (and 32 KB for .json, 512 KB for images)
+ *   main.lua is larger than 256 KB        (and 32 KB for .json, 512 KB for images, 256 KB for sounds)
  *   the app is larger than 2 MB           (manifest and files)
  *   files[1] x.lua is a compiled chunk: install Lua source text
  *   images add up to more than 1.5 MB
+ *   sounds add up to more than 1 MB
  *   data.json: unexpected '}' at byte 6   (a .json file that doesn't parse)
  *   logo.bin: image: not an LVGL v9 image file (use LVGLImage.py --ofmt BIN)
+ *   bell.wav: sound: use 16 kHz mono 16-bit PCM WAV (ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le)
  * or, for the manifest, a message of apps_pkg.h ("manifest: ...").
  */
 static bool load_package(const char *folder, const char *id, apps_pkg_t *pkg, char *err, size_t err_len) {
@@ -389,7 +392,7 @@ static bool load_package(const char *folder, const char *id, apps_pkg_t *pkg, ch
         return false;
     }
     bool ok = apps_manifest_parse((const char *)json, json_len, id, HEAP_MAX_KB, &pkg->manifest, err, err_len);
-    size_t app_bytes = json_len, image_bytes = 0;
+    size_t app_bytes = json_len, image_bytes = 0, sound_bytes = 0;
     free(json);
     if (!ok) {
         return false;
@@ -433,6 +436,17 @@ static bool load_package(const char *folder, const char *id, apps_pkg_t *pkg, ch
             }
             bool icon = strcmp(rel, pkg->manifest.icon) == 0;  /* the launcher's icon: square and small as well */
             if (!(icon ? apps_icon_check(data, len, why, sizeof why) : apps_image_check(data, len, NULL, NULL, why, sizeof why))) {
+                snprintf(err, err_len, "%s: %s", rel, why);
+                goto fail;
+            }
+        }
+        if (kind == APPS_FILE_SOUND) {
+            sound_bytes += len;
+            if (sound_bytes > APPS_SOUNDS_TOTAL_MAX) {
+                snprintf(err, err_len, "sounds add up to more than 1 MB");
+                goto fail;
+            }
+            if (!apps_wav_check(data, len, NULL, NULL, why, sizeof why)) {
                 snprintf(err, err_len, "%s: %s", rel, why);
                 goto fail;
             }

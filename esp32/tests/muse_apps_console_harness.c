@@ -1130,7 +1130,7 @@ static void limits_as_bytes_arrive(void) {
            ". / -, no '..', at most 64 characters)\"}\n");
     CHECK(line("app.put hello notes.txt 0 QUJD"), "put");
     EXPECT("@app.err {\"op\":\"put\",\"path\":\"notes.txt\",\"message\":\"'notes.txt' has an unsupported type (use "
-           ".lua, .json or .bin)\"}\n");
+           ".lua, .json, .bin or .wav)\"}\n");
     CHECK(line("app.put Hello main.lua 0 QUJD"), "put");
     EXPECT("@app.err {\"op\":\"put\",\"path\":\"main.lua\",\"message\":\"app id 'Hello' must match "
            "^[a-z][a-z0-9_]{1,23}$\"}\n");
@@ -1151,6 +1151,16 @@ static void limits_as_bytes_arrive(void) {
     PUT_REFUSED("pics", "e.lua", 256 * KB, "the app is larger than 2 MB");
     /* A file sent again from seq 0 counts once. */
     CHECK(put_file("pics", "d.lua", ZEROS, 256 * KB), "d.lua again");
+    /* Sounds: 256 KB each and 1 MB in all (the stage counts bytes; the install checks the format). */
+    PUT_REFUSED("sfx", "a.wav", 257 * KB, "a.wav is larger than 256 KB");
+    for (int i = 0; i < 4; i++) {
+        char path[16];
+        snprintf(path, sizeof path, "s%d.wav", i);
+        CHECK(put_file("sfx", path, ZEROS, 256 * KB), "%s", path);
+    }
+    PUT_REFUSED("sfx", "e.wav", 1, "sounds add up to more than 1 MB");
+    /* A sound sent again from seq 0 counts once. */
+    CHECK(put_file("sfx", "s0.wav", ZEROS, 256 * KB), "s0.wav again");
     /* 32 files and manifest.json, no more. */
     for (int i = 0; i < 32; i++) {
         char path[16];
@@ -2765,6 +2775,8 @@ static void guide_written_or_inline(void) {
     CHECK_AT(done_result, "payload.limits.json_kb", "32");
     CHECK_AT(done_result, "payload.limits.image_kb", "512");
     CHECK_AT(done_result, "payload.limits.images_kb", "1536");
+    CHECK_AT(done_result, "payload.limits.sound_kb", "256");
+    CHECK_AT(done_result, "payload.limits.sounds_kb", "1024");
     CHECK_AT(done_result, "payload.limits.app_kb", "2048");
     CHECK_AT(done_result, "payload.limits.memory_kb", "{\"min\":64,\"default\":256,\"max\":1024}");
     CHECK_AT(done_result, "payload.limits.widgets", "128");

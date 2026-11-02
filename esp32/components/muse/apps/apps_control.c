@@ -515,10 +515,11 @@ static cJSON *number_object(const char *const *keys, const double *values, size_
 static bool add_facts(cJSON *p) {
     static const char *const screen_keys[] = {"w", "h"};
     const double screen[] = {SCREEN_PX, SCREEN_PX};
-    static const char *const limit_keys[] = {"files", "lua_kb", "json_kb", "image_kb", "images_kb", "app_kb", "widgets",
+    static const char *const limit_keys[] = {"files", "lua_kb", "json_kb", "image_kb", "images_kb", "sound_kb", "sounds_kb", "app_kb", "widgets",
                                              "timers", "alarms", "store_kb"};
     const double limits[] = {APPS_MAX_FILES, APPS_LUA_MAX / 1024, APPS_JSON_FILE_MAX / 1024, APPS_IMAGE_MAX / 1024,
-                             APPS_IMAGES_TOTAL_MAX / 1024, APPS_APP_MAX / 1024, APPS_UI_SLOTS, APPS_TIMERS_MAX,
+                             APPS_IMAGES_TOTAL_MAX / 1024, APPS_SOUND_MAX / 1024, APPS_SOUNDS_TOTAL_MAX / 1024,
+                             APPS_APP_MAX / 1024, APPS_UI_SLOTS, APPS_TIMERS_MAX,
                              APPS_ALARMS_PER_APP, APPS_STORE_MAX_BYTES / 1024};
     static const char *const memory_keys[] = {"min", "default", "max"};
     const double memory[] = {MEMORY_MIN_KB, MEMORY_DEFAULT_KB, MEMORY_MAX_KB};

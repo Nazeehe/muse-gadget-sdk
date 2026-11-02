@@ -37,7 +37,7 @@ This guide is for Muse, writing apps for a Muse gadget with a round screen. It c
 
 ## Files and the manifest
 
-An app is a folder named after its id: you write it on your VM as `workspace/apps/<id>/`, with `manifest.json`, `main.lua` and any files the manifest lists. Paths are relative to the folder: `a-z 0-9 _ . / -`, at most 64 characters, no `..` and no part that starts with a dot. A file's type is its ending: `.lua` (Lua source text), `.json` (must parse) or `.bin` (an LVGL image, see Images); there is no other kind.
+An app is a folder named after its id: you write it on your VM as `workspace/apps/<id>/`, with `manifest.json`, `main.lua` and any files the manifest lists. Paths are relative to the folder: `a-z 0-9 _ . / -`, at most 64 characters, no `..` and no part that starts with a dot. A file's type is its ending: `.lua` (Lua source text), `.json` (must parse), `.bin` (an LVGL image, see Images) or `.wav` (a 16 kHz mono 16-bit PCM sound: `ffmpeg -i in.mp3 -ac 1 -ar 16000 -c:a pcm_s16le out.wav`); there is no other kind.
 
 manifest.json, a JSON object of at most 8 KB:
 
@@ -46,13 +46,13 @@ manifest.json, a JSON object of at most 8 KB:
 - `version` (optional): up to 23 bytes, like `"1.0.0"`.
 - `api` (required): `1`, a JSON integer (`1.0` isn't one).
 - `main` (optional): the main `.lua` file, `"main.lua"` if left out.
-- `files` (optional): every other file, like `["util.lua", "assets/bell.bin"]`: modules for `require`, `.json` data and images.
+- `files` (optional): every other file, like `["util.lua", "assets/bell.bin", "sounds/ding.wav"]`: modules for `require`, `.json` data, images and `.wav` sounds.
 - `icon` (optional): one of `files`, a square `.bin` image at most 160 x 160, shown in the launcher; make it 160 x 160, the size of the app in the middle. See Icons.
 - `permissions` (optional): any of `sound` (for `sound.chirp`), `alarm` (the `alarm` module), `store` (the `store` module), `keep_awake` (for `sys.keep_awake`), `vm` (the `vm` module) and `muse` (for `muse.ask`). `net` and `secrets` aren't available in this firmware yet.
 - `memory_kb` (optional): the Lua heap, a whole number from 64 to 1024; 256 if left out.
 - `messages` (optional): up to 16 event names, each with a description under 200 characters: the events Muse may send with `app.send`. Describe the data each takes and what it replies.
 
-Any other key is ignored with a warning. Limits: 32 files; 256 KB for a `.lua` file, 32 KB for a `.json` file, 512 KB for an image and 1.5 MB for all the images; 2 MB for the whole app. A running app has at most 128 widgets, 16 timers, 4 alarms (8 on the gadget) and 16 KB in its store. `app.api` returns these numbers as `limits`.
+Any other key is ignored with a warning. Limits: 32 files; 256 KB for a `.lua` file, 32 KB for a `.json` file, 512 KB for an image and 1.5 MB for all the images; 256 KB for a `.wav` sound and 1 MB for all the sounds; 2 MB for the whole app. A running app has at most 128 widgets, 16 timers, 4 alarms (8 on the gadget) and 16 KB in its store. `app.api` returns these numbers as `limits`.
 
 An app's files and its Lua heap share the gadget's memory, and the gadget keeps a reserve of it for itself: `app.api`'s `limits.room_kb` is what an app's files and its `memory_kb` may take together right now. With Muse's session up, the 2 MB of files and a 1024 KB heap don't both fit. While an app runs its memory is taken, so installing the app that runs again needs room for two copies of its files until the new one starts: stop it first when `room_kb` is short. A launch while another app runs counts what that app frees when it ends: it is refused up front, with the app that runs left running, when it wouldn't fit even then, or when its files don't fit beside that app now.
 
@@ -422,7 +422,7 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `manifest: api is missing (this gadget supports api 1)`: add `"api": 1`.
 - `manifest: id '<id>' must match ^[a-z][a-z0-9_]{1,23}$ and the folder name '<folder>'`: make the id lower case and the same as the folder's name.
 - `manifest: name must be 1 to 24 characters`: give a short `name`.
-- `manifest: files[<n>] '<path>' has an unsupported type (use .lua, .json or .bin)`: convert the file (images with LVGLImage.py), or leave it out.
+- `manifest: files[<n>] '<path>' has an unsupported type (use .lua, .json, .bin or .wav)`: convert the file (images with LVGLImage.py, sounds with ffmpeg), or leave it out.
 - `manifest: icon '<path>' is not one of the app's files`: list the icon's file in `files`, or fix the path in `icon`.
 - `manifest: icon '<path>' must be a .bin image`: name a `.bin` made with LVGLImage.py (see Icons).
 - `icon: <w>x<h> must be square, at most 160x160`: redraw the icon 160 x 160 px and convert it again.

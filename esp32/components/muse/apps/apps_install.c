@@ -751,7 +751,7 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
         return failure(APPS_ERR_OUT_OF_MEMORY, MSG_NO_MEMORY);
     }
     const apps_manifest_t *m = &pkg->manifest;
-    size_t app_bytes = len, image_bytes = 0;
+    size_t app_bytes = len, image_bytes = 0, sound_bytes = 0;
     for (int i = 0; i < m->file_count; i++) {
         const char *rel = m->files[i];
         if (!apps_path_valid(rel)) {  /* the manifest's parse checked it: never read a path that isn't one */
@@ -789,6 +789,15 @@ static cJSON *install(install_t *in, const char *id, bool run, const apps_source
             bool icon = strcmp(rel, m->icon) == 0;  /* the launcher's icon: square and small as well */
             if (!(icon ? apps_icon_check(data, len, in->raw, sizeof in->raw)
                        : apps_image_check(data, len, NULL, NULL, in->raw, sizeof in->raw))) {
+                return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE, "%s: %s", rel, in->raw);
+            }
+        }
+        if (kind == APPS_FILE_SOUND) {
+            sound_bytes += len;
+            if (sound_bytes > APPS_SOUNDS_TOTAL_MAX) {
+                return failure(APPS_ERR_INVALID_PACKAGE, "sounds add up to more than 1 MB");
+            }
+            if (!apps_wav_check(data, len, NULL, NULL, in->raw, sizeof in->raw)) {
                 return failuref(in->msg, sizeof in->msg, APPS_ERR_INVALID_PACKAGE, "%s: %s", rel, in->raw);
             }
         }

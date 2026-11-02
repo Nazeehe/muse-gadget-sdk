@@ -20,6 +20,7 @@
  *   muse_apps_pkg_harness parse <file> <folder|-> <heap_kb> [err_len]
  *   muse_apps_pkg_harness check id|path|kind          (one text per line on stdin, one answer per line)
  *   muse_apps_pkg_harness image <file>
+ *   muse_apps_pkg_harness wav <file> [odd]
  *   muse_apps_pkg_harness <case>                      (a case listed by "list": one test of tests/test_muse_apps_pkg.py)
  * It exits 0 when everything it checked holds and prints what it got when something doesn't.
  *
@@ -436,7 +437,7 @@ static void run_check(int argc, char **argv) {
         fputs("usage: check id|path|kind\n", stderr);
         exit(2);
     }
-    static const char *const kinds[] = {"lua", "json", "image", "bad"};
+    static const char *const kinds[] = {"lua", "json", "image", "wav", "bad"};
     char *line = NULL;
     size_t cap = 0;
     ssize_t n;
@@ -480,6 +481,42 @@ static void run_image(int argc, char **argv) {
         CHECK(w == 0 && h == 0, "%ux%u after an image that failed", w, h);
         CHECK(strncmp(err, "image: ", 7) == 0, "err '%s'", err);
         CHECK(json_text_ok(err), "err isn't valid text");
+        fputs("{\"ok\":false,\"error\":", stdout);
+        put_json_string(err);
+        puts("}");
+    }
+}
+
+/* wav <file> [odd]: odd puts the bytes at an odd address, as an unaligned blob would be. */
+static void run_wav(int argc, char **argv) {
+    if (argc < 3) {
+        fputs("usage: wav <file> [odd]\n", stderr);
+        exit(2);
+    }
+    size_t len;
+    char *raw = read_file(argv[2], &len);
+    const uint8_t *data = (const uint8_t *)exact_copy(raw, len);
+    free(raw);
+    if (argc > 3 && strcmp(argv[3], "odd") == 0) {
+        uint8_t *shifted = malloc(len + 2);  /* malloc's block is aligned: +1 is odd */
+        CHECK(shifted != NULL, "out of memory");
+        memcpy(shifted + 1, data, len);
+        data = shifted + 1;
+    }
+    const int16_t *samples = (const int16_t *)(uintptr_t)1;
+    size_t frames = 0xAAAA;
+    char err[256];
+    memset(err, 'x', sizeof err);
+    bool ok = apps_wav_check(data, len, &samples, &frames, err, sizeof err);
+    CHECK(apps_wav_check(data, len, NULL, NULL, NULL, 0) == ok, "the verdict changes without out parameters");
+    if (ok) {
+        CHECK(err[0] == '\0', "err '%s' after a sound that passed", err);
+        CHECK((const uint8_t *)samples >= data && (const uint8_t *)(samples + frames) <= data + len, "samples isn't in data");
+        CHECK(((uintptr_t)samples & 1) == 0, "samples is unaligned");
+        printf("{\"ok\":true,\"frames\":%zu,\"offset\":%zu}\n", frames, (size_t)((const uint8_t *)samples - data));
+    } else {
+        CHECK(samples == NULL && frames == 0, "samples and frames after a sound that failed");
+        CHECK(strncmp(err, "sound: ", 7) == 0, "err '%s'", err);
         fputs("{\"ok\":false,\"error\":", stdout);
         put_json_string(err);
         puts("}");
@@ -607,7 +644,8 @@ static void contracts(void) {
     /* apps_file_max: the one table of the kinds' limits, the console's stage and the install pipeline both read it
      * (Task 13's F9). */
     CHECK(apps_file_max(APPS_FILE_LUA) == APPS_LUA_MAX && apps_file_max(APPS_FILE_JSON) == APPS_JSON_FILE_MAX &&
-              apps_file_max(APPS_FILE_IMAGE) == APPS_IMAGE_MAX && apps_file_max(APPS_FILE_BAD) == 0,
+              apps_file_max(APPS_FILE_IMAGE) == APPS_IMAGE_MAX && apps_file_max(APPS_FILE_SOUND) == APPS_SOUND_MAX &&
+              apps_file_max(APPS_FILE_BAD) == 0,
           "apps_file_max");
     /* apps_text_shown: text from outside as a message shows it (Task 13's F7 and F9). */
     char out[80];
@@ -1434,7 +1472,7 @@ int main(int argc, char **argv) {
         {"fuzz", fuzz},
     };
     if (argc < 2) {
-        fputs("usage: muse_apps_pkg_harness <case>|list|parse|check|image\n", stderr);
+        fputs("usage: muse_apps_pkg_harness <case>|list|parse|check|image|wav\n", stderr);
         return 2;
     }
     if (strcmp(argv[1], "list") == 0) {
@@ -1449,6 +1487,8 @@ int main(int argc, char **argv) {
         run_check(argc, argv);
     } else if (strcmp(argv[1], "image") == 0) {
         run_image(argc, argv);
+    } else if (strcmp(argv[1], "wav") == 0) {
+        run_wav(argc, argv);
     } else if (strcmp(argv[1], "icon") == 0) {
         run_icon(argc, argv);
     } else {

@@ -206,6 +206,9 @@ apps_file_kind_t apps_file_kind(const char *path) {
     if (ends_with(path, ".bin")) {
         return APPS_FILE_IMAGE;
     }
+    if (ends_with(path, ".wav")) {
+        return APPS_FILE_SOUND;
+    }
     return APPS_FILE_BAD;
 }
 
@@ -252,6 +255,8 @@ size_t apps_file_max(apps_file_kind_t kind) {
         return APPS_JSON_FILE_MAX;
     case APPS_FILE_IMAGE:
         return APPS_IMAGE_MAX;
+    case APPS_FILE_SOUND:
+        return APPS_SOUND_MAX;
     default:
         return 0;
     }
@@ -591,7 +596,7 @@ static NOINLINE bool check_files(parse_t *p) {
                         quote(&shown, e, text, read));
         }
         if (apps_file_kind(text) == APPS_FILE_BAD) {
-            return fail(p, "manifest: files[%d] '%s' has an unsupported type (use .lua, .json or .bin)", index, text);
+            return fail(p, "manifest: files[%d] '%s' has an unsupported type (use .lua, .json, .bin or .wav)", index, text);
         }
         if (strcmp(text, "manifest.json") == 0) {  /* the store keeps it beside the files: a file of that path would replace it */
             return fail(p, "manifest: files[%d] 'manifest.json' is the manifest itself; don't list it", index);
@@ -977,6 +982,82 @@ bool apps_icon_check(const uint8_t *data, size_t len, char *err, size_t err_len)
     /* The launcher reads at most this (apps_icons.c): a padded file past it would install and show as its tile at every load. */
     if (len > APPS_ICON_MAX_BYTES) {
         return failf(err, err_len, APPS_MSG_ICON_BYTES, (unsigned)len, (unsigned)APPS_ICON_MAX_BYTES);
+    }
+    return true;
+}
+
+/* ==== Sounds ==== */
+
+static unsigned le32(const uint8_t *p) {
+    return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+}
+
+#define WAV_FORMAT_MSG "sound: use 16 kHz mono 16-bit PCM WAV (ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le)"
+
+bool apps_wav_check(const uint8_t *data, size_t len, const int16_t **samples, size_t *frames, char *err, size_t err_len) {
+    if (samples != NULL) {
+        *samples = NULL;
+    }
+    if (frames != NULL) {
+        *frames = 0;
+    }
+    if (err != NULL && err_len > 0) {
+        err[0] = '\0';
+    }
+    if (data == NULL || len < 12 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
+        return failf(err, err_len, "sound: not a WAV file (no RIFF/WAVE header)");
+    }
+    const uint8_t *fmt = NULL;
+    size_t data_at = 0, data_size = 0;
+    bool have_data = false;
+    for (size_t pos = 12; pos + 8 <= len;) {
+        size_t size = le32(data + pos + 4), body = pos + 8;
+        bool is_fmt = memcmp(data + pos, "fmt ", 4) == 0, is_data = memcmp(data + pos, "data", 4) == 0;
+        if (is_data && !have_data) {
+            have_data = true;
+            data_at = body;
+            data_size = size;
+        }
+        if (size > len - body) {  /* runs past the end: nothing after it can be read (a data chunk is judged below) */
+            if (is_fmt && fmt == NULL) {
+                return failf(err, err_len, "sound: the fmt chunk is cut short");
+            }
+            break;
+        }
+        if (is_fmt && fmt == NULL) {
+            if (size < 16) {
+                return failf(err, err_len, "sound: the fmt chunk is cut short");
+            }
+            fmt = data + body;
+        }
+        pos = body + size + (size & 1);  /* an odd chunk is followed by a pad byte */
+    }
+    if (fmt == NULL) {
+        return failf(err, err_len, "sound: no fmt chunk");
+    }
+    if (le16(fmt) != 1 || le16(fmt + 2) != 1 || le32(fmt + 4) != 16000 || le16(fmt + 14) != 16) {
+        return failf(err, err_len, WAV_FORMAT_MSG);
+    }
+    if (!have_data) {
+        return failf(err, err_len, "sound: no data chunk");
+    }
+    if (data_size > len - data_at) {
+        return failf(err, err_len, "sound: the data chunk runs past the end of the file");
+    }
+    if (data_size == 0) {
+        return failf(err, err_len, "sound: the data chunk is empty");
+    }
+    if ((data_size & 1) != 0) {
+        return failf(err, err_len, "sound: the data chunk has an odd size");
+    }
+    if (((data_at | (uintptr_t)data) & 1) != 0) {
+        return failf(err, err_len, "sound: the data chunk is not on a 2-byte boundary");
+    }
+    if (samples != NULL) {
+        *samples = (const int16_t *)(const void *)(data + data_at);
+    }
+    if (frames != NULL) {
+        *frames = data_size / 2;
     }
     return true;
 }

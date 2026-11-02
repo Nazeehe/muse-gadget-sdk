@@ -89,11 +89,12 @@ SNAP_DELAY_S = 1.0                   # --snap: the pause between the result and 
 POLL_S = 0.5                         # watch: how often it looks at the files, and logs reads at least this long
 # What the board takes of a package (apps_pkg.h; tests/test_muse_apps_tool.py reads the header and holds these to it):
 # manifest.json at most 8 KB, a file at most the limit of its kind, the app (manifest and files) at most 2 MB, the images
-# among them at most 1.5 MB, and at most 32 files besides manifest.json (main among them).
+# among them at most 1.5 MB, the sounds at most 1 MB, and at most 32 files besides manifest.json (main among them).
 MANIFEST_MAX = 8 * 1024
-FILE_MAX = {".lua": 256 * 1024, ".json": 32 * 1024, ".bin": 512 * 1024}
+FILE_MAX = {".lua": 256 * 1024, ".json": 32 * 1024, ".bin": 512 * 1024, ".wav": 256 * 1024}
 APP_MAX = 2 * 1024 * 1024
 IMAGES_MAX = 1536 * 1024
+SOUNDS_MAX = 1024 * 1024
 FILES_MAX = 32
 # What apps_path_valid and apps_id_valid (apps_pkg.c) take: a path is 1 to 64 characters of parts split by '/', and no
 # part is empty, starts or ends with '.', or has '..' in it; an id is 2 to 24 characters.
@@ -232,11 +233,11 @@ def read_package(folder):
     if len(paths) > FILES_MAX:
         raise AppError(f"more than {FILES_MAX} files besides manifest.json")
     # Every file is looked at, in the board's order and by the board's rules, before the first is read.
-    found, app_bytes, image_bytes = [], size, 0
+    found, app_bytes, image_bytes, sound_bytes = [], size, 0, 0
     for path in paths:
         kind = next((suffix for suffix in FILE_MAX if path.endswith(suffix)), None)
         if kind is None:
-            raise AppError(f"'{path}' has an unsupported type (use .lua, .json or .bin)")
+            raise AppError(f"'{path}' has an unsupported type (use .lua, .json, .bin or .wav)")
         target, size = listed_file(here, path,
                                    lambda why: f"{path} is listed in {manifest_path} but can't be read: {why}")
         if size > FILE_MAX[kind]:
@@ -248,6 +249,10 @@ def read_package(folder):
             image_bytes += size
             if image_bytes > IMAGES_MAX:
                 raise AppError("images add up to more than 1.5 MB")
+        if kind == ".wav":
+            sound_bytes += size
+            if sound_bytes > SOUNDS_MAX:
+                raise AppError("sounds add up to more than 1 MB")
         found.append((path, target, FILE_MAX[kind]))
     return Package(app_id, [("manifest.json", text), *((path, read_listed(target, path, limit))
                                                           for path, target, limit in found)])

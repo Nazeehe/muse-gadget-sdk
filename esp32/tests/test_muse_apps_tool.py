@@ -520,13 +520,15 @@ class PackageTest(ToolTestCase):
         manifest_max, lua_max = c_define("apps_pkg.h", "APPS_MANIFEST_MAX"), c_define("apps_pkg.h", "APPS_LUA_MAX")
         json_max, image_max = c_define("apps_pkg.h", "APPS_JSON_FILE_MAX"), c_define("apps_pkg.h", "APPS_IMAGE_MAX")
         app_max, images_max = c_define("apps_pkg.h", "APPS_APP_MAX"), c_define("apps_pkg.h", "APPS_IMAGES_TOTAL_MAX")
+        sound_max, sounds_max = c_define("apps_pkg.h", "APPS_SOUND_MAX"), c_define("apps_pkg.h", "APPS_SOUNDS_TOTAL_MAX")
         files_max = c_define("apps_pkg.h", "APPS_MAX_FILES")
         self.assertEqual((self.app.MANIFEST_MAX, self.app.FILE_MAX), (manifest_max, {
-            ".lua": lua_max, ".json": json_max, ".bin": image_max}))
+            ".lua": lua_max, ".json": json_max, ".bin": image_max, ".wav": sound_max}))
         self.assertEqual((self.app.APP_MAX, self.app.IMAGES_MAX, self.app.FILES_MAX), (app_max, images_max, files_max))
+        self.assertEqual((self.app.SOUNDS_MAX, sound_max, sounds_max), (sounds_max, 256 * 1024, 1024 * 1024))
         self.assertEqual((manifest_max, lua_max, json_max, image_max, app_max, images_max, files_max),
                          (8 * 1024, 256 * 1024, 32 * 1024, 512 * 1024, 2 * 1024 * 1024, 1536 * 1024, 32), "the numbers")
-        for name, limit in (("x.lua", lua_max), ("x.json", json_max), ("x.bin", image_max)):
+        for name, limit in (("x.lua", lua_max), ("x.json", json_max), ("x.bin", image_max), ("x.wav", sound_max)):
             folder = make_package(self.tmp, app_id="limits", files={name: b" " * limit})
             self.assertEqual(dict(self.app.read_package(folder).files)[name], b" " * limit, name)
             folder = make_package(self.tmp, app_id="limits", files={name: b" " * (limit + 1)})
@@ -581,6 +583,12 @@ class PackageTest(ToolTestCase):
         with self.assertRaises(self.app.AppError) as raised:
             self.app.read_package(make_package(self.tmp, app_id="img", files=images))
         self.assertEqual(str(raised.exception), "images add up to more than 1.5 MB")
+        sounds = {f"s{i}.wav": b"S" * (230 * 1024) for i in range(4)}   # 920 KB
+        self.assertEqual(len(self.app.read_package(make_package(self.tmp, app_id="snd", files=sounds)).files), 6)
+        sounds["s4.wav"] = b"S" * (230 * 1024)
+        with self.assertRaises(self.app.AppError) as raised:
+            self.app.read_package(make_package(self.tmp, app_id="snd", files=sounds))
+        self.assertEqual(str(raised.exception), "sounds add up to more than 1 MB")
         # 32 files, main among them; a 33rd is one too many, whatever it holds.
         few = {f"f{i}.lua": b"-" for i in range(31)}
         paths = [p for p, _ in self.app.read_package(make_package(self.tmp, app_id="few", files=few)).files]
@@ -597,13 +605,13 @@ class PackageTest(ToolTestCase):
         folder = make_package(self.tmp, files={"notes.txt": b"x"})
         with self.assertRaises(self.app.AppError) as raised:
             self.app.read_package(folder)
-        self.assertEqual(str(raised.exception), "'notes.txt' has an unsupported type (use .lua, .json or .bin)")
+        self.assertEqual(str(raised.exception), "'notes.txt' has an unsupported type (use .lua, .json, .bin or .wav)")
         os.chmod(folder / "notes.txt", 0)   # said for its type, and not opened to find that it can't be read
         self.addCleanup(os.chmod, folder / "notes.txt", 0o644)
         if not os.access(folder / "notes.txt", os.R_OK):
             with self.assertRaises(self.app.AppError) as raised:
                 self.app.read_package(folder)
-            self.assertEqual(str(raised.exception), "'notes.txt' has an unsupported type (use .lua, .json or .bin)")
+            self.assertEqual(str(raised.exception), "'notes.txt' has an unsupported type (use .lua, .json, .bin or .wav)")
         folder = make_package(self.tmp, main="{}", manifest={"main": "main.json"})
         with self.assertRaises(self.app.AppError) as raised:
             self.app.read_package(folder)
@@ -2067,6 +2075,17 @@ class CheckTest(unittest.TestCase):
         self.assertIn("started", done.stdout)
         self.assertEqual(self.kinds(done.stdout), ["started"], "no warning either")
         self.assertEqual(done.stderr, "")
+
+    def test_check_refuses_a_stereo_wav_with_the_firmwares_message(self):
+        stereo = (b"RIFF" + struct.pack("<I", 36 + 4) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 2, 16000, 64000, 4, 16)
+                  + b"data" + struct.pack("<I", 4) + bytes(4))
+        folder, _ = self.make("return {}", files={"bell.wav": stereo})
+        code, out, err = self.check(folder)
+        self.assertNotEqual(code, 0)
+        self.assertIn("bell.wav: sound: use 16 kHz mono 16-bit PCM WAV (ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le)", out + err)
+        mono = stereo.replace(struct.pack("<HHIIHH", 1, 2, 16000, 64000, 4, 16), struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16))
+        folder, _ = self.make("return {}", files={"bell.wav": mono})
+        self.assertEqual(self.check(folder)[0], 0)
 
     def test_a_clean_app_exits_zero_and_prints_apphosts_events(self):
         folder, _ = self.make("return {start = function() print('hi') end}")

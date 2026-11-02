@@ -76,7 +76,7 @@ typedef struct {
 typedef struct {
     char id[APPS_ID_MAX + 1];
     staged_t files[STAGE_FILES];
-    size_t app_bytes, image_bytes;  /* what is staged, manifest.json in the app's */
+    size_t app_bytes, image_bytes, sound_bytes;  /* what is staged, manifest.json in the app's */
 } stage_t;
 
 /* A job for the I/O worker: a commit's (which has the stage) or a launch's. */
@@ -338,6 +338,9 @@ static void unaccount(stage_t *stage, const staged_t *f) {
     if (apps_file_kind(f->path) == APPS_FILE_IMAGE) {
         stage->image_bytes -= f->len;
     }
+    if (apps_file_kind(f->path) == APPS_FILE_SOUND) {
+        stage->sound_bytes -= f->len;
+    }
 }
 
 /* f goes from the stage: the next piece of it must be seq 0. */
@@ -434,7 +437,7 @@ static void put(const char *args) {
     }
     apps_file_kind_t kind = apps_file_kind(path);
     if (kind == APPS_FILE_BAD) {
-        fail("put", NULL, path, "'%s' has an unsupported type (use .lua, .json or .bin)", path);
+        fail("put", NULL, path, "'%s' has an unsupported type (use .lua, .json, .bin or .wav)", path);
         return;
     }
     unsigned seq;
@@ -501,6 +504,11 @@ static void put_staged(const char *id, const char *path, apps_file_kind_t kind, 
         fail("put", NULL, path, "images add up to more than 1.5 MB");
         return;
     }
+    if (kind == APPS_FILE_SOUND && s_stage->sound_bytes + bytes > APPS_SOUNDS_TOTAL_MAX) {
+        drop_file(s_stage, f);
+        fail("put", NULL, path, "sounds add up to more than 1 MB");
+        return;
+    }
     if (len > f->cap) {
         size_t cap = grown_cap(s_stage, f, len, max);
         uint8_t *grown = apps_port_realloc(f->data, cap);
@@ -519,6 +527,9 @@ static void put_staged(const char *id, const char *path, apps_file_kind_t kind, 
     s_stage->app_bytes += bytes;
     if (kind == APPS_FILE_IMAGE) {
         s_stage->image_bytes += bytes;
+    }
+    if (kind == APPS_FILE_SOUND) {
+        s_stage->sound_bytes += bytes;
     }
     f->next = seq + 1;
     printf("@app.ack %s %u\n", path, seq);

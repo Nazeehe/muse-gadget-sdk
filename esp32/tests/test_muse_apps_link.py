@@ -444,6 +444,26 @@ class GuideAndSkill(unittest.TestCase):
         self.assertIn(f"and {deadline_s} s after boot at the latest (`APPS_BOOT_DEADLINE_MS`, `apps_task.h`)", agents)
         self.assertIn(f'answers `unavailable`, "{match.group(1)}"', agents)
 
+    def test_guide_lists_wav_files_and_their_limits_as_the_header_has_them(self):
+        # The file-type line, the `files` line and the limits sentence name .wav with the header's sizes, and app.api reports them.
+        header = (APPS / "apps_pkg.h").read_text()
+
+        def kb(name):
+            return int(re.search(rf"(?m)^#define {name} \((\d+) \* 1024\)$", header).group(1))
+
+        sound_kb, sounds_kb = kb("APPS_SOUND_MAX"), kb("APPS_SOUNDS_TOTAL_MAX")
+        self.assertEqual((sound_kb, sounds_kb), (256, 1024))
+        section = " ".join(guide_section(GUIDE.read_text(), "Files and the manifest").split())
+        self.assertIn("`.bin` (an LVGL image, see Images) or `.wav` (a 16 kHz mono 16-bit PCM sound: "
+                      "`ffmpeg -i in.mp3 -ac 1 -ar 16000 -c:a pcm_s16le out.wav`); there is no other kind.", section)
+        self.assertIn("`.json` data, images and `.wav` sounds.", section)
+        self.assertIn(f"{sound_kb} KB for a `.wav` sound and {sounds_kb // 1024} MB for all the sounds;", section)
+        control = (APPS / "apps_control.c").read_text()
+        self.assertRegex(control, r'"image_kb", "images_kb", "sound_kb", "sounds_kb", "app_kb"')
+        self.assertIn("APPS_SOUND_MAX / 1024, APPS_SOUNDS_TOTAL_MAX / 1024", " ".join(control.split()))
+        self.assertIn("(use .lua, .json, .bin or .wav)", GUIDE.read_text())
+        self.assertNotIn("(use .lua, .json or .bin)", GUIDE.read_text())
+
     def test_guide_quotes_the_cpu_limits_as_the_firmware_has_them(self):
         # Task 27 set the budgets from the board's measured speed (D12: a test pins each number the guide quotes; the skill
         # holds the guide verbatim). Each sentence with its numbers made from the headers, with thousands separators.

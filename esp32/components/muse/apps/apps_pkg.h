@@ -30,8 +30,8 @@
  * - why so strict: FAT reads "a/./b.lua", "a//b.lua" and "a./b.lua" as the file "a/b.lua" (it skips doubled
  *   separators and trailing dots), which comparing strings can't see, so two entries of the manifest could
  *   be one file. The letters are lower case for the same reason.
- * Files are typed by their end: .lua (Lua source text), .json (must parse) or .bin (an LVGL image, below).
- * Anything else is refused: an app has no way to read raw bytes.
+ * Files are typed by their end: .lua (Lua source text), .json (must parse), .bin (an LVGL image, below) or .wav (a 16 kHz
+ * mono 16-bit PCM sound, below). Anything else is refused: an app has no way to read raw bytes.
  *
  * The manifest is a JSON object of at most APPS_MANIFEST_MAX bytes, read by apps_manifest_parse:
  *   id           required text: a valid id, the folder's name
@@ -39,7 +39,7 @@
  *   version      optional text, 0 to 23 bytes, informational
  *   api          required whole number: 1
  *   main         optional path of a .lua file; "main.lua" if left out
- *   files        optional list of paths (.lua, .json, .bin): every file but main
+ *   files        optional list of paths (.lua, .json, .bin, .wav): every file but main
  *   permissions  optional list of sound alarm store keep_awake vm muse (net and secrets aren't there yet)
  *   memory_kb    optional whole number, 64 to min(1024, heap_max_kb); 256 (or heap_max_kb, if less) if left out
  *   messages     optional object of at most 16 event names to descriptions, each under 200 bytes
@@ -68,7 +68,7 @@
  *   manifest: main must name a .lua file
  *   manifest: files must be a list of paths, like ["util.lua"]
  *   manifest: files[%d] '%s' is not an allowed path (a-z 0-9 _ . / -, no '..', at most 64 characters)
- *   manifest: files[%d] '%s' has an unsupported type (use .lua, .json or .bin)
+ *   manifest: files[%d] '%s' has an unsupported type (use .lua, .json, .bin or .wav)
  *   manifest: more than 32 files                                           (main and the rest, no repeats)
  *   manifest: icon '%s' is not an allowed path (a-z 0-9 _ . / -, no '..', at most 64 characters)
  *   manifest: icon '%s' must be a .bin image
@@ -91,6 +91,10 @@
  * pixels", "image: %ux%u is larger than the 466x466 screen", "image: colour format 0x%02x isn't RGB565,
  * RGB565A8 or A8", "image: stride %u is too small for a row of %u pixels (%u bytes needed)" and "image: size %u
  * doesn't match its header (%u expected)". An icon's, past those: "icon: %ux%u must be square, at most 160x160".
+ * A sound's (apps_wav_check): "sound: not a WAV file (no RIFF/WAVE header)", "sound: the fmt chunk is cut short", "sound: no fmt
+ * chunk", "sound: use 16 kHz mono 16-bit PCM WAV (ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le)" (the format is anything but that),
+ * "sound: no data chunk", "sound: the data chunk runs past the end of the file", "sound: the data chunk is empty", "sound: the
+ * data chunk has an odd size" and "sound: the data chunk is not on a 2-byte boundary".
  *
  * Memory. A parsed manifest owns one block, messages_json: the "messages" object as written, less the
  * whitespace outside its strings. It is in PSRAM on the device (the muse overlay keeps small mallocs in
@@ -111,6 +115,8 @@
 #define APPS_JSON_FILE_MAX (32 * 1024)
 #define APPS_IMAGE_MAX (512 * 1024)
 #define APPS_IMAGES_TOTAL_MAX (1536 * 1024)
+#define APPS_SOUND_MAX (256 * 1024)
+#define APPS_SOUNDS_TOTAL_MAX (1024 * 1024)
 #define APPS_APP_MAX (2 * 1024 * 1024)
 
 /* The launcher's icon (a manifest's "icon"): a square .bin image of at most APPS_ICON_MAX_PX each way. APPS_ICON_MAX_BYTES
@@ -175,7 +181,7 @@ enum { APPS_PERM_SOUND = 1, APPS_PERM_ALARM = 2, APPS_PERM_STORE = 4, APPS_PERM_
  * module (apps_vmio.h) reads and writes the running app's own folder there. */
 #define APPS_VM_DIR "workspace/apps/"
 
-typedef enum { APPS_FILE_LUA, APPS_FILE_JSON, APPS_FILE_IMAGE, APPS_FILE_BAD } apps_file_kind_t;
+typedef enum { APPS_FILE_LUA, APPS_FILE_JSON, APPS_FILE_IMAGE, APPS_FILE_SOUND, APPS_FILE_BAD } apps_file_kind_t;
 
 typedef struct {
     char id[APPS_ID_MAX + 1], name[25], version[24], main[APPS_PATH_MAX + 1];
@@ -214,11 +220,11 @@ bool apps_id_valid(const char *id);
 /* Whether path is one a manifest may list (Ids and paths, above). NULL is not. */
 bool apps_path_valid(const char *path);
 
-/* How a file is read, by the end of its path: .lua, .json or .bin (case matters); APPS_FILE_BAD for anything
+/* How a file is read, by the end of its path: .lua, .json, .bin or .wav (case matters); APPS_FILE_BAD for anything
  * else. It doesn't check that the path is valid. */
 apps_file_kind_t apps_file_kind(const char *path);
 
-/* The most bytes a file of that kind may have: APPS_LUA_MAX, APPS_JSON_FILE_MAX or APPS_IMAGE_MAX, and 0 for
+/* The most bytes a file of that kind may have: APPS_LUA_MAX, APPS_JSON_FILE_MAX, APPS_IMAGE_MAX or APPS_SOUND_MAX, and 0 for
  * APPS_FILE_BAD (manifest.json's own is APPS_MANIFEST_MAX). The one table of them: the USB console's stage and the
  * install pipeline both read it. */
 size_t apps_file_max(apps_file_kind_t kind);
@@ -335,3 +341,15 @@ bool apps_image_check(const uint8_t *data, size_t len, uint16_t *w, uint16_t *h,
  * manifest's icon file, and for the launcher's load.
  */
 bool apps_icon_check(const uint8_t *data, size_t len, char *err, size_t err_len);
+
+/*
+ * Whether data[0, len) is a WAV the gadget can play: 16 kHz, mono, 16-bit PCM. The rules, in this order, each with its own
+ * message (Messages, above): "RIFF" then "WAVE"; the chunks walked by their sizes, an odd one followed by its pad byte, and any
+ * but "fmt " and "data" (LIST, which ffmpeg writes, and the like) skipped; the "fmt " chunk (format 1, one channel, 16000 Hz, 16
+ * bits); a "data" chunk (the first) of an even, non-zero size that fits in the file, and whose bytes are on a 2-byte boundary
+ * (the samples are read as int16_t, which Xtensa faults on when unaligned: a valid file always has it, its chunks starting at
+ * even offsets, so only the data pointer itself can be odd). On success *samples points INTO data, at the first sample (no copy:
+ * the mixer plays from the package's own bytes, so they must outlive it) and *frames is how many there are (the data's size / 2);
+ * otherwise they are NULL and 0, and err has the message. samples and frames may be NULL; nothing past data[len] is read.
+ */
+bool apps_wav_check(const uint8_t *data, size_t len, const int16_t **samples, size_t *frames, char *err, size_t err_len);

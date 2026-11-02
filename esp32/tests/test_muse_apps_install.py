@@ -112,6 +112,9 @@ class Install(unittest.TestCase):
     def test_oversize_and_totals(self):
         self.run_case("oversize_and_totals")
 
+    def test_sound_files(self):  # a 257 KB .wav, five of 230 KB, a stereo file, a file that isn't a WAV, a valid one
+        self.run_case("sound_files")
+
     def test_compile_error_has_excerpt(self):  # C17: the raw message, the excerpt from the package's file
         self.run_case("compile_error_has_excerpt")
 

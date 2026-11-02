@@ -671,6 +671,41 @@ static uint8_t *make_image(unsigned w, unsigned h, bool alpha, size_t *len) {
     return img;
 }
 
+/* A 16 kHz mono 16-bit PCM WAV of `data_len` bytes of samples, after a LIST chunk the way ffmpeg writes one (odd, padded); channels
+ * 2 makes a stereo file (the format refusal). */
+static uint8_t *make_wav(size_t data_len, unsigned channels, size_t *len) {
+    static const uint8_t list[] = {'L', 'I', 'S', 'T', 26, 0, 0, 0, 'I', 'N', 'F', 'O', 'I', 'S', 'F', 'T', 13, 0, 0, 0,
+                                   'L', 'a', 'v', 'f', '6', '1', '.', '7', '.', '1', '0', '0', 0, 0};
+    *len = 12 + 24 + sizeof list + 8 + data_len;
+    uint8_t *w = calloc(1, *len), *p = w;
+    CHECK(w != NULL, "no memory");
+    memcpy(p, "RIFF", 4);
+    p[4] = (uint8_t)(*len - 8), p[5] = (uint8_t)((*len - 8) >> 8), p[6] = (uint8_t)((*len - 8) >> 16);
+    memcpy(p + 8, "WAVE", 4);
+    p += 12;
+    memcpy(p, "fmt ", 4);
+    p[4] = 16;
+    p[8] = 1;
+    p[10] = (uint8_t)channels;
+    p[12] = 0x80, p[13] = 0x3E;  /* 16000 */
+    p[16] = (uint8_t)(32000 * channels), p[17] = (uint8_t)((32000 * channels) >> 8);
+    p[20] = (uint8_t)(2 * channels);
+    p[22] = 16;
+    p += 24;
+    memcpy(p, list, sizeof list);
+    p += sizeof list;
+    memcpy(p, "data", 4);
+    p[4] = (uint8_t)data_len, p[5] = (uint8_t)(data_len >> 8), p[6] = (uint8_t)(data_len >> 16);
+    return w;
+}
+
+static void serve_wav(const char *path, size_t data_len, unsigned channels) {
+    size_t len;
+    uint8_t *w = make_wav(data_len, channels, &len);
+    serve(path, w, len);
+    free(w);
+}
+
 static void serve_image(const char *path, unsigned w, unsigned h, bool alpha) {
     size_t len;
     uint8_t *img = make_image(w, h, alpha, &len);
@@ -872,6 +907,49 @@ static void oversize_and_totals(void) {
     }
     CHECK(APPS_ICON_MAX_PX == 160, "the messages above say 160");
     CHECK(compiles == 1, "only the 256 KB main.lua was compiled: %d", compiles);
+}
+
+/* .wav files: 256 KB each and 1 MB in all, and each is a 16 kHz mono 16-bit PCM WAV. */
+static void sound_files(void) {
+    static const char one[] = "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"a.wav\"]}";
+    uint8_t *big = calloc(1, 256 * KB + 1);
+    CHECK(big != NULL, "no memory");
+    serve_text("manifest.json", one);
+    serve_text("main.lua", MAIN);
+    serve("a.wav", big, 256 * KB + 1);
+    EXPECT_FAILURE(install("hello", false), APPS_ERR_INVALID_PACKAGE, "a.wav is larger than 256 KB");
+    CHECK(read_max[2] == APPS_SOUND_MAX, "a sound's limit: %zu", read_max[2]);
+    free(big);
+    /* Five of 230 KB: four fit 1 MB (920 KB), the fifth doesn't. */
+    unserve();
+    serve_text("manifest.json", "{\"id\":\"hello\",\"name\":\"Hello\",\"api\":1,\"files\":[\"a.wav\",\"b.wav\",\"c.wav\","
+                                "\"d.wav\",\"e.wav\"]}");
+    serve_text("main.lua", MAIN);
+    static const char *const names[] = {"a.wav", "b.wav", "c.wav", "d.wav", "e.wav"};
+    for (int i = 0; i < 5; i++) {
+        serve_wav(names[i], 230 * KB, 1);
+    }
+    EXPECT_FAILURE(install("hello", false), APPS_ERR_INVALID_PACKAGE, "sounds add up to more than 1 MB");
+    /* A stereo file is refused with the file's name and the fix. */
+    unserve();
+    serve_text("manifest.json", one);
+    serve_text("main.lua", MAIN);
+    serve_wav("a.wav", 64, 2);
+    EXPECT_FAILURE(install("hello", false), APPS_ERR_INVALID_PACKAGE,
+                   "a.wav: sound: use 16 kHz mono 16-bit PCM WAV (ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le)");
+    /* Not a WAV at all. */
+    unserve();
+    serve_text("manifest.json", one);
+    serve_text("main.lua", MAIN);
+    serve_text("a.wav", "ID3");
+    EXPECT_FAILURE(install("hello", false), APPS_ERR_INVALID_PACKAGE, "a.wav: sound: not a WAV file (no RIFF/WAVE header)");
+    /* A valid one installs (with ffmpeg's LIST chunk), and so does one at exactly 256 KB. */
+    unserve();
+    serve_text("manifest.json", one);
+    serve_text("main.lua", MAIN);
+    serve_wav("a.wav", 64, 1);
+    install("hello", false);
+    CHECK(strncmp(last, "{\"ok\":true,", 11) == 0, "a valid WAV: %.200s", last);
 }
 
 static void compile_error_has_excerpt(void) {
@@ -1934,6 +2012,7 @@ int main(int argc, char **argv) {
         {"path_checked_before_read", path_checked_before_read},
         {"compiled_chunk_refused", compiled_chunk_refused},
         {"oversize_and_totals", oversize_and_totals},
+        {"sound_files", sound_files},
         {"compile_error_has_excerpt", compile_error_has_excerpt},
         {"compile_message_is_clean", compile_message_is_clean},
         {"crash_in_start_message", crash_in_start_message},

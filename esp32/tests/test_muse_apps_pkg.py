@@ -65,6 +65,42 @@ IMAGE_NOT_LVGL_MSG = "image: not an LVGL v9 image file (use LVGLImage.py --ofmt 
 IMAGE_COMPRESSED_MSG = "image: compressed images aren't supported"
 
 
+WAV_FORMAT_MSG = "sound: use 16 kHz mono 16-bit PCM WAV (ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le)"
+WAV_NOT_WAV_MSG = "sound: not a WAV file (no RIFF/WAVE header)"
+WAV_NO_FMT_MSG = "sound: no fmt chunk"
+WAV_FMT_SHORT_MSG = "sound: the fmt chunk is cut short"
+WAV_NO_DATA_MSG = "sound: no data chunk"
+WAV_PAST_END_MSG = "sound: the data chunk runs past the end of the file"
+WAV_EMPTY_MSG = "sound: the data chunk is empty"
+WAV_ODD_SIZE_MSG = "sound: the data chunk has an odd size"
+WAV_UNALIGNED_MSG = "sound: the data chunk is not on a 2-byte boundary"
+
+
+def chunk(tag, body, pad=True):
+    """A RIFF chunk: tag, little-endian size, body, and the pad byte an odd size is followed by."""
+    return tag + struct.pack("<I", len(body)) + body + (b"\0" if pad and len(body) % 2 else b"")
+
+
+def wav_fmt(fmt=1, channels=1, rate=16000, bits=16):
+    block = channels * bits // 8
+    return chunk(b"fmt ", struct.pack("<HHIIHH", fmt, channels, rate, rate * block, block, bits))
+
+
+def wav(data=b"\x01\x00\x02\x00", fmt=None, magic=b"RIFF", wave=b"WAVE", between=b"", data_size=None, tail=b""):
+    """A WAV: RIFF, WAVE, fmt (16 kHz mono 16-bit PCM unless fmt is given), `between` chunks, then data."""
+    fmt = wav_fmt() if fmt is None else fmt
+    size = data_size if data_size is not None or data is None else len(data)
+    body = wave + fmt + between + (b"data" + struct.pack("<I", size) + data if data is not None else b"") + tail
+    return magic + struct.pack("<I", len(body)) + body
+
+
+def ffmpeg_wav(data=bytes(range(40))):
+    """What ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le writes: fmt, then a LIST/INFO chunk with ISFT 'Lavf61.7.100' (13 bytes with
+    its NUL: odd, so a pad byte), then data."""
+    isft = b"ISFT" + struct.pack("<I", 13) + b"Lavf61.7.100\0" + b"\0"
+    return wav(data, between=chunk(b"LIST", b"INFO" + isft))
+
+
 def image_flags_msg(flags):
     return f"image: flags 0x{flags:04x} aren't supported (only premultiplied alpha)"
 
@@ -86,7 +122,7 @@ def file_path_msg(index, path):
 
 
 def file_type_msg(index, path):
-    return f"manifest: files[{index}] '{path}' has an unsupported type (use .lua, .json or .bin)"
+    return f"manifest: files[{index}] '{path}' has an unsupported type (use .lua, .json, .bin or .wav)"
 
 
 def not_yet_msg(permission):
@@ -241,6 +277,14 @@ class MuseAppsPkgTest(unittest.TestCase):
         done = self.run_harness("icon", self.put_file(data))
         return json.loads(done.stdout)
 
+    def wav(self, data, odd=False) -> dict:
+        """What apps_wav_check says of data. odd puts the bytes at an odd address, as an unaligned blob would."""
+        done = self.run_harness("wav", self.put_file(data), *(["odd"] if odd else []))
+        return json.loads(done.stdout)
+
+    def refused_wav(self, data, message, **kwargs):
+        self.assertEqual(self.wav(data, **kwargs), {"ok": False, "error": message})
+
     def refused_image(self, data, message):
         self.assertEqual(self.image(data), {"ok": False, "error": message})
 
@@ -274,12 +318,14 @@ class MuseAppsPkgTest(unittest.TestCase):
         self.assertEqual(len(invalid[5]), 65)
 
     def test_file_kinds(self):
-        texts = ["x.lua", "a/b.json", "i.bin", "x.txt", "lua", "x.LUA", "x.lua.txt", "x.bin.lua", "x.luax", "x.lu", "x",
-                 "x.json5", "", ".lua", ".json", "x.jsonx", "bin", "x.Bin", "a.b/c"]
-        want = ["lua", "json", "image", "bad", "bad", "bad", "bad", "lua", "bad", "bad", "bad", "bad", "bad", "lua",
-                "json", "bad", "bad", "bad", "bad"]
-        got = self.check("kind", texts)
-        self.assertEqual(got, want, list(zip(texts, got)))
+        cases = [("x.lua", "lua"), ("a/b.json", "json"), ("i.bin", "image"), ("a.wav", "wav"), ("x.txt", "bad"),
+                 ("lua", "bad"), ("x.LUA", "bad"), ("x.lua.txt", "bad"), ("x.bin.lua", "lua"), ("x.luax", "bad"),
+                 ("x.lu", "bad"), ("x", "bad"), ("x.json5", "bad"), ("", "bad"), (".lua", "lua"), (".json", "json"),
+                 ("x.jsonx", "bad"), ("bin", "bad"), ("x.Bin", "bad"), ("a.b/c", "bad"), ("x.WAV", "bad"),
+                 ("wav", "bad"), (".wav", "wav"), ("x.wav.txt", "bad"), ("x.wav.lua", "lua"), ("x.bin.wav", "wav"),
+                 ("x.wave", "bad")]
+        got = self.check("kind", [text for text, _ in cases])
+        self.assertEqual(got, [kind for _, kind in cases], list(zip([text for text, _ in cases], got)))
 
     # ---- The manifest that parses ----
 
@@ -1104,6 +1150,78 @@ class MuseAppsPkgTest(unittest.TestCase):
         self.refused_image(struct.pack("<BBHHHHH", 0x19, 0x12, 0x0000, 4, 4, 1, 0) + bytes(3),
                            image_stride_msg(1, 4, 8))
         self.refused_image(struct.pack("<BBHHHHH", 0x19, 0x12, 0x0000, 4, 4, 8, 0) + bytes(3), image_size_msg(15, 44))
+
+    # ---- Sounds ----
+
+    def test_wav_check(self):
+        # The smallest file: one sample (two bytes). samples points INTO the bytes, at the payload, and frames counts them.
+        self.assertEqual(self.wav(wav(b"\x01\x00")), {"ok": True, "frames": 1, "offset": 44})
+        self.assertEqual(self.wav(wav(bytes(64000))), {"ok": True, "frames": 32000, "offset": 44})
+        self.refused_wav(wav(magic=b"RIFX"), WAV_NOT_WAV_MSG)
+        self.refused_wav(wav(wave=b"AVI "), WAV_NOT_WAV_MSG)
+        self.refused_wav(b"", WAV_NOT_WAV_MSG)
+        self.refused_wav(b"RIFF\0\0\0\0WAV", WAV_NOT_WAV_MSG)
+        self.refused_wav(wav(fmt=wav_fmt(channels=2)), WAV_FORMAT_MSG)  # stereo
+        self.refused_wav(wav(fmt=wav_fmt(rate=44100)), WAV_FORMAT_MSG)
+        self.refused_wav(wav(fmt=wav_fmt(bits=8)), WAV_FORMAT_MSG)
+        self.refused_wav(wav(fmt=wav_fmt(bits=24)), WAV_FORMAT_MSG)
+        self.refused_wav(wav(fmt=wav_fmt(fmt=3, bits=32)), WAV_FORMAT_MSG)  # float
+        self.refused_wav(wav(fmt=wav_fmt(channels=0)), WAV_FORMAT_MSG)
+        self.refused_wav(wav(fmt=wav_fmt(rate=8000)), WAV_FORMAT_MSG)
+        self.refused_wav(wav(fmt=b""), WAV_NO_FMT_MSG)
+        self.refused_wav(wav(fmt=chunk(b"fmt ", bytes(8))), WAV_FMT_SHORT_MSG)
+        self.refused_wav(wav(data=None), WAV_NO_DATA_MSG)
+        self.refused_wav(wav(data=b"\x01\x00\x02"), WAV_ODD_SIZE_MSG)
+        self.refused_wav(wav(data=b""), WAV_EMPTY_MSG)
+        # G5: a payload at an odd address is refused (Xtensa faults on an unaligned int16_t load).
+        self.refused_wav(wav(), WAV_UNALIGNED_MSG, odd=True)
+        # A fmt chunk longer than 16 bytes (WAVE_FORMAT_PCM with cbSize) is read by its first 16.
+        long_fmt = chunk(b"fmt ", struct.pack("<HHIIHHH", 1, 1, 16000, 32000, 2, 16, 0))
+        self.assertTrue(self.wav(wav(fmt=long_fmt))["ok"])
+
+    def test_wav_checks_come_in_a_fixed_order(self):
+        # magic, fmt present, format, data present, data past the end, data empty, data odd.
+        stereo = wav_fmt(channels=2)
+        self.refused_wav(wav(magic=b"RIFX", fmt=stereo, data=None), WAV_NOT_WAV_MSG)
+        self.refused_wav(wav(fmt=b"", data=None), WAV_NO_FMT_MSG)
+        self.refused_wav(wav(fmt=stereo, data=None), WAV_FORMAT_MSG)
+        self.refused_wav(wav(fmt=stereo, data=b"\x01"), WAV_FORMAT_MSG)
+        self.refused_wav(wav(data=None), WAV_NO_DATA_MSG)
+        self.refused_wav(wav(data=b"\x01\x00\x02", data_size=99), WAV_PAST_END_MSG)  # odd and past the end
+        self.refused_wav(wav(data=b"", data_size=0), WAV_EMPTY_MSG)
+        self.refused_wav(wav(data=b"\x01\x00\x02"), WAV_ODD_SIZE_MSG)
+        self.refused_wav(wav(data=b"\x01\x00\x02", data_size=3), WAV_ODD_SIZE_MSG)
+        self.refused_wav(wav(data=b"\x01\x00\x02"), WAV_ODD_SIZE_MSG, odd=True)  # odd size before odd address
+
+    def test_wav_with_list_chunk_and_pad_byte_is_accepted(self):
+        # An odd-sized chunk before data is followed by a pad byte, and data is still found at an even offset.
+        junk = chunk(b"JUNK", b"abc")  # 3 bytes + pad
+        self.assertEqual(self.wav(wav(between=junk)), {"ok": True, "frames": 2, "offset": 44 + 12})
+        listed = chunk(b"LIST", b"INFOISFT" + struct.pack("<I", 5) + b"Lavf\0" + b"\0")  # odd ISFT inside, padded
+        self.assertEqual(self.wav(wav(between=listed + junk))["ok"], True)
+        # the same, with the chunks before fmt
+        self.assertTrue(self.wav(wav(fmt=junk + wav_fmt()))["ok"])
+        # what ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le writes
+        data = ffmpeg_wav(bytes(range(40)))
+        self.assertEqual(self.wav(data), {"ok": True, "frames": 20, "offset": len(data) - 40})
+        self.assertEqual(len(data) % 2, 0)
+        # a chunk after data (ffmpeg's -write_bext, or a trailing LIST) is not read
+        self.assertTrue(self.wav(wav(tail=chunk(b"LIST", b"INFOx")))["ok"])
+
+    def test_wav_with_a_missing_pad_byte_is_refused(self):
+        # An odd chunk with no pad byte puts the next header at an odd offset: the walk, which honours the pad, reads garbage.
+        data = wav(between=chunk(b"JUNK", b"abc", pad=False))
+        self.assertFalse(self.wav(data)["ok"])
+
+    def test_wav_data_past_the_end_is_refused(self):
+        self.refused_wav(wav(data=b"\x01\x00\x02\x00", data_size=6), WAV_PAST_END_MSG)
+        self.refused_wav(wav(data=b"", data_size=2), WAV_PAST_END_MSG)
+        self.refused_wav(wav(data=b"\x01\x00", data_size=0xFFFFFFFE), WAV_PAST_END_MSG)  # a streaming writer's size
+        data = wav()
+        self.refused_wav(data[:-1], WAV_PAST_END_MSG)  # cut one byte short
+        self.refused_wav(data[:44], WAV_PAST_END_MSG)  # header only
+        self.refused_wav(data[:40], WAV_NO_DATA_MSG)  # cut inside the data chunk's own header
+        self.refused_wav(data[:30], WAV_FMT_SHORT_MSG)  # cut inside fmt
 
     def test_image_header_is_little_endian_and_reserved_is_ignored(self):
         data = lvgl_image(w=0x0104, h=1, stride=0x0208)  # 260 x 1, stride 520

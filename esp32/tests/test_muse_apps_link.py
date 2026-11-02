@@ -945,7 +945,7 @@ class GuideAndSkill(unittest.TestCase):
         # numbers measured on the board (2026-11-01, after R5f) are measurements, pinned as they were written; the fixture's 121
         # widgets are its 40 rows of three and the list.
         lv = (APPS / "apps_lv.c").read_text()
-        self.assertIn('ESP_LOGI(TAG, "scroll frame %d ms"', lv)
+        self.assertIn('s_frames.scroll.name = "scroll";', lv)
         self.assertIn("lv_obj_add_event_cb(obj, on_scroll_end, LV_EVENT_SCROLL_END, NULL);", lv)
         self.assertIn('!strncmp(line, "drag ", 5)', (MUSE / "muse_input.c").read_text())
         ui_h = (MUSE / "muse_ui.h").read_text()
@@ -957,10 +957,10 @@ class GuideAndSkill(unittest.TestCase):
         self.assertNotIn("Leave those out", section)
         for phrase in ("**Lists:** a box with `scroll = \"y\"` scrolls up and down with LVGL's own drag, throw and elastic edge "
                        "(`style_box` in `apps_lv.c`)",
-                       "A bench build logs `scroll frame <ms> ms` (the `muse_apps` tag) at each display refresh while an app's box with "
-                       "`scroll = \"y\"` scrolls on the layer in front, with no card or launcher over it: the time since the refresh "
-                       "before, unless the box's scroll ended in between (`LV_EVENT_SCROLL_END`, which a throw that stops short of the "
-                       "list's ends sends at an input read that moves nothing, with no refresh to see it).",
+                       "A bench build sums up the frames of an app's box with `scroll = \"y\"` while it scrolls on the layer in front, "
+                       "with no card or launcher over it, in `scroll frames:` lines (the bench's frame summaries, under Build); the box's "
+                       "`LV_EVENT_SCROLL_END` ends a scroll's summary too, since a throw that stops short of the list's ends sends it at "
+                       "an input read that moves nothing, with no refresh to see it: that summary comes at the next refresh.",
                        "`>drag X1 Y1 X2 Y2 MS` (a bench build's console) presses at the first point, moves straight to the second over MS "
                        f"ms and lifts, as a finger that drags would (MS is {low} to {high}, `MUSE_UI_DRAG_MS_MIN` and `_MAX` in "
                        "`muse_ui.h`).",
@@ -989,7 +989,7 @@ class GuideAndSkill(unittest.TestCase):
         pitch = header_number("apps_lv.h", "APPS_LV_ITEM_PITCH")
         window = header_number("apps_icons.h", "APPS_ICONS_WINDOW")
         side_px = (icon_px * side + 128) // 256  # a neighbour's tile, as apps_lv.c's draw_scale sizes it
-        self.assertIn('ESP_LOGI(TAG, "launcher frame %d ms"', (APPS / "apps_lv.c").read_text())
+        self.assertIn('s_frames.launcher.name = "launcher";', (APPS / "apps_lv.c").read_text())
         agents = (ROOT / "AGENTS.md").read_text()
         section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
         for phrase in (
@@ -999,13 +999,51 @@ class GuideAndSkill(unittest.TestCase):
                 "a side app brings it to the middle, and a swipe up from the bottom edge or a tap on the background closes the launcher.",
                 f"The guide asks for {icon_px} x {icon_px} icons, the size of the app in the middle",
                 f"the icons of the {window} apps around the middle (`APPS_ICONS_WINDOW`)",
-                "A bench build logs `launcher frame <ms> ms` (the `muse_apps` tag) at each display refresh while the carousel scrolls:",
+                "A bench build sums up the carousel's frames while it scrolls in `launcher frames:` lines (the bench's frame "
+                "summaries, under Build).",
                 # The final review's hardening (d): the drag's own frames, so later per-frame work isn't sized against the 30 ms median.
                 "That median counts the snap's slow tail, 47 frames under 28 ms: the other 103, while a finger drags and as the snap "
                 "starts, have a median of 33 ms against the 30 of all 150, the gate's own limit, so per-frame work added later has no "
                 "margin to spend."):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
+
+    def test_agents_md_has_the_frame_summaries(self):
+        # Task 1 of the perf plan: the bench's frame lines are summaries. D12: the line as muse_frame_stats.c prints it (its tag and
+        # format), the names the callers give, the second, the 128 frames a summary holds and the 50 ms its last field counts over,
+        # and the bands' batch, are the code's.
+        stats = (MUSE / "muse_frame_stats.c").read_text()
+        header = (MUSE / "muse_frame_stats.h").read_text()
+        self.assertIn('static const char *TAG = "muse_frames";', stats)
+        self.assertIn('ESP_LOGI(TAG, "%s frames: n=%d p50=%d p95=%d max=%d over50=%d", s->name,', stats)
+        window = int(re.search(r"(?m)^#define MUSE_FRAME_STATS_WINDOW_US (\d+)", stats).group(1))
+        over = int(re.search(r"(?m)^#define MUSE_FRAME_STATS_OVER_MS (\d+)", stats).group(1))
+        held = int(re.search(r"uint16_t ms\[(\d+)\];", header).group(1))
+        self.assertEqual((window, over), (1000000, 50))
+        batch = int(re.search(r"(?m)^#define FRAME_BATCH (\d+)", (MUSE / "boards/muse_lcd_bands.c").read_text()).group(1))
+        lv = (APPS / "apps_lv.c").read_text()
+        for name in ("launcher", "spin", "scroll"):
+            self.assertIn(f's_frames.{name}.name = "{name}";', lv)
+        self.assertIn('s_page_frames.name = "page";', (MUSE / "muse_ui.c").read_text())
+        agents = (ROOT / "AGENTS.md").read_text()
+        bench = " ".join(agents[:agents.index("\n## Muse apps\n")].split())
+        for phrase in (
+                "A bench build's frame measurements are summaries (`muse_frame_stats.c`, the `muse_frames` tag), one line for a motion "
+                "rather than one a frame: `<name> frames: n=<n> p50=<ms> p95=<ms> max=<ms> over50=<k>`,",
+                "a frame being the time between two display refreshes that found the same motion (the first refresh of one follows a "
+                f"rest and isn't timed), p50 and p95 nearest-rank, and `over{over}` the frames over {over} ms.",
+                "The names are `page` (the home pages' slide) and, with the apps, `launcher` (the carousel), `spin` (a spinning image) "
+                "and `scroll` (a list).",
+                "A summary is printed at the first refresh after its motion ends (one that finds it stopped, or the first after its "
+                "`LV_EVENT_SCROLL_END`, however late that comes; a throw's end that hands the scroll to the snap or spring-back it has "
+                "just started ends nothing), once a second of motion has passed since its first frame, or at its "
+                f"{held}th frame, and only from LVGL's `LV_EVENT_REFR_READY`, never from a scroll or input callback.",
+                "For the same reason the bands print `tearing effect: torn refresh of ...` only for the first torn refresh of each "
+                f"batch of {batch}, which the batch line counts: every line the console prints spins the task that prints it until the "
+                "UART has sent it."):
+            with self.subTest(phrase[:40]):
+                self.assertIn(phrase, bench)
+        self.assertEqual(window // 1000000, 1, "\"a second\"")
 
     def test_guide_icon_numbers_are_the_headers(self):
         # D12: the icon's size limit is APPS_ICON_MAX_PX, and its largest file is the LVGL header and that square of RGB565A8. The size

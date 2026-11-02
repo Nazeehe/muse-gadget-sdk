@@ -62,6 +62,126 @@ def build_bench(name, program, tmp):
     return apps_host.build(name, [path], tmp, include_dirs=[include, MUSE])
 
 
+FRAME_STATS = MUSE / "muse_frame_stats.c"
+
+
+def build_frame_stats(name, program, tmp):
+    """`program` and the real muse_frame_stats.c compiled with CONFIG_MUSE_BENCH on, its log printing "I <tag>: <line>"; the
+    executable's path."""
+    include = Path(tmp) / "include"
+    include.mkdir()
+    (include / "sdkconfig.h").write_text("#pragma once\n#define CONFIG_MUSE_BENCH 1\n")
+    (include / "esp_log.h").write_text('#pragma once\n#include <stdio.h>\n'
+                                       '#define ESP_LOGI(tag, fmt, ...) printf("I %s: " fmt "\\n", tag, ##__VA_ARGS__)\n')
+    path = Path(tmp) / f"{name}.c"
+    path.write_text(program)
+    return apps_host.build(name, [path, FRAME_STATS], tmp, include_dirs=[include, MUSE])
+
+
+FRAME_STATS_DRIVER = r"""
+#include <stdio.h>
+#include <string.h>
+#include "muse_frame_stats.h"
+static muse_frame_stats_t s;
+/* One step a line: "add MS US" (muse_frame_stats_add), "flush" (muse_frame_stats_flush), "n" (prints the frames held). */
+int main(void)
+{
+    char cmd[16];
+    long long ms, us;
+    s.name = "scroll";
+    while (scanf("%15s", cmd) == 1) {
+        if (!strcmp(cmd, "add") && scanf("%lld %lld", &ms, &us) == 2) muse_frame_stats_add(&s, (int)ms, us);
+        else if (!strcmp(cmd, "flush")) muse_frame_stats_flush(&s);
+        else if (!strcmp(cmd, "n")) printf("n %d\n", s.n);
+    }
+    return 0;
+}
+"""
+
+
+def nearest_rank(frames, p):
+    """The p-th percentile of frames by nearest rank: the ceil(p * n / 100)-th smallest."""
+    ordered = sorted(frames)
+    return ordered[max(1, -(-p * len(frames) // 100)) - 1]
+
+
+class FrameStatsTest(unittest.TestCase):
+    """muse_frame_stats.c (Task 1 of the perf plan): the bench's frame summaries, one line for a motion's frames instead of one a
+    frame. Its p50 and p95 are nearest-rank, from a counting sort over the frames held."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.exe = build_frame_stats("frame_stats", FRAME_STATS_DRIVER, cls.tmp.name)
+
+    def play(self, steps):
+        done = apps_host.run(self.exe, input="\n".join(steps) + "\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.splitlines()
+
+    @staticmethod
+    def summary(frames):
+        clamped = [min(max(v, 0), 65535) for v in frames]
+        return (f"I muse_frames: scroll frames: n={len(clamped)} p50={nearest_rank(clamped, 50)} p95={nearest_rank(clamped, 95)} "
+                f"max={max(clamped)} over50={sum(v > 50 for v in clamped)}")
+
+    def test_the_line_and_its_numbers(self):
+        frames = [20, 33, 16, 17, 51, 50]
+        out = self.play([f"add {v} 0" for v in frames] + ["flush", "n"])
+        self.assertEqual(out, ["I muse_frames: scroll frames: n=6 p50=20 p95=51 max=51 over50=1", "n 0"])   # 50 isn't over 50
+        self.assertRegex(out[0], r"^I muse_frames: scroll frames: n=\d+ p50=\d+ p95=\d+ max=\d+ over50=\d+$")
+
+    def test_nothing_held_prints_nothing(self):
+        self.assertEqual(self.play(["flush", "flush", "n"]), ["n 0"])
+        self.assertEqual(self.play(["add 16 0", "flush", "flush"]), [self.summary([16])])
+
+    def test_nearest_rank_against_a_sort(self):
+        # Frames of every length a summary can hold, short ones and ones past the counting sort's bins (ranked among themselves),
+        # and the bounds of a uint16_t (a negative gap is 0, a longer one its most).
+        rng = random.Random(1)
+        for trial in range(300):
+            n = rng.randint(1, 127)
+            spread = rng.choice([40, 127, 128, 129, 300, 70000])
+            frames = [rng.randint(-5 if spread == 70000 else 0, spread) for _ in range(n)]
+            with self.subTest(trial=trial, n=n, spread=spread):
+                self.assertEqual(self.play([f"add {v} 0" for v in frames] + ["flush"]), [self.summary(frames)])
+
+    def test_a_full_summary_prints_at_its_last_frame(self):
+        frames = [16 + i % 7 for i in range(130)]
+        out = self.play([f"add {v} 0" for v in frames[:127]] + ["n", f"add {frames[127]} 0", "n"] +
+                        [f"add {v} 0" for v in frames[128:]] + ["flush"])
+        self.assertEqual(out, ["n 127", self.summary(frames[:128]), "n 0", self.summary(frames[128:])])
+
+    def test_a_second_of_motion_prints_its_summary(self):
+        # The frame that reaches 1 s since the summary's first ends it; the next starts a summary of its own, timed from itself.
+        out = self.play(["add 33 5000000", "add 33 5500000", "add 40 5999999", "n", "add 33 6000000", "n",
+                         "add 20 6000001", "add 20 6999999", "n", "add 20 7000001", "n"])
+        self.assertEqual(out, ["n 3", self.summary([33, 33, 40, 33]), "n 0", "n 2", self.summary([20, 20, 20]), "n 0"])
+
+    def test_the_interface_is_the_benchs_alone_and_allocates_nothing(self):
+        header = (MUSE / "muse_frame_stats.h").read_text()
+        source = FRAME_STATS.read_text()
+        code = re.sub(r"/\*.*?\*/", " ", header, flags=re.S)
+        self.assertRegex(" ".join(code.split()), r"typedef struct \{ const char \*name; uint16_t ms\[128\]; uint16_t n; "
+                                                 r"int64_t first_us; \} muse_frame_stats_t;")
+        for line in ("void muse_frame_stats_add(muse_frame_stats_t *s, int ms, int64_t now_us);",
+                     "void muse_frame_stats_flush(muse_frame_stats_t *s);"):
+            self.assertIn(line, header)
+            self.assertEqual(open_conditions(header, header.index(line)), ["if CONFIG_MUSE_BENCH"])
+        self.assertEqual(open_conditions(header, header.index("typedef struct")), ["if CONFIG_MUSE_BENCH"])
+        self.assertIn('#include "sdkconfig.h"', header)
+        body = re.sub(r"/\*.*?\*/", " ", source, flags=re.S)
+        self.assertNotRegex(body, r"\b(malloc|calloc|realloc|free|heap_caps_\w+|alloca)\b")
+        self.assertRegex(body, r"uint8_t count\[[A-Z_]+\] = \{ ?0 ?\};")   # the counting sort's bins, on the stack
+        for function in ("void muse_frame_stats_add(", "void muse_frame_stats_flush("):
+            self.assertEqual(open_conditions(source, source.index(function)), ["if CONFIG_MUSE_BENCH"])
+        # Built only into a bench build.
+        cmake = (MUSE / "CMakeLists.txt").read_text()
+        self.assertRegex(cmake, r'if\(CONFIG_MUSE_BENCH\)\n(?:\s*#[^\n]*\n)?\s*list\(APPEND srcs "muse_frame_stats\.c"\)')
+        self.assertEqual(cmake.count("muse_frame_stats.c"), 1)
+
+
 SNAPSHOT_PRELUDE = r"""
 #include <pthread.h>
 #include <stdbool.h>
@@ -1042,7 +1162,7 @@ int main(int argc, char **argv)
         release = first.index("R233,300@90")
         self.assertEqual(first[release + 1:release + 3], ["end0@90", "P100,100@105"])
 
-    # ---- The clock and Muse's slide: the page frame line ----
+    # ---- The clock and Muse's slide: the page frames summary (Task 1 of the perf plan) ----
 
     PAGE_HARNESS = r"""
 #include <stdbool.h>
@@ -1050,23 +1170,25 @@ int main(int argc, char **argv)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "muse_frame_stats.h"
 #define EXT_RAM_BSS_ATTR
-#define ESP_LOGI(tag, fmt, ...) printf("I %s: " fmt "\n", tag, ##__VA_ARGS__)
 typedef struct lv_obj { bool scrolling; } lv_obj_t;
 typedef struct { void *target; } lv_event_t;
 static void *lv_event_get_target(lv_event_t *e) { return e->target; }
 static bool lv_obj_is_scrolling(const lv_obj_t *obj) { return obj->scrolling; }
 static int64_t g_now;
 static int64_t esp_timer_get_time(void) { return g_now; }
-static const char *TAG = "muse_ui";
 static lv_obj_t tv, other;
 static lv_obj_t *s_tv = &tv;
+typedef struct lv_anim lv_anim_t;
+static bool g_animating;   /* a scroll animation (the snap) runs on the tileview */
+static lv_anim_t *lv_anim_get(void *var, void *exec_cb) { (void)exec_cb; return var == &tv && g_animating ? (lv_anim_t *)&tv : NULL; }
 """
 
     def run_page_harness(self, steps):
-        """muse_ui.c's page frame block (from its comment to its #endif) played the steps, one a line: "at US" (the clock),
-        "scroll 0|1" (the tileview's lv_obj_is_scrolling), "refresh" (LV_EVENT_REFR_READY), "end tv" or "end other"
-        (LV_EVENT_SCROLL_END on it). Its log lines."""
+        """muse_ui.c's page frames block (from its comment to its #endif) with the real muse_frame_stats.c, played the steps, one
+        a line: "at US" (the clock), "scroll 0|1" (the tileview's lv_obj_is_scrolling), "anim 0|1" (an animation on it: the snap),
+        "refresh" (LV_EVENT_REFR_READY), "end tv" or "end other" (LV_EVENT_SCROLL_END on it). Its log lines."""
         ui = (MUSE / "muse_ui.c").read_text()
         start = ui.index("/*\n * The slide's frames, in a bench build")
         block = ui[start:ui.index("\n#endif", start)]
@@ -1074,10 +1196,12 @@ static lv_obj_t *s_tv = &tv;
 int main(void)
 {
     char line[64];
+    s_page_frames.name = "page";   /* as build_screen names it */
     while (fgets(line, sizeof line, stdin)) {
         lv_event_t e = { .target = strstr(line, "other") ? (void *)&other : (void *)&tv };
         if (!strncmp(line, "at ", 3)) g_now = atoll(line + 3);
         else if (!strncmp(line, "scroll ", 7)) tv.scrolling = line[7] == '1';
+        else if (!strncmp(line, "anim ", 5)) g_animating = line[5] == '1';
         else if (!strncmp(line, "refresh", 7)) page_refresh(&e);
         else if (!strncmp(line, "end", 3)) page_scroll_end(&e);
     }
@@ -1085,43 +1209,75 @@ int main(void)
 }
 """
         with tempfile.TemporaryDirectory() as tmp:
-            exe = build_bench("bench_page", program, tmp)
+            exe = build_frame_stats("bench_page", program, tmp)
             done = apps_host.run(exe, input="\n".join(steps) + "\n")
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout.splitlines()
 
     def test_the_slide_logs_its_page_frames(self):
-        # While the home tileview scrolls, each display refresh logs "page frame <ms> ms" (the muse_ui tag), the time since the
-        # refresh before to the nearest ms, when that one found it scrolling too, as the apps' launcher and spin frame lines do:
-        # the first refresh of a slide follows a rest of any length. Its LV_EVENT_SCROLL_END ends the timing.
+        # While the home tileview scrolls, each display refresh times the gap since the refresh before, to the nearest ms, when that
+        # one found it scrolling too, as the apps' launcher and spin frames are: the first refresh of a slide follows a rest of any
+        # length. The slide's frames, its drag's and its snap's, are printed as one summary (the muse_frames tag) at the first refresh
+        # after its LV_EVENT_SCROLL_END, which isn't timed, or at the refresh that finds it at rest. The drag's own SCROLL_END, which
+        # LVGL sends as the snap it has just started animates, ends nothing.
         out = self.run_page_harness([
             "at 1000", "refresh",                            # at rest: nothing
             "scroll 1", "at 5000", "refresh",                # the slide's first refresh: nothing to time it from
-            "at 56000", "refresh", "at 107499", "refresh", "at 158000", "refresh",
-            "end other", "at 209000", "refresh",             # another object's scroll end changes nothing
-            "end tv", "at 260000", "refresh",                # the tileview's: the next refresh isn't timed
-            "at 294000", "refresh",
-            "scroll 0", "at 345000", "refresh",              # at rest: nothing, and the next slide starts afresh
-            "scroll 1", "at 900000", "refresh", "at 951000", "refresh"])
-        self.assertEqual(out, ["I muse_ui: page frame 51 ms", "I muse_ui: page frame 51 ms", "I muse_ui: page frame 51 ms",
-                               "I muse_ui: page frame 51 ms", "I muse_ui: page frame 34 ms", "I muse_ui: page frame 51 ms"])
-        for line in out:
-            self.assertRegex(line, r"^I muse_ui: page frame \d+ ms$")   # the board driver's measurement line, digits only
+            "at 56000", "refresh", "at 107499", "refresh",   # 51 and 51 ms
+            "anim 1", "end tv",                              # the drag's end, the snap animating: the slide goes on
+            "at 175000", "refresh",                          # 68 ms
+            "end other", "at 226000", "refresh",             # another object's scroll end changes nothing: 51 ms
+            "anim 0", "end tv", "at 277000", "refresh",      # the snap's own: this refresh prints the summary, untimed
+            "at 311000", "refresh",                          # 34 ms
+            "scroll 0", "at 362000", "refresh",              # at rest: the summary of the frame since
+            "scroll 1", "at 900000", "refresh", "at 951000", "refresh"])   # a slide that goes on: nothing yet
+        self.assertEqual(out, ["I muse_frames: page frames: n=4 p50=51 p95=68 max=68 over50=4",
+                               "I muse_frames: page frames: n=1 p50=34 p95=34 max=34 over50=0"])
+        for line in out:   # the board driver's measurement line, digits only
+            self.assertRegex(line, r"^I muse_frames: page frames: n=\d+ p50=\d+ p95=\d+ max=\d+ over50=\d+$")
 
-    def test_the_page_frame_line_is_the_bench_builds_alone(self):
-        # Every part of it (the line, its state, its callbacks and their registration on the tileview and the display) is inside
-        # #if CONFIG_MUSE_BENCH and nothing else, so a build without the bench adds nothing to the display.
+    def test_a_long_slide_prints_a_summary_a_second(self):
+        # A slide that goes on for 1.2 s at 68 ms a frame: the frame that reaches a second since the summary's first (the 16th: 15 * 68
+        # is 1,020 ms) ends the first summary, and the rest come at rest.
+        steps = ["scroll 1", "at 1000", "refresh"] + [f"at {1000 + 68000 * k}\nrefresh" for k in range(1, 18)] + [
+            "scroll 0", "at 1300000", "refresh"]
+        self.assertEqual(self.run_page_harness(steps), ["I muse_frames: page frames: n=16 p50=68 p95=68 max=68 over50=16",
+                                                        "I muse_frames: page frames: n=1 p50=68 p95=68 max=68 over50=1"])
+
+    def test_the_page_frames_summary_is_the_bench_builds_alone(self):
+        # Every part of it (its state, its callbacks and their registration on the tileview and the display, the accumulator's
+        # header) is inside #if CONFIG_MUSE_BENCH and nothing else, so a build without the bench adds nothing to the display; and no
+        # line is printed a frame.
         ui = (MUSE / "muse_ui.c").read_text()
-        self.assertIn('ESP_LOGI(TAG, "page frame %d ms", (int)((now - s_page_last_us + 500) / 1000));', ui)
+        self.assertIn("muse_frame_stats_add(&s_page_frames, (int)((now - s_page_last_us + 500) / 1000), now);", ui)
+        self.assertNotIn('"page frame %d ms"', ui)
         build = c_function(ui, "static void build_screen(void)")
-        self.assertRegex(build, r"#if CONFIG_MUSE_BENCH\n\s*lv_obj_add_event_cb\(s_tv, page_scroll_end, LV_EVENT_SCROLL_END, NULL\);\n"
+        self.assertRegex(build, r"#if CONFIG_MUSE_BENCH\n\s*s_page_frames\.name = \"page\";\n"
+                                r"\s*lv_obj_add_event_cb\(s_tv, page_scroll_end, LV_EVENT_SCROLL_END, NULL\);\n"
                                 r"\s*lv_display_add_event_cb\(lv_obj_get_display\(s_tv\), page_refresh, LV_EVENT_REFR_READY, NULL\);\n"
                                 r"#endif")
-        mentions = [m.start() for m in re.finditer(r"page_refresh|page_scroll_end|s_page_last_us|page frame", ui)]
-        self.assertGreaterEqual(len(mentions), 10)
+        mentions = [m.start() for m in re.finditer(r"page_refresh|page_scroll_end|s_page_last_us|s_page_ended|s_page_frames|"
+                                                   r"muse_frame_stats", ui)]
+        self.assertGreaterEqual(len(mentions), 12)
         for index in mentions:
             with self.subTest(ui[ui.rindex("\n", 0, index) + 1:ui.index("\n", index)].strip()):
                 self.assertEqual(open_conditions(ui, index), ["if CONFIG_MUSE_BENCH"])
+
+    def test_the_page_summary_prints_from_the_refresh_alone(self):
+        # Review Focus 1: the summary is printed from LV_EVENT_REFR_READY's callback alone, never from the tileview's SCROLL_END
+        # callback or the slide's SCROLL_BEGIN (frame mode's switch), deep in LVGL's input read, where vprintf's frame would sit on the
+        # LVGL task's thin stack: those only note what happened.
+        ui = (MUSE / "muse_ui.c").read_text()
+        refresh = c_function(ui, "static void page_refresh(lv_event_t *e)")
+        self.assertIn("muse_frame_stats_flush(&s_page_frames);", refresh)
+        for head in ("static void page_scroll_end(lv_event_t *e)", "static void slide_begins(lv_event_t *e)",
+                     "static void slide_rests(lv_event_t *e)"):
+            with self.subTest(head):
+                self.assertNotRegex(c_function(ui, head), r"ESP_LOG|printf|muse_frame_stats")
+        self.assertEqual(len(re.findall(r"muse_frame_stats_(?:add|flush)\(", ui)),
+                         len(re.findall(r"muse_frame_stats_(?:add|flush)\(", refresh)), "a summary call outside page_refresh")
+        self.assertEqual(re.findall(r"lv_\w+_add_event_cb\([^;]*page_refresh[^;]*\);", ui),
+                         ["lv_display_add_event_cb(lv_obj_get_display(s_tv), page_refresh, LV_EVENT_REFR_READY, NULL);"])
 
     # ---- Task 14: the screenshot stream's CRC ----
 

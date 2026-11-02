@@ -439,6 +439,7 @@ void lv_anim_set_bezier3_param(lv_anim_t *a, int16_t x1, int16_t y1, int16_t x2,
 int32_t lv_anim_path_custom_bezier3(const lv_anim_t *a);
 lv_anim_t *lv_anim_start(const lv_anim_t *a);
 bool lv_anim_delete(void *var, lv_anim_exec_xcb_t exec_cb);
+lv_anim_t *lv_anim_get(void *var, lv_anim_exec_xcb_t exec_cb);
 
 void *lv_event_get_user_data(lv_event_t *e);
 void *lv_event_get_param(lv_event_t *e);

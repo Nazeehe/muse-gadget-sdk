@@ -730,6 +730,8 @@ int main(void)
             g_free = (size_t)v;
         } else if (strcmp(cmd, "fail") == 0) {
             g_fail = v != 0;
+        } else if (strcmp(cmd, "tell") == 0) {
+            tell_frame();   /* the send task's loop, at its next band */
         } else {
             muse_lcd_bands_set_frame_mode(v != 0);
             printf("framing %d allocs %d caps %u\n", s_framing, g_allocs, g_caps);
@@ -748,6 +750,7 @@ int main(void)
                  re.search(r"^#define WHOLE_RESERVE .*$", source, re.M).group(0)]
         parts += re.findall(r"^static EXT_RAM_BSS_ATTR [^;\n]*;", source, re.M)
         parts.append(function_text(source, "void muse_lcd_bands_set_frame_mode("))
+        parts.append(function(source, "tell_frame"))
         src = Path(cls.tmp.name) / "frame_mode.c"
         src.write_text(cls.PROGRAM.replace("PARTS", "\n".join(parts)))
         cls.exe = Path(cls.tmp.name) / "frame_mode"
@@ -764,18 +767,21 @@ int main(void)
         out = self.run_script([f"free {frame + self.reserve - 1}", "on 1", "on 1", "off 0", "on 1"])
         self.assertEqual([line for line in out if line.startswith("framing")],
                          ["framing 0 allocs 0 caps 0"] * 4, "PSRAM short of the frame and the reserve: nothing taken, off")
+        self.assertFalse([line for line in out if line.startswith(("I ", "W "))], "the switch itself logs nothing")
+        out = self.run_script([f"free {frame + self.reserve - 1}", "on 1", "tell 0", "on 1", "tell 0", "off 0", "on 1", "tell 0"])
         warnings = [line for line in out if line.startswith("W ")]
         self.assertEqual(len(warnings), 1, out)
         self.assertIn("lcd_bands: tearing effect: ", warnings[0])   # an allowlisted line
         self.assertIn(f"{frame} B", warnings[0])
+        self.assertEqual(out.index(warnings[0]), 1, "told at the send task's next band after the first turn on")
         # The allocation itself failing (no block that large) is the same.
-        out = self.run_script([f"free {10 * frame}", "fail 1", "on 1", "on 1"])
-        self.assertEqual(out[-1], f"framing 0 allocs 2 caps {(1 << 10) | (1 << 2)}")
+        out = self.run_script([f"free {10 * frame}", "fail 1", "on 1", "tell 0", "on 1", "tell 0"])
+        self.assertEqual([line for line in out if line.startswith("framing")][-1], f"framing 0 allocs 2 caps {(1 << 10) | (1 << 2)}")
         self.assertEqual(sum(line.startswith("W ") for line in out), 1, out)
 
     def test_the_frame_is_made_once_from_psram_and_kept(self):
         frame = 466 * 466 * 2
-        out = self.run_script([f"free {frame + self.reserve}", "on 1", "off 0", "on 1", "on 1", "off 0"])
+        out = self.run_script([f"free {frame + self.reserve}", "on 1", "tell 0", "off 0", "tell 0", "on 1", "on 1", "tell 0", "off 0"])
         states = [line for line in out if line.startswith("framing")]
         psram = (1 << 10) | (1 << 2)
         self.assertEqual(states, [f"framing 1 allocs 1 caps {psram}", f"framing 0 allocs 1 caps {psram}",
@@ -785,9 +791,31 @@ int main(void)
         self.assertEqual(len(infos), 1, out)
         self.assertIn(f"lcd_bands: tearing effect: frame mode's frame, {frame} B of PSRAM", infos[0])
         self.assertFalse(any(line.startswith("W ") for line in out))
-        # A frame that couldn't be made the first time is tried again at the next turn on.
-        out = self.run_script([f"free {frame}", "on 1", f"free {frame + self.reserve}", "on 1"])
-        self.assertEqual(out[-1], f"framing 1 allocs 1 caps {psram}")
+        # A frame that couldn't be made the first time is tried again at the next turn on; told after it, neither line is lost.
+        out = self.run_script([f"free {frame}", "on 1", f"free {frame + self.reserve}", "on 1", "tell 0", "tell 0"])
+        self.assertEqual([line for line in out if line.startswith("framing")][-1], f"framing 1 allocs 1 caps {psram}")
+        logged = [line[:2] for line in out if line.startswith(("I ", "W "))]
+        self.assertEqual(sorted(logged), ["I ", "W "], out)
+
+    def test_the_switch_logs_nothing_and_the_send_loop_tells(self):
+        # W1 fix C and Review Focus 1 (Task 1 of the perf plan): the switch runs on the LVGL task inside the slide's SCROLL_BEGIN
+        # (muse_ui.c's slide_begins, deep in LVGL's input read), where vprintf's frame would sit on the thin stack, so it logs nothing
+        # and only notes what happened: the send task logs it at the top of its loop, at its next band, its shallowest frame. Nothing
+        # of the bands logs from LVGL's flush or render callbacks either: only the send task's, the registration and the TE pin's
+        # setup do.
+        source = variant(SOURCE.read_text(), apps=True)
+        self.assertNotRegex(strip_c(function_text(source, "void muse_lcd_bands_set_frame_mode(")), r"ESP_LOG|printf")
+        self.assertRegex(function(SOURCE.read_text(), "send_bands"),
+                         r"xQueueReceive\(s_bands, &b, portMAX_DELAY\);\n#if CONFIG_MUSE_APPS\n\s*tell_frame\(\);")
+        self.assertEqual(len(re.findall(r"\btell_frame\(\);", strip_c(source))), 1, "told from the send loop alone")
+        self.assertEqual(logging_functions(source), {"te_done", "frame_done", "tell_frame", "muse_lcd_bands_register",
+                                                     "muse_lcd_bands_set_te"})
+        ui = (ROOT / "components/muse/muse_ui.c").read_text()
+        for head in ("static void slide_begins(lv_event_t *e)", "static void slide_rests(lv_event_t *e)"):
+            with self.subTest(head):
+                self.assertNotRegex(strip_c(function_text(ui, head)), r"ESP_LOG|printf")
+        self.assertIn("muse_board->frame_mode(true);", function_text(ui, "static void slide_begins(lv_event_t *e)"))
+        self.assertIn(".frame_mode = muse_lcd_bands_set_frame_mode,", BOARD_175C.read_text())
 
     def test_the_reserve_is_the_apps_floor(self):
         # What the frame leaves the rest of the gadget is the apps' own floor (APPS_RAM_RESERVE): Muse's session and LVGL, which
@@ -797,6 +825,106 @@ int main(void)
         self.assertIsNotNone(floor, "APPS_RAM_RESERVE's form changed")
         self.assertEqual(self.reserve, int(floor.group(1)) * int(floor.group(2)))
 
+
+def logging_functions(source):
+    """The names of source's functions (each opening brace on the line after its head, this file's style) that log."""
+    names = set()
+    for match in re.finditer(r"^(?:static )?[\w ]+?\**\b(\w+)\([^;{}]*\)\n\{", source, re.M):
+        brace = source.index("\n{", match.start()) + 1
+        depth, end = 1, brace + 1
+        while depth:
+            depth += (source[end] == "{") - (source[end] == "}")
+            end += 1
+        if re.search(r"\bESP_LOG[EWID]\(|\bprintf\(", strip_c(source[brace:end])):
+            names.add(match.group(1))
+    return names
+
+
+class TornLineTest(unittest.TestCase):
+    """frame_done's torn-refresh line (a bench build's), compiled with what it calls stubbed: each line spins the console in the send
+    task (priority 6, above LVGL), so it is printed for the first torn refresh of each batch of FRAME_BATCH refreshes alone; the batch
+    line counts them all (Task 1 of the perf plan)."""
+
+    PROGRAM = r"""
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define CONFIG_MUSE_BENCH 1
+static const char *TAG = "lcd_bands";
+#define ESP_LOGI(tag, fmt, ...) printf("I %s: " fmt "\n", tag, ##__VA_ARGS__)
+static unsigned uxTaskGetStackHighWaterMark(void *task) { (void)task; return 596; }
+static int64_t s_gap_us = 300;
+static bool g_torn;
+static void wire_idle(int held) { (void)held; }
+static void band_gone(void) {}
+PARTS
+static bool frame_meets(const write_t *w, int n, int64_t fall, int64_t p, int64_t scan)
+{
+    (void)w; (void)n; (void)fall; (void)p; (void)scan;
+    return g_torn;
+}
+FRAME_DONE
+/* One refresh of two bands a line: 1 torn, 0 not. Each is announced, then judged. */
+int main(void)
+{
+    int torn, k = 0;
+    while (scanf("%d", &torn) == 1) {
+        printf("refresh %d\n", k++);
+        g_torn = torn != 0;
+        s_frame.fall = 0;
+        s_frame.p = 16800;
+        s_frame.scan = 16200;
+        s_frame.n = 2;
+        s_frame.w[0] = (write_t){ 0, 118, 1000, 6000 };
+        s_frame.w[1] = (write_t){ 118, 236, 9000, 6000 };
+        band_t b = { 0 };
+        b.last = true;
+        b.render_us = 900;
+        frame_done(&b);
+    }
+    return 0;
+}
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        source = variant(SOURCE.read_text(), apps=True)
+        parts = [typedef(source, "band_t"), typedef(source, "write_t"), typedef(source, "hold_t"),
+                 re.search(r"^#define FRAME_WRITES_MAX .*$", source, re.M).group(0),
+                 re.search(r"^static struct \{\n    write_t w\[FRAME_WRITES_MAX\];.*?^\} s_frame;", source, re.M | re.S).group(0),
+                 re.search(r"^#define FRAME_BATCH .*$", source, re.M).group(0),
+                 re.search(r"^static struct \{\n    uint32_t n, torn, bands, paired, framed;.*?^\} s_batch;", source,
+                           re.M | re.S).group(0),
+                 function(source, "floor_div")]
+        src = Path(cls.tmp.name) / "torn.c"
+        src.write_text(cls.PROGRAM.replace("PARTS", "\n".join(parts)).replace("FRAME_DONE", function(source, "frame_done")))
+        cls.exe = Path(cls.tmp.name) / "torn"
+        subprocess.run(["cc", "-std=gnu11", "-Wall", "-Werror", "-o", str(cls.exe), str(src)], check=True)
+        cls.batch = source_number("FRAME_BATCH")
+
+    def run_refreshes(self, torn):
+        return subprocess.run([str(self.exe)], input=" ".join(str(int(t)) for t in torn) + "\n", check=True, capture_output=True,
+                              text=True).stdout.splitlines()
+
+    def test_a_batch_prints_its_first_torn_refresh_alone(self):
+        self.assertEqual(self.batch, 30)
+        first = [i in (2, 5, 6, 17, 29) for i in range(self.batch)]   # 5 torn
+        clear = [False] * self.batch
+        again = [i in (0, 1) for i in range(self.batch)]
+        out = self.run_refreshes(first + clear + again)
+        torn = [i for i, line in enumerate(out) if "tearing effect: torn refresh of " in line]
+        batches = [line for line in out if re.search(r"tearing effect: \d+ refreshes, ", line)]
+        self.assertEqual(len(torn), 2, out)
+        self.assertEqual(out[torn[0] - 1], "refresh 2", "the first batch's line is its first torn refresh's")
+        self.assertEqual(out[torn[1] - 1], f"refresh {2 * self.batch}", "the third's, at its first refresh")
+        self.assertRegex(out[torn[0]], r"^I lcd_bands: tearing effect: torn refresh of 2 bands, scan 16200/16800 us: 0-118 \+1000 ")
+        self.assertEqual(len(batches), 3, out)
+        for line, count in zip(batches, (5, 0, 2)):
+            self.assertIn(f"tearing effect: {self.batch} refreshes, {count} torn, ", line)
 
 class FrameModeDocTest(unittest.TestCase):
     """esp32/AGENTS.md's frame mode paragraph (D12): what it quotes of the code is the code's (the board's bands, WHOLE_SPREAD,
@@ -814,7 +942,7 @@ class FrameModeDocTest(unittest.TestCase):
                       'its own",', source)
         self.assertIn("%u paired, %u framed; us avg/max: render %d/%d, \"\n                     \"copy %d/%d,", source)
         ui = (ROOT / "components/muse/muse_ui.c").read_text()
-        self.assertIn('ESP_LOGI(TAG, "page frame %d ms"', ui)
+        self.assertIn('s_page_frames.name = "page";', ui)
         self.assertIn("lv_obj_add_event_cb(s_tv, slide_begins, LV_EVENT_SCROLL_BEGIN, NULL);", ui)
         self.assertIn(".frame_mode = muse_lcd_bands_set_frame_mode,", board)
         agents = (ROOT / "AGENTS.md").read_text()
@@ -830,7 +958,10 @@ class FrameModeDocTest(unittest.TestCase):
                 f"The frame is {frame:,} bytes of PSRAM, made at the first slide if {reserve // (1024 * 1024)} MB of PSRAM stays free "
                 "after it (`WHOLE_RESERVE`, the apps' floor) and kept;",
                 "the bands log `tearing effect: no frame for frame mode` once.",
-                "A bench build logs `page frame <ms> ms` (the `muse_ui` tag) at each display refresh while the tileview scrolls:",
+                "That line and `tearing effect: frame mode's frame, <bytes> B of PSRAM` come from the send task at its next band, never "
+                "from the slide's scroll callback, deep in LVGL's input read.",
+                "A bench build sums up each slide's frames, its drag's and its snap's together, in `page frames:` lines (the bench's "
+                "frame summaries, under Build).",
                 "The bands' batch line then counts the refreshes `framed` and their `copy` into the frame.",
                 # Measured on the board, 2026-11-02 (the task's report): pinned as written.
                 "none of the 527 refreshes in frame mode was torn, and no torn refresh came during a slide (the 57 torn were the Muse "

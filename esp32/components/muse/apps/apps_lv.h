@@ -294,9 +294,10 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * does. Showing it again ends the hold.
  *
  * A bench build (CONFIG_MUSE_BENCH) measures the carousel's frames: while it scrolls, each display refresh (LV_EVENT_REFR_READY, watched
- * from apps_lv_build) logs "launcher frame <ms> ms", the time since the refresh before it when that one found it scrolling too. Nothing
- * at rest, closed or holding; nothing at all in other builds. It measures a spin's frames the same way: while an image spins on the
- * layer in front with no card over it, each refresh logs "spin frame <ms> ms" (the spin gate's measurement, connected apps Task 1).
+ * from apps_lv_build) times the gap since the refresh before it when that one found it scrolling too, and the scroll's frames are
+ * printed as one "launcher frames: ..." summary (muse_frame_stats.h). Nothing at rest, closed or holding; nothing at all in other
+ * builds. It measures a spin's frames the same way, while an image spins on the layer in front with no card over it ("spin frames:
+ * ...", the spin gate's measurement, connected apps Task 1), and a list's while it scrolls ("scroll frames: ...").
  */
 
 #define APPS_LV_ICON_PX 160          /* the centre's icon, and every item's box */

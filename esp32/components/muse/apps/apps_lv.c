@@ -29,6 +29,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
+#if CONFIG_MUSE_BENCH
+#include "muse_frame_stats.h"
+#endif
 
 #include "apps_icons.h"
 #include "apps_json.h"
@@ -1693,8 +1696,8 @@ static void on_carousel_scroll(lv_event_t *e) {
     update_carousel();
 }
 
-/* An image spins on the layer in front, with no launcher or card over it: what the board's frame pairing and the bench's spin frame
- * log follow. */
+/* An image spins on the layer in front, with no launcher or card over it: what the board's frame pairing and the bench's spin frames
+ * follow. */
 static bool spin_in_front(void) {
     return s_spinning > 0 && s_front && !s_launcher_shown && !s_crash_shown;
 }
@@ -1709,7 +1712,7 @@ static void cut_sound_if_covered(void) {
 
 /* A spinner is shown on the layer in front, with no launcher or card over it: its own object is not hidden and no box above it is
  * (lv_obj_has_flag up to the layer). Its two-band refreshes tear without the board's frame pairing (R8a), so it follows the spin.
- * A spinner is not an image that spins: no spin cap and no spin frame log count it. */
+ * A spinner is not an image that spins: no spin cap and no spin frames count it. */
 static bool spinner_in_front(void) {
     if (s_state == NULL || !s_front || s_launcher_shown || s_crash_shown) {
         return false;
@@ -1756,30 +1759,41 @@ static void watch_spin(lv_obj_t *screen) {
 /* The frame gates' measurements, in a bench build only. LVGL sends LV_EVENT_REFR_READY at the end of every refresh, drawn or not, and
  * refreshes at most every LV_DEF_REFR_PERIOD while something is invalid, so while something moves the gap between two is the frame's
  * time. A gap is timed only when the refresh before it found the same motion: the first refresh of one follows a rest of any length.
- * - The launcher's (launcher carousel Task 6): while the carousel scrolls (a drag, a fling's snap, a side tap's animation) each refresh
- *   logs "launcher frame <ms> ms", the time since the refresh before it, to the nearest ms. At rest, closed (a snap LVGL still animates
- *   on a hidden row) or holding (the row is still) nothing is logged.
- * - The spin's (connected apps Task 1): while an image spins on the layer in front, with no card over it, each refresh logs
- *   "spin frame <ms> ms" the same way. Behind, under a card or with no image spinning, nothing is.
- * - A list's (games Task 5): while an app's box with scroll = "y" scrolls on the layer in front (a drag, its throw, an elastic end,
- *   an animated scroll_to), with no launcher or card over it, each refresh logs "scroll frame <ms> ms" the same way. Its scroll can
- *   also end with no refresh to see it (R5f): a throw that stops short of the ends stops at an input read that moves nothing, so
- *   nothing is invalidated and LVGL draws nothing more. So a box's LV_EVENT_SCROLL_END (the throw's end, in
- *   lv_indev_scroll_throw_handler, and any scroll animation's, completed or deleted) ends the timing too: the refresh after it isn't
- *   timed. A scroll that goes on past one costs that refresh's line: the spring-back from an elastic end, which starts just before the
- *   throw's SCROLL_END, a scroll_to that replaces a running one, a press that catches the list moving.
- * One test each refresh, and a line only while something moves. */
+ * Each motion's frames go into its summary (muse_frame_stats.h), printed at the refresh that finds the motion stopped, a second into
+ * it, or at 128 frames: one line, where a line a frame spun the console in this task and stalled the screen it measured.
+ * - The launcher's (launcher carousel Task 6), "launcher frames: ...": while the carousel scrolls (a drag, a fling's snap, a side tap's
+ *   animation). At rest, closed (a snap LVGL still animates on a hidden row) or holding (the row is still) nothing is timed.
+ * - The spin's (connected apps Task 1), "spin frames: ...": while an image spins on the layer in front, with no card over it. Behind,
+ *   under a card or with no image spinning, nothing is.
+ * - A list's (games Task 5), "scroll frames: ...": while an app's box with scroll = "y" scrolls on the layer in front (a drag, its
+ *   throw, an elastic end, an animated scroll_to), with no launcher or card over it. Its scroll can also end with no refresh to see it
+ *   (R5f): a throw that stops short of the ends stops at an input read that moves nothing, so nothing is invalidated and LVGL draws
+ *   nothing more. So a box's LV_EVENT_SCROLL_END (the throw's end, in lv_indev_scroll_throw_handler, and any scroll animation's,
+ *   completed or deleted) ends the motion too: the refresh after it isn't timed, and prints the summary, however late it comes. The
+ *   callback only notes the end: it runs deep in LVGL's input read, where vprintf's frame would sit on this task's thin stack. One
+ *   sent while an animation still runs on the box ends nothing: the throw's, as it hands the scroll to the spring-back from an elastic
+ *   end. A scroll that goes on past a real one costs that refresh's frame and splits its summary in two: a press that catches the list
+ *   moving, a scroll_to that replaces a running one (lv_anim_start deletes the old animation, which sends its SCROLL_END, before the
+ *   new one is on the box).
+ * One test each refresh, and a summary only for something that moved. */
 static EXT_RAM_BSS_ATTR struct {
     lv_display_t *display;  /* the display on_refresh is on: once, however often the layer is built */
     int64_t last_us;        /* esp_timer_get_time() of the last refresh that found the row scrolling; 0: the last one didn't */
     int64_t spin_last_us;   /* the same for an image spinning in front */
     int64_t scroll_last_us; /* and for an app's scroll box scrolling in front */
+    bool scroll_ended;      /* an app's box's LV_EVENT_SCROLL_END came since the last refresh */
+    muse_frame_stats_t launcher, spin, scroll;   /* each motion's frames so far, named in watch_frames */
 } s_frames;
 
-/* LV_EVENT_SCROLL_END on an app's box: its scroll ended, seen by a refresh or not. */
+/* LV_EVENT_SCROLL_END on an app's box: its scroll ended, seen by a refresh or not. The next refresh prints its summary. A throw that
+ * reaches an end sends its SCROLL_END as the spring-back it has just started animates the box (lv_indev_scroll_throw_handler): with an
+ * animation on the box the scroll goes on, and that animation's own SCROLL_END, sent once it is off the box, ends it. */
 static void on_scroll_end(lv_event_t *e) {
-    (void)e;
+    if (lv_anim_get(lv_event_get_target_obj(e), NULL) != NULL) {
+        return;
+    }
     s_frames.scroll_last_us = 0;
+    s_frames.scroll_ended = true;
 }
 
 /* Every box gets the callback as it is made, so one that turns scroll off and on doesn't collect more. */
@@ -1802,33 +1816,41 @@ static bool scroll_box_scrolling(void) {
     return false;
 }
 
+/* One motion at one refresh (on_refresh's): moving, the gap since the refresh before goes into its summary when that one found it
+ * moving too; stopped, its summary is printed. */
+static void time_frame(muse_frame_stats_t *s, bool moving, int64_t *last_us, int64_t now) {
+    if (!moving) {
+        *last_us = 0;
+        muse_frame_stats_flush(s);
+        return;
+    }
+    if (*last_us != 0) {
+        muse_frame_stats_add(s, (int)((now - *last_us + 500) / 1000), now);
+    }
+    *last_us = now;
+}
+
 static void on_refresh(lv_event_t *e) {
     (void)e;
     bool scrolling = s_launcher_shown && C.row != NULL && lv_obj_is_scrolling(C.row);
     bool spinning = spin_in_front();
     bool listing = scroll_box_scrolling();
-    if (!scrolling && !spinning && !listing) {
-        s_frames.last_us = s_frames.spin_last_us = s_frames.scroll_last_us = 0;
-        return;
+    if (s_frames.scroll_ended) {
+        s_frames.scroll_ended = false;
+        muse_frame_stats_flush(&s_frames.scroll);
     }
-    int64_t now = esp_timer_get_time();
-    if (scrolling && s_frames.last_us != 0) {
-        ESP_LOGI(TAG, "launcher frame %d ms", (int)((now - s_frames.last_us + 500) / 1000));
-    }
-    if (spinning && s_frames.spin_last_us != 0) {
-        ESP_LOGI(TAG, "spin frame %d ms", (int)((now - s_frames.spin_last_us + 500) / 1000));
-    }
-    if (listing && s_frames.scroll_last_us != 0) {
-        ESP_LOGI(TAG, "scroll frame %d ms", (int)((now - s_frames.scroll_last_us + 500) / 1000));
-    }
-    s_frames.last_us = scrolling ? now : 0;
-    s_frames.spin_last_us = spinning ? now : 0;
-    s_frames.scroll_last_us = listing ? now : 0;
+    int64_t now = scrolling || spinning || listing ? esp_timer_get_time() : 0;
+    time_frame(&s_frames.launcher, scrolling, &s_frames.last_us, now);
+    time_frame(&s_frames.spin, spinning, &s_frames.spin_last_us, now);
+    time_frame(&s_frames.scroll, listing, &s_frames.scroll_last_us, now);
 }
 
 static void watch_frames(lv_obj_t *screen) {
     lv_display_t *display = lv_obj_get_display(screen);
     if (display != NULL && display != s_frames.display) {
+        s_frames.launcher.name = "launcher";
+        s_frames.spin.name = "spin";
+        s_frames.scroll.name = "scroll";
         lv_display_add_event_cb(display, on_refresh, LV_EVENT_REFR_READY, NULL);
         s_frames.display = display;
     }

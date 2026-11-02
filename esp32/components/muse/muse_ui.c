@@ -45,6 +45,9 @@
 #include "muse_apps.h"
 #endif
 #include "muse_console.h"
+#if CONFIG_MUSE_BENCH
+#include "muse_frame_stats.h"
+#endif
 #include "muse_link.h"
 #include "muse_mem.h"
 #include "muse_menu.h"
@@ -914,31 +917,43 @@ static void slide_rests(lv_event_t *e)
 
 #if CONFIG_MUSE_BENCH
 /*
- * The slide's frames, in a bench build: while the home tileview scrolls, each display refresh (LV_EVENT_REFR_READY) logs
- * "page frame <ms> ms", the time since the refresh before it when that one found it scrolling too, as the apps' launcher and
- * spin frame lines do: the first refresh of a slide follows a rest of any length. The tileview's LV_EVENT_SCROLL_END ends the
- * timing, so the refresh after it isn't timed.
+ * The slide's frames, in a bench build: while the home tileview scrolls, each display refresh (LV_EVENT_REFR_READY) times the
+ * gap since the refresh before, when that one found it scrolling too, as the apps' launcher and spin frames are: the first
+ * refresh of a slide follows a rest of any length. The slide's frames are printed as one summary, "page frames: ..."
+ * (muse_frame_stats.h), its drag's and its snap's frames together, at the refresh that finds it at rest or the first after its
+ * LV_EVENT_SCROLL_END, which ends the timing, so that refresh isn't timed. The SCROLL_END callback runs deep in LVGL's input read and
+ * only notes the end: the summary is printed here, from the refresh.
  */
 static EXT_RAM_BSS_ATTR int64_t s_page_last_us;   /* esp_timer_get_time() of the last refresh that found it scrolling; 0: none */
+static EXT_RAM_BSS_ATTR bool s_page_ended;        /* its LV_EVENT_SCROLL_END came since the last refresh */
+static EXT_RAM_BSS_ATTR muse_frame_stats_t s_page_frames;   /* the slide's frames so far, named in build_screen */
 
 static void page_refresh(lv_event_t *e)
 {
     (void)e;
+    if (s_page_ended) {
+        s_page_ended = false;
+        muse_frame_stats_flush(&s_page_frames);
+    }
     if (!lv_obj_is_scrolling(s_tv)) {
         s_page_last_us = 0;
+        muse_frame_stats_flush(&s_page_frames);
         return;
     }
     int64_t now = esp_timer_get_time();
     if (s_page_last_us != 0) {
-        ESP_LOGI(TAG, "page frame %d ms", (int)((now - s_page_last_us + 500) / 1000));
+        muse_frame_stats_add(&s_page_frames, (int)((now - s_page_last_us + 500) / 1000), now);
     }
     s_page_last_us = now;
 }
 
+/* The drag's SCROLL_END comes as the snap it has just started animates the tileview (lv_indev_scroll_throw_handler): with an animation
+ * on it the slide goes on, and the snap's own SCROLL_END, sent once it is off the tileview, ends it. */
 static void page_scroll_end(lv_event_t *e)
 {
-    if (lv_event_get_target(e) == s_tv) {
+    if (lv_event_get_target(e) == s_tv && lv_anim_get(s_tv, NULL) == NULL) {
         s_page_last_us = 0;
+        s_page_ended = true;
     }
 }
 #endif
@@ -985,6 +1000,7 @@ static void build_screen(void)
         }
 #endif
 #if CONFIG_MUSE_BENCH
+        s_page_frames.name = "page";
         lv_obj_add_event_cb(s_tv, page_scroll_end, LV_EVENT_SCROLL_END, NULL);
         lv_display_add_event_cb(lv_obj_get_display(s_tv), page_refresh, LV_EVENT_REFR_READY, NULL);
 #endif

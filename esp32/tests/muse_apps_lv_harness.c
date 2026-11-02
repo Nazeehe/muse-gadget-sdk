@@ -2278,6 +2278,25 @@ bool lv_anim_delete(void *var, lv_anim_exec_xcb_t exec_cb) {
     return any;
 }
 
+/* lv_anim_get: the first animation on var with exec_cb (NULL: any), as LVGL's list walk finds it. The scroll animations the fake runs
+ * (anims[]) have no lv_anim_t of their own here: for one of those, with exec_cb NULL, a stand-in that is only ever compared with NULL
+ * (LVGL's would be the scroll_x_anim or scroll_y_anim animation). Not logged: it changes nothing. */
+lv_anim_t *lv_anim_get(void *var, lv_anim_exec_xcb_t exec_cb) {
+    static lv_anim_t scroll_anim_stand_in;
+    lvgl_calls++;
+    for (int i = 0; i < n_lv_anims; i++) {
+        if (lv_anims[i]->var == var && (lv_anims[i]->exec_cb == exec_cb || exec_cb == NULL)) {
+            return lv_anims[i];
+        }
+    }
+    for (int i = 0; exec_cb == NULL && i < n_anims; i++) {
+        if (anims[i].obj == var) {
+            return &scroll_anim_stand_in;
+        }
+    }
+    return NULL;
+}
+
 /* lv_obj_destructor's lv_anim_delete(obj, NULL), for an object the fake deletes: no call of apps_lv.c's, so not logged. */
 static void lv_anims_of_deleted(const lv_obj_t *o) {
     for (int i = 0; i < n_lv_anims;) {
@@ -8158,23 +8177,74 @@ static void the_hold_drops_offscreen_icons(void) {
 #define FRAMES_LOGGED false
 #endif
 
-/* The ms of each "launcher frame <ms> ms" line apps_lv.c logged since the last esp_clear, in order, into ms (at most cap of them);
- * how many there were. A line of any other shape after the words is a failure. */
-static int frame_lines_at(int line, int *ms, int cap) {
-    static const char prefix[] = "I muse_apps: launcher frame ";
+/* A motion's summary as muse_frame_stats.c prints it (Task 1 of the perf plan): "I muse_frames: <name> frames: n=<n> p50=<ms> p95=<ms>
+ * max=<ms> over50=<k>". */
+typedef struct {
+    int n, p50, p95, max, over50;
+} summary_t;
+
+/* The summaries of `name` ("launcher", "spin" or "scroll") logged since the last esp_clear, in order, into out (at most cap of them);
+ * how many there were. A line of any other shape after "<name> frames: " is a failure, and so is a per-frame line of the old kind
+ * ("<name> frame <ms> ms"): a line a frame is gone. */
+static int summaries_at(int line, const char *name, summary_t *out, int cap) {
+    char prefix[64], old[64];
+    snprintf(prefix, sizeof prefix, "I muse_frames: %s frames: ", name);
+    snprintf(old, sizeof old, " %s frame ", name);
+    size_t len = strlen(prefix);
     int n = 0;
-    for (const char *at = esp_peek(); (at = strstr(at, prefix)) != NULL; at += sizeof prefix - 1) {
-        char *end;
-        long v = strtol(at + sizeof prefix - 1, &end, 10);
-        CHECK_AT(line, end != at + sizeof prefix - 1 && strncmp(end, " ms\n", 4) == 0, "a frame line of another shape:\n%s", at);
+    for (const char *at = esp_peek(); (at = strstr(at, prefix)) != NULL; at += len) {
+        summary_t s = {0};
+        int used = 0;
+        int got = sscanf(at + len, "n=%d p50=%d p95=%d max=%d over50=%d%n", &s.n, &s.p50, &s.p95, &s.max, &s.over50, &used);
+        CHECK_AT(line, got == 5 && at[len + used] == '\n', "a %s summary of another shape:\n%s", name, at);
         if (n < cap) {
-            ms[n] = (int)v;
+            out[n] = s;
         }
         n++;
     }
+    CHECK_AT(line, strstr(esp_peek(), old) == NULL, "a %s line a frame:\n%s", name, esp_peek());
     return n;
 }
-#define FRAME_LINES(ms, cap) frame_lines_at(__LINE__, (ms), (cap))
+#define SUMMARIES(name, out, cap) summaries_at(__LINE__, (name), (out), (cap))
+
+static int cmp_int(const void *a, const void *b) {
+    return (*(const int *)a > *(const int *)b) - (*(const int *)a < *(const int *)b);
+}
+
+/* What the summary of these frames (ms each, n of them) says, worked out here by sorting them: p50 and p95 are nearest-rank (the
+ * smallest r with 100 * r >= p * n is the rank), over50 counts the frames over 50 ms. */
+static summary_t expect_summary(const int *ms, int n) {
+    int sorted[256];
+    summary_t s = {n, 0, 0, 0, 0};
+    if (n <= 0 || n > (int)ARRAY_LEN(sorted)) {
+        return s;
+    }
+    memcpy(sorted, ms, (size_t)n * sizeof *ms);
+    qsort(sorted, (size_t)n, sizeof *sorted, cmp_int);
+    int r50 = 1, r95 = 1;
+    while (100 * r50 < 50 * n) {
+        r50++;
+    }
+    while (100 * r95 < 95 * n) {
+        r95++;
+    }
+    s.p50 = sorted[r50 - 1];
+    s.p95 = sorted[r95 - 1];
+    s.max = sorted[n - 1];
+    for (int i = 0; i < n; i++) {
+        s.over50 += ms[i] > 50;
+    }
+    return s;
+}
+
+/* The summary got is the one these frames make. */
+static void check_summary_at(int line, const char *what, summary_t got, const int *ms, int n) {
+    summary_t want = expect_summary(ms, n);
+    CHECK_AT(line, got.n == want.n && got.p50 == want.p50 && got.p95 == want.p95 && got.max == want.max && got.over50 == want.over50,
+             "%s: n=%d p50=%d p95=%d max=%d over50=%d, want n=%d p50=%d p95=%d max=%d over50=%d", what, got.n, got.p50, got.p95, got.max,
+             got.over50, want.n, want.p50, want.p95, want.max, want.over50);
+}
+#define CHECK_SUMMARY(what, got, ms, n) check_summary_at(__LINE__, (what), (got), (ms), (n))
 
 /* A refresh gap_us after the last one. */
 static void refresh_after(int64_t gap_us) {
@@ -8182,9 +8252,10 @@ static void refresh_after(int64_t gap_us) {
     fake_refresh();
 }
 
-/* While the carousel scrolls (a drag, a fling's snap), each display refresh logs "launcher frame <ms> ms", the time since the refresh
- * before it, rounded to the ms, when that one found it scrolling too: the first refresh of a scroll follows a rest of any length and
- * isn't timed. Nothing at rest, nothing from a row that moves on under a closed launcher, and one callback on the display however
+/* While the carousel scrolls (a drag, a fling's snap), each display refresh times the gap since the refresh before it, rounded to the
+ * ms, when that one found it scrolling too (the first refresh of a scroll follows a rest of any length and isn't timed), and the
+ * refresh that finds it at rest prints the scroll's frames as one summary, "launcher frames: n=... p50=... p95=... max=...
+ * over50=...". Nothing at rest, nothing from a row that moves on under a closed launcher, and one callback on the display however
  * often the layer is built. A build without the bench registers nothing and logs nothing, whatever scrolls. */
 static void launcher_frame_log(void) {
     cards_scene();
@@ -8197,14 +8268,15 @@ static void launcher_frame_log(void) {
     }
     apps_lv_show_launcher(FIVE, 5, NULL, pick);
     int row = carousel_row();
-    int ms[64];
+    summary_t got[8];
+    int ms[128], timed = 0;
     esp_clear();
     for (int i = 0; i < 3; i++) {
         refresh_after(1000000);  /* at rest: a clock tick, an icon swapped in */
     }
-    CHECK(FRAME_LINES(ms, 64) == 0, "nothing at rest:\n%s", esp_peek());
+    CHECK(SUMMARIES("launcher", got, 8) == 0, "nothing at rest:\n%s", esp_peek());
 
-    /* A drag. Its first refresh follows the rest; the rest are timed, to the nearest ms. */
+    /* A drag. Its first refresh follows the rest; the rest are timed, to the nearest ms, and nothing is printed while it goes on. */
     lv_point_t p = face_at(0);
     fake_down(p.x, p.y);
     fake_move(p.x - 12, p.y);
@@ -8212,45 +8284,49 @@ static void launcher_frame_log(void) {
     refresh_after(15000);
     static const int64_t gaps_us[] = {20000, 33000, 16400, 16600, 51000};
     static const int want_drag[] = {20, 33, 16, 17, 51};
+    int64_t moving_us = 0;
     for (size_t i = 0; i < ARRAY_LEN(gaps_us); i++) {
         fake_move(p.x - 12 * (int32_t)(i + 2), p.y);
         refresh_after(gaps_us[i]);
+        ms[timed++] = want_drag[i];
+        moving_us += gaps_us[i];
     }
-    int n = FRAME_LINES(ms, 64);
-    if (FRAMES_LOGGED) {
-        CHECK(n == 5, "the drag's frames after its first: %d lines\n%s", n, esp_peek());
-        for (int i = 0; i < 5 && i < n; i++) {
-            CHECK(ms[i] == want_drag[i], "frame %d of the drag: %d ms, want %d", i, ms[i], want_drag[i]);
-        }
-    } else {
-        CHECK(n == 0, "no frame line without the bench:\n%s", esp_peek());
-    }
+    CHECK(SUMMARIES("launcher", got, 8) == 0, "nothing while the drag goes on:\n%s", esp_peek());
 
-    /* The fling: after the lift, the snap's animation, a refresh after each of its frames, each timed until it has ended. */
-    esp_clear();
+    /* The fling: after the lift, the snap's animation, a refresh after each of its frames, each timed until it has ended; the refresh
+     * that finds it ended prints the drag's and the snap's frames as one summary (all of it in under a second). */
     fake_lift();
     int frames = 0;
     for (; frames < 100 && (throw_pending || n_anims > 0); frames++) {
         clock_us += 16000;
         fake_frame(16);
         fake_refresh();
+        if (fake_scrolling(row)) {  /* the refresh found it scrolling: timed */
+            ms[timed++] = 16;
+            moving_us += 16000;
+        }
     }
     CHECK(!fake_scrolling(row) && frames >= 6, "the snap ran %d frames and ended", frames);
-    n = FRAME_LINES(ms, 64);
+    CHECK(moving_us < 1000000, "the drag and the snap took %lld us: under the summary's second", (long long)moving_us);
+    int n = SUMMARIES("launcher", got, 8);
     if (FRAMES_LOGGED) {
-        CHECK(n == frames - 1, "every frame of the snap but the one that ended it: %d lines, %d frames\n%s", n, frames, esp_peek());
-        for (int i = 0; i < n && i < 64; i++) {
-            CHECK(ms[i] == 16, "frame %d of the snap: %d ms", i, ms[i]);
+        CHECK(n == 1, "one summary of the drag and the snap: %d\n%s", n, esp_peek());
+        CHECK(timed == 5 + frames - 1, "the drag's 5 frames and every frame of the snap but the one that ended it: %d", timed);
+        if (n == 1) {
+            CHECK_SUMMARY("the drag and the snap", got[0], ms, timed);
+            CHECK(got[0].max == 51 && got[0].over50 == 1, "the drag's 51 ms frame is its longest, and over 50 ms");
         }
     } else {
-        CHECK(n == 0, "no frame line without the bench:\n%s", esp_peek());
+        CHECK(n == 0, "no summary without the bench:\n%s", esp_peek());
     }
 
-    /* At rest again, for 5 s: nothing, and the next drag's first refresh isn't a 5,000 ms frame. */
+    /* At rest again, for 5 s: nothing, and the next drag's first refresh isn't a 5,000 ms frame: its summary, printed at the first
+     * refresh after the row comes to rest, has the one frame after it. */
     esp_clear();
     for (int i = 0; i < 5; i++) {
         refresh_after(1000000);
     }
+    CHECK(SUMMARIES("launcher", got, 8) == 0, "nothing at rest after the snap:\n%s", esp_peek());
     p = (lv_point_t){SCREEN_CENTRE, face_at(0).y};  /* the app at the centre, wherever the fling left it */
     int way = scroll_now() < 4 * APPS_LV_ITEM_PITCH ? -1 : 1;  /* towards an app there is */
     fake_down(p.x, p.y);
@@ -8258,11 +8334,12 @@ static void launcher_frame_log(void) {
     refresh_after(15000);
     fake_move(p.x + way * 24, p.y);
     refresh_after(18000);
-    n = FRAME_LINES(ms, 64);
-    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || ms[0] == 18), "after a rest, only the frame after the first: %d lines\n%s",
-          n, esp_peek());
     fake_lift();
     SETTLE();
+    refresh_after(16000);  /* at rest */
+    n = SUMMARIES("launcher", got, 8);
+    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || (got[0].n == 1 && got[0].max == 18)),
+          "after a rest, only the frame after the first: %d summaries\n%s", n, esp_peek());
 
     /* A launcher closed under a fling: LVGL animates its hidden row to the snap point all the same, and nothing is logged. */
     way = scroll_now() < 4 * APPS_LV_ITEM_PITCH ? -1 : 1;
@@ -8277,7 +8354,7 @@ static void launcher_frame_log(void) {
         fake_frame(16);
         fake_refresh();
     }
-    CHECK(FRAME_LINES(ms, 64) == 0, "nothing from a closed launcher's row:\n%s", esp_peek());
+    CHECK(SUMMARIES("launcher", got, 8) == 0, "nothing from a closed launcher's row:\n%s", esp_peek());
     LAUNCHER_END();
 }
 
@@ -8620,26 +8697,10 @@ static void spin_ends_with_the_widget(void) {
     FINISH(&e);
 }
 
-/* The ms of each "spin frame <ms> ms" line apps_lv.c logged since the last esp_clear, as frame_lines_at reads the launcher's. */
-static int spin_lines_at(int line, int *ms, int cap) {
-    static const char prefix[] = "I muse_apps: spin frame ";
-    int n = 0;
-    for (const char *at = esp_peek(); (at = strstr(at, prefix)) != NULL; at += sizeof prefix - 1) {
-        char *end;
-        long v = strtol(at + sizeof prefix - 1, &end, 10);
-        CHECK_AT(line, end != at + sizeof prefix - 1 && strncmp(end, " ms\n", 4) == 0, "a spin frame line of another shape:\n%s", at);
-        if (n < cap) {
-            ms[n] = (int)v;
-        }
-        n++;
-    }
-    return n;
-}
-#define SPIN_LINES(ms, cap) spin_lines_at(__LINE__, (ms), (cap))
-
-/* The spin gate's measurement, in a bench build: while an image spins on the layer in front, each display refresh logs "spin frame
- * <ms> ms", the time since the refresh before it, when that one found an image spinning there too (the first after a rest isn't
- * timed). Nothing while none spins, while the layer is behind or a card is over it, and nothing at all without the bench. */
+/* The spin gate's measurement, in a bench build: while an image spins on the layer in front, each display refresh times the gap since
+ * the refresh before it, when that one found an image spinning there too (the first after a rest isn't timed), and the refresh that
+ * finds none spinning there prints the spin's frames as one summary, "spin frames: ...". A spin that goes on prints one every second
+ * of it. Nothing while none spins, while the layer is behind or a card is over it, and nothing at all without the bench. */
 static void spin_frame_log(void) {
     env_t e;
     scene(&e);
@@ -8650,11 +8711,11 @@ static void spin_frame_log(void) {
         CHECK(display_obj.n_cbs == 0, "a build without the bench adds nothing to the display: %d callbacks", display_obj.n_cbs);
     }
     apps_lv_set_front(true);
-    int ms[64];
+    summary_t got[8];
     esp_clear();
     refresh_after(1000000);
     refresh_after(16000);
-    CHECK(SPIN_LINES(ms, 64) == 0, "nothing while no image spins:\n%s", esp_peek());
+    CHECK(SUMMARIES("spin", got, 8) == 0, "nothing while no image spins:\n%s", esp_peek());
 
     RUN(&e, "d = ui.image{src = 'a.bin', spin = 33}");
     CHECK(APPLY(&e), "made");
@@ -8666,57 +8727,93 @@ static void spin_frame_log(void) {
         fake_frame(15);
         refresh_after(gaps_us[i]);
     }
-    int n = SPIN_LINES(ms, 64);
-    if (FRAMES_LOGGED) {
-        CHECK(n == 5, "the spin's frames after its first: %d lines\n%s", n, esp_peek());
-        for (int i = 0; i < 5 && i < n; i++) {
-            CHECK(ms[i] == want[i], "frame %d: %d ms, want %d", i, ms[i], want[i]);
-        }
-    } else {
-        CHECK(n == 0, "no spin frame line without the bench:\n%s", esp_peek());
-    }
-    CHECK(FRAME_LINES(ms, 64) == 0, "no launcher frame line for a spin:\n%s", esp_peek());
+    CHECK(SUMMARIES("spin", got, 8) == 0, "nothing while it spins on:\n%s", esp_peek());
 
-    /* Behind (another page shows): nothing; in front again, the first refresh isn't timed. */
-    esp_clear();
+    /* Behind (another page shows): the refresh that finds it so prints the spin's summary, and nothing after; in front again, the
+     * first refresh isn't timed. */
     apps_lv_set_front(false);
     refresh_after(33000);
+    int n = SUMMARIES("spin", got, 8);
+    if (FRAMES_LOGGED) {
+        CHECK(n == 1, "the spin's frames after its first, as one summary: %d\n%s", n, esp_peek());
+        if (n == 1) {
+            CHECK_SUMMARY("the spin", got[0], want, 5);
+        }
+    } else {
+        CHECK(n == 0, "no summary without the bench:\n%s", esp_peek());
+    }
+    CHECK(SUMMARIES("launcher", got, 8) == 0 && SUMMARIES("scroll", got, 8) == 0, "no launcher or list summary for a spin:\n%s",
+          esp_peek());
+    esp_clear();
     refresh_after(33000);
-    CHECK(SPIN_LINES(ms, 64) == 0, "nothing while the layer is behind:\n%s", esp_peek());
+    CHECK(SUMMARIES("spin", got, 8) == 0, "nothing while the layer is behind:\n%s", esp_peek());
     apps_lv_set_front(true);
     refresh_after(33000);
     refresh_after(20000);
-    n = SPIN_LINES(ms, 64);
-    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || ms[0] == 20), "in front again: %d lines\n%s", n, esp_peek());
 
-    /* A card over it: nothing. */
-    esp_clear();
+    /* A card over it: the summary of the frame since it came in front, and nothing under the card. */
     apps_lv_show_crash("Spin", NULL);
     refresh_after(33000);
+    n = SUMMARIES("spin", got, 8);
+    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || (got[0].n == 1 && got[0].max == 20)), "in front again: %d summaries\n%s",
+          n, esp_peek());
+    esp_clear();
     refresh_after(33000);
-    CHECK(SPIN_LINES(ms, 64) == 0, "nothing under a card:\n%s", esp_peek());
+    CHECK(SUMMARIES("spin", got, 8) == 0, "nothing under a card:\n%s", esp_peek());
     apps_lv_hide_cards();
 
-    /* Stopped, or gone: nothing. */
+    /* Stopped: nothing; spinning again, its summary once its widget is gone. */
     RUN(&e, "d:set{spin = 0}");
     CHECK(APPLY(&e), "stopped");
     esp_clear();
     for (int i = 0; i < 3; i++) {
         refresh_after(33000);
     }
-    CHECK(SPIN_LINES(ms, 64) == 0, "nothing once it stops:\n%s", esp_peek());
+    CHECK(SUMMARIES("spin", got, 8) == 0, "nothing once it stops:\n%s", esp_peek());
     RUN(&e, "d:set{spin = 10}");
     CHECK(APPLY(&e), "again");
     esp_clear();
     refresh_after(33000);
     refresh_after(33000);
-    CHECK(SPIN_LINES(ms, 64) == (FRAMES_LOGGED ? 1 : 0), "spinning again:\n%s", esp_peek());
+    CHECK(SUMMARIES("spin", got, 8) == 0, "spinning again, still going:\n%s", esp_peek());
     RUN(&e, "d:delete()");
     CHECK(APPLY(&e), "deleted");
+    refresh_after(33000);
+    n = SUMMARIES("spin", got, 8);
+    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || (got[0].n == 1 && got[0].max == 33)),
+          "its widget gone: the frame of the spin again: %d summaries\n%s", n, esp_peek());
     esp_clear();
     refresh_after(33000);
+    CHECK(SUMMARIES("spin", got, 8) == 0, "nothing once its widget is gone:\n%s", esp_peek());
+
+    /* A spin of 1.2 s with no break: two summaries, the first ending with the frame that reaches a second since its first frame (at
+     * 33 ms a frame, the 32nd: 31 * 33 ms is 1,023 ms), the second the rest, printed as it stops. */
+    RUN(&e, "d = ui.image{src = 'a.bin', spin = 33}");
+    CHECK(APPLY(&e), "made again");
+    esp_clear();
+    refresh_after(500000);  /* the first: not timed */
+    int frames = 0;
+    for (int64_t spun = 0; spun + 33000 <= 1200000; spun += 33000) {
+        fake_frame(33);
+        refresh_after(33000);
+        frames++;
+    }
+    CHECK(frames == 36, "36 frames of 33 ms: %d", frames);
+    CHECK(SUMMARIES("spin", got, 8) == (FRAMES_LOGGED ? 1 : 0), "a second's summary while it spins on:\n%s", esp_peek());
+    RUN(&e, "d:set{spin = 0}");
+    CHECK(APPLY(&e), "stopped again");
     refresh_after(33000);
-    CHECK(SPIN_LINES(ms, 64) == 0, "nothing once its widget is gone:\n%s", esp_peek());
+    n = SUMMARIES("spin", got, 8);
+    if (FRAMES_LOGGED) {
+        CHECK(n == 2, "1.2 s of spin: two summaries, %d\n%s", n, esp_peek());
+        if (n == 2) {
+            CHECK(got[0].n == 32 && got[1].n == 4 && got[0].p50 == 33 && got[0].p95 == 33 && got[0].max == 33 && got[1].max == 33 &&
+                      got[0].over50 == 0 && got[1].over50 == 0,
+                  "a second's 32 frames, then the 4 left: n=%d and n=%d\n%s", got[0].n, got[1].n, esp_peek());
+        }
+    } else {
+        CHECK(n == 0, "no summary without the bench:\n%s", esp_peek());
+    }
     FINISH(&e);
 }
 
@@ -10221,24 +10318,6 @@ static void children_of_a_scroll_box_get_no_overflow_warning(void) {
 
 /* ---- Games Task 5: the list gate's measurement, in a MUSE_BENCH build only ---- */
 
-/* The ms of each "scroll frame <ms> ms" line apps_lv.c logged since the last esp_clear, as frame_lines_at reads the launcher's. */
-static int scroll_lines_at(int line, int *ms, int cap) {
-    static const char prefix[] = "I muse_apps: scroll frame ";
-    int n = 0;
-    for (const char *at = esp_peek(); (at = strstr(at, prefix)) != NULL; at += sizeof prefix - 1) {
-        char *end;
-        long v = strtol(at + sizeof prefix - 1, &end, 10);
-        CHECK_AT(line, end != at + sizeof prefix - 1 && strncmp(end, " ms\n", 4) == 0, "a scroll frame line of another shape:\n%s",
-                 at);
-        if (n < cap) {
-            ms[n] = (int)v;
-        }
-        n++;
-    }
-    return n;
-}
-#define SCROLL_LINES(ms, cap) scroll_lines_at(__LINE__, (ms), (cap))
-
 /* One run of LVGL's timers gap_us after the last refresh: the animations and a throw's step, then the refresh. */
 static void frame_then_refresh(int64_t gap_us) {
     fake_frame((int)(gap_us / 1000));
@@ -10246,9 +10325,10 @@ static void frame_then_refresh(int64_t gap_us) {
 }
 
 /* While an app's box with scroll = "y" scrolls on the layer in front (a drag, its throw, an animated scroll_to), each display refresh
- * logs "scroll frame <ms> ms", the time since the refresh before it, when that one found a box scrolling there too: the first refresh of
- * a scroll follows a rest of any length and isn't timed. Nothing at rest, nothing while only an image spins, nothing while the layer is
- * behind or a card or the launcher is over it, and nothing at all, with no callback on the display, without the bench. */
+ * times the gap since the refresh before it, when that one found a box scrolling there too (the first refresh of a scroll follows a
+ * rest of any length and isn't timed), and the scroll's frames are printed as one summary, "scroll frames: ...", at the refresh that
+ * finds it stopped, or the first after the box's LV_EVENT_SCROLL_END. Nothing at rest, nothing while only an image spins, nothing while
+ * the layer is behind or a card or the launcher is over it, and nothing at all, with no callback on the display, without the bench. */
 static void scroll_frame_log(void) {
     env_t e;
     list_scene(&e, 10, true);  /* 500 px of rows in 200, each with a tap: a drag that begins on one scrolls the list */
@@ -10259,52 +10339,56 @@ static void scroll_frame_log(void) {
     } else {
         CHECK(display_obj.n_cbs == 0, "a build without the bench adds nothing to the display: %d callbacks", display_obj.n_cbs);
     }
-    int ms[64];
+    summary_t got[8];
+    int ms[128], timed = 0;
     esp_clear();
     refresh_after(1000000);
     refresh_after(16000);
-    CHECK(SCROLL_LINES(ms, 64) == 0, "nothing at rest:\n%s", esp_peek());
+    CHECK(SUMMARIES("scroll", got, 8) == 0, "nothing at rest:\n%s", esp_peek());
 
-    /* A drag that begins on a row. Its first refresh follows the rest; the rest are timed, to the nearest ms. */
+    /* A drag of 6 frames that begins on a row. Its first refresh follows the rest; the rest are timed, to the nearest ms, and
+     * nothing is printed while it goes on. */
     int id = fake_down(233, 200);
     fake_move(233, 188);
     CHECK(id == BOX_OBJ(2) && fake_scrolling(list), "the drag began on %d, not row 2 (%d), or scrolled nothing", id, BOX_OBJ(2));
     refresh_after(15000);
-    static const int64_t gaps_us[] = {20000, 33000, 16400, 16600, 51000};
-    static const int want[] = {20, 33, 16, 17, 51};
+    static const int64_t gaps_us[] = {20000, 33000, 16400, 16600, 50000, 24000};
+    static const int want[] = {20, 33, 16, 17, 50, 24};
+    int64_t moving_us = 0;
     for (size_t i = 0; i < ARRAY_LEN(gaps_us); i++) {
         fake_move(233, 188 - 8 * (int32_t)(i + 1));
         refresh_after(gaps_us[i]);
+        ms[timed++] = want[i];
+        moving_us += gaps_us[i];
     }
-    int n = SCROLL_LINES(ms, 64);
-    if (FRAMES_LOGGED) {
-        CHECK(n == 5, "the drag's frames after its first: %d lines\n%s", n, esp_peek());
-        for (int i = 0; i < 5 && i < n; i++) {
-            CHECK(ms[i] == want[i], "frame %d of the drag: %d ms, want %d", i, ms[i], want[i]);
-        }
-    } else {
-        CHECK(n == 0, "no scroll frame line without the bench:\n%s", esp_peek());
-    }
-    CHECK(FRAME_LINES(ms, 64) == 0 && SPIN_LINES(ms, 64) == 0, "no launcher or spin frame line for a list:\n%s", esp_peek());
+    CHECK(SUMMARIES("scroll", got, 8) == 0, "nothing while the drag goes on:\n%s", esp_peek());
 
-    /* The throw after the lift: a refresh after each of its frames, each timed but the one after the frame that ends it. The row
-     * heard press and release, and no tap. */
-    esp_clear();
+    /* The throw after the lift: a refresh after each of its frames, each timed but the one after the frame that ends it, which prints
+     * the drag's 6 frames and the throw's as one summary (all in under a second). The row heard press and release, and no tap. */
     fake_lift();
     int frames = 0;
     for (; frames < 100 && fake_scrolling(list); frames++) {
         frame_then_refresh(16000);
+        if (fake_scrolling(list)) {  /* the refresh found it scrolling: timed */
+            ms[timed++] = 16;
+            moving_us += 16000;
+        }
     }
     CHECK(!fake_scrolling(list) && frames >= 5, "the throw ran %d frames and ended", frames);
-    n = SCROLL_LINES(ms, 64);
+    CHECK(moving_us < 1000000, "the drag and the throw took %lld us: under the summary's second", (long long)moving_us);
+    int n = SUMMARIES("scroll", got, 8);
     if (FRAMES_LOGGED) {
-        CHECK(n == frames - 1, "every frame of the throw but the one that ended it: %d lines, %d frames\n%s", n, frames, esp_peek());
-        for (int i = 0; i < n && i < 64; i++) {
-            CHECK(ms[i] == 16, "frame %d of the throw: %d ms", i, ms[i]);
+        CHECK(n == 1, "one summary of the drag and its throw: %d\n%s", n, esp_peek());
+        CHECK(timed == 6 + frames - 1, "the drag's 6 and every frame of the throw but the one that ended it: %d", timed);
+        if (n == 1) {
+            CHECK_SUMMARY("the drag and its throw", got[0], ms, timed);
+            CHECK(got[0].max == 50 && got[0].over50 == 0, "the 50 ms frame is the longest, and not over 50 ms");
         }
     } else {
-        CHECK(n == 0, "no scroll frame line without the bench:\n%s", esp_peek());
+        CHECK(n == 0, "no summary without the bench:\n%s", esp_peek());
     }
+    CHECK(SUMMARIES("launcher", got, 8) == 0 && SUMMARIES("spin", got, 8) == 0, "no launcher or spin summary for a list:\n%s",
+          esp_peek());
     CHECK(n_evs == 2 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE, "press, release and no tap: %d events",
           n_evs);
 
@@ -10313,36 +10397,45 @@ static void scroll_frame_log(void) {
     for (int i = 0; i < 5; i++) {
         refresh_after(1000000);
     }
-    CHECK(SCROLL_LINES(ms, 64) == 0, "nothing at rest after the throw:\n%s", esp_peek());
+    CHECK(SUMMARIES("scroll", got, 8) == 0, "nothing at rest after the throw:\n%s", esp_peek());
 
-    /* An animated scroll_to is timed as a drag is (to the end, 400 ms of animation: what follows needs it to run). */
+    /* An animated scroll_to is timed as a drag is (to the end, 400 ms of animation: what follows needs it to run). The layer going
+     * behind ends it as a motion: that refresh prints its summary, and nothing more comes while it is behind. */
     RUN(&e, "list:scroll_to('end', true)");
     CHECK(APPLY(&e), "animated");
     CHECK(fake_scrolling(list), "it animates");
-    esp_clear();
     refresh_after(16000);  /* after the rest: not timed */
     frame_then_refresh(16000);
     frame_then_refresh(20000);
-    n = SCROLL_LINES(ms, 64);
-    CHECK(n == (FRAMES_LOGGED ? 2 : 0) && (!FRAMES_LOGGED || (ms[0] == 16 && ms[1] == 20)), "an animated scroll_to: %d lines\n%s", n,
-          esp_peek());
-
-    /* Behind (another page shows): nothing; in front again, the first refresh isn't timed. */
-    esp_clear();
+    CHECK(SUMMARIES("scroll", got, 8) == 0, "nothing while it animates on:\n%s", esp_peek());
     apps_lv_set_front(false);
     frame_then_refresh(16000);
+    n = SUMMARIES("scroll", got, 8);
+    if (FRAMES_LOGGED) {
+        static const int want_to[] = {16, 20};
+        CHECK(n == 1, "an animated scroll_to: %d summaries\n%s", n, esp_peek());
+        if (n == 1) {
+            CHECK_SUMMARY("the animated scroll_to", got[0], want_to, 2);
+        }
+    } else {
+        CHECK(n == 0, "no summary without the bench:\n%s", esp_peek());
+    }
+    esp_clear();
     frame_then_refresh(16000);
-    CHECK(SCROLL_LINES(ms, 64) == 0, "nothing while the layer is behind:\n%s", esp_peek());
+    CHECK(SUMMARIES("scroll", got, 8) == 0, "nothing while the layer is behind:\n%s", esp_peek());
+
+    /* In front again, the first refresh isn't timed; a card over it ends that motion with the frame since. */
     apps_lv_set_front(true);
     frame_then_refresh(16000);
     frame_then_refresh(20000);
-    n = SCROLL_LINES(ms, 64);
-    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || ms[0] == 20), "in front again: %d lines\n%s", n, esp_peek());
-
-    /* A card over it, then the launcher: nothing, while the list still moves under them. */
-    esp_clear();
     apps_lv_show_crash("List", NULL);
     frame_then_refresh(16000);
+    n = SUMMARIES("scroll", got, 8);
+    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || (got[0].n == 1 && got[0].max == 20)), "in front again: %d summaries\n%s",
+          n, esp_peek());
+
+    /* Under a card, then the launcher: nothing, while the list still moves under them. */
+    esp_clear();
     frame_then_refresh(16000);
     apps_lv_hide_cards();
     apps_lv_show_launcher(FIVE, 5, NULL, pick);
@@ -10351,17 +10444,21 @@ static void scroll_frame_log(void) {
     CHECK(fake_scrolling(list), "the list's animation still runs");
     apps_lv_hide_cards();
     run_io();
-    CHECK(SCROLL_LINES(ms, 64) == 0, "nothing under a card or the launcher:\n%s", esp_peek());
+    CHECK(SUMMARIES("scroll", got, 8) == 0, "nothing under a card or the launcher:\n%s", esp_peek());
     SETTLE();
 
-    /* At rest with an image spinning in front: the spin's lines, not the list's. */
+    /* At rest with an image spinning in front: the spin's summary, not the list's, once the layer goes behind. */
     RUN(&e, "ui.image{src = 'a.bin', spin = 33}");
     CHECK(APPLY(&e), "a spin");
     esp_clear();
     for (int i = 0; i < 3; i++) {
         frame_then_refresh(33000);
     }
-    CHECK(SCROLL_LINES(ms, 64) == 0 && SPIN_LINES(ms, 64) == (FRAMES_LOGGED ? 2 : 0), "a spin by a list at rest:\n%s", esp_peek());
+    apps_lv_set_front(false);
+    frame_then_refresh(33000);
+    n = SUMMARIES("spin", got, 8);
+    CHECK(SUMMARIES("scroll", got + 1, 7) == 0 && n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || got[0].n == 2),
+          "a spin by a list at rest:\n%s", esp_peek());
     FINISH(&e);
 }
 
@@ -10390,10 +10487,12 @@ static bool step_and_refresh_if_moved(int list) {
 }
 
 /* Ruling R5f: a throw that stops short of the list's ends ends at an input read that moves nothing (lv_indev_scroll_throw_handler's
- * 0 px step), so no refresh sees it end; LVGL sends SCROLL_END there, and that is what ends the timing. After a rest with no refresh
- * at all, the next drag's first refresh isn't timed. A throw that reaches an end springs back in an animation that starts as the
- * throw ends, before its SCROLL_END: the spring-back's first refresh isn't timed (the one line this costs), the rest are, and its own
- * end is seen. Each box has one SCROLL_END callback in a bench build, however often its scroll changes, and none in any other. */
+ * 0 px step), so no refresh sees it end; LVGL sends SCROLL_END there, and that is what ends its motion: its summary comes at the next
+ * refresh, however late (never from the SCROLL_END callback itself, deep in LVGL's input read), and that refresh, after a rest with no
+ * refresh at all, isn't timed. A throw that reaches an end springs back in an animation that starts as the throw ends, before its
+ * SCROLL_END: that end, with the spring-back's animation running on the box, ends nothing, and the drag, its throw and the spring-back
+ * are one motion, every refresh timed, its summary printed after the spring-back's own SCROLL_END. Each box has one SCROLL_END callback
+ * in a bench build, however often its scroll changes, and none in any other. */
 static void a_throw_that_ends_unseen_times_no_rest(void) {
     env_t e;
     list_scene(&e, 10, true);  /* 500 px of rows in 200: it scrolls up to 300 */
@@ -10404,9 +10503,9 @@ static void a_throw_that_ends_unseen_times_no_rest(void) {
     CHECK(APPLY(&e), "scroll again");
     CHECK(scroll_end_cbs(list) == (FRAMES_LOGGED ? 1 : 0) && scroll_end_cbs(BOX_OBJ(1)) == (FRAMES_LOGGED ? 1 : 0),
           "SCROLL_END callbacks: the list %d, a row %d", scroll_end_cbs(list), scroll_end_cbs(BOX_OBJ(1)));
-    int ms[64];
+    summary_t got[8];
 
-    /* A drag and its throw, which stops in the list's middle. */
+    /* A drag and its throw, which stops in the list's middle with no refresh to see it: nothing yet. */
     esp_clear();
     fake_down(233, 200);
     fake_move(233, 188);
@@ -10422,27 +10521,24 @@ static void a_throw_that_ends_unseen_times_no_rest(void) {
     }
     int32_t y = fake_obj(list)->scroll_y;
     CHECK(!fake_scrolling(list) && y > 0 && y < 300, "the throw ended in the middle: at %d after %d steps", (int)y, frames);
-    int n = SCROLL_LINES(ms, 64);
-    if (FRAMES_LOGGED) {
-        CHECK(n == 4 + frames - 1, "the drag's 4 and the throw's moving steps: %d lines, %d steps\n%s", n, frames, esp_peek());
-        for (int i = 0; i < n && i < 64; i++) {
-            CHECK(ms[i] == 16, "frame %d: %d ms", i, ms[i]);
-        }
-    } else {
-        CHECK(n == 0, "no scroll frame line without the bench:\n%s", esp_peek());
-    }
+    CHECK(SUMMARIES("scroll", got, 8) == 0, "no refresh saw it end: nothing yet\n%s", esp_peek());
 
-    /* 800 ms with no refresh, then a drag: its first refresh isn't a frame of 800 ms. */
-    esp_clear();
+    /* 800 ms with no refresh, then a drag: its first refresh prints the throw's summary (the drag's 4 frames and the throw's moving
+     * steps, none of them 800 ms) and isn't timed itself. */
     clock_us += 800000;
     fake_down(233, 200);
     fake_move(233, 188);
     refresh_after(16000);
     fake_move(233, 180);
     refresh_after(20000);
-    n = SCROLL_LINES(ms, 64);
-    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || ms[0] == 20), "the next drag: %d lines, the first %d ms\n%s", n,
-          n > 0 ? ms[0] : -1, esp_peek());
+    int n = SUMMARIES("scroll", got, 8);
+    if (FRAMES_LOGGED) {
+        CHECK(n == 1 && got[0].n == 4 + frames - 1 && got[0].p50 == 16 && got[0].max == 16,
+              "the drag's 4 and the throw's moving steps: %d summaries, n=%d, %d steps\n%s", n, n > 0 ? got[0].n : -1, frames,
+              esp_peek());
+    } else {
+        CHECK(n == 0, "no summary without the bench:\n%s", esp_peek());
+    }
     fake_lift();
     SETTLE();
 
@@ -10452,7 +10548,11 @@ static void a_throw_that_ends_unseen_times_no_rest(void) {
     esp_clear();
     fake_down(233, 300);
     fake_move(233, 288);
-    refresh_after(16000);
+    refresh_after(16000);  /* the drag before's summary (its one 20 ms frame): its throw's end, unseen too */
+    n = SUMMARIES("scroll", got, 8);
+    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || (got[0].n == 1 && got[0].max == 20)), "the next drag: %d summaries\n%s",
+          n, esp_peek());
+    esp_clear();
     for (int i = 1; i <= 3; i++) {
         fake_move(233, 288 - 12 * i);
         refresh_after(16000);
@@ -10468,18 +10568,18 @@ static void a_throw_that_ends_unseen_times_no_rest(void) {
     }
     CHECK(!fake_scrolling(list) && fake_obj(list)->scroll_y == 300 && moving >= 5, "sprang back to %d: %d steps, %d refreshes moving",
           (int)fake_obj(list)->scroll_y, spring, moving);
-    n = SCROLL_LINES(ms, 64);
+    n = SUMMARIES("scroll", got, 8);
     if (FRAMES_LOGGED) {
-        /* The drag's first refresh follows the throw's unseen end (the SETTLE above) and isn't timed, and nor is the spring-back's
-         * first: the throw's SCROLL_END came as it started. Every other refresh that found it moving is, at 16 ms or, after a step of
-         * the ease-out that moved nothing and so had no refresh, a multiple of it. */
-        CHECK(n == 3 + moving - 1, "the drag's 3, then the spring-back's moving refreshes but its first: %d lines, %d moving\n%s", n,
-              moving, esp_peek());
-        for (int i = 0; i < n && i < 64; i++) {
-            CHECK(ms[i] % 16 == 0 && ms[i] <= 64, "frame %d: %d ms", i, ms[i]);
+        /* The drag's 3 frames and every refresh of the spring-back that found it moving, the first too, as one summary: at 16 ms or,
+         * after a step of the ease-out that moved nothing and so had no refresh, a multiple of it. */
+        CHECK(n == 1, "the drag and its spring-back, one summary: %d\n%s", n, esp_peek());
+        if (n == 1) {
+            CHECK(got[0].n == 3 + moving && got[0].p50 % 16 == 0 && got[0].p95 % 16 == 0 && got[0].max % 16 == 0 && got[0].max <= 64,
+                  "the drag's 3 and the spring-back's moving refreshes: n=%d (%d moving), p50=%d p95=%d max=%d", got[0].n, moving,
+                  got[0].p50, got[0].p95, got[0].max);
         }
     } else {
-        CHECK(n == 0, "no scroll frame line without the bench:\n%s", esp_peek());
+        CHECK(n == 0, "no summary without the bench:\n%s", esp_peek());
     }
     FINISH(&e);
 }

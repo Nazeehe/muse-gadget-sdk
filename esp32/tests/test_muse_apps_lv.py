@@ -44,13 +44,14 @@ from test_muse_apps_wiring import c_function, open_conditions, strip_c_comments
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "components/muse/apps"
+MUSE = ROOT / "components/muse"
 TESTS = ROOT / "tests"
 FAKES = TESTS / "muse_apps_lv_fakes.h"
 HARNESS = TESTS / "muse_apps_lv_harness.c"
 APPS_LV = APPS / "apps_lv.c"
 HARNESS_SOURCES = [HARNESS, APPS_LV, APPS / "apps_icons.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c",
                    APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_svc.c", APPS / "apps_sound.c",
-                   APPS / "apps_vmio.c", APPS / "apps_ask.c"]
+                   APPS / "apps_vmio.c", APPS / "apps_ask.c", MUSE / "muse_frame_stats.c"]
 
 # What apps_lv.c and apps_icons.c include of LVGL and ESP-IDF: each one is a line that includes the fakes.
 FAKE_HEADERS = ["lvgl.h", "esp_attr.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h"]
@@ -142,7 +143,8 @@ def run_slide_harness(steps):
 def build_harness(tmp, bench=False):
     stage = stage_fakes(Path(tmp) / "fake_headers", bench=bench)
     return apps_host.build("muse_apps_lv_harness_bench" if bench else "muse_apps_lv_harness",
-                           [*HARNESS_SOURCES, *apps_host.lua_sources()], tmp, include_dirs=[apps_host.LUA_SRC, APPS, stage, TESTS])
+                           [*HARNESS_SOURCES, *apps_host.lua_sources()], tmp,
+                           include_dirs=[apps_host.LUA_SRC, APPS, stage, TESTS, MUSE])
 
 
 class HarnessTest(unittest.TestCase):
@@ -523,14 +525,18 @@ class HarnessTest(unittest.TestCase):
         self.assertNotIn("add_event_cb", hit)
         hit_start = source.index(hit)
         hit_end = hit_start + len(hit)
-        mentions = [m.start() for m in re.finditer(r"on_refresh|watch_frames|s_frames|launcher frame|spin frame|scroll frame|"
+        mentions = [m.start() for m in re.finditer(r"on_refresh|watch_frames|s_frames|time_frame|muse_frame_stats|"
                                                    r"scroll_box_scrolling|watch_scroll_end|on_scroll_end|LV_EVENT_SCROLL_END|"
                                                    r"LV_EVENT_REFR_READY|lv_display_add_event_cb|lv_obj_get_display", source)
                     if not pairing_start <= m.start() < pairing_end and not hit_start <= m.start() < hit_end]
         self.assertGreaterEqual(len(mentions), 10)
-        self.assertIn("spin frame", " ".join(source[i:i + 12] for i in mentions))
-        # Games Task 5: the list's line and the walk that finds a scroll box scrolling are the bench's too.
-        self.assertIn('ESP_LOGI(TAG, "scroll frame %d ms"', source)
+        # Task 1 of the perf plan: each motion's frames go into a summary (muse_frame_stats.h, the bench's alone), named as the line
+        # prints it, and no line is printed a frame.
+        for name in ("launcher", "spin", "scroll"):
+            self.assertIn(f's_frames.{name}.name = "{name}";', source)
+        self.assertIn('#include "muse_frame_stats.h"', source)
+        self.assertNotRegex(source, r'"(launcher|spin|scroll) frame %d ms"')
+        # Games Task 5: the walk that finds a scroll box scrolling is the bench's too.
         self.assertIn("scroll_box_scrolling", " ".join(source[i:i + 20] for i in mentions))
         # R5f: the SCROLL_END callback that ends a list's timing, and its registration on every box, are the bench's too.
         self.assertIn("watch_scroll_end", " ".join(source[i:i + 20] for i in mentions))
@@ -540,6 +546,20 @@ class HarnessTest(unittest.TestCase):
                 self.assertEqual(open_conditions(source, index), ["if CONFIG_MUSE_BENCH"])
         build = c_function(source, "void apps_lv_build(lv_obj_t *screen)")
         self.assertIn("watch_frames(screen);", build)
+
+    def test_the_summaries_print_from_the_refresh_alone(self):
+        # Review Focus 1 (Task 1 of the perf plan): the frame summaries are printed only from LV_EVENT_REFR_READY's callback
+        # (on_refresh, and time_frame, which only it calls), never from the boxes' SCROLL_END callback, deep in LVGL's input read, where
+        # vprintf's frame would sit on the LVGL task's thin stack: that callback only notes the end, for the next refresh to print.
+        source = strip_c_comments(APPS_LV.read_text())
+        owner = function_owner(source)
+        self.assertEqual({owner(m.start()) for m in re.finditer(r"\bmuse_frame_stats_(?:add|flush)\(", source)},
+                         {"on_refresh", "time_frame"})
+        self.assertEqual({owner(m.start()) for m in re.finditer(r"\btime_frame\(", source)} - {"time_frame"}, {"on_refresh"})
+        self.assertNotRegex(c_function(source, "static void on_scroll_end(lv_event_t *e) {"), r"ESP_LOG|printf|muse_frame_stats")
+        self.assertNotRegex(c_function(source, "static void on_refresh(lv_event_t *e) {"), r"ESP_LOG|printf")
+        self.assertEqual(re.findall(r"lv_\w+_add_event_cb\([^;]*\bon_refresh\b[^;]*\);", source),
+                         ["lv_display_add_event_cb(display, on_refresh, LV_EVENT_REFR_READY, NULL);"])
 
     def test_the_crash_card(self):
         self.run_case("crash_card_text_and_tap")
@@ -673,12 +693,13 @@ class HarnessTest(unittest.TestCase):
     def test_spin_is_on_the_lvgl_task_only(self):
         # The animation is the apply step's: every lv_anim_ call of the apps' sources is apps_lv.c's, in apply_turn or start_spin,
         # which only the apply step runs (apply_style calls apply_turn, and apply_turn start_spin). LVGL runs it on its own task, and
-        # its callbacks call no lv_anim_ function.
-        call = re.compile(r"\blv_anim_\w+\(")
+        # its callbacks call no lv_anim_ function that changes one. The one other call only looks: the bench's SCROLL_END callback
+        # (on_scroll_end, on the LVGL task) asks lv_anim_get whether an animation still runs on the box (Task 1 of the perf plan).
+        call = re.compile(r"\blv_anim_(?!get\()\w+\(")
         for path in sorted(APPS.glob("*.c")):
             if path != APPS_LV:
                 with self.subTest(path.name):
-                    self.assertIsNone(call.search(strip_c_comments(path.read_text())), f"{path.name} calls lv_anim")
+                    self.assertIsNone(re.search(r"\blv_anim_\w+\(", strip_c_comments(path.read_text())), f"{path.name} calls lv_anim")
         source = strip_c_comments(APPS_LV.read_text())
         definitions = [(m.group(1), m.start()) for m in
                        re.finditer(r"^(?:static\s+)?[A-Za-z_][\w \*]*?\b(\w+)\([^;{}]*\)\s*\{", source, re.M)]
@@ -691,6 +712,7 @@ class HarnessTest(unittest.TestCase):
 
         owners = {owner(m.start()) for m in call.finditer(source)}
         self.assertEqual(owners, {"apply_turn", "start_spin"})
+        self.assertEqual({owner(m.start()) for m in re.finditer(r"\blv_anim_get\(", source)}, {"on_scroll_end"})
         for name, callers in (("apply_turn", {"apply_style"}), ("start_spin", {"apply_turn"})):
             with self.subTest(name):
                 calls = {owner(m.start()) for m in re.finditer(rf"\b{name}\(", source)} - {None}
@@ -785,6 +807,20 @@ class BenchHarnessTest(unittest.TestCase):
 
     def test_the_touchs_scroll_boxes(self):  # app.control tap and drag: the scroll boxes, their y and whether they move
         self.run_case("the_touchs_scroll_boxes")
+
+
+def function_owner(source):
+    """For source's function definitions, a function from an index in source to the name of the function it is in (None: none)."""
+    definitions = [(m.group(1), m.start()) for m in
+                   re.finditer(r"^(?:static\s+)?[A-Za-z_][\w \*]*?\b(\w+)\([^;{}]*\)\s*\{", source, re.M)]
+    bodies = {name: (start, start + len(c_function(source[start:], source[start:source.index("(", start)])))
+              for name, start in definitions}
+
+    def owner(index):
+        inside = [name for name, (start, end) in bodies.items() if start <= index < end]
+        return inside[0] if inside else None
+
+    return owner
 
 
 # ---- The fakes against the real headers ----
@@ -1314,7 +1350,7 @@ class FakesTest(unittest.TestCase):
                                                             "UNSCII_8", "UNSCII_16")]
                 args = [*apps_host.cc(), "-std=gnu17", "-Wall", "-Wextra", "-Werror", "-DLV_CONF_SKIP=1", *fonts, "-fsyntax-only",
                         "-isystem", str(self.lvgl), "-isystem", str(self.lvgl / "src"), f"-I{stage}", f"-I{APPS}",
-                        f"-I{apps_host.LUA_SRC}", str(APPS_LV)]
+                        f"-I{apps_host.LUA_SRC}", f"-I{MUSE}", str(APPS_LV)]
                 done = subprocess.run(args, capture_output=True, text=True)
                 self.assertEqual(done.returncode, 0, shlex.join(args) + "\n" + done.stdout + done.stderr)
 

@@ -148,7 +148,9 @@ static SemaphoreHandle_t s_wake;
 #define WHOLE_RESERVE (1024 * 1024)      /* PSRAM the frame leaves free: the apps' floor (APPS_RAM_RESERVE), for Muse's session and LVGL */
 typedef struct {
     uint8_t *px;               /* the frame: the screen, s_cols x s_rows at 2 bytes, made the first time frame mode is on, and kept */
-    bool failed;               /* it couldn't be made, and that was logged (once) */
+    bool failed;               /* it couldn't be made (once) */
+    bool made_untold;          /* set by the LVGL task as the frame is made, cleared by the send task as it logs that (tell_frame) */
+    bool failed_untold;        /* the same for its first failure */
     int at;                    /* LVGL task: the rows of the refresh in frame mode flushed so far */
     int staged;                /* send task: the rows copied into px so far */
     int64_t us;                /* send task: a frame's write, learned from the ones before (0: none timed yet) */
@@ -159,6 +161,7 @@ static EXT_RAM_BSS_ATTR te_stats_t s_te_whole;      /* the frames' writes agains
 static EXT_RAM_BSS_ATTR int s_cols;                 /* the panel's */
 static void whole_band(const band_t *b);
 static void whole_write(int rows, bool hold);
+static void tell_frame(void);
 
 /* A refresh of LVGL's (its bands, the last one marked) as it went to the panel, for the stats: torn if a scan passed
  * between its writes, so that one refresh of the panel showed some of it and the next the rest (frame_meets). */
@@ -755,8 +758,9 @@ static void frame_done(const band_t *b)
         for (int i = 0; i < n; i++) {
             wire += s_frame.w[i].w;
         }
-        if (torn) {
-            /* Each band (at most 3): its rows, its start after the scan's start (0 to the period), its write and
+        if (torn && s_batch.torn == 0) {
+            /* The batch's first torn refresh alone (the batch line counts them all): each line spins the console in this task,
+             * above LVGL's. Each band (at most 3): its rows, its start after the scan's start (0 to the period), its write and
              * the one expected, and how its hold went. */
             char line[160];
             int at = 0;
@@ -860,6 +864,9 @@ static void send_bands(void *arg)
     band_t b;
     for (;;) {
         xQueueReceive(s_bands, &b, portMAX_DELAY);
+#if CONFIG_MUSE_APPS
+        tell_frame();
+#endif
         if (!b.data) {
             wire_idle(0);
             s_call(s_call_arg);
@@ -1221,6 +1228,11 @@ void muse_lcd_bands_set_pairing(bool on)
     s_pairing = on;
 }
 
+/*
+ * On the LVGL task, from the home tileview's LV_EVENT_SCROLL_BEGIN (muse_ui.c's slide_begins), deep in LVGL's input read: nothing is
+ * logged here, where vprintf's frame would sit on the LVGL task's thin stack. What became of the frame is noted, and the send task
+ * logs it at its next band (tell_frame).
+ */
 void muse_lcd_bands_set_frame_mode(bool on)
 {
     size_t bytes = (size_t)s_cols * (size_t)s_rows * 2;
@@ -1230,14 +1242,28 @@ void muse_lcd_bands_set_frame_mode(bool on)
             s_whole.px = heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         }
         if (s_whole.px) {
-            ESP_LOGI(TAG, "tearing effect: frame mode's frame, %u B of PSRAM", (unsigned)bytes);
+            s_whole.made_untold = true;
         } else if (!s_whole.failed) {
             s_whole.failed = true;
-            ESP_LOGW(TAG, "tearing effect: no frame for frame mode (%u B of PSRAM, %u B kept free): each band goes on its own",
-                     (unsigned)bytes, (unsigned)WHOLE_RESERVE);
+            s_whole.failed_untold = true;
         }
     }
     s_framing = on && s_whole.px;
+}
+
+/* On the send task, at the top of its loop (its shallowest frame): what muse_lcd_bands_set_frame_mode noted of the frame, each once.
+ * Each flag is set once by the LVGL task and cleared here only after it was seen set, so neither line is lost. */
+static void tell_frame(void)
+{
+    if (s_whole.made_untold) {
+        s_whole.made_untold = false;
+        ESP_LOGI(TAG, "tearing effect: frame mode's frame, %u B of PSRAM", (unsigned)((size_t)s_cols * (size_t)s_rows * 2));
+    }
+    if (s_whole.failed_untold) {
+        s_whole.failed_untold = false;
+        ESP_LOGW(TAG, "tearing effect: no frame for frame mode (%u B of PSRAM, %u B kept free): each band goes on its own",
+                 (unsigned)((size_t)s_cols * (size_t)s_rows * 2), (unsigned)WHOLE_RESERVE);
+    }
 }
 #endif
 

@@ -190,7 +190,26 @@ one over USB, so the log lines an app or the system prints meanwhile come out af
 END and can't land inside it; it stops, and lets the console go, if the host takes
 nothing for 2 s. A UART console (the Watcher's) holds nothing, since its stream takes
 about 40 s and no task could log for that long: the log can come between its rows,
-and a capture it broke into is retaken. Or run `idf.py` directly:
+and a capture it broke into is retaken.
+
+A bench build's frame measurements are summaries (`muse_frame_stats.c`, the
+`muse_frames` tag), one line for a motion rather than one a frame:
+`<name> frames: n=<n> p50=<ms> p95=<ms> max=<ms> over50=<k>`, a frame being the
+time between two display refreshes that found the same motion (the first refresh
+of one follows a rest and isn't timed), p50 and p95 nearest-rank, and `over50`
+the frames over 50 ms. The names are `page` (the home pages' slide) and, with the
+apps, `launcher` (the carousel), `spin` (a spinning image) and `scroll` (a list).
+A summary is printed at the first refresh after its motion ends (one that finds
+it stopped, or the first after its `LV_EVENT_SCROLL_END`, however late that
+comes; a throw's end that hands the scroll to the snap or spring-back it has
+just started ends nothing), once a second of motion has passed since its first
+frame, or at its 128th frame, and only from LVGL's `LV_EVENT_REFR_READY`, never
+from a scroll or input callback. For the same reason the bands print
+`tearing effect: torn refresh of ...` only for the first torn refresh of each
+batch of 30, which the batch line counts: every line the console prints spins
+the task that prints it until the UART has sent it.
+
+Or run `idf.py` directly:
 
 ```sh
 idf.py -B build-muse-aipi -DIDF_TARGET=esp32s3 \
@@ -777,8 +796,8 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   at most 228,200 while scrolling, and came back to within 16 bytes at the
   close. With an app of 1.3 MB running behind it (906 KB of Lua heap and a
   434 KB image) the launcher cost the same and its icons still loaded. A bench
-  build logs `launcher frame <ms> ms` (the `muse_apps` tag) at each display
-  refresh while the carousel scrolls: the time since the refresh before. Five
+  build sums up the carousel's frames while it scrolls in `launcher frames:`
+  lines (the bench's frame summaries, under Build). Five
   flings across all 10 apps (two `>swipe left` or `>swipe right` back to back
   each) gave 150 frames, a median of 30 ms and a 95th percentile of 41 ms
   (the longest 51), inside the frame gate of 33 and 50 ms, so the carousel
@@ -829,13 +848,13 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   row hears press and release, and no tap. `>drag X1 Y1 X2 Y2 MS` (a bench
   build's console) presses at the first point, moves straight to the second
   over MS ms and lifts, as a finger that drags would (MS is 50 to 2000,
-  `MUSE_UI_DRAG_MS_MIN` and `_MAX` in `muse_ui.h`). A bench build logs
-  `scroll frame <ms> ms` (the `muse_apps` tag) at each display refresh while an
-  app's box with `scroll = "y"` scrolls on the layer in front, with no card or
-  launcher over it: the time since the refresh before, unless the box's scroll
-  ended in between (`LV_EVENT_SCROLL_END`, which a throw that stops short of
-  the list's ends sends at an input read that moves nothing, with no refresh
-  to see it). Measured on the 1.75C on 2026-11-01 (apps+bench build,
+  `MUSE_UI_DRAG_MS_MIN` and `_MAX` in `muse_ui.h`). A bench build sums up the
+  frames of an app's box with `scroll = "y"` while it scrolls on the layer in
+  front, with no card or launcher over it, in `scroll frames:` lines (the
+  bench's frame summaries, under Build); the box's `LV_EVENT_SCROLL_END` ends a
+  scroll's summary too, since a throw that stops short of the list's ends sends
+  it at an input read that moves nothing, with no refresh to see it: that
+  summary comes at the next refresh. Measured on the 1.75C on 2026-11-01 (apps+bench build,
   `tests/muse_apps_fixtures/list`: 40 rows of wrapped text in bubbles at the
   left and the right by turns, 121 widgets; 10 drags up and 10 down of 200 px
   over 300 ms in the list's middle, then 5 flings of 300 px over 120 ms): 712
@@ -1058,10 +1077,12 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   pairing is on. The frame is 434,312 bytes of PSRAM, made at the first slide
   if 1 MB of PSRAM stays free after it (`WHOLE_RESERVE`, the apps' floor) and
   kept; without it every refresh takes the band path, and the bands log
-  `tearing effect: no frame for frame mode` once. A bench build logs
-  `page frame <ms> ms` (the `muse_ui` tag) at each display refresh while the
-  tileview scrolls: the time since the refresh before, when that one found it
-  scrolling too, unless its scroll ended in between. The bands' batch line
+  `tearing effect: no frame for frame mode` once. That line and
+  `tearing effect: frame mode's frame, <bytes> B of PSRAM` come from the send
+  task at its next band, never from the slide's scroll callback, deep in LVGL's
+  input read. A bench build sums up each slide's frames, its drag's and its
+  snap's together, in `page frames:` lines (the bench's frame summaries, under
+  Build). The bands' batch line
   then counts the refreshes `framed` and their `copy` into the frame.
   Measured on the 1.75C on 2026-11-02 (apps+bench build, 20 `>swipe left`
   from the clock and 20 `>swipe right` back, and 4 `>drag` from the clock at

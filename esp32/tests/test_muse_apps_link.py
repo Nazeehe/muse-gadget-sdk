@@ -358,10 +358,45 @@ class GuideAndSkill(unittest.TestCase):
         reference = " ".join(guide_section(GUIDE.read_text(), "API reference").split())
         self.assertIn("Widgets draw in the order they are made: each new widget draws over every widget there is.", reference)
         self.assertIn("A widget with no handler takes no touches: the touch goes to the widget under it.", reference)
+        # games Task 4 (finding 2): a scroll box keeps its clickability with no handler, so a drag on its own area finds it; any other
+        # widget with no handler is still left unclickable.
+        self.assertIn('A box with `scroll = "y"` takes the touches on it, to scroll, even with no handler.', reference)
         lv = strip_c_comments((APPS / "apps_lv.c").read_text())
-        self.assertRegex(lv, r"if \(w->events == 0\) \{\s*lv_obj_remove_flag\(n->obj, LV_OBJ_FLAG_CLICKABLE\);\s*return;")
+        self.assertRegex(lv, r"if \(w->events == 0\) \{\s*if \(w->scroll != APPS_SCROLL_Y\) \{\s*"
+                             r"lv_obj_remove_flag\(n->obj, LV_OBJ_FLAG_CLICKABLE\);\s*\}\s*return;")
         self.assertEqual(sorted(set(re.findall(r"lv_obj_move_(?:to_index|foreground|background)\((\w+)", lv))),
                          ["crash", "launcher"])
+
+    def test_guide_says_how_boxes_scroll_and_lay_out(self):
+        # games Task 4: the box's five properties in the C order, their values (the gap and pad range is APPS_UI_SPACE_MAX: D12),
+        # w:scroll_to, the drag that scrolls, and the Lists pattern, whose widget count is APPS_UI_SLOTS.
+        guide = GUIDE.read_text()
+        reference = " ".join(guide_section(guide, "API reference").split())
+        space = header_number("apps_ui.h", "APPS_UI_SPACE_MAX")
+        slots = header_number("apps_ui.h", "APPS_UI_SLOTS")
+        props = c_table(strip_c_comments((APPS / "apps_ui.c").read_text()), "apps_ui_props_box")
+        self.assertEqual(props[-5:], ["scroll", "layout", "gap", "pad", "items"])
+        self.assertIn("- `ui.box` properties: " + ", ".join(props) + ";", reference)
+        for sentence in (
+                'A box\'s `scroll` is `"none"` (the default) or `"y"`',
+                '`layout` is `"none"` (the default: each widget by its align, x and y) or `"column"`',
+                f"`gap` is the space between them and `pad` the space inside the box's edges, 0 to {space} px, 0 by default.",
+                '`items` places them across the column: `"start"` (the default, on the left), `"center"` or `"end"`, lined up on the '
+                'widest of them.',
+                '- `w:scroll_to(where, animate)` scrolls a box with `scroll = "y"`: where is `"start"`, `"end"` or a number of px',
+                'A drag up or down that begins on a widget in a box with `scroll = "y"` scrolls the box: the widget hears press, then '
+                'release, and no tap.'):
+            with self.subTest(sentence):
+                self.assertIn(sentence, reference)
+        patterns = " ".join(guide_section(guide, "Patterns").split())
+        lists = re.search(r"- Lists \(.*?(?= - |$)", patterns)
+        self.assertIsNotNone(lists, "no Lists pattern")
+        for phrase in ('one box with `scroll = "y", layout = "column"`', "a row box for each item, with a `w` and no `h`",
+                       '`align = "left"` or `align = "right"`', "`wrap = true`", "2 to 3 widgets an item",
+                       f"an app has {slots} widgets", "show the last 30 to 40 items", "delete the oldest rows as new ones come",
+                       'Call `list:scroll_to("end")` after adding rows.', "Widgets in a scroll box get no round-edge warning"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, lists.group(0))
 
     def test_guide_games_section_quotes_the_firmware(self):
         # The Games section's numbers (D12): the shortest timer, the ticks a second it allows, and the duty cycle's limits.

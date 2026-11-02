@@ -54,8 +54,15 @@ static const char *TAG = "muse_apps";
 #define SLOW_LOG_US 1000000  /* a slow pass is logged at most this often */
 #define MAX_CALLBACK_SKIPS 3
 
-/* The bits that name a group of properties, as opposed to CREATE and DELETE. */
-#define GROUPS (APPS_DIRTY_GEOM | APPS_DIRTY_STYLE | APPS_DIRTY_TEXT | APPS_DIRTY_VALUE | APPS_DIRTY_EVENTS)
+/* The bits that name a group of properties (and SCROLL, a w:scroll_to), as opposed to CREATE and DELETE. */
+#define GROUPS (APPS_DIRTY_GEOM | APPS_DIRTY_STYLE | APPS_DIRTY_TEXT | APPS_DIRTY_VALUE | APPS_DIRTY_EVENTS | APPS_DIRTY_SCROLL)
+
+/* A scroll box's scrollbar (LV_PART_SCROLLBAR), which lv_obj_remove_style_all took off with the theme's: a thin white bar at 40%,
+ * rounded at its ends. And the y w:scroll_to("end") asks LVGL for, which lv_obj_scroll_to_y bounds to the bottom of the content. */
+#define SCROLLBAR_W 4
+#define SCROLLBAR_COLOR 0xFFFFFF
+#define SCROLLBAR_OPA LV_OPA_40
+#define SCROLL_END_Y LV_COORD_MAX
 
 _Static_assert(sizeof(lv_image_header_t) == IMAGE_HEADER, "an image's header is the first 12 bytes of its file");
 
@@ -80,6 +87,9 @@ typedef struct {
     uint32_t rotation_sets;  /* an image's: the widget's rotation_sets when its angle was last applied */
     bool capped;       /* an image's: cap_turn is on obj */
     float reach;       /* a turned image's: how far from its centre its picture draws, in px on the screen; 0: no cap */
+    bool scrolls;      /* a box's: it was made scrollable up and down (scroll = "y") */
+    uint8_t layout, items, gap, pad;  /* a box's: what was last applied of them (a new object's: none, start, 0, 0) */
+    uint32_t scroll_sets;  /* a box's: the widget's scroll_sets when its last scroll_to was applied, or dropped */
 } node_t;
 
 /* The records of the app on the layer, and the descriptors its images are drawn from: one block, from the apps'
@@ -250,6 +260,15 @@ static const char *check_widget(const pass_t *p, int slot, const apps_widget_t *
     }
     if (w->events > (APPS_UI_TAP | APPS_UI_LONG_PRESS | APPS_UI_PRESS | APPS_UI_RELEASE)) {
         return "events";
+    }
+    if (w->scroll > APPS_SCROLL_Y || w->layout > APPS_LAYOUT_COLUMN || w->items > APPS_ITEMS_END) {
+        return "layout";
+    }
+    if (w->gap > APPS_UI_SPACE_MAX || w->pad > APPS_UI_SPACE_MAX) {
+        return "space";
+    }
+    if (w->scroll_target != APPS_UI_SCROLL_END && (w->scroll_target < 0 || w->scroll_target > APPS_UI_SCROLL_MAX)) {
+        return "scroll";
     }
     if (w->min < -APPS_UI_VALUE_MAX || w->min > APPS_UI_VALUE_MAX || w->max < -APPS_UI_VALUE_MAX ||
         w->max > APPS_UI_VALUE_MAX || w->value < -APPS_UI_VALUE_MAX || w->value > APPS_UI_VALUE_MAX) {
@@ -485,6 +504,11 @@ static made_t make_object(pass_t *p, int slot, int depth) {
     n->rotation_sets = 0;
     n->capped = false;
     n->reach = 0;
+    n->scrolls = false;     /* new_object made it neither scrollable nor laid out, with no padding */
+    n->layout = APPS_LAYOUT_NONE;
+    n->items = APPS_ITEMS_START;
+    n->gap = n->pad = 0;
+    n->scroll_sets = 0;     /* a scroll_to made with the box is still to apply */
     w->dirty = (w->dirty & ~(uint32_t)APPS_DIRTY_CREATE) | groups_of_new(w);
     p->changed = true;
     return MADE;
@@ -735,6 +759,64 @@ static void apply_turn(const apps_widget_t *w, node_t *n) {
     }
 }
 
+static lv_flex_align_t items_of(uint8_t items) {
+    static const lv_flex_align_t map[] = {LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END};
+    return items < ARRAY_LEN(map) ? map[items] : LV_FLEX_ALIGN_START;
+}
+
+/*
+ * A box's scroll, layout, gap, pad and items, each called only when it differs from what the record says was applied. scroll = "y"
+ * makes it scrollable up and down only, with LVGL's own scrollbar while its content is taller (AUTO), styled here (the theme's went
+ * with lv_obj_remove_style_all), and the elastic edge and the throw lv_obj_constructor gave it; it is clickable whatever its
+ * handlers, so a drag that begins on its own area finds it (LVGL's hit test passes over an object that isn't). "none" brings the
+ * content back to the top first, and leaves it clickable only for a handler. layout = "column" is LVGL's flex column (it sets
+ * LV_LAYOUT_FLEX), the children in their track by items; "none" is no layout, which puts them back by their align, x and y. gap is
+ * the column's pad_row, pad the four sides' padding (their declared setters: pad_all is inline).
+ */
+static void style_box(const apps_widget_t *w, node_t *n) {
+    lv_obj_t *obj = n->obj;
+    bool scrolls = w->scroll == APPS_SCROLL_Y;
+    if (scrolls && !n->scrolls) {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(obj, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_AUTO);
+        lv_obj_set_style_width(obj, SCROLLBAR_W, LV_PART_SCROLLBAR);
+        lv_obj_set_style_bg_color(obj, colour(SCROLLBAR_COLOR), LV_PART_SCROLLBAR);
+        lv_obj_set_style_bg_opa(obj, SCROLLBAR_OPA, LV_PART_SCROLLBAR);
+        lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    } else if (!scrolls && n->scrolls) {
+        lv_obj_scroll_to_y(obj, 0, LV_ANIM_OFF);
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+        if (w->events == 0) {
+            lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+        }
+    }
+    n->scrolls = scrolls;
+
+    if (w->layout == APPS_LAYOUT_COLUMN && (n->layout != APPS_LAYOUT_COLUMN || n->items != w->items)) {
+        if (n->layout != APPS_LAYOUT_COLUMN) {
+            lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_COLUMN);
+        }
+        lv_obj_set_flex_align(obj, LV_FLEX_ALIGN_START, items_of(w->items), LV_FLEX_ALIGN_START);
+    } else if (w->layout == APPS_LAYOUT_NONE && n->layout != APPS_LAYOUT_NONE) {
+        lv_obj_set_layout(obj, LV_LAYOUT_NONE);
+    }
+    n->layout = w->layout;
+    n->items = w->items;
+    if (n->gap != w->gap) {
+        lv_obj_set_style_pad_row(obj, w->gap, LV_PART_MAIN);
+        n->gap = w->gap;
+    }
+    if (n->pad != w->pad) {
+        lv_obj_set_style_pad_top(obj, w->pad, LV_PART_MAIN);
+        lv_obj_set_style_pad_bottom(obj, w->pad, LV_PART_MAIN);
+        lv_obj_set_style_pad_left(obj, w->pad, LV_PART_MAIN);
+        lv_obj_set_style_pad_right(obj, w->pad, LV_PART_MAIN);
+        n->pad = w->pad;
+    }
+}
+
 static void apply_style(pass_t *p, const apps_widget_t *w, node_t *n) {
     lv_obj_t *obj = n->obj;
     if (w->hidden) {
@@ -756,6 +838,7 @@ static void apply_style(pass_t *p, const apps_widget_t *w, node_t *n) {
             break;
         case APPS_W_BOX:
             style_surface(w, obj);
+            style_box(w, n);
             break;
         case APPS_W_ARC:
         case APPS_W_SPINNER:
@@ -804,7 +887,9 @@ static void apply_value(const apps_widget_t *w, lv_obj_t *obj) {
 
 static void apply_events(int slot, const apps_widget_t *w, node_t *n) {
     if (w->events == 0) {
-        lv_obj_remove_flag(n->obj, LV_OBJ_FLAG_CLICKABLE);
+        if (w->scroll != APPS_SCROLL_Y) {  /* a scroll box takes a drag on it with no handler (style_box) */
+            lv_obj_remove_flag(n->obj, LV_OBJ_FLAG_CLICKABLE);
+        }
         return;
     }
     if (!n->subscribed) {
@@ -914,6 +999,7 @@ static void visit_live(pass_t *p, int slot, apps_widget_t *w) {
     if ((todo & APPS_DIRTY_EVENTS) != 0) {
         apply_events(slot, w, n);
     }
+    /* SCROLL has nothing to apply here: the pass scrolls after its layout (apply_scrolls). */
     if (todo != 0) {
         p->changed = true;
     }
@@ -925,6 +1011,18 @@ static void visit_live(pass_t *p, int slot, apps_widget_t *w) {
 static bool is_hidden(const pass_t *p, const apps_widget_t *w) {
     for (int steps = 0; w != NULL && steps <= APPS_UI_BOX_DEPTH_MAX + 1; steps++) {
         if (w->hidden) {
+            return true;
+        }
+        w = w->parent >= 0 ? apps_ui_slot(p->ui, w->parent) : NULL;
+    }
+    return false;
+}
+
+/* Whether a box above the widget scrolls (scroll = "y"): its rows go off the screen as it scrolls, by design. */
+static bool in_scroll_box(const pass_t *p, const apps_widget_t *w) {
+    w = w->parent >= 0 ? apps_ui_slot(p->ui, w->parent) : NULL;
+    for (int steps = 0; w != NULL && steps <= APPS_UI_BOX_DEPTH_MAX + 1; steps++) {
+        if (w->kind == APPS_W_BOX && w->scroll == APPS_SCROLL_Y) {
             return true;
         }
         w = w->parent >= 0 ? apps_ui_slot(p->ui, w->parent) : NULL;
@@ -952,7 +1050,8 @@ static uint32_t isqrt(uint64_t n) {
 
 /*
  * How far the widget goes past the round edge (a circle of radius SCREEN_R about (SCREEN_R, SCREEN_R)), in px,
- * to the nearest, or 0. The widget covers x1.. x1 + w, y1 .. y1 + h in continuous coordinates. A rectangle goes as
+ * to the nearest, or 0; always 0 for a widget in a scroll box, whose rows scroll past the edge by design (the box
+ * itself is measured). The widget covers x1.. x1 + w, y1 .. y1 + h in continuous coordinates. A rectangle goes as
  * far as its farthest corner; the real outline is used for what is round: an arc is the circle that fits its box,
  * and a box whose radius is at least half its shorter side is a stadium (a segment along its long axis, with a
  * circle of half the shorter side round it). The farthest point of such a shape is its circle's, about the
@@ -963,7 +1062,7 @@ static uint32_t isqrt(uint64_t n) {
  * round(distance + r - SCREEN_R), halves up.
  */
 static int16_t overflow_of(const pass_t *p, const apps_widget_t *w, int32_t x1, int32_t y1, int32_t rw, int32_t rh) {
-    if (rw <= 0 || rh <= 0 || is_hidden(p, w)) {
+    if (rw <= 0 || rh <= 0 || is_hidden(p, w) || in_scroll_box(p, w)) {
         return 0;
     }
     const int64_t c = 2 * SCREEN_R;  /* the screen's centre, doubled */
@@ -992,9 +1091,39 @@ static int16_t overflow_of(const pass_t *p, const apps_widget_t *w, int32_t x1, 
     return over <= 0 ? 0 : (int16_t)(over / 2 > INT16_MAX ? INT16_MAX : over / 2);
 }
 
-/* Lays the layer out and writes where each widget with an object is, and how far it goes over the edge, back. */
+/*
+ * The w:scroll_to calls not yet applied (a record's scroll_sets behind its widget's), after the layout, so "end" is the end of the
+ * rows made in the same callback (code map 4.5). A box that doesn't show waits for the pass that shows it, which a STYLE change
+ * brings; one that no longer scrolls drops its call, and so does one whose target is out of range (check_widget's rule: this may be a
+ * box no visit of this pass checked). lv_obj_scroll_to_y stops a scroll animation that runs and bounds the y to the content
+ * (lv_obj_scroll_by_bounded).
+ */
+static void apply_scrolls(pass_t *p) {
+    for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
+        apps_widget_t *w = apps_ui_slot(p->ui, slot);
+        node_t *n = &p->st->node[slot];
+        if (!w->alive || w->kind != APPS_W_BOX || !record_fits(n, w) || n->scroll_sets == w->scroll_sets) {
+            continue;
+        }
+        bool target_ok = w->scroll_target == APPS_UI_SCROLL_END || (w->scroll_target >= 0 && w->scroll_target <= APPS_UI_SCROLL_MAX);
+        if (!n->scrolls || !target_ok) {
+            n->scroll_sets = w->scroll_sets;
+            continue;
+        }
+        if (is_hidden(p, w)) {
+            continue;
+        }
+        int32_t y = w->scroll_target == APPS_UI_SCROLL_END ? SCROLL_END_Y : w->scroll_target;
+        lv_obj_scroll_to_y(n->obj, y, w->scroll_animate ? LV_ANIM_ON : LV_ANIM_OFF);
+        n->scroll_sets = w->scroll_sets;
+    }
+}
+
+/* Lays the layer out, scrolls what was asked to, and writes where each widget with an object is, and how far it goes over the edge,
+ * back. */
 static void write_back(pass_t *p) {
     lv_obj_update_layout(s_layer);
+    apply_scrolls(p);
     for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
         apps_widget_t *w = apps_ui_slot(p->ui, slot);
         const node_t *n = &p->st->node[slot];

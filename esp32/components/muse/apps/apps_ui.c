@@ -39,7 +39,7 @@
 
 #define ARRAY_LEN(a) ((int)(sizeof(a) / sizeof((a)[0])))
 #define NORETURN __attribute__((noreturn))
-#define BIT(p) (1u << (p))
+#define BIT(p) (UINT64_C(1) << (p))
 
 _Static_assert(APPS_UI_ASSETS_MAX >= APPS_MAX_FILES, "every file of a package may be an image");
 _Static_assert(APPS_RT_IMAGES_MAX <= 32, "a runtime image is a bit of the pass's report");
@@ -52,6 +52,8 @@ _Static_assert(IMAGES_ALL <= INT16_MAX, "a widget's image is an int16_t");
 #define SCREEN 466
 #define SCREEN_R 233
 #define SCREEN_SAFE 330
+_Static_assert(APPS_UI_SCROLL_MAX >= APPS_UI_SLOTS * (SCREEN + APPS_UI_SPACE_MAX) + 2 * APPS_UI_SPACE_MAX,
+               "scroll_to's largest number is past the tallest column: every widget at its tallest, the gaps and the padding");
 #define WIDGET_MT "muse.widget"
 /* Text an app supplied, as a message shows it: cut here, on a character boundary, with "..." after the cut. */
 #define SHOWN_MAX 40
@@ -71,6 +73,13 @@ _Static_assert(ARRAY_LEN(apps_ui_fonts) == APPS_FONT_DIGITS96 + 1, "a name for e
 
 static const char *const apps_ui_text_aligns[] = {"left", "center", "right"};
 
+static const char *const apps_ui_scrolls[] = {"none", "y"};
+_Static_assert(ARRAY_LEN(apps_ui_scrolls) == APPS_SCROLL_Y + 1, "a name for each scroll");
+static const char *const apps_ui_layouts[] = {"none", "column"};
+_Static_assert(ARRAY_LEN(apps_ui_layouts) == APPS_LAYOUT_COLUMN + 1, "a name for each layout");
+static const char *const apps_ui_items[] = {"start", "center", "end"};
+_Static_assert(ARRAY_LEN(apps_ui_items) == APPS_ITEMS_END + 1, "a name for each place across");
+
 /* An event's bit is 1 << its index here. "click" is "tap" under another name. */
 static const char *const apps_ui_events[] = {"tap", "long_press", "press", "release"};
 _Static_assert(ARRAY_LEN(apps_ui_events) == 4, "four events fit the events mask");
@@ -85,7 +94,8 @@ static const char *const apps_ui_props_button[] = {
     "border_color",
 };
 static const char *const apps_ui_props_box[] = {
-    "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "bg", "radius", "border", "border_color",
+    "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "bg", "radius", "border", "border_color", "scroll", "layout",
+    "gap", "pad", "items",
 };
 static const char *const apps_ui_props_arc[] = {
     "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "min", "max", "value", "start_angle", "end_angle",
@@ -122,9 +132,10 @@ typedef enum {
     P_BG, P_RADIUS, P_BORDER, P_BORDER_COLOR,
     P_MIN, P_MAX, P_VALUE, P_START_ANGLE, P_END_ANGLE, P_THICKNESS, P_TRACK_COLOR,
     P_SRC, P_SCALE, P_ROTATION, P_SPIN,
+    P_SCROLL, P_LAYOUT, P_GAP, P_PAD, P_ITEMS,
     P_COUNT
 } prop_t;
-_Static_assert(P_COUNT <= 32, "a property is a bit of change_t's set");
+_Static_assert(P_COUNT <= 64, "a property is a bit of change_t's set and read_props' present, which are 64 bits");
 
 static const char *const prop_names[P_COUNT] = {
     [P_ALIGN] = "align", [P_X] = "x", [P_Y] = "y", [P_W] = "w", [P_H] = "h", [P_HIDDEN] = "hidden",
@@ -133,6 +144,7 @@ static const char *const prop_names[P_COUNT] = {
     [P_BORDER_COLOR] = "border_color", [P_MIN] = "min", [P_MAX] = "max", [P_VALUE] = "value",
     [P_START_ANGLE] = "start_angle", [P_END_ANGLE] = "end_angle", [P_THICKNESS] = "thickness",
     [P_TRACK_COLOR] = "track_color", [P_SRC] = "src", [P_SCALE] = "scale", [P_ROTATION] = "rotation", [P_SPIN] = "spin",
+    [P_SCROLL] = "scroll", [P_LAYOUT] = "layout", [P_GAP] = "gap", [P_PAD] = "pad", [P_ITEMS] = "items",
 };
 
 typedef enum { T_NUM, T_BOOL, T_ENUM, T_COLOR, T_BG, T_TEXT, T_RADIUS, T_PARENT, T_SRC } ptype_t;
@@ -175,6 +187,11 @@ static const prop_info_t prop_info[P_COUNT] = {
     [P_SCALE] = {T_NUM, APPS_DIRTY_STYLE, 10, 400, NULL, 0, NULL},
     [P_ROTATION] = {T_NUM, APPS_DIRTY_STYLE, 0, 359, NULL, 0, "degrees"},
     [P_SPIN] = {T_NUM, APPS_DIRTY_STYLE, 0, APPS_SPIN_RPM_MAX, NULL, 0, "turns a minute"},
+    [P_SCROLL] = {T_ENUM, APPS_DIRTY_STYLE, 0, 0, apps_ui_scrolls, ARRAY_LEN(apps_ui_scrolls), NULL},
+    [P_LAYOUT] = {T_ENUM, APPS_DIRTY_STYLE, 0, 0, apps_ui_layouts, ARRAY_LEN(apps_ui_layouts), NULL},
+    [P_GAP] = {T_NUM, APPS_DIRTY_STYLE, 0, APPS_UI_SPACE_MAX, NULL, 0, NULL},
+    [P_PAD] = {T_NUM, APPS_DIRTY_STYLE, 0, APPS_UI_SPACE_MAX, NULL, 0, NULL},
+    [P_ITEMS] = {T_ENUM, APPS_DIRTY_STYLE, 0, 0, apps_ui_items, ARRAY_LEN(apps_ui_items), NULL},
 };
 
 /* ---- The table ---- */
@@ -233,6 +250,11 @@ static int64_t fetch(const apps_widget_t *w, prop_t p) {
         case P_SCALE: return w->scale;
         case P_ROTATION: return w->rotation;
         case P_SPIN: return w->spin;
+        case P_SCROLL: return w->scroll;
+        case P_LAYOUT: return w->layout;
+        case P_GAP: return w->gap;
+        case P_PAD: return w->pad;
+        case P_ITEMS: return w->items;
         case P_TEXT:
         case P_COUNT: break;
     }
@@ -269,13 +291,19 @@ static void store(apps_widget_t *w, prop_t p, int64_t v) {
         case P_SCALE: w->scale = (uint16_t)v; break;
         case P_ROTATION: w->rotation = (int16_t)v; break;
         case P_SPIN: w->spin = (uint8_t)v; break;
+        case P_SCROLL: w->scroll = (uint8_t)v; break;
+        case P_LAYOUT: w->layout = (uint8_t)v; break;
+        case P_GAP: w->gap = (uint8_t)v; break;
+        case P_PAD: w->pad = (uint8_t)v; break;
+        case P_ITEMS: w->items = (uint8_t)v; break;
         case P_TEXT:
         case P_COUNT: break;
     }
 }
 
 /* A new widget: every field has a value that is in range for any kind, so a table never holds a slot that the
- * apply step has to guess about. */
+ * apply step has to guess about. The caller zeroed it: a box's scroll, layout, gap, pad and items are none, none, 0, 0 and
+ * start, and it has had no scroll_to. */
 static void init_widget(apps_widget_t *w, int kind) {
     w->kind = (uint8_t)kind;
     w->parent = -1;
@@ -461,7 +489,7 @@ static handle_t *self_handle(lua_State *L, const char *method) {
 
 /* What a create or a set asks for, validated and not yet applied. */
 typedef struct {
-    uint32_t set;  /* BIT(p) for each property given */
+    uint64_t set;  /* BIT(p) for each property given */
     int64_t v[P_COUNT];
     char text[APPS_UI_TEXT_MAX + 1];
     size_t text_len;
@@ -872,7 +900,7 @@ static void check_spin(const ctx_t *x, const change_t *c) {
             check_spin_side(x->L, x->kind, w, h, (uint16_t)scale);
         }
     }
-    uint32_t grows = x->kind == APPS_W_IMAGE                ? BIT(P_SPIN) | BIT(P_SCALE) | BIT(P_SRC) | BIT(P_HIDDEN)
+    uint64_t grows = x->kind == APPS_W_IMAGE                ? BIT(P_SPIN) | BIT(P_SCALE) | BIT(P_SRC) | BIT(P_HIDDEN)
                      : x->kind == APPS_W_BOX && !x->creating ? BIT(P_HIDDEN)
                                                              : 0;
     if ((c->set & grows) != 0) {
@@ -909,7 +937,7 @@ static void read_prop(const ctx_t *x, prop_t p, int idx, change_t *c) {
  */
 static void read_props(const ctx_t *x, int t, change_t *c) {
     lua_State *L = x->L;
-    uint32_t present = 0;
+    uint64_t present = 0;
     /* A walk C does where no count hook fires: charged by the slots lua_next visits. */
     apps_vm_charge(L, apps_vm_table_slots(L, t) + 1);
     lua_pushnil(L);
@@ -1452,8 +1480,67 @@ static int w_delete(lua_State *L) {
     return 0;
 }
 
+/* The where of w:scroll_to at idx: 0 for "start", APPS_UI_SCROLL_END for "end", or a number of px rounded and clamped to
+ * 0..APPS_UI_SCROLL_MAX (LVGL bounds it to the content). */
+static int32_t scroll_target(lua_State *L, int idx) {
+    int type = lua_type(L, idx);
+    if (type == LUA_TSTRING) {
+        size_t len;
+        const char *s = lua_tolstring(L, idx, &len);
+        if (len == 5 && memcmp(s, "start", 5) == 0) {
+            return 0;
+        }
+        if (len == 3 && memcmp(s, "end", 3) == 0) {
+            return APPS_UI_SCROLL_END;
+        }
+        shown_t shown;
+        fail(L, "w:scroll_to: where '%s' is not \"start\", \"end\" or a number of px", show(&shown, s, len));
+    }
+    if (type != LUA_TNUMBER) {
+        fail(L, "w:scroll_to: where must be \"start\", \"end\" or a number of px, got %s", luaL_typename(L, idx));
+    }
+    double d = (double)lua_tonumber(L, idx);
+    if (isnan(d)) {
+        fail(L, "w:scroll_to: where must be \"start\", \"end\" or a number of px, got NaN");
+    }
+    d = round(d);  /* as doubles: an int32 made of an out of range double is undefined */
+    return d < 0 ? 0 : d > APPS_UI_SCROLL_MAX ? APPS_UI_SCROLL_MAX : (int32_t)d;
+}
+
+/* The command, under the lock: a call moves scroll_sets on, and the apply step scrolls when it sees it move (apps_ui.h). */
+static void commit_scroll(apps_ui_t *ui, int slot, int32_t target, bool animate) {
+    apps_port_ui_lock();
+    apps_widget_t *w = &ui->w[slot];
+    w->scroll_target = target;
+    w->scroll_animate = animate;
+    w->scroll_sets++;
+    w->dirty |= APPS_DIRTY_SCROLL;
+    apps_port_ui_unlock();
+}
+
+static int w_scroll_to(lua_State *L) {
+    apps_vm_check(L);
+    apps_ui_t *ui = ui_of(L);
+    handle_t *h = self_handle(L, "scroll_to");
+    apps_widget_t *w = live_widget(L, ui, h);
+    if (h->kind != APPS_W_BOX) {
+        fail(L, "w:scroll_to: only a box scrolls");
+    }
+    if (w->scroll != APPS_SCROLL_Y) {
+        fail(L, "w:scroll_to: %s#%d doesn't scroll (set scroll = \"y\")", apps_ui_kinds[h->kind], (int)h->slot);
+    }
+    int32_t target = scroll_target(L, 2);
+    int type = lua_type(L, 3);
+    if (type != LUA_TBOOLEAN && type != LUA_TNIL && type != LUA_TNONE) {
+        fail(L, "w:scroll_to: animate must be a boolean, got %s", luaL_typename(L, 3));
+    }
+    commit_scroll(ui, h->slot, target, lua_toboolean(L, 3) != 0);
+    lua_settop(L, 1);
+    return 1;
+}
+
 static const luaL_Reg apps_ui_methods[] = {
-    {"set", w_set}, {"get", w_get}, {"on", w_on}, {"delete", w_delete}, {NULL, NULL},
+    {"set", w_set}, {"get", w_get}, {"on", w_on}, {"delete", w_delete}, {"scroll_to", w_scroll_to}, {NULL, NULL},
 };
 
 /* ---- The handle's metamethods ---- */
@@ -1557,7 +1644,7 @@ static int open_ui(lua_State *L) {
     luaL_newmetatable(L, WIDGET_MT);
     lua_pushliteral(L, WIDGET_MT);
     lua_setfield(L, -2, "__metatable");
-    lua_createtable(L, 0, 4);  /* the methods */
+    lua_createtable(L, 0, ARRAY_LEN(apps_ui_methods) - 1);  /* the methods */
     lua_pushlightuserdata(L, ui);
     luaL_setfuncs(L, apps_ui_methods, 1);
     lua_pushlightuserdata(L, ui);

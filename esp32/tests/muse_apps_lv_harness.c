@@ -636,7 +636,17 @@ struct lv_obj {
     lv_area_t area;
     bool forced;           /* the test set the area: the layout leaves it */
     int32_t pad_left, pad_right;  /* where its children's content area starts and ends (0 until set) */
+    int32_t pad_top, pad_bottom;  /* the same, up and down (games Task 4) */
+    int32_t pad_row;       /* the gap between a flex column's children (lv_obj_set_style_pad_row): 0 until set */
+    lv_layout_t layout;    /* LV_LAYOUT_NONE until set; lv_obj_set_flex_flow and lv_obj_set_flex_align set LV_LAYOUT_FLEX (lv_flex.c) */
+    lv_flex_flow_t flex_flow;   /* LV_FLEX_FLOW_ROW until set, as LVGL's style default */
+    lv_flex_align_t flex_main, flex_cross, flex_track;  /* LV_FLEX_ALIGN_START until set */
+    int32_t lw, lh;        /* the size the layout gives it (lv_obj_refr_size), while fake_layout runs */
+    int32_t fx, fy;        /* where its parent's flex column puts it, when flexed */
+    bool flexed;           /* the layout positions it (lv_obj_is_layout_positioned): its parent is a flex column, and it shows */
+    bool readjust;         /* readjust_scroll_after_layout: a child of it was deleted, or its size changed (lv_obj.c, lv_obj_pos.c) */
     int32_t scroll_x;      /* how far its content is scrolled left (lv_obj_get_scroll_x): a test moves it */
+    int32_t scroll_y;      /* how far its content is scrolled up (lv_obj_get_scroll_y, -scroll.y), for one that scrolls vertically */
     lv_dir_t scroll_dir;   /* LV_DIR_ALL until set, as LVGL's */
     lv_scroll_snap_t snap_x;
     lv_scrollbar_mode_t scrollbar_mode;  /* LV_SCROLLBAR_MODE_AUTO until set, as LVGL's */
@@ -655,7 +665,7 @@ struct lv_obj {
         const char *prop;
         lv_style_selector_t sel;
         char value[24];
-    } styles[24];
+    } styles[32];
     int n_styles;
 };
 
@@ -698,8 +708,9 @@ static lv_obj_t *scroll_obj;    /* what this touch's drag scrolls; after the lif
 static lv_dir_t scroll_dir_now; /* pointer.scroll_dir: LV_DIR_HOR or LV_DIR_VER once a drag scrolls */
 static lv_point_t scroll_sum, gesture_sum;
 static bool gesture_sent;
-static bool throw_pending;      /* indev->scroll_throw_anim: a drag's lift started it, and it hasn't run yet */
-static int32_t throw_vect_x;    /* pointer.scroll_throw_vect_ori.x at the lift */
+static bool throw_pending;      /* indev->scroll_throw_anim: a drag's lift started it, and it hasn't ended yet (it steps each frame) */
+static int32_t throw_vect_x;    /* pointer.scroll_throw_vect (and _ori, which a snapping throw predicts from) .x at the lift */
+static int32_t throw_vect_y;    /* and .y, which a vertical throw loses FAKE_SCROLL_THROW % of a step */
 static lv_obj_t *active_obj;    /* indev_obj_act: the pressed object while a read is processed, NULL otherwise */
 
 /* LVGL 9.5.0's numbers for all that (test_the_fakes_pointer_is_lvgl_9_5_0s reads them in its tree). */
@@ -711,11 +722,14 @@ static lv_obj_t *active_obj;    /* indev_obj_act: the pressed object while a rea
 #define FAKE_SCROLL_ANIM_MIN_MS 200   /* SCROLL_ANIM_TIME_MIN */
 #define FAKE_SCROLL_ANIM_MAX_MS 400   /* SCROLL_ANIM_TIME_MAX */
 #define FAKE_HOR_RES 466              /* the display: lv_obj_scroll_by animates at half its width a second */
+#define FAKE_VER_RES 466              /* and a vertical scroll at half its height */
 #define FAKE_COORD_MIN (-LV_COORD_MAX)
 
-/* A scroll animation (lv_obj_scroll_by with LV_ANIM_ON: scroll_x_anim), in LVGL's scroll.x, which is -lv_obj_get_scroll_x. */
+/* A scroll animation (lv_obj_scroll_by with LV_ANIM_ON: scroll_x_anim, or scroll_y_anim for ver), in LVGL's scroll.x (or .y), which
+ * is -lv_obj_get_scroll_x (or _y). An object has one of each at most. */
 typedef struct {
     lv_obj_t *obj;
+    bool ver;
     int32_t from, to, now;
     int32_t duration, elapsed;  /* ms */
     bool started;               /* its first step has run (lv_anim_t.start_cb_called): its end sends SCROLL_END */
@@ -865,6 +879,7 @@ static const char *code_name(lv_event_code_t c) {
 static const char *part_suffix(lv_style_selector_t sel) {
     switch (sel) {
         case LV_PART_MAIN: return "";
+        case LV_PART_SCROLLBAR: return " scrollbar";
         case LV_PART_INDICATOR: return " indicator";
         case LV_PART_KNOB: return " knob";
         case LV_PART_MAIN | LV_STATE_PRESSED: return " pressed";
@@ -1033,18 +1048,30 @@ void lv_obj_delete(lv_obj_t *obj) {
     }
     logline("delete %d", obj->id);
     mark_deleted(obj);
+    if (obj->parent != NULL && !obj->parent->deleted) {
+        obj->parent->readjust = true;  /* LV_EVENT_CHILD_DELETED to the parent: its scroll is readjusted after the next layout */
+    }
 }
 
+static void anim_delete(lv_obj_t *o);
+
+/* LVGL's: the children go, the scroll goes back to 0 (lv_obj_scroll_to, which stops its scroll animations, and the scroll zeroed), and
+ * a child gone readjusts it. */
 void lv_obj_clean(lv_obj_t *obj) {
     if (use(obj, "lv_obj_clean", NULL) == NULL) {
         return;
     }
     logline("clean %d", obj->id);
+    bool had = false;
     for (int i = 0; i < n_objs; i++) {
         if (objs[i]->parent == obj && !objs[i]->deleted) {
             mark_deleted(objs[i]);
+            had = true;
         }
     }
+    anim_delete(obj);
+    obj->scroll_x = obj->scroll_y = 0;
+    obj->readjust = obj->readjust || had;
 }
 
 /* parent's live children in their order (LVGL's child list), into kids; their count. */
@@ -1184,7 +1211,15 @@ void lv_obj_align(lv_obj_t *obj, lv_align_t align, int32_t x_ofs, int32_t y_ofs)
     logline("align %d %s %d %d", obj->id, align_name(align), (int)x_ofs, (int)y_ofs);
 }
 
-/* ---- The fake layout: enough to place objects by their alignment and size ---- */
+/* ---- The fake layout: LVGL 9.5.0's (lv_obj_pos.c, lv_flex.c) for what apps_lv makes ----
+ *
+ * Sizes first (lv_obj_refr_size): a side set in px is that, a percentage is of the parent's content (its box less its padding), and
+ * LV_SIZE_CONTENT is the content's: a label's text, a button's label, an image's picture, and an lv_obj's children (calc_content_width
+ * and _height, and a flex column's calc_min_size), the children sized before the object. Then places (lv_obj_refr_pos, lv_obj_move_to
+ * and flex_update), parents first: in the parent's content area, moved by its scroll, by the alignment, or where the parent's flex column
+ * puts it. Then each object whose scroll is to be readjusted is (lv_obj_readjust_scroll). Objects are made after their parent, so the
+ * order they were made in is parents first. What the fake leaves out: a border's width, which LVGL adds to the padding (its "space"), a
+ * margin, a translation, right-to-left, and the flows and places of a flex layout but a column's start, center and end. */
 
 static int32_t px_of(int32_t v, int32_t whole, int32_t content) {
     if (v == LV_SIZE_CONTENT) {
@@ -1197,6 +1232,7 @@ static int32_t px_of(int32_t v, int32_t whole, int32_t content) {
 }
 
 static int32_t ext_of(lv_obj_t *o);
+static bool counted_child(const lv_obj_t *c, const lv_obj_t *parent);
 
 static void content_size(lv_obj_t *o, int32_t *w, int32_t *h) {
     *w = *h = 0;
@@ -1218,18 +1254,122 @@ static void content_size(lv_obj_t *o, int32_t *w, int32_t *h) {
     }
 }
 
-/* As LVGL 9.5.0's lv_obj_refr_pos and lv_obj_move_to: an object is placed in its parent's content area (the parent's
- * box less its left and right padding), moved left by how far the parent is scrolled. */
-static void layout_one(lv_obj_t *o) {
-    if (o->forced) {
-        return;
+/* A flex column: lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_COLUMN) (a flex layout of another flow is the fake's error, at the layout). */
+static bool is_column(const lv_obj_t *o) {
+    if (o->layout != LV_LAYOUT_FLEX) {
+        return false;
     }
+    if (o->flex_flow != LV_FLEX_FLOW_COLUMN) {
+        fake_error("a flex layout of %d that isn't a column: the fake models a column only", o->id);
+        return false;
+    }
+    return true;
+}
+
+/* place_content (lv_flex.c) for start, end and center: where content of size in a space of max starts. */
+static int32_t place_start(lv_flex_align_t place, int32_t max, int32_t size) {
+    return place == LV_FLEX_ALIGN_CENTER ? (max - size) / 2 : place == LV_FLEX_ALIGN_END ? max - size : 0;
+}
+
+/* children_repos's cross position of an item of size in a track of size track: center rounds the track up to even first. */
+static int32_t cross_pos(lv_flex_align_t place, int32_t track, int32_t size) {
+    return place == LV_FLEX_ALIGN_CENTER ? (((track + 1) & ~1) - size) / 2 : place == LV_FLEX_ALIGN_END ? track - size : 0;
+}
+
+/* The widest of a column's children (find_track_end's track_cross_size: a column is one track, as it never wraps here). */
+static int32_t column_track(const lv_obj_t *o) {
+    int32_t track = 0;
+    for (int i = 0; i < n_objs; i++) {
+        if (counted_child(objs[i], o) && objs[i]->lw > track) {
+            track = objs[i]->lw;
+        }
+    }
+    return track;
+}
+
+/* The content size of an lv_obj, from its children's sizes (calc_content_width and _height, with the scroll left out). A flex column is
+ * as tall as its children and the gaps between them (calc_min_size), and as wide as its children reach across it; any other lv_obj
+ * reaches as far as its children placed from its left (or top) do, or, for a child placed by another alignment, as far as the child's
+ * size when its x (or y) is 0 (LVGL leaves out the others, which would be circular). The padding is added on both sides. */
+static void box_content(const lv_obj_t *o, int32_t *cw, int32_t *ch) {
+    int32_t w = FAKE_COORD_MIN, h = FAKE_COORD_MIN;
+    bool column = is_column(o);
+    int32_t track = column ? column_track(o) : 0, sum = 0, n = 0;
+    for (int i = 0; i < n_objs; i++) {
+        const lv_obj_t *c = objs[i];
+        if (!counted_child(c, o)) {
+            continue;
+        }
+        if (column) {
+            int32_t reach = o->pad_left + cross_pos(o->flex_cross, track, c->lw) + c->lw;
+            w = reach > w ? reach : w;
+            sum += c->lh;
+            n++;
+            continue;
+        }
+        int32_t rx = FAKE_COORD_MIN, ry = FAKE_COORD_MIN;
+        switch (c->align) {
+            case LV_ALIGN_DEFAULT:
+            case LV_ALIGN_TOP_LEFT:
+            case LV_ALIGN_BOTTOM_LEFT:
+            case LV_ALIGN_LEFT_MID: rx = o->pad_left + c->x + c->lw; break;
+            default: rx = c->x == 0 ? c->lw + o->pad_left : FAKE_COORD_MIN; break;
+        }
+        switch (c->align) {
+            case LV_ALIGN_DEFAULT:
+            case LV_ALIGN_TOP_LEFT:
+            case LV_ALIGN_TOP_MID:
+            case LV_ALIGN_TOP_RIGHT: ry = o->pad_top + c->y + c->lh; break;
+            default: ry = c->y == 0 ? c->lh + o->pad_top : FAKE_COORD_MIN; break;
+        }
+        w = rx > w ? rx : w;
+        h = ry > h ? ry : h;
+    }
+    if (column) {
+        h = n > 0 ? o->pad_top + sum + (n - 1) * o->pad_row : FAKE_COORD_MIN;
+    }
+    int32_t self_w = o->pad_left + o->pad_right, self_h = o->pad_top + o->pad_bottom;
+    *cw = w == FAKE_COORD_MIN ? self_w : w + o->pad_right > self_w ? w + o->pad_right : self_w;
+    *ch = h == FAKE_COORD_MIN ? self_h : h + o->pad_bottom > self_h ? h + o->pad_bottom : self_h;
+}
+
+static lv_obj_t *fake_kids_layout[FAKE_OBJS_MAX];
+
+/* flex_update for a column: its children that show stacked from its content area's top (less its scroll), each a gap after the last,
+ * placed across in the one track (the widest child) and the track in the content area (at its start when the column sizes to its
+ * content's width). */
+static void place_column(lv_obj_t *o) {
+    int32_t abs_x = o->area.x1 + o->pad_left - o->scroll_x, abs_y = o->area.y1 + o->pad_top - o->scroll_y;
+    int32_t track = column_track(o), main = 0, n = 0;
+    for (int i = 0; i < n_objs; i++) {
+        if (counted_child(objs[i], o)) {
+            main += objs[i]->lh + (n++ > 0 ? o->pad_row : 0);
+        }
+    }
+    int32_t max_main = o->lh - o->pad_top - o->pad_bottom, max_cross = o->lw - o->pad_left - o->pad_right;
+    lv_flex_align_t track_place = o->w == LV_SIZE_CONTENT ? LV_FLEX_ALIGN_START : o->flex_track;
+    abs_x += place_start(track_place, max_cross, track);
+    int32_t main_pos = place_start(o->flex_main, max_main, main);
+    int k = fake_children(o, fake_kids_layout);
+    for (int i = 0; i < k; i++) {
+        lv_obj_t *c = fake_kids_layout[i];
+        if ((c->flags & LV_OBJ_FLAG_HIDDEN) != 0) {
+            continue;
+        }
+        c->flexed = true;
+        c->fx = abs_x + cross_pos(o->flex_cross, track, c->lw);
+        c->fy = abs_y + main_pos;
+        main_pos += c->lh + o->pad_row;
+    }
+}
+
+/* Where an object goes in its parent by its alignment (lv_obj_refr_pos and lv_obj_move_to), at size w x h. */
+static void place_aligned(const lv_obj_t *o, int32_t w, int32_t h, int32_t *x, int32_t *y) {
     const lv_obj_t *parent = o->parent;
     const lv_area_t *pa = &parent->area;
-    int32_t pw = pa->x2 - pa->x1 + 1 - parent->pad_left - parent->pad_right, ph = pa->y2 - pa->y1 + 1, cw, ch;
-    content_size(o, &cw, &ch);
-    int32_t w = px_of(o->w, pw, cw), h = px_of(o->h, ph, ch);
-    int32_t x1 = pa->x1 + parent->pad_left - parent->scroll_x, y1 = pa->y1;
+    int32_t pw = pa->x2 - pa->x1 + 1 - parent->pad_left - parent->pad_right;
+    int32_t ph = pa->y2 - pa->y1 + 1 - parent->pad_top - parent->pad_bottom;
+    int32_t x1 = pa->x1 + parent->pad_left - parent->scroll_x, y1 = pa->y1 + parent->pad_top - parent->scroll_y;
     switch (o->align) {
         case LV_ALIGN_DEFAULT:
         case LV_ALIGN_TOP_LEFT: break;
@@ -1242,12 +1382,76 @@ static void layout_one(lv_obj_t *o) {
         case LV_ALIGN_RIGHT_MID: x1 += pw - w; y1 += (ph - h) / 2; break;
         case LV_ALIGN_CENTER: x1 += (pw - w) / 2; y1 += (ph - h) / 2; break;
     }
-    x1 += o->x;
-    y1 += o->y;
-    bool resized = o->area.x2 - o->area.x1 + 1 != w || o->area.y2 - o->area.y1 + 1 != h;
-    o->area = (lv_area_t){x1, y1, x1 + w - 1, y1 + h - 1};
-    if (resized && strcmp(o->cls, "image") == 0) {
-        o->ext_draw = ext_of(o);  /* lv_obj_refr_size sends for the room again whenever the size changes */
+    *x = x1 + o->x;
+    *y = y1 + o->y;
+}
+
+static void readjust_scroll(lv_obj_t *o);
+
+/* Everything laid out: sizes, then places, then the scrolls to readjust. */
+static void layout_all(void) {
+    /* The sides set in px or a percentage, parents first (a percentage is of the parent's, which is set: nothing apps_lv makes has a
+     * percentage inside an object sized to its content); then the sides sized to their content, children first. */
+    for (int i = 0; i < n_objs; i++) {
+        lv_obj_t *o = objs[i];
+        if (o->deleted) {
+            continue;
+        }
+        if (o->forced) {
+            o->lw = o->area.x2 - o->area.x1 + 1;
+            o->lh = o->area.y2 - o->area.y1 + 1;
+            continue;
+        }
+        const lv_obj_t *p = o->parent;
+        int32_t cw, ch;
+        content_size(o, &cw, &ch);
+        o->lw = px_of(o->w, p->lw - p->pad_left - p->pad_right, cw);
+        o->lh = px_of(o->h, p->lh - p->pad_top - p->pad_bottom, ch);
+    }
+    for (int i = n_objs - 1; i >= 0; i--) {
+        lv_obj_t *o = objs[i];
+        if (!o->deleted && !o->forced && strcmp(o->cls, "obj") == 0 && (o->w == LV_SIZE_CONTENT || o->h == LV_SIZE_CONTENT)) {
+            int32_t cw, ch;
+            box_content(o, &cw, &ch);
+            o->lw = o->w == LV_SIZE_CONTENT ? cw : o->lw;
+            o->lh = o->h == LV_SIZE_CONTENT ? ch : o->lh;
+        }
+    }
+    for (int i = 0; i < n_objs; i++) {
+        objs[i]->flexed = false;
+    }
+    for (int i = 0; i < n_objs; i++) {
+        lv_obj_t *o = objs[i];
+        if (o->deleted) {
+            continue;
+        }
+        if (!o->forced) {
+            int32_t w = o->lw, h = o->lh, x1, y1;
+            if (o->flexed) {
+                x1 = o->fx;
+                y1 = o->fy;
+            } else {
+                place_aligned(o, w, h, &x1, &y1);
+            }
+            bool resized = o->area.x2 - o->area.x1 + 1 != w || o->area.y2 - o->area.y1 + 1 != h;
+            o->area = (lv_area_t){x1, y1, x1 + w - 1, y1 + h - 1};
+            if (resized) {
+                o->readjust = true;  /* lv_obj_refr_size: readjust_scroll_after_layout */
+                if (strcmp(o->cls, "image") == 0) {
+                    o->ext_draw = ext_of(o);  /* lv_obj_refr_size sends for the room again whenever the size changes */
+                }
+            }
+        }
+        if (is_column(o)) {
+            place_column(o);
+        }
+    }
+    for (int i = 0; i < n_objs; i++) {
+        lv_obj_t *o = objs[i];
+        if (!o->deleted && o->readjust) {
+            o->readjust = false;  /* layout_update_core clears it before it readjusts, so the readjust's own layout doesn't again */
+            readjust_scroll(o);
+        }
     }
 }
 
@@ -1256,11 +1460,7 @@ void lv_obj_update_layout(const lv_obj_t *obj) {
         return;
     }
     logline("update_layout %d", obj->id);
-    for (int i = 0; i < n_objs; i++) {
-        if (!objs[i]->deleted) {
-            layout_one(objs[i]);
-        }
-    }
+    layout_all();
 }
 
 void lv_obj_get_coords(const lv_obj_t *obj, lv_area_t *coords) {
@@ -1321,6 +1521,57 @@ int32_t lv_obj_get_scroll_x(const lv_obj_t *obj) {
     return obj->scroll_x;
 }
 
+/* ---- Layouts (games Task 4): what is set is kept and logged, and the fake layout follows it ---- */
+
+static const char *flex_align_name(lv_flex_align_t a) {
+    return a == LV_FLEX_ALIGN_START ? "start" : a == LV_FLEX_ALIGN_END ? "end" : a == LV_FLEX_ALIGN_CENTER ? "center" : "?";
+}
+
+void lv_obj_set_layout(lv_obj_t *obj, uint32_t layout) {
+    if (use(obj, "lv_obj_set_layout", NULL) == NULL) {
+        return;
+    }
+    if (layout != LV_LAYOUT_NONE && layout != LV_LAYOUT_FLEX) {
+        fake_error("lv_obj_set_layout(%d, %u): the fake knows none and flex", obj->id, (unsigned)layout);
+        return;
+    }
+    obj->layout = (lv_layout_t)layout;
+    logline("layout %d %s", obj->id, layout == LV_LAYOUT_NONE ? "none" : "flex");
+}
+
+/* lv_flex.c's: the flow's style, and the layout LV_LAYOUT_FLEX. */
+void lv_obj_set_flex_flow(lv_obj_t *obj, lv_flex_flow_t flow) {
+    if (use(obj, "lv_obj_set_flex_flow", NULL) == NULL) {
+        return;
+    }
+    if (flow != LV_FLEX_FLOW_COLUMN) {
+        fake_error("lv_obj_set_flex_flow(%d, 0x%x): the fake models a column only", obj->id, (unsigned)flow);
+        return;
+    }
+    obj->flex_flow = flow;
+    obj->layout = LV_LAYOUT_FLEX;
+    logline("flex_flow %d column", obj->id);
+}
+
+/* lv_flex.c's: the three places' styles, and the layout LV_LAYOUT_FLEX. */
+void lv_obj_set_flex_align(lv_obj_t *obj, lv_flex_align_t main_place, lv_flex_align_t cross_place, lv_flex_align_t track_cross_place) {
+    if (use(obj, "lv_obj_set_flex_align", NULL) == NULL) {
+        return;
+    }
+    if ((unsigned)main_place > LV_FLEX_ALIGN_CENTER || (unsigned)cross_place > LV_FLEX_ALIGN_CENTER ||
+        (unsigned)track_cross_place > LV_FLEX_ALIGN_CENTER) {
+        fake_error("lv_obj_set_flex_align(%d, %d, %d, %d): the fake models start, end and center", obj->id, (int)main_place,
+                   (int)cross_place, (int)track_cross_place);
+        return;
+    }
+    obj->flex_main = main_place;
+    obj->flex_cross = cross_place;
+    obj->flex_track = track_cross_place;
+    obj->layout = LV_LAYOUT_FLEX;
+    logline("flex_align %d %s %s %s", obj->id, flex_align_name(main_place), flex_align_name(cross_place),
+            flex_align_name(track_cross_place));
+}
+
 /* ---- Styles ---- */
 
 static void style_log(lv_obj_t *obj, const char *prop, lv_style_selector_t sel, const char *fmt, ...)
@@ -1370,6 +1621,44 @@ void lv_obj_set_style_radius(lv_obj_t *obj, int32_t value, lv_style_selector_t s
             fake_error("a negative radius %d on %d", (int)value, obj->id);
         }
         style_log(obj, "radius", selector, "%d", (int)value);
+    }
+}
+
+/* A part's width: the scrollbar's thickness. The main part's width is lv_obj_set_size's here, which the layout reads. */
+void lv_obj_set_style_width(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    if (use(obj, "lv_obj_set_style_width", NULL) != NULL) {
+        if ((selector & 0xFF0000u) != LV_PART_SCROLLBAR) {
+            fake_error("lv_obj_set_style_width(%d) of a part that isn't the scrollbar: the fake lays out by lv_obj_set_size", obj->id);
+            return;
+        }
+        style_log(obj, "width", selector, "%d", (int)value);
+    }
+}
+
+void lv_obj_set_style_pad_top(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    if (use(obj, "lv_obj_set_style_pad_top", NULL) != NULL) {
+        if (selector == LV_PART_MAIN) {
+            obj->pad_top = value;
+        }
+        style_log(obj, "pad_top", selector, "%d", (int)value);
+    }
+}
+
+void lv_obj_set_style_pad_bottom(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    if (use(obj, "lv_obj_set_style_pad_bottom", NULL) != NULL) {
+        if (selector == LV_PART_MAIN) {
+            obj->pad_bottom = value;
+        }
+        style_log(obj, "pad_bottom", selector, "%d", (int)value);
+    }
+}
+
+void lv_obj_set_style_pad_row(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    if (use(obj, "lv_obj_set_style_pad_row", NULL) != NULL) {
+        if (selector == LV_PART_MAIN) {
+            obj->pad_row = value;
+        }
+        style_log(obj, "pad_row", selector, "%d", (int)value);
     }
 }
 
@@ -2336,7 +2625,9 @@ lv_obj_t *lv_indev_get_active_obj(void) {
 }
 
 /* ---- Scrolling as LVGL 9.5.0 does it (lv_obj_scroll.c, lv_indev_scroll.c), for what apps_lv makes: a row that snaps its children to
- * its centre. What the fake doesn't model (a vertical scroll, a throw without snapping, the other snap modes) is an error. ---- */
+ * its centre, and (games Task 4) a box that scrolls vertically with no snap points, LVGL's elastic edge and its throw. What the fake
+ * doesn't model (a vertical scroll of an object that doesn't scroll vertically, a sideways throw without snapping, snapping up and down,
+ * the other snap modes) is an error. ---- */
 
 static void fake_layout(void);
 static void fake_fire(int id, lv_event_code_t code);
@@ -2350,24 +2641,32 @@ static bool anim_on(const lv_obj_t *o) {
     return false;
 }
 
-/* lv_obj_scroll_by_raw: the content moves x to the right (scroll.x += x, so lv_obj_get_scroll_x falls by x), and SCROLL. */
+/* What the fake scrolls up and down: a scrollable object whose scroll direction has them (a scroll box: apps_lv.c gives it LV_DIR_VER). */
+static bool scrolls_vertically(const lv_obj_t *o) {
+    return (o->flags & LV_OBJ_FLAG_SCROLLABLE) != 0 && (o->scroll_dir & LV_DIR_VER) != 0;
+}
+
+/* lv_obj_scroll_by_raw: the content moves x to the right and y down (scroll.x += x, so lv_obj_get_scroll_x falls by x; the same for y),
+ * and SCROLL. */
 static void scroll_by_raw(lv_obj_t *o, int32_t x, int32_t y) {
     if (x == 0 && y == 0) {
         return;
     }
-    if (y != 0) {
-        fake_error("a vertical scroll of %d by %d: the fake doesn't model one", o->id, (int)y);
+    if (y != 0 && !scrolls_vertically(o)) {
+        fake_error("a vertical scroll of %d by %d, which doesn't scroll vertically: the fake models one only for an object that does",
+                   o->id, (int)y);
         return;
     }
     o->scroll_x -= x;
+    o->scroll_y -= y;
     fake_layout();
     fake_fire(o->id, LV_EVENT_SCROLL);
 }
 
-/* lv_anim_delete(obj, scroll_x_anim): its deleted_cb (scroll_end_cb) sends SCROLL_END when it had begun. */
-static void anim_delete(lv_obj_t *o) {
+/* lv_anim_delete(obj, scroll_y_anim) for ver, else scroll_x_anim: its deleted_cb (scroll_end_cb) sends SCROLL_END when it had begun. */
+static void anim_delete_axis(lv_obj_t *o, bool ver) {
     for (int i = 0; i < n_anims; i++) {
-        if (anims[i].obj == o) {
+        if (anims[i].obj == o && anims[i].ver == ver) {
             bool started = anims[i].started;
             anims[i] = anims[--n_anims];
             if (started) {
@@ -2378,36 +2677,56 @@ static void anim_delete(lv_obj_t *o) {
     }
 }
 
-/* lv_obj_scroll_by. Animated: SCROLL_BEGIN, then an ease-out from where it is to dx further, over the distance at half the screen's
- * width a second, 200 to 400 ms (lv_anim_speed_clamped), one step a frame (fake_frame), SCROLL_END at its end. It takes the place of
- * one that was running (LVGL's remove_concurrent_anims, at the new one's first step). Not animated: the ones running stop, then
+/* lv_obj_stop_scroll_anim: both, the vertical first. */
+static void anim_delete(lv_obj_t *o) {
+    anim_delete_axis(o, true);
+    anim_delete_axis(o, false);
+}
+
+/* One axis of an animated lv_obj_scroll_by: SCROLL_BEGIN, then an ease-out from where it is to d further, over the distance at half the
+ * screen's width (or height) a second, 200 to 400 ms (lv_anim_speed_clamped), one step a frame (fake_frame), SCROLL_END at its end. It
+ * takes the place of one that was running on that axis (LVGL's remove_concurrent_anims, at the new one's first step). */
+static void start_scroll_anim(lv_obj_t *o, bool ver, int32_t d) {
+    int32_t speed = ((FAKE_HOR_RES >> 1) + 5) / 10;  /* lv_anim_speed_clamped keeps it in 10 px/s */
+    if (ver) {
+        speed = ((FAKE_VER_RES >> 1) + 5) / 10;  /* lv_display_get_vertical_resolution's half */
+    }
+    int32_t dist = d < 0 ? -d : d, ms = dist * 100 / speed;
+    ms = ms < FAKE_SCROLL_ANIM_MIN_MS ? FAKE_SCROLL_ANIM_MIN_MS : ms > FAKE_SCROLL_ANIM_MAX_MS ? FAKE_SCROLL_ANIM_MAX_MS : ms;
+    fake_fire(o->id, LV_EVENT_SCROLL_BEGIN);
+    anim_delete_axis(o, ver);
+    if (n_anims >= (int)ARRAY_LEN(anims)) {
+        fake_error("more scroll animations than the fake holds");
+        return;
+    }
+    int32_t from = ver ? -o->scroll_y : -o->scroll_x;
+    anims[n_anims++] = (fake_anim_t){o, ver, from, from + d, from, ms, 0, false};
+}
+
+/* lv_obj_scroll_by. Animated: each axis that moves, sideways first (start_scroll_anim). Not animated: the ones running stop, then
  * SCROLL_BEGIN, the move and SCROLL_END. */
 static void scroll_by(lv_obj_t *o, int32_t dx, int32_t dy, bool anim) {
     if (dx == 0 && dy == 0) {
         return;
     }
-    if (dy != 0) {
-        fake_error("a vertical scroll of %d by %d: the fake doesn't model one", o->id, (int)dy);
+    if (dy != 0 && !scrolls_vertically(o)) {
+        fake_error("a vertical scroll of %d by %d, which doesn't scroll vertically: the fake models one only for an object that does",
+                   o->id, (int)dy);
         return;
     }
     if (!anim) {
         anim_delete(o);
         fake_fire(o->id, LV_EVENT_SCROLL_BEGIN);
-        scroll_by_raw(o, dx, 0);
+        scroll_by_raw(o, dx, dy);
         fake_fire(o->id, LV_EVENT_SCROLL_END);
         return;
     }
-    int32_t speed = ((FAKE_HOR_RES >> 1) + 5) / 10;  /* lv_anim_speed_clamped keeps it in 10 px/s */
-    int32_t d = dx < 0 ? -dx : dx, ms = d * 100 / speed;
-    ms = ms < FAKE_SCROLL_ANIM_MIN_MS ? FAKE_SCROLL_ANIM_MIN_MS : ms > FAKE_SCROLL_ANIM_MAX_MS ? FAKE_SCROLL_ANIM_MAX_MS : ms;
-    fake_fire(o->id, LV_EVENT_SCROLL_BEGIN);
-    anim_delete(o);
-    if (n_anims >= (int)ARRAY_LEN(anims)) {
-        fake_error("more scroll animations than the fake holds");
-        return;
+    if (dx != 0) {
+        start_scroll_anim(o, false, dx);
     }
-    int32_t from = -o->scroll_x;
-    anims[n_anims++] = (fake_anim_t){o, from, from + dx, from, ms, 0, false};
+    if (dy != 0) {
+        start_scroll_anim(o, true, dy);
+    }
 }
 
 /* An object's children that LVGL counts for scrolling and snapping: alive and not hidden. */
@@ -2450,7 +2769,7 @@ static void more_snap_points(const lv_obj_t *o, bool *start, bool *end) {
     *start = find_snap_point_x(o, FAKE_COORD_MIN, x - 1, 0) != LV_COORD_MAX;
 }
 
-/* lv_obj_get_scroll_left/right/top/bottom (left to right, no self size, no vertical padding or scroll): how far the content goes
+/* lv_obj_get_scroll_left/right/top/bottom (left to right, no self size, no margins, no border in the padding): how far the content goes
  * past each side of the content area. */
 static int32_t scroll_left(const lv_obj_t *o) {
     return o->scroll_x;
@@ -2469,23 +2788,28 @@ static int32_t scroll_right(const lv_obj_t *o) {
 }
 
 static int32_t scroll_top(const lv_obj_t *o) {
-    (void)o;
-    return 0;  /* -scroll.y: nothing scrolls vertically here */
+    return o->scroll_y;  /* -scroll.y */
 }
 
 static int32_t scroll_bottom(const lv_obj_t *o) {
     int32_t bottom = FAKE_COORD_MIN;
     for (int i = 0; i < n_objs; i++) {
-        if (counted_child(objs[i], o) && objs[i]->area.y2 - o->area.y2 > bottom) {
-            bottom = objs[i]->area.y2 - o->area.y2;
+        if (counted_child(objs[i], o) && objs[i]->area.y2 > bottom) {
+            bottom = objs[i]->area.y2;
         }
     }
-    int32_t self = -(o->area.y2 - o->area.y1 + 1);
+    int32_t self = -(o->area.y2 - o->area.y1 + 1 - o->pad_top - o->pad_bottom) - o->scroll_y;
+    bottom = bottom == FAKE_COORD_MIN ? bottom : bottom - (o->area.y2 - o->pad_bottom);
     return bottom > self ? bottom : self;
 }
 
-/* elastic_diff, sideways, with SCROLL_ELASTIC (every object has it): past the last snap point either way (or the content's end,
- * without snapping), a quarter of the finger's movement. */
+/* elastic_diff with SCROLL_ELASTIC (every object has it): past the last snap point either way (or the content's end, without
+ * snapping), a quarter of the finger's movement. Sideways for a row, which may snap; up and down, where nothing snaps here. */
+static int32_t elastic_slow(int32_t diff) {
+    diff += diff < 0 ? -FAKE_ELASTIC_SLOWNESS / 2 : FAKE_ELASTIC_SLOWNESS / 2;
+    return diff / FAKE_ELASTIC_SLOWNESS;
+}
+
 static int32_t elastic_diff_x(const lv_obj_t *o, int32_t diff) {
     bool out;
     if (o->snap_x == LV_SCROLL_SNAP_NONE) {
@@ -2495,11 +2819,72 @@ static int32_t elastic_diff_x(const lv_obj_t *o, int32_t diff) {
         more_snap_points(o, &start, &end);
         out = !start || !end;
     }
-    if (!out || diff == 0) {
-        return diff;
+    return !out || diff == 0 ? diff : elastic_slow(diff);
+}
+
+static int32_t elastic_diff_y(const lv_obj_t *o, int32_t diff) {
+    bool out = scroll_bottom(o) < 0 || scroll_top(o) < 0;
+    return !out || diff == 0 ? diff : elastic_slow(diff);
+}
+
+/* lv_obj_scroll_by_bounded: lays out, then scrolls by no more than the content allows, either way. */
+static void scroll_by_bounded(lv_obj_t *o, int32_t dx, int32_t dy, bool anim) {
+    if (dx == 0 && dy == 0) {
+        return;
     }
-    diff += diff < 0 ? -FAKE_ELASTIC_SLOWNESS / 2 : FAKE_ELASTIC_SLOWNESS / 2;
-    return diff / FAKE_ELASTIC_SLOWNESS;
+    fake_layout();  /* lv_obj_update_layout */
+    int32_t x_current = -o->scroll_x, x_bounded = x_current + dx;
+    if (x_bounded > 0) {
+        x_bounded = 0;
+    }
+    if (x_bounded < 0) {
+        int32_t scroll_max = scroll_left(o) + scroll_right(o);
+        scroll_max = scroll_max < 0 ? 0 : scroll_max;
+        x_bounded = x_bounded < -scroll_max ? -scroll_max : x_bounded;
+    }
+    int32_t y_current = -o->scroll_y, y_bounded = y_current + dy;
+    if (y_bounded > 0) {
+        y_bounded = 0;
+    }
+    if (y_bounded < 0) {
+        int32_t scroll_max = scroll_top(o) + scroll_bottom(o);
+        scroll_max = scroll_max < 0 ? 0 : scroll_max;
+        y_bounded = y_bounded < -scroll_max ? -scroll_max : y_bounded;
+    }
+    dx = x_bounded - x_current;
+    dy = y_bounded - y_current;
+    if (dx != 0 || dy != 0) {
+        scroll_by(o, dx, dy, anim);
+    }
+}
+
+/* lv_obj_scroll_to_y: its running vertical animation stops, then a scroll to y bounded by the content. */
+void lv_obj_scroll_to_y(lv_obj_t *obj, int32_t y, lv_anim_enable_t anim_en) {
+    if (use(obj, "lv_obj_scroll_to_y", NULL) == NULL) {
+        return;
+    }
+    logline("scroll_to_y %d %d%s", obj->id, (int)y, anim_en ? " anim" : "");
+    anim_delete_axis(obj, true);
+    int32_t diff = -y + obj->scroll_y;
+    scroll_by_bounded(obj, 0, diff, anim_en);
+}
+
+/* lv_obj_readjust_scroll, after a layout, for an object a child of which was deleted or whose size changed: content scrolled in past its
+ * bottom (or right) end comes back by no more than it is scrolled, at once. Up and down with no snap points (the fake's only kind);
+ * sideways only without snapping. */
+static void readjust_scroll(lv_obj_t *o) {
+    int32_t st = scroll_top(o), sb = scroll_bottom(o);
+    if (sb < 0 && st > 0) {
+        sb = st < -sb ? st : -sb;
+        scroll_by(o, 0, sb, false);
+    }
+    if (o->snap_x == LV_SCROLL_SNAP_NONE) {
+        int32_t sl = scroll_left(o), sr = scroll_right(o);
+        if (sr < 0 && sl > 0) {
+            sr = sl < -sr ? sl : -sr;
+            scroll_by(o, sr, 0, false);
+        }
+    }
 }
 
 /* lv_indev_find_scroll_obj: up from the pressed object, the one that can scroll the way the drag goes, once it has gone
@@ -2570,7 +2955,8 @@ static lv_obj_t *find_scroll_obj(void) {
     return candidate;
 }
 
-/* lv_indev_scroll_handler: a read that moves scrolls what the drag scrolls (found on the first read that can: SCROLL_BEGIN). */
+/* lv_indev_scroll_handler: a read that moves scrolls what the drag scrolls (found on the first read that can: SCROLL_BEGIN), along the
+ * drag's axis, slowed past an end (elastic_diff), and not a way the object doesn't scroll. */
 static void indev_scroll(void) {
     if (vect.x == 0 && vect.y == 0) {
         return;
@@ -2584,15 +2970,22 @@ static void indev_scroll(void) {
         fake_set_state(pressed_obj, (lv_state_t)(pressed_obj->state & ~LV_STATE_PRESSED));  /* the scroll's, not a press */
         fake_fire(o->id, LV_EVENT_SCROLL_BEGIN);
     }
-    if (scroll_dir_now != LV_DIR_HOR) {
-        fake_error("a vertical drag of %d: the fake doesn't model one", o->id);
+    int32_t dx = 0, dy = 0;
+    if (scroll_dir_now == LV_DIR_HOR) {
+        dx = elastic_diff_x(o, vect.x);
+    } else if (!scrolls_vertically(o)) {
+        fake_error("a vertical drag of %d, which doesn't scroll vertically: the fake models one only for an object that does", o->id);
         return;
+    } else {
+        dy = elastic_diff_y(o, vect.y);
     }
-    int32_t dx = elastic_diff_x(o, vect.x);
     if ((o->scroll_dir & LV_DIR_LEFT) == 0 && dx > 0) dx = 0;
     if ((o->scroll_dir & LV_DIR_RIGHT) == 0 && dx < 0) dx = 0;
-    scroll_by_raw(o, dx, 0);
+    if ((o->scroll_dir & LV_DIR_TOP) == 0 && dy > 0) dy = 0;
+    if ((o->scroll_dir & LV_DIR_BOTTOM) == 0 && dy < 0) dy = 0;
+    scroll_by_raw(o, dx, dy);
     scroll_sum.x += dx;
+    scroll_sum.y += dy;
 }
 
 /* indev_gesture: while nothing scrolls, the reads' movement adds up (a read under FAKE_GESTURE_MIN_VELOCITY starts it again), and
@@ -2632,72 +3025,121 @@ static int32_t throw_predict(int32_t v) {
     return sum;
 }
 
-/* The throw's first step (lv_indev_scroll_throw_handler, on a snapping row): an animated scroll to the snap point nearest where the
- * throw would carry it, SCROLL_END, and the touch's scroll is over. Its later steps find no scroll object and stop. */
+/* One step of the throw (lv_indev_scroll_throw_handler, which LVGL's throw animation runs once a run of the animation timer). A snapping
+ * row's: an animated scroll to the snap point nearest where the throw would carry it, and the throw is over. A box's that scrolls
+ * vertically, with no snap point: the throw loses FAKE_SCROLL_THROW % and moves the content by what is left, a quarter as far past an end
+ * (elastic_diff). Once the throw is spent, content scrolled in past an end goes back to it, animated, then SCROLL_END, and the touch's
+ * scroll is over. */
 static void indev_throw(void) {
-    throw_pending = false;
     lv_obj_t *o = scroll_obj;
     if (o == NULL || scroll_dir_now == LV_DIR_NONE) {
+        throw_pending = false;
         return;
     }
-    if (scroll_dir_now != LV_DIR_HOR || o->snap_x == LV_SCROLL_SNAP_NONE) {
-        fake_error("a throw of %d that isn't a snapping row's: the fake doesn't model one", o->id);
-    } else {
-        int32_t diff = throw_predict(throw_vect_x);
-        int32_t x = find_snap_point_x(o, FAKE_COORD_MIN, LV_COORD_MAX, diff);
-        if (x == LV_COORD_MAX) {
-            fake_error("a throw of %d, which has no snap point", o->id);
+    if (scroll_dir_now == LV_DIR_VER) {
+        throw_vect_x = 0;
+        if (!scrolls_vertically(o)) {
+            fake_error("a vertical throw of %d, which doesn't scroll vertically: the fake models one only for an object that does", o->id);
+            throw_vect_y = 0;
         } else {
-            scroll_by(o, x + diff, 0, true);
+            throw_vect_y = throw_vect_y * (100 - FAKE_SCROLL_THROW) / 100;
+            throw_vect_y = elastic_diff_y(o, throw_vect_y);
+            scroll_by_raw(o, 0, throw_vect_y);
+            if (scroll_obj != o) {
+                return;  /* the SCROLL's callback deleted it, or ended the touch's scroll */
+            }
+        }
+    } else {
+        throw_vect_y = 0;
+        if (o->snap_x == LV_SCROLL_SNAP_NONE) {
+            fake_error("a sideways throw of %d that isn't a snapping row's: the fake doesn't model one", o->id);
+        } else {
+            int32_t diff = throw_predict(throw_vect_x);
+            int32_t x = find_snap_point_x(o, FAKE_COORD_MIN, LV_COORD_MAX, diff);
+            if (x == LV_COORD_MAX) {
+                fake_error("a throw of %d, which has no snap point", o->id);
+            } else {
+                scroll_by(o, x + diff, 0, true);
+            }
+        }
+        throw_vect_x = 0;
+    }
+    if (throw_vect_x != 0 || throw_vect_y != 0) {
+        return;  /* the next frame takes the next step */
+    }
+    int32_t st = scroll_top(o), sb = scroll_bottom(o);
+    if (st > 0 || sb > 0) {
+        if (st < 0) {
+            scroll_by(o, 0, st, true);
+        } else if (sb < 0) {
+            scroll_by(o, 0, -sb, true);
+        }
+    }
+    if (o->snap_x == LV_SCROLL_SNAP_NONE) {
+        int32_t sl = scroll_left(o), sr = scroll_right(o);
+        if (sl > 0 || sr > 0) {
+            if (sl < 0) {
+                scroll_by(o, sl, 0, true);
+            } else if (sr < 0) {
+                scroll_by(o, -sr, 0, true);
+            }
         }
     }
     fake_fire(o->id, LV_EVENT_SCROLL_END);
     scroll_dir_now = LV_DIR_NONE;
     scroll_obj = NULL;
+    throw_pending = false;
 }
 
-/* One run of LVGL's animation timer, ms after the last: a throw a lift started takes its first step, the animations apps_lv.c started
- * take theirs (lv_anim_timer), then each scroll animation moves on (an ease-out: LVGL's is a cubic Bezier, and only the ends and the
- * time matter here), sending SCROLL, and one that has run its time ends, with SCROLL_END. */
+/* One run of LVGL's animation timer, ms after the last: a throw a lift started takes its step, the animations apps_lv.c started take
+ * theirs (lv_anim_timer), then each scroll animation moves on (an ease-out: LVGL's is a cubic Bezier, and only the ends and the time
+ * matter here), sending SCROLL, and one that has run its time ends, with SCROLL_END. */
 static void fake_frame(int ms) {
     if (throw_pending) {
         indev_throw();
     }
     lv_anim_timer(ms);
     lv_obj_t *moving[ARRAY_LEN(anims)];
+    bool axis[ARRAY_LEN(anims)];
     int n = n_anims;
     for (int i = 0; i < n; i++) {
         moving[i] = anims[i].obj;
+        axis[i] = anims[i].ver;
     }
     for (int i = 0; i < n; i++) {
-        fake_anim_t *a = NULL;
+        int at = -1;
         for (int k = 0; k < n_anims; k++) {
-            if (anims[k].obj == moving[i]) {
-                a = &anims[k];
+            if (anims[k].obj == moving[i] && anims[k].ver == axis[i]) {
+                at = k;
             }
         }
-        if (a == NULL) {
+        if (at < 0) {
             continue;  /* a SCROLL before it stopped it */
         }
+        fake_anim_t *a = &anims[at];
         a->started = true;
         a->elapsed += ms;
         int32_t t = a->elapsed < a->duration ? a->elapsed : a->duration;
         int32_t p = t * 1024 / a->duration, eased = 1024 - (1024 - p) * (1024 - p) / 1024;
         int32_t v = a->from + (a->to - a->from) * eased / 1024;
         lv_obj_t *o = a->obj;
-        bool done = a->elapsed >= a->duration;
+        bool ver = a->ver, done = a->elapsed >= a->duration;
         if (v != a->now) {
             a->now = v;
-            scroll_by_raw(o, v + o->scroll_x, 0);  /* scroll_x_anim: scroll.x becomes v */
+            if (ver) {
+                scroll_by_raw(o, 0, v + o->scroll_y);  /* scroll_y_anim: scroll.y becomes v */
+            } else {
+                scroll_by_raw(o, v + o->scroll_x, 0);  /* scroll_x_anim: scroll.x becomes v */
+            }
         }
-        if (done && anim_on(o)) {
+        if (done) {
             for (int k = 0; k < n_anims; k++) {
-                if (anims[k].obj == o) {
+                if (anims[k].obj == o && anims[k].ver == ver) {
                     anims[k] = anims[--n_anims];
+                    fake_fire(o->id, LV_EVENT_SCROLL_END);
                     break;
                 }
             }
-            fake_fire(o->id, LV_EVENT_SCROLL_END);
         }
     }
 }
@@ -2722,7 +3164,7 @@ void lv_obj_scroll_to_view(lv_obj_t *obj, lv_anim_enable_t anim_en) {
         return;
     }
     const lv_area_t *c = &obj->area, *p = &parent->area;
-    int32_t y_scroll = 0, top_diff = p->y1 - c->y1, bottom_diff = -(p->y2 - c->y2);
+    int32_t y_scroll = 0, top_diff = p->y1 + parent->pad_top - c->y1, bottom_diff = -(p->y2 - parent->pad_bottom - c->y2);
     if (!(top_diff >= 0 && bottom_diff >= 0)) {
         if (top_diff > 0) {
             y_scroll = scroll_top(parent) - top_diff < 0 ? 0 : top_diff;
@@ -2893,12 +3335,14 @@ static lv_obj_t *search_obj(lv_obj_t *o, int32_t x, int32_t y) {
     return on && (o->flags & LV_OBJ_FLAG_CLICKABLE) != 0 ? o : NULL;
 }
 
-/* A touch the way LVGL 9.5.0's indev (lv_indev.c) sends it. A new touch on an object: a throw still waiting for its first step takes
- * it (indev_proc_press stops the throw so: the snap's animation it starts goes on), the touch's state starts afresh, and the object gets
- * PRESSED. */
+/* A touch the way LVGL 9.5.0's indev (lv_indev.c) sends it. A new touch on an object: a throw still running takes one more step and
+ * stops (indev_proc_press deletes the throw's animation and runs its handler once: a snap's animation it starts goes on, and a vertical
+ * throw that isn't spent ends where it is, with no SCROLL_END), the touch's state starts afresh, and the object gets PRESSED. */
 static void begin_touch(lv_obj_t *o) {
     if (scroll_obj != NULL) {
+        throw_pending = false;
         indev_throw();
+        throw_pending = false;
     }
     pressed_obj = active_obj = o;
     last_point = act_point;
@@ -3002,6 +3446,7 @@ static void fake_lift(void) {
     if (s != NULL && scroll_obj == s) {
         throw_pending = true;
         throw_vect_x = vect.x;
+        throw_vect_y = vect.y;
     }
 }
 
@@ -3064,6 +3509,7 @@ static void fake_free_all(void) {
     memset(&screen_obj, 0, sizeof screen_obj);
     screen_obj.cls = "screen";
     screen_obj.area = (lv_area_t){0, 0, 465, 465};
+    screen_obj.lw = screen_obj.lh = 466;
     indev_present = true;
     gesture_dir = LV_DIR_NONE;
     pressed_obj = NULL;
@@ -3073,7 +3519,7 @@ static void fake_free_all(void) {
     scroll_obj = active_obj = NULL;
     scroll_dir_now = LV_DIR_NONE;
     gesture_sent = throw_pending = false;
-    throw_vect_x = 0;
+    throw_vect_x = throw_vect_y = 0;
     n_anims = 0;
     while (n_lv_anims > 0) {  /* lv_anim_delete_all: each deleted callback called */
         remove_lv_anim(n_lv_anims - 1);
@@ -3469,6 +3915,13 @@ POKE(box_four_into_box_three, W(e, 4)->parent = 3)
 POKE(parent_four_boxes_up, w->parent = 3)
 POKE(parent_loop, W(e, 0)->parent = 1)               /* 0 inside 1 inside 0 */
 POKE(parent_kind_changed, W(e, 0)->kind = APPS_W_LABEL)
+POKE(scroll_2, w->scroll = 2)
+POKE(layout_2, w->layout = 2)
+POKE(items_3, w->items = 3)
+POKE(gap_65, w->gap = APPS_UI_SPACE_MAX + 1)
+POKE(pad_255, w->pad = 255)
+POKE(scroll_target_minus_2, w->scroll_target = -2)
+POKE(scroll_target_past_the_max, w->scroll_target = APPS_UI_SCROLL_MAX + 1)
 
 static const bad_t BAD[] = {
     {"a kind past the last", "w = ui.label{text = 'hi'}", 0, kind_past_the_last, 0, 1},
@@ -3527,6 +3980,13 @@ static const bad_t BAD[] = {
                             "b4 = ui.box{} w = ui.label{parent = b4}", 5, box_four_into_box_three, 4, 2},
     {"a parent chain that loops", "b0 = ui.box{} b1 = ui.box{parent = b0}", 1, parent_loop, 0, 2},
     {"a box that became a label under a child", "b = ui.box{} w = ui.label{parent = b}", 1, parent_kind_changed, 1, 1},
+    {"scroll 2", "w = ui.box{}", 0, scroll_2, 0, 1},
+    {"layout 2", "w = ui.box{}", 0, layout_2, 0, 1},
+    {"items 3", "w = ui.box{layout = 'column'}", 0, items_3, 0, 1},
+    {"a gap past the most", "w = ui.box{}", 0, gap_65, 0, 1},
+    {"a pad of 255", "w = ui.box{}", 0, pad_255, 0, 1},
+    {"a scroll target of -2", "w = ui.box{scroll = 'y'} w:scroll_to('end')", 0, scroll_target_minus_2, 0, 1},
+    {"a scroll target past the most", "w = ui.box{scroll = 'y'} w:scroll_to(5)", 0, scroll_target_past_the_max, 0, 1},
     /* A box in a higher slot than its pending child is made for the child, so it is checked first: bad, it is not made,
      * and neither is the child. */
     {"a pending box above its child that is bad itself", "x = ui.label{} b = ui.box{} x:delete() c = ui.label{parent = b}", 1,
@@ -5585,7 +6045,12 @@ static const char *const COLOUR_NAMES[] = {"'#fff'", "'#102030'", "0xff8800", "'
 /* One property, as a Lua field: mostly right for the kind, sometimes not (the binding raises and the pcall eats it). */
 static void random_prop(int kind, char *out, size_t cap) {
     char text[40];
-    switch (rnd(22)) {
+    switch (rnd(27)) {
+        case 22: snprintf(out, cap, "scroll = '%s'", rnd(3) == 0 ? "none" : "y"); break;
+        case 23: snprintf(out, cap, "layout = '%s'", rnd(3) == 0 ? "none" : "column"); break;
+        case 24: snprintf(out, cap, "gap = %d", (int)rnd(80) - 5); break;
+        case 25: snprintf(out, cap, "pad = %d", (int)rnd(80) - 5); break;
+        case 26: snprintf(out, cap, "items = '%s'", rnd(4) == 0 ? "middle" : (rnd(2) ? "center" : "end")); break;
         case 0: snprintf(out, cap, "x = %d", (int)rnd(1000) - 500); break;
         case 1: snprintf(out, cap, "y = %d", (int)rnd(1000) - 500); break;
         case 2: snprintf(out, cap, "w = %d", (int)rnd(500) - 10); break;
@@ -5621,7 +6086,7 @@ static void random_prop(int kind, char *out, size_t cap) {
 /* Overwrites one field of the slot with garbage (the harness puts the widget back after the pass). */
 static void corrupt(env_t *e, int slot) {
     apps_widget_t *w = W(e, slot);
-    switch (rnd(26)) {
+    switch (rnd(31)) {
         case 0: w->kind = (uint8_t)rnd(10); break;
         case 1: w->parent = (int16_t)((int)rnd(140) - 6); break;
         case 2: w->x = (int16_t)((int)rnd(2000) - 1000); break;
@@ -5647,6 +6112,12 @@ static void corrupt(env_t *e, int slot) {
         case 22: w->alive = !w->alive; break;
         case 23: w->rotation = (int16_t)((int)rnd(800) - 200); break;
         case 24: w->spin = (uint8_t)rnd(255); break;
+        case 25: w->scroll = (uint8_t)rnd(4); break;
+        case 26: w->layout = (uint8_t)rnd(4); break;
+        case 27: w->items = (uint8_t)rnd(5); break;
+        case 28: w->gap = (uint8_t)rnd(255); break;
+        case 29: w->pad = (uint8_t)rnd(255); break;
+        case 30: w->scroll_target = (int32_t)rnd(3 * APPS_UI_SCROLL_MAX) - APPS_UI_SCROLL_MAX; break;
         default: {  /* a block of its own: the widget's own is kept by the caller, who puts it back */
             const char *bytes = rnd(2) != 0 ? "\xff\xfe" : "plain";
             size_t len = bytes[0] == 'p' ? 5 : 2;
@@ -5711,6 +6182,7 @@ static void fuzz_seed(uint32_t seed) {
             case 0 ... 29: {  /* a widget */
                 int kind = (int)rnd(ARRAY_LEN(KIND_NAMES));
                 char fields[500] = "";
+                const char *rows = "";
                 for (uint32_t i = 0, n = rnd(5); i < n; i++) {
                     random_prop(kind, props, sizeof props);
                     strncat(fields, props, sizeof fields - strlen(fields) - 2);
@@ -5719,11 +6191,16 @@ static void fuzz_seed(uint32_t seed) {
                 if (kind == APPS_W_IMAGE && rnd(8) != 0) {
                     strncat(fields, "src = 'a.bin', ", sizeof fields - strlen(fields) - 1);
                 }
+                if (kind == APPS_W_BOX && rnd(3) == 0) {  /* a list, filled past its height, which a drag in its middle scrolls */
+                    strncat(fields, "scroll = 'y', layout = 'column', w = 240, h = 160, ", sizeof fields - strlen(fields) - 1);
+                    rows = "for i = 1, 8 do ui.box{parent = w, w = 200, h = 30} end ";
+                }
                 if (rnd(3) == 0) {
                     snprintf(props, sizeof props, "parent = H[%u], ", (unsigned)rnd(12) + 1);
                     strncat(fields, props, sizeof fields - strlen(fields) - 1);
                 }
-                snprintf(src, sizeof src, "pcall(function() local w = ui.%s{%s} N = N + 1 H[N] = w end)", KIND_NAMES[kind], fields);
+                snprintf(src, sizeof src, "pcall(function() local w = ui.%s{%s} %sN = N + 1 H[N] = w end)", KIND_NAMES[kind], fields,
+                         rows);
                 break;
             }
             case 30 ... 54:  /* a change */
@@ -5733,10 +6210,16 @@ static void fuzz_seed(uint32_t seed) {
             case 55 ... 64: snprintf(src, sizeof src, "pcall(function() H[%u]:delete() end)", (unsigned)rnd(14) + 1); break;
             case 65 ... 68: snprintf(src, sizeof src, "ui.clear() H = {} N = 0"); break;
             case 69 ... 71: snprintf(src, sizeof src, "ui.bg(%s)", COLOUR_NAMES[rnd(3)]); break;
-            case 72 ... 79:
+            case 72 ... 77:
                 snprintf(src, sizeof src, "pcall(function() H[%u]:on('%s', %s) end)", (unsigned)rnd(14) + 1,
                          rnd(2) ? "tap" : "long_press", rnd(4) == 0 ? "nil" : "function() end");
                 break;
+            case 78 ... 79: {  /* a scroll_to, of a box that may not scroll, or of no box */
+                static const char *const wheres[] = {"'end'", "'start'", "120", "-5", "1e9", "'middle'"};
+                snprintf(src, sizeof src, "pcall(function() H[%u]:scroll_to(%s, %s) end)", (unsigned)rnd(14) + 1,
+                         wheres[rnd(ARRAY_LEN(wheres))], rnd(2) ? "true" : "false");
+                break;
+            }
             case 80 ... 92: {  /* a pass */
                 psram_free = rnd(4) == 0 ? (size_t)rnd(600 * 1024) : 4u * 1024 * 1024;
                 trylock_refusals = rnd(8) == 0 ? 1 : 0;
@@ -5770,8 +6253,19 @@ static void fuzz_seed(uint32_t seed) {
                 }
                 break;
             }
-            case 93 ... 97:  /* a touch, of an object that may be long gone */
-                if (n_objs > 1) {
+            case 93 ... 97:  /* a touch, of an object that may be long gone; or a drag across the layer in front, which may scroll a box */
+                if (rnd(2) == 0) {
+                    apps_lv_set_front(true);
+                    if (rnd(2) == 0) {  /* anywhere */
+                        fake_drag((int32_t)rnd(466), (int32_t)rnd(466), (int32_t)rnd(466), (int32_t)rnd(466), (int)rnd(8) + 1, (int)rnd(3));
+                    } else {  /* up or down from where a list is, in the middle */
+                        int32_t x = 113 + (int32_t)rnd(240), y = 153 + (int32_t)rnd(160);
+                        fake_drag(x, y, x + (int32_t)rnd(21) - 10, (int32_t)rnd(466), (int)rnd(8) + 1, (int)rnd(3));
+                    }
+                    fake_lift();
+                    fake_frame((int)rnd(40) + 1);
+                    n_evs = 0;
+                } else if (n_objs > 1) {
                     static const lv_event_code_t codes[] = {LV_EVENT_SHORT_CLICKED, LV_EVENT_LONG_PRESSED, LV_EVENT_PRESSED,
                                                             LV_EVENT_RELEASED, LV_EVENT_PRESS_LOST, LV_EVENT_CLICKED,
                                                             LV_EVENT_GESTURE};
@@ -5858,11 +6352,7 @@ static bool fake_shown(int id) {
 
 /* LVGL's layout of everything, as a refresh does it before it draws (no LVGL call of the code under test). */
 static void fake_layout(void) {
-    for (int i = 0; i < n_objs; i++) {
-        if (!objs[i]->deleted) {
-            layout_one(objs[i]);
-        }
-    }
+    layout_all();
 }
 
 /* The finger (or a fling, or the snap's animation) scrolls the object to x: LVGL moves its children and sends SCROLL. */
@@ -9132,6 +9622,491 @@ static void the_pass_reports_what_it_draws(void) {
     CHECK(watch_gone[a_watch], "freed after the reset");
 }
 
+/* ---- Scroll boxes and columns (games Task 4): a box's scroll, layout, gap, pad and items, and w:scroll_to ---- */
+
+/* The style an object holds for exactly this selector (a part, and a state), as its setter logged it; NULL for none. */
+static const char *fake_style_of(int id, const char *prop, lv_style_selector_t sel) {
+    const lv_obj_t *o = fake_obj(id);
+    for (int i = 0; i < o->n_styles; i++) {
+        if (o->styles[i].sel == sel && strcmp(o->styles[i].prop, prop) == 0) {
+            return o->styles[i].value;
+        }
+    }
+    return NULL;
+}
+
+static bool style_is(int id, const char *prop, lv_style_selector_t sel, const char *want) {
+    const char *got = fake_style_of(id, prop, sel);
+    return got != NULL && strcmp(got, want) == 0;
+}
+
+/* The object of the box made k-th (from 0) in a scene whose widgets are all boxes (the layer is the first lv_obj). */
+#define BOX_OBJ(k) fake_nth("obj", (k) + 1)
+
+/* The log's line of an lv_obj_scroll_to_y of object id to the end: LV_COORD_MAX, as apps_lv.c's "end" is. */
+static const char *scroll_end_line(int id, bool anim) {
+    static char line[64];
+    snprintf(line, sizeof line, "scroll_to_y %d %d%s", id, (int)LV_COORD_MAX, anim ? " anim" : "");
+    return line;
+}
+
+/* A list: a scroll box 300 x 200 in the middle of the screen (x 83 to 382, y 133 to 332), a column of n rows 300 x 50, each with a
+ * handler of tap, press and release when handlers is true. The list is slot 0 and row i slot i. */
+static void list_scene(env_t *e, int n, bool handlers) {
+    scene(e);
+    apps_lv_set_event_cb(on_event);
+    apps_lv_set_front(true);  /* a touch finds nothing on a hidden layer */
+    char src[600];
+    snprintf(src, sizeof src,
+             "list = ui.box{w = 300, h = 200, scroll = 'y', layout = 'column'}\n"
+             "rows = {}\n"
+             "for i = 1, %d do\n"
+             "  local r = ui.box{parent = list, w = 300, h = 50}\n"
+             "  if %s then r:on('tap', function() end) r:on('press', function() end) r:on('release', function() end) end\n"
+             "  rows[i] = r\n"
+             "end",
+             n, handlers ? "true" : "false");
+    RUN(e, src);
+    CHECK(APPLY(e), "the list was made");
+    n_evs = 0;
+}
+
+/* scroll = "y": scrollable up and down only, with LVGL's own scrollbar (shown while the content is taller: AUTO), styled as the theme's
+ * would be (lv_obj_remove_style_all took it off): 4 px, white at 40%, rounded. It is clickable with no handler, so a drag that begins on
+ * its own area finds it (finding 2). A box without scroll makes none of these calls, and "none" undoes them. */
+static void scroll_box_is_scrollable_vertically_with_a_styled_scrollbar(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "b = ui.box{w = 300, h = 200, scroll = 'y'}  p = ui.box{w = 100, h = 100}");
+    CHECK(APPLY(&e), "made");
+    int box = BOX_OBJ(0), plain = BOX_OBJ(1);
+    CHECK(fake_flag(box, LV_OBJ_FLAG_SCROLLABLE) && fake_obj(box)->scroll_dir == LV_DIR_VER &&
+              fake_obj(box)->scrollbar_mode == LV_SCROLLBAR_MODE_AUTO && fake_flag(box, LV_OBJ_FLAG_CLICKABLE),
+          "the scroll box: scrollable %d, dir 0x%x, scrollbar mode %d, clickable %d", fake_flag(box, LV_OBJ_FLAG_SCROLLABLE),
+          (unsigned)fake_obj(box)->scroll_dir, (int)fake_obj(box)->scrollbar_mode, fake_flag(box, LV_OBJ_FLAG_CLICKABLE));
+    CHECK(style_is(box, "width", LV_PART_SCROLLBAR, "4") && style_is(box, "bg_color", LV_PART_SCROLLBAR, "#ffffff") &&
+              style_is(box, "bg_opa", LV_PART_SCROLLBAR, "102") && style_is(box, "radius", LV_PART_SCROLLBAR, "32767"),
+          "the scrollbar's style\n%s", log_peek());
+    HAS("add_flag 2 scrollable");
+    HAS("scroll_dir 2 ver");
+    HAS("scrollbar_mode 2 auto");
+    HAS("add_flag 2 clickable");
+    CHECK(!fake_flag(plain, LV_OBJ_FLAG_SCROLLABLE) && !fake_flag(plain, LV_OBJ_FLAG_CLICKABLE) &&
+              fake_obj(plain)->layout == LV_LAYOUT_NONE && fake_style_of(plain, "pad_top", LV_PART_MAIN) == NULL &&
+              fake_style_of(plain, "pad_row", LV_PART_MAIN) == NULL && fake_style_of(plain, "width", LV_PART_SCROLLBAR) == NULL &&
+              log_count("scroll_dir 3") == 0 && log_count("scrollbar_mode 3") == 0,
+          "a box that doesn't scroll made calls for it\n%s", log_peek());
+    log_clear();
+
+    /* none: back to 0, not scrollable, and not clickable with no handler. */
+    RUN(&e, "b:set{scroll = 'none'}");
+    CHECK(APPLY(&e), "none");
+    CHECK(!fake_flag(box, LV_OBJ_FLAG_SCROLLABLE) && !fake_flag(box, LV_OBJ_FLAG_CLICKABLE), "none: scrollable %d clickable %d",
+          fake_flag(box, LV_OBJ_FLAG_SCROLLABLE), fake_flag(box, LV_OBJ_FLAG_CLICKABLE));
+    CHECK(log_find("scroll_to_y 2 0") >= 0 && log_find("scroll_to_y 2 0") < log_find("remove_flag 2 scrollable"),
+          "the content back at the top before it stops scrolling\n%s", log_peek());
+    log_clear();
+
+    /* A scroll box keeps its clickability when its last handler goes; one that stops scrolling with a handler keeps it too. */
+    RUN(&e, "b:set{scroll = 'y'} b:on('tap', function() end)");
+    CHECK(APPLY(&e), "scrolls, with a handler");
+    RUN(&e, "b:on('tap', nil)");
+    CHECK(APPLY(&e), "no handler");
+    CHECK(fake_flag(box, LV_OBJ_FLAG_CLICKABLE) && fake_flag(box, LV_OBJ_FLAG_SCROLLABLE) && log_count("remove_flag 2 clickable") == 0,
+          "a scroll box with no handler isn't clickable\n%s", log_peek());
+    RUN(&e, "b:on('press', function() end) b:set{scroll = 'none'}");
+    CHECK(APPLY(&e), "a handler, and no scroll");
+    CHECK(fake_flag(box, LV_OBJ_FLAG_CLICKABLE) && !fake_flag(box, LV_OBJ_FLAG_SCROLLABLE), "a box with a handler isn't clickable");
+    RUN(&e, "b:on('press', nil)");
+    CHECK(APPLY(&e), "neither");
+    CHECK(!fake_flag(box, LV_OBJ_FLAG_CLICKABLE), "a box with neither is clickable");
+    FINISH(&e);
+}
+
+/* layout = "column": the children that show stacked top to bottom in the order they were made, gap px apart, inside pad, their align, x
+ * and y ignored (lv_flex.c). And a box with no w or h sizes to its content: a column to its children, gaps and padding; any other box to
+ * the children placed from its top or left, or with a y (or x) of 0 (lv_obj_pos.c's calc_content_height and _width). */
+static void column_stacks_children_with_gap_and_pad(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "col = ui.box{w = 300, h = 400, layout = 'column', gap = 10, pad = 20}\n"
+            "a = ui.box{parent = col, w = 100, h = 50, align = 'bottom_right', x = 40, y = 30}\n"
+            "b = ui.label{parent = col, text = 'hello'}\n"
+            "c = ui.box{parent = col, w = 260, h = 30}");
+    CHECK(APPLY(&e), "made");
+    HAS("flex_flow 2 column");
+    HAS("flex_align 2 start start start");
+    HAS("pad_row 2 10");
+    HAS("pad_top 2 20");
+    HAS("pad_bottom 2 20");
+    HAS("pad_left 2 20");
+    HAS("pad_right 2 20");
+    /* col is at (83, 33): its content starts at (103, 53). */
+    CHECK(W(&e, 1)->rx == 103 && W(&e, 1)->ry == 53 && W(&e, 1)->rw == 100 && W(&e, 1)->rh == 50, "a at %d,%d %dx%d", W(&e, 1)->rx,
+          W(&e, 1)->ry, W(&e, 1)->rw, W(&e, 1)->rh);
+    CHECK(W(&e, 2)->rx == 103 && W(&e, 2)->ry == 113 && W(&e, 2)->rw == 50 && W(&e, 2)->rh == 20, "b at %d,%d %dx%d", W(&e, 2)->rx,
+          W(&e, 2)->ry, W(&e, 2)->rw, W(&e, 2)->rh);
+    CHECK(W(&e, 3)->rx == 103 && W(&e, 3)->ry == 143, "c at %d,%d", W(&e, 3)->rx, W(&e, 3)->ry);
+    /* A hidden child takes no place in the column. */
+    RUN(&e, "b:set{hidden = true}");
+    CHECK(APPLY(&e), "hidden");
+    CHECK(W(&e, 3)->ry == 113, "c moved up to %d", W(&e, 3)->ry);
+    log_clear();
+
+    /* Boxes that size to their content. */
+    RUN(&e, "auto = ui.box{w = 200, layout = 'column', gap = 5, pad = 4, y = 150}\n"
+            "for i = 1, 3 do ui.box{parent = auto, w = 50, h = 30} end\n"
+            "row = ui.box{w = 300, y = -150}\n"
+            "bubble = ui.box{parent = row, align = 'left', pad = 6}\n"
+            "msg = ui.label{parent = bubble, text = 'hi there', w = 120}\n"
+            "free = ui.box{align = 'top_left', x = 100, y = 100}\n"
+            "ui.box{parent = free, align = 'top_left', x = 5, y = 7, w = 40, h = 30}");
+    CHECK(APPLY(&e), "made");
+    CHECK(W(&e, 4)->rw == 200 && W(&e, 4)->rh == 108, "the column is as tall as 4 + 3 x 30 + 2 x 5 + 4: %dx%d", W(&e, 4)->rw,
+          W(&e, 4)->rh);
+    CHECK(W(&e, 5)->ry == W(&e, 4)->ry + 4 && W(&e, 7)->ry == W(&e, 4)->ry + 4 + 70, "its rows at %d and %d", W(&e, 5)->ry,
+          W(&e, 7)->ry);
+    CHECK(W(&e, 10)->rw == 120 && W(&e, 10)->rh == 20, "the label %dx%d", W(&e, 10)->rw, W(&e, 10)->rh);
+    CHECK(W(&e, 9)->rw == 132 && W(&e, 9)->rh == 32, "the bubble is its label and its padding: %dx%d", W(&e, 9)->rw, W(&e, 9)->rh);
+    CHECK(W(&e, 8)->rw == 300 && W(&e, 8)->rh == 32, "the row is as tall as its bubble: %dx%d", W(&e, 8)->rw, W(&e, 8)->rh);
+    CHECK(W(&e, 9)->rx == W(&e, 8)->rx && W(&e, 10)->rx == W(&e, 9)->rx + 6, "the bubble at the row's left, the label in its padding");
+    CHECK(W(&e, 11)->rw == 45 && W(&e, 11)->rh == 37, "a box to a child placed from its top left: %dx%d", W(&e, 11)->rw, W(&e, 11)->rh);
+    FINISH(&e);
+}
+
+/* items: where a column puts each child across, as LVGL places it in the column's one track, which is as wide as its widest child and
+ * starts at the column's left (the track's place is LV_FLEX_ALIGN_START): lined up on the widest child. */
+static void items_place_children_across(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "col = ui.box{w = 300, h = 300, layout = 'column', items = 'center'}\n"
+            "a = ui.box{parent = col, w = 200, h = 20}\n"
+            "b = ui.box{parent = col, w = 100, h = 20}\n"
+            "c = ui.box{parent = col, w = 51, h = 20}");
+    CHECK(APPLY(&e), "made");
+    HAS("flex_align 2 start center start");
+    CHECK(W(&e, 1)->rx == 83 && W(&e, 2)->rx == 133 && W(&e, 3)->rx == 157, "center: %d %d %d", W(&e, 1)->rx, W(&e, 2)->rx,
+          W(&e, 3)->rx);
+    RUN(&e, "col:set{items = 'end'}");
+    CHECK(APPLY(&e), "end");
+    HAS("flex_align 2 start end start");
+    CHECK(W(&e, 1)->rx == 83 && W(&e, 2)->rx == 183 && W(&e, 3)->rx == 232, "end: %d %d %d", W(&e, 1)->rx, W(&e, 2)->rx, W(&e, 3)->rx);
+    RUN(&e, "col:set{items = 'start'}");
+    CHECK(APPLY(&e), "start");
+    CHECK(W(&e, 1)->rx == 83 && W(&e, 2)->rx == 83 && W(&e, 3)->rx == 83, "start: %d %d %d", W(&e, 1)->rx, W(&e, 2)->rx, W(&e, 3)->rx);
+    log_clear();
+    /* With no layout, items makes no call; the column takes it when it comes back. */
+    RUN(&e, "col:set{layout = 'none'}");
+    CHECK(APPLY(&e), "none");
+    RUN(&e, "col:set{items = 'center'}");
+    CHECK(APPLY(&e), "items, with no layout");
+    CHECK(log_count("flex_") == 0, "a flex call with no layout\n%s", log_peek());
+    RUN(&e, "col:set{layout = 'column'}");
+    CHECK(APPLY(&e), "a column again");
+    HAS("flex_flow 2 column");
+    HAS("flex_align 2 start center start");
+    /* A child as wide as the box puts the others across the whole box. */
+    RUN(&e, "ui.box{parent = col, w = 300, h = 20}");
+    CHECK(APPLY(&e), "a full row");
+    CHECK(W(&e, 2)->rx == 183, "b in the middle of the box: %d", W(&e, 2)->rx);
+    FINISH(&e);
+}
+
+/* A drag up or down on a scroll box scrolls it by the finger's movement; a fling goes on, losing 10% a frame; past an end the content
+ * goes a quarter as far and springs back at the lift (LVGL's elastic edge); a sideways swipe scrolls nothing and still reaches the
+ * layer, whose right swipe puts the app behind. */
+static void vertical_drag_scrolls_a_scroll_box(void) {
+    env_t e;
+    list_scene(&e, 10, false);  /* 500 px of rows in 200: it scrolls up to 300 */
+    int list = BOX_OBJ(0);
+    int id = fake_drag(233, 300, 233, 200, 10, 2);
+    CHECK(id == list, "the drag began on %d, not the list %d (a row with no handler takes no touch)", id, list);
+    CHECK(fake_obj(list)->scroll_y == 100 && fake_scrolling(list), "dragged 100 px: scrolled %d", (int)fake_obj(list)->scroll_y);
+    CHECK(fake_obj(BOX_OBJ(1))->area.y1 == 33, "the first row moved up with it: %d", (int)fake_obj(BOX_OBJ(1))->area.y1);
+    fake_lift();
+    SETTLE();
+    CHECK(fake_obj(list)->scroll_y == 100 && !fake_scrolling(list), "a finger that stopped throws nothing: %d",
+          (int)fake_obj(list)->scroll_y);
+
+    /* A fling: the last read's 10 px go on as 9, 8 ... 1. */
+    fake_drag(233, 300, 233, 200, 10, 0);
+    fake_lift();
+    SETTLE();
+    CHECK(fake_obj(list)->scroll_y == 245, "flung: %d", (int)fake_obj(list)->scroll_y);
+
+    /* Past the end: 55 px to go, then a quarter of each read; back to the end once lifted. */
+    fake_drag(233, 300, 233, 200, 10, 2);
+    CHECK(fake_obj(list)->scroll_y == 317, "past the end: %d", (int)fake_obj(list)->scroll_y);
+    fake_lift();
+    SETTLE();
+    CHECK(fake_obj(list)->scroll_y == 300, "back to the end: %d", (int)fake_obj(list)->scroll_y);
+
+    /* Past the top. */
+    RUN(&e, "list:scroll_to('start')");
+    CHECK(APPLY(&e), "to the start");
+    CHECK(fake_obj(list)->scroll_y == 0, "at the start: %d", (int)fake_obj(list)->scroll_y);
+    fake_drag(233, 200, 233, 300, 10, 2);
+    CHECK(fake_obj(list)->scroll_y == -37 && fake_obj(BOX_OBJ(1))->area.y1 == 170, "pulled down past the top: %d",
+          (int)fake_obj(list)->scroll_y);
+    fake_lift();
+    SETTLE();
+    CHECK(fake_obj(list)->scroll_y == 0 && fake_obj(BOX_OBJ(1))->area.y1 == 133, "back to the top: %d", (int)fake_obj(list)->scroll_y);
+
+    /* Sideways: nothing scrolls, and the right swipe closes the app. */
+    closes = 0;
+    apps_lv_set_close_cb(on_close);
+    fake_drag(150, 233, 300, 233, 10, 0);
+    fake_lift();
+    SETTLE();
+    CHECK(closes == 1 && fake_obj(list)->scroll_y == 0 && fake_obj(list)->scroll_x == 0, "a right swipe: %d closes, scrolled %d,%d",
+          closes, (int)fake_obj(list)->scroll_x, (int)fake_obj(list)->scroll_y);
+    apps_lv_set_close_cb(NULL);
+    FINISH(&e);
+}
+
+/* Review Focus 5: a drag that begins on a row with a tap handler scrolls the list, and the row hears press, then release, and no tap
+ * (LVGL clicks nothing at the lift of a drag that scrolled: finding 4). */
+static void drag_on_a_row_scrolls_and_does_not_tap(void) {
+    env_t e;
+    list_scene(&e, 10, true);
+    int list = BOX_OBJ(0), row = BOX_OBJ(2);
+    int id = fake_drag(233, 200, 233, 120, 8, 1);  /* row 2 is at 183 to 232 */
+    CHECK(id == row, "the drag began on %d, not row 2 (%d)", id, row);
+    CHECK(fake_obj(list)->scroll_y == 80 && fake_scrolling(list), "scrolled %d", (int)fake_obj(list)->scroll_y);
+    CHECK((fake_state(row) & LV_STATE_PRESSED) == 0, "the row stays pressed while the list scrolls");
+    fake_lift();
+    SETTLE();
+    CHECK(n_evs == 2 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE && evs[0].slot == 2 && evs[1].slot == 2,
+          "press, release and no tap: %d events, the first %d of slot %d", n_evs, n_evs > 0 ? evs[0].event : -1,
+          n_evs > 0 ? evs[0].slot : -1);
+    CHECK(fake_obj(list)->scroll_y == 80, "and the list stays where it was dragged: %d", (int)fake_obj(list)->scroll_y);
+    FINISH(&e);
+}
+
+/* A touch that moves less than LVGL's scroll limit (10 px) taps the row under it, wherever the list is scrolled to. */
+static void still_touch_on_a_row_taps(void) {
+    env_t e;
+    list_scene(&e, 10, true);
+    int list = BOX_OBJ(0);
+    int id = fake_down(233, 200);
+    fake_move(233, 209);
+    fake_lift();
+    SETTLE();
+    CHECK(id == BOX_OBJ(2) && n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE &&
+              evs[2].event == APPS_UI_TAP && evs[2].slot == 2,
+          "press, release, tap on row 2: %d events", n_evs);
+    CHECK(fake_obj(list)->scroll_y == 0, "a touch scrolled the list: %d", (int)fake_obj(list)->scroll_y);
+    /* Scrolled by 80, the same point is on row 3. */
+    RUN(&e, "list:scroll_to(80)");
+    CHECK(APPLY(&e), "scrolled");
+    n_evs = 0;
+    fake_tap_at(233, 200);
+    CHECK(n_evs == 3 && evs[2].event == APPS_UI_TAP && evs[2].slot == 3, "the tap is row 3's: %d events, slot %d", n_evs,
+          n_evs == 3 ? evs[2].slot : -1);
+    FINISH(&e);
+}
+
+/* The ordering trap (code map 4.5): scroll_to("end") in the callback that makes the rows lands at their end, because the pass scrolls
+ * after its layout. "end" is a y past any content, which LVGL bounds; a number is rounded and clamped; the last scroll_to of a callback
+ * wins; animate scrolls smoothly over the next frames. */
+static void scroll_to_end_after_filling_lands_at_the_end(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "list = ui.box{w = 300, h = 200, scroll = 'y', layout = 'column', gap = 10, pad = 5}\n"
+            "for i = 1, 12 do ui.box{parent = list, w = 280, h = 40} end\n"
+            "list:scroll_to('end')");
+    CHECK(APPLY(&e), "made");
+    int list = BOX_OBJ(0);
+    CHECK(fake_obj(list)->scroll_y == 400, "600 px of content in 200: at %d", (int)fake_obj(list)->scroll_y);
+    CHECK(log_count("scroll_to_y ") == 1 && log_has_line(scroll_end_line(2, false)), "one scroll to the end\n%s", log_peek());
+    CHECK(log_find("update_layout 1") >= 0 && log_find("update_layout 1") < log_find("scroll_to_y 2"), "the scroll after the layout\n%s",
+          log_peek());
+    CHECK(W(&e, 12)->ry == 288 && W(&e, 12)->rh == 40, "the last row as written back, at the list's bottom less its pad: %d",
+          W(&e, 12)->ry);
+    log_clear();
+
+    RUN(&e, "list:scroll_to('start')");
+    CHECK(APPLY(&e), "start");
+    HAS("scroll_to_y 2 0");
+    CHECK(fake_obj(list)->scroll_y == 0 && W(&e, 1)->ry == 138, "at the start: %d, the first row at %d", (int)fake_obj(list)->scroll_y,
+          W(&e, 1)->ry);
+    static const struct {
+        const char *where;
+        int32_t target, scrolled;
+    } numbers[] = {{"120", 120, 120}, {"40.5", 41, 41}, {"-3", 0, 0}, {"1e9", APPS_UI_SCROLL_MAX, 400}, {"math.huge", APPS_UI_SCROLL_MAX, 400},
+                   {"0", 0, 0}};
+    for (size_t i = 0; i < ARRAY_LEN(numbers); i++) {
+        char src[64];
+        snprintf(src, sizeof src, "list:scroll_to(%s)", numbers[i].where);
+        RUN(&e, src);
+        CHECK(W(&e, 0)->scroll_target == numbers[i].target, "%s: the target %d", src, (int)W(&e, 0)->scroll_target);
+        CHECK(APPLY(&e), "%s", src);
+        CHECK(fake_obj(list)->scroll_y == numbers[i].scrolled, "%s: scrolled to %d", src, (int)fake_obj(list)->scroll_y);
+    }
+    log_clear();
+    RUN(&e, "list:scroll_to(10) list:scroll_to(20)");
+    CHECK(APPLY(&e), "two");
+    CHECK(log_count("scroll_to_y ") == 1 && log_has_line("scroll_to_y 2 20"), "the last of a callback's\n%s", log_peek());
+
+    /* Animated: the pass starts it, the frames move it. */
+    RUN(&e, "list:scroll_to('end', true)");
+    CHECK(APPLY(&e), "animated");
+    HAS(scroll_end_line(2, true));
+    CHECK(fake_obj(list)->scroll_y == 20 && fake_scrolling(list), "it animates: %d", (int)fake_obj(list)->scroll_y);
+    SETTLE();
+    CHECK(fake_obj(list)->scroll_y == 400 && !fake_scrolling(list), "animated to the end: %d", (int)fake_obj(list)->scroll_y);
+
+    /* Rows added with a scroll_to("end") in the same callback: the new end. */
+    RUN(&e, "for i = 1, 3 do ui.box{parent = list, w = 280, h = 40} end list:scroll_to('end')");
+    CHECK(APPLY(&e), "more rows");
+    CHECK(fake_obj(list)->scroll_y == 550, "750 px in 200: at %d", (int)fake_obj(list)->scroll_y);
+    FINISH(&e);
+}
+
+/* Review Focus 4: rows deleted from a list scrolled to its end leave no blank space: LVGL readjusts the scroll after the layout (a child
+ * deleted), to the new end, or to the top once the rows no longer fill the list. */
+static void rows_deleted_at_the_end_clamp_the_scroll(void) {
+    env_t e;
+    list_scene(&e, 10, false);
+    int list = BOX_OBJ(0);
+    RUN(&e, "list:scroll_to('end')");
+    CHECK(APPLY(&e), "to the end");
+    CHECK(fake_obj(list)->scroll_y == 300, "at the end: %d", (int)fake_obj(list)->scroll_y);
+    RUN(&e, "for i = 8, 10 do rows[i]:delete() end");
+    CHECK(APPLY(&e), "the last three deleted");
+    CHECK(fake_obj(list)->scroll_y == 150 && W(&e, 7)->ry + W(&e, 7)->rh - 1 == 332, "at the new end: %d, row 7 ends at %d",
+          (int)fake_obj(list)->scroll_y, W(&e, 7)->ry + W(&e, 7)->rh - 1);
+    RUN(&e, "rows[1]:delete() rows[2]:delete()");
+    CHECK(APPLY(&e), "the oldest two deleted");
+    CHECK(fake_obj(list)->scroll_y == 50 && W(&e, 7)->ry + W(&e, 7)->rh - 1 == 332, "at the new end: %d, row 7 ends at %d",
+          (int)fake_obj(list)->scroll_y, W(&e, 7)->ry + W(&e, 7)->rh - 1);
+    RUN(&e, "for i = 3, 5 do rows[i]:delete() end");
+    CHECK(APPLY(&e), "two rows left");
+    CHECK(fake_obj(list)->scroll_y == 0 && W(&e, 6)->ry == 133, "at the top: %d, row 6 at %d", (int)fake_obj(list)->scroll_y,
+          W(&e, 6)->ry);
+    FINISH(&e);
+}
+
+/* Review Focus 4: a scroll_to on a box that doesn't show (it or a box it is in is hidden) waits for the pass that shows it, and lands on
+ * the content it has then; one made on a box that stops scrolling before it shows is dropped. */
+static void scroll_to_waits_for_a_hidden_box(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "list = ui.box{w = 300, h = 200, scroll = 'y', layout = 'column', hidden = true}\n"
+            "for i = 1, 10 do ui.box{parent = list, w = 300, h = 50} end\n"
+            "list:scroll_to('end')");
+    CHECK(APPLY(&e), "made hidden");
+    int list = BOX_OBJ(0);
+    CHECK(log_count("scroll_to_y ") == 0 && fake_obj(list)->scroll_y == 0, "a hidden box scrolled\n%s", log_peek());
+    RUN(&e, "for i = 1, 2 do ui.box{parent = list, w = 300, h = 50} end");
+    CHECK(APPLY(&e), "more rows, still hidden");
+    CHECK(log_count("scroll_to_y ") == 0, "a hidden box scrolled\n%s", log_peek());
+    RUN(&e, "list:set{hidden = false}");
+    CHECK(APPLY(&e), "shown");
+    HAS(scroll_end_line(2, false));
+    CHECK(fake_obj(list)->scroll_y == 400, "600 px in 200: at %d", (int)fake_obj(list)->scroll_y);
+    FINISH(&e);
+
+    /* In a hidden box. */
+    scene(&e);
+    RUN(&e, "outer = ui.box{w = 400, h = 400, hidden = true}\n"
+            "inner = ui.box{parent = outer, w = 300, h = 200, scroll = 'y', layout = 'column'}\n"
+            "for i = 1, 10 do ui.box{parent = inner, w = 300, h = 50} end\n"
+            "inner:scroll_to(120)");
+    CHECK(APPLY(&e), "made in a hidden box");
+    int inner = BOX_OBJ(1);
+    CHECK(log_count("scroll_to_y ") == 0 && fake_obj(inner)->scroll_y == 0, "a box in a hidden box scrolled\n%s", log_peek());
+    log_clear();
+    RUN(&e, "outer:set{hidden = false}");
+    CHECK(APPLY(&e), "the outer box shown");
+    HAS("scroll_to_y 3 120");
+    CHECK(fake_obj(inner)->scroll_y == 120, "at %d", (int)fake_obj(inner)->scroll_y);
+    FINISH(&e);
+
+    /* Stopped scrolling while hidden: dropped. */
+    scene(&e);
+    RUN(&e, "list = ui.box{w = 300, h = 200, scroll = 'y', layout = 'column', hidden = true}\n"
+            "for i = 1, 10 do ui.box{parent = list, w = 300, h = 50} end\n"
+            "list:scroll_to('end') list:set{scroll = 'none'}");
+    CHECK(APPLY(&e), "made");
+    RUN(&e, "list:set{hidden = false}");
+    CHECK(APPLY(&e), "shown");
+    CHECK(log_count(scroll_end_line(2, false)) == 0 && fake_obj(BOX_OBJ(0))->scroll_y == 0, "a dropped scroll_to ran\n%s",
+          log_peek());
+    FINISH(&e);
+}
+
+/* none undoes each: layout none puts the children back by their align, x and y; gap and pad 0 take the padding off; scroll none brings
+ * the content back to the top. */
+static void layout_none_undoes_the_column(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "col = ui.box{w = 300, h = 300, layout = 'column', gap = 10, pad = 20, items = 'center'}\n"
+            "a = ui.box{parent = col, w = 100, h = 50, align = 'bottom_right', x = -5, y = -5}\n"
+            "b = ui.box{parent = col, w = 60, h = 50}");
+    CHECK(APPLY(&e), "made");
+    CHECK(W(&e, 1)->rx == 103 && W(&e, 1)->ry == 103 && W(&e, 2)->rx == 123 && W(&e, 2)->ry == 163, "the column: a %d,%d b %d,%d",
+          W(&e, 1)->rx, W(&e, 1)->ry, W(&e, 2)->rx, W(&e, 2)->ry);
+    log_clear();
+    RUN(&e, "col:set{layout = 'none'}");
+    CHECK(APPLY(&e), "no layout");
+    HAS("layout 2 none");
+    CHECK(W(&e, 1)->rx == 258 && W(&e, 1)->ry == 308 && W(&e, 2)->rx == 203 && W(&e, 2)->ry == 208,
+          "placed by align in the padded box: a %d,%d b %d,%d", W(&e, 1)->rx, W(&e, 1)->ry, W(&e, 2)->rx, W(&e, 2)->ry);
+    RUN(&e, "col:set{gap = 0, pad = 0}");
+    CHECK(APPLY(&e), "no padding");
+    HAS("pad_row 2 0");
+    HAS("pad_top 2 0");
+    HAS("pad_bottom 2 0");
+    HAS("pad_left 2 0");
+    HAS("pad_right 2 0");
+    CHECK(W(&e, 1)->rx == 278 && W(&e, 1)->ry == 328 && W(&e, 2)->rx == 203 && W(&e, 2)->ry == 208, "no padding: a %d,%d b %d,%d",
+          W(&e, 1)->rx, W(&e, 1)->ry, W(&e, 2)->rx, W(&e, 2)->ry);
+    RUN(&e, "col:set{layout = 'column'}");
+    CHECK(APPLY(&e), "a column again");
+    HAS("flex_flow 2 column");
+    HAS("flex_align 2 start center start");
+    CHECK(W(&e, 1)->rx == 83 && W(&e, 1)->ry == 83 && W(&e, 2)->rx == 103 && W(&e, 2)->ry == 133, "the column again: a %d,%d b %d,%d",
+          W(&e, 1)->rx, W(&e, 1)->ry, W(&e, 2)->rx, W(&e, 2)->ry);
+
+    RUN(&e, "s = ui.box{w = 200, h = 100, scroll = 'y', layout = 'column', y = 150}\n"
+            "for i = 1, 5 do ui.box{parent = s, w = 200, h = 50} end\n"
+            "s:scroll_to(100)");
+    CHECK(APPLY(&e), "a scroll box");
+    int s = BOX_OBJ(3);
+    CHECK(fake_obj(s)->scroll_y == 100, "scrolled %d", (int)fake_obj(s)->scroll_y);
+    RUN(&e, "s:set{scroll = 'none'}");
+    CHECK(APPLY(&e), "no scroll");
+    CHECK(fake_obj(s)->scroll_y == 0 && !fake_flag(s, LV_OBJ_FLAG_SCROLLABLE) && !fake_flag(s, LV_OBJ_FLAG_CLICKABLE) &&
+              W(&e, 4)->ry == W(&e, 3)->ry,
+          "back to the top, and neither scrollable nor clickable: %d", (int)fake_obj(s)->scroll_y);
+    FINISH(&e);
+}
+
+/* Finding 13: a widget in a scroll box is never warned of going past the round edge (its rows go off the screen as it scrolls, by
+ * design); the scroll box itself still is, and so is a widget in a box that doesn't scroll. */
+static void children_of_a_scroll_box_get_no_overflow_warning(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "list = ui.box{w = 300, h = 300, scroll = 'y', layout = 'column'}\n"
+            "for i = 1, 20 do\n"
+            "  local row = ui.box{parent = list, w = 300, h = 40, bg = '#333333'}\n"
+            "  ui.label{parent = row, text = 'row ' .. i, align = 'left'}\n"
+            "end");
+    CHECK(APPLY(&e), "made");
+    CHECK(W(&e, 39)->ry > 466, "the last row is far below the screen: %d", W(&e, 39)->ry);
+    for (int slot = 0; slot <= 40; slot++) {
+        CHECK(W(&e, slot)->overflow == 0, "slot %d: overflow %d", slot, W(&e, slot)->overflow);
+    }
+    RUN(&e, "big = ui.box{w = 466, h = 466, scroll = 'y'}\n"
+            "plain = ui.box{w = 400, h = 400}\n"
+            "ui.box{parent = plain, w = 400, h = 40, align = 'top'}");
+    CHECK(APPLY(&e), "made");
+    CHECK(W(&e, 41)->overflow > 0, "the scroll box itself: overflow %d", W(&e, 41)->overflow);
+    CHECK(W(&e, 43)->overflow > 0, "a widget in a box that doesn't scroll: overflow %d", W(&e, 43)->overflow);
+    FINISH(&e);
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -9253,6 +10228,17 @@ int main(int argc, char **argv) {
         {"crash_card_text_and_tap", crash_card_text_and_tap},
         {"cards_survive_a_reset", cards_survive_a_reset},
         {"cards_need_a_layer", cards_need_a_layer},
+        {"scroll_box_is_scrollable_vertically_with_a_styled_scrollbar", scroll_box_is_scrollable_vertically_with_a_styled_scrollbar},
+        {"column_stacks_children_with_gap_and_pad", column_stacks_children_with_gap_and_pad},
+        {"items_place_children_across", items_place_children_across},
+        {"vertical_drag_scrolls_a_scroll_box", vertical_drag_scrolls_a_scroll_box},
+        {"drag_on_a_row_scrolls_and_does_not_tap", drag_on_a_row_scrolls_and_does_not_tap},
+        {"still_touch_on_a_row_taps", still_touch_on_a_row_taps},
+        {"scroll_to_end_after_filling_lands_at_the_end", scroll_to_end_after_filling_lands_at_the_end},
+        {"rows_deleted_at_the_end_clamp_the_scroll", rows_deleted_at_the_end_clamp_the_scroll},
+        {"scroll_to_waits_for_a_hidden_box", scroll_to_waits_for_a_hidden_box},
+        {"layout_none_undoes_the_column", layout_none_undoes_the_column},
+        {"children_of_a_scroll_box_get_no_overflow_warning", children_of_a_scroll_box_get_no_overflow_warning},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

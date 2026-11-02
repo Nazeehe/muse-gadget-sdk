@@ -86,7 +86,7 @@ return app
 
 - `ui.label{...}`: a line or block of text. Returns the widget.
 - `ui.button{...}`: a button with text on it; give it a "tap" handler. It shows itself pressed while touched.
-- `ui.box{...}`: a rectangle with a background, corners and a border, and the parent of the widgets made with `parent = box` (boxes nest at most 4 deep). A box without `bg` (or a `border`) is invisible: it has no background until you give it one.
+- `ui.box{...}`: a rectangle with a background, corners and a border, and the parent of the widgets made with `parent = box` (boxes nest at most 4 deep). A box without `bg` (or a `border`) is invisible: it has no background until you give it one. With `layout = "column"` it stacks the widgets in it top to bottom, and with `scroll = "y"` a finger scrolls them up and down when they are taller than the box (see Lists in Patterns).
 - `ui.arc{...}`: a ring, or part of one, filled from start_angle by value between min and max. Give it `w` and `h`: without them it draws nothing.
 - `ui.bar{...}`: a straight progress bar, value between min and max. Give it `w` and `h`: without them it draws nothing.
 - `ui.image{...}`: one of the app's images (`src`, a path of the manifest's files, or a `muse.image`), which can be turned (`rotation`) or spun (`spin`).
@@ -96,9 +96,10 @@ return app
 - `ui.polar(deg, r)`: the x and y offsets, as integers, of the point r px from the centre at deg clock degrees, for a widget with `align = "center"`: `ui.polar(90, 100)` is `100, 0`, and `ui.polar(0, 100)` is `0, -100`.
 - `ui.W` and `ui.H` are 466, `ui.R` is 233 and `ui.SAFE` is 330.
 - `w:set{...}` changes properties, `w:get(name)` reads one (colours as `"#rrggbb"`), `w:on(event, fn)` calls `fn(w, event)` for the event (nil removes it), and `w:delete()` removes the widget and everything inside it. `set` and `on` return w, so calls chain.
+- `w:scroll_to(where, animate)` scrolls a box with `scroll = "y"`: where is `"start"`, `"end"` or a number of px from the top, and animate (false by default) scrolls smoothly instead of at once. Call it in the callback that adds the rows: it scrolls once the screen has laid them out, so `"end"` is their end. A hidden box scrolls when it shows. It returns w.
 - `ui.label` properties: align, x, y, w, h, hidden, opacity, parent, text, font, color, text_align, wrap; events: tap, long_press, press, release
 - `ui.button` properties: align, x, y, w, h, hidden, opacity, parent, text, font, color, bg, radius, border, border_color; events: tap, long_press, press, release
-- `ui.box` properties: align, x, y, w, h, hidden, opacity, parent, bg, radius, border, border_color; events: tap, long_press, press, release
+- `ui.box` properties: align, x, y, w, h, hidden, opacity, parent, bg, radius, border, border_color, scroll, layout, gap, pad, items; events: tap, long_press, press, release
 - `ui.arc` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, start_angle, end_angle, thickness, color, track_color; events: tap, long_press, press, release
 - `ui.bar` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, color, track_color, radius; events: tap, long_press, press, release
 - `ui.image` properties: align, x, y, w, h, hidden, opacity, parent, src, scale, rotation, spin; events: tap, long_press, press, release
@@ -112,15 +113,16 @@ The values:
 - `text` is a string (or a number) of at most 256 bytes of UTF-8. `font` is one of sans14, sans16, sans20 (the default), sans28, mono8, mono16, digits48 and digits96; the two digit fonts hold only `0-9 : . - + %` and the space. `text_align` is left, center (the default) or right.
 - Colours (`color`, `bg`, `border_color`, `track_color`) are `"#rgb"`, `"#rrggbb"` or `0xRRGGBB`; `bg` also takes `"none"`. Text, arcs and spinners default to white, button backgrounds and tracks to `"#262626"`.
 - `radius` is 0 to 233, or `"circle"`. `border` is 0 to 20. `thickness` (of an arc or a spinner) is 1 to 64, 12 by default.
+- A box's `scroll` is `"none"` (the default) or `"y"`: what is in the box scrolls up and down under a finger, with a thin scrollbar while there is more to see. `layout` is `"none"` (the default: each widget by its align, x and y) or `"column"`: the widgets in the box stack top to bottom in the order they were made, and their align, x and y are ignored. `gap` is the space between them and `pad` the space inside the box's edges, 0 to 64 px, 0 by default. `items` places them across the column: `"start"` (the default, on the left), `"center"` or `"end"`, lined up on the widest of them. A column with no `h` is as tall as its widgets, the gaps and the padding.
 - `min`, `max` and `value` default to 0, 100 and 0, with min less than max; value is kept between them. `start_angle` and `end_angle` are clock degrees, 0 to 360: 0 is 12 o'clock, and they go clockwise.
 - `parent` is a box, and can be given only when the widget is made. Widgets inside a box lay out in its content area: a border moves them in by its width, and LVGL clips what sticks out of the box. A box may have three boxes above it; a label, button, arc, bar or image may go in the fourth. `scale` is a percentage, 10 to 400.
 - `rotation` (of an image) is clock degrees, 0 to 359, 0 by default: the picture turns clockwise about its centre. `spin` is turns a minute, 0 to 60, 0 (still) by default: the gadget turns the picture clockwise at that rate itself, with no Lua running. See Images.
 - Numbers are rounded (halves away from zero) and clamped to these ranges, and an infinity is clamped too; NaN is an error. A value of the wrong type is an error; so is an unknown property or name, and that error lists the valid ones.
 - A widget's handle is the same object for as long as the app holds it, so it can be a table key, and a handler gets the very handle the app holds. `tostring(w)` is like `label#3` (`label#3 (deleted)` once it is gone), and `getmetatable(w)` is the string `muse.widget`.
 
-Touches. A tap is heard as press, release, tap, in that order; a long press as press, long_press, release, with no tap. A right swipe that begins on a widget puts the app behind: the widget hears press, then release, and no tap. A left swipe that begins on a widget is heard as press, release, tap. A widget that is deleted, or cleared with `ui.clear()`, while it is pressed never hears its release.
+Touches. A tap is heard as press, release, tap, in that order; a long press as press, long_press, release, with no tap. A right swipe that begins on a widget puts the app behind: the widget hears press, then release, and no tap. A left swipe that begins on a widget is heard as press, release, tap. A widget that is deleted, or cleared with `ui.clear()`, while it is pressed never hears its release. A drag up or down that begins on a widget in a box with `scroll = "y"` scrolls the box: the widget hears press, then release, and no tap.
 
-Stacking. Widgets draw in the order they are made: each new widget draws over every widget there is. So make what must stay in view (a score, a message) after what passes under it, and keep it on top by moving the widgets you have rather than making new ones. A widget with no handler takes no touches: the touch goes to the widget under it. So one full-screen box with a `press` handler, with a `bg` or without one, hears a touch anywhere no widget with a handler covers, whatever is drawn over it.
+Stacking. Widgets draw in the order they are made: each new widget draws over every widget there is. So make what must stay in view (a score, a message) after what passes under it, and keep it on top by moving the widgets you have rather than making new ones. A widget with no handler takes no touches: the touch goes to the widget under it. So one full-screen box with a `press` handler, with a `bg` or without one, hears a touch anywhere no widget with a handler covers, whatever is drawn over it. A box with `scroll = "y"` takes the touches on it, to scroll, even with no handler.
 
 ### time
 
@@ -263,6 +265,7 @@ The rest of Lua's `string`, `table`, `math` and `utf8` libraries is there, with 
 - Lay out with `align = "center"` and x, y offsets inside `ui.SAFE`. Place things on a ring with `ui.polar`, and make an edge ring with an arc of `w = 440, h = 440`. Install results warn of any widget that goes past the round edge.
 - Tick only while shown: start `timer.every` when the app is shown (in `start()` and in `show()`) and cancel it in `hide()`, as the timer example's `ticking()` does. An app behind needs no redraws.
 - Waiting: when the app starts a `muse.ask`, a `vm.command` or a slow `vm.read`, show a `ui.spinner{...}` and hide it in the callback with `hidden = true`, whether the call worked or not; if it failed, show the error's text in a label instead. A hidden spinner draws nothing, so keep one and show it again for the next wait.
+- Lists (a chat, a log, a feed): one box with `scroll = "y", layout = "column"`, a `w` and an `h`, and in it a row box for each item, with a `w` and no `h`, so it is as tall as what is in it. In each row put a bubble, a box with `align = "left"` or `align = "right"`, a `bg`, a `radius` and a `pad`, holding a label with a `w` and `wrap = true`. That is 2 to 3 widgets an item, and an app has 128 widgets: show the last 30 to 40 items, and delete the oldest rows as new ones come. Call `list:scroll_to("end")` after adding rows. Widgets in a scroll box get no round-edge warning, as they scroll past it by design: keep the scroll box itself inside the circle.
 - Answer `message()` with a small table (`{state = "running", remaining = 290}`), and raise `error("...")` with what to send instead for an event or data you can't take.
 
 ## Images
@@ -469,6 +472,8 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `layout not checked: the screen was asleep`: a warning: the screen was dark, so the install didn't check the layout (the round-edge warnings above); take an `app.control` `snapshot`, which wakes the screen, and read its `warnings`.
 - `ui.<kind>: src '<path>' is not one of this app's images (manifest.json "files")`: list the `.bin` in `files`.
 - `ui.<kind>: boxes nest at most 4 deep`: flatten the layout; a label, button, arc, bar or image may still go in the fourth box.
+- `w:scroll_to: only a box scrolls`: call it on the box with `scroll = "y"`, not on a row or a label in it.
+- `w:scroll_to: <kind>#<n> doesn't scroll (set scroll = "y")`: give the box `scroll = "y"` first.
 - `<module>: add "<permission>" to "permissions" in manifest.json`: add the permission (`alarm`, `store`, `sound`, `keep_awake`, `vm` or `muse`).
 - `the VM is not connected`: the gadget has no session with Muse right now (Wi-Fi, or Muse reconnecting): show it, and read again later; a watch tries again by itself.
 - `no such file on the VM: <path>`: nothing wrote `workspace/apps/<id>/<path>` yet: check the path, and that the hook has run.

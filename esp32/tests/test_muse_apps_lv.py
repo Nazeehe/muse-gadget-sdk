@@ -600,6 +600,41 @@ class HarnessTest(unittest.TestCase):
         # (task-1-report.md has the runs). A retune is a new gate run.
         self.assertEqual(header_number("apps_lv.h", "APPS_SPIN_STEP_MS"), 33)
 
+    # ---- Scroll boxes and columns (games Task 4) ----
+
+    def test_scroll_box_is_scrollable_vertically_with_a_styled_scrollbar(self):  # finding 3: remove_style_all took the theme's off
+        self.run_case("scroll_box_is_scrollable_vertically_with_a_styled_scrollbar")
+
+    def test_column_stacks_children_with_gap_and_pad(self):  # and a box with no w or h sizes to its content
+        self.run_case("column_stacks_children_with_gap_and_pad")
+
+    def test_items_place_children_across(self):  # in the column's one track, as wide as its widest child
+        self.run_case("items_place_children_across")
+
+    def test_vertical_drag_scrolls_a_scroll_box(self):  # the drag, the throw and the elastic edge, as lv_indev_scroll.c has them
+        self.run_case("vertical_drag_scrolls_a_scroll_box")
+
+    def test_drag_on_a_row_scrolls_and_does_not_tap(self):  # Review Focus 5, finding 4: press, release, no tap
+        self.run_case("drag_on_a_row_scrolls_and_does_not_tap")
+
+    def test_still_touch_on_a_row_taps(self):  # under LVGL's scroll limit
+        self.run_case("still_touch_on_a_row_taps")
+
+    def test_scroll_to_end_after_filling_lands_at_the_end(self):  # code map 4.5: the scroll after the pass's layout
+        self.run_case("scroll_to_end_after_filling_lands_at_the_end")
+
+    def test_rows_deleted_at_the_end_clamp_the_scroll(self):  # Review Focus 4: LVGL's readjust after a child is deleted
+        self.run_case("rows_deleted_at_the_end_clamp_the_scroll")
+
+    def test_scroll_to_waits_for_a_hidden_box(self):  # Review Focus 4
+        self.run_case("scroll_to_waits_for_a_hidden_box")
+
+    def test_layout_none_undoes_the_column(self):  # and gap, pad and scroll undone
+        self.run_case("layout_none_undoes_the_column")
+
+    def test_children_of_a_scroll_box_get_no_overflow_warning(self):  # finding 13: the scroll box itself still does
+        self.run_case("children_of_a_scroll_box_get_no_overflow_warning")
+
     # ---- Random tables ----
 
     def test_random_tables_and_passes_make_no_call_on_a_dead_object(self):
@@ -705,13 +740,15 @@ class FakesTest(unittest.TestCase):
         LV_OBJ_FLAG_HIDDEN LV_OBJ_FLAG_CLICKABLE LV_OBJ_FLAG_SCROLLABLE LV_OBJ_FLAG_SNAPPABLE LV_OBJ_FLAG_GESTURE_BUBBLE
         LV_SCROLLBAR_MODE_OFF LV_SCROLLBAR_MODE_ON LV_SCROLLBAR_MODE_ACTIVE LV_SCROLLBAR_MODE_AUTO
         LV_SCROLL_SNAP_NONE LV_SCROLL_SNAP_START LV_SCROLL_SNAP_END LV_SCROLL_SNAP_CENTER LV_DIR_HOR LV_DIR_VER LV_DIR_ALL
-        LV_PART_MAIN LV_PART_INDICATOR LV_PART_KNOB LV_STATE_DEFAULT LV_STATE_PRESSED
+        LV_PART_MAIN LV_PART_INDICATOR LV_PART_KNOB LV_PART_SCROLLBAR LV_STATE_DEFAULT LV_STATE_PRESSED
+        LV_FLEX_ALIGN_START LV_FLEX_ALIGN_END LV_FLEX_ALIGN_CENTER LV_FLEX_FLOW_ROW LV_FLEX_FLOW_COLUMN LV_FLEX_COLUMN
+        LV_LAYOUT_NONE LV_LAYOUT_FLEX
         LV_EVENT_ALL LV_EVENT_PRESSED LV_EVENT_PRESSING LV_EVENT_PRESS_LOST LV_EVENT_SHORT_CLICKED
         LV_EVENT_SINGLE_CLICKED LV_EVENT_DOUBLE_CLICKED LV_EVENT_TRIPLE_CLICKED LV_EVENT_LONG_PRESSED LV_EVENT_REFR_EXT_DRAW_SIZE
         LV_EVENT_LONG_PRESSED_REPEAT LV_EVENT_CLICKED LV_EVENT_RELEASED LV_EVENT_SCROLL_BEGIN
         LV_EVENT_SCROLL_THROW_BEGIN LV_EVENT_SCROLL_END LV_EVENT_SCROLL LV_EVENT_GESTURE LV_EVENT_KEY
         LV_EVENT_REFR_READY LV_EVENT_PREPROCESS
-        LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_30 LV_OPA_COVER LV_ANIM_OFF LV_ANIM_ON
+        LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_30 LV_OPA_40 LV_OPA_COVER LV_ANIM_OFF LV_ANIM_ON
         LV_IMAGE_ALIGN_DEFAULT LV_IMAGE_ALIGN_CENTER LV_COLOR_FORMAT_A8 LV_COLOR_FORMAT_RGB565A8 LV_IMAGE_FLAGS_PREMULTIPLIED
         sizeof(lv_image_header_t) sizeof(lv_image_dsc_t) sizeof(lv_color_t) sizeof(lv_area_t)
         offsetof(lv_image_dsc_t,header) offsetof(lv_image_dsc_t,data_size) offsetof(lv_image_dsc_t,data)
@@ -1063,6 +1100,64 @@ class FakesTest(unittest.TestCase):
                      "obj->flags |= LV_OBJ_FLAG_SCROLL_MOMENTUM;"):
             with self.subTest(line):
                 self.assertIn(line, constructor.group(0))
+
+    def test_the_fakes_vertical_scroll_and_column_are_lvgl_9_5_0s(self):
+        """games Task 4: the fake's scroll box and column follow LVGL 9.5.0's lines. lv_obj_scroll_to_y stops the vertical animation and
+        scrolls by the difference, bounded; a vertical animation runs at half the display's height a second; a drag past an end moves a
+        quarter as far (elastic_diff without snapping); a throw loses LV_INDEV_DEF_SCROLL_THROW % a step and is slowed the same way past
+        an end; after a layout, content scrolled in past its bottom comes back (lv_obj_readjust_scroll), which a deleted child and a size
+        change ask for; a column puts its children across in its track (place_content's cross_pos) and is as tall as they are with the
+        gaps (calc_min_size)."""
+        harness = HARNESS.read_text()
+
+        def source(path):
+            return _strip_comments((self.lvgl / path).read_text(errors="replace"))
+
+        def function(text, signature):
+            match = re.search(re.escape(signature) + r".*?\n\}", text, re.S)
+            self.assertIsNotNone(match, f"{signature} isn't in LVGL 9.5.0")
+            return match.group(0)
+
+        scroll = source("src/core/lv_obj_scroll.c")
+        to_y = function(scroll, "void lv_obj_scroll_to_y(lv_obj_t * obj, int32_t y, lv_anim_enable_t anim_en)")
+        for line in ("lv_anim_delete(obj, scroll_y_anim);", "int32_t diff = -y + scroll_y;", "lv_obj_scroll_by_bounded(obj, 0, diff, anim_en);"):
+            self.assertIn(line, to_y)
+        for line in ("anim_delete_axis(obj, true);", "int32_t diff = -y + obj->scroll_y;", "scroll_by_bounded(obj, 0, diff, anim_en);"):
+            self.assertIn(line, harness)
+        self.assertRegex(scroll, r"lv_anim_speed_clamped\(\(lv_display_get_vertical_resolution\(d\)\) >> 1, SCROLL_ANIM_TIME_MIN,")
+        self.assertIn("speed = ((FAKE_VER_RES >> 1) + 5) / 10;", harness)
+        self.assertEqual(int(re.search(r"^#define FAKE_VER_RES (\d+)\b", harness, re.M).group(1)), 466)
+        readjust = function(scroll, "void lv_obj_readjust_scroll(lv_obj_t * obj, lv_anim_enable_t anim_en)")
+        for line in ("if(sb < 0 && st > 0) {", "sb = LV_MIN(st, -sb);", "lv_obj_scroll_by(obj, 0, sb, anim_en);"):
+            self.assertIn(line, readjust)
+        for line in ("if (sb < 0 && st > 0) {", "sb = st < -sb ? st : -sb;", "scroll_by(o, 0, sb, false);"):
+            self.assertIn(line, harness)
+        pos = source("src/core/lv_obj_pos.c")
+        self.assertIn("lv_obj_readjust_scroll(obj, LV_ANIM_OFF);", pos)
+        self.assertIn("obj->readjust_scroll_after_layout = 1;", pos)  # lv_obj_refr_size, a size that changed
+        self.assertIn("obj->readjust_scroll_after_layout = 1;", source("src/core/lv_obj.c"))  # LV_EVENT_CHILD_DELETED
+
+        indev = source("src/indev/lv_indev_scroll.c")
+        elastic = function(indev, "static int32_t elastic_diff(lv_obj_t * scroll_obj, int32_t diff, int32_t scroll_start, int32_t scroll_end,\n"
+                                  "                            lv_dir_t dir)\n{")
+        for line in ("if(scroll_end < 0 || scroll_start < 0) {", "if(diff < 0) diff -= ELASTIC_SLOWNESS_FACTOR / 2;",
+                     "return diff / ELASTIC_SLOWNESS_FACTOR;"):
+            self.assertIn(line, elastic)
+        self.assertIn("bool out = scroll_bottom(o) < 0 || scroll_top(o) < 0;", harness)
+        self.assertIn("diff_y = elastic_diff(scroll_obj, indev->pointer.vect.y, st, sb, LV_DIR_VER);", indev)
+        self.assertRegex(indev, r"indev->pointer\.scroll_throw_vect\.y =\s+indev->pointer\.scroll_throw_vect\.y \* \(100 - scroll_throw\) / 100;")
+        self.assertIn("lv_obj_scroll_by_raw(scroll_obj, 0,  indev->pointer.scroll_throw_vect.y);", indev)
+        for line in ("throw_vect_y = throw_vect_y * (100 - FAKE_SCROLL_THROW) / 100;", "throw_vect_y = elastic_diff_y(o, throw_vect_y);",
+                     "scroll_by_raw(o, 0, throw_vect_y);"):
+            self.assertIn(line, harness)
+
+        flex = source("src/layouts/flex/lv_flex.c")
+        for line in ("cross_pos = (((t->track_cross_size + 1) & (~1)) - area_get_cross_size(&item->coords)) / 2;",
+                     "cross_pos = t->track_cross_size - area_get_cross_size(&item->coords);",
+                     "t->track_cross_size = LV_MAX(get_cross_size(item), t->track_cross_size);"):
+            self.assertIn(line, flex)
+        self.assertIn("return place == LV_FLEX_ALIGN_CENTER ? (((track + 1) & ~1) - size) / 2 : place == LV_FLEX_ALIGN_END ? track - size : 0;",
+                      harness)
 
     def test_apps_lv_compiles_against_the_real_headers(self):
         """The device build compiles apps_lv.c against these: every name, type and argument it uses is checked, a bench build's

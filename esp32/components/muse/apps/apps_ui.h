@@ -26,7 +26,8 @@
  * The Lua module (the guide copies this).
  * - ui.label{...} ui.button{...} ui.box{...} ui.arc{...} ui.bar{...} ui.image{...} ui.spinner{...} make a widget and
  *   return its handle. w:set{...} changes properties, w:get(name) reads one, w:on(event, fn) subscribes (fn nil removes it),
- *   w:delete() removes the widget and everything inside it. set and on return w, so calls chain. tostring(w) is
+ *   w:delete() removes the widget and everything inside it, and w:scroll_to(where, animate) scrolls a box with scroll = "y".
+ *   set, on and scroll_to return w, so calls chain. tostring(w) is
  *   "label#3": the kind and the slot. A widget is one object for as long as the app holds its handle, so a handle
  *   can be a table key and rawequal holds (a handle of a widget that is gone stays equal to itself, ==). The
  *   handles' metatable is not the app's to see: getmetatable(w) and getmetatable(ui) give a name.
@@ -35,14 +36,14 @@
  *   100) is 100, 0, and ui.polar(0, 100) is 0, -100. They go straight into the x and y of a widget whose align is
  *   "center". ui.W = ui.H = 466, ui.R = 233 and ui.SAFE = 330 (the inscribed square).
  * - Properties. All: align x y w h hidden opacity parent. label: text font color text_align wrap. button: text
- *   font color bg radius border border_color. box: bg radius border border_color. arc: min max value start_angle
- *   end_angle thickness color track_color. bar: min max value color track_color radius. image: src scale rotation
+ *   font color bg radius border border_color. box: bg radius border border_color scroll layout gap pad items. arc: min
+ *   max value start_angle end_angle thickness color track_color. bar: min max value color track_color radius. image: src scale rotation
  *   spin. spinner: thickness color track_color.
  *   (apps_ui_props_<kind> in apps_ui.c are the lists; the unknown-property message prints them.)
  * - Values. align is one of center top bottom left right top_left top_right bottom_left bottom_right, and x y are
  *   offsets from that anchor in the parent. Numbers are rounded to the nearest integer (halves away from zero)
  *   and then clamped: x, y to +-466; w, h to 1..466 (a widget with no w or h sizes to its content); opacity 0..100;
- *   radius 0..233, or "circle"; border 0..20; thickness 1..64; start_angle and end_angle 0..360 in clock degrees
+ *   radius 0..233, or "circle"; border 0..20; thickness 1..64; gap and pad 0..APPS_UI_SPACE_MAX; start_angle and end_angle 0..360 in clock degrees
  *   (0 is 12 o'clock, clockwise); scale 10..400 (percent); rotation 0..359 (clock degrees: the picture turns
  *   clockwise about its centre); spin 0..APPS_SPIN_RPM_MAX (turns a minute: the apply step turns the picture
  *   clockwise at that rate from the angle it is at, and 0 stops it where it got to); min and max
@@ -57,14 +58,15 @@
  *   hidden and wrap are booleans. text is a string
  *   or a number (as tostring makes it) of at most APPS_UI_TEXT_MAX bytes, valid UTF-8 (apps_json_utf8_len) and
  *   with no NUL byte; "" is no text. font is one of sans14 sans16 sans20 sans28 mono8 mono16 digits48 digits96
- *   (the digit fonts hold "0-9:.-+% "), text_align one of left center right. Colours are "#rgb", "#rrggbb" or
+ *   (the digit fonts hold "0-9:.-+% "), text_align one of left center right. A box's scroll is one of none y, layout
+ *   one of none column, items one of start center end. Colours are "#rgb", "#rrggbb" or
  *   0xRRGGBB, and bg also takes "none". src is the path of an image of the app's package (manifest.json "files"), or a
  *   runtime image's handle (apps_rt.h: what vm.read gives for a picture) that hasn't been freed.
  *   parent is a box, and can be given only when the widget is made. Boxes nest at most APPS_UI_BOX_DEPTH_MAX deep: a
  *   box may have at most APPS_UI_BOX_DEPTH_MAX - 1 box ancestors, and any other widget at most APPS_UI_BOX_DEPTH_MAX.
  * - Defaults. Every widget: align center, x y 0, w h to content, visible, opacity 100, border_color white. label:
  *   font sans20, text_align center, color white. button: bg "#262626", radius 16, font sans20, color white.
- *   box: bg none, radius 0. arc: min 0, max 100, value 0, start_angle 0, end_angle 360, thickness 12, color
+ *   box: bg none, radius 0, scroll none, layout none, gap 0, pad 0, items start. arc: min 0, max 100, value 0, start_angle 0, end_angle 360, thickness 12, color
  *   white, track_color "#262626". bar: min 0, max 100, value 0, color white, track_color "#262626", radius 0.
  *   image: scale 100, rotation 0, spin 0, and src is required. spinner: thickness 12, color white, track_color
  *   "#262626"; w and h stay nil for the app, and a side it leaves out is drawn APPS_SPINNER_SIDE px.
@@ -76,6 +78,10 @@
  * - Events: tap (and click, the same), long_press, press and release, on a widget of any kind. A handler gets
  *   (w, event) with the event's own name, "tap" for a click too. w:on replaces the event's handler. Deleting a
  *   widget drops its handlers.
+ * - w:scroll_to(where, animate): where is "start", "end" or a number of px from the top (rounded, and clamped to
+ *   0..APPS_UI_SCROLL_MAX: LVGL bounds it to the content), animate a boolean (nil: false). It is a command, as a set of rotation
+ *   is (The apply step's side, below): the box scrolls after the pass's layout, so "end" is the end of what was made before it,
+ *   and a box that doesn't show (it or a box above it hidden) scrolls in the pass that shows it.
  * - w:get returns what set takes: colours as "#rrggbb" (lower case) or "none"; align, font and text_align as
  *   names; radius "circle" or a number; w and h nil while they size to content (the declared values: the laid-out
  *   size comes from the LVGL task, later); parent as the parent's handle or nil; src as the path, or the runtime image's
@@ -103,7 +109,11 @@
  *             image's size is unknown
  *   ui.image: spin: images spinning at once may cover at most 180 x 180 px together (these would cover <n> px)
  *                                                    (ui.box the same, for a box shown with a spinner in it)
- *   ui.<kind>: unknown method '<name>' (valid: set, get, on, delete)
+ *   ui.<kind>: unknown method '<name>' (valid: set, get, on, delete, scroll_to)
+ *   w:scroll_to: only a box scrolls | w:scroll_to: box#<n> doesn't scroll (set scroll = "y")
+ *   w:scroll_to: where must be "start", "end" or a number of px, got <type>      also "got NaN"
+ *   w:scroll_to: where '<s>' is not "start", "end" or a number of px
+ *   w:scroll_to: animate must be a boolean, got <type>
  *   ui.<kind>: unknown event '<s>' (valid: tap, long_press, press, release)
  *   ui.<kind>: handler for '<event>' must be a function (or nil to remove it), got <type>
  *   ui: no more than 128 widgets per app            (with fewer alive, because deleted widgets still hold their
@@ -153,15 +163,18 @@
  *      for a label and button, VALUE for an arc and bar, so one that applies each bit in turn after making the
  *      object applies everything.
  *    - alive with other bits: GEOM is align, x, y, w, h; STYLE is hidden, opacity, font, color, text_align, wrap,
- *      bg, radius, border, border_color, thickness, track_color, src, scale, rotation and spin; TEXT is text;
+ *      bg, radius, border, border_color, thickness, track_color, src, scale, rotation, spin, scroll, layout, gap, pad and
+ *      items; TEXT is text;
  *      VALUE is min, max, value, start_angle and end_angle; EVENTS is the events mask (a widget with any is
  *      clickable). A change to what a widget sizes to (a text, a font) moves its neighbours: lay the layer out
  *      after any change and write rx, ry, rw, rh (screen coordinates) and overflow back.
  *    A set to the value a slot already has sets no bit, with one exception: rotation, once the image has spun
  *    since rotation was last set (spun), as the spin turned it away from that angle. Each set of rotation that
  *    turns the image (another angle, or that one) moves rotation_sets on, and the apply step turns the picture to
- *    rotation when it sees rotation_sets move; a create that gives rotation counts one. A widget made and deleted
- *    before a pass has no bits.
+ *    rotation when it sees rotation_sets move; a create that gives rotation counts one. A w:scroll_to is a command the
+ *    same way: each call moves scroll_sets on (with scroll_target and scroll_animate) and sets SCROLL, and the apply step
+ *    scrolls the box after its layout when scroll_sets moved, once the box shows; a box that no longer scrolls drops it. A
+ *    widget made and deleted before a pass has no bits.
  *
  * Handlers live in a table in the Lua registry, keyed by slot and event, and are looked up (apps_ui_push_handler)
  * against the slot's gen at dispatch, as well as dropped at delete.
@@ -197,6 +210,9 @@ typedef struct lua_State lua_State;
 #define APPS_SPIN_SIDE_MAX 180     /* ui.image spins only up to this many px a side as drawn (scale applied): the spin gate */
 #define APPS_SPIN_AREA_MAX 32400   /* the px the images spinning at once may cover together, drawn: one 180 x 180 */
 #define APPS_SPINNER_SIDE 48       /* ui.spinner's side, px, where the app leaves out a w or an h (the apply step sizes it) */
+#define APPS_UI_SPACE_MAX 64       /* a box's gap and pad, px */
+#define APPS_UI_SCROLL_MAX 100000  /* w:scroll_to's largest number of px: past the tallest content a box can hold */
+#define APPS_UI_SCROLL_END (-1)    /* w:scroll_to("end") as scroll_target: the apply step scrolls to the bottom bound */
 #define APPS_COLOR_NONE 0xFF000000u
 
 typedef enum { APPS_W_LABEL, APPS_W_BUTTON, APPS_W_BOX, APPS_W_ARC, APPS_W_BAR, APPS_W_IMAGE, APPS_W_SPINNER } apps_wkind_t;
@@ -208,13 +224,16 @@ typedef enum {
     APPS_ALIGN_CENTER, APPS_ALIGN_TOP, APPS_ALIGN_BOTTOM, APPS_ALIGN_LEFT, APPS_ALIGN_RIGHT,
     APPS_ALIGN_TOP_LEFT, APPS_ALIGN_TOP_RIGHT, APPS_ALIGN_BOTTOM_LEFT, APPS_ALIGN_BOTTOM_RIGHT
 } apps_align_t;
+typedef enum { APPS_SCROLL_NONE, APPS_SCROLL_Y } apps_scroll_t;
+typedef enum { APPS_LAYOUT_NONE, APPS_LAYOUT_COLUMN } apps_layout_t;
+typedef enum { APPS_ITEMS_START, APPS_ITEMS_CENTER, APPS_ITEMS_END } apps_items_t;
 
 /* Widget events; APPS_EV_* are task events. An event's bit is 1 << its index in {tap, long_press, press, release}. */
 enum { APPS_UI_TAP = 1, APPS_UI_LONG_PRESS = 2, APPS_UI_PRESS = 4, APPS_UI_RELEASE = 8 };
 
 enum {
     APPS_DIRTY_CREATE = 1, APPS_DIRTY_GEOM = 2, APPS_DIRTY_STYLE = 4, APPS_DIRTY_TEXT = 8,
-    APPS_DIRTY_VALUE = 16, APPS_DIRTY_EVENTS = 32, APPS_DIRTY_DELETE = 64
+    APPS_DIRTY_VALUE = 16, APPS_DIRTY_EVENTS = 32, APPS_DIRTY_DELETE = 64, APPS_DIRTY_SCROLL = 128
 };
 
 typedef struct {
@@ -236,6 +255,10 @@ typedef struct {
     uint8_t spin;                              /* turns a minute, 0..APPS_SPIN_RPM_MAX */
     bool spun;                                 /* it has spun since rotation was last set (the app task's alone) */
     uint32_t rotation_sets;                    /* sets of rotation that turn the image (above) */
+    uint8_t scroll, layout, gap, pad, items;   /* a box's: APPS_SCROLL_*, APPS_LAYOUT_*, px, px, APPS_ITEMS_* */
+    bool scroll_animate;                       /* the last w:scroll_to's animate */
+    int32_t scroll_target;                     /* and its where: px, or APPS_UI_SCROLL_END */
+    uint32_t scroll_sets;                      /* w:scroll_to calls (above) */
     char *text;                                /* PSRAM, NULL = "" */
     uint8_t events;                            /* APPS_UI_* subscribed */
     uint32_t dirty;                            /* APPS_DIRTY_*; the apply step clears it */

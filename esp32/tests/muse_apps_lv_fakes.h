@@ -29,7 +29,9 @@
  * an event at an object (a deleted one too) and set the objects' coordinates. A test can also touch the screen at a
  * point, move the finger and lift it, and run the animations' frames: the fake then does what LVGL 9.5.0's pointer
  * input does with that (lv_indev.c, lv_indev_scroll.c, lv_obj_scroll.c), from finding the object under the finger to a
- * scroll, a gesture or a click, and a fling's snap as an animation. The animations apps_lv.c starts itself (an image's spin)
+ * scroll, a gesture or a click, and a fling's snap as an animation; for a box that scrolls up and down (games Task 4), the drag,
+ * the elastic edge, the throw and lv_obj_scroll_to_y too. Its layout places children by their align, or in a flex column with its
+ * gap and padding (lv_flex.c), and sizes a box with no w or h to its children (lv_obj_pos.c). The animations apps_lv.c starts itself (an image's spin)
  * run as lv_anim.c runs them: copied into a list at lv_anim_start, stepped by each frame's animation timer (the path, the
  * exec callback only when the value changes, a repeat), and deleted with lv_anim_delete or with their object (lv_obj_destructor),
  * the deleted callback called each time. LVGL's own widget with an animation, lv_spinner, is here as lv_spinner.c has it (the
@@ -167,9 +169,30 @@ typedef enum {
 
 typedef enum {
     LV_PART_MAIN = 0x000000,
+    LV_PART_SCROLLBAR = 0x010000,
     LV_PART_INDICATOR = 0x020000,
     LV_PART_KNOB = 0x030000,
 } lv_part_t;
+
+/* lv_layout.h and lv_flex.h (LV_USE_FLEX is on in every Muse build, and by default): a layout, and a flex layout's flow and places
+ * (the flows and places the fake doesn't model aren't declared). */
+typedef enum {
+    LV_LAYOUT_NONE = 0,
+    LV_LAYOUT_FLEX,
+} lv_layout_t;
+
+#define LV_FLEX_COLUMN (1 << 0)
+
+typedef enum {
+    LV_FLEX_ALIGN_START,
+    LV_FLEX_ALIGN_END,
+    LV_FLEX_ALIGN_CENTER,
+} lv_flex_align_t;
+
+typedef enum {
+    LV_FLEX_FLOW_ROW = 0x00,
+    LV_FLEX_FLOW_COLUMN = LV_FLEX_COLUMN,
+} lv_flex_flow_t;
 
 /* lv_obj_style.h: the states a selector can name besides its part (the others aren't used). */
 typedef enum {
@@ -315,6 +338,7 @@ LV_FONT_DECLARE(lv_font_unscii_16)
 #define LV_RADIUS_CIRCLE 0x7FFF
 #define LV_OPA_TRANSP 0
 #define LV_OPA_30 76
+#define LV_OPA_40 102
 #define LV_OPA_COVER 255
 #define LV_ANIM_OFF false
 #define LV_ANIM_ON true
@@ -349,19 +373,28 @@ void lv_obj_align(lv_obj_t *obj, lv_align_t align, int32_t x_ofs, int32_t y_ofs)
 void lv_obj_update_layout(const lv_obj_t *obj);
 void lv_obj_get_coords(const lv_obj_t *obj, lv_area_t *coords);
 
+void lv_obj_set_layout(lv_obj_t *obj, uint32_t layout);
+void lv_obj_set_flex_flow(lv_obj_t *obj, lv_flex_flow_t flow);
+void lv_obj_set_flex_align(lv_obj_t *obj, lv_flex_align_t main_place, lv_flex_align_t cross_place, lv_flex_align_t track_cross_place);
+
 void lv_obj_set_scrollbar_mode(lv_obj_t *obj, lv_scrollbar_mode_t mode);
 void lv_obj_set_scroll_dir(lv_obj_t *obj, lv_dir_t dir);
 void lv_obj_set_scroll_snap_x(lv_obj_t *obj, lv_scroll_snap_t align);
 int32_t lv_obj_get_scroll_x(const lv_obj_t *obj);
 bool lv_obj_is_scrolling(const lv_obj_t *obj);
 void lv_obj_scroll_to_view(lv_obj_t *obj, lv_anim_enable_t anim_en);
+void lv_obj_scroll_to_y(lv_obj_t *obj, int32_t y, lv_anim_enable_t anim_en);
 
 void lv_obj_set_style_opa(lv_obj_t *obj, lv_opa_t value, lv_style_selector_t selector);
 void lv_obj_set_style_bg_color(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector);
 void lv_obj_set_style_bg_opa(lv_obj_t *obj, lv_opa_t value, lv_style_selector_t selector);
 void lv_obj_set_style_radius(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+void lv_obj_set_style_width(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+void lv_obj_set_style_pad_top(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+void lv_obj_set_style_pad_bottom(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
 void lv_obj_set_style_pad_left(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
 void lv_obj_set_style_pad_right(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+void lv_obj_set_style_pad_row(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
 void lv_obj_set_style_border_width(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
 void lv_obj_set_style_border_color(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector);
 void lv_obj_set_style_text_font(lv_obj_t *obj, const lv_font_t *value, lv_style_selector_t selector);

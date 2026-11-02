@@ -225,7 +225,7 @@ static void check_invariants(int line, env_t *e) {
     int alive = 0;
     for (int i = 0; i < APPS_UI_SLOTS; i++) {
         const apps_widget_t *w = apps_ui_slot(e->ui, i);
-        CHECK_AT(line, (w->dirty & ~127u) == 0, "slot %d: dirty %u", i, w->dirty);
+        CHECK_AT(line, (w->dirty & ~255u) == 0, "slot %d: dirty %u", i, w->dirty);
         if (!w->alive) {
             CHECK_AT(line, w->text == NULL && w->events == 0, "slot %d: a dead widget keeps text or events", i);
             continue;
@@ -268,6 +268,11 @@ static void check_invariants(int line, env_t *e) {
                  "slot %d: min %d max %d value %d", i, w->min, w->max, w->value);
         CHECK_AT(line, w->events <= (APPS_UI_TAP | APPS_UI_LONG_PRESS | APPS_UI_PRESS | APPS_UI_RELEASE),
                  "slot %d: events %d", i, w->events);
+        CHECK_AT(line, w->scroll <= APPS_SCROLL_Y && w->layout <= APPS_LAYOUT_COLUMN && w->items <= APPS_ITEMS_END &&
+                           w->gap <= APPS_UI_SPACE_MAX && w->pad <= APPS_UI_SPACE_MAX,
+                 "slot %d: scroll %d layout %d items %d gap %d pad %d", i, w->scroll, w->layout, w->items, w->gap, w->pad);
+        CHECK_AT(line, w->scroll_target == APPS_UI_SCROLL_END || in_range(w->scroll_target, 0, APPS_UI_SCROLL_MAX),
+                 "slot %d: scroll_target %d", i, (int)w->scroll_target);
         if (w->kind == APPS_W_IMAGE) {
             CHECK_AT(line, apps_ui_asset(e->ui, w->image) != NULL, "slot %d: image %d", i, w->image);
         }
@@ -550,6 +555,9 @@ static void dirty_groups(void) {
         {"ui.box{}", "bg = '#010203'", S},           {"ui.box{}", "radius = 3", S},
         {"ui.box{}", "border = 3", S},               {"ui.box{}", "border_color = '#010203'", S},
         {"ui.box{}", "align = 'left', w = 9", G},    {"ui.box{}", "hidden = true, opacity = 9", S},
+        {"ui.box{}", "scroll = 'y'", S},             {"ui.box{}", "layout = 'column'", S},
+        {"ui.box{}", "gap = 9", S},                  {"ui.box{}", "pad = 9", S},
+        {"ui.box{}", "items = 'end'", S},            {"ui.box{}", "scroll = 'y', items = 'center', pad = 64", S},
         {"ui.arc{}", "min = -5", V},                 {"ui.arc{}", "max = 500", V},
         {"ui.arc{}", "value = 9", V},                {"ui.arc{}", "start_angle = 9", V},
         {"ui.arc{}", "end_angle = 9", V},            {"ui.arc{}", "thickness = 9", S},
@@ -683,6 +691,60 @@ static void rotation_sets(void) {
     finish(&e);
 }
 
+/* w:scroll_to (games Task 4), a command as rotation is: each call that is let through moves scroll_sets on, with the target ("end" is
+ * APPS_UI_SCROLL_END, a number rounded and clamped to 0..APPS_UI_SCROLL_MAX) and animate, and sets APPS_DIRTY_SCROLL, the same call
+ * again too (the content may have moved since). A call that raises changes nothing; a new widget of the slot starts at 0. */
+static void scroll_to_sets(void) {
+    env_t e;
+    CHECK(env_open(&e, TWO_IMAGES, 2), "env_open");
+    RUN(&e, "b = ui.box{scroll = 'y', layout = 'column'} p = ui.box{} l = ui.label{}");
+    apply(&e, NULL);
+    CHECK(W(&e, 0)->scroll_sets == 0 && W(&e, 0)->scroll_target == 0 && !W(&e, 0)->scroll_animate, "made: sets %u target %d",
+          W(&e, 0)->scroll_sets, (int)W(&e, 0)->scroll_target);
+    static const struct {
+        const char *call;
+        int32_t target;
+        bool animate;
+    } calls[] = {
+        {"b:scroll_to('end')", APPS_UI_SCROLL_END, false}, {"b:scroll_to('end')", APPS_UI_SCROLL_END, false},
+        {"b:scroll_to('start', true)", 0, true},           {"b:scroll_to(120, false)", 120, false},
+        {"b:scroll_to(40.5)", 41, false},                  {"b:scroll_to(-40.5)", 0, false},
+        {"b:scroll_to(1e300, true)", APPS_UI_SCROLL_MAX, true}, {"b:scroll_to(-1 / 0)", 0, false},
+        {"b:scroll_to(APPS_MAX)", APPS_UI_SCROLL_MAX, false}, {"b:scroll_to(APPS_MAX + 1)", APPS_UI_SCROLL_MAX, false},
+        {"b:scroll_to('end', nil)", APPS_UI_SCROLL_END, false},
+    };
+    char src[96];
+    snprintf(src, sizeof src, "APPS_MAX = %d", APPS_UI_SCROLL_MAX);
+    RUN(&e, src);
+    for (size_t i = 0; i < ARRAY_LEN(calls); i++) {
+        RUN(&e, calls[i].call);
+        CHECK(W(&e, 0)->dirty == APPS_DIRTY_SCROLL && W(&e, 0)->scroll_sets == i + 1 && W(&e, 0)->scroll_target == calls[i].target &&
+                  W(&e, 0)->scroll_animate == calls[i].animate,
+              "%s: dirty %u sets %u target %d animate %d", calls[i].call, W(&e, 0)->dirty, W(&e, 0)->scroll_sets,
+              (int)W(&e, 0)->scroll_target, W(&e, 0)->scroll_animate);
+        apply(&e, NULL);
+    }
+    uint32_t sets = W(&e, 0)->scroll_sets;
+    RUN_FAILS(&e, "b:scroll_to('middle')", "w:scroll_to: where 'middle' is not");
+    RUN_FAILS(&e, "b:scroll_to(0 / 0)", "got NaN");
+    RUN_FAILS(&e, "b:scroll_to('end', 1)", "w:scroll_to: animate must be a boolean, got number");
+    RUN_FAILS(&e, "b:scroll_to(l, 'end')", "w:scroll_to: where must be");
+    RUN_FAILS(&e, "b.scroll_to(l, 'end')", "w:scroll_to: only a box scrolls");
+    RUN_FAILS(&e, "p:scroll_to('end')", "w:scroll_to: box#1 doesn't scroll (set scroll = \"y\")");
+    CHECK(W(&e, 0)->dirty == 0 && W(&e, 0)->scroll_sets == sets && W(&e, 1)->dirty == 0 && W(&e, 1)->scroll_sets == 0 &&
+              W(&e, 2)->dirty == 0,
+          "a call that raised changed the table: dirty %u %u %u", W(&e, 0)->dirty, W(&e, 1)->dirty, W(&e, 2)->dirty);
+    /* scroll = "none" takes the command away: the box doesn't scroll any more. The slot's next widget starts again. */
+    RUN(&e, "b:set{scroll = 'none'}");
+    RUN_FAILS(&e, "b:scroll_to('end')", "w:scroll_to: box#0 doesn't scroll");
+    RUN(&e, "b:delete()");
+    apply(&e, NULL);
+    RUN(&e, "c = ui.box{scroll = 'y'}");
+    CHECK(W(&e, 0)->alive && W(&e, 0)->scroll_sets == 0 && W(&e, 0)->scroll_target == 0 && !W(&e, 0)->scroll_animate,
+          "the slot's next widget: sets %u target %d", W(&e, 0)->scroll_sets, (int)W(&e, 0)->scroll_target);
+    finish(&e);
+}
+
 /* ---- A dying VM: every binding stops at apps_vm_check ---- */
 
 static int probe_calls;
@@ -714,6 +776,7 @@ static void vm_check(void) {
         "f_set(w, {x = 9, text = 'changed'}) probe()",
         "f_on(w, 'tap', probe) probe()",
         "f_delete(w) probe()",
+        "f_scroll(w, 'end') probe()",
         "local v = tostring(w) probe() return v",
         "local v = (w == w2) probe() return v",
         "local v = w.nothing probe() return v",
@@ -731,6 +794,8 @@ static void vm_check(void) {
         "f_on(w, 'swipe', probe) probe()",
         "f_on(w, 'tap', 'not a function') probe()",
         "f_delete(5) probe()",
+        "f_scroll(5, 'end') probe()",
+        "f_scroll(w, {}, 'yes') probe()",
         "local v = f_get(5, 'x') probe() return v",
     };
     for (size_t i = 0; i < ARRAY_LEN(chunks); i++) {
@@ -738,7 +803,7 @@ static void vm_check(void) {
         CHECK(env_open(&e, TWO_IMAGES, 2), "env_open");
         RUN(&e,
             "w = ui.label{text = 'a'} w2 = ui.label{}\n"
-            "f_get, f_set, f_on, f_delete = w.get, w.set, w.on, w.delete");
+            "f_get, f_set, f_on, f_delete, f_scroll = w.get, w.set, w.on, w.delete, w.scroll_to");
         apply(&e, NULL);
         apps_widget_t before[3];
         for (int slot = 0; slot < 3; slot++) {
@@ -1233,7 +1298,16 @@ static const char *const EVERYTHING =
     "ui.label{text = 'y'}\n"
     "ui.clear()\n"
     "ui.label{text = 'z'}\n"
-    "assert(select('#', ui.polar(0, 1)) == 2)\n";
+    "assert(select('#', ui.polar(0, 1)) == 2)\n"
+    "local s = ui.box{scroll = 'y', layout = 'column', gap = 4, pad = 2, items = 'center'}\n"
+    "for i = 1, 3 do ui.box{parent = s, w = 50, h = 30} end\n"
+    "assert(s:scroll_to('end', true) == s)\n"
+    "s:scroll_to(12.5)\n"
+    "pcall(s.scroll_to, s, 'middle')\n"
+    "pcall(s.scroll_to, ui.label{}, 'end')\n"
+    "s:set{scroll = 'none', layout = 'none', gap = 0}\n"
+    "pcall(s.scroll_to, s, 'end')\n"
+    "pcall(s.set, s, {items = 'middle'})\n";
 
 static void lock_discipline(void) {
     OPEN(e);
@@ -1368,6 +1442,9 @@ static void lock_taken(void) {
     TAKES_LOCK(&e, "ui.bg('#123456')");
     TAKES_LOCK(&e, "child = ui.label{parent = c}");
     TAKES_LOCK(&e, "child:delete()");
+    TAKES_LOCK(&e, "s = ui.box{scroll = 'y'}");
+    TAKES_LOCK(&e, "s:scroll_to('end')");
+    TAKES_LOCK(&e, "s:scroll_to('end')");  /* the same again: a command, not a value */
     TAKES_LOCK(&e, "c:delete()");
     TAKES_LOCK(&e, "ui.clear()");
     long before = lock_takes;
@@ -1545,6 +1622,7 @@ int main(int argc, char **argv) {
         {"dirty_bits", dirty_bits},
         {"dirty_groups", dirty_groups},
         {"rotation_sets", rotation_sets},
+        {"scroll_to_sets", scroll_to_sets},
         {"spin_refuses_an_unsized_src", spin_refuses_an_unsized_src},
         {"vm_check", vm_check},
         {"slot_reuse", slot_reuse},

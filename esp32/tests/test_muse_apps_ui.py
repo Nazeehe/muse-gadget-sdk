@@ -44,7 +44,7 @@ COMMON = ["align", "x", "y", "w", "h", "hidden", "opacity", "parent"]
 PROPS = {
     "label": COMMON + ["text", "font", "color", "text_align", "wrap"],
     "button": COMMON + ["text", "font", "color", "bg", "radius", "border", "border_color"],
-    "box": COMMON + ["bg", "radius", "border", "border_color"],
+    "box": COMMON + ["bg", "radius", "border", "border_color", "scroll", "layout", "gap", "pad", "items"],
     "arc": COMMON + ["min", "max", "value", "start_angle", "end_angle", "thickness", "color", "track_color"],
     "bar": COMMON + ["min", "max", "value", "color", "track_color", "radius"],
     "image": COMMON + ["src", "scale", "rotation", "spin"],
@@ -55,6 +55,7 @@ KINDS = list(PROPS)
 FONTS = "sans14, sans16, sans20, sans28, mono8, mono16, digits48, digits96"
 ALIGNS = "center, top, bottom, left, right, top_left, top_right, bottom_left, bottom_right"
 EVENTS = "tap, long_press, press, release"
+METHODS = "set, get, on, delete, scroll_to"
 UI_HAS = "label, button, box, arc, bar, image, spinner, bg, clear, polar, W, H, R, SAFE"
 COLOUR_HINT = '(use "#rgb", "#rrggbb" or 0xRRGGBB)'
 QUOTA = "ui: no more than 128 widgets per app"
@@ -144,7 +145,7 @@ class UiTest(UiTestCase):
             ("parent_set_later", "ui.label: parent can only be set when the widget is created"),
             ("parent_deleted", "ui.label: parent was deleted"),
             ("nesting_box", "ui.box: boxes nest at most 4 deep"),
-            ("unknown_method", "ui.label: unknown method 'frobnicate' (valid: set, get, on, delete)"),
+            ("unknown_method", f"ui.label: unknown method 'frobnicate' (valid: {METHODS})"),
             # What the brief leaves to the implementation.
             ("text_nul", "ui.label: text can't contain a NUL byte"),
             ("needs_a_table", "ui.label: needs a table of properties, like ui.label{...}, got string"),
@@ -634,7 +635,10 @@ class UiTest(UiTestCase):
             return re.findall(r'\{"(\w+)",', body.group(1))
 
         self.assertEqual(reg("apps_ui_funcs"), ["label", "button", "box", "arc", "bar", "image", "spinner", "bg", "clear", "polar"])
-        self.assertEqual(reg("apps_ui_methods"), ["set", "get", "on", "delete"])
+        self.assertEqual(reg("apps_ui_methods"), METHODS.split(", "))
+        self.assertEqual(strings("apps_ui_scrolls"), ["none", "y"])
+        self.assertEqual(strings("apps_ui_layouts"), ["none", "column"])
+        self.assertEqual(strings("apps_ui_items"), ["start", "center", "end"])
         self.assertEqual(strings("apps_ui_kinds"), KINDS)
         self.assertEqual(strings("apps_ui_events"), EVENTS.split(", "))
         for kind in KINDS:
@@ -1033,7 +1037,7 @@ class UiTest(UiTestCase):
             "text": "", "font": "sans20", "color": "#ffffff", "text_align": "center", "wrap": False, "bg": "none",
             "radius": 0, "border": 0, "border_color": "#ffffff", "min": 0, "max": 100, "value": 0,
             "start_angle": 0, "end_angle": 360, "thickness": 12, "track_color": "#262626", "src": "logo.bin",
-            "scale": 100, "rotation": 0, "spin": 0,
+            "scale": 100, "rotation": 0, "spin": 0, "scroll": "none", "layout": "none", "gap": 0, "pad": 0, "items": "start",
         }
         per_kind = {"button": {"bg": "#262626", "radius": 16}}  # the rest follow the table above
         for kind in KINDS:
@@ -1053,6 +1057,134 @@ class UiTest(UiTestCase):
                 self.assertEqual(got[:len(names)], want)
                 self.assertEqual(got[len(names):], [["false", unknown_property(kind, "nothing")],
                                                     ["false", unknown_property(kind, "nothing")]])
+
+    # ---- Scroll boxes and columns (games Task 4) ----
+
+    def test_box_scroll_props_and_defaults(self):
+        # scroll none|y, layout none|column, gap and pad 0 to APPS_UI_SPACE_MAX px (rounded and clamped), items start|center|end: made
+        # with, set live, read back. items is the 33rd property, past what a 32-bit mask holds.
+        space = header_number("apps_ui.h", "APPS_UI_SPACE_MAX")
+        self.assertEqual(space, 64)
+        lines = self.lua_lines("""
+            local function show(b) print(b:get("scroll"), b:get("layout"), b:get("gap"), b:get("pad"), b:get("items")) end
+            local b = ui.box{}
+            show(b)
+            b:set{scroll = "y", layout = "column", gap = 8, pad = 12, items = "center"}
+            show(b)
+            local c = ui.box{scroll = "y", layout = "column", gap = 64.5, pad = -1, items = "end"}
+            show(c)
+            print(math.type(c:get("gap")), math.type(c:get("pad")))
+            c:set{scroll = "none", layout = "none", items = "start", gap = 10.5, pad = 1 / 0}
+            show(c)
+            c:set{gap = -10.5, pad = 0.49}
+            show(c)
+            c:set{items = "end"} print(c:get("items"), c:get("scroll"))
+        """)
+        self.assertEqual(lines, ["none\tnone\t0\t0\tstart", "y\tcolumn\t8\t12\tcenter", "y\tcolumn\t64\t0\tend",
+                                 "integer\tinteger", "none\tnone\t11\t64\tstart", "none\tnone\t0\t0\tstart", "end\tnone"])
+
+    def test_box_scroll_props_reject_bad_values(self):
+        lines = self.lua_lines("""
+            local b = ui.box{}
+            for _, t in ipairs({{scroll = "x"}, {scroll = true}, {layout = "row"}, {layout = 1}, {items = "middle"},
+                                {items = {}}, {gap = "8"}, {pad = 0 / 0}, {gap = true}, {scroll = "Y"}}) do
+                print(select(2, pcall(b.set, b, t)))
+            end
+            print(select(2, pcall(ui.box, {layout = "grid"})))
+            print(b:get("scroll"), b:get("layout"), b:get("gap"), b:get("pad"), b:get("items"))
+            print(select(2, pcall(ui.label, {scroll = "y"})))
+        """)
+        self.assertEqual(lines, [
+            "ui.box: scroll 'x' is not one of none, y",
+            "ui.box: scroll '<boolean>' is not one of none, y",
+            "ui.box: layout 'row' is not one of none, column",
+            "ui.box: layout '1' is not one of none, column",
+            "ui.box: items 'middle' is not one of start, center, end",
+            "ui.box: items '<table>' is not one of start, center, end",
+            "ui.box: 'gap' must be a number, got string",
+            "ui.box: 'pad' must be a number, got NaN",
+            "ui.box: 'gap' must be a number, got boolean",
+            "ui.box: scroll 'Y' is not one of none, y",
+            "ui.box: layout 'grid' is not one of none, column",
+            "none\tnone\t0\t0\tstart",
+            unknown_property("label", "scroll"),
+        ])
+
+    def test_scroll_to_checks_its_widget_and_where(self):
+        # w:scroll_to(where, animate): a box with scroll = "y"; where "start", "end" or a number of px; animate a boolean (nil is
+        # false). It returns w. Each message starts "w:scroll_to: ", after the position of a call from Lua.
+        lines = self.lua_lines("""
+            local b = ui.box{scroll = "y", layout = "column"}
+            local plain = ui.box{}
+            local l = ui.label{}
+            print(b:scroll_to("end") == b, b:scroll_to("start", true) == b, b:scroll_to(120) == b, b:scroll_to(40.5, false) == b,
+                  b:scroll_to("end", nil) == b)
+            print(select("#", b:scroll_to("end")))
+            local function try(...) print(select(2, pcall(b.scroll_to, ...))) end
+            try(l, "end")
+            try(ui.button{}, "end")
+            try(plain, "end")
+            try(b, "middle")
+            try(b, "END")
+            try(b, true)
+            try(b)
+            try(b, 0 / 0)
+            try(b, {})
+            try(b, "end", "yes")
+            try(b, 1, 1)
+            local gone = ui.box{scroll = "y"}
+            gone:delete()
+            try(gone, "end")
+            try(5, "end")
+            plain:set{scroll = "y"}
+            print(plain:scroll_to(1e9) == plain, plain:scroll_to(-1 / 0) == plain, plain:scroll_to(1 / 0, true) == plain)
+            b:set{scroll = "none"}
+            try(b, "start")
+            print(pcall(function() b:scroll_to("start") end))
+        """)
+        doesnt = "w:scroll_to: box#{} doesn't scroll (set scroll = \"y\")"
+        where = 'w:scroll_to: where must be "start", "end" or a number of px, got '
+        self.assertEqual(lines[:-1], [
+            "true\ttrue\ttrue\ttrue\ttrue",
+            "1",
+            "w:scroll_to: only a box scrolls",
+            "w:scroll_to: only a box scrolls",
+            doesnt.format(1),
+            "w:scroll_to: where 'middle' is not \"start\", \"end\" or a number of px",
+            "w:scroll_to: where 'END' is not \"start\", \"end\" or a number of px",
+            where + "boolean",
+            where + "no value",
+            where + "NaN",
+            where + "table",
+            "w:scroll_to: animate must be a boolean, got string",
+            "w:scroll_to: animate must be a boolean, got number",
+            DELETED,
+            "ui: scroll_to needs a widget: call it as w:scroll_to(...)",
+            "true\ttrue\ttrue",
+            doesnt.format(0),
+        ])
+        self.assertRegex(lines[-1], r"^false\tmain\.lua:\d+: " + re.escape(doesnt.format(0)) + "$")
+
+    def test_masks_hold_more_than_32_props(self):
+        # Finding 1: a property is a bit of change_t's set and of read_props' present, and there are more than 32 of them now (the box's
+        # five made 33): every mask made of BIT() is 64 bits wide, and the assert says so.
+        source = (APPS / "apps_ui.c").read_text()
+        props = re.search(r"typedef enum \{(.*?)\} prop_t;", source, re.S)
+        self.assertIsNotNone(props)
+        names = re.findall(r"\bP_[A-Z_]+\b", props.group(1))
+        self.assertEqual(names[-1], "P_COUNT")
+        self.assertGreater(len(names) - 1, 32)
+        self.assertIn("#define BIT(p) (UINT64_C(1) << (p))", source)
+        self.assertRegex(source, r"_Static_assert\(P_COUNT <= 64, ")
+        self.assertNotIn("P_COUNT <= 32", source)
+        change = re.search(r"typedef struct \{(.*?)\} change_t;", source, re.S)
+        self.assertIsNotNone(change)
+        self.assertRegex(change.group(1), r"\buint64_t set;")
+        read_props = re.search(r"static void read_props\(.*?\n\}", source, re.S)
+        self.assertIsNotNone(read_props)
+        self.assertIn("uint64_t present = 0;", read_props.group(0))
+        self.assertEqual(re.findall(r"\b(?:u?int(?:8|16|32)_t|unsigned|int|long)\s+\w+\s*=[^;]*\bBIT\(", source), [],
+                         "a mask narrower than 64 bits made of BIT()")
 
     def test_spinner_props_and_defaults(self):  # connected apps Task 8
         # The brief's list: the common properties and thickness, color and track_color, with an arc's types, ranges and defaults;
@@ -1152,7 +1284,7 @@ class UiTest(UiTestCase):
     def test_handles_have_methods_not_fields(self):  # R9.6
         lines = self.lua_lines("""
             local w = ui.label{text = "a"}
-            for _, name in ipairs({"set", "get", "on", "delete"}) do print(name, type(w[name])) end
+            for _, name in ipairs({"set", "get", "on", "delete", "scroll_to"}) do print(name, type(w[name])) end
             print(pcall(function() return w.text end))
             print(pcall(function() return w[1] end))
             print(pcall(function() w.text = "b" end))
@@ -1162,16 +1294,17 @@ class UiTest(UiTestCase):
             print(pcall(function() return x:colour() end))
             print(tostring(w), tostring(x), w == w, w == x, w ~= x, type(w), getmetatable(w) ~= nil)
         """)
-        self.assertEqual(lines[:4], ["set\tfunction", "get\tfunction", "on\tfunction", "delete\tfunction"])
+        self.assertEqual(lines[:5], ["set\tfunction", "get\tfunction", "on\tfunction", "delete\tfunction", "scroll_to\tfunction"])
+        lines = lines[1:]  # the rows below as they were before scroll_to
         pos = r"main\.lua:\d+: "
         for line, want in zip(lines[4:8], [
-                "ui.label: unknown method 'text' (valid: set, get, on, delete)",
-                "ui.label: unknown method '<number>' (valid: set, get, on, delete)",
+                f"ui.label: unknown method 'text' (valid: {METHODS})",
+                f"ui.label: unknown method '<number>' (valid: {METHODS})",
                 "ui.label: can't assign w.text: change a widget with w:set{text = ...}",
                 "ui.label: can't assign to a widget: change it with w:set{...}"]):
             self.assertRegex(line, "^false\t" + pos + re.escape(want) + "$")
         self.assertEqual(lines[8], "a")
-        self.assertRegex(lines[9], "^false\t" + pos + re.escape("ui.arc: unknown method 'colour' (valid: set, get, on, delete)"))
+        self.assertRegex(lines[9], "^false\t" + pos + re.escape(f"ui.arc: unknown method 'colour' (valid: {METHODS})"))
         self.assertEqual(lines[10], "label#0\tarc#1\ttrue\tfalse\ttrue\tuserdata\ttrue")
 
     def test_set_and_on_return_the_widget_so_calls_chain(self):
@@ -1411,6 +1544,9 @@ class HarnessTest(unittest.TestCase):
 
     def test_spin_refuses_an_unsized_src(self):  # connected apps Task 1, fix round 1 (I2): the spin cap fails closed
         self.run_case("spin_refuses_an_unsized_src")
+
+    def test_scroll_to_tells_the_apply_step(self):  # games Task 4: a command, as rotation_sets
+        self.run_case("scroll_to_sets")
 
     def test_a_dying_vm_gets_no_work_from_any_binding(self):
         self.run_case("vm_check")

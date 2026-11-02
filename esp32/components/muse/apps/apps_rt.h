@@ -29,9 +29,9 @@
  *
  * What the app's code is given besides the sandbox's libraries (apps_vm.h), `json` (apps_json.h), `ui`
  * (apps_ui.h; main.lua's top level can already draw, so ui.image finds the package's images from the start) and
- * `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` (apps_svc.h; main.lua's top level can already arm a timer, which
- * runs once start() has, and use the store, which is loaded before it runs), and `vm` (apps_vmio.h: requests made at main.lua's top
- * level go once the app runs):
+ * `time`, `os`, `timer`, `alarm`, `store` and `sys` (apps_svc.h; main.lua's top level can already arm a timer, which
+ * runs once start() has, and use the store, which is loaded before it runs), `sound` (apps_sound.h) and `vm` (apps_vmio.h: requests
+ * made at main.lua's top level go once the app runs):
  * - print(...): the tostring of each argument, joined with tabs, as the lines of the app's log. The text
  *   is split at each "\n". In each line, a byte under 0x20 but tab, 0x7F, a C1 control character
  *   (U+0080 to U+009F) and anything that isn't valid UTF-8 (RFC 3629) become '?', one for each byte, or
@@ -156,6 +156,13 @@
  * Show, tap and exit. sys.show() is allowed inside message() and alarm(), and inside any callback within APPS_SHOW_TAP_MS (10 s) of a
  * touch the runtime was given (apps_rt_touch), the 10 s included. The runtime knows nothing of the front: it asks the port.
  *
+ * Shown, and the sound. The runtime keeps whether the app is shown, as the last apps_rt_show said, whatever its state: false when it
+ * is made, so that main.lua's top level never is. Whoever serves the app says shown before start() for an app launched in front (the
+ * guide's "an app launched in front starts shown"), and at each show and hide after. The sound module plays only while it is shown and
+ * the screen is lit (apps_sound.h). The app's sounds are its runtime's: their owner is apps_rt_gen. They all end (the port's
+ * apps_port_sound_end_owner) when it is hidden, before hide() runs; when it stops, before stop() runs and again after it; and when it
+ * crashes. The caller that frees the package ends them too, before it does, whatever became of the runtime (apps_task.c's end_app).
+ *
  * Messages (the runtime's own; <main> is the manifest's main file, "main.lua" unless it says otherwise):
  *   <main> must return a table of handlers: local app = {} … return app
  *   <main> returned '%s' as a %s; handlers must be functions         a handler key holding a non-function
@@ -254,8 +261,12 @@ bool apps_rt_compile(const apps_code_t *code, int n, unsigned memory_kb, char *e
  */
 bool apps_rt_start(apps_rt_t *rt);
 
-/* show() when shown, hide() when not, with APPS_BUDGET_CALL, for a RUNNING app; nothing otherwise. */
+/* Shown or not (above), for a runtime in any state: when not, the app's sounds end first. Then show() when shown, hide() when not, with
+ * APPS_BUDGET_CALL, for a RUNNING app; no handler otherwise. NULL is ignored. */
 void apps_rt_show(apps_rt_t *rt, bool shown);
+
+/* Whether the last apps_rt_show said shown; false for a runtime it was never called for, and for NULL. */
+bool apps_rt_is_shown(const apps_rt_t *rt);
 
 /* alarm(name), with APPS_BUDGET_CALL, for a RUNNING app: true when it returned or the app has no alarm; false,
  * with nothing run, when the app isn't RUNNING, and false, with the runtime CRASHED, when it fails. */
@@ -265,7 +276,8 @@ bool apps_rt_alarm(apps_rt_t *rt, const char *name);
 char *apps_rt_message(apps_rt_t *rt, const char *event, const char *data_json, size_t data_len, char *err,
                       size_t err_len);
 
-/* stop(), with APPS_BUDGET_CALL, for a RUNNING app: the runtime is STOPPED after it, or CRASHED if stop() fails.
+/* stop(), with APPS_BUDGET_CALL, for a RUNNING app: the runtime is STOPPED after it, or CRASHED if stop() fails. The app's sounds end
+ * before stop() runs, and again after it.
  * Nothing runs for an app that isn't RUNNING. A STOPPED runtime can be started again: apps_rt_start. */
 void apps_rt_stop(apps_rt_t *rt);
 
@@ -388,6 +400,15 @@ int apps_rt_timer_count(const apps_rt_t *rt);
  * is valid as long as the runtime is (it is the package's, which the runtime's caller keeps). */
 const char *apps_rt_id(const apps_rt_t *rt);
 bool apps_rt_permits(const apps_rt_t *rt, unsigned perm);
+
+/* The runtime's app generation: a number of its own, never 0, one past the last runtime's (wrapping past 0 to 1), which owns the app's
+ * sounds (apps_port_sound_*). Valid as long as the runtime is; the caller that ends the app reads it before apps_rt_free. */
+uint32_t apps_rt_gen(const apps_rt_t *rt);
+
+/* The package's sound at path, for the sound module's sound.play: true, with its samples and how many frames there are, for a file of
+ * the package that is a .wav (apps_file_kind) and passes apps_wav_check; false for any other path, a NULL one included. The samples
+ * are the package's own bytes, which outlive the runtime (apps_rt_new): read in place. samples and frames may be NULL. */
+bool apps_rt_sound(const apps_rt_t *rt, const char *path, const int16_t **samples, size_t *frames);
 
 /* The VM, for what the runtime doesn't wrap: apps_vm_kill, apps_vm_in_call, apps_vm_call_started_ms (on the VM's clock,
  * which leaves out stolen time: apps_vm.h) and the memory counters (apps_vm.h). What is installed into its globals

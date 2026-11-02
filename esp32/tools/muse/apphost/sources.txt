@@ -13,6 +13,7 @@ components/muse/apps/apps_pkg.c
 components/muse/apps/apps_rt.c
 components/muse/apps/apps_ui.c
 components/muse/apps/apps_svc.c
+components/muse/apps/apps_sound.c
 components/muse/apps/apps_alarm.c
 components/muse/apps/apps_vmio.c
 components/muse/apps/apps_ask.c

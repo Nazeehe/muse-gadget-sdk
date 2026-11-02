@@ -49,7 +49,7 @@ FAKES = TESTS / "muse_apps_lv_fakes.h"
 HARNESS = TESTS / "muse_apps_lv_harness.c"
 APPS_LV = APPS / "apps_lv.c"
 HARNESS_SOURCES = [HARNESS, APPS_LV, APPS / "apps_icons.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c",
-                   APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_svc.c",
+                   APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_svc.c", APPS / "apps_sound.c",
                    APPS / "apps_vmio.c", APPS / "apps_ask.c"]
 
 # What apps_lv.c and apps_icons.c include of LVGL and ESP-IDF: each one is a line that includes the fakes.
@@ -292,6 +292,9 @@ class HarnessTest(unittest.TestCase):
 
     def test_front_and_back(self):
         self.run_case("front_and_back")
+
+    def test_app_sound_is_cut_behind_and_under_cards(self):  # games Task 3: apps_lv_set_front(false) and a card over the app cut
+        self.run_case("app_sound_is_cut_behind_and_under_cards")
 
     def test_reset_deletes_every_object(self):
         self.run_case("reset_deletes_every_object")

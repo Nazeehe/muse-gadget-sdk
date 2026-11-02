@@ -17,8 +17,8 @@
 #pragma once
 
 /*
- * The services of the device a Muse app can call: the Lua modules `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys`
- * (logging is `print` and `sys.log`: there is no `log` module). Portable C: the clocks, the screen's sleep, the battery, the front
+ * The services of the device a Muse app can call: the Lua modules `time`, `os`, `timer`, `alarm`, `store` and `sys`, and `sound`, which
+ * apps_sound.h has (logging is `print` and `sys.log`: there is no `log` module). Portable C: the clocks, the screen's sleep, the battery, the front
  * and the rest come through apps_port.h, and what a timer is, and the store's cache, live in the runtime (apps_rt.h, which also
  * says when the timers run and when the store is saved). Every binding calls apps_vm_check first, and
  * everything that allocates in the app's heap runs inside a call of the app, so a heap that refuses is the app running
@@ -85,11 +85,7 @@
  *   A wrong name is `alarm: name must be 1-23 characters of a-z, 0-9 and _` (in all four), a wrong ms
  *   `alarm.after: ms must be a whole number from 1 to 604800000`.
  *
- * sound:
- *   sound.chirp()         one chirp at the gadget's volume (it plays when the voice task is idle); needs the "sound"
- *                         permission: `sound: add "sound" to "permissions" in manifest.json`
- *   sound.stop()          ends the ring of an alarm that is going, whichever app's it is; no permission, and nothing happens
- *                         when none is going
+ * sound: apps_sound.h (sound.chirp, sound.stop, and the app's own tones and clips).
  *
  * store (the app's own keys and values, kept across restarts; the "store" permission of the manifest is needed for all of them:
  * without it each raises `store: add "store" to "permissions" in manifest.json`, before anything else is looked at). A key is a
@@ -127,8 +123,8 @@
 
 typedef struct lua_State lua_State;
 
-/* Installs `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` into L's globals, and the `vm` and `muse` modules beside them
- * (apps_vmio.h: apps_vmio_open; apps_ask.h: apps_ask_open), for the app of rt, which must outlive L. It runs under lua_pcall, so a
+/* Installs `time`, `os`, `timer`, `alarm`, `store` and `sys` into L's globals, and the `sound`, `vm` and `muse` modules beside them
+ * (apps_sound.h: apps_sound_open; apps_vmio.h: apps_vmio_open; apps_ask.h: apps_ask_open), for the app of rt, which must outlive L. It runs under lua_pcall, so a
  * heap that refuses ends the app out of memory at its next call rather than aborting. Called by apps_rt_new, before
  * main.lua's top level runs. */
 void apps_svc_open(lua_State *L, apps_rt_t *rt);

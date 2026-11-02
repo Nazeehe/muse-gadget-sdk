@@ -122,6 +122,8 @@ struct apps_rt {
     apps_vm_t *vm;
     apps_ui_t *ui;
     apps_state_t state;
+    uint32_t gen;  /* the app generation (apps_rt_gen): its sounds' owner */
+    bool shown;    /* the last apps_rt_show said shown (apps_rt_is_shown) */
     int handler[H_COUNT];  /* registry references; LUA_NOREF for a handler the app hasn't */
     armed_t timers[APPS_TIMERS_MAX];
     uint32_t timer_gen;  /* the last gen given */
@@ -527,12 +529,19 @@ static apps_call_t vm_run(apps_rt_t *rt, lua_CFunction fn, void *arg, uint32_t b
     return result;
 }
 
-/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. Its timers go, its vm callbacks and
- * requests too, its ask's callback (the turn is let go of), and what it had written to its store is saved. */
+/* Every sound of the app ends at once (apps_port_sound_end_owner): no voice of it renders again, and its clips' bytes, the package's,
+ * are let go of. */
+static void sound_release(const apps_rt_t *rt) {
+    apps_port_sound_end_owner(rt->gen);
+}
+
+/* A call of the app failed: it has crashed, and rt->err (what apps_vm_call wrote) is the record. Its timers go, its sounds, its vm
+ * callbacks and requests too, its ask's callback (the turn is let go of), and what it had written to its store is saved. */
 static void crash(apps_rt_t *rt) {
     apps_text_clean(rt->err, strlen(rt->err), true);
     rt->state = APPS_STATE_CRASHED;
     timers_disarm(rt);
+    sound_release(rt);
     apps_vmio_release(rt->vmio, apps_vm_lua(rt->vm));
     apps_ask_release(&rt->ask, apps_vm_lua(rt->vm));
     store_flush_final(rt);
@@ -962,6 +971,12 @@ static const apps_blob_t *find_blob(const apps_pkg_t *pkg, const char *path) {
     return NULL;
 }
 
+bool apps_rt_sound(const apps_rt_t *rt, const char *path, const int16_t **samples, size_t *frames) {
+    const apps_blob_t *file = rt != NULL && path != NULL ? find_blob(rt->pkg, path) : NULL;
+    return file != NULL && apps_file_kind(file->path) == APPS_FILE_SOUND &&
+           apps_wav_check(file->data, file->len, samples, frames, NULL, 0);
+}
+
 /* The package's images as the table ui.image looks in: each .bin that passes the image check, in the package's
  * order, pointing into the package. */
 static int build_assets(const apps_pkg_t *pkg, apps_asset_t *assets) {
@@ -979,6 +994,9 @@ static int build_assets(const apps_pkg_t *pkg, apps_asset_t *assets) {
 /* The time the app task's core spent on others' work (apps_rt_steal_ms): one total for every runtime, a word of internal RAM (a
  * static), read and added to with atomics. */
 static atomic_uint s_stolen_ms;
+
+/* The last app generation given (apps_rt_gen): the app task's alone, which makes every runtime. */
+static uint32_t s_gen;
 
 void apps_rt_steal_ms(uint32_t ms) {
     atomic_fetch_add(&s_stolen_ms, ms);
@@ -1048,6 +1066,8 @@ apps_rt_t *apps_rt_new(const apps_pkg_t *pkg, char *err, size_t err_len) {
         return NULL;
     }
     memset(rt, 0, sizeof *rt);
+    s_gen = s_gen == UINT32_MAX ? 1 : s_gen + 1;  /* never 0 */
+    rt->gen = s_gen;
     rt->vmio = (apps_vmio_t *)((char *)rt + RT_BLOCK);
     apps_vmio_init(rt->vmio, rt);
     apps_ask_init(&rt->ask);
@@ -1159,8 +1179,16 @@ bool apps_rt_start(apps_rt_t *rt) {
 }
 
 void apps_rt_show(apps_rt_t *rt, bool shown) {
+    if (rt == NULL) {
+        return;
+    }
+    /* Behind first, then the sounds end, then hide(): so a sound that hide() asks for is done at once (G6). */
+    rt->shown = shown;
+    if (!shown) {
+        sound_release(rt);
+    }
     int h = shown ? H_SHOW : H_HIDE;
-    if (rt != NULL && rt->state == APPS_STATE_RUNNING && rt->handler[h] != LUA_NOREF) {
+    if (rt->state == APPS_STATE_RUNNING && rt->handler[h] != LUA_NOREF) {
         call_handler(rt, h, NULL, APPS_BUDGET_CALL);
     }
 }
@@ -1169,9 +1197,11 @@ void apps_rt_stop(apps_rt_t *rt) {
     if (rt == NULL || rt->state != APPS_STATE_RUNNING) {
         return;
     }
+    sound_release(rt);  /* the app's sounds end as it begins to stop, before what stop() prints */
     if (rt->handler[H_STOP] == LUA_NOREF || call_handler(rt, H_STOP, NULL, APPS_BUDGET_CALL)) {
         rt->state = APPS_STATE_STOPPED;
         timers_disarm(rt);
+        sound_release(rt);  /* and those stop() asked for */
         apps_vmio_release(rt->vmio, apps_vm_lua(rt->vm));  /* no vm callback runs after stop(), and no request goes */
         apps_ask_release(&rt->ask, apps_vm_lua(rt->vm));    /* nor an ask's: its turn is let go of */
         store_flush_final(rt);  /* what stop() wrote too */
@@ -1824,6 +1854,14 @@ const char *apps_rt_id(const apps_rt_t *rt) {
 
 bool apps_rt_permits(const apps_rt_t *rt, unsigned perm) {
     return (rt->pkg->manifest.perms & perm) != 0;
+}
+
+uint32_t apps_rt_gen(const apps_rt_t *rt) {
+    return rt->gen;
+}
+
+bool apps_rt_is_shown(const apps_rt_t *rt) {
+    return rt != NULL && rt->shown;
 }
 
 unsigned apps_rt_memory_kb(const apps_rt_t *rt) {

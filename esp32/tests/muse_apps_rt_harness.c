@@ -228,6 +228,33 @@ void apps_port_sound_stop(void) {
     fake_stops++;
 }
 
+/* An app's tones and clips (apps_port.h): counted; the module's own cases are apphost's (test_muse_apps_sound.py). */
+static int fake_tones, fake_clips, fake_ends, fake_end_owners, fake_cuts;
+
+uint32_t apps_port_sound_tone(uint32_t owner, int hz, int to_hz, int ms, int wave, int volume) {
+    (void)owner, (void)hz, (void)to_hz, (void)ms, (void)wave, (void)volume;
+    return (uint32_t)++fake_tones;
+}
+
+uint32_t apps_port_sound_clip(uint32_t owner, const int16_t *samples, size_t frames, int volume, bool loop) {
+    (void)owner, (void)samples, (void)frames, (void)volume, (void)loop;
+    return (uint32_t)++fake_clips;
+}
+
+void apps_port_sound_end(uint32_t id) {
+    (void)id;
+    fake_ends++;
+}
+
+void apps_port_sound_end_owner(uint32_t owner) {
+    (void)owner;
+    fake_end_owners++;
+}
+
+void apps_port_sound_cut(void) {
+    fake_cuts++;
+}
+
 /* The apps of the other kind: count alarms of the app `owner` ("other1", ...) in the table, as if it had armed them. */
 static void fake_fill(const char *owner, int count) {
     for (int k = 0; k < count; k++) {

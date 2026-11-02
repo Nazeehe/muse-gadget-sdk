@@ -48,7 +48,7 @@ manifest.json, a JSON object of at most 8 KB:
 - `main` (optional): the main `.lua` file, `"main.lua"` if left out.
 - `files` (optional): every other file, like `["util.lua", "assets/bell.bin", "sounds/ding.wav"]`: modules for `require`, `.json` data, images and `.wav` sounds.
 - `icon` (optional): one of `files`, a square `.bin` image at most 160 x 160, shown in the launcher; make it 160 x 160, the size of the app in the middle. See Icons.
-- `permissions` (optional): any of `sound` (for `sound.chirp`), `alarm` (the `alarm` module), `store` (the `store` module), `keep_awake` (for `sys.keep_awake`), `vm` (the `vm` module) and `muse` (for `muse.ask`). `net` and `secrets` aren't available in this firmware yet.
+- `permissions` (optional): any of `sound` (for `sound.chirp`, `sound.tone` and `sound.play`), `alarm` (the `alarm` module), `store` (the `store` module), `keep_awake` (for `sys.keep_awake`), `vm` (the `vm` module) and `muse` (for `muse.ask`). `net` and `secrets` aren't available in this firmware yet.
 - `memory_kb` (optional): the Lua heap, a whole number from 64 to 1024; 256 if left out.
 - `messages` (optional): up to 16 event names, each with a description under 200 characters: the events Muse may send with `app.send`. Describe the data each takes and what it replies.
 
@@ -192,7 +192,13 @@ What an app that uses alarms must guard against (the timer example shows the fir
 
 ### sound
 
+Sound plays only while the app is in front and the screen is lit. Behind or in the dark, `sound.tone` and `sound.play` check what they are given and return a sound that is already done, and nothing plays. A sound that plays stops when the app goes behind (a swipe, a voice turn), when the launcher or a card covers it, when the screen goes dark, when an alarm rings and when the app ends.
+
 - `sound.chirp()`: one chirp, at the gadget's volume. Needs the `sound` permission.
+- `sound.tone{hz, ms, to_hz, wave, volume}`: a tone of `ms` milliseconds (10 to 2000, 100 by default) whose pitch slides from `hz` to `to_hz` (each 20 to 8000 Hz; `hz` is required, and `to_hz` is `hz` unless given; tones sound best well below 8000 Hz, where a sine goes silent). `wave` is `"sine"` (the default), `"square"`, `"triangle"`, `"saw"` or `"noise"`, and `volume` is 0 to 100 (100 by default), a share of the gadget's volume. Numbers are rounded and kept to those ranges; a value of the wrong type, or a key it doesn't take, is an error that says so. It fades in and out over 5 ms, so it doesn't click. Returns a sound. Needs the `sound` permission.
+- `sound.play(path, {volume = 100, loop = false})`: plays the `.wav` at path, one of the manifest's `files` (see Sounds), at `volume` 0 to 100, and with `loop = true` from its start again each time it ends, until it is stopped. Returns a sound. Needs the `sound` permission.
+- `h:stop()`: stops the sound h, which fades out over 5 ms; nothing for a sound that has ended or was replaced. `tostring(h)` is `sound#<n>`, counting the app's sounds from 1.
+- 4 sounds play at once: a fifth replaces the one that started first, whose `h:stop()` then does nothing.
 - `sound.stop()`: ends the ring of an alarm, whichever app's it is. No permission.
 
 ### store
@@ -298,6 +304,17 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 - `spin` is for a picture of at most 180 x 180 px on screen (its width and height times `scale`): turning a picture costs about 1 µs for every pixel drawn, each frame, and only up to that size does a spinning picture keep the gadget smooth and its taps quick. Spinning a larger one is an error, when you make it or set `spin`, `scale` or `src`; `spin = 0` always works. Pictures that spin at once share that: together they may cover at most 32,400 px (one 180 x 180), counting each one's width times height on screen, so two of 125 x 125 fit and two of 130 x 130 don't. A hidden one, or one in a hidden box, doesn't count, and showing it again is an error when there's no room; stop one with `spin = 0` (or hide or delete it) to make room. For a larger picture, show it still and spin a smaller copy over it, like a record on a sleeve. A still picture under a spinning one is redrawn at every step: show it at scale 100, written at the size it's shown (a hook can resize it with ffmpeg); a scaled one costs as much as the spin.
 - Make a picture that spins round, like a record: bake a circle into its alpha, with the corners outside it transparent, and convert it with `--cf RGB565A8`. A square picture would swing its corners round the screen. With ffmpeg: `ffmpeg -i art.png -vf "format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='255*lte(hypot(X-(W-1)/2,Y-(H-1)/2),W/2)'" disc.png`, then convert `disc.png` with LVGLImage.py. A JPEG from the VM needs none of this: read it with `circle = true` (see `vm.read`).
 - Spin only what changes as it turns. A record's grooves and the light on it look the same at any angle, so draw the record still and spin only its label, a smaller picture over it: each step the gadget then redraws only the label's square, so the spin stays smooth and costs little. The same goes for the shape of what spins: a picture with a circle in its alpha is redrawn as its own square each step, and one with corners as the square it turns into, up to 1.4 times its side at 45 degrees.
+
+## Sounds
+
+Sounds are 16 kHz mono 16-bit PCM `.wav` files, made with ffmpeg. A short beep needs no file: use `sound.tone`.
+
+1. Make an effect from ffmpeg's own sources, `sine` for a tone and `anoisesrc` for a hiss or a crash: `ffmpeg -f lavfi -i "sine=frequency=880:duration=0.12" -ac 1 -ar 16000 -c:a pcm_s16le sfx/score.wav` and `ffmpeg -f lavfi -i "anoisesrc=color=brown:duration=0.25:amplitude=0.4" -ac 1 -ar 16000 -c:a pcm_s16le sfx/crash.wav`.
+2. Convert any other clip the same way: `ffmpeg -i in.mp3 -ac 1 -ar 16000 -c:a pcm_s16le out.wav`.
+3. List `"sfx/score.wav"` in the manifest's files, write it to `workspace/apps/<id>/sfx/score.wav`, and play it with `sound.play("sfx/score.wav")`.
+
+- Generate your sounds, or use only sounds licensed for this: never clips taken from the web.
+- A sound is at most 256 KB, about 8 s, and an app's sounds 1 MB together, about 33 s.
 
 ## Icons
 
@@ -410,7 +427,7 @@ A game is an app like any other, with the same manifest, API and limits, but it 
 - **A score you can read.** Text has no outline or shadow. Put the score on a solid box with a `radius` (a pill), or make a dark copy of the label 2 px down and to the right just before it, as a shadow.
 - **Awake while playing.** Keep the screen lit with `sys.keep_awake(true)` (the `keep_awake` permission) while a game is played, and call `sys.keep_awake(false)` on the start and game-over screens and while paused. `hide()` comes with a swipe or a voice turn: pause the game there, and when the app is back, wait for a touch before going on.
 - **The best score** goes in the store when a game ends (Keep state in the store, in Patterns).
-- **Sound.** `sound.chirp()` is the one sound there is (the `sound` permission): keep it for one event, such as a point scored.
+- **Sound.** Tones for flaps and hits (`sound.tone`), a clip for a fanfare (`sound.play`, see Sounds), and sound only in front: the gadget plays nothing while the app is behind or the screen is dark, so a paused game is quiet by itself. Keep tones short, like `sound.tone{hz = 520, to_hz = 780, ms = 60, wave = "square", volume = 40}` for a flap, and start one for each event, not each tick: 4 play at once (the `sound` permission).
 - **Functions used before they are defined.** Declare the name first, `local on_press`, and define it further down with `function on_press() ... end`, which sets that local: never make a global for it.
 - **Testing it.** You can't touch the gadget, so give a game `messages` to drive it with: `state` (the screen, the score and where things are), `press` (what a touch does) and `reset`. Play it with `app.send` and look with `snapshot`. While the user plays, `app.control status` shows its CPU: the gadget slows an app that uses more than 40% of the CPU for 3 s and stops it after 5 s.
 
@@ -446,6 +463,17 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `image: flags 0x<nnnn> aren't supported (only premultiplied alpha)`: convert again with LVGLImage.py, without other flags.
 - `image: colour format 0x<nn> isn't RGB565, RGB565A8 or A8`: convert with `--cf RGB565A8`.
 - `image: <w>x<h> is larger than the 466x466 screen`: scale the picture down first.
+- `sound: not a WAV file (no RIFF/WAVE header)`: convert the file with ffmpeg (see Sounds).
+- `sound: use 16 kHz mono 16-bit PCM WAV (ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le)`: convert it again with that line.
+- `sound: the fmt chunk is cut short`: the file is damaged: make it again with ffmpeg.
+- `sound: no fmt chunk`: the file is damaged: make it again with ffmpeg.
+- `sound: no data chunk`: the file has no sound in it: make it again with ffmpeg.
+- `sound: the data chunk runs past the end of the file`: the file was cut short: write it again.
+- `sound: the data chunk is empty`: the sound has no samples: make a longer one.
+- `sound: the data chunk has an odd size`: make it again with ffmpeg's `-c:a pcm_s16le`.
+- `sound: the data chunk is not on a 2-byte boundary`: make it again with ffmpeg, which writes it aligned.
+- `sounds add up to more than 1 MB`: use fewer or shorter sounds, or tones (`sound.tone`).
+- `sound.play: '<path>' is not one of this app's sounds (manifest.json "files")`: list the `.wav` in `files`, and play it by that path.
 - `unknown global '<name>' (did you mean '<name>'?)`: a typo, or a global never set; declare it `local` first.
 - `string.<name> is not available in Muse apps (api 1): use string.find(s, text, 1, true), string.split or json.decode`: no patterns; search plain text.
 - `'<close>' variables are not available in Muse apps`: use a plain local and close it yourself.

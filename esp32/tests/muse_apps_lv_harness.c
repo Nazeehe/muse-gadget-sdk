@@ -269,6 +269,31 @@ void apps_port_sound_chirp(void) {}
 
 void apps_port_sound_stop(void) {}
 
+/* The mixer as the port reaches it: apps_lv.c only cuts (games Task 3), counted here; the runtime's own calls do nothing. */
+static int sound_cuts;
+
+uint32_t apps_port_sound_tone(uint32_t owner, int hz, int to_hz, int ms, int wave, int volume) {
+    (void)owner, (void)hz, (void)to_hz, (void)ms, (void)wave, (void)volume;
+    return 1;
+}
+
+uint32_t apps_port_sound_clip(uint32_t owner, const int16_t *samples, size_t frames, int volume, bool loop) {
+    (void)owner, (void)samples, (void)frames, (void)volume, (void)loop;
+    return 1;
+}
+
+void apps_port_sound_end(uint32_t id) {
+    (void)id;
+}
+
+void apps_port_sound_end_owner(uint32_t owner) {
+    (void)owner;
+}
+
+void apps_port_sound_cut(void) {
+    sound_cuts++;
+}
+
 char *apps_port_store_load(const char *app, size_t *len) {
     (void)app;
     *len = 0;
@@ -6210,6 +6235,33 @@ static void tile_letter(void) {
 
 /* ---- The carousel ---- */
 
+/* Games Task 3: app sound is for the app in front with nothing over it (spin_in_front's test). Every voice is cut when the layer goes
+ * behind, and when the launcher or a card comes over the layer in front; a card over a layer behind, or the layer coming to the front,
+ * cuts nothing. */
+static void app_sound_is_cut_behind_and_under_cards(void) {
+    cards_scene();
+    sound_cuts = 0;
+    apps_lv_set_front(true);
+    CHECK(sound_cuts == 0, "fronting cuts nothing: %d", sound_cuts);
+    apps_lv_set_front(false);
+    CHECK(sound_cuts == 1, "behind: a cut, %d", sound_cuts);
+    apps_lv_show_crash("Hello", "main.lua:1: boom");
+    apps_lv_hide_cards();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    apps_lv_hide_cards();
+    CHECK(sound_cuts == 1, "cards over a layer behind cut nothing: %d", sound_cuts);
+    apps_lv_set_front(true);
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    CHECK(sound_cuts == 2, "the launcher over the app: a cut, %d", sound_cuts);
+    apps_lv_hide_cards();
+    apps_lv_show_crash("Hello", "main.lua:1: boom");
+    CHECK(sound_cuts == 3, "a card over the app: a cut, %d", sound_cuts);
+    apps_lv_hide_cards();
+    apps_lv_set_front(false);
+    CHECK(sound_cuts == 4, "behind again: a cut, %d", sound_cuts);
+    LAUNCHER_END();
+}
+
 static void opens_centred_on_first_app(void) {
     cards_scene();
     apps_lv_show_launcher(FIVE, 5, NULL, pick);
@@ -9086,6 +9138,7 @@ int main(int argc, char **argv) {
         void (*run)(void);
     } cases[] = {
         {"runtime_image_shows_in_ui_image", runtime_image_shows_in_ui_image},
+        {"app_sound_is_cut_behind_and_under_cards", app_sound_is_cut_behind_and_under_cards},
         {"freed_runtime_image_is_never_drawn", freed_runtime_image_is_never_drawn},
         {"images_free_at_app_end_after_the_reset", images_free_at_app_end_after_the_reset},
         {"the_pass_reports_what_it_draws", the_pass_reports_what_it_draws},

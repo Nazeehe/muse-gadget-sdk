@@ -825,6 +825,11 @@ static void end_app(end_t how) {
      * the reset. An unpublished table's never had objects, and apps_rt_free frees them. */
     void *images[APPS_RT_IMAGES_MAX];
     int n_images = T.was_published ? apps_rt_images_take(T.rt, images) : 0;
+    /* Its sounds end, however it ended (a crash or a hang ran no stop()): the mixer plays a clip from the package's bytes, which go
+     * below, and lets go of them only once this returns (apps_port.h). */
+    if (T.rt != NULL) {
+        apps_port_sound_end_owner(apps_rt_gen(T.rt));
+    }
     apps_rt_free(T.rt);  /* saves the store if a change is left in it (stop() has saved it when the app stopped) */
     T.rt = NULL;
     apps_values_flush(s_rec->st.id);  /* its last save is written now, even over the write budget (apps_values.h) */
@@ -1089,6 +1094,11 @@ static void run_locked(apps_pkg_t *pkg, bool front, req_t *r, int settle_ms, boo
         return;
     }
     put_text(T.what, sizeof T.what, "crashed in start()");
+    /* An app launched in front starts shown (the guide's words): start() may sound, as show() may after it. T.shown stays false until
+     * the LVGL task fronts the layer and its SHOW runs show() (handle). Nothing runs here: the runtime isn't started. */
+    if (front) {
+        apps_rt_show(T.rt, true);
+    }
     call_begin();
     (void)apps_rt_start(T.rt);
     if (!call_end()) {
@@ -1208,7 +1218,9 @@ static void handle(const apps_event_t *ev) {
     case APPS_EV_SHOW:
     case APPS_EV_HIDE: {
         bool show = ev->type == APPS_EV_SHOW;
-        if (app_runs(ev->app_gen) && T.shown != show) {
+        /* An app launched in front is shown from start() on, before its first SHOW (run_locked): a HIDE that comes first puts it
+         * behind, its sounds and all, and runs hide(). */
+        if (app_runs(ev->app_gen) && (T.shown != show || apps_rt_is_shown(T.rt) != show)) {
             T.shown = show;
             call_begin();
             apps_rt_show(T.rt, show);

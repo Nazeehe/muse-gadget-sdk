@@ -714,7 +714,8 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   the kill), `apps_rt.c` (handlers, timers, the duty cycle, the log),
   `apps_pkg.c` (the manifest and package rules), `apps_ui.c` and `apps_lv.c`
   (widgets: what Lua holds, and the LVGL task's apply step), `apps_svc.c`
-  (`time`, `os`, `timer`, `alarm`, `sound`, `store`, `sys`), `apps_json.c`,
+  (`time`, `os`, `timer`, `alarm`, `store`, `sys`), `apps_sound.c` (`sound`)
+  and `apps_mix.c` (the mixer of app sound: Sound, below), `apps_json.c`,
   `apps_task.c` (the app task and the supervisor that marks a hung call),
   `apps_io.c` (the I/O worker, which does every flash access), `apps_store.c`
   and `apps_values.c` (the apps' FAT and `apps_nvs`), `apps_icons.c` (the
@@ -779,6 +780,36 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   tail, 47 frames under 28 ms: the other 103, while a finger drags and as the
   snap starts, have a median of 33 ms against the 30 of all 150, the gate's
   own limit, so per-frame work added later has no margin to spend.
+- **Sound:** `apps_mix.c` (the mixer: 4 voices of tones and clips,
+  `APPS_MIX_VOICES`, summed and saturated into one 16 kHz mono stream; a start
+  while all 4 play replaces the oldest, and a stop or a replacement fades out
+  over 5 ms, `APPS_MIX_FADE_MS`), `apps_sound.c` (the `sound` module:
+  `sound.tone`, `sound.play` of one of the package's `.wav` files and their
+  handles, which reach the mixer only through `apps_port_sound_*`) and the
+  voice task (`muse_voice.c`, under `CONFIG_MUSE_APPS`), the speaker's only
+  writer, which renders one chunk of 320 frames (`MUSE_AUDIO_CHUNK`, 20 ms) on
+  each idle pass, before that pass's 20 ms mic read, so the writes keep in step
+  with the reads, and starts the pre-roll again after each, so an app's sound
+  never becomes a voice note's pre-roll. A clip plays from the package's own
+  bytes in PSRAM: however the app ends, its voices stop
+  (`apps_mix_stop_owner`, which returns only once none can render) before the
+  package is freed. Sound plays only while the app is shown and the screen is
+  lit; it fades out when the app goes behind or the launcher or a card covers
+  it (the LVGL task), when the screen goes dark or a talk press is taken (the
+  voice task, before it records), and when an alarm with sound fires. A bench
+  build logs `sound start <ms> ms` (the `muse_apps` tag) at the first render
+  of each voice, the time from the app's call to its first chunk, and
+  `sound render <us> us (<n> frames, <v> voices)`, how long a render held the
+  mixer's lock, once for each number of voices. Measured on the 1.75C on
+  BOARD_DATE (apps+bench build, `tests/muse_apps_fixtures/sound`, 20 presses
+  1 s apart): `sound start` BOARD_START_MEDIAN ms at the median and
+  BOARD_START_P95 ms at the 95th percentile, and the I2S queue holds
+  BOARD_I2S_MS ms more (BOARD_I2S_DESC descriptors of BOARD_I2S_FRAMES frames);
+  a render held the lock BOARD_RENDER_US us with BOARD_RENDER_VOICES voices;
+  the `lcd_bands` render average was BOARD_BANDS_SOUND ms and the app's
+  `cpu_pct` BOARD_CPU_SOUND with sound, against BOARD_BANDS_MUTE ms and
+  BOARD_CPU_MUTE muted; `>mem`'s internal and DMA free moved BOARD_MEM_INTERNAL
+  and BOARD_MEM_DMA bytes while it played, and PSRAM BOARD_MEM_PSRAM.
 - **Boot:** the apps' storage waits for the Link (`muse_apps.h`). The app task
   mounts the FAT and `apps_nvs`, and the I/O worker that does it is made, once
   the reply to the first `link.register` has come, accepted or not
@@ -960,7 +991,8 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   is empty, starts or ends with `.`, or has two dots in a row (so no `..`, and
   no leading or trailing `/`), and the install reads only
   `workspace/apps/<id>/`, a path the gadget makes. A file's type is its ending (`.lua` source text, `.json` that
-  must parse, `.bin` an LVGL image whose header is checked), under per-file and
+  must parse, `.bin` an LVGL image whose header is checked, `.wav` a 16 kHz
+  mono 16-bit PCM sound whose chunks are walked), under per-file and
   per-app size limits. Keep these when changing the bindings
   (`apps_*_funcs[]`), the package rules (`apps_pkg.c`) or the install.
 

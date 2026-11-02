@@ -2327,14 +2327,19 @@ class SvcStaticTest(unittest.TestCase):
                  "apps_timer_funcs": ["after", "every", "cancel"],
                  "apps_timer_methods": ["cancel"],
                  "apps_alarm_funcs": ["after", "cancel", "remaining", "list"],
-                 "apps_sound_funcs": ["chirp", "stop"],
                  "apps_store_funcs": ["get", "set", "remove"],
                  "apps_sys_funcs": ["battery", "wifi", "show", "keep_awake", "has", "mem", "exit", "log"]}
-        for table, functions in names.items():
+        # The sound module is apps_sound.c's (games Task 3): its table there, and none left here.
+        sound = (APPS / "apps_sound.c").read_text()
+        for table, functions, text in [*((t, f, source) for t, f in names.items()),
+                                       ("apps_sound_funcs", ["chirp", "stop", "tone", "play"], sound),
+                                       ("apps_sound_methods", ["stop"], sound)]:
             with self.subTest(table):
-                body = re.search(rf"static const luaL_Reg {table}\[\] = \{{(.*?)\n\}};", source, re.S)
+                body = re.search(rf"static const luaL_Reg {table}\[\] = \{{(.*?)\n\}};", text, re.S)
                 self.assertIsNotNone(body, f"no `static const luaL_Reg {table}[]`")
                 self.assertEqual(re.findall(r'\{"(\w+)",', body.group(1)), functions)
+        self.assertNotIn("apps_sound_funcs", source)
+        self.assertIn("apps_sound_open(L, rt);", source)
 
     def test_there_is_no_log_module(self):  # the rulings: logging is print and sys.log, so no apps_log_funcs and no `log` global
         source = (APPS / "apps_svc.c").read_text()
@@ -2349,14 +2354,19 @@ class SvcStaticTest(unittest.TestCase):
         self.assertLess(match.group(2).count("\n"), 6)
 
     def test_alarm_and_sound_hand_out_no_handle(self):  # X17
-        # The timer's handle is the one userdata with a metatable (protected, above); an alarm is the system's, named by a string,
-        # and alarm.list() gives plain tables. A later handle needs its own __metatable, and this test to be told of it.
+        # The timer's handle is apps_svc.c's one userdata with a metatable (protected, above); an alarm is the system's, named by a
+        # string, and alarm.list() gives plain tables. The sound module is apps_sound.c's, whose tones and clips have a handle of
+        # their own (protected: test_muse_apps_sound.py), and whose chirp and stop make none. A later handle needs its own
+        # __metatable, and this test to be told of it.
         source = (APPS / "apps_svc.c").read_text()
+        sound = (APPS / "apps_sound.c").read_text()
         self.assertEqual(source.count("luaL_newmetatable"), 1)
-        for name in ("alarm_after", "alarm_cancel", "alarm_remaining", "alarm_list", "sound_chirp", "sound_stop"):
-            body = re.search(rf"^static int {name}\(lua_State \*L\) \{{\n(.*?)^\}}", source, re.S | re.M).group(1)
+        for name, text in (("alarm_after", source), ("alarm_cancel", source), ("alarm_remaining", source), ("alarm_list", source),
+                           ("sound_chirp", sound), ("sound_stop", sound)):
+            body = re.search(rf"^static int {name}\(lua_State \*L\) \{{\n(.*?)^\}}", text, re.S | re.M).group(1)
             self.assertNotIn("lua_newuserdata", body, name)
             self.assertNotIn("lua_setmetatable", body, name)
+        self.assertNotRegex(source, re.compile(r"^static int sound_", re.M), "a sound binding left in apps_svc.c")
 
     def test_arm_gives_the_reference_back_when_the_runtime_has_no_slot(self):
         # Unreachable today (the count is checked just before and no app code runs between), so no script gets there: the

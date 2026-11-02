@@ -48,6 +48,7 @@
 #include "apphost_port.h"
 #include "apps_alarm.h"
 #include "apps_ask.h"
+#include "apps_mix.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_vmio.h"
@@ -144,6 +145,87 @@ void apps_port_sound_chirp(void) {
 void apps_port_sound_stop(void) {
     apps_alarm_ring_stop();
     apphost_ring_sync();
+}
+
+/* The mixer's voices as an app sees them (apphost_port.h): which play, whose, and until when on this clock. id 0 is a free slot. */
+typedef struct {
+    uint32_t id, owner;
+    int64_t ends_ms;  /* INT64_MAX: a loop */
+} voice_t;
+
+static voice_t voices[APPS_MIX_VOICES];
+static uint32_t last_voice_id;
+
+static bool voice_plays(const voice_t *v) {
+    return v->id != 0 && mono_ms < v->ends_ms;
+}
+
+/* A slot for a new voice: one that plays nothing, else the one that started first (the lowest id), which is replaced. Its id. */
+static uint32_t voice_start(uint32_t owner, int64_t ends_ms) {
+    voice_t *slot = NULL;
+    for (int i = 0; i < APPS_MIX_VOICES && slot == NULL; i++) {
+        if (!voice_plays(&voices[i])) {
+            slot = &voices[i];
+        }
+    }
+    if (slot == NULL) {
+        slot = &voices[0];
+        for (int i = 1; i < APPS_MIX_VOICES; i++) {
+            if (voices[i].id < slot->id) {
+                slot = &voices[i];
+            }
+        }
+    }
+    last_voice_id = last_voice_id == UINT32_MAX ? 1 : last_voice_id + 1;
+    *slot = (voice_t){.id = last_voice_id, .owner = owner, .ends_ms = ends_ms};
+    return slot->id;
+}
+
+/* The voice in v stops: the sink is told if it still played. */
+static void voice_end(voice_t *v) {
+    if (voice_plays(v) && sound_sink != NULL && sound_sink->sound_stop != NULL) {
+        sound_sink->sound_stop(v->id);
+    }
+    v->id = 0;
+}
+
+uint32_t apps_port_sound_tone(uint32_t owner, int hz, int to_hz, int ms, int wave, int volume) {
+    uint32_t id = voice_start(owner, mono_ms + ms);
+    if (sound_sink != NULL && sound_sink->tone != NULL) {
+        sound_sink->tone(id, hz, to_hz, ms, wave, volume);
+    }
+    return id;
+}
+
+uint32_t apps_port_sound_clip(uint32_t owner, const int16_t *samples, size_t frames, int volume, bool loop) {
+    int64_t ms = (int64_t)((frames * 1000 + APPS_MIX_RATE - 1) / APPS_MIX_RATE);
+    uint32_t id = voice_start(owner, loop ? INT64_MAX : mono_ms + ms);
+    if (sound_sink != NULL && sound_sink->play != NULL) {
+        sound_sink->play(id, samples, frames, volume, loop);
+    }
+    return id;
+}
+
+void apps_port_sound_end(uint32_t id) {
+    for (int i = 0; i < APPS_MIX_VOICES; i++) {
+        if (id != 0 && voices[i].id == id) {
+            voice_end(&voices[i]);
+        }
+    }
+}
+
+void apps_port_sound_end_owner(uint32_t owner) {
+    for (int i = 0; i < APPS_MIX_VOICES; i++) {
+        if (voices[i].id != 0 && voices[i].owner == owner) {
+            voice_end(&voices[i]);
+        }
+    }
+}
+
+void apps_port_sound_cut(void) {
+    for (int i = 0; i < APPS_MIX_VOICES; i++) {
+        voice_end(&voices[i]);
+    }
 }
 
 /* What an alarm asks of the rest of the gadget (apps_alarm.c calls them from its timer): the screen wakes, which here is lit; the voice

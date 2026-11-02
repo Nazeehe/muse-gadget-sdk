@@ -261,8 +261,88 @@ class GuideAndSkill(unittest.TestCase):
         svc = strip_c_comments((APPS / "apps_svc.c").read_text())
         for method in c_table(svc, "apps_timer_methods"):
             self.assertRegex(reference, rf"`h:{method}\(", f"h:{method}")
+        # The sound handle's (games Task 3), in the sound module's own section.
+        sound = strip_c_comments((APPS / "apps_sound.c").read_text())
+        sound_section = reference[reference.index("\n### sound\n"):]
+        sound_section = sound_section[:sound_section.find("\n### ", 1)]
+        for method in c_table(sound, "apps_sound_methods"):
+            self.assertRegex(sound_section, rf"(?m)^- `h:{method}\(", f"h:{method}")
         for constant in ("ui.W", "ui.H", "ui.R", "ui.SAFE", "json.null", "sys.api"):
             self.assertIn(f"`{constant}`", reference, constant)
+
+    def test_guide_documents_sound(self):
+        # Games Task 3: the sound module's lines, each range as apps_sound.h has it and the voices and the fade as apps_mix.h has
+        # them (D12); the permission's words; the Sounds recipe under Images, with ffmpeg's sources, the conversion line and the
+        # licensing rule; and the Games section's Sound bullet.
+        sound_h = APPS / "apps_sound.h"
+        hz_min, hz_max = header_number(sound_h, "APPS_SOUND_HZ_MIN"), header_number(sound_h, "APPS_SOUND_HZ_MAX")
+        ms_min, ms_max = header_number(sound_h, "APPS_SOUND_MS_MIN"), header_number(sound_h, "APPS_SOUND_MS_MAX")
+        ms_default = header_number(sound_h, "APPS_SOUND_MS_DEFAULT")
+        volume_max = header_number(sound_h, "APPS_SOUND_VOLUME_MAX")
+        voices = header_number("apps_mix.h", "APPS_MIX_VOICES")
+        fade = header_number("apps_mix.h", "APPS_MIX_FADE_MS")
+        guide = GUIDE.read_text()
+        reference = guide_section(guide, "API reference")
+        section = reference[reference.index("\n### sound\n"):]
+        section = " ".join(section[:section.find("\n### ", 1)].split())
+        for phrase in (
+                f"- `sound.tone{{hz, ms, to_hz, wave, volume}}`: a tone of `ms` milliseconds ({ms_min} to {ms_max}, {ms_default} by "
+                f"default) whose pitch slides from `hz` to `to_hz` (each {hz_min} to {hz_max} Hz;",
+                f"tones sound best well below {hz_max} Hz, where a sine goes silent",
+                "`wave` is `\"sine\"` (the default), `\"square\"`, `\"triangle\"`, `\"saw\"` or `\"noise\"`",
+                f"`volume` is 0 to {volume_max} ({volume_max} by default), a share of the gadget's volume",
+                f"It fades in and out over {fade} ms",
+                f"- `sound.play(path, {{volume = {volume_max}, loop = false}})`: plays the `.wav` at path, one of the manifest's `files`",
+                f"- `h:stop()`: stops the sound h, which fades out over {fade} ms;",
+                "`tostring(h)` is `sound#<n>`, counting the app's sounds from 1.",
+                f"{voices} sounds play at once: a fifth replaces the one that started first",
+                "Sound plays only while the app is in front and the screen is lit",
+                "return a sound that is already done, and nothing plays"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, section)
+        self.assertEqual(voices, 4, "the guide says 'a fifth'")
+        # sound_test's waves are apps_sound.c's, in apps_mix.h's order.
+        waves = c_table(strip_c_comments((APPS / "apps_sound.c").read_text()), "apps_sound_waves")
+        self.assertEqual(waves, ["sine", "square", "triangle", "saw", "noise"])
+        manifest = " ".join(guide_section(guide, "Files and the manifest").split())
+        self.assertIn("`sound` (for `sound.chirp`, `sound.tone` and `sound.play`)", manifest)
+        self.assertLess(guide.index("\n## Images\n"), guide.index("\n## Sounds\n"))
+        self.assertLess(guide.index("\n## Sounds\n"), guide.index("\n## Icons\n"))
+        sounds = " ".join(guide_section(guide, "Sounds").split())
+        pkg = (APPS / "apps_pkg.h").read_text()
+        sound_kb, sounds_kb = (int(re.search(rf"(?m)^#define {name} \((\d+) \* 1024\)$", pkg).group(1))
+                               for name in ("APPS_SOUND_MAX", "APPS_SOUNDS_TOTAL_MAX"))
+        rate = header_number("apps_mix.h", "APPS_MIX_RATE")  # 2 bytes a frame
+        for phrase in (
+                f"A sound is at most {sound_kb} KB, about {round(sound_kb * 1024 / (2 * rate))} s, and an app's sounds "
+                f"{sounds_kb // 1024} MB together, about {round(sounds_kb * 1024 / (2 * rate))} s.",
+                "`ffmpeg -f lavfi -i \"sine=frequency=880:duration=0.12\" -ac 1 -ar 16000 -c:a pcm_s16le sfx/score.wav`",
+                "`ffmpeg -f lavfi -i \"anoisesrc=color=brown:duration=0.25:amplitude=0.4\" -ac 1 -ar 16000 -c:a pcm_s16le "
+                "sfx/crash.wav`",
+                "`ffmpeg -i in.mp3 -ac 1 -ar 16000 -c:a pcm_s16le out.wav`",
+                "Generate your sounds, or use only sounds licensed for this: never clips taken from the web."):
+            with self.subTest(phrase):
+                self.assertIn(phrase, sounds)
+        games = " ".join(guide_section(guide, "Games").split())
+        self.assertIn("- **Sound.** Tones for flaps and hits (`sound.tone`), a clip for a fanfare (`sound.play`, see Sounds), and "
+                      "sound only in front:", games)
+        self.assertNotIn("`sound.chirp()` is the one sound there is", guide)
+
+    def test_guide_says_what_the_sound_refusals_are(self):
+        # Task 2's WAV refusals (apps_pkg.c's, after the file's path) and the sounds' total, and sound.play's path, each a Common
+        # errors entry quoted as the firmware has it (Task 3's rulings).
+        pkg = strip_c_comments((APPS / "apps_pkg.c").read_text())
+        wav = re.search(r"^bool apps_wav_check\(.*?^\}", pkg, re.S | re.M).group(0)
+        messages = re.findall(r'failf\(err, err_len, "(sound: [^"]+)"\)', wav)
+        fmt = re.search(r'#define WAV_FORMAT_MSG "([^"]+)"', pkg)
+        self.assertIsNotNone(fmt, "no WAV_FORMAT_MSG in apps_pkg.c")
+        messages.append(fmt.group(1))
+        self.assertEqual(len(set(messages)), 9, messages)
+        errors = guide_section(GUIDE.read_text(), "Common errors")
+        for message in [*sorted(set(messages)), "sounds add up to more than 1 MB",
+                        "sound.play: '<path>' is not one of this app's sounds (manifest.json \"files\")"]:
+            with self.subTest(message):
+                self.assertIn(f"- `{message}`: ", errors)
 
     def test_guide_says_a_button_shows_its_press(self):
         # P41: apps_lv.c gives every button a pressed style (button_shows_its_pressed_state), and the button's line says so.
@@ -641,6 +721,32 @@ class GuideAndSkill(unittest.TestCase):
                        "puts the app behind, where it keeps running.",
                        # Task 6a: the launch hold's bound is APPS_LV_LAUNCH_HOLD_MS.
                        f"until the app's first frame, for at most {hold // 1000} s (`APPS_LV_LAUNCH_HOLD_MS`)"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, section)
+
+    def test_agents_md_has_the_sound_paragraph(self):
+        # Games Task 3: the pieces of app sound, and the bench's log line as apps_mix.c prints it (D12). The board's numbers are pinned
+        # once they are measured.
+        mix = (APPS / "apps_mix.c").read_text()
+        self.assertIn('ESP_LOGI(TAG, "sound start %d ms"', mix)
+        self.assertRegex(mix, r'static const char \*TAG = "muse_apps";')
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        voices = header_number("apps_mix.h", "APPS_MIX_VOICES")
+        fade = header_number("apps_mix.h", "APPS_MIX_FADE_MS")
+        audio = (MUSE / "muse_audio.h").read_text()
+        chunk = int(re.search(r"(?m)^#define MUSE_AUDIO_CHUNK (\d+)", audio).group(1))
+        rate = int(re.search(r"(?m)^#define MUSE_AUDIO_RATE (\d+)", audio).group(1))
+        self.assertEqual(rate, header_number("apps_mix.h", "APPS_MIX_RATE"))
+        for phrase in (f"**Sound:** `apps_mix.c` (the mixer: {voices} voices of tones and clips, `APPS_MIX_VOICES`, summed and "
+                       f"saturated into one {rate // 1000} kHz mono stream; a start while all {voices} play replaces the oldest,",
+                       f"over {fade} ms, `APPS_MIX_FADE_MS`), `apps_sound.c` (the `sound` module:",
+                       "which reach the mixer only through `apps_port_sound_*`) and the voice task (`muse_voice.c`, under "
+                       "`CONFIG_MUSE_APPS`), the speaker's only writer,",
+                       f"renders one chunk of {chunk} frames (`MUSE_AUDIO_CHUNK`, {chunk * 1000 // rate} ms) on each idle pass",
+                       "A bench build logs `sound start <ms> ms` (the `muse_apps` tag) at the first render of each voice",
+                       "`sound render <us> us (<n> frames, <v> voices)`, how long a render held the mixer's lock",
+                       "`apps_svc.c` (`time`, `os`, `timer`, `alarm`, `store`, `sys`), `apps_sound.c` (`sound`) and `apps_mix.c`"):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
 

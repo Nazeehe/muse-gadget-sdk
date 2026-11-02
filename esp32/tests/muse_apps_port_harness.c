@@ -48,6 +48,7 @@
 #include "apps_ask.h"
 #include "apps_echo.h"
 #include "apps_io.h"
+#include "apps_mix.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_store.h"
@@ -540,6 +541,52 @@ bool apps_store_has(const char *id) {
 
 void muse_voice_request_chirp(void) {
     alarm_calls.chirps++;
+}
+
+/* The mixer (apps_mix.h, whose own cases are tests/muse_apps_mix_harness.c): what the port's sound calls hand it, and the id it gives. */
+static struct {
+    int tones, clips, stops, stop_owners, stop_alls;
+    uint32_t owner, id;
+    int hz, to_hz, ms, volume;
+    apps_wave_t wave;
+    const int16_t *samples;
+    size_t frames;
+    bool loop;
+} mix_calls;
+
+uint32_t apps_mix_tone(uint32_t owner, int hz, int to_hz, int ms, apps_wave_t wave, int volume) {
+    mix_calls.tones++;
+    mix_calls.owner = owner;
+    mix_calls.hz = hz;
+    mix_calls.to_hz = to_hz;
+    mix_calls.ms = ms;
+    mix_calls.wave = wave;
+    mix_calls.volume = volume;
+    return 0x51;
+}
+
+uint32_t apps_mix_clip(uint32_t owner, const int16_t *samples, size_t frames, int volume, bool loop) {
+    mix_calls.clips++;
+    mix_calls.owner = owner;
+    mix_calls.samples = samples;
+    mix_calls.frames = frames;
+    mix_calls.volume = volume;
+    mix_calls.loop = loop;
+    return 0x62;
+}
+
+void apps_mix_stop(uint32_t id) {
+    mix_calls.stops++;
+    mix_calls.id = id;
+}
+
+void apps_mix_stop_owner(uint32_t owner) {
+    mix_calls.stop_owners++;
+    mix_calls.owner = owner;
+}
+
+void apps_mix_stop_all(void) {
+    mix_calls.stop_alls++;
 }
 
 /* ---- The I/O worker's ops (apps_io.h): queued here, and run by the case, or by a caller that sleeps, in the order queued ---- */
@@ -1480,6 +1527,29 @@ static void alarms_and_sound_go_to_their_owners(void) {
     CHECK(alarm_calls.stops == 1 && alarm_calls.chirps == 1, "stop is the ring's");
 }
 
+/* An app's tones and clips are the mixer's (games Task 3, G1): each sound call of the port is one call of apps_mix.h with what it was
+ * given, and gives back the mixer's id. Nothing else is asked of the voice task or the ring. */
+static void sound_goes_to_the_mixer(void) {
+    CHECK(apps_port_sound_tone(7, 440, 880, 120, APPS_WAVE_SQUARE, 60) == 0x51 && mix_calls.tones == 1, "a tone");
+    CHECK(mix_calls.owner == 7 && mix_calls.hz == 440 && mix_calls.to_hz == 880 && mix_calls.ms == 120 &&
+              mix_calls.wave == APPS_WAVE_SQUARE && mix_calls.volume == 60,
+          "tone passed %u %d %d %d %d %d", (unsigned)mix_calls.owner, mix_calls.hz, mix_calls.to_hz, mix_calls.ms, (int)mix_calls.wave,
+          mix_calls.volume);
+    static const int16_t samples[4] = {1, -2, 3, -4};
+    CHECK(apps_port_sound_clip(8, samples, 4, 30, true) == 0x62 && mix_calls.clips == 1, "a clip");
+    CHECK(mix_calls.owner == 8 && mix_calls.samples == samples && mix_calls.frames == 4 && mix_calls.volume == 30 && mix_calls.loop,
+          "clip passed %u %zu %d %d", (unsigned)mix_calls.owner, mix_calls.frames, mix_calls.volume, mix_calls.loop);
+    apps_port_sound_end(0x51);
+    CHECK(mix_calls.stops == 1 && mix_calls.id == 0x51, "end is apps_mix_stop");
+    apps_port_sound_end_owner(9);
+    CHECK(mix_calls.stop_owners == 1 && mix_calls.owner == 9, "end_owner is apps_mix_stop_owner");
+    apps_port_sound_cut();
+    CHECK(mix_calls.stop_alls == 1, "cut is apps_mix_stop_all");
+    CHECK(mix_calls.tones == 1 && mix_calls.clips == 1 && mix_calls.stops == 1 && mix_calls.stop_owners == 1 &&
+              alarm_calls.chirps == 0 && alarm_calls.stops == 0,
+          "one call each, and none of the voice task's or the ring's");
+}
+
 
 /* ---- The store (apps_port.h): the I/O worker's map of each app's object ---- */
 
@@ -2377,6 +2447,7 @@ static const struct {
     {"dark_follows_the_ui", dark_follows_the_ui},
     {"the_wall_clock_counts_when_the_helper_says", the_wall_clock_counts_when_the_helper_says},
     {"alarms_and_sound_go_to_their_owners", alarms_and_sound_go_to_their_owners},
+    {"sound_goes_to_the_mixer", sound_goes_to_the_mixer},
     {"store_round_trip_through_the_worker", store_round_trip_through_the_worker},
     {"store_ops_run_in_the_order_of_the_calls", store_ops_run_in_the_order_of_the_calls},
     {"store_load_gives_up_when_the_worker_is_silent", store_load_gives_up_when_the_worker_is_silent},

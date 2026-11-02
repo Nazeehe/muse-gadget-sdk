@@ -64,7 +64,7 @@ if(CONFIG_MUSE_ENABLED)
     endif()
     if(CONFIG_MUSE_APPS)
         # Lua mini-apps (apps/): the sandboxed Lua state, its did-you-mean helper, JSON, the package rules, the
-        # runtime of one app, its services (the time, os, timer, alarm and sound modules), its widgets (the ui
+        # runtime of one app, its services (the time, os, timer, alarm, store and sys modules), its widgets (the ui
         # module and the shadow table) and the LVGL task's step that draws them, the app task and the device's port,
         # the system's alarms and their ring, the I/O worker, the apps' values behind it (apps_values.c: apps_nvs
         # or a map in RAM) and the store of the packages (apps_store.c: the FAT partition "apps" and apps_nvs, or
@@ -75,13 +75,14 @@ if(CONFIG_MUSE_ENABLED)
         # apps' JPEG decoder (apps_jpeg.c: runtime images, over the ROM's TJpgDec), the apps' vm module and the
         # network worker that runs its requests through the VM ops (apps_vmio.c, apps_net.c), the apps' muse module
         # (apps_ask.c: muse.ask, a typed turn in Muse's chat), the mixer of the apps' sound that the voice task plays
-        # (apps_mix.c) and the big digit fonts (apps/fonts/, made by tools/muse/gen_app_fonts.sh).
+        # (apps_mix.c), the sound module's tones and clips (apps_sound.c) and the big digit fonts (apps/fonts/, made by
+        # tools/muse/gen_app_fonts.sh).
         list(APPEND srcs "apps/apps_vm.c" "apps/apps_suggest.c" "apps/apps_json.c" "apps/apps_pkg.c"
             "apps/apps_rt.c" "apps/apps_svc.c" "apps/apps_ui.c" "apps/apps_lv.c" "apps/apps_task.c"
             "apps/apps_port_idf.c" "apps/apps_alarm.c" "apps/apps_io.c" "apps/apps_values.c" "apps/apps_store.c"
             "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/apps_snapshot.c"
             "apps/apps_result.c" "apps/apps_icons.c" "apps/apps_jpeg.c" "apps/apps_vmio.c" "apps/apps_net.c" "apps/apps_ask.c"
-            "apps/apps_mix.c" "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
+            "apps/apps_mix.c" "apps/apps_sound.c" "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
         # What app.api writes to Muse's VM (apps_control.c): the app guide, the timer example and the tally example (a
         # connected app and its hook). IDF names an embedded file's symbols, and its generated .S, after the file's name
         # alone, so the tally's files, which have the timer's names, are embedded through copies named tally_<name> here.

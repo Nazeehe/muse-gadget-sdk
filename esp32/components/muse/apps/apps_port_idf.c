@@ -18,8 +18,8 @@
  * apps_port.h on the gadget. The heap is PSRAM; the clock is esp_timer's; an app's log line goes to the console as
  * "@app.log <id> <line>", at most 1,024 bytes of them a second, queued in the call and printed after it; the UI lock is
  * a static FreeRTOS mutex that muse_apps_start() makes (apps_port_init); the system's alarms are apps_alarm.c's, and a chirp
- * is the voice task's. An app's store is apps_values.c's (apps_values.h): apps_nvs on a gadget with the apps partition, a map in PSRAM
- * otherwise, behind the I/O worker; an alarm that is armed or cancelled is a name its app touched, for its record
+ * is the voice task's, as an app's tones and clips are, through the mixer (apps_mix.h). An app's store is apps_values.c's
+ * (apps_values.h): apps_nvs on a gadget with the apps partition, a map in PSRAM otherwise, behind the I/O worker; an alarm that is armed or cancelled is a name its app touched, for its record
  * (apps_values_alarm_touched); sys's battery and Wi-Fi are muse_state's and muse_wifi's, and its show, keep_awake and exit are the app
  * task's (apps_task.h).
  *
@@ -51,6 +51,7 @@
 #include "apps_alarm.h"
 #include "apps_ask.h"
 #include "apps_echo.h"
+#include "apps_mix.h"
 #include "apps_pkg.h"
 #include "apps_task.h"
 #include "apps_values.h"
@@ -464,6 +465,27 @@ void apps_port_sound_chirp(void) {
 
 void apps_port_sound_stop(void) {
     apps_alarm_ring_stop();
+}
+
+/* An app's tones and clips are the mixer's (apps_mix.h), which the voice task renders on its idle passes. */
+uint32_t apps_port_sound_tone(uint32_t owner, int hz, int to_hz, int ms, int wave, int volume) {
+    return apps_mix_tone(owner, hz, to_hz, ms, (apps_wave_t)wave, volume);
+}
+
+uint32_t apps_port_sound_clip(uint32_t owner, const int16_t *samples, size_t frames, int volume, bool loop) {
+    return apps_mix_clip(owner, samples, frames, volume, loop);
+}
+
+void apps_port_sound_end(uint32_t id) {
+    apps_mix_stop(id);
+}
+
+void apps_port_sound_end_owner(uint32_t owner) {
+    apps_mix_stop_owner(owner);
+}
+
+void apps_port_sound_cut(void) {
+    apps_mix_stop_all();
 }
 
 /* The store of an app: apps_values.c keeps the objects (apps_values.h), behind the I/O worker. */

@@ -130,6 +130,9 @@ class AppPortTest(unittest.TestCase):
     def test_alarms_and_sound_go_to_their_owners(self):  # Task 17: apps_alarm.c's table and ring, the voice task's chirp
         self.run_case("alarms_and_sound_go_to_their_owners")
 
+    def test_sound_goes_to_the_mixer(self):  # games Task 3 (G1): apps_port_sound_* are apps_mix.h's calls, one each
+        self.run_case("sound_goes_to_the_mixer")
+
     # ---- Task 18: the store, sys's battery and Wi-Fi, and what goes to the app task ----
 
     def test_the_store_round_trips_through_the_worker(self):  # X11: saves and loads are the I/O worker's ops

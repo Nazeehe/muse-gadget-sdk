@@ -59,13 +59,22 @@ void apphost_set_dark(bool dark);
  * it runs the timers that came due (apphost_esp_run_timers), announces the alarms that fired (apps_alarm_fired), launches the app again
  * if it doesn't run and tells it (apps_alarm_take, then alarm(name)), as apps_task.c's deliver_alarms does, and tells the alarms how an
  * app ended (apps_alarm_app_ended, apps_alarm_cancel_app), as its end_app does. What the port does of its own is the sound module
- * (a chirp, sound.stop) and the screen an alarm with wake lights. A chirp and the ring's start and end are told to apphost.c as they
- * happen, inside whatever call made them, so that they print in order with what the app printed. The ring's period has no counterpart:
- * it is on or off.
+ * (a chirp, sound.stop, the app's tones and clips) and the screen an alarm with wake lights. A chirp and the ring's start and end are
+ * told to apphost.c as they happen, inside whatever call made them, so that they print in order with what the app printed. The ring's
+ * period has no counterpart: it is on or off.
+ * The app's tones and clips are the mixer as an app sees it: its APPS_MIX_VOICES voices, each with an id from 1 (one more each start),
+ * its owner and its end on this clock (a tone's ms, a clip's frames at APPS_MIX_RATE; a loop never ends). A start while every voice
+ * plays replaces the one that started first, and says nothing of it; a stop tells the sink of a voice that still played, and of no
+ * other, so a handle whose sound has ended or was replaced stops nothing, as on the gadget.
  */
 typedef struct {
     void (*chirp)(void);    /* sound.chirp() */
     void (*ring)(bool on);  /* the ring began (a first alarm with sound fired), or ended (sound.stop, its minute, nothing left to stop it) */
+    /* An app's tone or clip began, as its voice's id (apps_port_sound_tone, apps_port_sound_clip): wave is an apps_wave_t; a clip is
+     * its samples in the package's bytes, which apphost.c names by the package's file they are in. */
+    void (*tone)(uint32_t id, int hz, int to_hz, int ms, int wave, int volume);
+    void (*play)(uint32_t id, const int16_t *samples, size_t frames, int volume, bool loop);
+    void (*sound_stop)(uint32_t id);  /* a voice that played was stopped: h:stop(), its app's end or hide, a cut */
 } apphost_sound_t;
 
 /* Where the sound goes: NULL (the start, and --cycles) is nowhere. sink must outlive the run. */

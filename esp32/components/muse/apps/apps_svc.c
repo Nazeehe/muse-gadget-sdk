@@ -32,15 +32,16 @@
 #include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
+#include "apps_sound.h"
 #include "apps_vm.h"
 #include "apps_vmio.h"
 #include "lauxlib.h"
 #include "lua.h"
 
 /*
- * The `time`, `os`, `timer`, `alarm`, `sound`, `store` and `sys` modules (apps_svc.h says what they do). Every binding calls apps_vm_check first and runs
- * inside a call of the app, so what allocates in the app's heap (a table, a string, a handle, a registry reference) may be
- * refused and ends the app out of memory, as everywhere else. The clocks are the port's (apps_port.h): the wall clock is the
+ * The `time`, `os`, `timer`, `alarm`, `store` and `sys` modules (apps_svc.h says what they do; `sound` is apps_sound.c's). Every binding
+ * calls apps_vm_check first and runs inside a call of the app, so what allocates in the app's heap (a table, a string, a handle, a
+ * registry reference) may be refused and ends the app out of memory, as everywhere else. The clocks are the port's (apps_port.h): the wall clock is the
  * port's epoch, and the zone is the C library's (TZ), which the watch sets on the gadget (muse_clock_build) and apphost sets
  * to UTC. What a timer is lives in the runtime; the handle here is a slot and a gen. An alarm is the system's (apps_alarm.h):
  * the port keeps it, named by the app's id and a name of the app's, and there is no handle. The store's values are the runtime's
@@ -549,7 +550,7 @@ static int timer_tostring(lua_State *L) {
 /* ---- alarm ---- */
 
 /* Raises the module's message unless the manifest gives the app its permission. Upvalue 1 is the runtime. The module and its
- * permission are named alike ("alarm", "sound", "store"), except for sys's one (need_as). */
+ * permission are named alike ("alarm", "store"; apps_sound.c has its own for "sound"), except for sys's one (need_as). */
 static void need_as(lua_State *L, unsigned perm, const char *module, const char *permission) {
     apps_rt_t *rt = lua_touserdata(L, lua_upvalueindex(1));
     if (!apps_rt_permits(rt, perm)) {
@@ -676,24 +677,6 @@ static int alarm_list(lua_State *L) {
         lua_rawseti(L, -2, i + 1);
     }
     return 1;
-}
-
-/* ---- sound ---- */
-
-/* sound.chirp(): one chirp, with the "sound" permission. */
-static int sound_chirp(lua_State *L) {
-    apps_vm_check(L);
-    need(L, APPS_PERM_SOUND, "sound");
-    apps_port_sound_chirp();
-    return 0;
-}
-
-/* sound.stop(): ends the ring of an alarm that is going, whichever app's it is: no permission (an app that can't make a
- * noise can still be asked to stop one), and nothing happens when none is going. */
-static int sound_stop(lua_State *L) {
-    apps_vm_check(L);
-    apps_port_sound_stop();
-    return 0;
 }
 
 /* ---- store ---- */
@@ -928,12 +911,6 @@ static const luaL_Reg apps_alarm_funcs[] = {
     {NULL, NULL},
 };
 
-static const luaL_Reg apps_sound_funcs[] = {
-    {"chirp", sound_chirp},
-    {"stop", sound_stop},
-    {NULL, NULL},
-};
-
 static const luaL_Reg apps_store_funcs[] = {
     {"get", store_get},
     {"set", store_set},
@@ -958,7 +935,8 @@ static const luaL_Reg apps_timer_meta[] = {
     {NULL, NULL},
 };
 
-/* Runs under lua_pcall: the seven globals and the timer handle's metatable, then the vm module (apps_vmio.h). */
+/* Runs under lua_pcall: the six globals of this file and the timer handle's metatable, the sound module (apps_sound.h), then the vm
+ * and muse modules (apps_vmio.h, apps_ask.h). */
 static int open_svc(lua_State *L) {
     apps_rt_t *rt = lua_touserdata(L, 1);
     lua_settop(L, 0);
@@ -987,17 +965,14 @@ static int open_svc(lua_State *L) {
     luaL_setfuncs(L, apps_timer_funcs, 1);
     lua_setglobal(L, "timer");
 
-    /* alarm and sound make no handle: nothing to protect, but the runtime, which every one of them asks for the app's id and
-     * what its manifest permits. */
+    /* alarm makes no handle: nothing to protect, but the runtime, which every one of them asks for the app's id and what its
+     * manifest permits. */
     lua_createtable(L, 0, 4);
     lua_pushlightuserdata(L, rt);
     luaL_setfuncs(L, apps_alarm_funcs, 1);
     lua_setglobal(L, "alarm");
 
-    lua_createtable(L, 0, 2);
-    lua_pushlightuserdata(L, rt);
-    luaL_setfuncs(L, apps_sound_funcs, 1);
-    lua_setglobal(L, "sound");
+    apps_sound_open(L, rt);  /* `sound` and its handle's metatable (apps_sound.h) */
 
     /* store and sys make no handle either: plain tables of functions, which take the runtime for the app's id, permissions and
      * cache. There is no `log` global: logging is print and sys.log. */

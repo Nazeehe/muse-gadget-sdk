@@ -30,6 +30,8 @@
  *   count                                             how many of the ids handed out so far are playing
  *   locks                                             how many times the mixer's lock was taken since the last ask
  *   race <rounds>                                     a render thread against stop_owner and free on this one: "ok"
+ *   clock <us>                                        a bench build's (CONFIG_MUSE_BENCH): esp_timer_get_time() is us from now: "ok".
+ *                                                     Its log lines go to stderr, "@log <tag> <line>", and one under the lock aborts
  * An id is a number, or #k for the id that the k-th start of the run (from 0) returned.
  *
  * The mixer's lock (apps_port.h) is a pthread mutex that aborts on a second take by its holder and on a give by a thread that
@@ -37,6 +39,7 @@
  */
 
 #include <pthread.h>
+#include <stdarg.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -49,6 +52,7 @@
 #include "apps_mix.h"
 #include "apps_port.h"
 #include "muse_apps.h"
+#include "sdkconfig.h"
 
 /* ---- The mixer's lock ---- */
 
@@ -80,6 +84,28 @@ void apps_port_mix_unlock(void) {
     atomic_fetch_sub(&s_held, 1);
     pthread_mutex_unlock(&s_mutex);
 }
+
+#if CONFIG_MUSE_BENCH
+/* ---- The bench's clock and log (esp_timer.h and esp_log.h as the test stages them) ---- */
+
+static int64_t s_now_us = 1000000;
+
+int64_t esp_timer_get_time(void) {
+    return s_now_us;
+}
+
+void fake_esp_log(const char *tag, const char *fmt, ...) {
+    if (t_holding) {
+        die("a log line under the mixer's lock");
+    }
+    char text[200];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof text, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "@log %s %s\n", tag, text);
+}
+#endif
 
 /* ---- Clips and ids ---- */
 
@@ -323,6 +349,11 @@ int main(void) {
             printf("%u\n", atomic_exchange(&s_takes, 0));
         } else if (strcmp(cmd, "race") == 0 && argc == 2) {
             race(atoi(argv[1]));
+#if CONFIG_MUSE_BENCH
+        } else if (strcmp(cmd, "clock") == 0 && argc == 2) {
+            s_now_us = strtoll(argv[1], NULL, 10);
+            puts("ok");
+#endif
         } else {
             die("a command the harness doesn't know, or the wrong number of words");
         }

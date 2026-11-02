@@ -28,6 +28,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "apps_port.h"
 #include "muse_input.h"
 #include "muse_voice.h"
 
@@ -435,11 +436,13 @@ static void ring_orphaned_locked(const char *why) {
     }
 }
 
-/* An alarm with sound has fired. A ring that is going goes on, a minute from now, and its log names this alarm from now on; that is
- * all: no chirp is asked for, since the ring's period asks for one every 1.5 s, which keeps a flood of firings to the one chirp. One
- * that isn't going starts, with its first chirp. The call to the voice task sets a flag and an event-group bit and returns: nothing
- * that waits. */
+/* An alarm with sound has fired. The apps' own sound stops first (Muse wins the speaker): every voice fades out, the mixer's lock held
+ * only for bounded work, and none taken when nothing plays (apps_port_sound_cut). A ring that is going goes on, a minute from now, and its
+ * log names this alarm from now on; that is all: no chirp is asked for, since the ring's period asks for one every 1.5 s, which keeps a
+ * flood of firings to the one chirp. One that isn't going starts, with its first chirp. The call to the voice task sets a flag and an
+ * event-group bit and returns: nothing that waits. */
 static void ring_sound_locked(const char *app, const char *name, int64_t now_us) {
+    apps_port_sound_cut();
     snprintf(s_ring_app, sizeof s_ring_app, "%s", app);
     snprintf(s_ring_name, sizeof s_ring_name, "%s", name);
     s_ring_end_us = now_us + RING_MAX_US;

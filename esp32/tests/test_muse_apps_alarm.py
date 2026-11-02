@@ -116,6 +116,9 @@ class AlarmTest(unittest.TestCase):
     def test_sound_stop_ends_the_ring_once(self):
         self.run_case("stopping_the_ring")
 
+    def test_a_ring_cuts_app_sound(self):  # games Task 3: Muse wins the speaker at each firing with sound
+        self.run_case("a_ring_cuts_app_sound")
+
     def test_a_second_alarm_makes_the_ring_a_minute_longer(self):
         self.run_case("a_second_alarm_makes_the_ring_a_minute_longer")
 

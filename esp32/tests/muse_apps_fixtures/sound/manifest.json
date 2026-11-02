@@ -1,0 +1,23 @@
+{
+  "id": "sound",
+  "name": "Sound",
+  "version": "1",
+  "api": 1,
+  "files": [
+    "loop.wav"
+  ],
+  "permissions": [
+    "sound",
+    "alarm",
+    "keep_awake"
+  ],
+  "memory_kb": 64,
+  "messages": {
+    "press": "A flap: the box jumps and a tone plays, unless muted. Replies {flaps, muted, sound}.",
+    "mute": "data {on}: true silences the presses, false sounds them again, none toggles. Replies {muted}.",
+    "chord": "Four tones at once, 1.5 s each: a render of four voices. Replies {sounds}.",
+    "loop": "data {on}: the looping clip (loop.wav) on, or off with on = false. Replies {looping}.",
+    "alarm": "Arms a 5 s alarm with sound and starts the looping clip: the ring stops the clip, and alarm() ends the ring. Replies {armed}.",
+    "state": "Replies {flaps, muted, looping, y, rang}."
+  }
+}

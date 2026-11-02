@@ -390,6 +390,27 @@ int apps_port_alarm_list(const char *app, char names[4][24], int64_t remaining[4
 void apps_port_sound_chirp(void) {}
 void apps_port_sound_stop(void) {}
 
+/* An app's tones and clips (apps_port.h): no case here plays one, so they go nowhere. */
+uint32_t apps_port_sound_tone(uint32_t owner, int hz, int to_hz, int ms, int wave, int volume) {
+    (void)owner, (void)hz, (void)to_hz, (void)ms, (void)wave, (void)volume;
+    return 1;
+}
+
+uint32_t apps_port_sound_clip(uint32_t owner, const int16_t *samples, size_t frames, int volume, bool loop) {
+    (void)owner, (void)samples, (void)frames, (void)volume, (void)loop;
+    return 1;
+}
+
+void apps_port_sound_end(uint32_t id) {
+    (void)id;
+}
+
+void apps_port_sound_end_owner(uint32_t owner) {
+    (void)owner;
+}
+
+void apps_port_sound_cut(void) {}
+
 char *apps_port_store_load(const char *app, size_t *len) {
     (void)app;
     char *doc = apps_port_realloc(NULL, 3);

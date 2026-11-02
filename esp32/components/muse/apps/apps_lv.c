@@ -1223,6 +1223,11 @@ void apps_lv_set_front(bool front) {
         lv_obj_remove_flag(s_layer, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(s_layer, LV_OBJ_FLAG_HIDDEN);
+        /* App sound is for the app in front: every back goes through here (a swipe, a hang, the app's own, a voice turn, which the
+         * voice task's own cut misses when the press comes during a reply), and each one fades it out at once, a frame or more before
+         * the app task's hide() ends it. It waits for the mixer's lock at most as long as one render holds it, and takes none with
+         * nothing playing (apps_mix.h). */
+        apps_port_sound_cut();
     }
     s_front = front;
 }
@@ -1496,6 +1501,14 @@ static void on_carousel_scroll(lv_event_t *e) {
  * log follow. */
 static bool spin_in_front(void) {
     return s_spinning > 0 && s_front && !s_launcher_shown && !s_crash_shown;
+}
+
+/* The launcher or a card has come over the layer in front (spin_in_front's test of what covers it): the app's sound fades out, as when
+ * the layer goes behind (apps_lv_set_front). A card over a layer behind has nothing to cut. */
+static void cut_sound_if_covered(void) {
+    if (s_front && (s_launcher_shown || s_crash_shown)) {
+        apps_port_sound_cut();
+    }
 }
 
 /* A spinner is shown on the layer in front, with no launcher or card over it: its own object is not hidden and no box above it is
@@ -1950,6 +1963,7 @@ void apps_lv_show_launcher(const apps_lv_app_t *apps, int n, const char *running
     }
     lv_obj_remove_flag(s_launcher, LV_OBJ_FLAG_HIDDEN);
     s_launcher_shown = true;
+    cut_sound_if_covered();
 }
 
 void apps_lv_show_crash(const char *name, const char *first_line) {
@@ -1968,6 +1982,7 @@ void apps_lv_show_crash(const char *name, const char *first_line) {
     }
     lv_obj_remove_flag(s_crash, LV_OBJ_FLAG_HIDDEN);
     s_crash_shown = true;
+    cut_sound_if_covered();
 }
 
 void apps_lv_hide_cards(void) {

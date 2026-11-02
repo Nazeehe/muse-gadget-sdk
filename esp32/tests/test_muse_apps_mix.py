@@ -401,13 +401,20 @@ class MixTest(unittest.TestCase):
         self.assertEqual(self.run_script("race 3000", timeout=300).answers, ["ok"])
 
     def test_the_mixer_allocates_waits_and_logs_nothing(self):
-        # Every mixer call holds the lock only for bounded work: no allocation, no log line, no wait but the lock and no Lua.
+        # Every mixer call holds the lock only for bounded work: no allocation, no log line, no wait but the lock and no Lua. A bench
+        # build's lines (games Task 3, G4) are logged by the render once it has released the lock, and by nothing else.
         code = strip_c_comments((APPS / "apps_mix.c").read_text())
+        plain = re.sub(r"#if CONFIG_MUSE_BENCH\n.*?#endif\n", "", code, flags=re.S)
         for word in ("malloc", "calloc", "realloc", "free(", "heap_caps", "apps_port_realloc", "ESP_LOG", "printf", "puts",
                      "vTaskDelay", "xSemaphore", "xQueue", "lua_", "luaL_", "apps_port_ui_lock"):
             with self.subTest(word):
-                self.assertNotIn(word, code)
+                self.assertNotIn(word, plain)
         self.assertEqual(code.count("apps_port_mix_lock()"), code.count("apps_port_mix_unlock()"))
+        render = code[code.index("bool apps_mix_render("):]
+        render = render[:render.index("\n}\n")]
+        self.assertEqual(code.count("ESP_LOG"), render.count("ESP_LOGI("))
+        self.assertEqual(render.count("apps_port_mix_unlock();"), 1)
+        self.assertGreater(render.index("ESP_LOGI("), render.index("apps_port_mix_unlock();"))
 
     def test_plain_state_is_in_psram_and_the_flag_and_lock_are_internal(self):
         # I2's rule: what only the lock guards is plain memory in PSRAM; what is atomic or a lock stays in internal RAM.
@@ -420,6 +427,52 @@ class MixTest(unittest.TestCase):
         init = port[port.index("void apps_port_init(void) {"):]
         init = init[:init.index("\n}\n")]
         self.assertIn("s_mix_lock = xSemaphoreCreateMutexStatic(&s_mix_lock_buf);", init)
+
+
+class MixBenchTest(unittest.TestCase):
+    """The bench's lines (CONFIG_MUSE_BENCH, games Task 3's G4): each read under the mixer's lock and logged once it is released, on the
+    muse_apps tag. The harness's clock is esp_timer_get_time, which a `clock` command sets; its log is stderr, and a line under the lock
+    aborts."""
+
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        stage = Path(tmp.name) / "fakes"
+        stage.mkdir()
+        fakes = {**FAKES,
+                 "sdkconfig.h": "#pragma once\n#define CONFIG_SPIRAM 1\n#define CONFIG_MUSE_APPS 1\n#define CONFIG_MUSE_BENCH 1\n",
+                 "esp_timer.h": "#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n",
+                 "esp_log.h": ("#pragma once\nvoid fake_esp_log(const char *tag, const char *fmt, ...);\n"
+                               "#define ESP_LOGI(tag, ...) fake_esp_log(tag, __VA_ARGS__)\n")}
+        for name, text in fakes.items():
+            (stage / name).write_text(text)
+        cls.harness = apps_host.build("muse_apps_mix_bench_harness", [HARNESS, APPS / "apps_mix.c"], tmp.name,
+                                      include_dirs=[stage, APPS, MUSE])
+
+    def run_script(self, *commands):
+        done = apps_host.run(self.harness, input="".join(f"{c}\n" for c in commands), timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr[-6000:])
+        return [line for line in done.stderr.splitlines() if line.startswith("@log ")]
+
+    def test_a_voice_logs_its_start_once_and_a_render_its_hold(self):
+        # A tone asked for at 1.000 s and a clip at 1.004 s, first rendered at 1.0125 s: 13 and 9 ms (rounded), each once. The hold
+        # is logged once for each number of voices a render has: two here, then one after the tone has ended; the clip's next
+        # renders, of as many voices, log nothing.
+        lines = self.run_script("clock 1000000", "tone 1 440 440 30 sine 100", "make c ramp 16000", "clock 1004000",
+                                "clip 1 c 100 0", "clock 1012500", "render 320", "render 320", "clock 1100000",
+                                "render 640", "render 320", "render 320")
+        self.assertEqual([line for line in lines if " sound start " in line],
+                         ["@log muse_apps sound start 13 ms", "@log muse_apps sound start 9 ms"])
+        holds = [line for line in lines if " sound render " in line]
+        self.assertEqual(len(holds), 2, lines)
+        self.assertRegex(holds[0], r"^@log muse_apps sound render \d+ us \(320 frames, 2 voices\)$")
+        self.assertRegex(holds[1], r"^@log muse_apps sound render \d+ us \(640 frames, 1 voices\)$")
+
+    def test_the_lines_are_pinned(self):
+        source = (APPS / "apps_mix.c").read_text()
+        self.assertIn('ESP_LOGI(TAG, "sound start %d ms", started_ms[i]);', source)
+        self.assertIn('ESP_LOGI(TAG, "sound render %d us (%d frames, %d voices)"', source)
 
 
 if __name__ == "__main__":

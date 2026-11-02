@@ -20,6 +20,11 @@
 #include <string.h>
 
 #include "esp_attr.h"
+#include "sdkconfig.h"
+#if CONFIG_MUSE_BENCH
+#include "esp_log.h"
+#include "esp_timer.h"
+#endif
 
 #include "apps_port.h"
 #include "muse_apps.h"
@@ -37,6 +42,12 @@
  * statics go there, which the apps build does). s_active, read without the lock, is an atomic and stays in internal RAM, as the
  * lock does (apps_port_idf.c). It is written under the lock and is true exactly when a voice or a tail is live, so the voice task's
  * pass with nothing to play takes no lock.
+ *
+ * The bench's measurements (CONFIG_MUSE_BENCH only), on the muse_apps tag, each read under the lock and logged once it is released:
+ * - "sound start <ms> ms": a voice's start request (the call of apps_mix_tone or apps_mix_clip) to the render of its first chunk, once
+ *   for each voice. What the I2S queue adds after the render is the board's to measure.
+ * - "sound render <us> us (<n> frames, <v> voices)": how long a render held the lock, once for each number of voices (and tails) it
+ *   rendered, so that the most the voice task, or a task that waits for the lock, can be held up shows on the board.
  */
 
 #define FRAMES_PER_MS (APPS_MIX_RATE / 1000)
@@ -51,6 +62,10 @@
 #define SLOT_BITS 2
 #define GEN_MAX (UINT32_MAX >> SLOT_BITS)
 #define BLOCK 64                                    /* frames summed at a time: 256 bytes of the caller's stack */
+
+#if CONFIG_MUSE_BENCH
+static const char *TAG = "muse_apps";
+#endif
 
 _Static_assert(APPS_MIX_VOICES == 1 << SLOT_BITS, "an id keeps its slot in SLOT_BITS bits");
 _Static_assert(FADE_FRAMES > 1, "a fade has frames");
@@ -78,6 +93,9 @@ typedef struct {
     /* A tail: frames left of its fade, and the gain the fade began at. */
     uint32_t kill;
     int32_t kill_gain;
+#if CONFIG_MUSE_BENCH
+    int64_t asked_us;          /* esp_timer_get_time() of its start request, until its first render: then 0 */
+#endif
 } voice_t;
 
 typedef struct {
@@ -88,6 +106,9 @@ static EXT_RAM_BSS_ATTR struct {
     slot_t slot[APPS_MIX_VOICES];
     uint32_t gen;              /* the last generation handed out, 1 to GEN_MAX */
     uint32_t starts;           /* starts so far */
+#if CONFIG_MUSE_BENCH
+    uint32_t held_logged;      /* bit n: a render of n voices and tails has logged its hold */
+#endif
 } M;
 static atomic_bool s_active;
 
@@ -266,6 +287,9 @@ uint32_t apps_mix_tone(uint32_t owner, int hz, int to_hz, int ms, apps_wave_t wa
         .amp = APPS_MIX_TONE_PEAK * clamp(volume, 0, 100) / 100,
         .len = (uint32_t)clamp(ms, 1, TONE_MS_MAX) * FRAMES_PER_MS,
         .noise = NOISE_SEED,
+#if CONFIG_MUSE_BENCH
+        .asked_us = esp_timer_get_time(),
+#endif
     };
     v.fade = v.len / 2 < FADE_FRAMES ? v.len / 2 : FADE_FRAMES;
     int64_t from = ((int64_t)clamp(hz, 1, HZ_MAX) << (32 + PHASE_SHIFT)) / APPS_MIX_RATE;
@@ -286,6 +310,9 @@ uint32_t apps_mix_clip(uint32_t owner, const int16_t *samples, size_t frames, in
         .amp = clamp(volume, 0, 100),
         .samples = samples,
         .frames = frames,
+#if CONFIG_MUSE_BENCH
+        .asked_us = esp_timer_get_time(),
+#endif
     };
     apps_port_mix_lock();
     /* Nothing to play: a generation of its own, which no slot will ever hold, so the id is stale from the start. */
@@ -347,6 +374,19 @@ bool apps_mix_render(int16_t *out, size_t frames) {
     }
     apps_port_mix_lock();
     bool live = any_live();
+#if CONFIG_MUSE_BENCH
+    /* Read under the lock, logged after it (no log line under it). */
+    int64_t began_us = esp_timer_get_time();
+    int started_ms[APPS_MIX_VOICES], n_started = 0, rendering = 0;
+    for (int i = 0; i < APPS_MIX_VOICES; i++) {
+        voice_t *v = &M.slot[i].play;
+        rendering += (v->kind != FREE ? 1 : 0) + (M.slot[i].tail.kind != FREE ? 1 : 0);
+        if (v->kind != FREE && v->asked_us != 0) {
+            started_ms[n_started++] = (int)((began_us - v->asked_us + 500) / 1000);
+            v->asked_us = 0;
+        }
+    }
+#endif
     for (size_t done = 0; done < frames;) {
         int32_t acc[BLOCK] = {0};
         size_t n = frames - done < BLOCK ? frames - done : BLOCK;
@@ -364,7 +404,20 @@ bool apps_mix_render(int16_t *out, size_t frames) {
         done += n;
     }
     publish();
+#if CONFIG_MUSE_BENCH
+    int held_us = (int)(esp_timer_get_time() - began_us);
+    bool log_held = rendering > 0 && (M.held_logged & (1u << rendering)) == 0;
+    M.held_logged |= log_held ? 1u << rendering : 0;
+#endif
     apps_port_mix_unlock();
+#if CONFIG_MUSE_BENCH
+    for (int i = 0; i < n_started; i++) {
+        ESP_LOGI(TAG, "sound start %d ms", started_ms[i]);
+    }
+    if (log_held) {
+        ESP_LOGI(TAG, "sound render %d us (%d frames, %d voices)", held_us, (int)frames, rendering);
+    }
+#endif
     return live;
 }
 

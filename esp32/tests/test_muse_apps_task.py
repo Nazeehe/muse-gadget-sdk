@@ -41,8 +41,8 @@ TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_task_harness.c"
 SOURCES = [HARNESS, TESTS / "muse_apps_fake_esp_timer.c", APPS / "apps_task.c", APPS / "apps_io.c", APPS / "apps_alarm.c",
            APPS / "apps_rt.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c", APPS / "apps_pkg.c",
-           APPS / "apps_suggest.c", APPS / "apps_svc.c", APPS / "apps_vmio.c", APPS / "apps_net.c", APPS / "apps_jpeg.c",
-           APPS / "apps_ask.c",
+           APPS / "apps_suggest.c", APPS / "apps_svc.c", APPS / "apps_sound.c", APPS / "apps_vmio.c", APPS / "apps_net.c",
+           APPS / "apps_jpeg.c", APPS / "apps_ask.c",
            TESTS / "fake_tjpgd.c"]
 CONSOLE_SOURCES = [APPS / "apps_console.c", APPS / "apps_install.c", APPS / "apps_result.c"]
 
@@ -299,6 +299,20 @@ class AppTaskTest(HarnessCase):
 
     def test_a_turn_during_a_new_apps_load_fronts_nothing(self):  # N1
         self.run_case("a_turn_during_a_new_apps_load_fronts_nothing")
+
+    # ---- Games Task 3: app sound ----
+
+    def test_sounds_end_before_the_package_goes(self):  # the clip-lifetime guarantee, at every end of the app
+        self.run_case("sounds_end_before_the_package_goes")
+
+    def test_a_hung_apps_sounds_end_before_its_package_goes(self):  # no stop(), no crash: end_app alone ends them
+        self.run_case("a_hung_apps_sounds_end_before_its_package_goes")
+
+    def test_a_front_launch_plays_from_start(self):  # an app launched in front starts shown; one behind plays nothing
+        self.run_case("a_front_launch_plays_from_start")
+
+    def test_a_front_launch_hidden_before_its_show_is_behind(self):  # its sounds end and hide() runs (N1's shape, in front)
+        self.run_case("a_front_launch_hidden_before_its_show_is_behind")
 
     # ---- Task 13 ----
 

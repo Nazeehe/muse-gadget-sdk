@@ -753,6 +753,70 @@ void apps_port_sound_stop(void) {
     apps_alarm_ring_stop();
 }
 
+/* The mixer, as the port reaches it (apps_port.h's apps_port_sound_*): each call is an event, and the fake keeps each clip it is
+ * given. An end of its owner reads every sample of them (so a package freed before it is an AddressSanitizer report) and forgets them:
+ * what the mixer's apps_mix_stop_owner promises, that no voice of the owner reads a clip once it has returned. */
+static pthread_mutex_t sound_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    uint32_t owner;
+    const int16_t *samples;
+    size_t frames;
+} sound_clips[16];
+static uint32_t sound_ids;
+
+uint32_t apps_port_sound_tone(uint32_t owner, int hz, int to_hz, int ms, int wave, int volume) {
+    event("sound tone %u %d %d %d %d %d", (unsigned)owner, hz, to_hz, ms, wave, volume);
+    pthread_mutex_lock(&sound_mu);
+    uint32_t id = ++sound_ids;
+    pthread_mutex_unlock(&sound_mu);
+    return id;
+}
+
+uint32_t apps_port_sound_clip(uint32_t owner, const int16_t *samples, size_t frames, int volume, bool loop) {
+    event("sound clip %u %zu %d %d", (unsigned)owner, frames, volume, loop);
+    pthread_mutex_lock(&sound_mu);
+    uint32_t id = ++sound_ids;
+    bool kept = false;
+    for (size_t i = 0; i < ARRAY_LEN(sound_clips) && !kept; i++) {
+        if (sound_clips[i].samples == NULL) {
+            sound_clips[i].owner = owner;
+            sound_clips[i].samples = samples;
+            sound_clips[i].frames = frames;
+            kept = true;
+        }
+    }
+    pthread_mutex_unlock(&sound_mu);
+    if (!kept) {
+        error("more than %zu clips play at once", ARRAY_LEN(sound_clips));
+    }
+    return id;
+}
+
+void apps_port_sound_end(uint32_t id) {
+    event("sound end %u", (unsigned)id);
+}
+
+void apps_port_sound_end_owner(uint32_t owner) {
+    long sum = 0;
+    int clips = 0;
+    pthread_mutex_lock(&sound_mu);
+    for (size_t i = 0; i < ARRAY_LEN(sound_clips); i++) {
+        if (sound_clips[i].samples != NULL && sound_clips[i].owner == owner) {
+            for (size_t f = 0; f < sound_clips[i].frames; f++) {
+                sum += sound_clips[i].samples[f];  /* the package's bytes, which must still be there */
+            }
+            sound_clips[i].samples = NULL;
+            clips++;
+        }
+    }
+    pthread_mutex_unlock(&sound_mu);
+    event("sound end_owner %u: %d clips (%ld)", (unsigned)owner, clips, sum);
+}
+
+void apps_port_sound_cut(void) {
+    event("sound cut");
+}
+
 /* Free PSRAM: plenty, for the RAM store's room (the store class); or, once a case sets psram_total, that total less what the apps'
  * heap holds (C1's run admission). */
 static _Atomic size_t psram_total;
@@ -2177,6 +2241,10 @@ typedef struct {
 /* A valid LVGL v9 .bin, RGB565 2x1 (apps_image_check passes it). */
 static const uint8_t IMG_A[] = {0x19, 0x12, 0, 0, 2, 0, 1, 0, 4, 0, 0, 0, 0x11, 0x22, 0x33, 0x44};
 #define IMAGE(path) {(path), IMG_A, sizeof IMG_A}
+/* A valid WAV (apps_wav_check passes it): 16 kHz mono 16-bit PCM, 4 frames of 1, 2, 3 and 4. */
+static const uint8_t WAV_A[] = {'R', 'I', 'F', 'F', 36, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 1, 0,
+                                0x80, 0x3e, 0, 0, 0x00, 0x7d, 0, 0, 2, 0, 16, 0, 'd', 'a', 't', 'a', 8, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0};
+#define SOUND(path) {(path), WAV_A, sizeof WAV_A}
 
 /* A package as apps_task_run takes it: every block from apps_port_realloc. Its images and itself are watched. */
 static apps_pkg_t *make_pkg(const char *id, const char *name, const file_t *files, int n) {
@@ -2198,6 +2266,9 @@ static apps_pkg_t *make_pkg(const char *id, const char *name, const file_t *file
         b->len = files[i].len;
         if (apps_file_kind(b->path) == APPS_FILE_IMAGE) {
             watch(b->data, "image %s/%s", id, b->path);
+        }
+        if (apps_file_kind(b->path) == APPS_FILE_SOUND) {
+            watch(b->data, "sound %s/%s", id, b->path);
         }
     }
     p->count = n;
@@ -3987,6 +4058,170 @@ static void a_turn_during_a_new_apps_load_fronts_nothing(void) {
     ABSENT(from, "front 1");
     ABSENT(from, "print second show");
     CHECK(!apps_lv_front(), "the new app stays behind");
+    free(late.err);
+}
+
+/* ---- Games Task 3: app sound ---- */
+
+/* An app with a looping clip and a tone in start(), a tone in each message (then a crash, an exit or a reply), and every handler
+ * printing. A message that runs past its budget is a crash. */
+static const char APP_SOUNDS[] =
+    "local app = {}\n"
+    "function app.start() print('start') sound.play('beep.wav', {loop = true}) sound.tone{hz = 440, ms = 2000} end\n"
+    "function app.message(event)\n"
+    "  sound.tone{hz = 330, ms = 2000}\n"
+    "  if event == 'boom' then while true do end end\n"  /* killed for its budget: a crash (an error() fails the message alone) */
+    "  if event == 'bye' then sys.exit() end\n"
+    "  return true\n"
+    "end\n"
+    "function app.show() print('show') end\n"
+    "function app.hide() print('hide') end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+static const file_t SOUNDS[] = {LUA("main.lua", APP_SOUNDS), SOUND("beep.wav")};
+
+static apps_pkg_t *sounds_pkg(const char *id) {
+    return with_perms(make_pkg(id, "Sounds", SOUNDS, 2), APPS_PERM_SOUND);
+}
+
+/* The clip-lifetime guarantee's other half (the brief's case): however the app ends (a stop, a crash, sys.exit(), a run that replaces
+ * it), its sounds end before its package's bytes go. The fake reads every sample of a clip at its owner's end, and the log orders that
+ * end before the clip's bytes and the package are freed. */
+static void sounds_end_before_the_package_goes(void) {
+    char err[300];
+    const char *const ends[] = {"stop", "crash", "exit", "replaced"};
+    for (size_t k = 0; k < ARRAY_LEN(ends); k++) {
+        int from = mark();
+        CHECK(apps_task_run(sounds_pkg("sounds"), true, 50, NULL, err, sizeof err), "%s: run: %s", ends[k], err);
+        WAIT(from, "sound clip ");
+        WAIT(from, "sound tone ");
+        int end = mark();
+        if (k == 0) {
+            CHECK(stop_app(err, sizeof err), "stop: %s", err);
+        } else if (k == 1 || k == 2) {
+            char *reply = apps_task_message("sounds", k == 1 ? "boom" : "bye", NULL, false, 5000, err, sizeof err);
+            CHECK((reply == NULL) == (k == 1), "%s: the reply %s, '%s'", ends[k], reply != NULL ? reply : "(null)", err);
+            apps_port_free(reply);
+        } else {
+            CHECK(apps_task_run(make_pkg("hello", "Hello", HELLO, 1), true, 50, NULL, err, sizeof err), "replace: %s", err);
+        }
+        WAIT(end, "free pkg sounds");
+        WAIT(end, "free sound sounds/beep.wav");
+        ORDERED(end, "sound end_owner ", "free sound sounds/beep.wav");
+        ORDERED(end, "sound end_owner ", "free pkg sounds");
+        CHECK(at_from(end, "sound end_owner ") >= 0, "%s: the sounds ended", ends[k]);
+        if (k == 3) {
+            CHECK(stop_app(err, sizeof err), "stop hello: %s", err);
+        }
+    }
+}
+
+/* An app with a looping clip in start() and a button whose tap starts a tone, then gets stuck in its print. */
+static const char APP_SOUND_HANG[] =
+    "local app = {}\n"
+    "function app.start()\n"
+    "  sound.play('beep.wav', {loop = true})\n"
+    "  ui.button{text = 'Hang'}:on('tap', function() sound.tone{hz = 220, ms = 2000} print('hang') end)\n"
+    "end\n"
+    "function app.stop() print('stop') end\n"
+    "return app\n";
+
+/* A hung app runs no stop() and doesn't crash: only the app task's end of it (end_app, END_HUNG, once the stuck call has come back)
+ * ends its sounds, and it does before the package goes. */
+static void a_hung_apps_sounds_end_before_its_package_goes(void) {
+    const file_t files[] = {LUA("main.lua", APP_SOUND_HANG), SOUND("beep.wav")};
+    char err[200];
+    CHECK(apps_task_run(with_perms(make_pkg("hungry", "Hungry", files, 2), APPS_PERM_SOUND), true, 50, NULL, err, sizeof err),
+          "run: %s", err);
+    WAIT(0, "front 1");
+    WAIT(0, "sound clip ");
+    const int64_t t0 = 1000000;
+    clock_stop_at(t0);
+    block_print("hang");
+    int from = mark();
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    WAIT(from, "sound tone ");
+    clock_stop_at(t0 + 3001);
+    WAIT(from, "crash Hungry | (stopped responding)");
+    ABSENT(from, "sound end_owner ");  /* the call hasn't come back: nothing of the app has ended yet */
+    int back = mark();
+    clock_go();
+    release_print();
+    WAIT(back, "free pkg hungry");
+    WAIT(back, "free sound hungry/beep.wav");
+    CHECK(at_from(back, "log I stop hungry: hung, peak ") >= 0, "the stop line");
+    ABSENT(from, "print hungry stop");
+    ORDERED(back, "sound end_owner ", "free sound hungry/beep.wav");
+    ORDERED(back, "sound end_owner ", "free pkg hungry");
+    CHECK(apps_task_run(make_pkg("hello", "Hello", HELLO, 1), true, 50, NULL, err, sizeof err), "a run after it: %s", err);
+}
+
+/* An app launched in front starts shown (the guide's words), so start()'s sounds play; one launched behind gets sounds that are done at
+ * once, and nothing reaches the mixer, until it is brought to the front. */
+static void a_front_launch_plays_from_start(void) {
+    char err[300];
+    int from = mark();
+    CHECK(apps_task_run(sounds_pkg("sounds"), false, 50, NULL, err, sizeof err), "behind: %s", err);
+    WAIT(from, "print sounds start");
+    FIFO_SYNC();
+    ABSENT(from, "sound clip ");
+    ABSENT(from, "sound tone ");
+    char *reply = apps_task_message("sounds", "go", NULL, false, 0, err, sizeof err);
+    CHECK(reply != NULL, "the message: '%s'", err);
+    apps_port_free(reply);
+    ABSENT(from, "sound tone ");
+    int later = mark();
+    launch("sounds", true);
+    WAIT(later, "print sounds show");
+    reply = apps_task_message("sounds", "go", NULL, false, 0, err, sizeof err);
+    CHECK(reply != NULL, "the message in front: '%s'", err);
+    apps_port_free(reply);
+    WAIT(later, "sound tone ");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    from = mark();
+    CHECK(apps_task_run(sounds_pkg("sounds"), true, 50, NULL, err, sizeof err), "in front: %s", err);
+    ORDERED(from, "print sounds start", "sound clip ");
+    WAIT(from, "print sounds show");
+    ORDERED(from, "sound tone ", "print sounds show");
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+}
+
+/* A front launch over a layer still in front from the app it replaced, put behind by a voice turn before its first show(): the turn's
+ * HIDE finds an app that has had no show() but started shown, so its sounds end and hide() runs (as N1's case, with the new app run in
+ * front). The gate holds the app task in start(). */
+static void a_front_launch_hidden_before_its_show_is_behind(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("first", "First", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print first show");
+    int from = mark();
+    gate_arm(MUTEX_RECORD, "muse_apps", from, "print second start");
+    late.pkg = sounds_pkg("second");
+    late.front = true;
+    late.settle_ms = 0;
+    late.err = malloc(200);
+    late.st = NULL;
+    pthread_t caller;
+    CHECK(pthread_create(&caller, NULL, late_caller, NULL) == 0, "no caller thread");
+    WAIT(from, "gate 1");  /* in start(), the runtime shown */
+    WAIT_FRAMES(3);
+    CHECK(apps_lv_front(), "the layer is still in front, from the app that was replaced");
+    TURN(true);
+    CHECK(!apps_lv_front(), "a turn puts the leftover layer behind");
+    gate_open();
+    pthread_join(caller, NULL);
+    CHECK(late.ok, "run: %s", late.err);
+    WAIT(from, "print second hide");
+    int clip = WAIT(from, "sound clip ");  /* start()'s, shown: the first app's own end is before it */
+    ORDERED(clip, "sound end_owner ", "print second hide");
+    ABSENT(from, "print second show");
+    int after = mark();
+    char *reply = apps_task_message("second", "go", NULL, false, 0, err, sizeof err);
+    CHECK(reply != NULL, "the message: '%s'", err);
+    apps_port_free(reply);
+    ABSENT(after, "sound tone ");  /* behind: done at once */
+    TURN(false);
+    WAIT(from, "print second show");
     free(late.err);
 }
 
@@ -7725,6 +7960,10 @@ int main(int argc, char **argv) {
         {"stop_reports_failure", stop_reports_failure},
         {"the_tick_says_when_the_apps_cover", the_tick_says_when_the_apps_cover},
         {"a_turn_during_a_new_apps_load_fronts_nothing", a_turn_during_a_new_apps_load_fronts_nothing},
+        {"sounds_end_before_the_package_goes", sounds_end_before_the_package_goes},
+        {"a_hung_apps_sounds_end_before_its_package_goes", a_hung_apps_sounds_end_before_its_package_goes},
+        {"a_front_launch_plays_from_start", a_front_launch_plays_from_start},
+        {"a_front_launch_hidden_before_its_show_is_behind", a_front_launch_hidden_before_its_show_is_behind},
         {"a_turn_brings_back_the_app_that_was_in_front", a_turn_brings_back_the_app_that_was_in_front},
         {"a_message_gets_its_reply", a_message_gets_its_reply},
         {"run_for_send_is_by_id_behind_and_bounded", run_for_send_is_by_id_behind_and_bounded},

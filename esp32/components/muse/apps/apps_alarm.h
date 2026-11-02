@@ -35,7 +35,9 @@
  *      ends if that leaves nothing to stop it. Nothing of the rest happens. An app that arms an alarm each time it is told one,
  *      or from a timer, can neither keep the screen awake and ringing nor take the gadget over: it gets six, and its stop sticks;
  *   2. the alarm is marked fired and its bit in the pending word set: it keeps its slot until its app has been told;
- *   3. with sound, the ring starts: muse_voice_request_chirp() at once and every APPS_RING_PERIOD_MS, from a periodic esp_timer.
+ *   3. with sound, the apps' own sound stops (apps_port_sound_cut: every voice of the mixer fades out; its lock is held only for
+ *      bounded work, a render of one chunk at the most, and isn't taken when nothing plays), and the ring starts:
+ *      muse_voice_request_chirp() at once and every APPS_RING_PERIOD_MS, from a periodic esp_timer.
  *      A ring that is going goes on and is made a minute longer, and that is all a firing does to it: no chirp is asked for and
  *      none is logged (the ring's own period asks for one every 1.5 s, which keeps a flood of firings to one chirp per period).
  *      muse_voice_request_chirp sets a flag and a bit of an event group and returns, so it is safe here; the voice task plays the

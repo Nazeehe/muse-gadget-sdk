@@ -173,6 +173,31 @@ void apps_port_sound_chirp(void);
 void apps_port_sound_stop(void);
 
 /*
+ * The apps' tones and clips (the `sound` module, apps_sound.h): the device's mixer (apps_mix.h), which the voice task plays. Each call
+ * returns at once, and none waits but for the mixer's lock, held only for bounded work. A voice is named by the id a start returns,
+ * never 0, and belongs to an owner, the runtime's app generation (apps_rt_gen). apphost prints each as an event and keeps the mixer's
+ * voices as an app sees them (apphost_port.c).
+ */
+
+/* A tone (apps_mix_tone: wave is an apps_wave_t; the sound module has checked the rest). Its voice's id. */
+uint32_t apps_port_sound_tone(uint32_t owner, int hz, int to_hz, int ms, int wave, int volume);
+
+/* A clip of samples[0, frames), read in place until apps_port_sound_end_owner(owner) has returned: the package's bytes, which must
+ * outlive it (apps_mix_clip). Its voice's id. */
+uint32_t apps_port_sound_clip(uint32_t owner, const int16_t *samples, size_t frames, int volume, bool loop);
+
+/* Stops id's voice, which fades out (apps_mix_stop). Nothing for a voice that has ended or been replaced. */
+void apps_port_sound_end(uint32_t id);
+
+/* Ends every voice of owner at once: once it returns no voice of owner can render, and its clips' bytes may be freed
+ * (apps_mix_stop_owner). */
+void apps_port_sound_end_owner(uint32_t owner);
+
+/* Stops every voice, whoever's: each fades out (apps_mix_stop_all). Muse takes the speaker: the app went behind or a card covers it
+ * (the LVGL task, apps_lv.c), an alarm rings (the esp_timer task, apps_alarm.c). Any task; with nothing playing it takes no lock. */
+void apps_port_sound_cut(void);
+
+/*
  * The store of an app (the `store` module), which the runtime caches and saves (apps_rt.h): one JSON object an app, of at most 16 KB,
  * written by the runtime and read back by it, whole. The device keeps the objects behind the I/O worker (X11: no flash or NVS from
  * a task with a PSRAM stack, reads included), in apps_values.c (apps_values.h): on a gadget with the apps partition they are in

@@ -64,6 +64,18 @@
  *                                          nothing is left that could stop it (the app that was told the ring was stopped or
  *                                          crashed, and no alarm with sound waits to be told); never if nothing rang
  *   {"event":"chirp"}                      sound.chirp()
+ *   {"event":"tone","id":1,"hz":440,"to_hz":440,"ms":100,"wave":"sine","volume":100}
+ *                                          sound.tone{...} began, with the values as the module rounded and clamped them, and
+ *                                          its voice's id (from 1, one more for each sound that began)
+ *   {"event":"play","id":2,"path":"sfx/a.wav","volume":100,"loop":false}
+ *                                          sound.play(path, {...}) began
+ *   {"event":"sound_stop","id":1}          a sound that still played was stopped: h:stop(), the app's hide (before hide() runs), its
+ *                                          stop (before stop() runs, and after it for what stop() began), restart, install, exit or
+ *                                          crash, and an alarm's ring (Muse wins the speaker). The port keeps the gadget's 4 voices:
+ *                                          a fifth sound replaces the one that began first, and says nothing; a sound that has
+ *                                          ended (its ms, or its clip's length on the fake clock) or was replaced stops nothing.
+ *                                          While the app is hidden or the screen is dark nothing begins: the module's handle is
+ *                                          done at once
  *   {"event":"store_save","bytes":N}       the app's store was saved (apps_port_store_save): the object's bytes, the 16 KB's measure. The
  *                                          device writes it later, on the I/O worker; here it is kept in the process, so a `restart` reads it
  *                                          back. The runtime saves 2 s after the last change, when the app ends (stop, exit, a crash,
@@ -80,7 +92,10 @@
  *   message EVENT [JSON]   message(EVENT, JSON as a value, or nil) -> reply; error (a failed message,
  *                          "the app is not running", the crash record of a crashed app); crash
  *   start                  start() -> started; error (the crash record); crash
- *   stop | show | hide     the handler: nothing is printed, unless it crashes the app
+ *   stop | show | hide     the handler: nothing is printed, unless it crashes the app or ends its sounds (sound_stop). show
+ *                          and hide go through apps_rt_show, as the gadget's app task's do: the runtime is then shown or
+ *                          not (the sound module plays only while it is), and an app is launched shown, as one launched
+ *                          in front is
  *   state                  -> state
  *   log [N]                the last N lines of the app's log ring, oldest first (all of them by default), as
  *                          log events. An empty log, and a log of one empty line, print nothing.
@@ -179,6 +194,7 @@
 #include "apps_pkg.h"
 #include "apps_port.h"
 #include "apps_rt.h"
+#include "apps_sound.h"
 #include "apps_ui.h"
 #include "apps_vmio.h"
 
@@ -288,7 +304,44 @@ static void emit_ring(bool on) {
     end_event();
 }
 
-static const apphost_sound_t SOUND_EVENTS = {.chirp = emit_chirp, .ring = emit_ring};
+/* The package whose bytes an app's clips are read from: the one that runs (run_app, and an install's). */
+static const apps_pkg_t *sound_pkg;
+
+static void emit_tone(uint32_t id, int hz, int to_hz, int ms, int wave, int volume) {
+    begin("tone");
+    printf(",\"id\":%u,\"hz\":%d,\"to_hz\":%d,\"ms\":%d", (unsigned)id, hz, to_hz, ms);
+    const char *name = wave >= 0 && wave < APPS_SOUND_WAVES ? apps_sound_waves[wave] : "?";
+    field("wave", name, strlen(name));
+    printf(",\"volume\":%d", volume);
+    end_event();
+}
+
+/* A clip is named by the package's file its samples are in. */
+static void emit_play(uint32_t id, const int16_t *samples, size_t frames, int volume, bool loop) {
+    (void)frames;
+    const char *path = "?";
+    const uint8_t *at = (const uint8_t *)samples;
+    for (int i = 0; sound_pkg != NULL && i < sound_pkg->count; i++) {
+        const apps_blob_t *file = &sound_pkg->files[i];
+        if (file->data != NULL && at >= file->data && at < file->data + file->len) {
+            path = file->path;
+        }
+    }
+    begin("play");
+    printf(",\"id\":%u", (unsigned)id);
+    field("path", path, strlen(path));
+    printf(",\"volume\":%d,\"loop\":%s", volume, loop ? "true" : "false");
+    end_event();
+}
+
+static void emit_sound_stop(uint32_t id) {
+    begin("sound_stop");
+    printf(",\"id\":%u", (unsigned)id);
+    end_event();
+}
+
+static const apphost_sound_t SOUND_EVENTS = {
+    .chirp = emit_chirp, .ring = emit_ring, .tone = emit_tone, .play = emit_play, .sound_stop = emit_sound_stop};
 
 /* The store's saves and sys.show, which the port tells as they happen (apphost_port.h). */
 static void emit_store_saved(size_t bytes) {
@@ -830,8 +883,9 @@ static void cmd_install(app_t *app, const char *dir) {
     app->rt = NULL;
     app->warned = 0;
     app->alarm_window = false;
-    apps_pkg_t *old = app->owned;  /* the runtime that read from it is gone */
+    apps_pkg_t *old = app->owned;  /* the runtime that read from it is gone, its sounds with it */
     app->pkg = app->owned = pkg;
+    sound_pkg = pkg;
     if (old != NULL) {
         apps_pkg_free(old, NULL);
         free(old);
@@ -1310,6 +1364,7 @@ static void make_and_start(app_t *app) {
     } else {
         emit_warnings(apps_rt_warnings(app->rt));
         app->warned = strlen(apps_rt_warnings(app->rt));
+        apps_rt_show(app->rt, true);  /* launched in front, so shown from start() on, as on the gadget; the runtime runs nothing yet */
         if (!apphost_take_exit()) {  /* main.lua's top level that called sys.exit() never starts the app */
             cmd_start(app);
             end_if_exited(app);
@@ -1327,6 +1382,7 @@ static int run_app(const apps_pkg_t *pkg, FILE *script, const char *script_name,
         return 1;
     }
     app_t app = {.pkg = pkg};
+    sound_pkg = pkg;
     apphost_set_log(emit_log);
     apphost_esp_set_log(emit_esp_log);
     apphost_set_sound(&SOUND_EVENTS);

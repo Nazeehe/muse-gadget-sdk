@@ -234,6 +234,13 @@ void muse_voice_request_chirp(void) {
     event("chirp");
 }
 
+/* The apps' sound cut (apps_port.h; games Task 3): counted, not an event, so that the cases of the ring see the events they always did. */
+static atomic_int sound_cuts;
+
+void apps_port_sound_cut(void) {
+    atomic_fetch_add(&sound_cuts, 1);
+}
+
 void vTaskDelay(const TickType_t ticks) {
     struct timespec ts = {0, (long)ticks * 1000000L};
     nanosleep(&ts, NULL);
@@ -573,6 +580,24 @@ static void the_ring_chirps_until_its_minute_is_over(void) {
     EXPECT_NONE(from);
     CHECK(count_from(0, "chirp") == 40, "%d chirps in all", count_from(0, "chirp"));
     CHECK(fake_esp_timer_next_due_us() == INT64_MAX, "no timer is left running");
+}
+
+/* Muse wins the speaker (games Task 3): each firing with sound cuts the apps' sound, the ring's start and a firing during a ring alike,
+ * while a firing without sound and the ring's own chirps cut nothing. */
+static void a_ring_cuts_app_sound(void) {
+    atomic_store(&sound_cuts, 0);
+    CHECK(arm("aa", "quiet", 500, false, true), "arm quiet");
+    advance(500);
+    CHECK(take_all(true) == 1 && atomic_load(&sound_cuts) == 0, "a firing without sound: %d cuts", atomic_load(&sound_cuts));
+    CHECK(arm("aa", "t", 1000, true, false), "arm t");
+    advance(1000);
+    CHECK(take_all(true) == 1 && atomic_load(&sound_cuts) == 1, "the ring's start: %d cuts", atomic_load(&sound_cuts));
+    advance(3 * APPS_RING_PERIOD_MS);
+    CHECK(atomic_load(&sound_cuts) == 1, "the ring's chirps: %d cuts", atomic_load(&sound_cuts));
+    CHECK(arm("bb", "u", 100, true, false), "arm u");
+    advance(100);
+    CHECK(take_all(true) == 1 && atomic_load(&sound_cuts) == 2, "a firing with sound in the ring: %d cuts", atomic_load(&sound_cuts));
+    apps_alarm_ring_stop();
 }
 
 /* sound.stop ends the ring, and says so once; with nothing ringing it does nothing; another reason reads as given. */
@@ -1612,6 +1637,7 @@ int main(int argc, char **argv) {
         {"sound_and_wake_options", sound_and_wake_options},
         {"the_ring_chirps_until_its_minute_is_over", the_ring_chirps_until_its_minute_is_over},
         {"stopping_the_ring", stopping_the_ring},
+        {"a_ring_cuts_app_sound", a_ring_cuts_app_sound},
         {"a_second_alarm_makes_the_ring_a_minute_longer", a_second_alarm_makes_the_ring_a_minute_longer},
         {"an_alarm_without_sound_leaves_the_ring_alone", an_alarm_without_sound_leaves_the_ring_alone},
         {"firings_in_a_ring_ask_for_no_chirp_of_their_own", firings_in_a_ring_ask_for_no_chirp_of_their_own},

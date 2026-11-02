@@ -36,9 +36,11 @@
  * The system's alarms (apps_alarm.h has the contract). Three kinds of task meet here: the app task (arming, cancelling, asking,
  * taking what has fired, and saying that an app has ended), the esp_timer task (every callback below), and whoever else asks (the
  * console). One mutex guards the table, the ring's state, the budget and the journal, held for copies and calls that don't wait
- * (esp_timer_start_* and _stop, the voice and input requests): never across a log line, which can wait for the console, nor a wait for
- * another task. The esp_timer task takes it with a short try, since it serves every timer of the gadget; a try that fails is made
- * again 10 ms later. The pending word is atomic, so the app task asks whether anything has fired without the lock.
+ * (esp_timer_start_* and _stop, the voice and input requests), and for one bounded wait: a ring's start cuts the apps' sound
+ * (ring_sound_locked), which takes the mixer's lock, a leaf the voice task holds for one render at most (apps_mix.h). Never across a
+ * log line, which can wait for the console, nor any other wait for another task. The esp_timer task takes it with a short try, since it
+ * serves every timer of the gadget; a try that fails is made again 10 ms later. The pending word is atomic, so the app task asks
+ * whether anything has fired without the lock.
  *
  * Where it lives. What a lock, a flag or a counter is made of stays in internal RAM (a flag or a lock in PSRAM would not be atomic on
  * the S3): the mutex's buffer, the pending word, the init state, the fired callback and the journal's counters, all statics here with

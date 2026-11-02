@@ -9922,6 +9922,25 @@ static void drag_on_a_row_scrolls_and_does_not_tap(void) {
     FINISH(&e);
 }
 
+/* A list whose rows all fit in it (3 of 50 px in a box 200 high) has nothing to scroll: LVGL takes a box for a drag only when what is in
+ * it goes past its top or bottom (lv_indev_find_scroll_obj's st > 0 || sb > 0). So the same drag scrolls nothing, and its release taps
+ * the row: the guide's Touches says so (the final review's M3). */
+static void drag_in_a_list_that_fits_taps_the_row(void) {
+    env_t e;
+    list_scene(&e, 3, true);
+    int list = BOX_OBJ(0), row = BOX_OBJ(2);
+    int id = fake_drag(233, 200, 233, 120, 8, 1);
+    CHECK(id == row, "the drag began on %d, not row 2 (%d)", id, row);
+    CHECK(fake_obj(list)->scroll_y == 0 && !fake_scrolling(list), "a list that fits scrolled %d", (int)fake_obj(list)->scroll_y);
+    fake_lift();
+    SETTLE();
+    CHECK(n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE && evs[2].event == APPS_UI_TAP &&
+              evs[2].slot == 2,
+          "press, release, tap on row 2: %d events, the last %d of slot %d", n_evs, n_evs > 0 ? evs[n_evs - 1].event : -1,
+          n_evs > 0 ? evs[n_evs - 1].slot : -1);
+    FINISH(&e);
+}
+
 /* A touch that moves less than LVGL's scroll limit (10 px) taps the row under it, wherever the list is scrolled to. */
 static void still_touch_on_a_row_taps(void) {
     env_t e;
@@ -10538,6 +10557,7 @@ int main(int argc, char **argv) {
         {"items_place_children_across", items_place_children_across},
         {"vertical_drag_scrolls_a_scroll_box", vertical_drag_scrolls_a_scroll_box},
         {"drag_on_a_row_scrolls_and_does_not_tap", drag_on_a_row_scrolls_and_does_not_tap},
+        {"drag_in_a_list_that_fits_taps_the_row", drag_in_a_list_that_fits_taps_the_row},
         {"still_touch_on_a_row_taps", still_touch_on_a_row_taps},
         {"scroll_to_end_after_filling_lands_at_the_end", scroll_to_end_after_filling_lands_at_the_end},
         {"rows_deleted_at_the_end_clamp_the_scroll", rows_deleted_at_the_end_clamp_the_scroll},

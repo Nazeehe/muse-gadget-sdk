@@ -964,7 +964,8 @@ static void sound_files(void) {
     serve_text("main.lua", MAIN);
     serve_text("a.wav", "ID3");
     EXPECT_FAILURE(install("hello", false), APPS_ERR_INVALID_PACKAGE, "a.wav: sound: not a WAV file (no RIFF/WAVE header)");
-    /* A valid one installs (with ffmpeg's LIST chunk), and so does one at exactly 256 KB. */
+    /* A valid one installs (with ffmpeg's LIST chunk). Only the refusals above are at the limits here: a .wav of exactly 256 KB is
+     * accepted by app.py's own check (test_muse_apps_tool.py), and no case installs sounds of exactly 1 MB in all. */
     unserve();
     serve_text("manifest.json", one);
     serve_text("main.lua", MAIN);

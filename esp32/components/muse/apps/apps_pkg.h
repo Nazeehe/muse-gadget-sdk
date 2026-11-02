@@ -117,6 +117,7 @@
 #define APPS_IMAGES_TOTAL_MAX (1536 * 1024)
 #define APPS_SOUND_MAX (256 * 1024)
 #define APPS_SOUNDS_TOTAL_MAX (1024 * 1024)
+#define APPS_SOUND_RATE 16000  /* a .wav's frames a second: the mixer's APPS_MIX_RATE (apps_sound.c checks it) */
 #define APPS_APP_MAX (2 * 1024 * 1024)
 
 /* The launcher's icon (a manifest's "icon"): a square .bin image of at most APPS_ICON_MAX_PX each way. APPS_ICON_MAX_BYTES

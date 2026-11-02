@@ -27,13 +27,15 @@
  * 2. manifest.json is read (at most APPS_MANIFEST_MAX bytes) and parsed for that id (apps_pkg.h: "manifest: ...").
  * 3. Every file the manifest lists, main first: its path is checked again (apps_path_valid) before it is read, then it
  *    is read with its kind's limit and checked, and hashed (apps_port_sha256):
- *      %s is larger than %u KB                          256 KB for .lua, 32 KB for .json, 512 KB for .bin
+ *      %s is larger than %u KB                          256 KB for .lua, 32 KB for .json, 512 KB for .bin, 256 KB for .wav
  *      the app is larger than 2 MB                      manifest.json and the files together
  *      files[%d] %s is a compiled chunk: install Lua source text     a .lua that starts with "\x1bLua" (%d counts
  *                                                       the package's files from 0, main first)
  *      %s: <apps_json_validate's message>               a .json that isn't JSON
  *      %s: image: ...                                   a .bin apps_image_check refuses
  *      images add up to more than 1.5 MB
+ *      sounds add up to more than 1 MB
+ *      %s: sound: ...                                   a .wav apps_wav_check refuses
  *    A source that can't read a file says so itself ("reading %s: %s"), and may give the result's code (read_failed
  *    otherwise). One that ran out of memory (out_of_memory) while the app being installed runs adds "; <id> is running,
  *    and an update needs room for two copies of it: stop it, then install again" (C1: the old copy goes only when the

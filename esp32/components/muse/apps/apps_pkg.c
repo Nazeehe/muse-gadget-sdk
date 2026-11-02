@@ -1035,7 +1035,7 @@ bool apps_wav_check(const uint8_t *data, size_t len, const int16_t **samples, si
     if (fmt == NULL) {
         return failf(err, err_len, "sound: no fmt chunk");
     }
-    if (le16(fmt) != 1 || le16(fmt + 2) != 1 || le32(fmt + 4) != 16000 || le16(fmt + 14) != 16) {
+    if (le16(fmt) != 1 || le16(fmt + 2) != 1 || le32(fmt + 4) != APPS_SOUND_RATE || le16(fmt + 14) != 16) {
         return failf(err, err_len, WAV_FORMAT_MSG);
     }
     if (!have_data) {

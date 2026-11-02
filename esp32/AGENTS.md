@@ -910,7 +910,16 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   Against the same build without the option, the image is 441,064 bytes
   bigger (Lua 101 KB, the JPEG encoder 30 KB, FAT 32 KB, the digit fonts
   27 KB) and an idle gadget has about 552 KB less free PSRAM, most of it that
-  image, since the board runs code and constant data from PSRAM. Internal RAM
+  image, since the board runs code and constant data from PSRAM. App sound and
+  scrolling boxes (a8513e4 to the fix wave of 2026-11-02) made the apps image
+  21,196 bytes bigger, measured with `esp_idf_size --diff` (what `idf.py size`
+  runs) against a8513e4 built with the same configuration: 8,028 bytes of
+  code and 13,168 of constant data (11,004 of it the guide). Their statics take
+  96 bytes more internal RAM (the mixer's lock and flag, and the runtime's
+  generation) and 1,296 more PSRAM (the mixer's voices and the voice task's
+  chunk of app sound). The size check's image, padded to 64 KB, reads
+  0x2b1000 at both ends, with about 13 KB of padding left (the apps+bench
+  image, which grew 24,012 bytes, about 5.5 KB). Internal RAM
   is the tight one: about 2.0 KB less free 25 s after boot (measured, the
   median of 24 boots each). The state only one task touches with plain loads
   and stores is in PSRAM (`EXT_RAM_BSS_ATTR`; atomics and locks stay

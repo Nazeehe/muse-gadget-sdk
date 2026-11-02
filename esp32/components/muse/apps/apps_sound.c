@@ -31,8 +31,8 @@
 /*
  * The `sound` module (apps_sound.h has the contract). Every binding calls apps_vm_check first and runs inside a call of the app, so a
  * handle the app's heap refuses ends the app out of memory, as everywhere else. A start makes its handle first and starts the voice
- * last, which can't fail: a refused allocation leaves nothing playing. Upvalue 1 of the module's functions is the runtime, upvalue 2
- * (tone and play's) the books.
+ * last, which can't fail: a refused allocation leaves nothing playing. Each of the module's four functions has two upvalues: 1 is the
+ * runtime and 2 the books, which only tone and play read.
  *
  * Stack, under app code: a key or a path as a message shows it (68 bytes) is the largest frame.
  */
@@ -41,6 +41,7 @@
 #define SHOWN_KEY_MAX 40
 
 _Static_assert(APPS_SOUND_HZ_MAX <= APPS_MIX_RATE / 2, "the mixer plays every tone the module takes");
+_Static_assert(APPS_SOUND_RATE == APPS_MIX_RATE, "a package's .wav plays at the mixer's rate, frame for frame");
 _Static_assert(APPS_WAVE_SINE == 0 && APPS_WAVE_NOISE == APPS_SOUND_WAVES - 1, "apps_sound_waves names apps_wave_t in order");
 
 const char *const apps_sound_waves[] = {"sine", "square", "triangle", "saw", "noise"};

@@ -630,6 +630,9 @@ class HarnessTest(unittest.TestCase):
     def test_drag_on_a_row_scrolls_and_does_not_tap(self):  # Review Focus 5, finding 4: press, release, no tap
         self.run_case("drag_on_a_row_scrolls_and_does_not_tap")
 
+    def test_a_drag_in_a_list_that_fits_taps_the_row(self):  # the final review's M3: nothing to scroll, so LVGL clicks
+        self.run_case("drag_in_a_list_that_fits_taps_the_row")
+
     def test_still_touch_on_a_row_taps(self):  # under LVGL's scroll limit
         self.run_case("still_touch_on_a_row_taps")
 

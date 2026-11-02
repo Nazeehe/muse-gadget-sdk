@@ -52,8 +52,10 @@ _Static_assert(IMAGES_ALL <= INT16_MAX, "a widget's image is an int16_t");
 #define SCREEN 466
 #define SCREEN_R 233
 #define SCREEN_SAFE 330
+/* Not a bound on every layout: borders and the padding of nested boxes aren't counted. The margin past this covers real content, and
+ * scroll_to("end") asks LVGL for its own end (apps_lv.c's SCROLL_END_Y), whatever the height. */
 _Static_assert(APPS_UI_SCROLL_MAX >= APPS_UI_SLOTS * (SCREEN + APPS_UI_SPACE_MAX) + 2 * APPS_UI_SPACE_MAX,
-               "scroll_to's largest number is past the tallest column: every widget at its tallest, the gaps and the padding");
+               "scroll_to's largest number is past a column of every widget a screen high, with its gaps and one box's padding");
 #define WIDGET_MT "muse.widget"
 /* Text an app supplied, as a message shows it: cut here, on a character boundary, with "..." after the cut. */
 #define SHOWN_MAX 40

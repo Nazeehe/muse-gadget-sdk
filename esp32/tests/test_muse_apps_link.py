@@ -296,12 +296,20 @@ class GuideAndSkill(unittest.TestCase):
                 f"- `h:stop()`: stops the sound h, which fades out over {fade} ms;",
                 "`tostring(h)` is `sound#<n>`, counting the app's sounds from 1.",
                 f"{voices} sounds play at once: a fifth replaces the one that started first",
-                "Sound plays only while the app is in front and the screen is lit",
-                "return a sound that is already done, and nothing plays"):
+                # The final review's M1: main.lua's top level is never shown (apps_rt.h), so its sounds are done at once.
+                "Sound plays only while the app is in front and the screen is lit, and from `start()` on: `main.lua`'s top level "
+                "is silent. Behind, in the dark or at the top level, `sound.tone` and `sound.play` check what they are given and "
+                "return a sound that is already done, and nothing plays.",
+                # M2: a cut loop isn't started again and the app isn't told; only a hide is followed by show().
+                "A loop stopped this way stays stopped, and nothing tells the app: start it again in `show()`, which comes when the "
+                "app is back from a swipe or a voice turn.",
+                "The dark, an alarm's ring and a talk press that starts no voice turn don't put the app behind, so no `show()` "
+                "follows them: keep the screen lit with `sys.keep_awake(true)` (the `keep_awake` permission) while a loop should "
+                "play, and let a tap start it again."):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
         self.assertEqual(voices, 4, "the guide says 'a fifth'")
-        # sound_test's waves are apps_sound.c's, in apps_mix.h's order.
+        # The waves the reference names (above) are apps_sound.c's apps_sound_waves, in apps_mix.h's order.
         waves = c_table(strip_c_comments((APPS / "apps_sound.c").read_text()), "apps_sound_waves")
         self.assertEqual(waves, ["sine", "square", "triangle", "saw", "noise"])
         manifest = " ".join(guide_section(guide, "Files and the manifest").split())
@@ -312,20 +320,23 @@ class GuideAndSkill(unittest.TestCase):
         pkg = (APPS / "apps_pkg.h").read_text()
         sound_kb, sounds_kb = (int(re.search(rf"(?m)^#define {name} \((\d+) \* 1024\)$", pkg).group(1))
                                for name in ("APPS_SOUND_MAX", "APPS_SOUNDS_TOTAL_MAX"))
-        rate = header_number("apps_mix.h", "APPS_MIX_RATE")  # 2 bytes a frame
+        rate = header_number("apps_pkg.h", "APPS_SOUND_RATE")  # 2 bytes a frame
+        self.assertEqual(rate, header_number("apps_mix.h", "APPS_MIX_RATE"), "a .wav plays at the mixer's rate")
         for phrase in (
+                f"Sounds are {rate // 1000} kHz mono 16-bit PCM `.wav` files, made with ffmpeg.",
                 f"A sound is at most {sound_kb} KB, about {round(sound_kb * 1024 / (2 * rate))} s, and an app's sounds "
                 f"{sounds_kb // 1024} MB together, about {round(sounds_kb * 1024 / (2 * rate))} s.",
-                "`ffmpeg -f lavfi -i \"sine=frequency=880:duration=0.12\" -ac 1 -ar 16000 -c:a pcm_s16le sfx/score.wav`",
-                "`ffmpeg -f lavfi -i \"anoisesrc=color=brown:duration=0.25:amplitude=0.4\" -ac 1 -ar 16000 -c:a pcm_s16le "
+                f"`ffmpeg -f lavfi -i \"sine=frequency=880:duration=0.12\" -ac 1 -ar {rate} -c:a pcm_s16le sfx/score.wav`",
+                f"`ffmpeg -f lavfi -i \"anoisesrc=color=brown:duration=0.25:amplitude=0.4\" -ac 1 -ar {rate} -c:a pcm_s16le "
                 "sfx/crash.wav`",
-                "`ffmpeg -i in.mp3 -ac 1 -ar 16000 -c:a pcm_s16le out.wav`",
+                f"`ffmpeg -i in.mp3 -ac 1 -ar {rate} -c:a pcm_s16le out.wav`",
                 "Generate your sounds, or use only sounds licensed for this: never clips taken from the web."):
             with self.subTest(phrase):
                 self.assertIn(phrase, sounds)
         games = " ".join(guide_section(guide, "Games").split())
         self.assertIn("- **Sound.** Tones for flaps and hits (`sound.tone`), a clip for a fanfare (`sound.play`, see Sounds), and "
                       "sound only in front:", games)
+        self.assertIn(f"start one for each event, not each tick: {voices} play at once (the `sound` permission).", games)
         self.assertNotIn("`sound.chirp()` is the one sound there is", guide)
 
     def test_guide_says_what_the_sound_refusals_are(self):
@@ -384,8 +395,11 @@ class GuideAndSkill(unittest.TestCase):
                 '`items` places each of them across the box: `"start"` (the default, at its left), `"center"` (in its middle) or '
                 '`"end"` (at its right).',
                 '- `w:scroll_to(where, animate)` scrolls a box with `scroll = "y"`: where is `"start"`, `"end"` or a number of px',
-                'A drag up or down that begins on a widget in a box with `scroll = "y"` scrolls the box: the widget hears press, then '
-                'release, and no tap.'):
+                # The final review's M3: LVGL 9.5 takes a box for a drag only when it has more to show (lv_indev_find_scroll_obj's
+                # st > 0 || sb > 0); with nothing to scroll the release clicks (drag_in_a_list_that_fits_taps_the_row).
+                'A drag up or down that begins on a widget in a box with `scroll = "y"` scrolls the box when the box holds more than '
+                'it shows: the widget hears press, then release, and no tap.',
+                "When all that is in the box fits in it, nothing scrolls, and the drag is heard as press, release, tap."):
             with self.subTest(sentence):
                 self.assertIn(sentence, reference)
         patterns = " ".join(guide_section(guide, "Patterns").split())
@@ -571,9 +585,10 @@ class GuideAndSkill(unittest.TestCase):
 
         sound_kb, sounds_kb = kb("APPS_SOUND_MAX"), kb("APPS_SOUNDS_TOTAL_MAX")
         self.assertEqual((sound_kb, sounds_kb), (256, 1024))
+        rate = header_number("apps_pkg.h", "APPS_SOUND_RATE")
         section = " ".join(guide_section(GUIDE.read_text(), "Files and the manifest").split())
-        self.assertIn("`.bin` (an LVGL image, see Images) or `.wav` (a 16 kHz mono 16-bit PCM sound: "
-                      "`ffmpeg -i in.mp3 -ac 1 -ar 16000 -c:a pcm_s16le out.wav`); there is no other kind.", section)
+        self.assertIn(f"`.bin` (an LVGL image, see Images) or `.wav` (a {rate // 1000} kHz mono 16-bit PCM sound: "
+                      f"`ffmpeg -i in.mp3 -ac 1 -ar {rate} -c:a pcm_s16le out.wav`); there is no other kind.", section)
         self.assertIn("`.json` data, images and `.wav` sounds.", section)
         self.assertIn(f"{sound_kb} KB for a `.wav` sound and {sounds_kb // 1024} MB for all the sounds;", section)
         control = (APPS / "apps_control.c").read_text()
@@ -798,7 +813,28 @@ class GuideAndSkill(unittest.TestCase):
                        f"The fixture's alarm cut its looping clip at the ring (`sound cut 1 voices ({fade} ms fade)`, 55 ms after the "
                        "ring's chirp, which the voice task writes first), and a talk press stopped the clip cleanly, by ear (the voice "
                        "path's `sound cut` line was not captured); the app was hidden for the turn and shown again after it, silent.",
-                       "`apps_svc.c` (`time`, `os`, `timer`, `alarm`, `store`, `sys`), `apps_sound.c` (`sound`) and `apps_mix.c`"):
+                       "`apps_svc.c` (`time`, `os`, `timer`, `alarm`, `store`, `sys`), `apps_sound.c` (`sound`) and `apps_mix.c`",
+                       # Untrusted input: the .wav the package rules take, at apps_pkg.h's rate.
+                       f"`.wav` a {header_number('apps_pkg.h', 'APPS_SOUND_RATE') // 1000} kHz mono 16-bit PCM sound whose chunks "
+                       "are walked"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, section)
+
+    def test_agents_md_has_the_apps_image_growth(self):
+        # The final review's M5 (spec gate 6): what app sound and scrolling boxes added to the apps image, measured on 2026-11-02 with
+        # esp_idf_size --diff against a8513e4 built with the same sdkconfig. Measurements, pinned as they were written; the parts add up.
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        code, constant, guide, total = 8028, 13168, 11004, 21196
+        self.assertEqual(code + constant, total)
+        self.assertLess(guide, constant)
+        for phrase in ("App sound and scrolling boxes (a8513e4 to the fix wave of 2026-11-02) made the apps image 21,196 bytes bigger, "
+                       "measured with `esp_idf_size --diff` (what `idf.py size` runs) against a8513e4 built with the same configuration: "
+                       "8,028 bytes of code and 13,168 of constant data (11,004 of it the guide).",
+                       "Their statics take 96 bytes more internal RAM (the mixer's lock and flag, and the runtime's generation) and 1,296 "
+                       "more PSRAM (the mixer's voices and the voice task's chunk of app sound).",
+                       "The size check's image, padded to 64 KB, reads 0x2b1000 at both ends, with about 13 KB of padding left (the "
+                       "apps+bench image, which grew 24,012 bytes, about 5.5 KB)."):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
 

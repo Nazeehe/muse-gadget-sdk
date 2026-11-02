@@ -368,4 +368,18 @@ struct cJSON *muse_apps_health(void);
  * none, state its name). */
 void muse_apps_brief(char *resident, size_t cap, const char **state, unsigned *lua_kb);
 
+/*
+ * App sound, for the voice task (muse_voice.c), the speaker's only writer: the apps' mixer (apps/apps_mix.h) as it sees it. Each idle
+ * pass renders one MUSE_AUDIO_CHUNK before its 20 ms read and writes it, so the writes keep in step with the reads; a pass whose
+ * render is false (out zeroed: no voice live) writes nothing. They never wait but for the mixer's lock, held only for bounded work,
+ * and with nothing to play they take no lock at all.
+ *   muse_apps_sound_render  apps_mix_render
+ *   muse_apps_sound_active  apps_mix_active: a sound plays (one fading out too), so the codecs mustn't rest
+ *   muse_apps_sound_cut     apps_mix_stop_all: every voice ends at once, with no fade (Muse wins the speaker). The voice task cuts
+ *                           when the screen is dark and on a talk press it takes, before the recording starts
+ */
+bool muse_apps_sound_render(int16_t *out, size_t frames);
+bool muse_apps_sound_active(void);
+void muse_apps_sound_cut(void);
+
 #endif

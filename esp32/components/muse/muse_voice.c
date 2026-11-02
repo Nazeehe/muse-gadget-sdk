@@ -42,6 +42,10 @@
 #include "muse_voice_call.h"
 #include "muse_voice_call_core.h"
 #endif
+#if CONFIG_MUSE_APPS
+#include "esp_attr.h"
+#include "muse_apps.h"
+#endif
 
 static const char *TAG = "muse_voice";
 
@@ -156,6 +160,13 @@ static muse_adpcm_t s_pre_enc;
 #endif
 static int16_t s_chunk[MUSE_AUDIO_CHUNK];
 static int s_settle;
+
+#if CONFIG_MUSE_APPS
+/* The apps' sound (muse_apps.h), a chunk each idle pass. Plain memory that
+ * only this task touches, so in PSRAM. */
+static EXT_RAM_BSS_ATTR int16_t s_app_sound[MUSE_AUDIO_CHUNK];
+static EXT_RAM_BSS_ATTR bool s_app_sounding;   /* the last pass wrote some */
+#endif
 
 /*
  * The note being recorded (HOLD_NOTES), kept whole in case it can't go now.
@@ -1136,8 +1147,16 @@ static void voice_task(void *arg)
         if (!pending_down) {
             muse_input_event_t ev;
             bool asleep = muse_state_asleep();
+#if CONFIG_MUSE_APPS
+            if (asleep) {
+                muse_apps_sound_cut();   /* dark: app sound ends */
+            }
+#endif
             bool battery = muse_state_on_battery();
             bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback;
+#if CONFIG_MUSE_APPS
+            rest = rest && !muse_apps_sound_active();
+#endif
 #if HOLD_NOTES
             /* A press goes first: send_held() leaves it queued and returns
              * without backing off, so retrying before it's read would spin. */
@@ -1184,6 +1203,22 @@ static void voice_task(void *arg)
                 muse_audio_loopback_test(muse_settings_volume());
                 pre_reset();
             }
+#if CONFIG_MUSE_APPS
+            /* An app's sound: one chunk a pass, so the writes keep in step
+             * with the read below. The mic hears it, so none of it becomes
+             * pre-roll: that starts again on each pass that plays some, and
+             * once more on the first that plays none, while the speaker
+             * still sounds what it queued. A press during a sound gets no
+             * pre-roll. */
+            if (muse_apps_sound_render(s_app_sound, MUSE_AUDIO_CHUNK)) {
+                muse_audio_write(s_app_sound, MUSE_AUDIO_CHUNK);
+                s_app_sounding = true;
+                pre_reset();
+            } else if (s_app_sounding) {
+                s_app_sounding = false;
+                pre_reset();
+            }
+#endif
             /* The 20 ms read paces this loop. */
             idle_capture();
             if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
@@ -1194,6 +1229,9 @@ static void voice_task(void *arg)
                 muse_input_clear_call_pending(ev.mark);
                 continue;
             }
+#if CONFIG_MUSE_APPS
+            muse_apps_sound_cut();   /* Muse wins the speaker, before it records */
+#endif
             s_press_input_epoch = ev.epoch;
             s_press_mark = ev.mark;
             wake = ev.wake;

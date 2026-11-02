@@ -600,6 +600,56 @@ class MuseAppsWiringTest(unittest.TestCase):
             with self.subTest(line.strip()):
                 self.assertIn("if CONFIG_MUSE_APPS", open_conditions(source, index))
 
+    def test_a_build_without_the_apps_has_no_app_sound_in_the_voice_task(self):  # X5
+        # The voice task, the speaker's only writer, plays the apps' mixer: every mention of it sits inside #if CONFIG_MUSE_APPS, so
+        # the plain build has none of it (the PTT harness compiles muse_voice.c with the option off, so nothing else checks this).
+        source = (MUSE / "muse_voice.c").read_text()
+        mentions = [m.start() for m in re.finditer(r"muse_apps|s_app_sound|EXT_RAM_BSS_ATTR|esp_attr\.h", source)]
+        self.assertGreaterEqual(len(mentions), 9)
+        for index in mentions:
+            line = source[source.rindex("\n", 0, index) + 1:source.index("\n", index)]
+            with self.subTest(line.strip()):
+                self.assertIn("if CONFIG_MUSE_APPS", open_conditions(source, index))
+        task = c_function(source, "static void voice_task(void *arg)")
+        # The dark cuts the sound before the loop decides to rest, and a sound that plays keeps it from resting.
+        asleep = task.index("bool asleep = muse_state_asleep();")
+        dark = task.index("if (asleep) {\n                muse_apps_sound_cut();")
+        self.assertLess(asleep, dark)
+        self.assertLess(dark, task.index("set_resting(rest);"))
+        self.assertRegex(task, r"bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback;\n"
+                               r"#if CONFIG_MUSE_APPS\n\s*rest = rest && !muse_apps_sound_active\(\);")
+        # One chunk a pass, rendered into the PSRAM buffer and written before the 20 ms read that paces the loop; the pre-roll starts
+        # again while it plays and on the first pass that plays none.
+        self.assertRegex(source, r"(?m)^static EXT_RAM_BSS_ATTR int16_t s_app_sound\[MUSE_AUDIO_CHUNK\];")
+        render = task.index("if (muse_apps_sound_render(s_app_sound, MUSE_AUDIO_CHUNK)) {")
+        played = task[render:task.index("#endif", render)]
+        self.assertEqual(played.count("muse_audio_write("), 1)
+        self.assertIn("muse_audio_write(s_app_sound, MUSE_AUDIO_CHUNK);", played)
+        self.assertEqual(played.count("pre_reset();"), 2)
+        self.assertIn("} else if (s_app_sounding) {", played)
+        self.assertLess(render, task.index("idle_capture();"))
+        self.assertLess(task.index("if (s_loopback) {"), render)
+        # A talk press the loop accepts cuts it before anything else: the recording (or a call) starts after.
+        accepted = task.index("if (ev.type != MUSE_PTT_DOWN || ev.epoch != muse_input_call_epoch()) {")
+        press = task.index("muse_apps_sound_cut();", accepted)
+        self.assertLess(press, task.index("s_press_input_epoch = ev.epoch;"))
+        self.assertLess(press, task.index("bool ok = record(pending_down, &held, why, sizeof(why));"))
+        self.assertEqual(task.count("muse_apps_sound_cut();"), 2)
+
+    def test_the_mixer_is_built_by_the_option(self):
+        cmake = (MUSE / "CMakeLists.txt").read_text()
+        block = cmake[cmake.index("    if(CONFIG_MUSE_APPS)\n"):]
+        block = block[:block.index("    endif()")]
+        self.assertIn('"apps/apps_mix.c"', block)
+
+    def test_the_mixer_runs_at_the_speakers_rate(self):
+        # The mixer renders the frames the voice task writes with muse_audio_write, at the one rate of the duplex bus.
+        def number(path, name):
+            match = re.search(rf"^#define {name} (\d+)\b", path.read_text(), re.M)
+            self.assertIsNotNone(match, f"no #define {name} in {path.name}")
+            return int(match.group(1))
+        self.assertEqual(number(MUSE / "apps/apps_mix.h", "APPS_MIX_RATE"), number(MUSE / "muse_audio.h", "MUSE_AUDIO_RATE"))
+
     def test_clock_showing_yields_to_apps(self):
         # An app in front or a card (the launcher, a crash card) covers the watch, whatever tile is under it: muse_input's
         # talk button then talks instead of turning to the face (F7). With the option off it is s_on_clock, as before.

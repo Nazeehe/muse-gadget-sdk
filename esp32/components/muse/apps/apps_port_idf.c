@@ -67,6 +67,8 @@ static const char *TAG = "muse_apps";
 static StaticSemaphore_t s_ui_lock_buf;
 static SemaphoreHandle_t s_ui_lock;
 static TaskHandle_t volatile s_ui_holder;  /* written by the holder alone, under the lock */
+static StaticSemaphore_t s_mix_lock_buf;  /* the mixer's (apps_mix.c): a lock, so in internal RAM */
+static SemaphoreHandle_t s_mix_lock;
 
 /* The kinds of breach, each logged once: a harmless first one of one kind can't hide a later one of another. */
 typedef enum { BREACH_RETAKE, BREACH_GIVE, BREACH_HEAP } breach_t;
@@ -89,6 +91,9 @@ static char *s_echo_queue;  /* APPS_ECHO_QUEUE bytes of PSRAM, made once: see th
 void apps_port_init(void) {
     if (s_ui_lock == NULL) {
         s_ui_lock = xSemaphoreCreateMutexStatic(&s_ui_lock_buf);
+    }
+    if (s_mix_lock == NULL) {
+        s_mix_lock = xSemaphoreCreateMutexStatic(&s_mix_lock_buf);
     }
     if (s_echo_queue == NULL) {
         s_echo_queue = heap_caps_malloc(APPS_ECHO_QUEUE, MUSE_BIG_CAPS);  /* none: nothing is echoed, all is counted */
@@ -417,6 +422,16 @@ void apps_port_ui_unlock(void) {
     }
     s_ui_holder = NULL;
     xSemaphoreGive(s_ui_lock);
+}
+
+/* The mixer's lock, made before any app runs and before the voice task starts (muse_app.c starts the apps first); the voice task's
+ * calls take it only once a voice has started anyway (apps_mix.h). */
+void apps_port_mix_lock(void) {
+    xSemaphoreTake(s_mix_lock, portMAX_DELAY);
+}
+
+void apps_port_mix_unlock(void) {
+    xSemaphoreGive(s_mix_lock);
 }
 
 /* The alarms and the sound: apps_alarm.c keeps the first (its table, its timers and its ring), the voice task plays the second. An arming

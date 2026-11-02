@@ -127,6 +127,13 @@ void apps_port_ui_lock(void);
 bool apps_port_ui_trylock(int ms);
 void apps_port_ui_unlock(void);
 
+/* The mixer's lock (apps_mix.c): it keeps the voices steady between the voice task's render and the calls that start and stop
+ * them. Lock takes it, waiting as long as it takes; unlock gives it back. Not recursive. Any task, the voice task's among them;
+ * whoever holds it does only bounded work (apps_mix.h). The device's is a static FreeRTOS mutex that apps_port_init makes, whose
+ * priority inheritance keeps the voice task from waiting long behind a lower task; only what links the mixer has one. */
+void apps_port_mix_lock(void);
+void apps_port_mix_unlock(void);
+
 /* The SHA-256 (FIPS 180-4) of data[0, len) into out. data may be NULL when len is 0. Any task. */
 void apps_port_sha256(const void *data, size_t len, uint8_t out[32]);
 

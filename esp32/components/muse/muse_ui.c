@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -883,6 +884,65 @@ static void on_clock_long_press(lv_event_t *e)
 }
 #endif
 
+#if CONFIG_MUSE_APPS
+/*
+ * Frame mode while the home tileview slides (muse_board_t frame_mode): each step of a slide between the pages redraws the
+ * whole screen, which the panel's scan splits between LVGL's bands, so the board sends those refreshes whole. On from the
+ * tileview's LV_EVENT_SCROLL_BEGIN (a finger's drag and its snap, the talk button's slide to Muse, a jump to a page), off at
+ * the end of the first refresh that finds the tileview at rest: that refresh drew where it stopped, and went whole too. Each
+ * change once, on the LVGL task.
+ */
+static EXT_RAM_BSS_ATTR bool s_slide_framed;
+
+static void slide_begins(lv_event_t *e)
+{
+    if (lv_event_get_target(e) == s_tv && !s_slide_framed) {
+        s_slide_framed = true;
+        muse_board->frame_mode(true);
+    }
+}
+
+static void slide_rests(lv_event_t *e)
+{
+    (void)e;
+    if (s_slide_framed && !lv_obj_is_scrolling(s_tv)) {
+        s_slide_framed = false;
+        muse_board->frame_mode(false);
+    }
+}
+#endif
+
+#if CONFIG_MUSE_BENCH
+/*
+ * The slide's frames, in a bench build: while the home tileview scrolls, each display refresh (LV_EVENT_REFR_READY) logs
+ * "page frame <ms> ms", the time since the refresh before it when that one found it scrolling too, as the apps' launcher and
+ * spin frame lines do: the first refresh of a slide follows a rest of any length. The tileview's LV_EVENT_SCROLL_END ends the
+ * timing, so the refresh after it isn't timed.
+ */
+static EXT_RAM_BSS_ATTR int64_t s_page_last_us;   /* esp_timer_get_time() of the last refresh that found it scrolling; 0: none */
+
+static void page_refresh(lv_event_t *e)
+{
+    (void)e;
+    if (!lv_obj_is_scrolling(s_tv)) {
+        s_page_last_us = 0;
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    if (s_page_last_us != 0) {
+        ESP_LOGI(TAG, "page frame %d ms", (int)((now - s_page_last_us + 500) / 1000));
+    }
+    s_page_last_us = now;
+}
+
+static void page_scroll_end(lv_event_t *e)
+{
+    if (lv_event_get_target(e) == s_tv) {
+        s_page_last_us = 0;
+    }
+}
+#endif
+
 static void build_screen(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -918,6 +978,16 @@ static void build_screen(void)
         s_settings = lv_tileview_add_tile(s_tv, col + 1, 0, LV_DIR_LEFT);
         s_pages = col + 2;
         lv_obj_add_event_cb(s_tv, tile_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+#if CONFIG_MUSE_APPS
+        if (muse_board->frame_mode) {
+            lv_obj_add_event_cb(s_tv, slide_begins, LV_EVENT_SCROLL_BEGIN, NULL);
+            lv_display_add_event_cb(lv_obj_get_display(s_tv), slide_rests, LV_EVENT_REFR_READY, NULL);
+        }
+#endif
+#if CONFIG_MUSE_BENCH
+        lv_obj_add_event_cb(s_tv, page_scroll_end, LV_EVENT_SCROLL_END, NULL);
+        lv_display_add_event_cb(lv_obj_get_display(s_tv), page_refresh, LV_EVENT_REFR_READY, NULL);
+#endif
         face = s_face;
     }
 

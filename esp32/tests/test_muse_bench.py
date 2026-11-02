@@ -833,6 +833,87 @@ int main(int argc, char **argv)
         self.assertEqual((long[0], long[-2], long[-1]), (("P", 0, 0, 0), ("P", 95, 0, 1900), ("R", 100, 0, 2000)))
         self.assertEqual(out["by_touch"][2], "drag_by_touch: P7,9@0 real=1")
 
+    # ---- The clock and Muse's slide: the page frame line ----
+
+    PAGE_HARNESS = r"""
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define EXT_RAM_BSS_ATTR
+#define ESP_LOGI(tag, fmt, ...) printf("I %s: " fmt "\n", tag, ##__VA_ARGS__)
+typedef struct lv_obj { bool scrolling; } lv_obj_t;
+typedef struct { void *target; } lv_event_t;
+static void *lv_event_get_target(lv_event_t *e) { return e->target; }
+static bool lv_obj_is_scrolling(const lv_obj_t *obj) { return obj->scrolling; }
+static int64_t g_now;
+static int64_t esp_timer_get_time(void) { return g_now; }
+static const char *TAG = "muse_ui";
+static lv_obj_t tv, other;
+static lv_obj_t *s_tv = &tv;
+"""
+
+    def run_page_harness(self, steps):
+        """muse_ui.c's page frame block (from its comment to its #endif) played the steps, one a line: "at US" (the clock),
+        "scroll 0|1" (the tileview's lv_obj_is_scrolling), "refresh" (LV_EVENT_REFR_READY), "end tv" or "end other"
+        (LV_EVENT_SCROLL_END on it). Its log lines."""
+        ui = (MUSE / "muse_ui.c").read_text()
+        start = ui.index("/*\n * The slide's frames, in a bench build")
+        block = ui[start:ui.index("\n#endif", start)]
+        program = self.PAGE_HARNESS + block + r"""
+int main(void)
+{
+    char line[64];
+    while (fgets(line, sizeof line, stdin)) {
+        lv_event_t e = { .target = strstr(line, "other") ? (void *)&other : (void *)&tv };
+        if (!strncmp(line, "at ", 3)) g_now = atoll(line + 3);
+        else if (!strncmp(line, "scroll ", 7)) tv.scrolling = line[7] == '1';
+        else if (!strncmp(line, "refresh", 7)) page_refresh(&e);
+        else if (!strncmp(line, "end", 3)) page_scroll_end(&e);
+    }
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = build_bench("bench_page", program, tmp)
+            done = apps_host.run(exe, input="\n".join(steps) + "\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.splitlines()
+
+    def test_the_slide_logs_its_page_frames(self):
+        # While the home tileview scrolls, each display refresh logs "page frame <ms> ms" (the muse_ui tag), the time since the
+        # refresh before to the nearest ms, when that one found it scrolling too, as the apps' launcher and spin frame lines do:
+        # the first refresh of a slide follows a rest of any length. Its LV_EVENT_SCROLL_END ends the timing.
+        out = self.run_page_harness([
+            "at 1000", "refresh",                            # at rest: nothing
+            "scroll 1", "at 5000", "refresh",                # the slide's first refresh: nothing to time it from
+            "at 56000", "refresh", "at 107499", "refresh", "at 158000", "refresh",
+            "end other", "at 209000", "refresh",             # another object's scroll end changes nothing
+            "end tv", "at 260000", "refresh",                # the tileview's: the next refresh isn't timed
+            "at 294000", "refresh",
+            "scroll 0", "at 345000", "refresh",              # at rest: nothing, and the next slide starts afresh
+            "scroll 1", "at 900000", "refresh", "at 951000", "refresh"])
+        self.assertEqual(out, ["I muse_ui: page frame 51 ms", "I muse_ui: page frame 51 ms", "I muse_ui: page frame 51 ms",
+                               "I muse_ui: page frame 51 ms", "I muse_ui: page frame 34 ms", "I muse_ui: page frame 51 ms"])
+        for line in out:
+            self.assertRegex(line, r"^I muse_ui: page frame \d+ ms$")   # the board driver's measurement line, digits only
+
+    def test_the_page_frame_line_is_the_bench_builds_alone(self):
+        # Every part of it (the line, its state, its callbacks and their registration on the tileview and the display) is inside
+        # #if CONFIG_MUSE_BENCH and nothing else, so a build without the bench adds nothing to the display.
+        ui = (MUSE / "muse_ui.c").read_text()
+        self.assertIn('ESP_LOGI(TAG, "page frame %d ms", (int)((now - s_page_last_us + 500) / 1000));', ui)
+        build = c_function(ui, "static void build_screen(void)")
+        self.assertRegex(build, r"#if CONFIG_MUSE_BENCH\n\s*lv_obj_add_event_cb\(s_tv, page_scroll_end, LV_EVENT_SCROLL_END, NULL\);\n"
+                                r"\s*lv_display_add_event_cb\(lv_obj_get_display\(s_tv\), page_refresh, LV_EVENT_REFR_READY, NULL\);\n"
+                                r"#endif")
+        mentions = [m.start() for m in re.finditer(r"page_refresh|page_scroll_end|s_page_last_us|page frame", ui)]
+        self.assertGreaterEqual(len(mentions), 10)
+        for index in mentions:
+            with self.subTest(ui[ui.rindex("\n", 0, index) + 1:ui.index("\n", index)].strip()):
+                self.assertEqual(open_conditions(ui, index), ["if CONFIG_MUSE_BENCH"])
+
     # ---- Task 14: the screenshot stream's CRC ----
 
     def test_snap_crc_matches_zlib(self):

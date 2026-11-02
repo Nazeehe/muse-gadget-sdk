@@ -32,6 +32,7 @@
 #include "muse_mem.h"
 #if CONFIG_MUSE_APPS
 #include <stdio.h>
+#include "esp_attr.h"
 #include "src/display/lv_display_private.h"   /* a refresh's areas and the band being drawn, for the pair (on_render_event) */
 #endif
 
@@ -41,6 +42,7 @@ typedef struct {
 #if CONFIG_MUSE_APPS
     bool last;             /* the refresh's last band (lv_display_flush_is_last) */
     bool pair;             /* the first of a refresh of two: held until LVGL has drawn the second, then sent with it */
+    bool whole;            /* a band of a whole-screen refresh in frame mode: copied into the frame, the last sends it whole */
     uint32_t drawn;        /* s_drawn as LVGL flushed it */
     int32_t render_us;     /* the last band's: LVGL's drawing of the refresh, its waits for the wire left out (bench) */
 #endif
@@ -134,6 +136,30 @@ static int64_t s_gap_us = 300;           /* from a band's end to the next one's 
 static esp_timer_handle_t s_wake_timer;  /* ends a hold to the microsecond (sleep_until) */
 static SemaphoreHandle_t s_wake;
 
+/*
+ * Frame mode (muse_lcd_bands_set_frame_mode), while the home screen's pages slide: each step redraws the whole screen, which
+ * takes about two scans' time on the wire as LVGL's four bands, so the next scan always overtakes it between two of them. In
+ * frame mode such a refresh's bands are copied into one frame as LVGL flushes them, each given back to LVGL at once, and the
+ * last sends the frame as one write through one window (send_frame's framing), held to just after a scan's start: slower than
+ * the scan, the write stays behind the scan that has just started and ahead of the next one, however long LVGL took to draw.
+ * The state is in PSRAM: only the LVGL and send tasks touch it, with plain loads and stores.
+ */
+#define WHOLE_SPREAD 10                  /* a frame's write, as a percentage of the frames' learned time, either way */
+#define WHOLE_RESERVE (1024 * 1024)      /* PSRAM the frame leaves free: the apps' floor (APPS_RAM_RESERVE), for Muse's session and LVGL */
+typedef struct {
+    uint8_t *px;               /* the frame: the screen, s_cols x s_rows at 2 bytes, made the first time frame mode is on, and kept */
+    bool failed;               /* it couldn't be made, and that was logged (once) */
+    int at;                    /* LVGL task: the rows of the refresh in frame mode flushed so far */
+    int staged;                /* send task: the rows copied into px so far */
+    int64_t us;                /* send task: a frame's write, learned from the ones before (0: none timed yet) */
+} whole_t;
+static EXT_RAM_BSS_ATTR whole_t s_whole;
+static EXT_RAM_BSS_ATTR bool s_framing, s_framed;   /* LVGL task: frame mode on (with its frame); the refresh under way in it */
+static EXT_RAM_BSS_ATTR te_stats_t s_te_whole;      /* the frames' writes against the scan ("UI frame") */
+static EXT_RAM_BSS_ATTR int s_cols;                 /* the panel's */
+static void whole_band(const band_t *b);
+static void whole_write(int rows, bool hold);
+
 /* A refresh of LVGL's (its bands, the last one marked) as it went to the panel, for the stats: torn if a scan passed
  * between its writes, so that one refresh of the panel showed some of it and the next the rest (frame_meets). */
 #define FRAME_WRITES_MAX 8
@@ -147,6 +173,8 @@ static struct {
     hold_t hold[FRAME_WRITES_MAX];
     int how, est;              /* the band being sent's */
     bool paired;               /* its first two bands went as a pair */
+    bool framed;               /* it went through frame mode, as one write */
+    int64_t copy_us;           /* its bands' copies into the frame */
 #endif
 } s_frame;
 #if CONFIG_MUSE_BENCH
@@ -155,8 +183,8 @@ static int64_t s_render_t0, s_render_waited, s_wait_t0;
 /* The bench's line every FRAME_BATCH refreshes: each figure's sum and most. */
 #define FRAME_BATCH 30
 static struct {
-    uint32_t n, torn, bands, paired;
-    int64_t render, render_max, held, held_max, wire, wire_max, span, span_max;
+    uint32_t n, torn, bands, paired, framed;
+    int64_t render, render_max, copy, copy_max, held, held_max, wire, wire_max, span, span_max;
 } s_batch;
 #endif
 #endif
@@ -248,6 +276,37 @@ static bool band_pairs(bool pairing, int flushed, int parts, bool last)
 {
     return pairing && flushed == 0 && parts == 2 && !last;   /* two: LVGL draws the second in its other buffer */
 }
+
+/*
+ * Whether LVGL draws the refresh of areas[0..n) (joined[i]: drawn as part of another) as the whole w x h screen: its one area
+ * that isn't joined into another is all of it, which LVGL 9.5.0 draws in bands of every row, full width, top to bottom
+ * (refr_invalid_areas). A slide's step is that: the tileview, the screen, with whatever else changed joined into it.
+ */
+static bool refresh_whole(const lv_area_t *areas, const uint8_t *joined, int n, int w, int h)
+{
+    int whole = 0, other = 0;
+    for (int i = 0; i < n; i++) {
+        if (joined[i]) {
+            continue;
+        }
+        const lv_area_t *a = &areas[i];
+        if (a->x1 <= 0 && a->y1 <= 0 && a->x2 >= w - 1 && a->y2 >= h - 1) {
+            whole++;
+        } else {
+            other++;
+        }
+    }
+    return whole == 1 && other == 0;
+}
+
+/*
+ * Whether the band LVGL flushes, rows [y1, y2) from x1 to x2 (end exclusive), continues a whole w x h screen whose bands so far
+ * ended at row `at`: the full width, from that row, and the screen's bottom if and only if it is the refresh's last.
+ */
+static bool frame_band(int at, int x1, int y1, int x2, int y2, int w, int h, bool last)
+{
+    return x1 == 0 && x2 == w && y1 == at && y2 > y1 && (last ? y2 == h : y2 < h);
+}
 #endif
 
 static esp_err_t queue_band(lv_display_t *disp, esp_lcd_panel_handle_t panel, int x1, int y1, int x2, int y2,
@@ -259,8 +318,16 @@ static esp_err_t queue_band(lv_display_t *disp, esp_lcd_panel_handle_t panel, in
     (void)panel;
     (void)ctx;
 #if CONFIG_MUSE_APPS
-    band_t b = { data, x1, y1, x2, y2, lv_display_flush_is_last(disp), false, s_drawn, 0 };
-    b.pair = band_pairs(s_pairing, s_flushed++, s_parts, b.last);
+    band_t b = { data, x1, y1, x2, y2, lv_display_flush_is_last(disp), false, false, s_drawn, 0 };
+    int flushed = s_flushed++;
+    if (s_framed) {
+        /* A band that doesn't continue the screen (never, as LVGL draws one) ends frame mode for the rest of the refresh: the
+         * send task writes the rows it has first. */
+        b.whole = frame_band(s_whole.at, x1, y1, x2, y2, s_cols, s_rows, b.last);
+        s_framed = b.whole;
+        s_whole.at = y2;
+    }
+    b.pair = !b.whole && band_pairs(s_pairing, flushed, s_parts, b.last);   /* frame mode wins if pairing is on too */
 #if CONFIG_MUSE_BENCH
     if (b.last) {
         b.render_us = (int32_t)(esp_timer_get_time() - s_render_t0 - s_render_waited);
@@ -274,7 +341,8 @@ static esp_err_t queue_band(lv_display_t *disp, esp_lcd_panel_handle_t panel, in
 #if CONFIG_MUSE_APPS
 
 /*
- * On the LVGL task. LV_EVENT_RENDER_START: the refresh's areas are settled, so how many bands it takes. And
+ * On the LVGL task. LV_EVENT_RENDER_START: the refresh's areas are settled, so how many bands it takes, and whether it is
+ * the whole screen and goes through frame mode. And
  * LV_EVENT_FLUSH_WAIT_START: LVGL has drawn a band (disp->refreshed_area) and waits to flush it, for the send task
  * holding the band before. The bench's render time is from LV_EVENT_RENDER_START to the last band's flush, less
  * LVGL's waits for the wire (LV_EVENT_FLUSH_WAIT_START to _FINISH).
@@ -289,6 +357,8 @@ static void on_render_event(lv_event_t *e)
         s_parts = s_pairing ? refresh_parts(s_disp->inv_areas, s_disp->inv_area_joined, (int)s_disp->inv_p,
                                             s_disp->buf_act->data_size)
                             : 0;
+        s_framed = s_framing && refresh_whole(s_disp->inv_areas, s_disp->inv_area_joined, (int)s_disp->inv_p, s_cols, s_rows);
+        s_whole.at = 0;
         s_flushed = 0;
 #if CONFIG_MUSE_BENCH
         s_render_t0 = now;
@@ -704,8 +774,11 @@ static void frame_done(const band_t *b)
         s_batch.torn += torn;
         s_batch.bands += n;
         s_batch.paired += s_frame.paired;
+        s_batch.framed += s_frame.framed;
         s_batch.render += b->render_us;
         s_batch.render_max = b->render_us > s_batch.render_max ? b->render_us : s_batch.render_max;
+        s_batch.copy += s_frame.copy_us;
+        s_batch.copy_max = s_frame.copy_us > s_batch.copy_max ? s_frame.copy_us : s_batch.copy_max;
         s_batch.held += s_frame.held_us;
         s_batch.held_max = s_frame.held_us > s_batch.held_max ? s_frame.held_us : s_batch.held_max;
         s_batch.wire += wire;
@@ -713,10 +786,11 @@ static void frame_done(const band_t *b)
         s_batch.span += span;
         s_batch.span_max = span > s_batch.span_max ? span : s_batch.span_max;
         if (s_batch.n == FRAME_BATCH) {
-            ESP_LOGI(TAG, "tearing effect: %u refreshes, %u torn, %u bands, %u paired; us avg/max: render %d/%d, "
-                     "held %d/%d, wire %d/%d, span %d/%d; gap %d us, send stack %u B free", (unsigned)s_batch.n,
-                     (unsigned)s_batch.torn, (unsigned)s_batch.bands, (unsigned)s_batch.paired,
-                     (int)(s_batch.render / s_batch.n), (int)s_batch.render_max, (int)(s_batch.held / s_batch.n),
+            ESP_LOGI(TAG, "tearing effect: %u refreshes, %u torn, %u bands, %u paired, %u framed; us avg/max: render %d/%d, "
+                     "copy %d/%d, held %d/%d, wire %d/%d, span %d/%d; gap %d us, send stack %u B free", (unsigned)s_batch.n,
+                     (unsigned)s_batch.torn, (unsigned)s_batch.bands, (unsigned)s_batch.paired, (unsigned)s_batch.framed,
+                     (int)(s_batch.render / s_batch.n), (int)s_batch.render_max, (int)(s_batch.copy / s_batch.n),
+                     (int)s_batch.copy_max, (int)(s_batch.held / s_batch.n),
                      (int)s_batch.held_max, (int)(s_batch.wire / s_batch.n), (int)s_batch.wire_max,
                      (int)(s_batch.span / s_batch.n), (int)s_batch.span_max, (int)s_gap_us,
                      (unsigned)uxTaskGetStackHighWaterMark(NULL));
@@ -724,6 +798,8 @@ static void frame_done(const band_t *b)
         }
     }
     s_frame.paired = false;
+    s_frame.framed = false;
+    s_frame.copy_us = 0;
 #endif
     s_frame.n = 0;
     s_frame.p = 0;
@@ -795,6 +871,14 @@ static void send_bands(void *arg)
         }
         size_t row = (size_t)(b.x2 - b.x1) * 2;
 #if CONFIG_MUSE_APPS
+        if (b.whole) {
+            whole_band(&b);
+            continue;
+        }
+        if (s_whole.staged) {
+            whole_write(s_whole.staged, false);   /* a refresh that stopped being whole: the rows copied so far go first */
+            s_whole.staged = 0;
+        }
         lv_area_t next;
         bool pair = b.pair && wait_drawn(&b, &next);
         te_band(b.y1, b.y2, row * (size_t)(b.y2 - b.y1), pair ? &next : NULL);
@@ -878,6 +962,10 @@ lv_display_t *muse_lcd_bands_register(esp_lv_adapter_display_config_t cfg, int l
         return NULL;
     }
     s_rows = cfg.profile.ver_res;
+#if CONFIG_MUSE_APPS
+    s_cols = cfg.profile.hor_res;
+    s_te_whole.what = "UI frame";
+#endif
     lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
     const esp_lv_adapter_draw_bitmap_callbacks_t draw_cbs = { .custom_draw_bitmap = queue_band };
     esp_lv_adapter_set_draw_bitmap_callbacks(s_disp, &draw_cbs, NULL);
@@ -987,6 +1075,107 @@ static void send_frame(void *arg)
         te_done(&s_te_video, j->y1, j->y2, t_start, w, fall, p, scan);
     }
 }
+#if CONFIG_MUSE_APPS
+
+/*
+ * What a frame's write of the whole screen is held as taking (te_hold, at `spread` percent): the frames' learned time `us`, but
+ * never more than the longest write a hold can still keep clear of the scan (frame_clear_in: a start up to TE_JITTER_US late,
+ * the write spread percent and 400 us longer, and a millisecond to spare). A write that long or longer is held to just after a
+ * scan's start, its best moment. Before the first is timed (us 0) it is that longest: any write up to it then stays clear.
+ */
+static int64_t whole_est(int64_t us, int spread, int64_t p, int64_t scan)
+{
+    int64_t most = (p + scan - TE_JITTER_US - 1400) * 100 / (100 + spread);
+    return us > 0 && us < most ? us : most;
+}
+
+/*
+ * On the send task: rows [0, rows) of the frame as one write, the window once and then the pieces as Memory Write and Memory
+ * Write Continue through the two internal buffers (send_frame's framing), recorded as one band of the refresh (s_frame) for
+ * frame_done to judge. With hold, at the first moment it stays clear of every scan (te_hold of whole_est at WHOLE_SPREAD).
+ */
+static void whole_write(int rows, bool hold)
+{
+    wire_idle(0);   /* nothing of LVGL's bands still in flight: on_chunk_sent's count of a band's pieces is theirs alone */
+    band_gone();
+    int64_t t = esp_timer_get_time(), fall = 0, p = 0, scan = 0, est = 0;
+    int how = 0;
+    if (hold && te_now(&fall, &p, &scan)) {
+        est = whole_est(s_whole.us, WHOLE_SPREAD, p, scan);
+        const write_t w = { 0, rows, 0, est };
+        how = te_hold(&s_te_whole, &w, 1, 0, WHOLE_SPREAD);
+    }
+    s_frame.held_us += esp_timer_get_time() - t;
+    bool timed = te_now(&fall, &p, &scan);
+    if (s_frame.n == 0) {
+        s_frame.fall = fall;
+        s_frame.p = timed ? p : 0;
+        s_frame.scan = scan;
+    }
+    size_t row = (size_t)s_cols * 2;
+    int step = (int)(s_chunk_bytes / row) & ~1;
+    int x1 = s_gap_x, x2 = s_cols - 1 + s_gap_x, y1 = s_gap_y, y2 = rows - 1 + s_gap_y;
+    int64_t t0 = esp_timer_get_time();
+    bool ok = esp_lcd_panel_io_tx_param(s_io, QSPI_CMD(0x2A), (uint8_t[]){ x1 >> 8, x1, x2 >> 8, x2 }, 4) == ESP_OK &&
+              esp_lcd_panel_io_tx_param(s_io, QSPI_CMD(0x2B), (uint8_t[]){ y1 >> 8, y1, y2 >> 8, y2 }, 4) == ESP_OK;
+    int k = 0;
+    for (int y = 0; ok && y < rows; y += step) {
+        int h = rows - y < step ? rows - y : step;
+        xSemaphoreTake(s_chunk_free, portMAX_DELAY);
+        memcpy(s_chunk[k], s_whole.px + (size_t)y * row, (size_t)h * row);
+        wire_idle(1);
+        if (esp_lcd_panel_io_tx_color(s_io, QSPI_PIXELS(y == 0 ? 0x2C : 0x3C), s_chunk[k], (size_t)h * row) != ESP_OK) {
+            xSemaphoreGive(s_chunk_free);
+            ok = false;
+        }
+        k ^= 1;
+    }
+    wire_idle(0);   /* both buffers back: the last piece has gone */
+    int64_t w = esp_timer_get_time() - t0;
+    if (rows == s_rows) {
+        s_whole.us = s_whole.us ? (s_whole.us * 7 + (w > s_whole.us ? 2 * w - s_whole.us : w)) / 8 : w;   /* quick to rise */
+    }
+    if (timed) {
+        te_done(&s_te_whole, 0, rows, t0, w, fall, p, scan);
+    }
+    if (s_frame.n < FRAME_WRITES_MAX) {
+        s_frame.w[s_frame.n] = (write_t){ 0, rows, t0, w };
+#if CONFIG_MUSE_BENCH
+        s_frame.hold[s_frame.n] = (hold_t){ how, est };
+#endif
+    }
+    s_frame.n++;
+#if CONFIG_MUSE_BENCH
+    s_frame.framed = true;
+#else
+    (void)how;
+#endif
+}
+
+/*
+ * On the send task, a band of a refresh in frame mode: copied into the frame and given back to LVGL at once, which draws the next
+ * one into its buffer meanwhile; the refresh's last sends the frame whole. This task sends one thing at a time, so the next
+ * refresh's first copy waits for that write.
+ */
+static void whole_band(const band_t *b)
+{
+    size_t row = (size_t)s_cols * 2;   /* the band's: the whole width (frame_band) */
+#if CONFIG_MUSE_BENCH
+    int64_t t = esp_timer_get_time();
+#endif
+    memcpy(s_whole.px + (size_t)b->y1 * row, b->data, (size_t)(b->y2 - b->y1) * row);
+#if CONFIG_MUSE_BENCH
+    s_frame.copy_us += esp_timer_get_time() - t;
+#endif
+    s_whole.staged = b->y2;
+    lv_display_flush_ready(s_disp);
+    if (b->last) {
+        whole_write(s_rows, true);
+        s_whole.staged = 0;
+        frame_done(b);
+    }
+}
+#endif
 
 static void IRAM_ATTR on_te(void *arg)
 {
@@ -1030,6 +1219,25 @@ void muse_lcd_bands_set_te(int gpio)
 void muse_lcd_bands_set_pairing(bool on)
 {
     s_pairing = on;
+}
+
+void muse_lcd_bands_set_frame_mode(bool on)
+{
+    size_t bytes = (size_t)s_cols * (size_t)s_rows * 2;
+    if (on && !s_whole.px && bytes) {
+        /* From PSRAM alone, and only while it leaves the rest of the gadget its reserve; kept once made. */
+        if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >= bytes + WHOLE_RESERVE) {
+            s_whole.px = heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+        if (s_whole.px) {
+            ESP_LOGI(TAG, "tearing effect: frame mode's frame, %u B of PSRAM", (unsigned)bytes);
+        } else if (!s_whole.failed) {
+            s_whole.failed = true;
+            ESP_LOGW(TAG, "tearing effect: no frame for frame mode (%u B of PSRAM, %u B kept free): each band goes on its own",
+                     (unsigned)bytes, (unsigned)WHOLE_RESERVE);
+        }
+    }
+    s_framing = on && s_whole.px;
 }
 #endif
 

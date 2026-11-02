@@ -95,6 +95,24 @@ void muse_lcd_bands_set_te(int gpio);
  * (muse_board_t frame_pairing).
  */
 void muse_lcd_bands_set_pairing(bool on);
+
+/*
+ * Frame mode: whether a refresh of the whole screen goes to the panel as
+ * one write, off until turned on. On, the bands of such a refresh (all of
+ * them full width, from the top row to the bottom one) are copied into one
+ * frame of the screen as LVGL flushes them, each given back to LVGL at
+ * once, and the last sends the frame through one window, held to just
+ * after a scan's start (muse_lcd_bands_set_te), where a write slower than
+ * the scan stays clear of it: no scan shows one band's new picture over
+ * another's old one, however long LVGL takes to draw. Any other refresh
+ * goes as it does off, and frame mode wins over pairing for a whole screen.
+ * The frame is 2 bytes a pixel of PSRAM (434,312 bytes on the 1.75C), made
+ * the first time this is turned on and kept; if it can't be made (or would
+ * leave less than 1 MB of PSRAM free) it says so once and frame mode stays
+ * off, to be tried again at the next turn on. On the LVGL task; the home
+ * screen turns it on while its pages slide (muse_board_t frame_mode).
+ */
+void muse_lcd_bands_set_frame_mode(bool on);
 #endif
 
 /*

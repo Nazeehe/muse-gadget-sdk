@@ -134,6 +134,13 @@ typedef struct {
      * the board sends each band on its own. Only with the apps.
      */
     void (*frame_pairing)(bool on);
+    /*
+     * Whether a refresh of the whole screen goes to the panel as one write,
+     * clear of its scan (muse_lcd_bands_set_frame_mode). The home screen
+     * turns it on while its pages slide, on the LVGL task. NULL: the board
+     * sends each band on its own. Only with the apps.
+     */
+    void (*frame_mode)(bool on);
 #endif
 
     /* Codec handles for one duplex, 2-slot I2S bus, not yet opened. */

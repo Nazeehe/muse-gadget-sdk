@@ -278,6 +278,7 @@ static const muse_board_t s_board = {
     .draw_frame = muse_lcd_bands_frame,
 #if CONFIG_MUSE_APPS
     .frame_pairing = muse_lcd_bands_set_pairing,   /* measured here only (connected apps Task 7) */
+    .frame_mode = muse_lcd_bands_set_frame_mode,   /* the clock and Muse's slide, measured here only */
 #endif
     .audio_init = audio_init,
     .mic_slot = -1,

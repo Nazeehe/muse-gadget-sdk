@@ -1011,10 +1011,49 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   `boards/muse_lcd_bands.c` (the hold that times each band clear of the
   panel's scan to the microsecond, the pairing of a refresh's two bands, the
   torn-refresh counts and the bench's `tearing effect:` lines) are built only
-  with `CONFIG_MUSE_APPS`, and so is `muse_board_t`'s `.frame_pairing`, which
-  only the 1.75C sets. A build without the apps sends exactly as before the
+  with `CONFIG_MUSE_APPS`, and so are the slide's frame mode (below) and
+  `muse_board_t`'s `.frame_pairing` and `.frame_mode`, which only the 1.75C
+  sets. A build without the apps sends exactly as before the
   connected apps (7e59ee0): `tests/test_lcd_tearing_effect.py` checks that
   its `muse_lcd_bands.c` is that commit's, byte for byte.
+- **The clock and Muse's slide (frame mode).** Each step of a slide between
+  the home pages (a finger's drag and its snap, the talk button's slide from
+  the pocket watch to Muse, a jump to a page) redraws the whole screen,
+  LVGL's 4 bands of 118 rows, and one band at a time that takes about two of
+  the panel's scans on the wire, so a scan split nearly every step. From the
+  tileview's `LV_EVENT_SCROLL_BEGIN` to the end of the first refresh that
+  finds it at rest (`muse_ui.c`), the 1.75C's `.frame_mode`
+  (`muse_lcd_bands_set_frame_mode`) sends such a refresh whole: each band is
+  copied into one frame of the screen and given back to LVGL at once, and the
+  last sends the frame as one write through one window (video's framing),
+  held to just after a scan's start, where a write slower than the scan stays
+  clear of it (`te_hold` of the frames' learned write at `WHOLE_SPREAD`, 10%,
+  and never more than the longest write a hold can keep clear). Only a
+  refresh of the whole screen goes that way, and it does even if the apps'
+  pairing is on. The frame is 434,312 bytes of PSRAM, made at the first slide
+  if 1 MB of PSRAM stays free after it (`WHOLE_RESERVE`, the apps' floor) and
+  kept; without it every refresh takes the band path, and the bands log
+  `tearing effect: no frame for frame mode` once. A bench build logs
+  `page frame <ms> ms` (the `muse_ui` tag) at each display refresh while the
+  tileview scrolls: the time since the refresh before, when that one found it
+  scrolling too, unless its scroll ended in between. The bands' batch line
+  then counts the refreshes `framed` and their `copy` into the frame.
+  Measured on the 1.75C on 2026-11-02 (apps+bench build, 20 `>swipe left`
+  from the clock and 20 `>swipe right` back, and 4 `>drag` from the clock at
+  150 and 600 ms): none of the 527 refreshes in frame mode was torn, and no
+  torn refresh came during a slide (the 57 torn were the Muse face's small
+  ones at rest), where the band path, in the same loop on the firmware
+  before, tore 562 whole-screen refreshes, 11 on each swipe left and 12 on
+  each swipe right. 395 page frames had a median of 68 ms and a 95th
+  percentile of 75 ms (the longest 84): the slide is no quicker than the band
+  path's, about 64 ms between its torn refreshes, and misses the 60 ms the
+  design asked for. A refresh in frame mode spent 14.5 ms copying its bands,
+  7.2 ms held for the scan and 26.4 ms on the wire, and LVGL's drawing of it,
+  with those copies and the frame before's write taking the same core,
+  54 ms. `>mem`'s internal and DMA free didn't move; PSRAM fell by 434,292
+  bytes at the first slide, the frame less 20, and stayed there. The send
+  task's unused stack fell to 596 bytes, and the LVGL task's from 3,868 to
+  2,956.
 - **Test** with `tests/test_muse_apps_*.py` (the VM and the sandbox, JSON,
   packages, widgets and the apply step, the services, the runtime and its duty
   cycle, the app task, the store, the install, the console and `app.py`, the

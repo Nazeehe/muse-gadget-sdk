@@ -15,10 +15,12 @@
 """Compile muse_lcd_bands.c's tearing-effect timing on the host and check it against the CO5300's measured scan (16.8 to
 17.0 ms refresh, 0.6 ms blanking, 466 rows): te_meets (one band against the scan), frame_meets (a refresh's bands
 against it: torn if a scan reads some of its rows before their write and some after), frame_clear_in (when a refresh's
-bands, sent back to back, stay clear of every scan) and refresh_parts (how many bands LVGL draws a refresh in).
+bands, sent back to back, stay clear of every scan) and refresh_parts (how many bands LVGL draws a refresh in); and the
+clock and Muse's slide's frame mode (FrameModeTest, FrameModeSwitchTest): a whole-screen refresh copied into one frame and
+sent as one write, held to just after a scan's start.
 
-Those are connected apps Task 7's, built only with the apps (CONFIG_MUSE_APPS): a build without them sends as 7e59ee0 did
-(PlainBuildTest)."""
+Those are connected apps Task 7's and the slide's, built only with the apps (CONFIG_MUSE_APPS): a build without them sends as
+7e59ee0 did (PlainBuildTest)."""
 import hashlib
 import math
 from pathlib import Path
@@ -96,6 +98,10 @@ def typedef(source, name):
 #   pace n (bytes us)*n bytes: the samples learned (pace_learn, on one pace_t kept from query to query), then pace_est
 #   pacenew: a new pace_t
 #   pairs pairing flushed parts last: band_pairs
+# and, built with frame mode's functions (WHOLE, WholeHarness):
+#   whole w h n (x1 y1 x2 y2 joined)*n: refresh_whole
+#   fband at x1 y1 x2 y2 w h last: frame_band
+#   west us spread p scan: whole_est
 HARNESS = r'''
 #include <stdbool.h>
 #include <stddef.h>
@@ -163,6 +169,27 @@ int main(void)
                 joined[i] = (uint8_t)j;
             }
             printf("%%d\n", refresh_parts(areas, joined, n, (uint32_t)buf));
+#if WHOLE
+        } else if (strcmp(cmd, "whole") == 0) {
+            long long w, h;
+            int n;
+            scanf("%%lld %%lld %%d", &w, &h, &n);
+            lv_area_t areas[8];
+            uint8_t joined[8];
+            for (int i = 0; i < n; i++) {
+                long long x1, y1, x2, y2, j;
+                scanf("%%lld %%lld %%lld %%lld %%lld", &x1, &y1, &x2, &y2, &j);
+                areas[i] = (lv_area_t){ (int32_t)x1, (int32_t)y1, (int32_t)x2, (int32_t)y2 };
+                joined[i] = (uint8_t)j;
+            }
+            printf("%%d\n", refresh_whole(areas, joined, n, (int)w, (int)h));
+        } else if (strcmp(cmd, "fband") == 0) {
+            for (int i = 0; i < 8; i++) scanf("%%lld", &a[i]);
+            printf("%%d\n", frame_band((int)a[0], (int)a[1], (int)a[2], (int)a[3], (int)a[4], (int)a[5], (int)a[6], a[7] != 0));
+        } else if (strcmp(cmd, "west") == 0) {
+            for (int i = 0; i < 4; i++) scanf("%%lld", &a[i]);
+            printf("%%lld\n", (long long)whole_est(a[0], (int)a[1], a[2], a[3]));
+#endif
         }
     }
     return 0;
@@ -177,24 +204,41 @@ SPREAD, JITTER = 50, 1000     # what the send task asks of frame_clear_in for LV
 
 class Harness:
     exe = None
+    whole = False   # frame mode's functions too (WholeHarness)
 
     @classmethod
     def build(cls, tmp):
         source = variant(SOURCE.read_text(), apps=True)
         parts = [typedef(source, "write_t"), typedef(source, "pace_t"), re.search(r"^#define PACE_VAR_MIN .*$", source, re.M).group(0)]
-        parts += [function(source, name) for name in
-                  ("te_meets", "floor_div", "frame_meets", "frame_clear_in", "refresh_parts", "pace_learn", "pace_est",
-                   "band_pairs")]
-        src = Path(tmp) / "te.c"
+        names = ["te_meets", "floor_div", "frame_meets", "frame_clear_in", "refresh_parts", "pace_learn", "pace_est", "band_pairs"]
+        if cls.whole:
+            parts += [re.search(rf"^#define {macro} .*$", source, re.M).group(0) for macro in ("TE_JITTER_US", "WHOLE_SPREAD")]
+            names += ["refresh_whole", "frame_band", "whole_est"]
+        parts += [function(source, name) for name in names]
+        name = "te_whole" if cls.whole else "te"
+        src = Path(tmp) / f"{name}.c"
         src.write_text(HARNESS % "\n".join(parts))
-        cls.exe = Path(tmp) / "te"
-        subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", "-o", str(cls.exe), str(src)], check=True)
+        cls.exe = Path(tmp) / name
+        subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", f"-DWHOLE={int(cls.whole)}", "-o", str(cls.exe), str(src)],
+                       check=True)
 
     @classmethod
     def ask(cls, queries):
         out = subprocess.run([str(cls.exe)], input="\n".join(queries) + "\n", check=True, capture_output=True,
                              text=True).stdout
         return [int(v) for v in out.split()]
+
+
+class WholeHarness(Harness):
+    """The harness with frame mode's functions (refresh_whole, frame_band, whole_est) as well, in an executable of its own."""
+    exe = None
+    whole = True
+
+
+def source_number(name):
+    """A #define of muse_lcd_bands.c's apps build, as an int: a number, or the product of two in brackets."""
+    text = re.search(rf"^#define {name} (\d+|\(\d+ \* \d+\))(?:\s|$)", variant(SOURCE.read_text(), apps=True), re.M).group(1)
+    return math.prod(int(v) for v in re.findall(r"\d+", text))
 
 
 def frame_query(writes, fall, p, scan):
@@ -457,6 +501,350 @@ class PairingTest(unittest.TestCase):
         self.assertEqual(on_torn, 0, "on: none is")
 
 
+class FrameModeTest(unittest.TestCase):
+    """Frame mode (muse_lcd_bands_set_frame_mode), on while the home screen's pages slide: a refresh of the whole screen, LVGL's
+    four 118-row bands of it, is copied into one frame and sent as one write, held to just after a scan's start, where a write
+    slower than the scan stays behind the scan that just started and ahead of the next one. Any other refresh takes the band
+    path, and so does every refresh while there is no frame."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        WholeHarness.build(cls.tmp.name)
+        cls.spread = source_number("WHOLE_SPREAD")
+
+    @staticmethod
+    def whole_query(areas, w=466, h=466):
+        return f"whole {w} {h} {len(areas)} " + " ".join(" ".join(str(v) for v in a) for a in areas)
+
+    def west(self, us, p=P2, scan=SCAN2):
+        return WholeHarness.ask([f"west {us} {self.spread} {p} {scan}"])[0]
+
+    def test_only_one_area_of_the_whole_screen_is_a_whole_refresh(self):
+        cases = [
+            ([(0, 0, 465, 465, 0)], 1),                         # a step of the slide: the tileview, all of the screen
+            ([(0, 0, 465, 465, 0), (20, 20, 99, 59, 1)], 1),    # a label's change joined into it (the clock's hand)
+            ([(20, 20, 99, 59, 1), (0, 0, 465, 465, 0)], 1),
+            ([(0, 0, 465, 235, 0)], 0),                         # the top half: full-width bands, but not the screen
+            ([(0, 118, 465, 465, 0)], 0),
+            ([(0, 0, 463, 465, 0)], 0),                         # not the whole width
+            ([(2, 0, 465, 465, 0)], 0),
+            ([(0, 0, 465, 465, 0), (20, 20, 99, 59, 0)], 0),    # and an area drawn after it
+            ([(132, 132, 333, 333, 0)], 0),                     # a spinning record
+            # The screen in two areas. LVGL joins two such areas before it draws (lv_refr_join_area: their union is no bigger),
+            # so a slide's step is one; frame mode takes only that.
+            ([(0, 0, 465, 233, 0), (0, 234, 465, 465, 0)], 0),
+            ([], 0),
+        ]
+        answers = WholeHarness.ask([self.whole_query(areas) for areas, _ in cases])
+        for (areas, whole), answer in zip(cases, answers):
+            with self.subTest(areas=areas):
+                self.assertEqual(answer, whole)
+
+    def test_only_full_width_bands_from_row_0_to_465_in_order_go_into_the_frame(self):
+        # LVGL's bands of the whole screen, as refresh_parts' rule cuts it (118 rows of a draw buffer each), top to bottom: each
+        # continues the screen from where the one before ended, and the last ends at its bottom.
+        rows = BUF // (466 * 2) & ~1
+        bands = [(y, min(y + rows, 466)) for y in range(0, 466, rows)]
+        self.assertEqual(bands, [(0, 118), (118, 236), (236, 354), (354, 466)])
+        good = [f"fband {y1} 0 {y1} 466 {y2} 466 466 {int(y2 == 466)}" for y1, y2 in bands]
+        self.assertEqual(WholeHarness.ask(good), [1, 1, 1, 1])
+        # Anything else doesn't: not the whole width, not from where the band before ended (a band again, a band skipped), a last
+        # band that doesn't reach the bottom, a band at the bottom that isn't LVGL's last, no rows.
+        bad = [(0, 0, 0, 464, 118, 0), (0, 2, 0, 466, 118, 0), (118, 0, 0, 466, 118, 0), (118, 0, 236, 466, 354, 0),
+               (354, 0, 354, 466, 464, 1), (354, 0, 354, 466, 466, 0), (0, 0, 0, 466, 118, 1), (0, 0, 0, 466, 0, 0)]
+        answers = WholeHarness.ask([f"fband {at} {x1} {y1} {x2} {y2} 466 466 {last}" for at, x1, y1, x2, y2, last in bad])
+        for case, answer in zip(bad, answers):
+            with self.subTest(case=case):
+                self.assertEqual(answer, 0)
+
+    def test_the_hold_is_for_the_frames_learned_write_but_never_more_than_a_hold_can_keep_clear(self):
+        # The longest write frame_clear_in can still find a moment for (at WHOLE_SPREAD, starting up to TE_JITTER_US late, with
+        # 400 us more and a millisecond to spare): a write as long or longer is held to a scan's start, its best moment. Before
+        # the first is timed (0) the estimate is that longest.
+        most = (P2 + SCAN2 - JITTER - 1400) * 100 // (100 + self.spread)
+        self.assertEqual(self.west(0), most)
+        for learned in (15000, 24000, 26000, most - 1):
+            self.assertEqual(self.west(learned), learned)
+        for learned in (most, most + 1, 40000):
+            self.assertEqual(self.west(learned), most)
+        self.assertEqual(self.west(0, PERIOD, SCAN), (PERIOD + SCAN - JITTER - 1400) * 100 // (100 + self.spread))
+
+    def test_the_frame_is_held_to_just_after_a_scan_start_and_clear_of_the_next(self):
+        # From every moment of a refresh: the frame's one write (rows 0-466) is held to a moment within a few ms of a scan's start,
+        # where every timing the hold allows for (a start up to TE_JITTER_US late, a write of WHOLE_SPREAD either way and 400 us
+        # more) stays behind that scan and ahead of the next one. Untimed, or as long as a hold can take, it goes within a
+        # millisecond of the start.
+        most = self.west(0)
+        for learned in (0, 20000, 24000, 26000, 28000, most + 5000):
+            est = self.west(learned)
+            lo, hi = est * (100 - self.spread) // 100, est * (100 + self.spread) // 100 + 400
+            nows = list(range(0, P2, 250))
+            delays = WholeHarness.ask([clear_query([(0, 466, est)], now, 0, 0, P2, SCAN2, spread=self.spread) for now in nows])
+            checks = []
+            for now, d in zip(nows, delays):
+                with self.subTest(learned=learned, now=now, d=d):
+                    self.assertGreaterEqual(d, 0, "always held to a moment, never sent at once for want of one")
+                    phase = (now + d) % P2
+                    # After a scan's start (phase 0: that scan is ahead of it), and so soon after that the next scan doesn't
+                    # catch it however long it takes; as long as a hold can take, within a millisecond of the start.
+                    self.assertLess(phase + JITTER + hi, P2 + SCAN2, "ahead of the next scan")
+                    if est == most:
+                        self.assertLessEqual(phase, 1000, "just after a scan's start")
+                    checks += [frame_query([(0, 466, now + d + late, w)], 0, P2, SCAN2) for late in (0, JITTER)
+                               for w in (lo, est, hi)]
+            self.assertEqual(sum(WholeHarness.ask(checks)), 0, f"a timing the hold allows for is torn (learned {learned})")
+
+    def test_the_first_frame_held_untimed_is_clear_for_any_write_up_to_its_estimate(self):
+        # The first frame mode's write has no time learned: held as the longest a hold can keep clear, it starts within a
+        # millisecond of a scan's start, and a real write of 20 ms to that long, from any moment, stays clear.
+        most = self.west(0)
+        nows = list(range(0, P2, 500))
+        delays = WholeHarness.ask([clear_query([(0, 466, most)], now, 0, 0, P2, SCAN2, spread=self.spread) for now in nows])
+        writes = [frame_query([(0, 466, now + d + late, w)], 0, P2, SCAN2) for now, d in zip(nows, delays)
+                  for late in (0, 200, JITTER) for w in range(20000, most + 1, 1000)]
+        self.assertEqual(sum(WholeHarness.ask(writes)), 0)
+
+    def test_the_slides_whole_screen_tears_as_bands_and_not_as_one_write(self):
+        # A step of the slide on the board (the user's capture, 2026-11-01): LVGL's four bands of the whole screen, 8.2 ms each on
+        # the band path. No moment keeps them clear sent back to back (FrameTest.test_a_refresh_that_cant_be_kept_clear), and the
+        # band path held each on its own: the third went behind the next scan and the refresh split at row 236 (the map's line,
+        # "0-118 +186 8410 h1, 118-236 +8779 8341 h0, 236-354 +8726 8056 h1", the third a refresh later). In frame mode the same
+        # rows are one write of the frame, 26 ms through one window (video's whole screen on the 1.75C), held by the same
+        # frame_clear_in: clear from every moment the refresh can be ready at.
+        bands = [(0, 118, 8200), (118, 236, 8200), (236, 354, 8200), (354, 466, 7800)]
+        self.assertEqual(WholeHarness.ask([clear_query(bands, now, 300, 0, P2, SCAN2) for now in (0, 4000, 8000, 12000)]),
+                         [-1, -1, -1, -1])
+        split = [(0, 118, 186, 8410), (118, 236, 186 + 8410 + 183, 8341), (236, 354, P2 + 8726, 8056)]
+        self.assertEqual(WholeHarness.ask([frame_query(split, 0, P2, SCAN2)]), [1])
+        nows = list(range(0, P2, 250))
+        delays = WholeHarness.ask([clear_query([(0, 466, 26000)], now, 0, 0, P2, SCAN2, spread=self.spread) for now in nows])
+        self.assertTrue(all(d >= 0 for d in delays))
+        self.assertEqual(sum(WholeHarness.ask([frame_query([(0, 466, now + d, 26000)], 0, P2, SCAN2)
+                                               for now, d in zip(nows, delays)])), 0)
+
+    def test_the_refresh_is_chosen_at_its_start_and_frame_mode_wins_over_pairing(self):
+        # LV_EVENT_RENDER_START decides, from LVGL's areas, whether the refresh goes through frame mode: only with frame mode on
+        # (which it is only with a frame: FrameModeSwitchTest) and only for a whole screen. Each band LVGL then flushes goes into
+        # the frame only while every one so far continued the screen; a band that doesn't ends frame mode for the rest of the
+        # refresh. A band in the frame is never a pair's first: frame mode wins if the apps' pairing is on too.
+        source = strip_c(variant(SOURCE.read_text(), apps=True))
+        render = function(source, "on_render_event")
+        self.assertRegex(render, r"(?s)case LV_EVENT_RENDER_START:.*?s_framed = s_framing && refresh_whole\(s_disp->inv_areas, "
+                                 r"s_disp->inv_area_joined, \(int\)s_disp->inv_p, s_cols, s_rows\);", )
+        queue = function(source, "queue_band")
+        self.assertRegex(queue, r"if \(s_framed\) \{\s*b\.whole = frame_band\(s_whole\.at, x1, y1, x2, y2, s_cols, s_rows, b\.last\);"
+                                r"\s*s_framed = b\.whole;\s*s_whole\.at = y2;\s*\}")
+        self.assertIn("b.pair = !b.whole && band_pairs(s_pairing, flushed, s_parts, b.last);", queue)
+        # The send task copies such a band into the frame, gives it back to LVGL at once, and at the refresh's last sends the frame
+        # whole; one task sends everything, so the next refresh's first copy comes after that write. A refresh that stopped being
+        # whole has the rows copied so far written first.
+        send = function(source, "send_bands")
+        self.assertRegex(send, r"if \(b\.whole\) \{\s*whole_band\(&b\);\s*continue;\s*\}\s*if \(s_whole\.staged\) \{\s*"
+                               r"whole_write\(s_whole\.staged, false\);\s*s_whole\.staged = 0;\s*\}")
+        band = function(source, "whole_band")
+        copy = band.index("memcpy(s_whole.px + (size_t)b->y1 * row, b->data, (size_t)(b->y2 - b->y1) * row);")
+        ready = band.index("lv_display_flush_ready(s_disp);")
+        send_it = band.index("whole_write(s_rows, true);")
+        self.assertLess(copy, ready)
+        self.assertLess(ready, send_it)
+        self.assertLess(send_it, band.index("frame_done(b);"))
+
+    def test_the_frame_is_one_window_and_counted_as_one_write_of_its_refresh(self):
+        # send_frame's framing: the window once (2Ah, 2Bh at the panel's gap), then 2Ch and 3Ch pieces through the two internal
+        # buffers, with nothing of LVGL's bands in flight. Held only when it is the whole frame, by whole_est at WHOLE_SPREAD.
+        # The write is the refresh's record (s_frame) as one band, which frame_done judges (frame_meets) and counts in the
+        # tearing effect lines like any other: a frame that meets a scan is a torn refresh.
+        write = function(strip_c(variant(SOURCE.read_text(), apps=True)), "whole_write")
+        self.assertRegex(write, r"^static void whole_write\(int rows, bool hold\)")
+        self.assertLess(write.index("wire_idle(0);"), write.index("QSPI_CMD(0x2A)"))
+        self.assertIn("QSPI_CMD(0x2B)", write)
+        self.assertIn("QSPI_PIXELS(y == 0 ? 0x2C : 0x3C)", write)
+        self.assertEqual(write.count("esp_lcd_panel_io_tx_color("), 1)
+        self.assertNotIn("esp_lcd_panel_draw_bitmap", write)
+        self.assertIn("int x1 = s_gap_x, x2 = s_cols - 1 + s_gap_x, y1 = s_gap_y, y2 = rows - 1 + s_gap_y;", write)
+        self.assertRegex(write, r"if \(hold && te_now\(&fall, &p, &scan\)\) \{\s*est = whole_est\(s_whole\.us, WHOLE_SPREAD, p, scan\);"
+                                r"\s*const write_t w = \{ 0, rows, 0, est \};\s*how = te_hold\(&s_te_whole, &w, 1, 0, WHOLE_SPREAD\);")
+        self.assertIn("s_frame.w[s_frame.n] = (write_t){ 0, rows, t0, w };", write)
+        self.assertIn("s_frame.n++;", write)
+        self.assertIn("te_done(&s_te_whole, 0, rows, t0, w, fall, p, scan);", write)
+        # The frames' time, learned as video's is (quick to rise), from whole frames only.
+        self.assertRegex(write, r"if \(rows == s_rows\) \{\s*s_whole\.us = s_whole\.us \? \(s_whole\.us \* 7 \+ \(w > s_whole\.us \? "
+                                r"2 \* w - s_whole\.us : w\)\) / 8 : w;")
+
+    def test_the_frame_is_psram_made_once_and_kept(self):
+        # 466 x 466 x 2 bytes, from PSRAM only (never internal or DMA RAM), made the first time frame mode goes on and never freed;
+        # its state is in PSRAM too (only tasks touch it, with plain loads and stores).
+        source = variant(SOURCE.read_text(), apps=True)
+        on = strip_c(function_text(source, "void muse_lcd_bands_set_frame_mode("))
+        self.assertIn("heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)", on)
+        self.assertNotRegex(on, r"MALLOC_CAP_(INTERNAL|DMA)|\bfree\(|heap_caps_free")
+        self.assertNotRegex(strip_c(source), r"\bfree\(s_whole|heap_caps_free\(s_whole")
+        for line in ("static EXT_RAM_BSS_ATTR whole_t s_whole;", "static EXT_RAM_BSS_ATTR bool s_framing, s_framed;",
+                     "static EXT_RAM_BSS_ATTR te_stats_t s_te_whole;", "static EXT_RAM_BSS_ATTR int s_cols;"):
+            self.assertIn(line, source)
+        self.assertEqual(466 * 466 * 2, 434312)
+
+
+class FrameModeSwitchTest(unittest.TestCase):
+    """muse_lcd_bands_set_frame_mode, compiled with a fake heap: frame mode is on only with its frame. The frame is made from PSRAM
+    the first time it goes on, if PSRAM keeps WHOLE_RESERVE free after it, and kept; with none, frame mode stays off (every
+    refresh takes the band path) and says so once, and a later turn on tries again."""
+
+    PROGRAM = r'''
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define EXT_RAM_BSS_ATTR
+#define MALLOC_CAP_8BIT (1u << 2)
+#define MALLOC_CAP_SPIRAM (1u << 10)
+static const char *TAG = "lcd_bands";
+#define ESP_LOGI(tag, fmt, ...) printf("I %s: " fmt "\n", tag, ##__VA_ARGS__)
+#define ESP_LOGW(tag, fmt, ...) printf("W %s: " fmt "\n", tag, ##__VA_ARGS__)
+static size_t g_free;
+static bool g_fail;
+static int g_allocs;
+static unsigned g_caps;
+static size_t heap_caps_get_free_size(unsigned caps) { (void)caps; return g_free; }
+static void *heap_caps_aligned_alloc(size_t align, size_t size, unsigned caps)
+{
+    g_allocs++;
+    g_caps = caps;
+    if (g_fail || size > g_free || align != 16) return NULL;
+    g_free -= size;
+    return malloc(size);
+}
+static int s_rows = 466;
+PARTS
+int main(void)
+{
+    char cmd[8];
+    long long v;
+    s_cols = 466;
+    while (scanf("%7s %lld", cmd, &v) == 2) {
+        if (strcmp(cmd, "free") == 0) {
+            g_free = (size_t)v;
+        } else if (strcmp(cmd, "fail") == 0) {
+            g_fail = v != 0;
+        } else {
+            muse_lcd_bands_set_frame_mode(v != 0);
+            printf("framing %d allocs %d caps %u\n", s_framing, g_allocs, g_caps);
+        }
+    }
+    return 0;
+}
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        source = variant(SOURCE.read_text(), apps=True)
+        parts = [typedef(source, "te_stats_t"), typedef(source, "whole_t"),
+                 re.search(r"^#define WHOLE_RESERVE .*$", source, re.M).group(0)]
+        parts += re.findall(r"^static EXT_RAM_BSS_ATTR [^;\n]*;", source, re.M)
+        parts.append(function_text(source, "void muse_lcd_bands_set_frame_mode("))
+        src = Path(cls.tmp.name) / "frame_mode.c"
+        src.write_text(cls.PROGRAM.replace("PARTS", "\n".join(parts)))
+        cls.exe = Path(cls.tmp.name) / "frame_mode"
+        subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", "-Wno-unused-variable", "-Wno-unused-function", "-o", str(cls.exe),
+                        str(src)], check=True)
+        cls.reserve = source_number("WHOLE_RESERVE")
+
+    def run_script(self, lines):
+        out = subprocess.run([str(self.exe)], input="\n".join(lines) + "\n", check=True, capture_output=True, text=True).stdout
+        return out.splitlines()
+
+    def test_no_frame_no_frame_mode_and_it_says_so_once(self):
+        frame = 466 * 466 * 2
+        out = self.run_script([f"free {frame + self.reserve - 1}", "on 1", "on 1", "off 0", "on 1"])
+        self.assertEqual([line for line in out if line.startswith("framing")],
+                         ["framing 0 allocs 0 caps 0"] * 4, "PSRAM short of the frame and the reserve: nothing taken, off")
+        warnings = [line for line in out if line.startswith("W ")]
+        self.assertEqual(len(warnings), 1, out)
+        self.assertIn("lcd_bands: tearing effect: ", warnings[0])   # an allowlisted line
+        self.assertIn(f"{frame} B", warnings[0])
+        # The allocation itself failing (no block that large) is the same.
+        out = self.run_script([f"free {10 * frame}", "fail 1", "on 1", "on 1"])
+        self.assertEqual(out[-1], f"framing 0 allocs 2 caps {(1 << 10) | (1 << 2)}")
+        self.assertEqual(sum(line.startswith("W ") for line in out), 1, out)
+
+    def test_the_frame_is_made_once_from_psram_and_kept(self):
+        frame = 466 * 466 * 2
+        out = self.run_script([f"free {frame + self.reserve}", "on 1", "off 0", "on 1", "on 1", "off 0"])
+        states = [line for line in out if line.startswith("framing")]
+        psram = (1 << 10) | (1 << 2)
+        self.assertEqual(states, [f"framing 1 allocs 1 caps {psram}", f"framing 0 allocs 1 caps {psram}",
+                                  f"framing 1 allocs 1 caps {psram}", f"framing 1 allocs 1 caps {psram}",
+                                  f"framing 0 allocs 1 caps {psram}"])
+        infos = [line for line in out if line.startswith("I ")]
+        self.assertEqual(len(infos), 1, out)
+        self.assertIn(f"lcd_bands: tearing effect: frame mode's frame, {frame} B of PSRAM", infos[0])
+        self.assertFalse(any(line.startswith("W ") for line in out))
+        # A frame that couldn't be made the first time is tried again at the next turn on.
+        out = self.run_script([f"free {frame}", "on 1", f"free {frame + self.reserve}", "on 1"])
+        self.assertEqual(out[-1], f"framing 1 allocs 1 caps {psram}")
+
+    def test_the_reserve_is_the_apps_floor(self):
+        # What the frame leaves the rest of the gadget is the apps' own floor (APPS_RAM_RESERVE): Muse's session and LVGL, which
+        # aborts when it can't allocate.
+        pkg = (ROOT / "components/muse/apps/apps_pkg.h").read_text()
+        floor = re.search(r"^#define APPS_RAM_RESERVE \((\d+) \* (\d+)\)", pkg, re.M)
+        self.assertIsNotNone(floor, "APPS_RAM_RESERVE's form changed")
+        self.assertEqual(self.reserve, int(floor.group(1)) * int(floor.group(2)))
+
+
+class FrameModeDocTest(unittest.TestCase):
+    """esp32/AGENTS.md's frame mode paragraph (D12): what it quotes of the code is the code's (the board's bands, WHOLE_SPREAD,
+    WHOLE_RESERVE, the frame's size, the switch, the log lines), and the numbers measured on the board are pinned as written."""
+
+    def test_agents_md_has_the_frame_mode_paragraph(self):
+        source = variant(SOURCE.read_text(), apps=True)
+        board = BOARD_175C.read_text()
+        rows = int(re.search(r"^#define DRAW_BUF_LINES (\d+)", board, re.M).group(1))
+        self.assertIn("round 466 px CO5300", board)
+        bands = math.ceil(466 / rows)
+        spread, reserve = source_number("WHOLE_SPREAD"), source_number("WHOLE_RESERVE")
+        frame = 466 * 466 * 2
+        self.assertIn('ESP_LOGW(TAG, "tearing effect: no frame for frame mode (%u B of PSRAM, %u B kept free): each band goes on '
+                      'its own",', source)
+        self.assertIn("%u paired, %u framed; us avg/max: render %d/%d, \"\n                     \"copy %d/%d,", source)
+        ui = (ROOT / "components/muse/muse_ui.c").read_text()
+        self.assertIn('ESP_LOGI(TAG, "page frame %d ms"', ui)
+        self.assertIn("lv_obj_add_event_cb(s_tv, slide_begins, LV_EVENT_SCROLL_BEGIN, NULL);", ui)
+        self.assertIn(".frame_mode = muse_lcd_bands_set_frame_mode,", board)
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        for phrase in (
+                "and so are the slide's frame mode (below) and `muse_board_t`'s `.frame_pairing` and `.frame_mode`, which only the "
+                "1.75C sets.",
+                f"redraws the whole screen, LVGL's {bands} bands of {rows} rows,",
+                "From the tileview's `LV_EVENT_SCROLL_BEGIN` to the end of the first refresh that finds it at rest (`muse_ui.c`), the "
+                "1.75C's `.frame_mode` (`muse_lcd_bands_set_frame_mode`) sends such a refresh whole:",
+                f"(`te_hold` of the frames' learned write at `WHOLE_SPREAD`, {spread}%, and never more than the longest write a hold "
+                "can keep clear).",
+                f"The frame is {frame:,} bytes of PSRAM, made at the first slide if {reserve // (1024 * 1024)} MB of PSRAM stays free "
+                "after it (`WHOLE_RESERVE`, the apps' floor) and kept;",
+                "the bands log `tearing effect: no frame for frame mode` once.",
+                "A bench build logs `page frame <ms> ms` (the `muse_ui` tag) at each display refresh while the tileview scrolls:",
+                "The bands' batch line then counts the refreshes `framed` and their `copy` into the frame.",
+                # Measured on the board, 2026-11-02 (the task's report): pinned as written.
+                "none of the 527 refreshes in frame mode was torn, and no torn refresh came during a slide (the 57 torn were the Muse "
+                "face's small ones at rest), where the band path, in the same loop on the firmware before, tore 562 whole-screen "
+                "refreshes, 11 on each swipe left and 12 on each swipe right.",
+                "395 page frames had a median of 68 ms and a 95th percentile of 75 ms (the longest 84): the slide is no quicker than "
+                "the band path's, about 64 ms between its torn refreshes, and misses the 60 ms the design asked for.",
+                "A refresh in frame mode spent 14.5 ms copying its bands, 7.2 ms held for the scan and 26.4 ms on the wire,",
+                f"PSRAM fell by 434,292 bytes at the first slide, the frame less {frame - 434292}, and stayed there.",
+                "The send task's unused stack fell to 596 bytes, and the LVGL task's from 3,868 to 2,956."):
+            with self.subTest(phrase):
+                self.assertIn(phrase, section)
+
+
 class PaceTest(unittest.TestCase):
     """pace_learn: the wire's pace, a smoothed line of a band's write over its size, that the holds time bands by. A
     small band's estimate has to bracket its write, as frame_clear_in reads it ((100 - SPREAD)% of it to (100 + SPREAD)%
@@ -563,6 +951,12 @@ TASK7_NAMES = ["write_t", "hold_t", "pace_t", "PACE_VAR_MIN", "s_pace", "FRAME_H
                "lv_display_flush_is_last", "LV_EVENT_RENDER_START", "LV_EVENT_FLUSH_WAIT_START", "LV_EVENT_FLUSH_WAIT_FINISH",
                "uxTaskGetStackHighWaterMark", "xTaskGetTickCount"]
 
+# The clock and Muse's slide's (frame mode) names in muse_lcd_bands.c: its state, constants and functions, and the IDF calls it
+# added. A build without the apps has none of them either.
+FRAME_MODE_NAMES = ["whole_t", "s_whole", "s_framing", "s_framed", "s_te_whole", "s_cols", "WHOLE_SPREAD", "WHOLE_RESERVE",
+                    "refresh_whole", "frame_band", "whole_est", "whole_band", "whole_write", "muse_lcd_bands_set_frame_mode",
+                    "EXT_RAM_BSS_ATTR", "MALLOC_CAP_SPIRAM", "heap_caps_get_free_size"]
+
 # sha256 of esp32/components/muse/boards/muse_lcd_bands.c at 7e59ee0, the connected apps' base: what a build without the apps
 # compiles. On a mismatch, diff variant(SOURCE, apps=False) with `git show 7e59ee0:esp32/components/muse/boards/muse_lcd_bands.c`.
 PLAIN_SHA256 = "058c9a2e4f76a56f2d15096a29cbc04dda748abf2bd17d161c03c4636768a530"
@@ -645,6 +1039,35 @@ class PlainBuildTest(unittest.TestCase):
         delay = Harness.ask([clear_query([(178, 288, 1927)], 6267, 0, 0, P2, SCAN2)])[0]
         self.assertGreater(delay, 0)
         self.assertGreaterEqual(waited, delay)
+
+    def test_frame_mode_is_the_apps_alone(self):
+        # The clock and Muse's slide (frame mode) is built only with the apps, as Task 7's changes are: its names, the switch, the
+        # board's op and the 1.75C's setting of it.
+        plain, apps = strip_c(self.plain), strip_c(self.apps)
+        for name in FRAME_MODE_NAMES:
+            with self.subTest(name):
+                self.assertRegex(apps, rf"\b{name}\b", "the apps build lost it")
+                self.assertNotRegex(plain, rf"\b{name}\b", "outside the CONFIG_MUSE_APPS guard")
+        for path, names in ((HEADER, ["muse_lcd_bands_set_frame_mode"]), (BOARD_H, ["frame_mode"]),
+                            (BOARD_175C, ["frame_mode", "muse_lcd_bands_set_frame_mode"])):
+            text = path.read_text()
+            for name in names:
+                with self.subTest(path.name, name=name):
+                    self.assertRegex(strip_c(variant(text, True)), rf"\b{name}\b")
+                    self.assertNotRegex(strip_c(variant(text, False)), rf"\b{name}\b")
+
+    def test_videos_write_is_as_it_was(self):
+        # Frame mode has a write of its own (whole_write): video's send_frame, its job and its entry point are 739cd75's, in both
+        # builds, so a video build sends its frames as before.
+        for build, text, digest in (("plain", self.plain, "19f99ccaa3f212920774eebdcc9ece4902b1b4c593a79bfa551c5d2ab0578b38"),
+                                    ("apps", self.apps, "8e372aea42e943223113aae4e425b65589aa7eb8e159328abd53ae0cbdd74090")):
+            with self.subTest(build):
+                self.assertEqual(hashlib.sha256(function(text, "send_frame").encode()).hexdigest(), digest)
+                self.assertEqual(hashlib.sha256(typedef(text, "frame_job_t").encode()).hexdigest(),
+                                 "a93c1b6c66a6239ea44da7a68882e1bc5e1a837af7c387db3d5496b891cab900")
+                self.assertIn("void muse_lcd_bands_frame(int x1, int y1, int x2, int y2, int rows, muse_lcd_fill_fn fill, void *arg)\n"
+                              "{\n    frame_job_t j = { x1, y1, x2, y2, rows, fill, arg };\n    muse_lcd_bands_run(send_frame, &j);\n}",
+                              text)
 
     def test_the_apps_hold_needs_no_timer(self):
         # M32: without its esp_timer the apps build still registers (its absence isn't a failure) and each hold sleeps in ticks,

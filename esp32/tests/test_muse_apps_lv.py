@@ -89,6 +89,56 @@ def lvgl_dir():
     return None
 
 
+SLIDE_HARNESS = r"""
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define EXT_RAM_BSS_ATTR
+typedef struct lv_obj { bool scrolling; } lv_obj_t;
+typedef struct { void *target; } lv_event_t;
+static void *lv_event_get_target(lv_event_t *e) { return e->target; }
+static bool lv_obj_is_scrolling(const lv_obj_t *obj) { return obj->scrolling; }
+static lv_obj_t tv, other;
+static lv_obj_t *s_tv = &tv;
+static void frame_mode(bool on) { printf("frame_mode %d\n", on); }
+static const struct { void (*frame_mode)(bool on); } board = { frame_mode }, *muse_board = &board;
+BLOCK
+/* One step a line: "begin tv" or "begin other" (LV_EVENT_SCROLL_BEGIN on it), "end" (the tileview's scroll ends: nothing here),
+ * "scroll 0|1" (lv_obj_is_scrolling of the tileview from now), "refresh" (LV_EVENT_REFR_READY); each answered with the mode. */
+int main(void)
+{
+    char line[64];
+    bool on = false;
+    while (fgets(line, sizeof line, stdin)) {
+        line[strcspn(line, "\n")] = 0;
+        lv_event_t e = { .target = strstr(line, "other") ? (void *)&other : (void *)&tv };
+        if (!strncmp(line, "begin", 5)) slide_begins(&e);
+        else if (!strncmp(line, "scroll ", 7)) tv.scrolling = line[7] == '1';
+        else if (!strcmp(line, "refresh")) slide_rests(&e);
+        on = s_slide_framed;
+        printf("%s: %s\n", line, on ? "on" : "off");
+    }
+    return 0;
+}
+"""
+
+
+def run_slide_harness(steps):
+    """muse_ui.c's frame-mode switch (its block "Frame mode while the home tileview slides", to its #endif) built with SLIDE_HARNESS
+    and played the steps: its output lines."""
+    ui = (ROOT / "components/muse/muse_ui.c").read_text()
+    start = ui.index("/*\n * Frame mode while the home tileview slides")
+    block = ui[start:ui.index("\n#endif", start)]
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "slide.c"
+        src.write_text(SLIDE_HARNESS.replace("BLOCK", block))
+        exe = apps_host.build("slide", [src], tmp)
+        done = apps_host.run(exe, input="\n".join(steps) + "\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    return done.stdout.splitlines()
+
+
 def build_harness(tmp, bench=False):
     stage = stage_fakes(Path(tmp) / "fake_headers", bench=bench)
     return apps_host.build("muse_apps_lv_harness_bench" if bench else "muse_apps_lv_harness",
@@ -548,6 +598,42 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(pairing, ["board_waveshare_s3_175c.c"])
         self.assertIn(".frame_pairing = muse_lcd_bands_set_pairing,", boards["board_waveshare_s3_175c.c"])
         self.assertIn("apps_lv_set_pairing_cb(pairing);", (APPS / "apps_task.c").read_text())
+
+    def test_frame_mode_follows_the_home_slide(self):
+        # The clock and Muse's slide: the board's frame mode (muse_board_t frame_mode, a whole-screen refresh sent as one write) is on
+        # from the home tileview's LV_EVENT_SCROLL_BEGIN and off at the end of the first refresh that finds the tileview at rest,
+        # the one that drew where it stopped, each change once. muse_ui.c's own block, with stand-ins for LVGL and the board.
+        out = run_slide_harness(["refresh", "begin other", "refresh",
+                                 "begin tv", "scroll 1", "begin tv", "refresh", "refresh",
+                                 "scroll 0", "refresh", "refresh",
+                                 "begin tv", "end", "refresh", "refresh",
+                                 "begin tv", "scroll 1", "refresh", "scroll 0", "begin tv", "refresh"])
+        self.assertEqual(out, ["refresh: off", "begin other: off", "refresh: off",
+                               "frame_mode 1", "begin tv: on", "scroll 1: on", "begin tv: on", "refresh: on", "refresh: on",
+                               "scroll 0: on", "frame_mode 0", "refresh: off", "refresh: off",
+                               # a jump to a page (LV_ANIM_OFF: its begin and end at once): the refresh that draws it goes whole
+                               "frame_mode 1", "begin tv: on", "end: on", "frame_mode 0", "refresh: off", "refresh: off",
+                               "frame_mode 1", "begin tv: on", "scroll 1: on", "refresh: on", "scroll 0: on", "begin tv: on",
+                               "frame_mode 0", "refresh: off"])
+        # Only an apps build has it (X5), and only a board with the op registers it: the 1.75C's is muse_lcd_bands_set_frame_mode,
+        # beside its frame pairing, and no other board has one.
+        ui = (ROOT / "components/muse/muse_ui.c").read_text()
+        build = c_function(ui, "static void build_screen(void)")
+        self.assertRegex(build, r"#if CONFIG_MUSE_APPS\n\s*if \(muse_board->frame_mode\) \{\n"
+                                r"\s*lv_obj_add_event_cb\(s_tv, slide_begins, LV_EVENT_SCROLL_BEGIN, NULL\);\n"
+                                r"\s*lv_display_add_event_cb\(lv_obj_get_display\(s_tv\), slide_rests, LV_EVENT_REFR_READY, NULL\);\n"
+                                r"\s*\}\n#endif")
+        self.assertLess(build.index("lv_obj_add_event_cb(s_tv, tile_changed_cb"), build.index("slide_begins"))
+        mentions = [m.start() for m in re.finditer(r"slide_begins|slide_rests|s_slide_framed|frame_mode", ui)]
+        self.assertGreaterEqual(len(mentions), 9)
+        for index in mentions:
+            with self.subTest(ui[ui.rindex("\n", 0, index) + 1:ui.index("\n", index)].strip()):
+                self.assertEqual(open_conditions(ui, index), ["if CONFIG_MUSE_APPS"])
+        boards = {path.name: path.read_text() for path in (ROOT / "components/muse/boards").glob("board_*.c")}
+        self.assertEqual(sorted(name for name, text in boards.items() if ".frame_mode" in text), ["board_waveshare_s3_175c.c"])
+        board = boards["board_waveshare_s3_175c.c"]
+        self.assertRegex(board, r"#if CONFIG_MUSE_APPS\n\s*\.frame_pairing = muse_lcd_bands_set_pairing,[^\n]*\n"
+                                r"\s*\.frame_mode = muse_lcd_bands_set_frame_mode,[^\n]*\n#endif")
 
     # ---- Connected apps Task 2: runtime images ----
 

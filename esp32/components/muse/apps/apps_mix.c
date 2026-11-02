@@ -330,8 +330,9 @@ void apps_mix_stop_all(void) {
     }
     apps_port_mix_lock();
     for (int i = 0; i < APPS_MIX_VOICES; i++) {
-        end(&M.slot[i].play);
-        end(&M.slot[i].tail);
+        if (M.slot[i].play.kind != FREE) {
+            fade_out(&M.slot[i]);
+        }
     }
     publish();
     apps_port_mix_unlock();

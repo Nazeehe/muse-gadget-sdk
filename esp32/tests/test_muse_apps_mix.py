@@ -129,6 +129,13 @@ class MixTest(unittest.TestCase):
         self.assertEqual(after[self.fade:], [0] * (len(after) - self.fade), f"{why}: still sounding after {self.fade} frames")
         self.assertGreater(peaks[0], 0, f"{why}: no fade, a cut")
 
+    def assert_fades_within(self, before, after, why):
+        """A fade of several voices at once: the sum's window peaks follow the voices' phases, so they needn't fall each window,
+        but the sum is never louder than before, sounds at first and is 0 from the fade's end on."""
+        self.assertLessEqual(max(abs(s) for s in after), max(abs(s) for s in before) * 1.2 + 1, f"{why}: the fade jumped up")
+        self.assertGreater(max(abs(s) for s in after[:self.fade]), 0, f"{why}: no fade, a cut")
+        self.assertEqual(after[self.fade:], [0] * (len(after) - self.fade), f"{why}: still sounding after {self.fade} frames")
+
     # ---- The brief's ----
 
     def test_tone_has_its_length_and_pitch(self):
@@ -234,7 +241,7 @@ class MixTest(unittest.TestCase):
 
     def test_clip_plays_scaled_and_loops(self):
         mix = self.run_script("make r ramp 1000", "samples r", "clip 1 r 50 0", "render 1000", "playing #0", "render 320",
-                              "clip 1 r 50 1", "render 3000", "playing #1", "stop_all", "clip 2 r 100 0", "render 1000",
+                              "clip 1 r 50 1", "render 3000", "playing #1", "stop_owner 1", "clip 2 r 100 0", "render 1000",
                               "clip 2 r 250 0", "render 1000")
         ramp = [int(s) for s in mix.answers[1].split()[1:]]
         self.assertEqual((ramp[0], ramp[-1]), (-32767, 32767))
@@ -254,7 +261,7 @@ class MixTest(unittest.TestCase):
         commands = ["make h high 320", "make l low 320"]
         cases = (("hhhh", 32767), ("llll", -32767), ("hhhl", 32767), ("hhll", -2), ("lll", -32767))
         for voices, _ in cases:
-            commands += [f"clip 1 {'h' if v == 'h' else 'l'} 100 0" for v in voices] + ["render 320", "stop_all"]
+            commands += [f"clip 1 {'h' if v == 'h' else 'l'} 100 0" for v in voices] + ["render 320", "stop_owner 1"]
         mix = self.run_script(*commands)
         at = 2
         for voices, want in cases:
@@ -281,7 +288,7 @@ class MixTest(unittest.TestCase):
         commands += ["count", "playing 0", "stop 0"]
         commands += [f"stop #{k}" for k in range(starts - self.voices)]  # every stale id: none stops anything
         commands += ["count"] + [f"playing #{k}" for k in range(starts - self.voices, starts)]
-        commands += ["render 320", "stop_all", "count", "active"]
+        commands += ["render 320", "stop_all", "count", "active", "render 320", "active"]
         mix = self.run_script(*commands)
         ids = [int(a) for c, a in zip(commands, mix.answers) if c.startswith(("tone", "clip"))]
         self.assertEqual(len(ids), 10000)
@@ -290,9 +297,10 @@ class MixTest(unittest.TestCase):
         counts = [int(a) for c, a in zip(commands, mix.answers) if c == "count"]
         self.assertLessEqual(max(counts), self.voices, "at most 4 voices live")
         self.assertEqual(counts[-3:], [self.voices, self.voices, 0], "the stale ids stopped nothing")
-        tail = mix.answers[-(self.voices + 4):-4]
+        tail = mix.answers[-(self.voices + 6):-6]
         self.assertEqual(tail, ["1"] * self.voices)
         self.assertEqual(mix.answers[commands.index("playing 0")], "0", "0 is never an id")
+        self.assertEqual(mix.answers[-3], "1", "stop_all's fades are live until they are rendered")
         self.assertEqual(mix.answers[-1], "0")
         renders = [mix.render(i) for i, c in enumerate(commands) if c.startswith("render")]
         self.assertTrue(all(abs(s) <= 32767 for _, frames in renders for s in frames))
@@ -342,18 +350,43 @@ class MixTest(unittest.TestCase):
         self.assert_envelope_falls_to_zero([8000] * 320, mix.render(12)[1], "replaced")
         self.assertEqual([mix.number(i) for i in (14, 15, 16)], [0, 1, 1], "then the next oldest")
 
-    def test_hooks_are_the_mixer_and_a_cut_is_at_once(self):
-        # muse_apps.h's hooks for the voice task. A cut (a talk press, the dark) is at once: nothing of the sound may play after it,
-        # not even a fade, which would otherwise come out when the voice task next renders, after the turn.
+    def test_stop_all_fades_out(self):
+        # Ruling R1a: Muse taking the speaker fades every voice out over APPS_MIX_FADE_MS, as a stop does, tones and clips alike, and
+        # the voice task renders the fades (one chunk holds them) before it records or rests.
+        for start in ("tone 1 1000 1000 1000 sine 100", "tone 1 440 1760 1000 square 100", "clip 1 c 100 1",
+                      "tone 1 1000 1000 1000 sine 100\ntone 2 330 330 1000 triangle 60\nclip 3 c 50 1"):
+            with self.subTest(start):
+                starts = start.split("\n")
+                mix = self.run_script("make c 12000 3000", *starts, "render 800", "stop_all", "active",
+                                      *(f"playing #{k}" for k in range(len(starts))), "render 160", "active", "render 16")
+                at = 1 + len(starts)
+                self.assertEqual(mix.number(at + 2), 1, "live while the fades last")
+                self.assertEqual([mix.number(at + 3 + k) for k in range(len(starts))], [0] * len(starts), "every id stale at once")
+                after = at + 3 + len(starts)
+                check = self.assert_envelope_falls_to_zero if len(starts) == 1 else self.assert_fades_within
+                check(mix.render(at)[1], mix.render(after)[1], "stop_all")
+                self.assertEqual(mix.number(after + 1), 0, "the fades rendered, nothing is live")
+                self.assertEqual(mix.render(after + 2), (False, [0] * 16))
+        # A stop_all with a clip's fade under way leaves its bytes in use: only stop_owner lets them go (the clip-lifetime guarantee).
+        mix = self.run_script("make c 12000 3000", "clip 1 c 100 1", "render 320", "stop_all", "stop_owner 1", "free c",
+                              "render 320", "active")
+        self.assertEqual(mix.render(6), (False, [0] * 320))
+        self.assertEqual(mix.number(7), 0)
+
+    def test_hooks_are_the_mixer(self):
+        # muse_apps.h's hooks for the voice task. A cut (a talk press, the dark) fades every voice out, those already fading too, and
+        # the next chunk the voice task renders holds the whole fade: after it nothing is live.
         mix = self.run_script("make c 9000 4000", "hook_active", "clip 1 c 100 1", "tone 2 440 440 2000 saw 100", "hook_active",
-                              "hook_render 320", "stop #1", "hook_cut", "hook_active", "active", "hook_render 320",
-                              "playing #0", "render 320")
+                              "hook_render 320", "stop #1", "hook_cut", "hook_active", "active", "playing #0",
+                              "hook_render 320", "hook_active", "render 320")
         self.assertEqual([mix.number(i) for i in (1, 4)], [0, 1])
         self.assertTrue(mix.render(5)[0])
-        self.assertEqual([mix.number(i) for i in (8, 9)], [0, 0])
-        self.assertEqual(mix.render(10), (False, [0] * 320))
-        self.assertEqual(mix.number(11), 0)
-        self.assertEqual(mix.render(12), (False, [0] * 320))
+        self.assertEqual([mix.number(i) for i in (8, 9, 10)], [1, 1, 0], "fading: live, and every id stale")
+        live, fade = mix.render(11)
+        self.assertTrue(live)
+        self.assert_fades_within(mix.render(5)[1], fade, "cut")
+        self.assertEqual(mix.number(12), 0)
+        self.assertEqual(mix.render(13), (False, [0] * 320))
 
     def test_an_idle_mixer_takes_no_lock(self):
         # The voice task asks every 20 ms pass, mostly with nothing to play: those asks are a load of an atomic, not the lock.

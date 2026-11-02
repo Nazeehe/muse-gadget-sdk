@@ -1149,7 +1149,7 @@ static void voice_task(void *arg)
             bool asleep = muse_state_asleep();
 #if CONFIG_MUSE_APPS
             if (asleep) {
-                muse_apps_sound_cut();   /* dark: app sound ends */
+                muse_apps_sound_cut();   /* dark: it fades out, below */
             }
 #endif
             bool battery = muse_state_on_battery();
@@ -1230,7 +1230,14 @@ static void voice_task(void *arg)
                 continue;
             }
 #if CONFIG_MUSE_APPS
-            muse_apps_sound_cut();   /* Muse wins the speaker, before it records */
+            /* Muse wins the speaker: app sound fades out, and the fade (one
+             * chunk holds it) is written before it records. */
+            muse_apps_sound_cut();
+            if (muse_apps_sound_render(s_app_sound, MUSE_AUDIO_CHUNK)) {
+                muse_audio_write(s_app_sound, MUSE_AUDIO_CHUNK);
+                s_app_sounding = true;
+                pre_reset();
+            }
 #endif
             s_press_input_epoch = ev.epoch;
             s_press_mark = ev.mark;

@@ -629,12 +629,21 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertIn("} else if (s_app_sounding) {", played)
         self.assertLess(render, task.index("idle_capture();"))
         self.assertLess(task.index("if (s_loopback) {"), render)
-        # A talk press the loop accepts cuts it before anything else: the recording (or a call) starts after.
+        # A talk press the loop accepts cuts it before anything else, and writes the fade (R1a: one chunk holds it) inside the
+        # option's block: the recording (or a call) starts after.
         accepted = task.index("if (ev.type != MUSE_PTT_DOWN || ev.epoch != muse_input_call_epoch()) {")
         press = task.index("muse_apps_sound_cut();", accepted)
-        self.assertLess(press, task.index("s_press_input_epoch = ev.epoch;"))
+        stored = task.index("s_press_input_epoch = ev.epoch;")
+        self.assertLess(press, stored)
         self.assertLess(press, task.index("bool ok = record(pending_down, &held, why, sizeof(why));"))
         self.assertEqual(task.count("muse_apps_sound_cut();"), 2)
+        fade = task[press:stored]
+        self.assertIn("if (muse_apps_sound_render(s_app_sound, MUSE_AUDIO_CHUNK)) {", fade)
+        self.assertEqual(fade.count("muse_audio_write("), 1)
+        self.assertNotIn("while", fade, "one chunk, never a loop that a sound started meanwhile could keep going")
+        write = source.index(task) + press + fade.index("muse_audio_write(s_app_sound, MUSE_AUDIO_CHUNK);")
+        self.assertIn("if CONFIG_MUSE_APPS", open_conditions(source, write))
+        self.assertLess(write, source.index(task) + stored)
 
     def test_the_mixer_is_built_by_the_option(self):
         cmake = (MUSE / "CMakeLists.txt").read_text()
@@ -648,7 +657,11 @@ class MuseAppsWiringTest(unittest.TestCase):
             match = re.search(rf"^#define {name} (\d+)\b", path.read_text(), re.M)
             self.assertIsNotNone(match, f"no #define {name} in {path.name}")
             return int(match.group(1))
-        self.assertEqual(number(MUSE / "apps/apps_mix.h", "APPS_MIX_RATE"), number(MUSE / "muse_audio.h", "MUSE_AUDIO_RATE"))
+        rate = number(MUSE / "apps/apps_mix.h", "APPS_MIX_RATE")
+        self.assertEqual(rate, number(MUSE / "muse_audio.h", "MUSE_AUDIO_RATE"))
+        # A talk press writes one chunk of the fade before it records (R1a): the whole fade has to fit it.
+        fade = number(MUSE / "apps/apps_mix.h", "APPS_MIX_FADE_MS") * rate // 1000
+        self.assertLessEqual(fade, number(MUSE / "muse_audio.h", "MUSE_AUDIO_CHUNK"))
 
     def test_clock_showing_yields_to_apps(self):
         # An app in front or a card (the launcher, a crash card) covers the watch, whatever tile is under it: muse_input's

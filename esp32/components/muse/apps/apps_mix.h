@@ -30,7 +30,8 @@
  * id is stale: apps_mix_playing says false and apps_mix_stop does nothing, whatever the slot plays since.
  *
  * The clip-lifetime guarantee: a clip's samples are read in place, only under the lock, in a render, and never once
- * apps_mix_stop_owner for its owner (or apps_mix_stop_all) has returned. So its bytes may be freed then, and not before.
+ * apps_mix_stop_owner for its owner has returned. So its bytes may be freed then, and not before: a stop or a replacement fades
+ * the clip out, reading it, and so does apps_mix_stop_all.
  */
 
 #include <stdbool.h>
@@ -73,8 +74,9 @@ void apps_mix_stop(uint32_t id);
  * only once the lock is released (the clip-lifetime guarantee). Always takes the lock. */
 void apps_mix_stop_owner(uint32_t owner);
 
-/* Ends every voice at once, those fading out too, with no fade: Muse takes the speaker (a talk press, the dark), and nothing of the
- * sound may come out after it, even at the voice task's next render after a turn. */
+/* Stops every voice as apps_mix_stop does: each fades out over APPS_MIX_FADE_MS, and every id is stale at once. Muse takes the
+ * speaker (a talk press, the dark): the voice task renders the fades, shorter than a chunk, before it records or rests, and
+ * apps_mix_active is false once they are rendered. */
 void apps_mix_stop_all(void);
 
 /* Mixes the next frames into out: the voices' sum, saturated to -32767 to 32767, never wrapped. False, with out all zeros, when no

@@ -375,8 +375,10 @@ void muse_apps_brief(char *resident, size_t cap, const char **state, unsigned *l
  * and with nothing to play they take no lock at all.
  *   muse_apps_sound_render  apps_mix_render
  *   muse_apps_sound_active  apps_mix_active: a sound plays (one fading out too), so the codecs mustn't rest
- *   muse_apps_sound_cut     apps_mix_stop_all: every voice ends at once, with no fade (Muse wins the speaker). The voice task cuts
- *                           when the screen is dark and on a talk press it takes, before the recording starts
+ *   muse_apps_sound_cut     apps_mix_stop_all: every voice fades out over APPS_MIX_FADE_MS (Muse wins the speaker). The voice
+ *                           task cuts when the screen is dark and on a talk press it takes; for a press it renders and writes the
+ *                           fades (one chunk holds them) before the recording starts, and in the dark the pass's own render does,
+ *                           while the fading sound keeps the codecs from resting until the next pass
  */
 bool muse_apps_sound_render(int16_t *out, size_t frames);
 bool muse_apps_sound_active(void);

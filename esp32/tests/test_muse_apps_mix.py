@@ -469,10 +469,20 @@ class MixBenchTest(unittest.TestCase):
         self.assertRegex(holds[0], r"^@log muse_apps sound render \d+ us \(320 frames, 2 voices\)$")
         self.assertRegex(holds[1], r"^@log muse_apps sound render \d+ us \(640 frames, 1 voices\)$")
 
+    def test_a_cut_logs_the_voices_it_faded_at_the_next_render(self):
+        # Two voices play, stop_all fades both: one line at the render that begins the fades, none at the next, and a cut with
+        # nothing playing (or only tails) logs nothing.
+        lines = self.run_script("stop_all", "render 320", "tone 1 440 440 500 sine 100", "tone 1 660 660 500 sine 100",
+                                "render 320", "stop_all", "stop_all", "render 320", "render 320", "stop_all", "render 320")
+        cuts = [line for line in lines if " sound cut " in line]
+        fade_ms = header_number(APPS / "apps_mix.h", "APPS_MIX_FADE_MS")
+        self.assertEqual(cuts, [f"@log muse_apps sound cut 2 voices ({fade_ms} ms fade)"], lines)
+
     def test_the_lines_are_pinned(self):
         source = (APPS / "apps_mix.c").read_text()
         self.assertIn('ESP_LOGI(TAG, "sound start %d ms", started_ms[i]);', source)
         self.assertIn('ESP_LOGI(TAG, "sound render %d us (%d frames, %d voices)"', source)
+        self.assertIn('ESP_LOGI(TAG, "sound cut %d voices (%d ms fade)", cut, APPS_MIX_FADE_MS);', source)
 
 
 if __name__ == "__main__":

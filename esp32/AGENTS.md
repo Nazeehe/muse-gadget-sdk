@@ -798,18 +798,25 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   it (the LVGL task), when the screen goes dark or a talk press is taken (the
   voice task, before it records), and when an alarm with sound fires. A bench
   build logs `sound start <ms> ms` (the `muse_apps` tag) at the first render
-  of each voice, the time from the app's call to its first chunk, and
+  of each voice, the time from the app's call to its first chunk,
   `sound render <us> us (<n> frames, <v> voices)`, how long a render held the
-  mixer's lock, once for each number of voices. Measured on the 1.75C on
-  BOARD_DATE (apps+bench build, `tests/muse_apps_fixtures/sound`, 20 presses
-  1 s apart): `sound start` BOARD_START_MEDIAN ms at the median and
-  BOARD_START_P95 ms at the 95th percentile, and the I2S queue holds
-  BOARD_I2S_MS ms more (BOARD_I2S_DESC descriptors of BOARD_I2S_FRAMES frames);
-  a render held the lock BOARD_RENDER_US us with BOARD_RENDER_VOICES voices;
-  the `lcd_bands` render average was BOARD_BANDS_SOUND ms and the app's
-  `cpu_pct` BOARD_CPU_SOUND with sound, against BOARD_BANDS_MUTE ms and
-  BOARD_CPU_MUTE muted; `>mem`'s internal and DMA free moved BOARD_MEM_INTERNAL
-  and BOARD_MEM_DMA bytes while it played, and PSRAM BOARD_MEM_PSRAM.
+  mixer's lock, once for each number of voices, and
+  `sound cut <n> voices (<ms> ms fade)` at the render that begins the fades of
+  a cut (`apps_mix_stop_all`). Measured on the 1.75C on 2026-11-01 (apps+bench
+  build, `tests/muse_apps_fixtures/sound`, 20 presses 1 s apart):
+  `sound start` 13.5 ms at the median and 26 ms at the 95th percentile (the
+  longest 29), and the I2S queue holds up to 90 ms more (6 descriptors of 240
+  frames, IDF's `I2S_CHANNEL_DEFAULT_CONFIG`, which the board's BSP keeps), so
+  a tone is heard about 0.1 s after the call; a render held the lock 160 us
+  with 1 voice and 835 us with 4 (851 with 4 and a fading tail), the longest
+  the LVGL task or an alarm's ring waits to cut; the `lcd_bands` render average
+  was 863 us and the app's `cpu_pct` 2 with sound, against 865 us and 2 muted;
+  `>mem`'s internal and DMA free moved 0 and 0 bytes while it played, and PSRAM
+  only with the app's Lua heap. The fixture's alarm cut its looping clip at
+  the ring (`sound cut 1 voices (5 ms fade)`, 55 ms after the ring's chirp,
+  which the voice task writes first), and a talk press stopped the clip
+  cleanly, by ear; the app was hidden for the turn and shown again after it,
+  silent.
 - **Boot:** the apps' storage waits for the Link (`muse_apps.h`). The app task
   mounts the FAT and `apps_nvs`, and the I/O worker that does it is made, once
   the reply to the first `link.register` has come, accepted or not

@@ -48,6 +48,8 @@
  *   for each voice. What the I2S queue adds after the render is the board's to measure.
  * - "sound render <us> us (<n> frames, <v> voices)": how long a render held the lock, once for each number of voices (and tails) it
  *   rendered, so that the most the voice task, or a task that waits for the lock, can be held up shows on the board.
+ * - "sound cut <n> voices (<ms> ms fade)": apps_mix_stop_all faded n voices that played (a ring, a talk press, the app going behind
+ *   or covered), logged at the next render, the one that begins their fades.
  */
 
 #define FRAMES_PER_MS (APPS_MIX_RATE / 1000)
@@ -108,6 +110,7 @@ static EXT_RAM_BSS_ATTR struct {
     uint32_t starts;           /* starts so far */
 #if CONFIG_MUSE_BENCH
     uint32_t held_logged;      /* bit n: a render of n voices and tails has logged its hold */
+    uint32_t cut;              /* voices apps_mix_stop_all faded since the last render */
 #endif
 } M;
 static atomic_bool s_active;
@@ -359,6 +362,9 @@ void apps_mix_stop_all(void) {
     for (int i = 0; i < APPS_MIX_VOICES; i++) {
         if (M.slot[i].play.kind != FREE) {
             fade_out(&M.slot[i]);
+#if CONFIG_MUSE_BENCH
+            M.cut++;
+#endif
         }
     }
     publish();
@@ -377,7 +383,8 @@ bool apps_mix_render(int16_t *out, size_t frames) {
 #if CONFIG_MUSE_BENCH
     /* Read under the lock, logged after it (no log line under it). */
     int64_t began_us = esp_timer_get_time();
-    int started_ms[APPS_MIX_VOICES], n_started = 0, rendering = 0;
+    int started_ms[APPS_MIX_VOICES], n_started = 0, rendering = 0, cut = (int)M.cut;
+    M.cut = 0;
     for (int i = 0; i < APPS_MIX_VOICES; i++) {
         voice_t *v = &M.slot[i].play;
         rendering += (v->kind != FREE ? 1 : 0) + (M.slot[i].tail.kind != FREE ? 1 : 0);
@@ -413,6 +420,9 @@ bool apps_mix_render(int16_t *out, size_t frames) {
 #if CONFIG_MUSE_BENCH
     for (int i = 0; i < n_started; i++) {
         ESP_LOGI(TAG, "sound start %d ms", started_ms[i]);
+    }
+    if (cut > 0) {
+        ESP_LOGI(TAG, "sound cut %d voices (%d ms fade)", cut, APPS_MIX_FADE_MS);
     }
     if (log_held) {
         ESP_LOGI(TAG, "sound render %d us (%d frames, %d voices)", held_us, (int)frames, rendering);

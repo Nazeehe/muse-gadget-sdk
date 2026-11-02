@@ -763,10 +763,12 @@ class GuideAndSkill(unittest.TestCase):
                 self.assertIn(phrase, section)
 
     def test_agents_md_has_the_sound_paragraph(self):
-        # Games Task 3: the pieces of app sound, and the bench's log line as apps_mix.c prints it (D12). The board's numbers are pinned
-        # once they are measured.
+        # Games Task 3: the pieces of app sound, and the bench's log lines as apps_mix.c prints them (D12). The numbers measured on the
+        # board (2026-11-01) are measurements, pinned as they were written; the 5 ms of the alarm's cut line is APPS_MIX_FADE_MS, and
+        # the I2S queue's 6 x 240 frames are IDF's I2S_CHANNEL_DEFAULT_CONFIG (driver/i2s_common.h), read on the build machine.
         mix = (APPS / "apps_mix.c").read_text()
         self.assertIn('ESP_LOGI(TAG, "sound start %d ms"', mix)
+        self.assertIn('ESP_LOGI(TAG, "sound cut %d voices (%d ms fade)", cut, APPS_MIX_FADE_MS);', mix)
         self.assertRegex(mix, r'static const char \*TAG = "muse_apps";')
         agents = (ROOT / "AGENTS.md").read_text()
         section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
@@ -784,6 +786,18 @@ class GuideAndSkill(unittest.TestCase):
                        f"renders one chunk of {chunk} frames (`MUSE_AUDIO_CHUNK`, {chunk * 1000 // rate} ms) on each idle pass",
                        "A bench build logs `sound start <ms> ms` (the `muse_apps` tag) at the first render of each voice",
                        "`sound render <us> us (<n> frames, <v> voices)`, how long a render held the mixer's lock",
+                       "`sound cut <n> voices (<ms> ms fade)` at the render that begins the fades of a cut (`apps_mix_stop_all`).",
+                       "Measured on the 1.75C on 2026-11-01 (apps+bench build, `tests/muse_apps_fixtures/sound`, 20 presses 1 s apart): "
+                       "`sound start` 13.5 ms at the median and 26 ms at the 95th percentile (the longest 29), and the I2S queue holds up "
+                       "to 90 ms more (6 descriptors of 240 frames, IDF's `I2S_CHANNEL_DEFAULT_CONFIG`, which the board's BSP keeps), so "
+                       "a tone is heard about 0.1 s after the call;",
+                       "a render held the lock 160 us with 1 voice and 835 us with 4 (851 with 4 and a fading tail), the longest the LVGL "
+                       "task or an alarm's ring waits to cut; the `lcd_bands` render average was 863 us and the app's `cpu_pct` 2 with "
+                       "sound, against 865 us and 2 muted; `>mem`'s internal and DMA free moved 0 and 0 bytes while it played, and PSRAM "
+                       "only with the app's Lua heap.",
+                       f"The fixture's alarm cut its looping clip at the ring (`sound cut 1 voices ({fade} ms fade)`, 55 ms after the "
+                       "ring's chirp, which the voice task writes first), and a talk press stopped the clip cleanly, by ear; the app was "
+                       "hidden for the turn and shown again after it, silent.",
                        "`apps_svc.c` (`time`, `os`, `timer`, `alarm`, `store`, `sys`), `apps_sound.c` (`sound`) and `apps_mix.c`"):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)

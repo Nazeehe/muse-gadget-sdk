@@ -284,7 +284,7 @@ class MuseAppsWiringTest(unittest.TestCase):
         for name in ("cJSON *apps_result_failure(", "cJSON *apps_result_success(", "bool apps_result_installed(",
                      "const char *apps_result_vm_code("):
             self.assertIn(name, shared)
-        for name in ("apps_control.c", "apps_snapshot.c", "apps_install.c"):
+        for name in ("apps_control.c", "apps_snapshot.c", "apps_install.c", "apps_touch.c"):
             source = (MUSE / "apps" / name).read_text()
             self.assertIn('#include "apps_result.h"', source, name)
             self.assertNotRegex(source, r"static cJSON \*success\(cJSON \*payload\)", name)

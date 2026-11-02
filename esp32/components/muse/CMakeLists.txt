@@ -70,7 +70,8 @@ if(CONFIG_MUSE_ENABLED)
         # or a map in RAM) and the store of the packages (apps_store.c: the FAT partition "apps" and apps_nvs, or
         # RAM when the table has no apps partition), the install pipeline and its RAM store, the USB console's
         # >app.* lines, Link's app.control and app.api, app.control's snapshot (apps_snapshot.c: LVGL's snapshot and
-        # esp_new_jpeg, which idf_component.yml brings in with the apps), the D14 results those jobs share
+        # esp_new_jpeg, which idf_component.yml brings in with the apps), app.control's tap and drag (apps_touch.c:
+        # Muse's touches on the app it tests, through muse_ui.c's touch player), the D14 results those jobs share
         # (apps_result.c), the launcher's icons (apps_icons.c: read on the I/O worker, shown by the LVGL task), the
         # apps' JPEG decoder (apps_jpeg.c: runtime images, over the ROM's TJpgDec), the apps' vm module and the
         # network worker that runs its requests through the VM ops (apps_vmio.c, apps_net.c), the apps' muse module
@@ -80,7 +81,7 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND srcs "apps/apps_vm.c" "apps/apps_suggest.c" "apps/apps_json.c" "apps/apps_pkg.c"
             "apps/apps_rt.c" "apps/apps_svc.c" "apps/apps_ui.c" "apps/apps_lv.c" "apps/apps_task.c"
             "apps/apps_port_idf.c" "apps/apps_alarm.c" "apps/apps_io.c" "apps/apps_values.c" "apps/apps_store.c"
-            "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/apps_snapshot.c"
+            "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/apps_snapshot.c" "apps/apps_touch.c"
             "apps/apps_result.c" "apps/apps_icons.c" "apps/apps_jpeg.c" "apps/apps_vmio.c" "apps/apps_net.c" "apps/apps_ask.c"
             "apps/apps_mix.c" "apps/apps_sound.c" "apps/fonts/apps_digits_48.c" "apps/fonts/apps_digits_96.c")
         # What app.api writes to Muse's VM (apps_control.c): the app guide, the timer example and the tally example (a

@@ -29,8 +29,8 @@
  *   U+2029) becomes one space, so nothing in it can start a line that reads as another head or as the user. Then it is cleaned to
  *   UTF-8 (apps_text_clean, tabs kept). The text's limit, APPS_ASK_TEXT_MAX, is the app's text's, before the head.
  * - Raised at the call (P18), and nothing is sent: no "muse" permission, text not a string of 1 to APPS_ASK_TEXT_MAX bytes (a NUL in
- *   it included), cb not a function, no tap on the app within APPS_SHOW_TAP_MS (APPS_ASK_MSG_TAP; only a tap counts, not message() or
- *   alarm()), an ask that waits already (APPS_ASK_MSG_ONE), and less than APPS_ASK_GAP_MS since the last accepted ask began
+ *   it included), cb not a function, no tap on the app within APPS_SHOW_TAP_MS (APPS_ASK_MSG_TAP; only a person's tap counts, not
+ *   message() or alarm(), nor Muse's own app.control tap or drag: apps_rt_tapped), an ask that waits already (APPS_ASK_MSG_ONE), and less than APPS_ASK_GAP_MS since the last accepted ask began
  *   (APPS_ASK_MSG_WAIT, with the seconds left rounded up).
  * - Through the callback: the reply, or the gadget short of memory (APPS_ASK_MSG_NO_MEMORY), the turn's end in the chat's words
  *   (muse_chat.h: "interrupted", "busy with a voice turn", "not set up", "CANCELLED" when the console's cancel ended it, "BUSY"

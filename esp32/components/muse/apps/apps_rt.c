@@ -1247,9 +1247,13 @@ void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event) {
     if (rt == NULL || rt->state != APPS_STATE_RUNNING) {
         return;
     }
-    rt->touched = true;  /* sys.show() may be called for the next APPS_SHOW_TAP_MS, whatever the touch found */
-    rt->touch_ms = apps_port_mono_ms();
-    touch_call_t t = {rt, slot, gen, event};
+    if ((event & APPS_UI_INJECTED) == 0) {
+        /* A person's touch: sys.show() and muse.ask may be called for the next APPS_SHOW_TAP_MS, whatever it found. Muse's own
+         * (app.control tap or drag) opens neither: an app can't pass its own testing off as the user's tap. */
+        rt->touched = true;
+        rt->touch_ms = apps_port_mono_ms();
+    }
+    touch_call_t t = {rt, slot, gen, (uint8_t)(event & ~APPS_UI_INJECTED)};
     if (vm_run(rt, touch_trampoline, &t, APPS_BUDGET_CALL) != APPS_CALL_OK) {
         crash(rt);
     }

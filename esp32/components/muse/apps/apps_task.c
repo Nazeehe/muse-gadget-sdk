@@ -39,6 +39,7 @@
 #include "apps_port.h"
 #include "apps_snapshot.h"
 #include "apps_store.h"
+#include "apps_touch.h"
 #include "apps_ui.h"
 #include "apps_values.h"
 #include "apps_vm.h"
@@ -204,6 +205,7 @@ typedef struct {
         bool running;                       /* the app below runs: from when it is up (start() has returned) until
                                              * it ends */
         char id[APPS_ID_MAX + 1], name[25]; /* the last app launched, and the name it shows (the hung card's too) */
+        uint32_t gen;                       /* its app_gen (app.control tap and drag read it with the id) */
         int list_n;                         /* the store's apps, most recent first (apps_task_set_list) */
         apps_listed_t list[APPS_TASK_LIST_MAX];
         bool card;                          /* a crash card to show, once reset card_after has run */
@@ -944,6 +946,7 @@ static void begin_app(apps_pkg_t *pkg) {
         s_rec->names.card = false;  /* an earlier app's crash card not shown yet would come up over this one */
         put_text(s_rec->names.id, sizeof s_rec->names.id, m->id);
         put_text(s_rec->names.name, sizeof s_rec->names.name, m->name[0] != '\0' ? m->name : m->id);
+        s_rec->names.gen = T.gen;
         names_give();
     }
     apps_marker_launch(apps_store_marker(), m->id);  /* a reset from here to its end counts toward its quarantine, if it is a crash */
@@ -1690,6 +1693,7 @@ static void on_widget_event(uint16_t slot, uint16_t gen, uint8_t event) {
     if (atomic_load(&s_rec->reset_req) != atomic_load(&s_rec->reset_done)) {
         return;
     }
+    event = apps_touch_tag(slot, event);  /* Muse's own touch (app.control tap or drag) is tagged as such */
     apps_event_t ev = {
         .type = APPS_EV_TOUCH, .code = event, .slot = slot, .gen = gen, .app_gen = atomic_load(&s_rec->app_gen),
     };
@@ -1704,6 +1708,7 @@ static void on_close(void) {
     if (!atomic_load(&s_up)) {
         return;
     }
+    apps_touch_closed();  /* a touch of Muse's that plays was the swipe: it is cut at its next read */
     apps_lv_set_front(false);
     post_from_lvgl(APPS_EV_HIDE, atomic_load(&s_rec->app_gen));
     update_covering();
@@ -1958,6 +1963,7 @@ void muse_apps_ui_supervise(void) {
     note_wake();
     update_covering();
     apps_snapshot_take_pending();  /* app.control snapshot's request, on the first lit frame (it looks at the dark itself) */
+    apps_touch_supervise();        /* app.control tap and drag's: handed on at the first lit frame, answered once settled */
 }
 
 bool muse_apps_ui_tick(void) {
@@ -2008,6 +2014,36 @@ bool muse_apps_front(void) {
 
 bool muse_apps_covering(void) {
     return atomic_load(&s_covering);
+}
+
+/* ---- app.control tap and drag (apps_touch.h) ---- */
+
+bool apps_task_touch_alive(uint32_t gen) {
+    return atomic_load(&s_up) && gen != 0 && atomic_load(&s_rec->app_gen) == gen && atomic_load(&s_rec->published) != 0 &&
+           atomic_load(&s_rec->reset_req) == atomic_load(&s_rec->reset_done) && atomic_load(&s_rec->hung) == 0;
+}
+
+apps_touch_target_t apps_task_touch_target(const char *id, uint32_t *gen) {
+    if (!atomic_load(&s_up) || id == NULL || gen == NULL) {
+        return APPS_TOUCH_TARGET_GONE;
+    }
+    if (!names_take(NAMES_LOCK_MS)) {
+        return APPS_TOUCH_TARGET_BUSY;  /* the LVGL task never waits longer */
+    }
+    const bool runs = s_rec->names.running && strcmp(s_rec->names.id, id) == 0;
+    const uint32_t g = s_rec->names.gen;
+    names_give();
+    if (!runs) {
+        return APPS_TOUCH_TARGET_GONE;
+    }
+    if (atomic_load(&s_rec->hung) != 0) {
+        return APPS_TOUCH_TARGET_HUNG;
+    }
+    if (!apps_task_touch_alive(g)) {
+        return APPS_TOUCH_TARGET_GONE;  /* its table isn't on the layer yet, or a reset is outstanding */
+    }
+    *gen = g;
+    return APPS_TOUCH_TARGET_OK;
 }
 
 /* ---- The callers ---- */

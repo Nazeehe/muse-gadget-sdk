@@ -205,6 +205,29 @@ void apps_lv_reset(void);
 void apps_lv_set_front(bool front);
 bool apps_lv_front(void);
 
+/*
+ * For app.control's tap and drag (apps_touch.h), on the LVGL task.
+ * apps_lv_hit: what a touch at (x, y) would press, found as LVGL 9.5.0 finds it (lv_indev.c's pointer_search_obj: the system layer,
+ * the top layer, the active screen, then the bottom layer, each with lv_indev_search_obj, from the layer's display):
+ * APPS_LV_HIT_OUTSIDE when that is neither the layer nor inside it (the layer hidden; a card, the downloaded image, the pairing
+ * card or the sleep cover over it; nothing at all), APPS_LV_HIT_LAYER for the layer itself or an object of no widget's, else the
+ * widget's slot: the nearest, of the object and the boxes up from it, that a record has.
+ * apps_lv_kind: the kind (apps_ui.h's APPS_W_*) the pass made slot's object for, or -1 when the slot has none.
+ * apps_lv_scrolls: the app's boxes with scroll = "y" that have an object, at most max of them in slot order: each one's slot, its
+ * scroll y (px from its top: lv_obj_get_scroll_y) and whether it is scrolling now (a drag, its throw, an elastic end, an animated
+ * scroll_to: lv_obj_is_scrolling). How many it wrote.
+ */
+#define APPS_LV_HIT_OUTSIDE (-2)
+#define APPS_LV_HIT_LAYER (-1)
+int apps_lv_hit(int32_t x, int32_t y);
+int apps_lv_kind(int slot);
+typedef struct {
+    int16_t slot;
+    int32_t y;
+    bool moving;
+} apps_lv_scroll_t;
+int apps_lv_scrolls(apps_lv_scroll_t *out, int max);
+
 /* Since boot (a reset doesn't clear them). applies: passes that ran; skips: passes that didn't (the lock, a
  * callback, or no memory for the pass's records); rejects: slots dropped by re-validation; refused_creates:
  * widgets not made for want of PSRAM; slow: passes over 2 ms. And spinning, now: the images whose spin animates

@@ -37,8 +37,9 @@
 // became of the session meanwhile (noise_ctrl_send_command_result drops a
 // result of a session that has ended). app.api (the guide's writes, which only
 // this task can pump), app.send (the launch an app may need, and the app's
-// reply, awaited for at most 5 s) and app.control's launch, stop, remove and
-// snapshot (the screen drawn, encoded and written to the VM) go the same way;
+// reply, awaited for at most 5 s) and app.control's launch, stop, remove,
+// snapshot (the screen drawn, encoded and written to the VM), tap and drag
+// (Muse's touch on the app it tests, through LVGL's input) go the same way;
 // app.control's list, status and logs answer at once, after a wait for the
 // worker of at most MUSE_APPS_CONTROL_WAIT_MS (D20).
 //
@@ -53,9 +54,11 @@
 #define INSTALL_TIMEOUT_MS 120000  // the VM's wait for app.install's result: over the gadget's 90 s deadline and a run's settle
 #define API_TIMEOUT_MS 30000       // app.api's: the guide's writes (MUSE_APPS_GUIDE_WRITE_MS) and the answer
 #define CONTROL_TIMEOUT_MS 30000   // app.control's: a launch's load, run and settle; a snapshot's 25 s (MUSE_APPS_SNAPSHOT_TOTAL_MS)
+                                   // and a touch's 15 s (MUSE_APPS_TOUCH_TOTAL_MS)
 #define SEND_TIMEOUT_MS 10000      // app.send's: the app's reply bound (5 s, MUSE_APPS_SEND_REPLY_MS) and the round trip
 // A snapshot answers by its own deadline, so the VM never gives up on app.control first.
 _Static_assert(MUSE_APPS_SNAPSHOT_TOTAL_MS < CONTROL_TIMEOUT_MS, "a snapshot's deadline must end before app.control's timeout");
+_Static_assert(MUSE_APPS_TOUCH_TOTAL_MS < CONTROL_TIMEOUT_MS, "a touch's deadline must end before app.control's timeout");
 #define REQUEST_ID_MAX 64
 
 // The headroom rule (D11): link.register carries the apps' entries in at most
@@ -68,9 +71,9 @@ _Static_assert(MUSE_APPS_SNAPSHOT_TOTAL_MS < CONTROL_TIMEOUT_MS, "a snapshot's d
 #define ADVERTISE_CONTROL 1
 
 // app.control's actions, as typed.
-enum { ACT_LIST, ACT_STATUS, ACT_LOGS, ACT_LAUNCH, ACT_STOP, ACT_REMOVE, ACT_SNAPSHOT };
-static const char *const ACTIONS[] = {"list", "status", "logs", "launch", "stop", "remove", "snapshot"};
-#define ACTIONS_TEXT "list, status, logs, launch, stop, remove, snapshot"
+enum { ACT_LIST, ACT_STATUS, ACT_LOGS, ACT_LAUNCH, ACT_STOP, ACT_REMOVE, ACT_SNAPSHOT, ACT_TAP, ACT_DRAG };
+static const char *const ACTIONS[] = {"list", "status", "logs", "launch", "stop", "remove", "snapshot", "tap", "drag"};
+#define ACTIONS_TEXT "list, status, logs, launch, stop, remove, snapshot, tap, drag"
 
 // What the reader's "out_of_memory" means for the one who asked.
 #define READER_NO_MEMORY "the gadget is short of memory for the VM reader right now; try again in a few seconds"
@@ -194,9 +197,11 @@ void apps_link_register(cJSON *commands) {
     if (ADVERTISE_CONTROL) {
         required = cJSON_CreateObject();
         optional = cJSON_CreateObject();
-        cJSON_AddItemToObject(required, "action", param("string", "list, status, logs, launch, stop, remove or snapshot."));
+        cJSON_AddItemToObject(required, "action",
+                              param("string", "list, status, logs, launch, stop, remove, snapshot, tap or drag."));
         cJSON_AddItemToObject(optional, "id", param("string", "App id, for every action but list."));
         cJSON_AddItemToObject(optional, "scale", param("integer", "1 full size (default), 2 half"));
+        cJSON_AddItemToObject(optional, "at", param("object", "tap {x,y,ms?}; drag {x,y,x2,y2,ms}"));
         add_command(commands, "app.control", "Manage gadget apps; app.api's guide says what each action returns.", required,
                     optional, CONTROL_TIMEOUT_MS);
     }
@@ -395,7 +400,33 @@ static int snapshot_scale(const cJSON *params) {
     return scale->valuedouble == 1 ? 1 : scale->valuedouble == 2 ? 2 : 0;
 }
 
-// app.control: action is one of ACTIONS, as typed; id an app id, for every action but list; snapshot's scale 1 or 2.
+// tap and drag's at: an object of whole numbers with these keys and no others, a tap's x, y and ms (absent or null:
+// MUSE_APPS_TOUCH_TAP_MS), a drag's x, y, x2, y2 and ms. Their ranges are muse_apps_touch's to check. False for anything else.
+static bool touch_at(const cJSON *params, bool drag, muse_apps_at_t *at) {
+    static const char *const KEYS[] = {"x", "y", "x2", "y2", "ms"};
+    const cJSON *given = cJSON_GetObjectItemCaseSensitive(params, "at");
+    if (!cJSON_IsObject(given)) return false;
+    *at = (muse_apps_at_t){.x2 = -1, .y2 = -1, .ms = MUSE_APPS_TOUCH_TAP_MS};
+    int *const values[] = {&at->x, &at->y, &at->x2, &at->y2, &at->ms};
+    bool seen[sizeof(KEYS) / sizeof(KEYS[0])] = {false};
+    const cJSON *item;
+    cJSON_ArrayForEach(item, given) {
+        int k = -1;
+        for (int i = 0; item->string && i < (int)(sizeof(KEYS) / sizeof(KEYS[0])); i++) {
+            if (strcmp(item->string, KEYS[i]) == 0) k = i;
+        }
+        if (k < 0 || seen[k] || (!drag && (k == 2 || k == 3))) return false;
+        seen[k] = true;
+        if (!drag && k == 4 && cJSON_IsNull(item)) continue;
+        const double v = item->valuedouble;
+        if (!cJSON_IsNumber(item) || !(v >= -100000 && v <= 100000) || v != (double)(int)v) return false;  // whole, and an int
+        *values[k] = (int)v;
+    }
+    return seen[0] && seen[1] && (!drag || (seen[2] && seen[3] && seen[4]));
+}
+
+// app.control: action is one of ACTIONS, as typed; id an app id, for every action but list; snapshot's scale 1 or 2; tap and
+// drag's at.
 static cJSON *control_command(cJSON *params, const char *request_id,
                               noise_ctrl_session_generation_t session_generation) {
     cJSON *action = cJSON_GetObjectItemCaseSensitive(params, "action");
@@ -421,6 +452,18 @@ static cJSON *control_command(cJSON *params, const char *request_id,
     if (act == ACT_STATUS || act == ACT_LOGS) return answer(muse_apps_status(id->valuestring, act == ACT_LOGS));
     int scale = act == ACT_SNAPSHOT ? snapshot_scale(params) : 1;
     if (!scale) return error_result("invalid_params", MUSE_APPS_SNAPSHOT_BAD_SCALE);
+    const bool touch = act == ACT_TAP || act == ACT_DRAG;
+    muse_apps_at_t at = {0};
+    if (touch) {
+        const cJSON *given = cJSON_GetObjectItemCaseSensitive(params, "at");
+        if (!given || cJSON_IsNull(given)) {
+            snprintf(msg, sizeof(msg), "at is required for %s", ACTIONS[act]);
+            return error_result("missing_param", msg);
+        }
+        if (!touch_at(params, act == ACT_DRAG, &at)) {
+            return error_result("invalid_params", act == ACT_DRAG ? MUSE_APPS_TOUCH_BAD_DRAG : MUSE_APPS_TOUCH_BAD_TAP);
+        }
+    }
 
     cJSON *refusal = NULL;
     request_t *req = new_request(request_id, session_generation, &refusal);
@@ -429,6 +472,7 @@ static cJSON *control_command(cJSON *params, const char *request_id,
     bool queued = act == ACT_LAUNCH   ? muse_apps_launch_async(id->valuestring, command_done, req, &code, &err)
                   : act == ACT_STOP   ? muse_apps_stop(id->valuestring, command_done, req, &code, &err)
                   : act == ACT_REMOVE ? muse_apps_remove(id->valuestring, command_done, req, &code, &err)
+                  : touch             ? muse_apps_touch(id->valuestring, act == ACT_DRAG, &at, command_done, req, &code, &err)
                                       : muse_apps_snapshot(id->valuestring, scale, command_done, req, &code, &err);
     if (!queued) {
         heap_caps_free(req);

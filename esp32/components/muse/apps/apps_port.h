@@ -42,6 +42,10 @@ bool apps_port_epoch_ms(int64_t *out);
  * the first round after it ends runs each one that came due. Any task. */
 bool apps_port_dark(void);
 
+/* Whether a voice turn is on: Muse listens, thinks or speaks (the device: muse_state_mode, frame_tick's test that hides an app
+ * in front at its next frame). Any task. */
+bool apps_port_in_turn(void);
+
 /* The apps' heap: PSRAM on the device. realloc(3) for n > 0: ptr NULL allocates, otherwise the block is
  * resized and may move; on failure it returns NULL and leaves ptr as it was. It is never called with
  * n == 0. A block comes back with apps_port_free, never with free(). Any task.

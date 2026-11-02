@@ -928,6 +928,92 @@ static void send(const char *args) {
     apps_port_free(event);
 }
 
+/* ---- app.tap and app.drag: Muse's touch, for board tests without a Muse turn (muse_apps_touch) ---- */
+
+/* A coordinate or ms: digits only, at most 6 of them (the touch checks the ranges). */
+static bool take_number(word_t w, int *out) {
+    if (w.n == 0 || w.n > 6) {
+        return false;
+    }
+    int v = 0;
+    for (size_t i = 0; i < w.n; i++) {
+        if (w.p[i] < '0' || w.p[i] > '9') {
+            return false;
+        }
+        v = v * 10 + (w.p[i] - '0');
+    }
+    *out = v;
+    return true;
+}
+
+/* A touch's context, from the line to its done: which it was, and of what app. */
+typedef struct {
+    bool drag;
+    char id[APPS_ID_MAX + 1];
+} touch_ctx_t;
+
+/* "@app.err {"op","id","code","message"}": a touch's failure, with the code app.control would give. */
+static void touch_failed(const touch_ctx_t *t, const char *code, const char *message) {
+    const char *op = t->drag ? "drag" : "tap";
+    cJSON *r = cJSON_CreateObject();
+    bool ok = r != NULL && cJSON_AddStringToObject(r, "id", t->id) != NULL && cJSON_AddStringToObject(r, "code", code) != NULL &&
+              cJSON_AddStringToObject(r, "message", message) != NULL;
+    print_reply("@app.err ", op, ok ? r : NULL);
+    cJSON_Delete(r);
+}
+
+/* The touch's done, on the I/O worker: its payload as "@app {"op":"tap"|"drag",...}", or its failure. */
+static void touch_done(void *ctx, cJSON *r) {
+    touch_ctx_t *t = ctx;
+    const cJSON *error = cJSON_GetObjectItemCaseSensitive(r, "error");
+    if (r == NULL) {
+        fail(t->drag ? "drag" : "tap", t->id, NULL, "out of memory: no room for the result");
+    } else if (error != NULL) {
+        const char *code = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(error, "code"));
+        const char *message = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(error, "message"));
+        touch_failed(t, code != NULL ? code : "unavailable", message != NULL ? message : "");
+    } else {
+        print_result(t->drag ? "drag" : "tap", t->id, cJSON_GetObjectItemCaseSensitive(r, "payload"));
+    }
+    cJSON_Delete(r);
+    apps_port_free(t);
+}
+
+/* app.tap <id> <x> <y> [ms] and app.drag <id> <x1> <y1> <x2> <y2> <ms>. */
+static void touch(const char *args, bool drag) {
+    const char *op = drag ? "drag" : "tap";
+    const char *at = args;
+    word_t id_w = next_word(&at);
+    muse_apps_at_t a = {.x2 = -1, .y2 = -1, .ms = MUSE_APPS_TOUCH_TAP_MS};
+    bool words = id_w.n > 0 && take_number(next_word(&at), &a.x) && take_number(next_word(&at), &a.y);
+    if (words && drag) {
+        words = take_number(next_word(&at), &a.x2) && take_number(next_word(&at), &a.y2) && take_number(next_word(&at), &a.ms);
+    } else if (words) {
+        word_t ms = next_word(&at);
+        words = ms.n == 0 || take_number(ms, &a.ms);
+    }
+    if (!words || next_word(&at).n > 0) {
+        fail(op, NULL, NULL, drag ? "usage: app.drag <id> <x1> <y1> <x2> <y2> <ms>" : "usage: app.tap <id> <x> <y> [ms]");
+        return;
+    }
+    char id[APPS_ID_MAX + 1];
+    if (!take_id(op, id_w, NULL, id)) {
+        return;
+    }
+    touch_ctx_t *t = apps_port_realloc(NULL, sizeof *t);
+    if (t == NULL) {
+        fail(op, id, NULL, "out of memory: no room for the touch");
+        return;
+    }
+    t->drag = drag;
+    snprintf(t->id, sizeof t->id, "%s", id);
+    const char *code = APPS_ERR_OUT_OF_MEMORY, *err = "failed to queue the touch";
+    if (!muse_apps_touch(t->id, drag, &a, touch_done, t, &code, &err)) {
+        touch_failed(t, code, err);
+        apps_port_free(t);
+    }
+}
+
 void muse_apps_console_tick(int64_t now_ms) {
     SemaphoreHandle_t lock = atomic_load(&s_stage_lock);
     if (lock == NULL || xSemaphoreTake(lock, 0) != pdTRUE) {
@@ -984,11 +1070,15 @@ bool muse_apps_console(const char *line) {
         list(args);
     } else if (is(cmd, "send")) {
         send(args);
+    } else if (is(cmd, "tap")) {
+        touch(args, false);
+    } else if (is(cmd, "drag")) {
+        touch(args, true);
     } else {
         char shown[APPS_SHOWN_MAX + 4];
         apps_text_shown(cmd.p, cmd.n, APPS_SHOWN_MAX, shown);
         fail(shown, NULL, NULL,
-             "unknown command app.%s (app.put, app.commit, app.launch, app.stop, app.status, app.list, app.send)",
+             "unknown command app.%s (app.put, app.commit, app.launch, app.stop, app.status, app.list, app.send, app.tap, app.drag)",
              shown);
     }
     return true;

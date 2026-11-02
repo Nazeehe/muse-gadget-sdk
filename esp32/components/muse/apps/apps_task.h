@@ -305,6 +305,18 @@ void apps_task_set_list(const apps_listed_t *apps, int n);
  * names lock (held only for copies). The store never drops it. */
 bool apps_task_running(char *id, size_t cap);
 
+/*
+ * For app.control's tap and drag (apps_touch.h). apps_task_touch_target, on the LVGL task: APPS_TOUCH_TARGET_OK when id is the app
+ * that runs (as apps_task_running says) and its touches reach it (apps_task_touch_alive), with *gen its app_gen, read with the id
+ * under the names lock; _HUNG for that app hung; _GONE when id isn't the app that runs, or its table isn't on the layer; _BUSY when
+ * the names lock wasn't free within 2 ms (it never waits longer: the LVGL task's rule). apps_task_touch_alive, any task, atomics
+ * only: whether gen is still that app with its table on the layer: the app that began last, its table published, no reset
+ * outstanding (the objects on the layer are its), and not hung.
+ */
+typedef enum { APPS_TOUCH_TARGET_OK, APPS_TOUCH_TARGET_GONE, APPS_TOUCH_TARGET_HUNG, APPS_TOUCH_TARGET_BUSY } apps_touch_target_t;
+apps_touch_target_t apps_task_touch_target(const char *id, uint32_t *gen);
+bool apps_task_touch_alive(uint32_t gen);
+
 /* N3: the app that is loaded (from its launch to its end, as apps_task_brief's) and what its end frees, for a load beside it
  * (apps_room_beside): id into id (cap bytes), and into *bytes its Lua heap as the VM counted it at the record's last refresh
  * (apps_vm_mem_used: after its run settled, then at most once a second) and its package's blocks (its files, manifest.json's

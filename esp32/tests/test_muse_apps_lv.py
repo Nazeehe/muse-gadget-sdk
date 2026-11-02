@@ -517,10 +517,16 @@ class HarnessTest(unittest.TestCase):
         watch_spin = c_function(source, "static void watch_spin(lv_obj_t *screen) {")
         pairing_end = source.index(watch_spin) + len(watch_spin)
         self.assertIn("s_pairing_cb != NULL && screen != NULL ? lv_obj_get_display(screen) : NULL", watch_spin)
+        # app.control tap and drag's hit test reads the layer's display for its layers (apps_lv_hit), in every apps build: it
+        # registers nothing.
+        hit = c_function(source, "int apps_lv_hit(int32_t x, int32_t y) {")
+        self.assertNotIn("add_event_cb", hit)
+        hit_start = source.index(hit)
+        hit_end = hit_start + len(hit)
         mentions = [m.start() for m in re.finditer(r"on_refresh|watch_frames|s_frames|launcher frame|spin frame|scroll frame|"
                                                    r"scroll_box_scrolling|watch_scroll_end|on_scroll_end|LV_EVENT_SCROLL_END|"
                                                    r"LV_EVENT_REFR_READY|lv_display_add_event_cb|lv_obj_get_display", source)
-                    if not pairing_start <= m.start() < pairing_end]
+                    if not pairing_start <= m.start() < pairing_end and not hit_start <= m.start() < hit_end]
         self.assertGreaterEqual(len(mentions), 10)
         self.assertIn("spin frame", " ".join(source[i:i + 12] for i in mentions))
         # Games Task 5: the list's line and the walk that finds a scroll box scrolling are the bench's too.
@@ -773,6 +779,12 @@ class BenchHarnessTest(unittest.TestCase):
 
     def test_a_throw_that_ends_unseen_times_no_rest(self):  # R5f: SCROLL_END ends the timing; the next drag's first refresh isn't timed
         self.run_case("a_throw_that_ends_unseen_times_no_rest")
+
+    def test_the_touchs_hit_test_is_lvgls(self):  # app.control tap and drag: what LVGL would press, and whether it is the app's
+        self.run_case("the_touchs_hit_test_is_lvgls")
+
+    def test_the_touchs_scroll_boxes(self):  # app.control tap and drag: the scroll boxes, their y and whether they move
+        self.run_case("the_touchs_scroll_boxes")
 
 
 # ---- The fakes against the real headers ----

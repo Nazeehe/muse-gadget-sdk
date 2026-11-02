@@ -73,6 +73,9 @@ bool muse_apps_starting(void);
  *   app.status                           the app task's record
  *   app.list                             the installed apps, most recent first (as the launcher lists them)
  *   app.send <id> <event> [json]         message(event, data) to the app that runs, and its reply
+ *   app.tap <id> <x> <y> [ms]            app.control's tap (muse_apps_touch, ms MUSE_APPS_TOUCH_TAP_MS when it has none): the
+ *                                        I/O worker prints the payload as "@app {"op":"tap",...}", or "@app.err" with its code
+ *   app.drag <id> <x1> <y1> <x2> <y2> <ms>  app.control's drag, the same way ("op":"drag")
  */
 bool muse_apps_console(const char *line);
 
@@ -169,9 +172,10 @@ bool muse_apps_id_valid(const char *id, char *err, size_t err_len);
 bool muse_apps_install(const char *id, bool run, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
 
 /*
- * Link's app.control and app.api (apps_control.c; main/apps_link.c has the commands). Any task, the Noise session's included,
- * which they never hold for long: list and status wait for one job of the I/O worker (the store is the worker's: X11) for at most
- * MUSE_APPS_CONTROL_WAIT_MS, and the others queue theirs and return.
+ * Link's app.control and app.api (apps_control.c; main/apps_link.c has the commands; snapshot, tap and drag are apps_snapshot.c's
+ * and apps_touch.c's, below). Any task, the Noise session's included, which they never hold for long: list and status wait for
+ * one job of the I/O worker (the store is the worker's: X11) for at most MUSE_APPS_CONTROL_WAIT_MS, and the others queue theirs
+ * and return.
  *
  * Results are a command's: {"ok":true,"payload":{...}} or {"ok":false,"error":{"code","message"}}. The codes are D14's
  * (invalid_params, not_found, busy, unavailable, out_of_memory) and a launch's own (apps_install.h: crashed, not_running). An id
@@ -320,6 +324,74 @@ bool muse_apps_write_guide(muse_apps_done_cb done, void *ctx, const char **code,
 #define MUSE_APPS_SNAPSHOT_BAD_SCALE "scale must be 1 (full size) or 2 (half)"
 bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void *ctx, const char **code, const char **err);
 
+/*
+ * Link's app.control tap and drag (apps/apps_touch.h has how it runs): Muse's touches on the app it tests, played through LVGL's own
+ * input as a finger's would be (muse_ui.h's guarded drag), so the app's widgets hear press, release, tap and long_press and its boxes
+ * scroll, throw and spring back. A tap presses (x, y) for at's ms; a drag presses (x, y) and moves straight to (x2, y2) over ms, its
+ * point following the clock, and lifts there. x, y, x2 and y2 are the screen's pixels, 0 to MUSE_APPS_TOUCH_XY_MAX, as status's ui
+ * has them; ms is MUSE_APPS_TOUCH_MS_MIN to _MAX (a tap's at->ms MUSE_APPS_TOUCH_TAP_MS when the caller has none). LVGL makes a press
+ * a long press 400 ms into it, at a read of the touch that comes every 15 ms: a tap of MUSE_APPS_TOUCH_LONG_MS or more is always one,
+ * and one under 400 ms never is. A drag that is a right swipe puts the app behind, as a finger's does.
+ *
+ * Any task, the Noise session's and the console's included: it never waits. True once queued: done then runs exactly once, on the
+ * I/O worker; false, with nothing queued and done never called, and *code and *err (literals) saying why:
+ *   invalid_params   not an app id; at out of its ranges (MUSE_APPS_TOUCH_BAD_TAP or _BAD_DRAG, also for a NULL at); no done
+ *   busy             a touch is already under way (one at a time: MUSE_APPS_TOUCH_BUSY)
+ *   out_of_memory    no memory for the job, or the I/O worker can't take it now
+ * One deadline for the whole touch, MUSE_APPS_TOUCH_TOTAL_MS from this call, under app.control's 30 s: a job that starts with less
+ * than APPS_TOUCH_MIN_LEFT_MS of it left does nothing and answers busy. The job: id must be the app that runs (not_running,
+ * MUSE_APPS_TOUCH_NOT_RUNNING, else); the screen is woken (muse_input_wake("touch"), as a snapshot's is) and has
+ * MUSE_APPS_TOUCH_SCREEN_MS from then to be lit and the touch taken. The LVGL task then checks, at the input read that would press
+ * the first point and before LVGL sees it (apps_touch.h), that id is still the app that runs with its table on the layer, not hung,
+ * its layer in front with no launcher or crash card over it, no voice turn on, the screen lit, no finger on the screen, and that
+ * the first point is on the app (what LVGL would press there is the layer or inside it). At every later read it checks all but the
+ * finger again for the point that read gives, and a finger that comes down, and cuts the touch when one fails: a clean lift that
+ * sends the widget pressed a release and no tap, and touches nothing more. The result is
+ *   {"ok":true,"payload":{"id","action":"tap"|"drag","pressed","heard":[...],"front","cut","played_ms","scroll":[...],
+ *    "warnings":[...]}}
+ * pressed the widget the touch went down on, as the "kind#slot" status's ui names it (null for the layer, where no widget is);
+ * heard the events the app was sent, "kind#slot event" in their order, at most MUSE_APPS_TOUCH_HEARD_MAX (a warning counts the
+ * rest); front whether id is the app on screen once the touch is over (false after a right swipe); cut whether the touch was cut,
+ * a warning saying why; played_ms how long it pressed; scroll, for each box with scroll = "y" whose scroll the touch moved,
+ * {"id","y"}: its scroll y once it has come to rest, or MUSE_APPS_TOUCH_SETTLE_MS after the lift (a warning says it was still
+ * moving). Or {"ok":false,"error":{"code","message"}}:
+ *   busy             the job came too late ("the gadget was busy for <n> ms; the touch wasn't played, so try again"), the last
+ *                    touch's is still ending (MUSE_APPS_TOUCH_BUSY), or the app task held its names at the take (APPS_TASK_MSG_BUSY)
+ *   not_running      MUSE_APPS_TOUCH_NOT_RUNNING
+ *   unavailable      nothing was touched: MUSE_APPS_TOUCH_NO_WAKE (the screen wasn't lit, or the touch not taken, in time),
+ *                    MUSE_APPS_TOUCH_NOT_FRONT, MUSE_APPS_TOUCH_COVERED, MUSE_APPS_TOUCH_FINGER, APPS_TASK_MSG_HUNG,
+ *                    MUSE_APPS_TOUCH_NO_INPUT; or MUSE_APPS_TOUCH_SLOW, a touch that didn't end in time (it is cut)
+ *   out_of_memory    no memory for the result
+ * The touches it sends reach the app tagged as Muse's (apps_ui.h's APPS_UI_INJECTED): its handlers hear them as any other, and they
+ * open none of the gates there to show a person tapped (sys.show's and muse.ask's: apps_rt_touch).
+ */
+#define MUSE_APPS_TOUCH_XY_MAX 465          /* x, y, x2 and y2: 0 to this, the 466 px screen's pixels */
+#define MUSE_APPS_TOUCH_MS_MIN 50           /* a touch's ms, both ways: the touch player's MUSE_UI_DRAG_MS_MIN */
+#define MUSE_APPS_TOUCH_MS_MAX 2000         /* and its MUSE_UI_DRAG_MS_MAX */
+#define MUSE_APPS_TOUCH_TAP_MS 80           /* a tap's press when it has no ms: the bench's tap */
+#define MUSE_APPS_TOUCH_LONG_MS 500         /* a tap this long or longer is a long press: LVGL's 400 ms, and a read's room */
+#define MUSE_APPS_TOUCH_TOTAL_MS 15000      /* the whole touch's, from muse_apps_touch: under app.control's 30 s */
+#define MUSE_APPS_TOUCH_SCREEN_MS 5000      /* from the wake, for the screen to light and the touch to be taken */
+#define MUSE_APPS_TOUCH_SETTLE_MS 1000      /* after the lift, the most a scroll the touch began is waited for */
+#define MUSE_APPS_TOUCH_HEARD_MAX 8         /* the events heard that a result lists */
+#define MUSE_APPS_TOUCH_BAD_TAP "at must be {x,y} or {x,y,ms} for a tap: x and y 0 to 465, ms 50 to 2000"
+#define MUSE_APPS_TOUCH_BAD_DRAG "at must be {x,y,x2,y2,ms} for a drag: x, y, x2 and y2 0 to 465, ms 50 to 2000"
+#define MUSE_APPS_TOUCH_BUSY "a touch is already playing on the gadget; try again in a second"
+#define MUSE_APPS_TOUCH_NOT_RUNNING "'%s' isn't running; launch it first (app.control launch)"
+#define MUSE_APPS_TOUCH_NO_WAKE "the gadget's screen didn't wake for the touch; nothing was touched, so try again"
+#define MUSE_APPS_TOUCH_NOT_FRONT \
+    "'%s' isn't on screen (the launcher, a card, another app or a voice turn covers it); nothing was touched"
+#define MUSE_APPS_TOUCH_COVERED \
+    "something is over '%s' where the touch would land (a picture Muse showed, or a pairing code); nothing was touched"
+#define MUSE_APPS_TOUCH_FINGER "someone is touching the gadget's screen; nothing was touched, so try again"
+#define MUSE_APPS_TOUCH_NO_INPUT "this gadget's touch screen can't be played from here; nothing was touched"
+#define MUSE_APPS_TOUCH_SLOW "the touch didn't end in time and was cut; try again"
+typedef struct {
+    int x, y, x2, y2, ms;  /* a tap's x2 and y2 are ignored: it is pressed where it went down */
+} muse_apps_at_t;
+bool muse_apps_touch(const char *id, bool drag, const muse_apps_at_t *at, muse_apps_done_cb done, void *ctx, const char **code,
+                     const char **err);
+
 /* Makes the app layer on screen (apps_lv_build) and takes its touches and swipes. In build_overlays(), after the
  * page dots and before the downloaded image, under the display lock and before the frame timer exists. */
 void muse_apps_ui_build(lv_obj_t *screen);
@@ -333,7 +405,8 @@ void muse_apps_ui_pairing(void (*pairing)(bool on));
  * asked for (a front once the app's table is published), the layer's place after a voice turn has ended, and the
  * cards (neither of these two during a turn); a launcher left open while the screen is dark closes, which frees its
  * icons (not one that holds for a pick); last, a snapshot app.control asked for, on the first frame the screen isn't dark
- * (apps_snapshot_take_pending). */
+ * (apps_snapshot_take_pending), and a tap or drag it asked for, handed to the touch player on that frame and answered once the
+ * scroll it began has come to rest (apps_touch_supervise). */
 void muse_apps_ui_supervise(void);
 
 /* The LVGL task, every frame the screen is awake: the apply step (apps_lv_apply). True while the app layer or a card

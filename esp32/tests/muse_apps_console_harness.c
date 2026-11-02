@@ -467,6 +467,32 @@ static void cjson_free(void *ptr) {
     }
 }
 
+/* ---- The fakes: app.control tap and drag (apps_touch.c, which has its own harness) ---- */
+
+static int touches;
+static bool touch_drag, touch_ok = true;
+static const char *touch_code = "busy", *touch_err = MUSE_APPS_TOUCH_BUSY;
+static char touch_id[32];
+static muse_apps_at_t touch_at;
+static muse_apps_done_cb touch_done;
+static void *touch_ctx;
+
+bool muse_apps_touch(const char *id, bool drag, const muse_apps_at_t *at, muse_apps_done_cb done, void *ctx, const char **code,
+                     const char **err) {
+    touches++;
+    snprintf(touch_id, sizeof touch_id, "%s", id != NULL ? id : "(null)");
+    touch_drag = drag;
+    touch_at = at != NULL ? *at : (muse_apps_at_t){0};
+    if (!touch_ok) {
+        *code = touch_code;
+        *err = touch_err;
+        return false;
+    }
+    touch_done = done;
+    touch_ctx = ctx;
+    return true;
+}
+
 /* ---- The fakes: the I/O worker ---- */
 
 static struct {
@@ -1711,6 +1737,72 @@ static void send_returns_the_reply(void) {
            "^[a-z][a-z0-9_]{1,23}$\"}\n");
 }
 
+/* >app.tap <id> X Y [MS] and >app.drag <id> X1 Y1 X2 Y2 MS: muse_apps_touch with a tap's ms 80 when it has none, nothing printed
+ * until its done, which prints the payload as "@app {"op":"tap",...}" (or "drag") or the failure with its code; the call's refusal
+ * the same way; the words checked first. */
+static void touch_lines(void) {
+    size_t held = port_held;
+    CHECK(line("app.tap list 233 150"), "tap");
+    EXPECT("");
+    CHECK(touches == 1 && !touch_drag && strcmp(touch_id, "list") == 0 && touch_at.x == 233 && touch_at.y == 150 &&
+              touch_at.ms == MUSE_APPS_TOUCH_TAP_MS && touch_done != NULL,
+          "tap: %d %d %s %d,%d %d", touches, touch_drag, touch_id, touch_at.x, touch_at.y, touch_at.ms);
+    touch_done(touch_ctx, cJSON_Parse("{\"ok\":true,\"payload\":{\"id\":\"list\",\"action\":\"tap\",\"pressed\":\"label#3\","
+                                      "\"heard\":[\"label#3 press\",\"label#3 release\",\"label#3 tap\"],\"front\":true,"
+                                      "\"cut\":false,\"played_ms\":80,\"scroll\":[],\"warnings\":[]}}"));
+    EXPECT("@app {\"op\":\"tap\",\"id\":\"list\",\"action\":\"tap\",\"pressed\":\"label#3\",\"heard\":[\"label#3 press\","
+           "\"label#3 release\",\"label#3 tap\"],\"front\":true,\"cut\":false,\"played_ms\":80,\"scroll\":[],\"warnings\":[]}\n");
+    CHECK(port_held == held, "the touch's context freed: %zu held", port_held - held);
+    CHECK(line("app.tap  list   0 465 600 "), "a long press");
+    CHECK(touches == 2 && touch_at.x == 0 && touch_at.y == 465 && touch_at.ms == 600, "%d,%d %d", touch_at.x, touch_at.y, touch_at.ms);
+    touch_done(touch_ctx, cJSON_Parse("{\"ok\":false,\"error\":{\"code\":\"unavailable\",\"message\":\"" MUSE_APPS_TOUCH_FINGER
+                                      "\"}}"));
+    EXPECT("@app.err {\"op\":\"tap\",\"id\":\"list\",\"code\":\"unavailable\",\"message\":\"" MUSE_APPS_TOUCH_FINGER "\"}\n");
+    CHECK(line("app.drag list 233 350 233 150 300"), "drag");
+    CHECK(touches == 3 && touch_drag && touch_at.x == 233 && touch_at.y == 350 && touch_at.x2 == 233 && touch_at.y2 == 150 &&
+              touch_at.ms == 300,
+          "drag: %d,%d to %d,%d over %d", touch_at.x, touch_at.y, touch_at.x2, touch_at.y2, touch_at.ms);
+    touch_done(touch_ctx, NULL);
+    EXPECT("@app.err {\"op\":\"drag\",\"id\":\"list\",\"message\":\"out of memory: no room for the result\"}\n");
+    CHECK(port_held == held, "every context freed: %zu held", port_held - held);
+    /* Ranges are the touch's: a number out of them goes to it, and its refusal is printed with its code. */
+    touch_ok = false;
+    touch_code = "invalid_params";
+    touch_err = MUSE_APPS_TOUCH_BAD_TAP;
+    CHECK(line("app.tap list 500 1 10"), "out of range");
+    EXPECT("@app.err {\"op\":\"tap\",\"id\":\"list\",\"code\":\"invalid_params\",\"message\":\"" MUSE_APPS_TOUCH_BAD_TAP
+           "\"}\n");
+    touch_code = "busy";
+    touch_err = MUSE_APPS_TOUCH_BUSY;
+    CHECK(line("app.drag list 1 2 3 4 50"), "busy");
+    EXPECT("@app.err {\"op\":\"drag\",\"id\":\"list\",\"code\":\"busy\",\"message\":\"" MUSE_APPS_TOUCH_BUSY "\"}\n");
+    touch_ok = true;
+    CHECK(port_held == held && touches == 5, "the refused contexts freed: %zu held, %d touches", port_held - held, touches);
+    /* The words: none of these reaches the touch. */
+    static const char *const bad_taps[] = {"app.tap", "app.tap list", "app.tap list 233", "app.tap list 233 150 80 9",
+                                           "app.tap list x 150", "app.tap list 233 -1", "app.tap list 233 1.5", "app.tap list 2e2 1",
+                                           "app.tap list 1234567 1"};
+    for (size_t i = 0; i < ARRAY_LEN(bad_taps); i++) {
+        CHECK(line("%s", bad_taps[i]), "%s", bad_taps[i]);
+        EXPECT("@app.err {\"op\":\"tap\",\"message\":\"usage: app.tap <id> <x> <y> [ms]\"}\n");
+    }
+    static const char *const bad_drags[] = {"app.drag list 1 2 3 4", "app.drag list 1 2 3 4 5 6", "app.drag list 1 2 3 y 5",
+                                            "app.drag"};
+    for (size_t i = 0; i < ARRAY_LEN(bad_drags); i++) {
+        CHECK(line("%s", bad_drags[i]), "%s", bad_drags[i]);
+        EXPECT("@app.err {\"op\":\"drag\",\"message\":\"usage: app.drag <id> <x1> <y1> <x2> <y2> <ms>\"}\n");
+    }
+    CHECK(line("app.tap List 1 2"), "a bad id");
+    EXPECT("@app.err {\"op\":\"tap\",\"id\":\"List\",\"message\":\"app id 'List' must match ^[a-z][a-z0-9_]{1,23}$\"}\n");
+    CHECK(touches == 5, "none of them touched: %d", touches);
+    /* No memory for the touch's context. */
+    port_refuse = 0;
+    CHECK(line("app.tap list 1 2"), "no memory");
+    EXPECT("@app.err {\"op\":\"tap\",\"id\":\"list\",\"message\":\"out of memory: no room for the touch\"}\n");
+    port_refuse = -1;
+    CHECK(touches == 5 && port_held == held, "nothing touched, nothing held");
+}
+
 static void foreign_and_unknown_lines(void) {
     CHECK(!muse_apps_console("status"), "not ours");
     CHECK(!muse_apps_console("sdk_token=x"), "not ours");
@@ -1719,11 +1811,11 @@ static void foreign_and_unknown_lines(void) {
     EXPECT("");
     CHECK(line("app.bogus x"), "ours");
     EXPECT("@app.err {\"op\":\"bogus\",\"message\":\"unknown command app.bogus (app.put, app.commit, app.launch, "
-           "app.stop, app.status, app.list, app.send)\"}\n");
+           "app.stop, app.status, app.list, app.send, app.tap, app.drag)\"}\n");
     /* What someone typed is shown cleaned: valid UTF-8 kept, control bytes and broken bytes as '?', 64 bytes at most. */
     CHECK(line("app.\x01\xff\xc3\xa9t\xc3"), "ours");
     EXPECT("@app.err {\"op\":\"??\xc3\xa9t?\",\"message\":\"unknown command app.??\xc3\xa9t? (app.put, app.commit, "
-           "app.launch, app.stop, app.status, app.list, app.send)\"}\n");
+           "app.launch, app.stop, app.status, app.list, app.send, app.tap, app.drag)\"}\n");
     /* A path too long to be one: shown cut at 64 bytes. */
     char path[80], shown_path[80], want[512];
     snprintf(path, sizeof path, "an/%.71s.lua", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -3112,6 +3204,7 @@ int main(int argc, char **argv) {
         {"an_idle_stage_is_freed", an_idle_stage_is_freed},
         {"send_returns_the_reply", send_returns_the_reply},
         {"foreign_and_unknown_lines", foreign_and_unknown_lines},
+        {"touch_lines", touch_lines},
         {"stage_out_of_memory", stage_out_of_memory},
         {"a_repeated_commit_is_busy", a_repeated_commit_is_busy},
         {"a_link_install_is_one_job", a_link_install_is_one_job},

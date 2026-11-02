@@ -693,6 +693,9 @@ static int n_objs;
 static int next_id;
 static int next_order;
 static lv_obj_t screen_obj;
+/* The display's other three layers (lv_display.c's): screens of their own, over the screen (sys, top) and under it (bottom). The
+ * top and the system layer aren't clickable, the bottom one is, as LVGL 9.5.0 makes them; a case puts what covers the app there. */
+static lv_obj_t layer_top_obj, layer_sys_obj, layer_bottom_obj;
 static lv_display_t display_obj;
 static lv_indev_t indev_obj;
 static bool indev_present = true;
@@ -1512,6 +1515,13 @@ void lv_obj_set_scroll_snap_x(lv_obj_t *obj, lv_scroll_snap_t align) {
     }
     obj->snap_x = align;
     logline("scroll_snap_x %d %s", obj->id, names[align]);
+}
+
+int32_t lv_obj_get_scroll_y(const lv_obj_t *obj) {
+    if (use((lv_obj_t *)obj, "lv_obj_get_scroll_y", NULL) == NULL) {
+        return 0;
+    }
+    return obj->scroll_y;
 }
 
 int32_t lv_obj_get_scroll_x(const lv_obj_t *obj) {
@@ -3335,6 +3345,44 @@ static lv_obj_t *search_obj(lv_obj_t *o, int32_t x, int32_t y) {
     return on && (o->flags & LV_OBJ_FLAG_CLICKABLE) != 0 ? o : NULL;
 }
 
+lv_obj_t *lv_indev_search_obj(lv_obj_t *obj, lv_point_t *point) {
+    if (use(obj, "lv_indev_search_obj", NULL) == NULL || point == NULL) {
+        return NULL;
+    }
+    return search_obj(obj, point->x, point->y);
+}
+
+static lv_obj_t *display_layer(lv_display_t *disp, lv_obj_t *layer, const char *fn) {
+    tick();
+    if (disp != &display_obj) {
+        fake_error("%s on %p, not the display", fn, (void *)disp);
+        return NULL;
+    }
+    return layer;
+}
+
+lv_obj_t *lv_display_get_screen_active(lv_display_t *disp) {
+    return display_layer(disp, &screen_obj, "lv_display_get_screen_active");
+}
+
+lv_obj_t *lv_display_get_layer_top(lv_display_t *disp) {
+    return display_layer(disp, &layer_top_obj, "lv_display_get_layer_top");
+}
+
+lv_obj_t *lv_display_get_layer_sys(lv_display_t *disp) {
+    return display_layer(disp, &layer_sys_obj, "lv_display_get_layer_sys");
+}
+
+lv_obj_t *lv_display_get_layer_bottom(lv_display_t *disp) {
+    return display_layer(disp, &layer_bottom_obj, "lv_display_get_layer_bottom");
+}
+
+/* The 1.75C's panel isn't rotated: a point stays where it is (lv_display.c's, for LV_DISPLAY_ROTATION_0). */
+void lv_display_rotate_point(lv_display_t *disp, lv_point_t *point) {
+    (void)display_layer(disp, NULL, "lv_display_rotate_point");
+    (void)point;
+}
+
 /* A touch the way LVGL 9.5.0's indev (lv_indev.c) sends it. A new touch on an object: a throw still running takes one more step and
  * stops (indev_proc_press deletes the throw's animation and runs its handler once: a snap's animation it starts goes on, and a vertical
  * throw that isn't spent ends where it is, with no SCROLL_END), the touch's state starts afresh, and the object gets PRESSED. */
@@ -3510,6 +3558,11 @@ static void fake_free_all(void) {
     screen_obj.cls = "screen";
     screen_obj.area = (lv_area_t){0, 0, 465, 465};
     screen_obj.lw = screen_obj.lh = 466;
+    lv_obj_t *const layers[] = {&layer_top_obj, &layer_sys_obj, &layer_bottom_obj};
+    for (size_t i = 0; i < ARRAY_LEN(layers); i++) {
+        *layers[i] = screen_obj;
+        layers[i]->flags = layers[i] == &layer_bottom_obj ? LV_OBJ_FLAG_CLICKABLE : 0;
+    }
     indev_present = true;
     gesture_dir = LV_DIR_NONE;
     pressed_obj = NULL;
@@ -10431,6 +10484,98 @@ static void a_throw_that_ends_unseen_times_no_rest(void) {
     FINISH(&e);
 }
 
+/* ---- app.control tap and drag (apps_touch.h) ---- */
+
+/* apps_lv_hit finds what LVGL 9.5.0 would press at a point (pointer_search_obj: the system layer, the top layer, the screen, the bottom
+ * layer) and says whose it is: a widget's slot (the nearest up from the object that has a record: a button for its label), the layer
+ * itself, or outside when the layer is hidden or something over it takes the point. Nothing it asks is a call that changes anything. */
+static void the_touchs_hit_test_is_lvgls(void) {
+    env_t e;
+    list_scene(&e, 10, true);  /* the list is slot 0 (x 83 to 382, y 133 to 332), row i slot i (50 px each, from y 133) */
+    RUN(&e, "b = ui.button{w = 100, h = 40, text = 'Go', align = 'top', y = 40} b:on('tap', function() end)");
+    CHECK(APPLY(&e), "the button");
+    fake_layout();
+    log_clear();
+    CHECK(apps_lv_hit(233, 150) == 1 && apps_lv_hit(233, 190) == 2 && apps_lv_hit(100, 330) == 4, "the rows: %d %d %d",
+          apps_lv_hit(233, 150), apps_lv_hit(233, 190), apps_lv_hit(100, 330));
+    CHECK(apps_lv_hit(233, 400) == APPS_LV_HIT_LAYER && apps_lv_hit(0, 0) == APPS_LV_HIT_LAYER &&
+              apps_lv_hit(465, 465) == APPS_LV_HIT_LAYER,
+          "no widget: the layer, which covers the screen: %d %d %d", apps_lv_hit(233, 400), apps_lv_hit(0, 0), apps_lv_hit(465, 465));
+    int button = fake_nth("button", 0);
+    const lv_area_t a = fake_obj(button)->area;
+    int label = fake_nth("label", 0);
+    CHECK(fake_parent(label) == button, "the button's text is in it");
+    CHECK(apps_lv_hit((a.x1 + a.x2) / 2, (a.y1 + a.y2) / 2) == 11, "the button's middle, on its text: %d",
+          apps_lv_hit((a.x1 + a.x2) / 2, (a.y1 + a.y2) / 2));
+    CHECK(log_count("") == 0, "the hit test changed something\n%s", log_peek());
+    CHECK(apps_lv_kind(0) == APPS_W_BOX && apps_lv_kind(1) == APPS_W_BOX && apps_lv_kind(11) == APPS_W_BUTTON &&
+              apps_lv_kind(12) == -1 && apps_lv_kind(-1) == -1 && apps_lv_kind(APPS_UI_SLOTS) == -1,
+          "the kinds: %d %d %d %d", apps_lv_kind(0), apps_lv_kind(1), apps_lv_kind(11), apps_lv_kind(12));
+
+    /* A list that has scrolled: the row now at the point. */
+    fake_drag(233, 300, 233, 200, 10, 2);
+    fake_lift();
+    SETTLE();
+    fake_layout();
+    CHECK(apps_lv_hit(233, 150) == 3, "scrolled 100 px, 150 is on row 3: %d", apps_lv_hit(233, 150));
+
+    /* Over the app, a clickable object on the top layer takes the point where it is (the downloaded image, the pairing card); one
+     * that isn't clickable takes none, and LVGL presses the app's widget through it. */
+    lv_obj_t *cover = lv_obj_create(&layer_top_obj);
+    fake_place(cover->id, 0, 0, 465, 160);
+    CHECK(apps_lv_hit(233, 150) == APPS_LV_HIT_OUTSIDE && apps_lv_hit(233, 190) == 4, "the cover: %d, below it %d",
+          apps_lv_hit(233, 150), apps_lv_hit(233, 190));
+    lv_obj_remove_flag(cover, LV_OBJ_FLAG_CLICKABLE);
+    CHECK(apps_lv_hit(233, 150) == 3, "through a cover that takes no touch: %d", apps_lv_hit(233, 150));
+    lv_obj_delete(cover);
+    lv_obj_t *sys = lv_obj_create(&layer_sys_obj);
+    fake_place(sys->id, 0, 0, 465, 465);
+    CHECK(apps_lv_hit(233, 150) == APPS_LV_HIT_OUTSIDE, "the system layer's: %d", apps_lv_hit(233, 150));
+    lv_obj_delete(sys);
+
+    /* A card is over the layer on the screen (the crash card, the launcher): outside. */
+    apps_lv_show_crash("Hello", "main.lua:1: boom");
+    fake_layout();
+    CHECK(apps_lv_hit(233, 150) == APPS_LV_HIT_OUTSIDE && apps_lv_hit(233, 400) == APPS_LV_HIT_OUTSIDE, "the card: %d %d",
+          apps_lv_hit(233, 150), apps_lv_hit(233, 400));
+    apps_lv_hide_cards();
+    CHECK(apps_lv_hit(233, 150) == 3, "the card closed: %d", apps_lv_hit(233, 150));
+
+    /* The layer behind: nothing of the app's can be pressed. */
+    apps_lv_set_front(false);
+    CHECK(apps_lv_hit(233, 150) == APPS_LV_HIT_OUTSIDE && apps_lv_hit(233, 400) == APPS_LV_HIT_OUTSIDE, "behind: %d %d",
+          apps_lv_hit(233, 150), apps_lv_hit(233, 400));
+    FINISH(&e);
+    /* No layer at all. */
+    CHECK(apps_lv_hit(233, 150) == APPS_LV_HIT_OUTSIDE, "after the reset: %d", apps_lv_hit(233, 150));
+}
+
+/* apps_lv_scrolls: the app's boxes with scroll = "y", in slot order, with their scroll y and whether they move (a drag, the throw), at
+ * most max of them; a box that doesn't scroll isn't one. */
+static void the_touchs_scroll_boxes(void) {
+    env_t e;
+    list_scene(&e, 10, true);
+    RUN(&e, "other = ui.box{w = 100, h = 100}  more = ui.box{w = 100, h = 60, scroll = 'y'}");
+    CHECK(APPLY(&e), "two more boxes");
+    apps_lv_scroll_t s[4];
+    int n = apps_lv_scrolls(s, 4);
+    CHECK(n == 2 && s[0].slot == 0 && s[0].y == 0 && !s[0].moving && s[1].slot == 12 && s[1].y == 0 && !s[1].moving,
+          "the two scroll boxes: %d, %d %d", n, n > 0 ? s[0].slot : -1, n > 1 ? s[1].slot : -1);
+    CHECK(apps_lv_scrolls(s, 1) == 1 && s[0].slot == 0 && apps_lv_scrolls(s, 0) == 0, "max is kept");
+    fake_drag(233, 300, 233, 200, 10, 0);
+    n = apps_lv_scrolls(s, 4);
+    CHECK(n == 2 && s[0].y == 100 && s[0].moving && !s[1].moving, "dragged: y %d, moving %d", s[0].y, s[0].moving);
+    fake_lift();
+    n = apps_lv_scrolls(s, 4);
+    CHECK(n == 2 && s[0].moving, "its throw moves it");
+    SETTLE();
+    n = apps_lv_scrolls(s, 4);
+    CHECK(n == 2 && s[0].y == fake_obj(BOX_OBJ(0))->scroll_y && s[0].y > 100 && !s[0].moving, "at rest at %d (moving %d)", s[0].y,
+          s[0].moving);
+    FINISH(&e);
+    CHECK(apps_lv_scrolls(s, 4) == 0, "no app: none");
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -10566,6 +10711,8 @@ int main(int argc, char **argv) {
         {"children_of_a_scroll_box_get_no_overflow_warning", children_of_a_scroll_box_get_no_overflow_warning},
         {"scroll_frame_log", scroll_frame_log},
         {"a_throw_that_ends_unseen_times_no_rest", a_throw_that_ends_unseen_times_no_rest},
+        {"the_touchs_hit_test_is_lvgls", the_touchs_hit_test_is_lvgls},
+        {"the_touchs_scroll_boxes", the_touchs_scroll_boxes},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

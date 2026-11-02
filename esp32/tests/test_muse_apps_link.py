@@ -104,9 +104,9 @@ class LinkCommands(unittest.TestCase):
         return done.stdout
 
     def test_register_entries_fit_budget(self):
-        # D11, re-asserted by Tasks 24 and 25: all four of the apps' entries, app.send's and app.control's snapshot scale included,
-        # are advertised, and fit the budget (the headroom rule would leave app.control out when they didn't; it still dispatches,
-        # and app.api's payload names it).
+        # D11, re-asserted by Tasks 24 and 25 and by tap and drag: all four of the apps' entries, app.send's, app.control's snapshot
+        # scale and its tap and drag's at included, are advertised, and fit the budget (the headroom rule would leave app.control
+        # out when they didn't; it still dispatches, and app.api's payload names it).
         stdout = self.run_case("register_entries")
         printed = {}
         for line in stdout.splitlines():
@@ -134,7 +134,9 @@ class LinkCommands(unittest.TestCase):
         control = everything["app.control"]
         self.assertEqual(control["description"], CONTROL_DESCRIPTION)
         self.assertEqual(sorted(control["required"]), ["action"])
-        self.assertEqual(sorted(control["optional"]), ["id", "scale"])
+        self.assertEqual(sorted(control["optional"]), ["at", "id", "scale"])
+        self.assertEqual(control["required"]["action"]["description"], "list, status, logs, launch, stop, remove, snapshot, tap or drag.")
+        self.assertEqual(control["optional"]["at"], {"type": "object", "description": "tap {x,y,ms?}; drag {x,y,x2,y2,ms}"})
         self.assertEqual(control["required"]["action"]["type"], "string")
         self.assertEqual(control["optional"]["id"]["type"], "string")
         self.assertEqual(control["optional"]["scale"], {"type": "integer", "description": "1 full size (default), 2 half"})
@@ -155,7 +157,7 @@ class LinkCommands(unittest.TestCase):
         self.run_case("install_handler")
         self.run_case("handles")
 
-    def test_control_actions_validated(self):  # the action as typed, the id for all but list, the sync and async ones, scale
+    def test_control_actions_validated(self):  # the action as typed, the id for all but list, the sync and async ones, scale, at
         self.run_case("control_handler")
 
     def test_api_is_async_and_frees_its_context(self):  # D2: _async, the request copied, freed once done has sent
@@ -827,16 +829,115 @@ class GuideAndSkill(unittest.TestCase):
         section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
         code, constant, guide, total = 8028, 13168, 11004, 21196
         self.assertEqual(code + constant, total)
+        self.assertEqual(8292 + 5568, 13860)  # the touches' parts add up too
         self.assertLess(guide, constant)
         for phrase in ("App sound and scrolling boxes (a8513e4 to the fix wave of 2026-11-02) made the apps image 21,196 bytes bigger, "
                        "measured with `esp_idf_size --diff` (what `idf.py size` runs) against a8513e4 built with the same configuration: "
                        "8,028 bytes of code and 13,168 of constant data (11,004 of it the guide).",
                        "Their statics take 96 bytes more internal RAM (the mixer's lock and flag, and the runtime's generation) and 1,296 "
                        "more PSRAM (the mixer's voices and the voice task's chunk of app sound).",
-                       "The size check's image, padded to 64 KB, reads 0x2b1000 at both ends, with about 13 KB of padding left (the "
-                       "apps+bench image, which grew 24,012 bytes, about 5.5 KB)."):
+                       "The size check's image, padded to 64 KB, read 0x2b1000 at both ends then, with about 13 KB of padding left (the "
+                       "apps+bench image, which grew 24,012 bytes, about 5.5 KB).",
+                       # Muse's touches: esp_idf_size --diff against c5cf24a (both builds of it exported with git archive), 2026-11-02.
+                       "Muse's touches (`app.control`'s `tap` and `drag`, 2026-11-02) then made the apps image 13,860 bytes bigger "
+                       "against c5cf24a, measured the same way: 8,292 bytes of code and 5,568 of constant data (3,017 of it the guide), "
+                       "with 48 bytes more internal RAM (the touch's and the touch player's atomics) and 384 more PSRAM; the apps+bench image grew 12,692.",
+                       "The size check's image now reads 0x2c1000 for both."):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
+
+    def test_guide_documents_tap_and_drag(self):
+        # app.control tap and drag (D12): The loop's entries quote muse_apps.h's numbers and the reply's fields, say what the guards
+        # do and that Muse's touches open no tap gate; Touches and Games' Testing it send Muse to them; the refusals are in Common
+        # errors in the firmware's words (test_common_errors_are_the_firmwares_words checks the words).
+        header = (MUSE / "muse_apps.h").read_text()
+
+        def define(name):
+            return int(re.search(rf"(?m)^#define {name} (\d+)", header).group(1))
+
+        def literal(name):
+            return re.search(rf'(?m)^#define {name} \\?\n?\s*"([^"]+)"', header).group(1)
+
+        xy, low, high = define("MUSE_APPS_TOUCH_XY_MAX"), define("MUSE_APPS_TOUCH_MS_MIN"), define("MUSE_APPS_TOUCH_MS_MAX")
+        tap, long_ms, heard = define("MUSE_APPS_TOUCH_TAP_MS"), define("MUSE_APPS_TOUCH_LONG_MS"), define("MUSE_APPS_TOUCH_HEARD_MAX")
+        settle_s = define("MUSE_APPS_TOUCH_SETTLE_MS") / 1000
+        lvgl_long = int(re.search(r"LVGL makes a press\s+\* a long press (\d+) ms into it", header).group(1))
+        guide = GUIDE.read_text()
+        loop = " ".join(guide_section(guide, "The loop").split())
+        for phrase in (
+                "`logs`, `snapshot`, a picture of the screen that you open and look at, and `tap` and `drag`, which touch the app as "
+                "a finger would.",
+                f"- `tap`: touches the app at `at`, `{{x, y}}` in screen pixels (0 to {xy}, as `ui` has them), for `ms` ({low} to "
+                f"{high}; {tap} if you leave it out), as a finger would. A press of {long_ms} ms or more is a long press; one under "
+                f"{lvgl_long} ms never is. It returns `pressed` (the widget the touch went down on, like `button#4`, or null for "
+                f"none), `heard` (the events the app was sent, like `button#4 tap`, the first {heard}), `front` (whether the app is "
+                "in front after it), `cut`, `played_ms`, `scroll` and `warnings`. A dark screen is woken for it.",
+                f"- `drag`: presses `at`'s `{{x, y}}`, moves straight to its `{{x2, y2}}` over `ms` ({low} to {high}, which a drag "
+                "must give), and lifts: drag up on a list to scroll it. `scroll` lists each box with `scroll = \"y\"` that moved, "
+                f"with its `y` once it has come to rest (at most {settle_s:g} s after the lift). A right swipe puts the app behind, "
+                "as a finger's does: `front` is false.",
+                "A touch lands only on the app: it plays only while the app runs in front, with no launcher, card or picture over "
+                "it, no voice turn and no finger on the screen, and it is cut (`cut` is true, and a warning says why) the moment "
+                "that stops, with a release and no tap. When it can't play, nothing is touched: `unavailable` says why, "
+                "`not_running` that the app isn't running, and `busy` that another touch is playing.",
+                "The app's handlers hear your touches as a finger's, but they aren't the user's taps: `muse.ask` and `sys.show` "
+                "refuse after them, as they would with no tap at all."):
+            with self.subTest(phrase[:40]):
+                self.assertIn(phrase, loop)
+        ui = " ".join(guide[guide.index("\n### ui\n"):guide.index("\n### time\n")].split())
+        self.assertIn("`app.control`'s `tap` and `drag` are heard the same way (The loop).", ui)
+        games = " ".join(guide_section(guide, "Games").split())
+        self.assertNotIn("You can't touch the gadget", games)
+        self.assertIn("**Testing it.** Play it with `app.control` `tap` and `drag` (The loop): a short tap on the full-screen box "
+                      "is a press, `heard` says what the game was sent, and `snapshot` shows the screen.", games)
+        errors = guide_section(guide, "Common errors")
+        for name in ("MUSE_APPS_TOUCH_BUSY", "MUSE_APPS_TOUCH_NOT_RUNNING", "MUSE_APPS_TOUCH_NO_WAKE", "MUSE_APPS_TOUCH_NOT_FRONT",
+                     "MUSE_APPS_TOUCH_COVERED", "MUSE_APPS_TOUCH_FINGER", "MUSE_APPS_TOUCH_NO_INPUT", "MUSE_APPS_TOUCH_SLOW",
+                     "MUSE_APPS_TOUCH_BAD_TAP", "MUSE_APPS_TOUCH_BAD_DRAG"):
+            with self.subTest(name):
+                self.assertIn("- `" + literal(name).replace("%s", "<id>") + "`: ", errors)
+
+    def test_agents_md_has_the_touch_paragraph(self):
+        # app.control tap and drag: the guard, the cut, the tag and the numbers as the headers have them (D12), the console's
+        # lines as apps_console.c takes them, and app.control's actions as apps_link.c has them.
+        header = (MUSE / "muse_apps.h").read_text()
+
+        def define(name):
+            return int(re.search(rf"(?m)^#define {name} (\d+)", header).group(1))
+
+        link = (MAIN / "apps_link.c").read_text()
+        control_s = int(re.search(r"#define CONTROL_TIMEOUT_MS (\d+)", link).group(1)) // 1000
+        actions = re.search(r'#define ACTIONS_TEXT "([^"]+)"', link).group(1)
+        console = (APPS / "apps_console.c").read_text()
+        self.assertIn('"usage: app.tap <id> <x> <y> [ms]"', console)
+        self.assertIn('"usage: app.drag <id> <x1> <y1> <x2> <y2> <ms>"', console)
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        for phrase in (
+                f"`app.control` ({actions})",
+                "`>app.send ID EVENT [JSON]`, `>app.tap ID X Y [MS]` and `>app.drag ID X1 Y1 X2 Y2 MS`",
+                "**Muse's touches:** `app.control`'s `tap` and `drag` (`apps_touch.c`) play through the bench's touch player "
+                "(`muse_ui.c`, built for `CONFIG_MUSE_BENCH || CONFIG_MUSE_APPS`) as a guarded drag:",
+                "inside LVGL's input read, before LVGL sees a point, the guard checks that the app named runs with its table on the "
+                "layer (by its `app_gen`), the layer is in front with no launcher or crash card, no voice turn is on, no finger is on "
+                "the screen and what LVGL would press there is the app's (`apps_lv_hit`, as `pointer_search_obj` finds it: not the "
+                "downloaded image or the pairing card);",
+                "a check that fails at the first point refuses the touch, and one that fails later cuts it with "
+                "`lv_indev_wait_release`, so the widget hears a release and no tap.",
+                f"Coordinates are 0 to {define('MUSE_APPS_TOUCH_XY_MAX')} (`MUSE_APPS_TOUCH_XY_MAX`), ms "
+                f"{define('MUSE_APPS_TOUCH_MS_MIN')} to {define('MUSE_APPS_TOUCH_MS_MAX')}, a tap "
+                f"{define('MUSE_APPS_TOUCH_TAP_MS')} ms by default, and the whole touch has "
+                f"{define('MUSE_APPS_TOUCH_TOTAL_MS') // 1000} s (`MUSE_APPS_TOUCH_TOTAL_MS`) of `app.control`'s {control_s}.",
+                "The events it sends reach the app tagged (`APPS_UI_INJECTED`): its handlers hear them, but they open neither "
+                "`muse.ask`'s nor `sys.show`'s tap gate."):
+            with self.subTest(phrase[:40]):
+                self.assertIn(phrase, section)
+        bench = " ".join(agents[:agents.index("\n## Muse apps\n")].split())
+        self.assertIn("An apps build has the same player for `app.control`'s `tap` and `drag` (Muse's touches, under Muse apps), "
+                      "but not these lines.", bench)
+        kconfig = " ".join((MUSE / "Kconfig").read_text().split())
+        self.assertIn("An apps build (MUSE_APPS) has the same player, for Muse's own touches (app.control tap and drag), but not "
+                      "these lines.", kconfig)
 
     def test_agents_md_has_the_list_paragraph(self):
         # Games Task 5: a list's scroll and the bench's log line as apps_lv.c prints it (D12), the SCROLL_END that ends its timing

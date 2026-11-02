@@ -118,6 +118,11 @@ bool apps_port_dark(void) {
     return muse_ui_dark();
 }
 
+bool apps_port_in_turn(void) {
+    const muse_mode_t mode = muse_state_mode(NULL);
+    return mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_THINKING || mode == MUSE_MODE_SPEAKING;  /* frame_tick's test */
+}
+
 /*
  * The floor (C1, apps_port.h): growth that would leave the rest of the gadget less than APPS_RAM_RESERVE of PSRAM is refused,
  * so an app, a package's read and the install's blocks run out of memory cleanly and LVGL (which asserts) never does because

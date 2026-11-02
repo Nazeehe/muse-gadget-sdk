@@ -230,6 +230,10 @@ typedef enum { APPS_ITEMS_START, APPS_ITEMS_CENTER, APPS_ITEMS_END } apps_items_
 
 /* Widget events; APPS_EV_* are task events. An event's bit is 1 << its index in {tap, long_press, press, release}. */
 enum { APPS_UI_TAP = 1, APPS_UI_LONG_PRESS = 2, APPS_UI_PRESS = 4, APPS_UI_RELEASE = 8 };
+/* With an event's bit, on its way from the LVGL task to apps_rt_touch: the touch was Muse's own (app.control tap or drag,
+ * apps_touch.h), not a person's. The app's handler hears it as any other; it opens none of the gates that are there to show a
+ * person tapped (apps_rt_touch). */
+#define APPS_UI_INJECTED 0x80
 
 enum {
     APPS_DIRTY_CREATE = 1, APPS_DIRTY_GEOM = 2, APPS_DIRTY_STYLE = 4, APPS_DIRTY_TEXT = 8,

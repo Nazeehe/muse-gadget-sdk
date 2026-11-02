@@ -171,6 +171,9 @@ class AppPortTest(unittest.TestCase):
     def test_battery_and_wifi_are_the_systems(self):  # C33's device half: muse_state's power, muse_wifi's status, no log
         self.run_case("battery_and_wifi_are_the_systems")
 
+    def test_a_voice_turn_is_listening_thinking_or_speaking(self):  # app.control tap and drag's guard: muse_state's mode
+        self.run_case("a_voice_turn_is_listening_thinking_or_speaking")
+
     def test_show_keep_awake_and_exit_are_the_app_tasks(self):  # C10, C11
         self.run_case("show_keep_awake_and_exit_go_to_the_app_task")
 

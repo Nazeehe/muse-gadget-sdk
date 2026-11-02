@@ -339,7 +339,8 @@ menu "Muse"
             inject a touch through LVGL's input, as a finger would arrive; they
             need a touch screen that LVGL polls (not one that reads only on its
             interrupt: the log says so), and a 'w' first when it sleeps on
-            battery.
+            battery. An apps build (MUSE_APPS) has the same player, for Muse's
+            own touches (app.control tap and drag), but not these lines.
             Screenshots (tools/muse/snap.py) are a separate option,
             CONFIG_LV_USE_SNAPSHOT.
 

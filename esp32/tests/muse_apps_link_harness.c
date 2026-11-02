@@ -237,6 +237,18 @@ bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void 
     return async_call("snapshot", id, done, ctx, code, err);
 }
 
+/* app.control tap and drag's call: kept like the other asynchronous ones, with the kind and the at the handler gave. */
+static bool touch_drag;
+static muse_apps_at_t touch_at;
+
+bool muse_apps_touch(const char *id, bool drag, const muse_apps_at_t *at, muse_apps_done_cb done, void *ctx, const char **code,
+                     const char **err) {
+    CHECK(at != NULL, "no at");
+    touch_drag = drag;
+    touch_at = *at;
+    return async_call(drag ? "drag" : "tap", id, done, ctx, code, err);
+}
+
 /* app.send's call (Task 24): kept like the other asynchronous ones, with what the handler made of the parameters. */
 static char send_event[300];
 static char send_data[8192];
@@ -540,7 +552,7 @@ static void install_handler(void) {
     CHECK(installs == 5 && sends == 3 && psram_blocks == 0, "refused twice, nothing sent, nothing held");
 }
 
-#define ACTIONS "list, status, logs, launch, stop, remove, snapshot"
+#define ACTIONS "list, status, logs, launch, stop, remove, snapshot, tap, drag"
 #define ASYNC "{\"_async\":true}"
 
 /* Done for the asynchronous call the case just started: the result is sent once, as request rid of session 7, and the
@@ -583,7 +595,7 @@ static void control_handler(void) {
                                        ACTIONS "\"}}");
     }
     /* The id, for every action but list. */
-    static const char *const needs_id[] = {"status", "logs", "launch", "stop", "remove", "snapshot"};
+    static const char *const needs_id[] = {"status", "logs", "launch", "stop", "remove", "snapshot", "tap", "drag"};
     for (size_t i = 0; i < ARRAY_LEN(needs_id); i++) {
         char params[96], want[160];
         snprintf(params, sizeof params, "{\"action\":\"%s\"}", needs_id[i]);
@@ -618,11 +630,15 @@ static void control_handler(void) {
     status_result = "{\"ok\":true,\"payload\":{\"state\":\"running\"}}";
     CHECK(psram_blocks == 0 && sends == 0, "nothing held, nothing sent: the reply is the answer");
 
-    /* launch, stop, remove and snapshot: queued, and done sends the result once. */
-    static const char *const queued[] = {"launch", "stop", "remove", "snapshot"};
+    /* launch, stop, remove, snapshot, tap and drag: queued, and done sends the result once. */
+    static const char *const queued[] = {"launch", "stop", "remove", "snapshot", "tap", "drag"};
     for (size_t i = 0; i < ARRAY_LEN(queued); i++) {
-        char params[96], request[16];
-        snprintf(params, sizeof params, "{\"action\":\"%s\",\"id\":\"timer\"}", queued[i]);
+        char params[160], request[16];
+        snprintf(params, sizeof params, "{\"action\":\"%s\",\"id\":\"timer\",\"at\":{\"x\":1,\"y\":2,\"x2\":3,\"y2\":4,\"ms\":300}}",
+                 queued[i]);
+        if (strcmp(queued[i], "tap") == 0) {
+            snprintf(params, sizeof params, "{\"action\":\"tap\",\"id\":\"timer\",\"at\":{\"x\":1,\"y\":2}}");
+        }
         snprintf(request, sizeof request, "req-%zu", i);
         char rid[16];
         memcpy(rid, request, sizeof rid);
@@ -703,6 +719,68 @@ static void control_handler(void) {
                    "seconds\"}}");
     async_ok = true;
     CHECK(psram_blocks == 0 && installs == 0, "the refused request freed");
+
+    /* tap and drag's at: an object of whole numbers, a tap's x, y and ms (absent or null: 80), a drag's x, y, x2, y2 and ms, and
+     * no other keys; the ranges are muse_apps_touch's. Anything else is refused before anything is queued. */
+    static const struct {
+        const char *params;
+        bool drag;
+        muse_apps_at_t at;
+    } ats[] = {
+        {"{\"action\":\"tap\",\"id\":\"timer\",\"at\":{\"x\":233,\"y\":150}}", false, {233, 150, -1, -1, MUSE_APPS_TOUCH_TAP_MS}},
+        {"{\"action\":\"tap\",\"id\":\"timer\",\"at\":{\"x\":0,\"y\":465,\"ms\":null}}", false, {0, 465, -1, -1, 80}},
+        {"{\"action\":\"tap\",\"id\":\"timer\",\"at\":{\"ms\":600,\"y\":7,\"x\":9.0}}", false, {9, 7, -1, -1, 600}},
+        {"{\"action\":\"tap\",\"id\":\"timer\",\"at\":{\"x\":500,\"y\":1,\"ms\":10}}", false, {500, 1, -1, -1, 10}},
+        {"{\"action\":\"drag\",\"id\":\"timer\",\"at\":{\"x\":233,\"y\":350,\"x2\":233,\"y2\":150,\"ms\":300}}", true,
+         {233, 350, 233, 150, 300}},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(ats); i++) {
+        memset(&touch_at, 0x55, sizeof touch_at);
+        EXPECT_CONTROL(ats[i].params, ASYNC);
+        CHECK(strcmp(async_what, ats[i].drag ? "drag" : "tap") == 0 && touch_drag == ats[i].drag && strcmp(async_id, "timer") == 0,
+              "%s: %s of %s", ats[i].params, async_what, async_id);
+        CHECK(memcmp(&touch_at, &ats[i].at, sizeof touch_at) == 0, "%s: at %d,%d %d,%d %d", ats[i].params, touch_at.x, touch_at.y,
+              touch_at.x2, touch_at.y2, touch_at.ms);
+        FINISH_ASYNC("r1");
+    }
+    calls = asyncs;
+    EXPECT_CONTROL("{\"action\":\"tap\",\"id\":\"timer\"}",
+                   "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"at is required for tap\"}}");
+    EXPECT_CONTROL("{\"action\":\"drag\",\"id\":\"timer\",\"at\":null}",
+                   "{\"ok\":false,\"error\":{\"code\":\"missing_param\",\"message\":\"at is required for drag\"}}");
+    static const char *const bad_taps[] = {
+        "[1,2]", "\"233,150\"", "7", "{}", "{\"x\":1}", "{\"y\":1}", "{\"x\":1,\"y\":2,\"x2\":3}", "{\"x\":1,\"y\":2,\"z\":3}",
+        "{\"x\":1.5,\"y\":2}", "{\"x\":\"1\",\"y\":2}", "{\"x\":true,\"y\":2}", "{\"x\":1,\"y\":null}", "{\"x\":1e300,\"y\":2}",
+        "{\"x\":1,\"y\":2,\"x\":3}", "{\"x\":1,\"y\":2,\"ms\":\"80\"}",
+    };
+    for (size_t i = 0; i < ARRAY_LEN(bad_taps); i++) {
+        char params[160];
+        snprintf(params, sizeof params, "{\"action\":\"tap\",\"id\":\"timer\",\"at\":%s}", bad_taps[i]);
+        EXPECT_CONTROL(params, "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"" MUSE_APPS_TOUCH_BAD_TAP "\"}}");
+    }
+    static const char *const bad_drags[] = {
+        "{\"x\":1,\"y\":2,\"x2\":3,\"y2\":4}", "{\"x\":1,\"y\":2,\"x2\":3,\"ms\":300}", "{\"x\":1,\"y\":2,\"y2\":4,\"ms\":300}",
+        "{\"x\":1,\"x2\":3,\"y2\":4,\"ms\":300}", "{\"x\":1,\"y\":2,\"x2\":3,\"y2\":4,\"ms\":null}",
+        "{\"x\":1,\"y\":2,\"x2\":3,\"y2\":4,\"ms\":300,\"dx\":1}", "{\"x\":1,\"y\":2,\"x2\":3.25,\"y2\":4,\"ms\":300}", "[]",
+    };
+    for (size_t i = 0; i < ARRAY_LEN(bad_drags); i++) {
+        char params[160];
+        snprintf(params, sizeof params, "{\"action\":\"drag\",\"id\":\"timer\",\"at\":%s}", bad_drags[i]);
+        EXPECT_CONTROL(params, "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"" MUSE_APPS_TOUCH_BAD_DRAG "\"}}");
+    }
+    CHECK(asyncs == calls && psram_blocks == 0, "a bad at queues nothing and holds nothing");
+    /* The touch's own refusal (one is playing: busy; out of range: invalid_params) is the reply, and frees the request. */
+    async_ok = false;
+    async_code = "busy";
+    async_err = MUSE_APPS_TOUCH_BUSY;
+    EXPECT_CONTROL("{\"action\":\"tap\",\"id\":\"timer\",\"at\":{\"x\":1,\"y\":2}}",
+                   "{\"ok\":false,\"error\":{\"code\":\"busy\",\"message\":\"" MUSE_APPS_TOUCH_BUSY "\"}}");
+    async_ok = true;
+    CHECK(psram_blocks == 0, "the refused request freed");
+    /* Another action ignores an at. */
+    EXPECT_CONTROL("{\"action\":\"stop\",\"id\":\"timer\",\"at\":\"nonsense\"}", ASYNC);
+    CHECK(strcmp(async_what, "stop") == 0, "stop: %s", async_what);
+    FINISH_ASYNC("r1");
 }
 
 /* Whether link.register advertises app.control (the headroom rule: tests/test_muse_apps_link.py measures it). */

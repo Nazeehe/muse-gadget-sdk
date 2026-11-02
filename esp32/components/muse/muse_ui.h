@@ -78,9 +78,13 @@ typedef enum {
 void muse_ui_bench_page(muse_ui_page_t page);
 /* Display-only demo name for privacy-safe screenshots; no provisioning changes. */
 void muse_ui_bench_demo(bool enabled);
+#endif
 
 /*
- * Bench-only, from any task: a scripted touch, played through LVGL's input
+ * The touch player, built for the bench (its console's >tap, >longpress,
+ * >swipe and >drag) and for Muse apps (app.control's tap and drag, below).
+ *
+ * From any task: a scripted touch, played through LVGL's input
  * read so the widgets see presses, clicks, scrolls and gestures as from a
  * finger. A tap and a long press hold the point (x, y) for 80 and 900 ms; a
  * swipe ignores x and y and drags along y=233 between x=406 and x=60 over
@@ -92,6 +96,7 @@ void muse_ui_bench_demo(bool enabled);
  * its input while the screen sleeps on battery: wake it first. No effect on
  * boards without a touch screen, or whose touch reads only on its interrupt.
  */
+#if CONFIG_MUSE_BENCH || CONFIG_MUSE_APPS
 typedef enum {
     MUSE_UI_TOUCH_TAP,
     MUSE_UI_TOUCH_LONG,
@@ -108,4 +113,37 @@ void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y);
 #define MUSE_UI_DRAG_MS_MIN 50
 #define MUSE_UI_DRAG_MS_MAX 2000
 void muse_ui_bench_drag(int x1, int y1, int x2, int y2, int ms);
+
+/*
+ * A guarded drag (Muse apps' app.control tap and drag: apps/apps_touch.h), played as muse_ui_bench_drag's is (a tap is a drag
+ * to its own point), from a slot of its own that a bench request never replaces, with three checks of its caller's, all called
+ * on the LVGL task from inside the input read, with nothing of LVGL's in between:
+ * - At the read that takes it, the real touch is read first: a finger on the screen refuses it (MUSE_UI_GUARD_FINGER) and LVGL
+ *   gets that read, the finger's own. Otherwise admit(x1, y1) says whether it may press there, before LVGL sees the point
+ *   (false: MUSE_UI_GUARD_REFUSED, and LVGL gets the real read).
+ * - At every read after that, the real touch is read into a read of its own, which LVGL never sees, and keep(x, y) is asked
+ *   about the point this read would give, its release's included. A finger on the screen, or a keep that says false, cuts the
+ *   drag: lv_indev_wait_release, then a release at the last point given, so LVGL sends the object pressed PRESS_LOST and no
+ *   RELEASED and no click, and presses nothing more until the next touch (MUSE_UI_GUARD_CUT_FINGER, MUSE_UI_GUARD_CUT).
+ * - end(how, ms) once, with how long it played: inside the take's read for a refusal, else at the start of the first read
+ *   after its release went out, when LVGL has sent all that the release made it send.
+ * False, with nothing asked and end never called, on a board with no touch to script (as above) or while a guarded drag
+ * waits to be taken; true once it waits. guard must outlive it (a static). Points and ms as muse_ui_bench_drag's.
+ * muse_ui_guarded_withdraw takes back one that is still waiting: true when it did (its end never comes), false when it had
+ * been taken or there was none. Any task.
+ */
+typedef enum {
+    MUSE_UI_GUARD_PLAYED,      /* it played to its release */
+    MUSE_UI_GUARD_REFUSED,     /* admit said no: nothing was pressed */
+    MUSE_UI_GUARD_FINGER,      /* a finger was on the screen at the take: nothing was pressed */
+    MUSE_UI_GUARD_CUT,         /* keep said no: lifted early, the press lost */
+    MUSE_UI_GUARD_CUT_FINGER,  /* a finger came down: lifted early the same way */
+} muse_ui_guard_end_t;
+typedef struct {
+    bool (*admit)(int x, int y);
+    bool (*keep)(int x, int y);
+    void (*end)(muse_ui_guard_end_t how, uint32_t ms);
+} muse_ui_guard_t;
+bool muse_ui_guarded_drag(int x1, int y1, int x2, int y2, int ms, const muse_ui_guard_t *guard);
+bool muse_ui_guarded_withdraw(void);
 #endif

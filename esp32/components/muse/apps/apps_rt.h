@@ -154,7 +154,8 @@
  *   line that says so (the port keeps a save it takes until its worker has it: apps_port.h says what that guarantees).
  *
  * Show, tap and exit. sys.show() is allowed inside message() and alarm(), and inside any callback within APPS_SHOW_TAP_MS (10 s) of a
- * touch the runtime was given (apps_rt_touch), the 10 s included. The runtime knows nothing of the front: it asks the port.
+ * person's touch the runtime was given (apps_rt_touch: not one of Muse's, APPS_UI_INJECTED), the 10 s included. The runtime knows
+ * nothing of the front: it asks the port.
  *
  * Shown, and the sound. The runtime keeps whether the app is shown, as the last apps_rt_show said, whatever its state: false when it
  * is made, so that main.lua's top level never is. Whoever serves the app says shown before start() for an app launched in front (the
@@ -317,9 +318,11 @@ apps_ui_t *apps_rt_ui(apps_rt_t *rt);
 /*
  * A touch on a widget, from the LVGL task through the app's queue: the handler the app gave w:on for that event
  * runs with (w, event) and APPS_BUDGET_CALL, for a RUNNING app. slot and gen are what the event carried when
- * the apply step posted it, and event one APPS_UI_* bit. A widget that has been deleted since (its gen has moved
- * on, or the slot is empty), or has no handler for the event, runs nothing, and says nothing. A handler that
- * fails crashes the app, like any other.
+ * the apply step posted it, and event one APPS_UI_* bit, with APPS_UI_INJECTED for a touch of Muse's own (app.control
+ * tap or drag). A widget that has been deleted since (its gen has moved on, or the slot is empty), or has no handler
+ * for the event, runs nothing, and says nothing. A handler that fails crashes the app, like any other. A person's
+ * touch, whatever it found, opens sys.show's window and muse.ask's (apps_rt_show_allowed, apps_rt_tapped); one with
+ * APPS_UI_INJECTED is heard all the same and opens neither.
  */
 void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event);
 
@@ -479,10 +482,10 @@ unsigned apps_rt_store_count(const apps_rt_t *rt);
  * needs no call to be bracketed. NULL is ignored. */
 void apps_rt_store_tick(apps_rt_t *rt, int64_t now_ms);
 
-/* Whether sys.show() may be called now: inside message() or alarm(), or within APPS_SHOW_TAP_MS of the last touch (apps_rt_touch). */
+/* Whether sys.show() may be called now: inside message() or alarm(), or within APPS_SHOW_TAP_MS of a person's last touch (apps_rt_touch). */
 bool apps_rt_show_allowed(const apps_rt_t *rt);
 
-/* Whether a touch (a tap on one of the app's widgets: apps_rt_touch) has come since the runtime was made, and when, in *at_ms
+/* Whether a person's touch (a tap on one of the app's widgets: apps_rt_touch, never one of Muse's) has come since the runtime was made, and when, in *at_ms
  * (apps_port_mono_ms; left alone when none has). muse.ask's gate (apps_ask.h): message() and alarm() don't open it, as they do
  * sys.show(). */
 bool apps_rt_tapped(const apps_rt_t *rt, int64_t *at_ms);

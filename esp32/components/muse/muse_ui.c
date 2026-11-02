@@ -1734,7 +1734,7 @@ void muse_ui_bench_page(muse_ui_page_t page)
 }
 #endif
 
-#if CONFIG_MUSE_BENCH
+#if CONFIG_MUSE_BENCH || CONFIG_MUSE_APPS
 /*
  * Bench touch: scripted presses played through LVGL's own input read, so the
  * widgets get presses, clicks, scrolls and gestures as they do from a finger.
@@ -1749,6 +1749,21 @@ void muse_ui_bench_page(muse_ui_page_t page)
  * period, so no read stands still: LVGL forgets a gesture's distance on a read
  * that moves under 3 px and fires it past 50 px (indev_gesture). A drag slower
  * than that a read builds no gesture, as a slow finger doesn't.
+ *
+ * The guarded drag (muse_ui.h: Muse apps' app.control tap and drag) is the same
+ * drag, asked for in a request word of its own (s_guarded_request), which a
+ * bench request never replaces, and taken first. Its guard's checks are its
+ * caller's; this is only where each comes. The real touch is read at its take
+ * into LVGL's own read, which LVGL gets as it is when the drag doesn't start,
+ * and at each read after into a read of its own, which LVGL never sees. A cut
+ * ends it as the apps' right swipe ends a finger's touch (apps_lv.c's
+ * on_gesture): lv_indev_wait_release, which in LVGL 9.5.0 only sets the
+ * indev's wait_until_release, read when LVGL handles this read's data right
+ * after the callback returns, so it may be called from inside it. While it is
+ * set, indev_proc_press returns at once and presses nothing, whatever is under
+ * the point; the release sends the object pressed PRESS_LOST, no RELEASED and
+ * no click, and clears it (lv_indev.c). The end comes at the first read after
+ * the release, by when LVGL has sent all that the release made it send.
  */
 #define BENCH_TAP_MS 80
 #define BENCH_LONG_MS 900
@@ -1765,13 +1780,22 @@ static atomic_uint s_touch_request;      /* waiting for the LVGL task: 0, or BEN
 /* A drag's end (x in bits 12-23, y in 0-11) and its ms, which don't fit the request: stored before the request that
  * names the drag, and read once the LVGL task has taken it. */
 static atomic_uint s_drag_end, s_drag_ms;
-static struct {
+/* The guarded drag's request (0, or BENCH_PENDING and its first point, as a request's), and its end, ms and guard, stored
+ * before the request and read once the LVGL task has taken it. */
+static atomic_uint s_guarded_request, s_guarded_end, s_guarded_ms;
+static const muse_ui_guard_t *_Atomic s_guarded_guard;
+static EXT_RAM_BSS_ATTR struct {
     bool running;                        /* the LVGL task's alone, from here on */
     muse_ui_touch_t kind;
     int x, y;
     int x2, y2;                          /* a drag's end */
     uint32_t ms;                         /* and its time */
     uint32_t start;                      /* lv_tick_get() at the script's first read */
+    const muse_ui_guard_t *guard;        /* a guarded drag's; NULL for a bench script */
+    int last_x, last_y;                  /* the point the last read gave */
+    bool ending;                         /* a guarded drag has let go: its end is due at the next read */
+    muse_ui_guard_end_t how;             /* and how it went */
+    uint32_t played;                     /* its ms, from its first read to its release */
 } s_touch;
 
 static int bench_clamp(int v, int size)
@@ -1783,6 +1807,11 @@ static int bench_clamp(int v, int size)
 static unsigned bench_point(int x, int y)
 {
     return ((unsigned)bench_clamp(x, s_w) << 12) | (unsigned)bench_clamp(y, s_h);
+}
+
+static int bench_ms(int ms)
+{
+    return ms < MUSE_UI_DRAG_MS_MIN ? MUSE_UI_DRAG_MS_MIN : ms > MUSE_UI_DRAG_MS_MAX ? MUSE_UI_DRAG_MS_MAX : ms;
 }
 
 void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y)
@@ -1803,15 +1832,77 @@ void muse_ui_bench_drag(int x1, int y1, int x2, int y2, int ms)
         ESP_LOGW(TAG, "bench touch: no touch input to script on this board");
         return;
     }
-    ms = ms < MUSE_UI_DRAG_MS_MIN ? MUSE_UI_DRAG_MS_MIN : ms > MUSE_UI_DRAG_MS_MAX ? MUSE_UI_DRAG_MS_MAX : ms;
     atomic_store(&s_drag_end, bench_point(x2, y2));
-    atomic_store(&s_drag_ms, (unsigned)ms);
+    atomic_store(&s_drag_ms, (unsigned)bench_ms(ms));
     atomic_store(&s_touch_request, BENCH_PENDING | ((unsigned)MUSE_UI_TOUCH_DRAG << 24) | bench_point(x1, y1));
+}
+
+/* One caller at a time (the apps' touch, which claims it first): a request already waiting is refused before anything of it
+ * is touched. */
+bool muse_ui_guarded_drag(int x1, int y1, int x2, int y2, int ms, const muse_ui_guard_t *guard)
+{
+    if (!s_real_read || guard == NULL || atomic_load(&s_guarded_request) != 0) {
+        return false;
+    }
+    atomic_store(&s_guarded_end, bench_point(x2, y2));
+    atomic_store(&s_guarded_ms, (unsigned)bench_ms(ms));
+    atomic_store(&s_guarded_guard, guard);
+    unsigned none = 0;
+    return atomic_compare_exchange_strong(&s_guarded_request, &none, BENCH_PENDING | bench_point(x1, y1));
+}
+
+bool muse_ui_guarded_withdraw(void)
+{
+    return (atomic_exchange(&s_guarded_request, 0) & BENCH_PENDING) != 0;
+}
+
+/* The guarded drag waiting, if one is, at the read that would start it: false when it doesn't (it was withdrawn just now, a
+ * finger is down, or the guard's admit says no), its end said for the last two, with data the real read, which LVGL then gets
+ * as it is. */
+static bool guarded_take(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    unsigned request = atomic_exchange(&s_guarded_request, 0);
+    s_real_read(indev, data);
+    if (!(request & BENCH_PENDING)) {
+        return false;
+    }
+    const muse_ui_guard_t *guard = atomic_load(&s_guarded_guard);
+    int x = (int)((request >> 12) & 0xfff), y = (int)(request & 0xfff);
+    if (data->state == LV_INDEV_STATE_PRESSED) {
+        guard->end(MUSE_UI_GUARD_FINGER, 0);
+        return false;
+    }
+    if (!guard->admit(x, y)) {
+        guard->end(MUSE_UI_GUARD_REFUSED, 0);
+        return false;
+    }
+    unsigned end = atomic_load(&s_guarded_end);
+    s_touch.kind = MUSE_UI_TOUCH_DRAG;
+    s_touch.x = x;
+    s_touch.y = y;
+    s_touch.x2 = (int)((end >> 12) & 0xfff);
+    s_touch.y2 = (int)(end & 0xfff);
+    s_touch.ms = atomic_load(&s_guarded_ms);
+    s_touch.guard = guard;
+    s_touch.start = lv_tick_get();
+    s_touch.running = true;
+    return true;
 }
 
 static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
-    if (!s_touch.running) {
+    if (s_touch.ending) {
+        /* A guarded drag let go at the last read, and LVGL has sent what that made it send since. */
+        s_touch.ending = false;
+        s_touch.guard->end(s_touch.how, s_touch.played);
+    }
+    bool taken = false;   /* a guarded drag began at this read: its admit has seen the point */
+    if (!s_touch.running && atomic_load(&s_guarded_request) != 0) {
+        taken = guarded_take(indev, data);
+        if (!taken) {
+            return;
+        }
+    } else if (!s_touch.running) {
         unsigned request = atomic_exchange(&s_touch_request, 0);
         if (request & BENCH_PENDING) {
             s_touch.kind = (muse_ui_touch_t)((request >> 24) & 7);
@@ -1823,6 +1914,7 @@ static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
                 s_touch.y2 = (int)(end & 0xfff);
                 s_touch.ms = atomic_load(&s_drag_ms);
             }
+            s_touch.guard = NULL;
             s_touch.start = lv_tick_get();
             s_touch.running = true;
         }
@@ -1851,11 +1943,37 @@ static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
         x = t >= hold ? to : from + (to - from) * (int)t / (int)hold;
         y = BENCH_SWIPE_Y;
     }
-    data->point.x = bench_clamp(x, s_w);
-    data->point.y = bench_clamp(y, s_h);
+    x = bench_clamp(x, s_w);
+    y = bench_clamp(y, s_h);
+    if (s_touch.guard != NULL && !taken) {
+        lv_indev_data_t real;
+        memset(&real, 0, sizeof real);
+        s_real_read(indev, &real);   /* a finger that has come down since: it wins */
+        bool finger = real.state == LV_INDEV_STATE_PRESSED;
+        if (finger || !s_touch.guard->keep(x, y)) {
+            lv_indev_wait_release(indev);
+            data->point.x = s_touch.last_x;
+            data->point.y = s_touch.last_y;
+            data->state = LV_INDEV_STATE_RELEASED;
+            s_touch.running = false;
+            s_touch.ending = true;
+            s_touch.how = finger ? MUSE_UI_GUARD_CUT_FINGER : MUSE_UI_GUARD_CUT;
+            s_touch.played = t;
+            return;
+        }
+    }
+    data->point.x = x;
+    data->point.y = y;
+    s_touch.last_x = x;
+    s_touch.last_y = y;
     if (t >= hold) {
         data->state = LV_INDEV_STATE_RELEASED;   /* where the finger was last */
         s_touch.running = false;
+        if (s_touch.guard != NULL) {
+            s_touch.ending = true;
+            s_touch.how = MUSE_UI_GUARD_PLAYED;
+            s_touch.played = t;
+        }
     } else {
         data->state = LV_INDEV_STATE_PRESSED;
     }
@@ -2112,7 +2230,7 @@ esp_err_t muse_ui_start(void)
 
     s_image_mutex = xSemaphoreCreateMutex();
     muse_board->display_lock(-1);
-#if CONFIG_MUSE_BENCH
+#if CONFIG_MUSE_BENCH || CONFIG_MUSE_APPS
     bench_touch_install();
 #endif
     build_screen();

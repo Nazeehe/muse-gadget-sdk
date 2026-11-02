@@ -388,6 +388,9 @@ class Console(unittest.TestCase):
     def test_foreign_and_unknown_lines(self):
         self.run_case("foreign_and_unknown_lines")
 
+    def test_touch_lines(self):  # >app.tap and >app.drag: muse_apps_touch, its done printed with the code; the words checked first
+        self.run_case("touch_lines")
+
     def test_stage_out_of_memory(self):
         self.run_case("stage_out_of_memory")
 

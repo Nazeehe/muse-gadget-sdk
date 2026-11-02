@@ -64,6 +64,7 @@
 #include "apps_rt.h"
 #include "apps_store.h"
 #include "apps_task.h"
+#include "apps_touch.h"
 #include "apps_ui.h"
 #include "apps_values.h"
 #include "muse_apps.h"
@@ -2101,6 +2102,45 @@ void apps_snapshot_take_pending(void) {
     }
 }
 
+/* app.control tap and drag's LVGL side (apps_touch.c, which has its own harness): the supervisor hands a touch on every frame, the
+ * dark ones included; each touch event the layer's widgets send goes through the tag (which a case can make tag them as Muse's,
+ * as it does while a touch plays), and the layer's right swipe says so. All on the LVGL task. */
+static atomic_uint touch_offers, touch_offers_dark, touch_tags, touch_closes;
+static atomic_bool touch_tagging;
+static atomic_int touch_tag_slot = -1, touch_tag_event = -1;
+
+void apps_touch_supervise(void) {
+    lvgl_only("apps_touch_supervise");
+    atomic_fetch_add(&touch_offers, 1);
+    if (atomic_load(&lvgl_asleep)) {
+        atomic_fetch_add(&touch_offers_dark, 1);
+    }
+}
+
+uint8_t apps_touch_tag(uint16_t slot, uint8_t event) {
+    lvgl_only("apps_touch_tag");
+    atomic_fetch_add(&touch_tags, 1);
+    atomic_store(&touch_tag_slot, slot);
+    atomic_store(&touch_tag_event, event);
+    return atomic_load(&touch_tagging) ? (uint8_t)(event | APPS_UI_INJECTED) : event;
+}
+
+void apps_touch_closed(void) {
+    lvgl_only("apps_touch_closed");
+    atomic_fetch_add(&touch_closes, 1);
+}
+
+#ifdef HARNESS_CONSOLE
+/* The console's >app.tap and >app.drag call app.control's touch (apps_touch.c, not linked here): no case sends them. */
+bool muse_apps_touch(const char *id, bool drag, const muse_apps_at_t *at, muse_apps_done_cb done, void *ctx, const char **code,
+                     const char **err) {
+    (void)id, (void)drag, (void)at, (void)done, (void)ctx;
+    *code = "unavailable";
+    *err = "no touch in this harness";
+    return false;
+}
+#endif
+
 static void *lvgl_main(void *arg) {
     (void)arg;
     lvgl_thread = pthread_self();
@@ -3823,6 +3863,127 @@ static void the_snapshot_is_offered_every_frame(void) {
     sleep_ms(60);
     CHECK(atomic_load(&snapshot_offers_dark) - dark_before >= 5, "offered while asleep: %u",
           atomic_load(&snapshot_offers_dark) - dark_before);
+    atomic_store(&lvgl_asleep, false);
+}
+
+/* ---- app.control tap and drag (apps_touch.h) ---- */
+
+typedef struct {
+    const char *id;
+    apps_touch_target_t got;
+    uint32_t gen;
+    bool alive;          /* apps_task_touch_alive(gen) for the gen asked about */
+    uint32_t ask_alive;  /* that gen */
+} target_t;
+
+static void target_job(void *arg) {
+    target_t *t = arg;
+    t->gen = 0;
+    t->got = apps_task_touch_target(t->id, &t->gen);
+    t->alive = apps_task_touch_alive(t->ask_alive);
+}
+
+static target_t target_of(const char *id, uint32_t ask_alive) {
+    target_t t = {.id = id, .ask_alive = ask_alive};
+    ON_LVGL(target_job, &t);
+    return t;
+}
+
+/* apps_task_touch_target: the app that runs, with its app_gen, once its table is on the layer; another id, or no app, is gone;
+ * apps_task_touch_alive follows the gen: false once the app ends, and for the last app's once a new one runs. */
+static void the_touch_target_is_the_app_on_the_layer(void) {
+    target_t t = target_of("busy", 0);
+    CHECK(t.got == APPS_TOUCH_TARGET_GONE && !t.alive, "no app: %d", (int)t.got);
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "set_ui table#1");
+    WAIT(0, "print busy show");
+    t = target_of("busy", 0);
+    const uint32_t first = t.gen;
+    CHECK(t.got == APPS_TOUCH_TARGET_OK && first != 0, "the app that runs: %d, gen %u", (int)t.got, (unsigned)first);
+    t = target_of("other", first);
+    CHECK(t.got == APPS_TOUCH_TARGET_GONE && t.alive, "another id: %d; the app's gen alive %d", (int)t.got, t.alive);
+    CHECK(stop_app(err, sizeof err), "stop: %s", err);
+    t = target_of("busy", first);
+    CHECK(t.got == APPS_TOUCH_TARGET_GONE && !t.alive, "stopped: %d, alive %d", (int)t.got, t.alive);
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 50, NULL, err, sizeof err), "run again: %s", err);
+    WAIT(0, "set_ui table#2");
+    t = target_of("busy", first);
+    CHECK(t.got == APPS_TOUCH_TARGET_OK && t.gen != first && !t.alive, "run again: %d, gen %u (was %u), the old gen alive %d",
+          (int)t.got, (unsigned)t.gen, (unsigned)first, t.alive);
+    const uint32_t second = t.gen;
+    t = target_of("busy", second);
+    CHECK(t.alive, "the new gen is alive");
+    /* A reset outstanding (the LVGL task paused as the app ends): the objects on the layer aren't the app's. */
+    pause_lvgl();
+    CHECK(apps_task_run(make_pkg("two", "Two", BUSY, 1), true, 0, NULL, err, sizeof err), "run two: %s", err);
+    CHECK(!apps_task_touch_alive(second), "busy's gen after its end");
+    atomic_store(&lvgl_paused, false);
+    WAIT(0, "set_ui table#3");
+    t = target_of("two", 0);
+    CHECK(t.got == APPS_TOUCH_TARGET_OK && t.gen != second, "two once its table is up: %d", (int)t.got);
+}
+
+/* A hung app is HUNG, and its gen isn't alive. */
+static void a_hung_app_is_no_touch_target(void) {
+    const file_t files[] = {LUA("main.lua", APP_HANG)};
+    char err[200];
+    CHECK(apps_task_run(make_pkg("hangy", "Hangy", files, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "front 1");
+    target_t t = target_of("hangy", 0);
+    const uint32_t gen = t.gen;
+    CHECK(t.got == APPS_TOUCH_TARGET_OK && gen != 0, "running: %d", (int)t.got);
+    const int64_t t0 = apps_port_mono_ms();
+    clock_stop_at(t0);
+    block_print("hang");
+    int from = mark();
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    clock_stop_at(t0 + 3001);
+    WAIT(from, "crash Hangy | (stopped responding)");
+    t = target_of("hangy", gen);
+    CHECK(t.got == APPS_TOUCH_TARGET_HUNG && !t.alive, "hung: %d, alive %d", (int)t.got, t.alive);
+    int back = mark();
+    clock_go();
+    release_print();
+    WAIT(back, "priority muse_apps 2");
+}
+
+/* The layer's touch events go through the tag before they are posted: the app hears a tag's code (here Muse's), a touch dropped for
+ * an outstanding reset is never tagged, a right swipe tells the touch, and the supervisor offers it every frame, dark ones too. */
+static void touch_events_go_through_the_tag(void) {
+    char err[200];
+    CHECK(apps_task_run(make_pkg("busy", "Busy", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "print busy show");
+    unsigned tags = atomic_load(&touch_tags);
+    atomic_store(&touch_tagging, true);
+    int from = mark();
+    TAP(0);
+    WAIT(from, "print busy");
+    atomic_store(&touch_tagging, false);
+    CHECK(atomic_load(&touch_tags) == tags + 1 && atomic_load(&touch_tag_slot) == 0 && atomic_load(&touch_tag_event) == APPS_UI_TAP,
+          "one tag, of slot 0's tap: %u, %d %d", atomic_load(&touch_tags) - tags, atomic_load(&touch_tag_slot),
+          atomic_load(&touch_tag_event));
+    /* An outstanding reset drops the touch before the tag. */
+    uint16_t gen = published_gen(0);
+    pause_lvgl();
+    CHECK(apps_task_run(make_pkg("two", "Two", BUSY, 1), true, 0, NULL, err, sizeof err), "run two: %s", err);
+    tags = atomic_load(&touch_tags);
+    lv_event_cb(0, gen, APPS_UI_TAP);  /* as apps_lv's callback sends it (the paused LVGL task's stand-in) */
+    CHECK(atomic_load(&touch_tags) == tags, "a dropped touch was tagged");
+    atomic_store(&lvgl_paused, false);
+    WAIT(0, "set_ui table#2");
+    unsigned closes = atomic_load(&touch_closes);
+    ON_LVGL(swipe_job, NULL);
+    CHECK(atomic_load(&touch_closes) == closes + 1, "the right swipe told the touch");
+    unsigned frames_before = atomic_load(&frames), offers_before = atomic_load(&touch_offers);
+    sleep_ms(60);
+    unsigned frames_seen = atomic_load(&frames) - frames_before, offers = atomic_load(&touch_offers) - offers_before;
+    CHECK(frames_seen >= 5 && offers + 1 >= frames_seen && offers <= frames_seen + 1, "%u offers in %u frames", offers, frames_seen);
+    atomic_store(&lvgl_asleep, true);
+    unsigned dark_before = atomic_load(&touch_offers_dark);
+    sleep_ms(60);
+    CHECK(atomic_load(&touch_offers_dark) - dark_before >= 5, "offered while asleep: %u", atomic_load(&touch_offers_dark) - dark_before);
     atomic_store(&lvgl_asleep, false);
 }
 
@@ -7954,6 +8115,9 @@ int main(int argc, char **argv) {
         {"a_snapshot_is_not_the_calls_time", a_snapshot_is_not_the_calls_time},
         {"a_snapshot_is_not_hung_time", a_snapshot_is_not_hung_time},
         {"the_snapshot_is_offered_every_frame", the_snapshot_is_offered_every_frame},
+        {"the_touch_target_is_the_app_on_the_layer", the_touch_target_is_the_app_on_the_layer},
+        {"a_hung_app_is_no_touch_target", a_hung_app_is_no_touch_target},
+        {"touch_events_go_through_the_tag", touch_events_go_through_the_tag},
         {"dropped_is_read_with_its_base", dropped_is_read_with_its_base},
         {"a_front_asked_during_a_turn_comes_after_it", a_front_asked_during_a_turn_comes_after_it},
         {"a_card_waits_for_the_turn_to_end", a_card_waits_for_the_turn_to_end},

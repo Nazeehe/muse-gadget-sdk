@@ -586,6 +586,51 @@ static void ask_needs_a_recent_tap(void) {
     expect_nothing_said();
 }
 
+/* app.control's tap and drag (apps_touch.h): a touch of Muse's own reaches the app tagged APPS_UI_INJECTED. Its handler hears it as
+ * a tap, but it opens no gate that is there to show a person tapped: muse.ask from it, from message() after it, or from it within
+ * 10 s of it, is refused as with no tap at all, and so is sys.show() outside message() and alarm(). A person's tap opens both as
+ * ever, and a touch of Muse's after it doesn't move the window it opened. */
+static const char *const INJECTED_APP = APP("T.tap = function() print('heard tap') try(sys.show) try(muse.ask, 'from a tap', cb('reply')) end\n"
+                                            "T.ask = function() try(muse.ask, 'hello', cb('reply')) end\n");
+
+static void an_injected_tap_opens_no_gate(void) {
+    words();
+    const char *no_show = "false\tsys.show: allowed only in message() or alarm(), or within 10 s of a tap";
+    start_app(INJECTED_APP);
+    const uint16_t gen = apps_ui_slot(apps_rt_ui(rt), 0)->gen;
+    apps_rt_touch(rt, 0, gen, APPS_UI_TAP | APPS_UI_INJECTED);
+    expect_logged("heard tap", no_show, ok_tap);
+    call("ask");  /* in message(), after Muse's tap: no person has tapped yet */
+    expect_logged(ok_tap);
+    apps_rt_touch(rt, 0, gen, APPS_UI_PRESS | APPS_UI_INJECTED);  /* a press of Muse's, with no handler: heard by nobody, opens nothing */
+    call("ask");
+    expect_logged(ok_tap);
+    CHECK(asks == 0, "an ask after Muse's touches was sent: %d", asks);
+    /* A person's tap opens both, as ever. */
+    clock_ms += 1000;
+    apps_rt_touch(rt, 0, gen, APPS_UI_TAP);
+    expect_logged("heard tap", "true\tnil", "true\tnil");
+    CHECK(asks == 1, "the person's tap's ask wasn't sent: %d", asks);
+    chat_done(NULL);
+    settle();
+    expect_logged("reply\t[]\tnil");
+    expect_said("ask app: done (0 bytes)");
+    /* Muse's touch later doesn't move the window a person's touch opened: it ends APPS_SHOW_TAP_MS after the person's. */
+    clock_ms += APPS_ASK_GAP_MS;
+    const int64_t pressed = clock_ms;
+    apps_rt_touch(rt, 0, gen, APPS_UI_PRESS);  /* a person's press (the button has no press handler: nothing runs) */
+    clock_ms = pressed + 5000;
+    apps_rt_touch(rt, 0, gen, APPS_UI_PRESS | APPS_UI_INJECTED);
+    clock_ms = pressed + APPS_SHOW_TAP_MS + 1;
+    call("ask");  /* a millisecond past the person's window: Muse's press 5 s into it didn't stretch it */
+    expect_logged(ok_tap);
+    apps_rt_touch(rt, 0, gen, APPS_UI_TAP | APPS_UI_INJECTED);
+    expect_logged("heard tap", no_show, ok_tap);
+    CHECK(asks == 1, "an ask after Muse's touches was sent: %d", asks);
+    finish();
+    expect_nothing_said();
+}
+
 /* One ask at a time, of any app (P17: a turn the apps have let go of still counts until its end), and APPS_ASK_GAP_MS from one
  * accepted ask's start to the next, any app's, with the seconds left rounded up (P18). */
 static void one_ask_at_a_time_and_30_s_gap(void) {
@@ -1132,6 +1177,7 @@ int main(int argc, char **argv) {
         void (*run)(void);
     } cases[] = {
         {"ask_needs_a_recent_tap", ask_needs_a_recent_tap},
+        {"an_injected_tap_opens_no_gate", an_injected_tap_opens_no_gate},
         {"one_ask_at_a_time_and_30_s_gap", one_ask_at_a_time_and_30_s_gap},
         {"text_and_reply_limits", text_and_reply_limits},
         {"ask_text_line_breaks_are_flattened", ask_text_line_breaks_are_flattened},

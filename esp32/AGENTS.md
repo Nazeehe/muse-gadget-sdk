@@ -179,7 +179,9 @@ the Mac, through LVGL's own input: `>tap X Y`, `>longpress X Y`,
 (`snap.py PORT '>swipe left' OUT.png`) press and drag as a finger would, on a
 touch screen that LVGL polls (`>swipe up` from the bottom edge, at the middle, as
 the launcher's close takes it; `>drag` from the first point straight to the
-second in MS ms, 50 to 2000). `snap.py` sends `w` first,
+second in MS ms, 50 to 2000). An apps build has the same player for
+`app.control`'s `tap` and `drag` (Muse's touches, under Muse apps), but not
+these lines. `snap.py` sends `w` first,
 since LVGL doesn't read its input while the screen sleeps on battery, and waits
 for the script to finish before the picture (`snap.capture()` does both for
 every caller). Each screenshot ends with a CRC-32 that `snap.py` checks, retaking
@@ -744,14 +746,16 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   example to `workspace/apps/_guide/` on its VM and returns the gadget's limits),
   `app.install` (the gadget reads `workspace/apps/<id>/`
   from the VM, checks, compiles, stores and runs it), `app.control` (list,
-  status, logs, launch, stop, remove, snapshot) and `app.send` (an event to the
-  app's `message()`). From a laptop, `tools/muse/app.py check DIR` runs an app
+  status, logs, launch, stop, remove, snapshot, tap, drag) and `app.send` (an
+  event to the app's `message()`). From a laptop, `tools/muse/app.py check DIR` runs an app
   on the host, `push PORT DIR [--run] [--snap OUT.png]` installs it over USB,
   `watch PORT DIR` pushes it on every change and `logs PORT` follows its log.
   The console's own lines are `>app.put`, `>app.commit ID [run]`,
-  `>app.launch ID`, `>app.stop`, `>app.status`, `>app.list` and
-  `>app.send ID EVENT [JSON]`; `>app.status` takes no id and reports the app
-  that runs. The first line after the port opens can be lost, so send `w`
+  `>app.launch ID`, `>app.stop`, `>app.status`, `>app.list`,
+  `>app.send ID EVENT [JSON]`, `>app.tap ID X Y [MS]` and
+  `>app.drag ID X1 Y1 X2 Y2 MS` (the last two are `app.control`'s `tap` and
+  `drag`, for board tests without a Muse turn); `>app.status` takes no id and
+  reports the app that runs. The first line after the port opens can be lost, so send `w`
   first and wait a second.
 - **Launcher:** a carousel (`apps_lv.c`): the app in the middle is 160 px
   across (`APPS_LV_ICON_PX`), its neighbours 100/256 of that, 63 px
@@ -845,6 +849,21 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   bytes of its free before the install once the app stopped. The LVGL task's
   unused stack fell from 3,916 to 2,972 bytes with the list made, and to 2,796
   while it scrolled.
+- **Muse's touches:** `app.control`'s `tap` and `drag` (`apps_touch.c`) play
+  through the bench's touch player (`muse_ui.c`, built for
+  `CONFIG_MUSE_BENCH || CONFIG_MUSE_APPS`) as a guarded drag: inside LVGL's
+  input read, before LVGL sees a point, the guard checks that the app named
+  runs with its table on the layer (by its `app_gen`), the layer is in front
+  with no launcher or crash card, no voice turn is on, no finger is on the
+  screen and what LVGL would press there is the app's (`apps_lv_hit`, as
+  `pointer_search_obj` finds it: not the downloaded image or the pairing
+  card); a check that fails at the first point refuses the touch, and one that
+  fails later cuts it with `lv_indev_wait_release`, so the widget hears a
+  release and no tap. Coordinates are 0 to 465 (`MUSE_APPS_TOUCH_XY_MAX`), ms
+  50 to 2000, a tap 80 ms by default, and the whole touch has 15 s
+  (`MUSE_APPS_TOUCH_TOTAL_MS`) of `app.control`'s 30. The events it sends
+  reach the app tagged (`APPS_UI_INJECTED`): its handlers hear them, but they
+  open neither `muse.ask`'s nor `sys.show`'s tap gate.
 - **Boot:** the apps' storage waits for the Link (`muse_apps.h`). The app task
   mounts the FAT and `apps_nvs`, and the I/O worker that does it is made, once
   the reply to the first `link.register` has come, accepted or not
@@ -917,9 +936,15 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   code and 13,168 of constant data (11,004 of it the guide). Their statics take
   96 bytes more internal RAM (the mixer's lock and flag, and the runtime's
   generation) and 1,296 more PSRAM (the mixer's voices and the voice task's
-  chunk of app sound). The size check's image, padded to 64 KB, reads
-  0x2b1000 at both ends, with about 13 KB of padding left (the apps+bench
-  image, which grew 24,012 bytes, about 5.5 KB). Internal RAM
+  chunk of app sound). The size check's image, padded to 64 KB, read
+  0x2b1000 at both ends then, with about 13 KB of padding left (the apps+bench
+  image, which grew 24,012 bytes, about 5.5 KB). Muse's touches
+  (`app.control`'s `tap` and `drag`, 2026-11-02) then made the apps image
+  13,860 bytes bigger against c5cf24a, measured the same way: 8,292 bytes of
+  code and 5,568 of constant data (3,017 of it the guide), with 48 bytes more
+  internal RAM (the touch's and the touch player's atomics) and 384 more
+  PSRAM; the apps+bench image grew 12,692. The size check's image now reads
+  0x2c1000 for both. Internal RAM
   is the tight one: about 2.0 KB less free 25 s after boot (measured, the
   median of 24 boots each). The state only one task touches with plain loads
   and stores is in PSRAM (`EXT_RAM_BSS_ATTR`; atomics and locks stay

@@ -1374,6 +1374,64 @@ bool apps_lv_front(void) {
     return s_front;
 }
 
+/* ---- For app.control tap and drag (apps_touch.h) ---- */
+
+/* The slot whose record has obj (as its object, or as a button's text), or -1. */
+static int slot_of(const lv_obj_t *obj) {
+    for (int slot = 0; s_state != NULL && slot < APPS_UI_SLOTS; slot++) {
+        if (s_state->node[slot].obj == obj || (s_state->node[slot].label == obj && s_state->node[slot].obj != NULL)) {
+            return slot;
+        }
+    }
+    return -1;
+}
+
+int apps_lv_hit(int32_t x, int32_t y) {
+    if (s_layer == NULL || lv_obj_has_flag(s_layer, LV_OBJ_FLAG_HIDDEN)) {
+        return APPS_LV_HIT_OUTSIDE;
+    }
+    /* lv_indev.c's: the read's point turned as the display is (indev_read_core), then pointer_search_obj's four layers in order. */
+    lv_display_t *disp = lv_obj_get_display(s_layer);
+    lv_point_t p = {x, y};
+    lv_display_rotate_point(disp, &p);
+    lv_obj_t *const layers[] = {lv_display_get_layer_sys(disp), lv_display_get_layer_top(disp), lv_display_get_screen_active(disp),
+                                lv_display_get_layer_bottom(disp)};
+    lv_obj_t *found = NULL;
+    for (size_t i = 0; i < sizeof layers / sizeof layers[0] && found == NULL; i++) {
+        lv_point_t at = p;  /* each search has the point as the read gave it */
+        found = layers[i] != NULL ? lv_indev_search_obj(layers[i], &at) : NULL;
+    }
+    int slot = -1;
+    for (lv_obj_t *o = found; o != NULL; o = lv_obj_get_parent(o)) {
+        if (o == s_layer) {
+            return slot >= 0 ? slot : APPS_LV_HIT_LAYER;
+        }
+        if (slot < 0) {
+            slot = slot_of(o);
+        }
+    }
+    return APPS_LV_HIT_OUTSIDE;  /* nothing, or something that isn't in the layer: a card, an image, the screen's own */
+}
+
+int apps_lv_kind(int slot) {
+    if (s_state == NULL || slot < 0 || slot >= APPS_UI_SLOTS || s_state->node[slot].obj == NULL) {
+        return -1;
+    }
+    return s_state->node[slot].kind;
+}
+
+int apps_lv_scrolls(apps_lv_scroll_t *out, int max) {
+    int n = 0;
+    for (int slot = 0; s_state != NULL && out != NULL && slot < APPS_UI_SLOTS && n < max; slot++) {
+        const node_t *node = &s_state->node[slot];
+        if (node->obj != NULL && node->kind == APPS_W_BOX && node->scrolls) {
+            out[n++] = (apps_lv_scroll_t){.slot = (int16_t)slot, .y = lv_obj_get_scroll_y(node->obj),
+                                          .moving = lv_obj_is_scrolling(node->obj)};
+        }
+    }
+    return n;
+}
+
 void apps_lv_stats(apps_lv_stats_t *out) {
     if (out == NULL) {
         return;

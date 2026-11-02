@@ -143,7 +143,7 @@ The values:
 - Numbers are rounded (halves away from zero) and clamped to these ranges, and an infinity is clamped too; NaN is an error. A value of the wrong type is an error; so is an unknown property or name, and that error lists the valid ones.
 - A widget's handle is the same object for as long as the app holds it, so it can be a table key, and a handler gets the very handle the app holds. `tostring(w)` is like `label#3` (`label#3 (deleted)` once it is gone), and `getmetatable(w)` is the string `muse.widget`.
 
-Touches. A tap is heard as press, release, tap, in that order; a long press as press, long_press, release, with no tap. A right swipe that begins on a widget puts the app behind: the widget hears press, then release, and no tap. A left swipe that begins on a widget is heard as press, release, tap. A widget that is deleted, or cleared with `ui.clear()`, while it is pressed never hears its release. A drag up or down that begins on a widget in a box with `scroll = "y"` scrolls the box when the box holds more than it shows: the widget hears press, then release, and no tap. When all that is in the box fits in it, nothing scrolls, and the drag is heard as press, release, tap.
+Touches. A tap is heard as press, release, tap, in that order; a long press as press, long_press, release, with no tap. A right swipe that begins on a widget puts the app behind: the widget hears press, then release, and no tap. A left swipe that begins on a widget is heard as press, release, tap. A widget that is deleted, or cleared with `ui.clear()`, while it is pressed never hears its release. A drag up or down that begins on a widget in a box with `scroll = "y"` scrolls the box when the box holds more than it shows: the widget hears press, then release, and no tap. When all that is in the box fits in it, nothing scrolls, and the drag is heard as press, release, tap. `app.control`'s `tap` and `drag` are heard the same way (The loop).
 
 Stacking. Widgets draw in the order they are made: each new widget draws over every widget there is. So make what must stay in view (a score, a message) after what passes under it, and keep it on top by moving the widgets you have rather than making new ones. A widget with no handler takes no touches: the touch goes to the widget under it. So one full-screen box with a `press` handler, with a `bg` or without one, hears a touch anywhere no widget with a handler covers, whatever is drawn over it. A box with `scroll = "y"` takes the touches on it, to scroll, even with no handler.
 
@@ -335,7 +335,7 @@ The launcher shows each app by its icon.
 2. Write the app on your VM: `workspace/apps/<id>/manifest.json`, `main.lua` and the files it lists. Start from the timer example, or from the tally for an app that shows data from your VM or its connectors (Connected apps). For a game, read Games first.
 3. Call `app.install` with the id. The gadget reads the files itself, checks them, compiles, stores and runs the app in front, and returns `ok` with its `state`, `log`, `ui` (every widget with where it was laid out) and `warnings` (unknown keys, widgets past the round edge); or an error with a `code` (invalid_package, read_failed, compile_failed with the lines around the error, crashed with the traceback and the log, busy) and a message that says what to fix.
 4. Fix and install again: an install replaces the app, and its store stays.
-5. Check it with `app.control`: `status` (state, the error with its traceback, the last 50 log lines, memory, CPU, the widgets), `logs`, and `snapshot`, a picture of the screen that you open and look at.
+5. Check it with `app.control`: `status` (state, the error with its traceback, the last 50 log lines, memory, CPU, the widgets), `logs`, `snapshot`, a picture of the screen that you open and look at, and `tap` and `drag`, which touch the app as a finger would.
 
 `app.control` takes `action` and, for all but list, `id`:
 
@@ -345,6 +345,10 @@ The launcher shows each app by its icon.
 - `stop`: stops it, if it is the one running.
 - `remove`: deletes the app with its store and alarms. Stop it first if it runs.
 - `snapshot`: saves a JPEG of the gadget's screen to `workspace/apps/<id>/snapshot.jpg` on this VM (open it to see the screen) and returns its `path`, `w`, `h`, `bytes`, `front` (whether the app is what is on screen: the picture is whatever is), the app's `ui` and `warnings` (widgets past the round edge). `scale: 2` makes it half size. A dark screen is woken for it. A snapshot needs room in the gadget's memory: when there isn't any it is refused before anything is drawn (`out_of_memory`), and a full-size one says when `scale: 2` would fit. The app that runs keeps running either way.
+- `tap`: touches the app at `at`, `{x, y}` in screen pixels (0 to 465, as `ui` has them), for `ms` (50 to 2000; 80 if you leave it out), as a finger would. A press of 500 ms or more is a long press; one under 400 ms never is. It returns `pressed` (the widget the touch went down on, like `button#4`, or null for none), `heard` (the events the app was sent, like `button#4 tap`, the first 8), `front` (whether the app is in front after it), `cut`, `played_ms`, `scroll` and `warnings`. A dark screen is woken for it.
+- `drag`: presses `at`'s `{x, y}`, moves straight to its `{x2, y2}` over `ms` (50 to 2000, which a drag must give), and lifts: drag up on a list to scroll it. `scroll` lists each box with `scroll = "y"` that moved, with its `y` once it has come to rest (at most 1 s after the lift). A right swipe puts the app behind, as a finger's does: `front` is false.
+
+A touch lands only on the app: it plays only while the app runs in front, with no launcher, card or picture over it, no voice turn and no finger on the screen, and it is cut (`cut` is true, and a warning says why) the moment that stops, with a release and no tap. When it can't play, nothing is touched: `unavailable` says why, `not_running` that the app isn't running, and `busy` that another touch is playing. The app's handlers hear your touches as a finger's, but they aren't the user's taps: `muse.ask` and `sys.show` refuse after them, as they would with no tap at all.
 
 ## Messages
 
@@ -432,7 +436,7 @@ A game is an app like any other, with the same manifest, API and limits, but it 
 - **The best score** goes in the store when a game ends (Keep state in the store, in Patterns).
 - **Sound.** Tones for flaps and hits (`sound.tone`), a clip for a fanfare (`sound.play`, see Sounds), and sound only in front: the gadget plays nothing while the app is behind or the screen is dark, so a paused game is quiet by itself. Keep tones short, like `sound.tone{hz = 520, to_hz = 780, ms = 60, wave = "square", volume = 40}` for a flap, and start one for each event, not each tick: 4 play at once (the `sound` permission).
 - **Functions used before they are defined.** Declare the name first, `local on_press`, and define it further down with `function on_press() ... end`, which sets that local: never make a global for it.
-- **Testing it.** You can't touch the gadget, so give a game `messages` to drive it with: `state` (the screen, the score and where things are), `press` (what a touch does) and `reset`. Play it with `app.send` and look with `snapshot`. While the user plays, `app.control status` shows its CPU: the gadget slows an app that uses more than 40% of the CPU for 3 s and stops it after 5 s.
+- **Testing it.** Play it with `app.control` `tap` and `drag` (The loop): a short tap on the full-screen box is a press, `heard` says what the game was sent, and `snapshot` shows the screen. Give it `messages` too, `state` (the screen, the score and where things are) and `reset`, to read what a picture can't show and to start over with `app.send`. While the user plays, `app.control status` shows its CPU: the gadget slows an app that uses more than 40% of the CPU for 3 s and stops it after 5 s.
 
 ## Common errors
 
@@ -553,6 +557,16 @@ What the gadget says, and what to do. `<...>` stands for a name or number in the
 - `not enough memory for a full-size snapshot right now; take it at scale 2`: take the snapshot again with `scale: 2`.
 - `not enough memory for a snapshot while the app runs; stop it (app.control stop) or make it use less memory, then try again`: the running app holds the room a snapshot needs: stop it with `app.control`, or give it smaller images or a smaller `memory_kb`, and take the snapshot again.
 - `not enough memory for a snapshot right now`: try again in a few seconds.
+- `a touch is already playing on the gadget; try again in a second`: wait for the last `tap` or `drag` to answer, then touch again.
+- `'<id>' isn't running; launch it first (app.control launch)`: launch it, then touch it.
+- `the gadget's screen didn't wake for the touch; nothing was touched, so try again`: touch again.
+- `'<id>' isn't on screen (the launcher, a card, another app or a voice turn covers it); nothing was touched`: `launch` it to bring it to the front, or wait for the voice turn to end; a `snapshot` shows what is on screen.
+- `something is over '<id>' where the touch would land (a picture Muse showed, or a pairing code); nothing was touched`: take a `snapshot` to see it, and touch again once it has gone.
+- `someone is touching the gadget's screen; nothing was touched, so try again`: the user is using the gadget: try again later.
+- `this gadget's touch screen can't be played from here; nothing was touched`: drive the app with `app.send` and look with `snapshot` instead.
+- `the touch didn't end in time and was cut; try again`: touch again.
+- `at must be {x,y} or {x,y,ms} for a tap: x and y 0 to 465, ms 50 to 2000`: give whole numbers in those ranges, and no other keys.
+- `at must be {x,y,x2,y2,ms} for a drag: x, y, x2 and y2 0 to 465, ms 50 to 2000`: give all five, whole numbers in those ranges.
 - `the gadget is busy with another app job (an install, a launch or the guide); try again in a few seconds`: try again once the install has finished.
 
 ## Verify the Result

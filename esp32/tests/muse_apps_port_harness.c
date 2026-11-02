@@ -671,6 +671,15 @@ muse_power_t muse_state_power(void) {
     return fake_power;
 }
 
+static muse_mode_t fake_voice_mode = MUSE_MODE_IDLE;
+
+muse_mode_t muse_state_mode(float *secs_in_mode) {
+    if (secs_in_mode != NULL) {
+        *secs_in_mode = 0;
+    }
+    return fake_voice_mode;
+}
+
 void muse_wifi_status(muse_wifi_status_t *out) {
     *out = fake_wifi;
 }
@@ -2342,6 +2351,17 @@ static void a_refused_save_is_charged_once(void) {
     free(json);
 }
 
+/* app.control tap and drag's voice turn: Muse listens, thinks or speaks (the modes frame_tick hides an app in front for); not
+ * otherwise. */
+static void a_voice_turn_is_listening_thinking_or_speaking(void) {
+    for (int m = 0; m < MUSE_MODE_COUNT; m++) {
+        fake_voice_mode = (muse_mode_t)m;
+        bool want = m == MUSE_MODE_LISTENING || m == MUSE_MODE_THINKING || m == MUSE_MODE_SPEAKING;
+        CHECK(apps_port_in_turn() == want, "mode %d: in a turn %d", m, apps_port_in_turn());
+    }
+    fake_voice_mode = MUSE_MODE_IDLE;
+}
+
 /* sys.battery()'s numbers are muse_state's, a percentage clamped to 0 to 100 and -1 for none. sys.wifi() is connected only when the
  * station is joined, with that network's name, cut to the room the caller has (and never past the NUL a full-length name lacks), and
  * "" when it isn't, whatever name the status still holds. Nothing of it is logged. */
@@ -2460,6 +2480,7 @@ static const struct {
     {"store_a_kept_save_comes_after_the_one_the_worker_took", store_a_kept_save_comes_after_the_one_the_worker_took},
     {"store_load_begins_the_call_again", store_load_begins_the_call_again},
     {"battery_and_wifi_are_the_systems", battery_and_wifi_are_the_systems},
+    {"a_voice_turn_is_listening_thinking_or_speaking", a_voice_turn_is_listening_thinking_or_speaking},
     {"show_keep_awake_and_exit_go_to_the_app_task", show_keep_awake_and_exit_go_to_the_app_task},
     {"values_go_to_apps_nvs_on_flash", values_go_to_apps_nvs_on_flash},
     {"a_backend_failure_is_said_once_a_streak", a_backend_failure_is_said_once_a_streak},

@@ -35,6 +35,8 @@ from test_muse_apps_wiring import c_function, open_conditions
 ROOT = Path(__file__).resolve().parents[1]
 MUSE = ROOT / "components/muse"
 TOOLS = ROOT / "tools/muse"
+# The touch player's option: the bench's console and Muse apps' app.control tap and drag both play through it.
+PLAYER = "if CONFIG_MUSE_BENCH || CONFIG_MUSE_APPS"
 
 
 def load_snap():
@@ -264,20 +266,29 @@ class MuseBenchTest(unittest.TestCase):
         self.assertNotIn("LV_USE_SNAPSHOT", source)
 
     def test_page_demo_and_touch_api_sit_on_the_bench_option(self):
+        # The page and the demo name are the bench's. The touch player is the bench's and the apps' (app.control tap and drag), so
+        # its API, the guarded drag's included, sits on either option: a build with neither has none of it.
         header = (MUSE / "muse_ui.h").read_text()
-        for text in ("muse_ui_page_t;", "void muse_ui_bench_page(", "void muse_ui_bench_demo(", "muse_ui_touch_t;",
-                     "void muse_ui_bench_touch(", "void muse_ui_bench_drag(", "MUSE_UI_DRAG_MS_MIN", "MUSE_UI_DRAG_MS_MAX"):
+        for text in ("muse_ui_page_t;", "void muse_ui_bench_page(", "void muse_ui_bench_demo("):
             with self.subTest(text):
                 self.assertEqual(open_conditions(header, header.index(text)), ["if CONFIG_MUSE_BENCH"])
+        for text in ("muse_ui_touch_t;", "void muse_ui_bench_touch(", "void muse_ui_bench_drag(", "MUSE_UI_DRAG_MS_MIN",
+                     "MUSE_UI_DRAG_MS_MAX", "muse_ui_guard_end_t;", "muse_ui_guard_t;", "bool muse_ui_guarded_drag(",
+                     "bool muse_ui_guarded_withdraw("):
+            with self.subTest(text):
+                self.assertEqual(open_conditions(header, header.index(text)), [PLAYER])
         self.assertRegex(header, r"MUSE_UI_TOUCH_TAP,\s*MUSE_UI_TOUCH_LONG,\s*MUSE_UI_TOUCH_SWIPE_LEFT,\s*"
                                  r"MUSE_UI_TOUCH_SWIPE_RIGHT,\s*MUSE_UI_TOUCH_SWIPE_UP,\s*(?:/\*.*?\*/\s*)?MUSE_UI_TOUCH_DRAG,")
         # Streaming a screenshot is not a bench option's: it stays declared for every build.
         self.assertEqual(open_conditions(header, header.index("void muse_ui_request_snapshot(void)")), [])
         ui = (MUSE / "muse_ui.c").read_text()
-        for text in ("void muse_ui_bench_page(", "void muse_ui_bench_demo(", "void muse_ui_bench_touch(",
-                     "void muse_ui_bench_drag("):
+        for text in ("void muse_ui_bench_page(", "void muse_ui_bench_demo("):
             with self.subTest(text):
                 self.assertEqual(open_conditions(ui, ui.index(text)), ["if CONFIG_MUSE_BENCH"])
+        for text in ("void muse_ui_bench_touch(", "void muse_ui_bench_drag(", "bool muse_ui_guarded_drag(",
+                     "bool muse_ui_guarded_withdraw("):
+            with self.subTest(text):
+                self.assertEqual(open_conditions(ui, ui.index(text)), [PLAYER])
         uses = [m.start() for m in re.finditer(r"s_bench_(?:demo|page)", ui)]
         self.assertGreaterEqual(len(uses), 6)
         for index in uses:
@@ -285,16 +296,20 @@ class MuseBenchTest(unittest.TestCase):
                 self.assertEqual(open_conditions(ui, index), ["if CONFIG_MUSE_BENCH"])
 
     def test_with_the_option_off_the_ui_is_as_before(self):
-        # Every mention of the touch script, its wrapper and the install is inside #if CONFIG_MUSE_BENCH, and the
-        # wrapper goes in after the display exists, under the display lock muse_ui_start() already holds.
+        # Every mention of the touch script, its wrapper, the install and the guarded drag is inside the player's
+        # #if CONFIG_MUSE_BENCH || CONFIG_MUSE_APPS, so a build with neither option is as it was, and the wrapper goes in
+        # after the display exists, under the display lock muse_ui_start() already holds.
         ui = (MUSE / "muse_ui.c").read_text()
         mentions = [m.start() for m in re.finditer(r"bench_touch_install|bench_read|s_real_read|s_touch\b|"
                                                    r"s_touch_request|BENCH_[A-Z_]+|muse_ui_bench_touch|"
-                                                   r"muse_ui_bench_drag|s_drag_(?:end|ms)|MUSE_UI_DRAG_MS_\w+", ui)]
-        self.assertGreaterEqual(len(mentions), 26)
+                                                   r"muse_ui_bench_drag|s_drag_(?:end|ms)|MUSE_UI_DRAG_MS_\w+|"
+                                                   r"s_guarded_\w+|guarded_take|muse_ui_guarded_\w+|MUSE_UI_GUARD_\w+|"
+                                                   r"lv_indev_wait_release", ui)]
+        self.assertGreaterEqual(len(mentions), 40)
         for index in mentions:
             with self.subTest(ui[ui.rindex("\n", 0, index) + 1:ui.index("\n", index)].strip()):
-                self.assertEqual(open_conditions(ui, index), ["if CONFIG_MUSE_BENCH"])
+                self.assertEqual(open_conditions(ui, index), [PLAYER])
+        self.assertEqual(ui.count("#if " + PLAYER[3:]), 2, "the player's block and its install")
         start = c_function(ui, "esp_err_t muse_ui_start(void)")
         self.assertLess(start.index("display_start(&s_indev)"), start.index("bench_touch_install();"))
         self.assertLess(start.index("display_lock(-1)"), start.index("bench_touch_install();"))
@@ -446,11 +461,7 @@ int main(void)
 
     # ---- Task 14: touch scripts through LVGL's read callback ----
 
-    def run_touch_harness(self, scenario):
-        source = (MUSE / "muse_ui.c").read_text()
-        start = source.index("/*\n * Bench touch")
-        block = source[start:source.index("\n#endif", start)]
-        program = r"""
+    TOUCH_PRELUDE = r"""
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -479,17 +490,23 @@ static const char *TAG = "muse_ui";
 static int s_w = 466, s_h = 466;
 static lv_indev_t *s_indev;
 
+#define EXT_RAM_BSS_ATTR
 static int real_calls;
+static bool g_finger = true;   /* a finger on the glass at (7, 9); off, the glass is bare and the read says released there */
 static void real_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
     real_calls++;
-    data->state = LV_INDEV_STATE_PRESSED;   /* a finger on the glass at (7, 9) */
+    data->state = g_finger ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
     data->point.x = 7;
     data->point.y = 9;
 }
+static int g_waits;            /* lv_indev_wait_release calls */
+__attribute__((unused)) static void lv_indev_wait_release(lv_indev_t *indev) { (void)indev; g_waits++; printf(" wait"); }
 
-""" + block + r"""
+"""
+
+    TOUCH_HELPERS = r"""
 
 /* One read, the way LVGL makes it: the data starts zeroed. */
 static lv_indev_data_t read_now(void)
@@ -507,7 +524,7 @@ static void show(const char *what, lv_indev_data_t d, uint32_t t0)
 }
 
 /* Reads every `step` ms from the first read of the script until its release; then one more read. */
-static void play(const char *label, int step)
+__attribute__((unused)) static void play(const char *label, int step)
 {
     real_calls = 0;
     uint32_t t0 = g_tick;
@@ -528,6 +545,9 @@ static void play(const char *label, int step)
     g_tick += 1000;
 }
 
+"""
+
+    TOUCH_MAIN = r"""
 int main(int argc, char **argv)
 {
     const char *what = argc > 1 ? argv[1] : "";
@@ -630,6 +650,14 @@ int main(int argc, char **argv)
     return 0;
 }
 """
+
+    def run_touch_harness(self, scenario, main=None):
+        """muse_ui.c's touch player block (from its comment to its #endif), compiled over a fake LVGL with `main` (TOUCH_MAIN, or a
+        case's own), and run once a scenario: its output lines."""
+        source = (MUSE / "muse_ui.c").read_text()
+        start = source.index("/*\n * Bench touch")
+        block = source[start:source.index("\n#endif", start)]
+        program = self.TOUCH_PRELUDE + block + self.TOUCH_HELPERS + (main or self.TOUCH_MAIN)
         with tempfile.TemporaryDirectory() as tmp:
             exe = build_bench("bench_touch", program, tmp)
             cases = {name: apps_host.run(exe, *args) for name, args in scenario.items()}
@@ -832,6 +860,187 @@ int main(int argc, char **argv)
         long = self.reads(out["long"][2])
         self.assertEqual((long[0], long[-2], long[-1]), (("P", 0, 0, 0), ("P", 95, 0, 1900), ("R", 100, 0, 2000)))
         self.assertEqual(out["by_touch"][2], "drag_by_touch: P7,9@0 real=1")
+
+    # ---- Muse apps' app.control tap and drag: the guarded drag ----
+
+    GUARDED_MAIN = r"""
+/* The guard: each call printed; admit says g_admit; keep says yes until its g_keep_until-th call (0: always). */
+static int g_admit = 1, g_keep_until, keeps;
+static bool admit(int x, int y) { printf(" admit%d,%d", x, y); return g_admit != 0; }
+static bool keep(int x, int y) { keeps++; printf(" keep%d,%d", x, y); return g_keep_until == 0 || keeps < g_keep_until; }
+static void end(muse_ui_guard_end_t how, uint32_t ms) { printf(" end%d@%u", (int)how, (unsigned)ms); }
+static const muse_ui_guard_t GUARD = {admit, keep, end};
+
+/* n reads, step ms apart, each shown with what the guard was asked in it; a finger comes down at read finger_from (1 the first;
+ * 0 never) and stays. */
+static void reads(const char *label, int n, int step, int finger_from)
+{
+    uint32_t t0 = g_tick;
+    real_calls = 0;
+    printf("%s:", label);
+    for (int i = 1; i <= n; i++) {
+        if (finger_from != 0 && i >= finger_from) {
+            g_finger = true;
+        }
+        show("", read_now(), t0);
+        g_tick += (uint32_t)step;
+    }
+    printf(" real=%d waits=%d\n", real_calls, g_waits);
+}
+
+int main(int argc, char **argv)
+{
+    const char *what = argc > 1 ? argv[1] : "";
+    s_indev = (lv_indev_t *)&g_tick;
+    g_cb = strcmp(what, "no_driver") ? real_read : NULL;
+    g_finger = false;
+    bench_touch_install();
+    if (!strcmp(what, "no_driver")) {
+        printf("queued=%d\n", muse_ui_guarded_drag(1, 1, 2, 2, 100, &GUARD));
+    } else if (!strcmp(what, "tap")) {
+        printf("queued=%d\n", muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD));
+        reads("tap", 9, 15, 0);
+    } else if (!strcmp(what, "drag")) {
+        printf("queued=%d\n", muse_ui_guarded_drag(233, 333, 233, 133, 300, &GUARD));
+        reads("drag", 23, 15, 0);
+    } else if (!strcmp(what, "finger_at_take")) {
+        printf("queued=%d\n", muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD));
+        reads("finger_at_take", 2, 15, 1);
+    } else if (!strcmp(what, "refused")) {
+        g_admit = 0;
+        printf("queued=%d\n", muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD));
+        reads("refused", 2, 15, 0);
+    } else if (!strcmp(what, "cut")) {
+        g_keep_until = 3;
+        printf("queued=%d\n", muse_ui_guarded_drag(233, 333, 233, 133, 300, &GUARD));
+        reads("cut", 5, 15, 0);
+    } else if (!strcmp(what, "cut_finger")) {
+        printf("queued=%d\n", muse_ui_guarded_drag(233, 333, 233, 133, 300, &GUARD));
+        reads("cut_finger", 5, 15, 3);
+    } else if (!strcmp(what, "withdraw")) {
+        int queued = muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD);
+        int withdrawn = muse_ui_guarded_withdraw();
+        printf("queued=%d withdrawn=%d again=%d\n", queued, withdrawn, muse_ui_guarded_withdraw());
+        reads("withdraw", 2, 15, 0);
+    } else if (!strcmp(what, "busy")) {
+        int first = muse_ui_guarded_drag(100, 100, 100, 100, 80, &GUARD);
+        int second = muse_ui_guarded_drag(200, 200, 200, 200, 300, &GUARD);
+        printf("first=%d second=%d\n", first, second);
+        reads("busy", 9, 15, 0);
+        printf("later=%d\n", muse_ui_guarded_drag(200, 200, 200, 200, 80, &GUARD));
+    } else if (!strcmp(what, "bench_first")) {
+        muse_ui_bench_touch(MUSE_UI_TOUCH_TAP, 100, 100);
+        uint32_t t0 = g_tick;
+        printf("bench:");
+        show("", read_now(), t0);
+        printf("\nqueued=%d\nthen:", muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD));
+        for (int i = 0; i < 9; i++) {   /* the times from the bench tap's start */
+            g_tick += 15;
+            show("", read_now(), t0);
+        }
+        printf(" real=%d waits=%d\n", real_calls, g_waits);
+    } else if (!strcmp(what, "guarded_first")) {
+        printf("queued=%d\n", muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD));
+        muse_ui_bench_touch(MUSE_UI_TOUCH_TAP, 100, 100);
+        reads("guarded_first", 9, 15, 0);
+    }
+    return 0;
+}
+"""
+
+    def run_guarded(self, *names):
+        """GUARDED_MAIN's scenarios, by name: each one's lines."""
+        out = self.run_touch_harness({name: (name,) for name in names}, main=self.GUARDED_MAIN)
+        return {name: lines[1:] if lines and lines[0] == "installed=1" else lines for name, lines in out.items()}
+
+    @staticmethod
+    def tokens(line):
+        """A scenario's reads, as the words of its line after the label: the guard's calls, 'wait' and the reads."""
+        return line.split(":", 1)[1].split(" real=")[0].split()
+
+    def test_a_guarded_tap_asks_its_guard_at_every_read_and_ends_after_its_release(self):
+        # Muse apps' app.control tap: a drag to its own point. At the read that takes it the real touch is read, then admit sees the
+        # first point before LVGL does; every read after it asks keep about the point it gives, the release's included; the end
+        # comes at the first read after the release (when LVGL has sent what the release made it send), with the ms it played, and
+        # the real touch is LVGL's again from that read. Every read reads the real touch once.
+        out = self.run_guarded("tap")["tap"]
+        self.assertEqual(out[0], "queued=1")
+        held = []
+        for t in range(15, 90, 15):
+            held += ["keep233,300", f"P233,300@{t}"]
+        self.assertEqual(self.tokens(out[1]), ["admit233,300", "P233,300@0", *held, "keep233,300", "R233,300@90",
+                                               "end0@90", "R7,9@105", "R7,9@120"])
+        self.assertTrue(out[1].endswith("real=9 waits=0"), out[1])
+
+    def test_a_guarded_drag_follows_the_clock_as_a_bench_drag_does(self):
+        out = self.run_guarded("drag")["drag"]
+        words = self.tokens(out[1])
+        pressed = [w for w in words if w.startswith("P")]
+        self.assertEqual(pressed, [f"P233,{333 - 200 * t // 300}@{t}" for t in range(0, 300, 15)])
+        self.assertEqual(words[:2], ["admit233,333", "P233,333@0"])
+        self.assertEqual(words[-5:], ["keep233,133", "R233,133@300", "end0@300", "R7,9@315", "R7,9@330"])
+        keeps = [w for w in words if w.startswith("keep")]
+        self.assertEqual(keeps, [f"keep233,{333 - 200 * t // 300}" for t in range(15, 300, 15)] + ["keep233,133"])
+
+    def test_a_finger_on_the_glass_refuses_a_guarded_drag_and_keeps_its_touch(self):
+        # A finger down at the take: the end says so at once (MUSE_UI_GUARD_FINGER, 2), admit isn't asked, and LVGL gets the
+        # finger's own read, then the finger's reads as ever.
+        out = self.run_guarded("finger_at_take")["finger_at_take"]
+        self.assertEqual(self.tokens(out[1]), ["end2@0", "P7,9@0", "P7,9@15"])
+
+    def test_an_admit_that_says_no_presses_nothing(self):
+        # MUSE_UI_GUARD_REFUSED (1): the end at once, and LVGL gets the real read, a bare screen.
+        out = self.run_guarded("refused")["refused"]
+        self.assertEqual(self.tokens(out[1]), ["admit233,300", "end1@0", "R7,9@0", "R7,9@15"])
+
+    def test_a_keep_that_says_no_cuts_the_drag_with_a_lost_press(self):
+        # The third keep says no: that read calls lv_indev_wait_release and lets go at the last point given, so LVGL sends the
+        # object pressed PRESS_LOST and no click; the end (MUSE_UI_GUARD_CUT, 3, after 45 ms) comes at the next read.
+        out = self.run_guarded("cut")["cut"]
+        self.assertEqual(self.tokens(out[1]), ["admit233,333", "P233,333@0", "keep233,323", "P233,323@15", "keep233,313",
+                                               "P233,313@30", "keep233,303", "wait", "R233,313@45", "end3@45", "R7,9@60"])
+        self.assertTrue(out[1].endswith("waits=1"), out[1])
+
+    def test_a_finger_that_comes_down_cuts_the_drag_and_has_the_screen(self):
+        # A finger mid-drag wins: the read that finds it lifts the drag the same way, with no keep asked (MUSE_UI_GUARD_CUT_FINGER, 4),
+        # and from the next read LVGL has the finger, as a new touch.
+        out = self.run_guarded("cut_finger")["cut_finger"]
+        self.assertEqual(self.tokens(out[1]), ["admit233,333", "P233,333@0", "keep233,323", "P233,323@15", "wait",
+                                               "R233,323@30", "end4@30", "P7,9@45", "P7,9@60"])
+
+    def test_a_waiting_guarded_drag_can_be_withdrawn_once(self):
+        out = self.run_guarded("withdraw")["withdraw"]
+        self.assertEqual(out[0], "queued=1 withdrawn=1 again=0")
+        self.assertEqual(self.tokens(out[1]), ["R7,9@0", "R7,9@15"])   # nothing plays, and no end comes
+
+    def test_one_guarded_drag_waits_at_a_time(self):
+        # A second ask while one waits is refused, and leaves the one waiting as it was asked; once it has been taken another
+        # may wait.
+        out = self.run_guarded("busy")["busy"]
+        self.assertEqual(out[0], "first=1 second=0")
+        words = self.tokens(out[1])
+        self.assertEqual(words[:2], ["admit100,100", "P100,100@0"])
+        self.assertIn("R100,100@90", words)
+        self.assertEqual(out[2], "later=1")
+
+    def test_a_board_with_no_touch_to_script_queues_no_guarded_drag(self):
+        out = self.run_guarded("no_driver")["no_driver"]
+        self.assertEqual(out, ["installed=0", "queued=0"] if out and out[0] == "installed=0" else ["queued=0"])
+
+    def test_a_bench_script_and_a_guarded_drag_take_turns(self):
+        # A guarded drag asked while a bench script plays waits for its release, and is taken at the read after; one waiting when a
+        # bench request comes is taken first, the bench request at the read of its end. A bench request never replaces it.
+        out = self.run_guarded("bench_first", "guarded_first")
+        bench = out["bench_first"]
+        self.assertEqual(bench[0], "bench: P100,100@0")
+        then = self.tokens(bench[2])
+        self.assertEqual(then[:5], ["P100,100@15", "P100,100@30", "P100,100@45", "P100,100@60", "P100,100@75"])
+        self.assertEqual(then[5:8], ["R100,100@90", "admit233,300", "P233,300@105"])
+        self.assertNotIn("keep100,100", then)
+        first = self.tokens(out["guarded_first"][1])
+        self.assertEqual(first[:2], ["admit233,300", "P233,300@0"])
+        release = first.index("R233,300@90")
+        self.assertEqual(first[release + 1:release + 3], ["end0@90", "P100,100@105"])
 
     # ---- The clock and Muse's slide: the page frame line ----
 

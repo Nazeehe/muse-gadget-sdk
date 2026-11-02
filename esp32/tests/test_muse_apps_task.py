@@ -277,6 +277,15 @@ class AppTaskTest(HarnessCase):
     def test_the_snapshot_is_offered_every_frame(self):  # Task 25, E9: the supervisor offers it, dark frames included
         self.run_case("the_snapshot_is_offered_every_frame")
 
+    def test_the_touch_target_is_the_app_on_the_layer(self):  # app.control tap and drag: the id with its gen, under the names lock
+        self.run_case("the_touch_target_is_the_app_on_the_layer")
+
+    def test_a_hung_app_is_no_touch_target(self):  # app.control tap and drag: HUNG, and its gen not alive
+        self.run_case("a_hung_app_is_no_touch_target")
+
+    def test_touch_events_go_through_the_tag(self):  # app.control tap and drag: tagged before posting, the swipe told, offered every frame
+        self.run_case("touch_events_go_through_the_tag")
+
     def test_dropped_is_read_with_its_base(self):  # F10
         self.run_case("dropped_is_read_with_its_base")
 

@@ -1522,6 +1522,11 @@ class HarnessTest(unittest.TestCase):
         header = (APPS / "apps_rt.h").read_text()
         self.assertRegex(header, r"(?s)apps_rt_image_add.{0,600}app task|app task.{0,600}apps_rt_image_add")
 
+    # ---- App sound: the final review's I1 ----
+
+    def test_hide_fades_the_apps_sounds_and_stop_ends_them(self):  # the cut, not the owner's end, which could beat the fade
+        self.run_case("hide_fades_sound")
+
 
 class AppHostSession:
     """apphost talked to a line at a time, for a test that changes the fake VM's files between commands, as a hook does on the VM:

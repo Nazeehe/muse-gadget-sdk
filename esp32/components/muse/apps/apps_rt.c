@@ -1182,10 +1182,14 @@ void apps_rt_show(apps_rt_t *rt, bool shown) {
     if (rt == NULL) {
         return;
     }
-    /* Behind first, then the sounds end, then hide(): so a sound that hide() asks for is done at once (G6). */
+    /* Behind first, then the sounds are cut, then hide(): so a sound that hide() asks for is done at once (G6). The cut fades out each
+     * voice that has sounded and drops one that hasn't, as the LVGL task's own cut a moment before did (apps_lv.c). An end here would
+     * stop them dead, and could reach the mixer before the voice task had rendered that fade: a click (the final review's I1). Hide
+     * frees nothing, so it needs no end; the package's end has its own (apps_task.c's end_app). One app runs, so every voice the mixer
+     * has is this app's, and the cut of them all is the cut of its own. */
     rt->shown = shown;
     if (!shown) {
-        sound_release(rt);
+        apps_port_sound_cut();
     }
     int h = shown ? H_SHOW : H_HIDE;
     if (rt->state == APPS_STATE_RUNNING && rt->handler[h] != LUA_NOREF) {

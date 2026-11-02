@@ -228,8 +228,11 @@ void apps_port_sound_stop(void) {
     fake_stops++;
 }
 
-/* An app's tones and clips (apps_port.h): counted; the module's own cases are apphost's (test_muse_apps_sound.py). */
+/* An app's tones and clips (apps_port.h): counted, and the cut's place among the lines the app logs kept (hide_fades_sound reads them);
+ * the module's own cases are apphost's (test_muse_apps_sound.py). */
 static int fake_tones, fake_clips, fake_ends, fake_end_owners, fake_cuts;
+static size_t fake_cut_lines;  /* the lines logged when the last cut came */
+static size_t lines_logged(void);
 
 uint32_t apps_port_sound_tone(uint32_t owner, int hz, int to_hz, int ms, int wave, int volume) {
     (void)owner, (void)hz, (void)to_hz, (void)ms, (void)wave, (void)volume;
@@ -253,6 +256,7 @@ void apps_port_sound_end_owner(uint32_t owner) {
 
 void apps_port_sound_cut(void) {
     fake_cuts++;
+    fake_cut_lines = lines_logged();
 }
 
 /* The apps of the other kind: count alarms of the app `owner` ("other1", ...) in the table, as if it had armed them. */
@@ -465,6 +469,10 @@ static void forget_logged(void) {
     }
     logged_n = 0;
     log_bad_id = false;
+}
+
+static size_t lines_logged(void) {
+    return logged_n;
 }
 
 /* The nth line logged since forget_logged, or "(none)". */
@@ -3006,6 +3014,46 @@ static void show_window(void) {
     fake_store_reset();
 }
 
+/* A tone a message starts, and hide() asks for one more. */
+static const char *const HIDE_SOUND_APP =
+    "local app = {}\n"
+    "function app.message() sound.tone{hz = 440, ms = 2000} return true end\n"
+    "function app.hide() print('hide ' .. tostring(sound.tone{hz = 330})) end\n"
+    "return app\n";
+
+/* The final review's I1: hide stops the app's sounds with the cut (apps_port_sound_cut), which fades out each voice that has sounded and
+ * drops one that hasn't, never with the owner's end (apps_port_sound_end_owner), which stops them dead. On the gadget the LVGL task has
+ * just cut them, and an end from the app task could reach the mixer before the voice task had rendered that fade: a click. Hide frees
+ * nothing, so it needs no end; stop, a crash and the package's end (apps_task.c's end_app) keep theirs. The cut comes once the runtime
+ * is behind and before hide() runs (G6), so what hide() asks for is done at once and reaches the port not at all. */
+static void hide_fades_sound(void) {
+    port_dark = false;
+    apps_pkg_t *pkg;
+    apps_rt_t *rt = launch_perms(&pkg, HIDE_SOUND_APP, APPS_PERM_SOUND);
+    if (rt == NULL) {
+        return;
+    }
+    apps_rt_show(rt, true);
+    char err[256];
+    char *reply = send(rt, "go", err, sizeof err);
+    CHECK(reply != NULL, "the message: %s", err);
+    apps_port_free(reply);
+    CHECK(fake_tones == 1 && fake_cuts == 0 && fake_end_owners == 0, "shown: %d tones, %d cuts, %d ends", fake_tones, fake_cuts,
+          fake_end_owners);
+    forget_logged();
+    apps_rt_show(rt, false);
+    expect_logged("hide sound#2");
+    CHECK(fake_cuts == 1 && fake_cut_lines == 0, "hidden: %d cuts, the last after %zu lines of hide()", fake_cuts, fake_cut_lines);
+    CHECK(fake_end_owners == 0 && fake_ends == 0, "hidden: the sounds were stopped dead, %d owner ends and %d voice ends",
+          fake_end_owners, fake_ends);
+    CHECK(fake_tones == 1, "hide()'s tone reached the port: %d tones", fake_tones);
+    forget_logged();
+    /* Stop ends them at once, before stop() and after it, as before. */
+    apps_rt_stop(rt);
+    CHECK(fake_end_owners == 2 && fake_cuts == 1, "stopped: %d owner ends, %d cuts", fake_end_owners, fake_cuts);
+    finish(rt, pkg);
+}
+
 /* The timers' contract at the runtime's own API, which the app task and apphost build on, where a script only sees events:
  * when the next one is due, what one step of a pass does (which timer, in what order, from what time it reschedules), what the
  * dark screen, a stop, a crash and a kill from outside leave. The clocks are the case's. */
@@ -4591,6 +4639,7 @@ int main(int argc, char **argv) {
         {"store_books_drift", store_books_drift},
         {"sys_services", sys_services},
         {"show_window", show_window},
+        {"hide_fades_sound", hide_fades_sound},
         {"timer_api", timer_api},
         {"timer_tie", timer_tie},
         {"os_time_charge", os_time_charge},

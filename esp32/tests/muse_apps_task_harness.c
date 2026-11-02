@@ -4188,8 +4188,8 @@ static void a_front_launch_plays_from_start(void) {
 }
 
 /* A front launch over a layer still in front from the app it replaced, put behind by a voice turn before its first show(): the turn's
- * HIDE finds an app that has had no show() but started shown, so its sounds end and hide() runs (as N1's case, with the new app run in
- * front). The gate holds the app task in start(). */
+ * HIDE finds an app that has had no show() but started shown, so its sounds are cut and hide() runs (as N1's case, with the new app run
+ * in front). The gate holds the app task in start(). */
 static void a_front_launch_hidden_before_its_show_is_behind(void) {
     char err[200];
     CHECK(apps_task_run(make_pkg("first", "First", BUSY, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
@@ -4213,7 +4213,8 @@ static void a_front_launch_hidden_before_its_show_is_behind(void) {
     CHECK(late.ok, "run: %s", late.err);
     WAIT(from, "print second hide");
     int clip = WAIT(from, "sound clip ");  /* start()'s, shown: the first app's own end is before it */
-    ORDERED(clip, "sound end_owner ", "print second hide");
+    ORDERED(clip, "sound cut", "print second hide");
+    ABSENT(clip, "sound end_owner ");  /* the hide's stop fades (the final review's I1): only an end of the app ends them dead */
     ABSENT(from, "print second show");
     int after = mark();
     char *reply = apps_task_message("second", "go", NULL, false, 0, err, sizeof err);

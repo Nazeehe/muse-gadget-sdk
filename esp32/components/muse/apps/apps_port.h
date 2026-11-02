@@ -194,7 +194,8 @@ void apps_port_sound_end(uint32_t id);
 void apps_port_sound_end_owner(uint32_t owner);
 
 /* Stops every voice, whoever's: each fades out (apps_mix_stop_all). Muse takes the speaker: the app went behind or a card covers it
- * (the LVGL task, apps_lv.c), an alarm rings (the esp_timer task, apps_alarm.c). Any task; with nothing playing it takes no lock. */
+ * (the LVGL task, apps_lv.c, and the runtime's hide after it, apps_rt.c), an alarm rings (the esp_timer task, apps_alarm.c). Any task;
+ * with nothing playing it takes no lock. */
 void apps_port_sound_cut(void);
 
 /*

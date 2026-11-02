@@ -1361,9 +1361,10 @@ void apps_lv_set_front(bool front) {
     } else {
         lv_obj_add_flag(s_layer, LV_OBJ_FLAG_HIDDEN);
         /* App sound is for the app in front: every back goes through here (a swipe, a hang, the app's own, a voice turn, which the
-         * voice task's own cut misses when the press comes during a reply), and each one fades it out at once, a frame or more before
-         * the app task's hide() ends it. It waits for the mixer's lock at most as long as one render holds it, and takes none with
-         * nothing playing (apps_mix.h). */
+         * voice task's own cut misses when the press comes during a reply), and each one fades it out at once. The app task's hide
+         * comes later and cuts again (apps_rt_show), which leaves these fades to play: a voice the app started in between fades out
+         * too if it has sounded, and is dropped if it hasn't. It waits for the mixer's lock at most as long as one render holds it,
+         * and takes none with nothing playing (apps_mix.h). */
         apps_port_sound_cut();
     }
     s_front = front;

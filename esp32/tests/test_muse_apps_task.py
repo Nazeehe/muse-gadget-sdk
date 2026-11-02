@@ -311,7 +311,7 @@ class AppTaskTest(HarnessCase):
     def test_a_front_launch_plays_from_start(self):  # an app launched in front starts shown; one behind plays nothing
         self.run_case("a_front_launch_plays_from_start")
 
-    def test_a_front_launch_hidden_before_its_show_is_behind(self):  # its sounds end and hide() runs (N1's shape, in front)
+    def test_a_front_launch_hidden_before_its_show_is_behind(self):  # its sounds are cut and hide() runs (N1's shape, in front)
         self.run_case("a_front_launch_hidden_before_its_show_is_behind")
 
     # ---- Task 13 ----

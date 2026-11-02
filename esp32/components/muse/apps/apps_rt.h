@@ -159,9 +159,10 @@
  * Shown, and the sound. The runtime keeps whether the app is shown, as the last apps_rt_show said, whatever its state: false when it
  * is made, so that main.lua's top level never is. Whoever serves the app says shown before start() for an app launched in front (the
  * guide's "an app launched in front starts shown"), and at each show and hide after. The sound module plays only while it is shown and
- * the screen is lit (apps_sound.h). The app's sounds are its runtime's: their owner is apps_rt_gen. They all end (the port's
- * apps_port_sound_end_owner) when it is hidden, before hide() runs; when it stops, before stop() runs and again after it; and when it
- * crashes. The caller that frees the package ends them too, before it does, whatever became of the runtime (apps_task.c's end_app).
+ * the screen is lit (apps_sound.h). The app's sounds are its runtime's: their owner is apps_rt_gen. When it is hidden they are cut
+ * before hide() runs (the port's apps_port_sound_cut: each that has sounded fades out, and one that hasn't is dropped). They all end at
+ * once (apps_port_sound_end_owner) when it stops, before stop() runs and again after it, and when it crashes. The caller that frees
+ * the package ends them too, before it does, whatever became of the runtime (apps_task.c's end_app).
  *
  * Messages (the runtime's own; <main> is the manifest's main file, "main.lua" unless it says otherwise):
  *   <main> must return a table of handlers: local app = {} … return app
@@ -261,8 +262,8 @@ bool apps_rt_compile(const apps_code_t *code, int n, unsigned memory_kb, char *e
  */
 bool apps_rt_start(apps_rt_t *rt);
 
-/* Shown or not (above), for a runtime in any state: when not, the app's sounds end first. Then show() when shown, hide() when not, with
- * APPS_BUDGET_CALL, for a RUNNING app; no handler otherwise. NULL is ignored. */
+/* Shown or not (above), for a runtime in any state: when not, the app's sounds are cut first. Then show() when shown, hide() when not,
+ * with APPS_BUDGET_CALL, for a RUNNING app; no handler otherwise. NULL is ignored. */
 void apps_rt_show(apps_rt_t *rt, bool shown);
 
 /* Whether the last apps_rt_show said shown; false for a runtime it was never called for, and for NULL. */

@@ -215,6 +215,40 @@ power management on: 10 us a byte, where the default 115200 took 87. Nothing
 reads it: the console's input and the tools use USB-Serial-JTAG, the secondary
 output, which the baud doesn't touch.
 
+With the apps, a bench build also measures the apply step and the frames under
+an app (`apps_lv.c`, the `muse_apps` tag). Once a second while an app is in
+front with no launcher or card over it, `frame_tick` has it print
+`apply: calls=<n> applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us> stack_peak=<path>:<bytes>`:
+the app's calls that ended in the second, the passes that ran, the frames
+skipped while the app was in a call (at most 3 in a row) and for a UI lock not
+free within 2 ms, the display's refreshes, the most time between the ends of
+two passes that changed something, the passes' average and longest time, the
+longest the app task's dump of its table (`>app.status`) held the UI lock, and
+the deepest stack path so far with the bytes it left free (`none:-1` before one
+is found). The slow pass's line (a pass over 2000 us, at most one line a
+second) adds
+`visits=<us> layout=<us> writeback=<us> creates=<n> texts=<n> styles=<n>` for
+the longest pass since the last line. A refresh over 50 ms with an app in
+front, timed from the refresh before it (which must have had the app in front
+too), prints
+`slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us>`
+from `LV_EVENT_REFR_READY`: the time to the refresh's start, its layout, its
+drawing less its waits for the panel, those waits, and the passes since the
+refresh before and their time. A refresh after a rest counts too: its gap is
+the rest. The stack paths are the apply pass, the home pages' slide
+(`LV_EVENT_SCROLL_BEGIN`), the launcher carousel's scroll and app.control's
+snapshot (`muse_bench_mem.c`): before each, the LVGL task's stack is filled
+with 0xA5 from its start up to 256 B under the stack pointer, and after it the
+first byte changed says how deep it went; FreeRTOS's own high-water mark is
+kept, except while a paint is open. `>mem` adds `swdraw_stack_free`, the
+high-water marks of LVGL's two drawing tasks. `>frame copy off` sends the home
+slide's whole-screen refreshes as bands, with no copy (they tear), and
+`>frame copy on` puts the copy back. `>memtest` times a 109976 B memcpy within
+PSRAM and a 107520 B `esp_async_memcpy` (GDMA):
+`memtest: memcpy psram 109976 B <us> us; async_memcpy 107520 B <us> us`, or the
+reason the second was skipped. The DMA driver takes some internal RAM while it
+is installed, for the length of the test.
+
 Or run `idf.py` directly:
 
 ```sh

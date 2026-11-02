@@ -30,6 +30,7 @@
 #include "esp_timer.h"
 #include "sdkconfig.h"
 #if CONFIG_MUSE_BENCH
+#include "muse_bench_mem.h"
 #include "muse_frame_stats.h"
 #endif
 
@@ -56,6 +57,10 @@ static const char *TAG = "muse_apps";
 #define SLOW_US 2000
 #define SLOW_LOG_US 1000000  /* a slow pass is logged at most this often */
 #define MAX_CALLBACK_SKIPS 3
+#if CONFIG_MUSE_BENCH
+#define BENCH_SECOND_US 1000000  /* the apply summary's second */
+#define SLOW_FRAME_MS 50         /* a refresh longer than this, with an app in front, prints its anatomy */
+#endif
 
 /* The bits that name a group of properties (and SCROLL, a w:scroll_to), as opposed to CREATE and DELETE. */
 #define GROUPS (APPS_DIRTY_GEOM | APPS_DIRTY_STYLE | APPS_DIRTY_TEXT | APPS_DIRTY_VALUE | APPS_DIRTY_EVENTS | APPS_DIRTY_SCROLL)
@@ -143,7 +148,40 @@ typedef struct {
     uint32_t rejects, refused;
     int reject_slot;         /* the first slot dropped, or -1 */
     const char *reject_why;
+#if CONFIG_MUSE_BENCH
+    int64_t layout_us, writeback_us;  /* the bench's slow pass: write_back's layout, and the rest of it */
+    uint32_t creates, texts, styles;  /* the objects made, the texts set and the styles applied */
+#endif
 } pass_t;
+
+#if CONFIG_MUSE_BENCH
+/*
+ * The bench's apply summary (apps_lv_bench_tick, perf plan Task 2): the second's counts, the pass's and the frame's. The LVGL task's,
+ * but dump_pending_us, which the app task writes with the UI lock held (apps_lv_bench_dump_hold) and a pass takes in under it.
+ */
+static EXT_RAM_BSS_ATTR struct {
+    bool second;                /* a second runs: an app is in front */
+    int64_t since_us;           /* its start */
+    uint32_t calls_at;          /* the app task's calls ended at its start */
+    uint32_t applies, skips_in_call, skips_lock_busy, refr;
+    int64_t pass_us, pass_max_us;   /* the passes' time in the second, and the longest */
+    int64_t gap_max_us;         /* the most between the ends of two passes that changed something */
+    bool changed_seen;          /* a pass changed something since the app came in front, */
+    int64_t changed_at_us;      /* and the last one ended then */
+    uint32_t dump_max_us;       /* the longest dump hold taken in, this second */
+    uint32_t dump_pending_us;   /* the longest told since a pass last took them in */
+    uint32_t frame_applies;     /* the passes since the last refresh, and their time: the slow frame's */
+    int64_t frame_apply_us;
+} s_bench;
+
+/* The slow pass's phases: visits (the deletes, the visits and what came before them), the layout, the write-back (the scrolls and
+ * every widget's place and overflow), and what the pass made, set and styled. The longest slow pass's since the last line. */
+typedef struct {
+    int64_t visits_us, layout_us, writeback_us;
+    uint32_t creates, texts, styles;
+} phases_t;
+static EXT_RAM_BSS_ATTR phases_t s_slow_phases;
+#endif
 
 typedef enum { MADE, REFUSED, BAD } made_t;
 
@@ -520,6 +558,9 @@ static made_t make_object(pass_t *p, int slot, int depth) {
     n->scroll_sets = 0;     /* a scroll_to made with the box is still to apply */
     w->dirty = (w->dirty & ~(uint32_t)APPS_DIRTY_CREATE) | groups_of_new(w);
     p->changed = true;
+#if CONFIG_MUSE_BENCH
+    p->creates++;
+#endif
     return MADE;
 }
 
@@ -1000,9 +1041,15 @@ static void visit_live(pass_t *p, int slot, apps_widget_t *w) {
     }
     if ((todo & APPS_DIRTY_STYLE) != 0) {
         apply_style(p, w, n);
+#if CONFIG_MUSE_BENCH
+        p->styles++;
+#endif
     }
     if ((todo & APPS_DIRTY_TEXT) != 0) {
         apply_text(w, n);
+#if CONFIG_MUSE_BENCH
+        p->texts++;
+#endif
     }
     if ((todo & APPS_DIRTY_VALUE) != 0) {
         apply_value(w, n->obj);
@@ -1133,7 +1180,14 @@ static void apply_scrolls(pass_t *p) {
 /* Lays the layer out, scrolls what was asked to, and writes where each widget with an object is, and how far it goes over the edge,
  * back. */
 static void write_back(pass_t *p) {
+#if CONFIG_MUSE_BENCH
+    int64_t t0 = esp_timer_get_time();
+#endif
     lv_obj_update_layout(s_layer);
+#if CONFIG_MUSE_BENCH
+    int64_t t1 = esp_timer_get_time();
+    p->layout_us += t1 - t0;
+#endif
     apply_scrolls(p);
     for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
         apps_widget_t *w = apps_ui_slot(p->ui, slot);
@@ -1151,6 +1205,9 @@ static void write_back(pass_t *p) {
         w->rh = (int16_t)rh;
         w->overflow = overflow_of(p, w, x1, y1, rw, rh);
     }
+#if CONFIG_MUSE_BENCH
+    p->writeback_us += esp_timer_get_time() - t1;
+#endif
 }
 
 /* ---- The pass ---- */
@@ -1214,22 +1271,41 @@ void apps_lv_set_ui(apps_ui_t *ui) {
     s_ui = ui;
 }
 
-bool apps_lv_apply(bool in_callback) {
-    if (s_layer == NULL) {
-        return false;
+#if CONFIG_MUSE_BENCH
+/* A pass that ran, into the bench's second and the frame it is in: its time, and the gap since the last pass that changed something
+ * when it changed something too. */
+static void bench_pass(const pass_t *p, int64_t took, int64_t end) {
+    s_bench.applies++;
+    s_bench.pass_us += took;
+    if (took > s_bench.pass_max_us) {
+        s_bench.pass_max_us = took;
     }
-    if (!in_callback) {
-        s_skip_run = 0;
-    } else if (s_skip_run < MAX_CALLBACK_SKIPS) {
-        s_skip_run++;
-        s_skips++;
-        return false;
+    s_bench.frame_applies++;
+    s_bench.frame_apply_us += took;
+    if (p->changed) {
+        if (s_bench.changed_seen && end - s_bench.changed_at_us > s_bench.gap_max_us) {
+            s_bench.gap_max_us = end - s_bench.changed_at_us;
+        }
+        s_bench.changed_seen = true;
+        s_bench.changed_at_us = end;
     }
+}
 
+static phases_t phases_of(const pass_t *p, int64_t took) {
+    phases_t ph = {took - p->layout_us - p->writeback_us, p->layout_us, p->writeback_us, p->creates, p->texts, p->styles};
+    return ph;
+}
+#endif
+
+/* The pass, once the callback's skip has let it through: the lock, the records, run_pass and what it found. */
+static bool locked_pass(void) {
     /* The table is read with the lock held. The app task clears the pointer under it before it frees the table, so
      * a table seen here stays until the unlock: a pass that holds the lock finishes first, a later one sees NULL. */
     if (!apps_port_ui_trylock(LOCK_MS)) {
         s_skips++;
+#if CONFIG_MUSE_BENCH
+        s_bench.skips_lock_busy++;
+#endif
         return false;
     }
     apps_ui_t *ui = s_ui;
@@ -1237,12 +1313,26 @@ bool apps_lv_apply(bool in_callback) {
         /* The first pass of a layer needs its records. Let go of the lock to make them, and look again: the app may
          * have ended meanwhile. */
         apps_port_ui_unlock();
-        if (!make_state() || !apps_port_ui_trylock(LOCK_MS)) {
+        if (!make_state()) {
+            s_skips++;  /* no memory: the bench counts it as neither a callback's skip nor the lock's */
+            return false;
+        }
+        if (!apps_port_ui_trylock(LOCK_MS)) {
             s_skips++;
+#if CONFIG_MUSE_BENCH
+            s_bench.skips_lock_busy++;
+#endif
             return false;
         }
         ui = s_ui;
     }
+#if CONFIG_MUSE_BENCH
+    /* The app task's dump holds told since the last pass, taken in under the lock they were told under. */
+    if (s_bench.dump_pending_us > s_bench.dump_max_us) {
+        s_bench.dump_max_us = s_bench.dump_pending_us;
+    }
+    s_bench.dump_pending_us = 0;
+#endif
     if (ui == NULL) {
         apps_port_ui_unlock();
         return false;
@@ -1258,6 +1348,9 @@ bool apps_lv_apply(bool in_callback) {
     s_applies++;
     s_rejects += pass.rejects;
     s_refused += pass.refused;
+#if CONFIG_MUSE_BENCH
+    bench_pass(&pass, took, end);
+#endif
     if (pass.reject_slot >= 0 && !s_reject_logged) {
         s_reject_logged = true;
         ESP_LOGW(TAG, "widget %d dropped: bad %s (more are only counted)", pass.reject_slot, pass.reject_why);
@@ -1266,11 +1359,23 @@ bool apps_lv_apply(bool in_callback) {
         s_slow++;
         /* Every slow pass is counted, and the log has one line a second: a console that is written to at the frame
          * rate blocks the LVGL task (its UART spins the task that prints), which makes the passes slower. The line says how many there were
-         * since the last and the longest of them. */
+         * since the last and the longest of them (and, in a bench build, where the longest one's time went). */
         s_slow_unlogged++;
-        s_slow_worst_us = took > s_slow_worst_us ? took : s_slow_worst_us;
+        if (took > s_slow_worst_us) {
+            s_slow_worst_us = took;
+#if CONFIG_MUSE_BENCH
+            s_slow_phases = phases_of(&pass, took);
+#endif
+        }
         if (end >= s_slow_next_log) {
+#if CONFIG_MUSE_BENCH
+            const phases_t *ph = &s_slow_phases;
+            ESP_LOGW(TAG, "apply %u us (%u slow since last) visits=%u layout=%u writeback=%u creates=%u texts=%u styles=%u",
+                     (unsigned)s_slow_worst_us, (unsigned)s_slow_unlogged, (unsigned)ph->visits_us, (unsigned)ph->layout_us,
+                     (unsigned)ph->writeback_us, (unsigned)ph->creates, (unsigned)ph->texts, (unsigned)ph->styles);
+#else
             ESP_LOGW(TAG, "apply %u us (%u slow since last)", (unsigned)s_slow_worst_us, (unsigned)s_slow_unlogged);
+#endif
             s_slow_next_log = end + SLOW_LOG_US;
             s_slow_unlogged = 0;
             s_slow_worst_us = 0;
@@ -1278,6 +1383,46 @@ bool apps_lv_apply(bool in_callback) {
     }
     return true;
 }
+
+/* The pass after the callback's skip. In a bench build, W1's stack paint is around it (perf plan Task 2), outside the lock: the
+ * paint is a memset, which would lengthen the hold. */
+static bool apply_pass(void) {
+#if CONFIG_MUSE_BENCH
+    bool painted = muse_stack_paint();
+    bool ran = locked_pass();
+    if (painted) {
+        muse_stack_note("apply");
+    }
+    return ran;
+#else
+    return locked_pass();
+#endif
+}
+
+bool apps_lv_apply(bool in_callback) {
+    if (s_layer == NULL) {
+        return false;
+    }
+    if (!in_callback) {
+        s_skip_run = 0;
+    } else if (s_skip_run < MAX_CALLBACK_SKIPS) {
+        s_skip_run++;
+        s_skips++;
+#if CONFIG_MUSE_BENCH
+        s_bench.skips_in_call++;
+#endif
+        return false;
+    }
+    return apply_pass();
+}
+
+#if CONFIG_MUSE_BENCH
+void apps_lv_bench_dump_hold(uint32_t us) {
+    if (us > s_bench.dump_pending_us) {
+        s_bench.dump_pending_us = us;
+    }
+}
+#endif
 
 /* ---- The layer ---- */
 
@@ -1693,7 +1838,15 @@ static void on_carousel_scroll(lv_event_t *e) {
     if (!s_launcher_shown || C.holding) {
         return;  /* holding: the row doesn't scroll, and nothing changes the window */
     }
+#if CONFIG_MUSE_BENCH
+    bool painted = muse_stack_paint();  /* W1's stack paint around the scroll's work (perf plan Task 2) */
+#endif
     update_carousel();
+#if CONFIG_MUSE_BENCH
+    if (painted) {
+        muse_stack_note("carousel");
+    }
+#endif
 }
 
 /* An image spins on the layer in front, with no launcher or card over it: what the board's frame pairing and the bench's spin frames
@@ -1783,6 +1936,12 @@ static EXT_RAM_BSS_ATTR struct {
     int64_t scroll_last_us; /* and for an app's scroll box scrolling in front */
     bool scroll_ended;      /* an app's box's LV_EVENT_SCROLL_END came since the last refresh */
     muse_frame_stats_t launcher, spin, scroll;   /* each motion's frames so far, named in watch_frames */
+    /* The slow frame's (perf plan Task 2): this refresh's phases, as on_phase saw them, and the last refresh's end. */
+    bool started, rendered;           /* LV_EVENT_REFR_START came for this refresh; and LV_EVENT_RENDER_START */
+    int64_t refr_start_us, render_start_us, render_ready_us;
+    int64_t wait_start_us, flush_us;  /* the wait for the panel under way, and the waits so far */
+    bool ready_in_front;              /* the last refresh ended with an app in front, */
+    int64_t ready_us;                 /* then */
 } s_frames;
 
 /* LV_EVENT_SCROLL_END on an app's box: its scroll ended, seen by a refresh or not. The next refresh prints its summary. A throw that
@@ -1830,8 +1989,69 @@ static void time_frame(muse_frame_stats_t *s, bool moving, int64_t *last_us, int
     *last_us = now;
 }
 
+/* The phases of a refresh, as lv_display_refr_timer sends them (perf plan Task 2's slow frame): its start, the drawing's start and
+ * end, and each wait for the panel in it. Only times, in the refresh: on_refresh, at its LV_EVENT_REFR_READY, reads them. */
+static void on_phase(lv_event_t *e) {
+    int64_t now = esp_timer_get_time();
+    switch (lv_event_get_code(e)) {
+        case LV_EVENT_REFR_START:
+            s_frames.started = true;
+            s_frames.rendered = false;
+            s_frames.refr_start_us = now;
+            s_frames.flush_us = 0;
+            break;
+        case LV_EVENT_RENDER_START:
+            s_frames.rendered = true;
+            s_frames.render_start_us = now;
+            s_frames.render_ready_us = now;
+            break;
+        case LV_EVENT_RENDER_READY: s_frames.render_ready_us = now; break;
+        case LV_EVENT_FLUSH_WAIT_START: s_frames.wait_start_us = now; break;
+        case LV_EVENT_FLUSH_WAIT_FINISH: s_frames.flush_us += now - s_frames.wait_start_us; break;
+        default: break;
+    }
+}
+
+static int ms_of(int64_t us) {
+    return us <= 0 ? 0 : (int)((us + 500) / 1000);
+}
+
+/* An app on the layer in front, with no launcher or card over it: what the apply summary and the slow frame follow. */
+static bool app_in_front(void) {
+    return s_front && !s_launcher_shown && !s_crash_shown;
+}
+
+/*
+ * The slow frame (perf plan Task 2), at a refresh's LV_EVENT_REFR_READY: a refresh over SLOW_FRAME_MS from the end of the one before,
+ * both with an app in front, prints
+ *     slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us>
+ * the gap from that refresh to this one's start (the timers, the apply), its layout (to the drawing's start, or its end with nothing
+ * to draw), the drawing less its waits for the panel, those waits, and the passes since the refresh before and their time. A
+ * refresh after a rest counts too: its gap is the rest. Only a refresh whose start on_phase saw is timed.
+ */
+static void time_slow_frame(int64_t now) {
+    bool front = app_in_front();
+    if (front && s_frames.ready_in_front && s_frames.started) {
+        int ms = ms_of(now - s_frames.ready_us);
+        if (ms > SLOW_FRAME_MS) {
+            int64_t layout_end = s_frames.rendered ? s_frames.render_start_us : now;
+            int64_t render = s_frames.rendered ? s_frames.render_ready_us - s_frames.render_start_us - s_frames.flush_us : 0;
+            ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u", ms,
+                     ms_of(s_frames.refr_start_us - s_frames.ready_us), ms_of(layout_end - s_frames.refr_start_us), ms_of(render),
+                     ms_of(s_frames.flush_us), (unsigned)s_bench.frame_applies, (unsigned)s_bench.frame_apply_us);
+        }
+    }
+    s_frames.started = false;
+    s_frames.ready_in_front = front;
+    s_frames.ready_us = now;
+    s_bench.frame_applies = 0;
+    s_bench.frame_apply_us = 0;
+}
+
 static void on_refresh(lv_event_t *e) {
     (void)e;
+    s_bench.refr++;
+    time_slow_frame(esp_timer_get_time());
     bool scrolling = s_launcher_shown && C.row != NULL && lv_obj_is_scrolling(C.row);
     bool spinning = spin_in_front();
     bool listing = scroll_box_scrolling();
@@ -1852,8 +2072,41 @@ static void watch_frames(lv_obj_t *screen) {
         s_frames.spin.name = "spin";
         s_frames.scroll.name = "scroll";
         lv_display_add_event_cb(display, on_refresh, LV_EVENT_REFR_READY, NULL);
+        static const lv_event_code_t phases[] = {LV_EVENT_REFR_START, LV_EVENT_RENDER_START, LV_EVENT_RENDER_READY,
+                                                 LV_EVENT_FLUSH_WAIT_START, LV_EVENT_FLUSH_WAIT_FINISH};
+        for (size_t i = 0; i < ARRAY_LEN(phases); i++) {
+            lv_display_add_event_cb(display, on_phase, phases[i], NULL);
+        }
         s_frames.display = display;
     }
+}
+
+void apps_lv_bench_tick(uint32_t calls) {
+    if (s_layer == NULL || !app_in_front()) {
+        s_bench.second = false;  /* no app in front: no second, and the next one starts afresh */
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    if (s_bench.second && now - s_bench.since_us < BENCH_SECOND_US) {
+        return;
+    }
+    if (s_bench.second) {
+        int peak = -1;
+        const char *path = muse_stack_peak(&peak);
+        uint32_t avg = s_bench.applies != 0 ? (uint32_t)(s_bench.pass_us / s_bench.applies) : 0;
+        ESP_LOGI(TAG, "apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u stack_peak=%s:%d",
+                 (unsigned)(calls - s_bench.calls_at), (unsigned)s_bench.applies, (unsigned)s_bench.skips_in_call,
+                 (unsigned)s_bench.skips_lock_busy, (unsigned)s_bench.refr, ms_of(s_bench.gap_max_us), (unsigned)avg,
+                 (unsigned)s_bench.pass_max_us, (unsigned)s_bench.dump_max_us, path != NULL ? path : "none", peak);
+    } else {
+        s_bench.changed_seen = false;  /* the app has just come in front: no gap from before */
+    }
+    s_bench.second = true;
+    s_bench.since_us = now;
+    s_bench.calls_at = calls;
+    s_bench.applies = s_bench.skips_in_call = s_bench.skips_lock_busy = s_bench.refr = 0;
+    s_bench.pass_us = s_bench.pass_max_us = s_bench.gap_max_us = 0;
+    s_bench.dump_max_us = 0;
 }
 #endif
 

@@ -37,6 +37,10 @@
 #include "lvgl.h"
 #include "muse_apps.h"
 #include "muse_input.h"
+#include "sdkconfig.h"
+#if CONFIG_MUSE_BENCH
+#include "muse_bench_mem.h"
+#endif
 
 #if defined(ESP_PLATFORM) && !LV_USE_SNAPSHOT
 #error "apps_snapshot.c draws the screen with lv_snapshot: set CONFIG_LV_USE_SNAPSHOT (devices/sdkconfig.muse-apps does)"
@@ -165,6 +169,9 @@ void apps_snapshot_take_pending(void) {
     if (!atomic_compare_exchange_strong(&s_cap, &expected, CAP_TAKING)) {
         return;  /* the job took it back at its deadline */
     }
+#if CONFIG_MUSE_BENCH
+    bool painted = muse_stack_paint();  /* W1's stack paint around the drawing (perf plan Task 2) */
+#endif
     const int64_t began = apps_port_mono_ms();
     lv_obj_t *screen = lv_screen_active();
     lv_obj_update_layout(screen);
@@ -186,6 +193,11 @@ void apps_snapshot_take_pending(void) {
         shot.why = NO_DRAWING;
     }
     shot.render_ms = (uint32_t)(apps_port_mono_ms() - began);
+#if CONFIG_MUSE_BENCH
+    if (painted) {
+        muse_stack_note("snapshot");
+    }
+#endif
     apps_rt_steal_ms(shot.render_ms);  /* the drawing held the app task's core: not the app's time (apps_rt.h) */
     /* What the picture is of, read with it: the layer's place and the app that runs (its names lock is a mutex held only for
      * copies, so the wait is one copy's). */

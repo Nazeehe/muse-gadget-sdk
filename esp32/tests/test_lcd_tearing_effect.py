@@ -29,6 +29,8 @@ import subprocess
 import tempfile
 import unittest
 
+from test_muse_apps_wiring import open_conditions
+
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "components/muse/boards/muse_lcd_bands.c"
 HEADER = ROOT / "components/muse/boards/muse_lcd_bands.h"
@@ -824,6 +826,143 @@ int main(void)
         floor = re.search(r"^#define APPS_RAM_RESERVE \((\d+) \* (\d+)\)", pkg, re.M)
         self.assertIsNotNone(floor, "APPS_RAM_RESERVE's form changed")
         self.assertEqual(self.reserve, int(floor.group(1)) * int(floor.group(2)))
+
+
+class FrameCopyTest(unittest.TestCase):
+    """A bench build's switch of frame mode's copy (Task 2 of the perf plan, PF4): with it off (muse_lcd_bands_set_frame_copy(false),
+    the console's '>frame copy off'), a slide's whole-screen refresh goes on the band path, each band sent as LVGL flushes it and
+    nothing copied (it tears), so the batch line's render is the slide's without the copies. LV_EVENT_RENDER_START and queue_band
+    compiled with the display and the queue faked."""
+
+    PROGRAM = r'''
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define CONFIG_MUSE_BENCH 1
+#define EXT_RAM_BSS_ATTR
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_FAIL (-1)
+typedef struct { int32_t x1, y1, x2, y2; } lv_area_t;
+typedef struct { uint32_t data_size; } lv_draw_buf_t;
+typedef struct {
+    lv_area_t inv_areas[8];
+    uint8_t inv_area_joined[8];
+    uint32_t inv_p;
+    lv_draw_buf_t *buf_act;
+    lv_area_t refreshed_area;
+    bool last;
+} lv_display_t;
+typedef enum { LV_EVENT_RENDER_START = 1, LV_EVENT_FLUSH_WAIT_START, LV_EVENT_FLUSH_WAIT_FINISH } lv_event_code_t;
+typedef struct { lv_event_code_t code; } lv_event_t;
+static lv_event_code_t lv_event_get_code(lv_event_t *e) { return e->code; }
+static bool lv_display_flush_is_last(lv_display_t *disp) { return disp->last; }
+typedef void *esp_lcd_panel_handle_t;
+typedef void *SemaphoreHandle_t;
+typedef void *QueueHandle_t;
+typedef int portMUX_TYPE;
+#define portENTER_CRITICAL(lock) (void)(lock)
+#define portEXIT_CRITICAL(lock) (void)(lock)
+#define pdTRUE 1
+static void xSemaphoreGive(SemaphoreHandle_t s) { (void)s; }
+static int64_t esp_timer_get_time(void) { return 0; }
+TYPES
+static band_t g_band;
+static int xQueueSend(QueueHandle_t q, const band_t *b, int wait) { (void)q; (void)wait; g_band = *b; return pdTRUE; }
+static lv_draw_buf_t g_buf = { 466 * 118 * 2 };
+static lv_display_t g_disp = { .buf_act = &g_buf };
+static lv_display_t *s_disp = &g_disp;
+static QueueHandle_t s_bands;
+static portMUX_TYPE s_lock;
+static int s_rows = 466;
+static bool s_pairing;
+static int s_parts, s_flushed;
+static volatile uint32_t s_drawn;
+static lv_area_t s_drawn_area;
+static SemaphoreHandle_t s_drawn_sem;
+static int64_t s_render_t0, s_render_waited, s_wait_t0;
+PARTS
+/* One step a line: "framing 0|1" (frame mode, with its frame), "copy 0|1" (the switch), "whole" (a refresh of the whole screen in
+ * LVGL's four bands) or "part" (one of an area of 200 x 100): each band answered as it was queued. */
+int main(void)
+{
+    char cmd[16];
+    int v = 0;
+    s_cols = 466;
+    while (scanf("%15s", cmd) == 1) {
+        if (!strcmp(cmd, "framing") && scanf("%d", &v) == 1) {
+            s_framing = v != 0;
+        } else if (!strcmp(cmd, "copy") && scanf("%d", &v) == 1) {
+            muse_lcd_bands_set_frame_copy(v != 0);
+        } else if (!strcmp(cmd, "whole") || !strcmp(cmd, "part")) {
+            bool whole = !strcmp(cmd, "whole");
+            g_disp.inv_areas[0] = whole ? (lv_area_t){ 0, 0, 465, 465 } : (lv_area_t){ 100, 100, 299, 199 };
+            g_disp.inv_area_joined[0] = 0;
+            g_disp.inv_p = 1;
+            lv_event_t e = { LV_EVENT_RENDER_START };
+            on_render_event(&e);
+            static const int rows[][2] = { { 0, 118 }, { 118, 236 }, { 236, 354 }, { 354, 466 } };
+            for (int i = 0; i < (whole ? 4 : 1); i++) {
+                g_disp.last = !whole || i == 3;
+                if (whole) {
+                    queue_band(s_disp, NULL, 0, rows[i][0], 466, rows[i][1], "", NULL);
+                } else {
+                    queue_band(s_disp, NULL, 100, 100, 300, 200, "", NULL);
+                }
+                printf("%d-%d whole %d pair %d\n", g_band.y1, g_band.y2, g_band.whole, g_band.pair);
+            }
+        }
+    }
+    return 0;
+}
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        source = variant(SOURCE.read_text(), apps=True)
+        types = [typedef(source, "te_stats_t"), typedef(source, "whole_t"), typedef(source, "band_t")]
+        parts = re.findall(r"^static EXT_RAM_BSS_ATTR [^;\n]*;", source, re.M)
+        parts += [function(source, name) for name in ("refresh_parts", "band_pairs", "refresh_whole", "frame_band", "queue_band",
+                                                      "on_render_event")]
+        parts.append(function_text(source, "void muse_lcd_bands_set_frame_copy("))
+        src = Path(cls.tmp.name) / "frame_copy.c"
+        src.write_text(cls.PROGRAM.replace("TYPES", "\n".join(types)).replace("PARTS", "\n".join(parts)))
+        cls.exe = Path(cls.tmp.name) / "frame_copy"
+        subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", "-Wno-unused-variable", "-Wno-unused-function", "-o", str(cls.exe),
+                        str(src)], check=True)
+
+    def run_script(self, lines):
+        return subprocess.run([str(self.exe)], input="\n".join(lines) + "\n", check=True, capture_output=True,
+                              text=True).stdout.splitlines()
+
+    def test_copy_off_sends_a_slides_whole_screen_as_bands(self):
+        framed = ["0-118 whole 1 pair 0", "118-236 whole 1 pair 0", "236-354 whole 1 pair 0", "354-466 whole 1 pair 0"]
+        bands = [line.replace("whole 1", "whole 0") for line in framed]
+        self.assertEqual(self.run_script(["framing 1", "whole", "copy 0", "whole", "part", "copy 1", "whole", "framing 0", "whole"]),
+                         framed + bands + ["100-200 whole 0 pair 0"] + framed + bands)
+
+    def test_the_switch_is_the_benchs_and_the_apps_alone(self):
+        # Built only with the apps (frame mode's) and the bench: the plain build stays 7e59ee0's (PlainBuildTest), and the console's
+        # line reaches it through muse_board_t frame_copy, a bench build's field that only the 1.75C's apps build sets.
+        text = SOURCE.read_text()
+        for name in ("void muse_lcd_bands_set_frame_copy(bool on)", "s_copy_off"):
+            for m in re.finditer(re.escape(name), text):
+                with self.subTest(name, at=m.start()):
+                    self.assertEqual(open_conditions(text, m.start()), ["if CONFIG_MUSE_APPS", "if CONFIG_MUSE_BENCH"])
+        header = HEADER.read_text()
+        self.assertEqual(open_conditions(header, header.index("void muse_lcd_bands_set_frame_copy(bool on);")),
+                         ["if CONFIG_MUSE_APPS", "if CONFIG_MUSE_BENCH"])
+        board_h = BOARD_H.read_text()
+        self.assertEqual(open_conditions(board_h, board_h.index("void (*frame_copy)(bool on);")), ["if CONFIG_MUSE_BENCH"])
+        board = BOARD_175C.read_text()
+        self.assertEqual(open_conditions(board, board.index(".frame_copy = muse_lcd_bands_set_frame_copy,")),
+                         ["if CONFIG_MUSE_APPS && CONFIG_MUSE_BENCH"])
+        # The switch logs nothing: the console's line answers it.
+        self.assertNotRegex(strip_c(function_text(variant(text, True), "void muse_lcd_bands_set_frame_copy(")), r"ESP_LOG|printf")
 
 
 def logging_functions(source):

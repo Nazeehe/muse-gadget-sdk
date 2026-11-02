@@ -46,6 +46,7 @@
 #endif
 #include "muse_console.h"
 #if CONFIG_MUSE_BENCH
+#include "muse_bench_mem.h"
 #include "muse_frame_stats.h"
 #endif
 #include "muse_link.h"
@@ -915,6 +916,30 @@ static void slide_rests(lv_event_t *e)
 }
 #endif
 
+#if CONFIG_MUSE_APPS && CONFIG_MUSE_BENCH
+/*
+ * W1's stack paint around the slide's LV_EVENT_SCROLL_BEGIN (perf plan Task 2; the apps' summary prints the deepest path): painted
+ * by the tileview's first callback for it and noted by its last, so it holds what the callbacks between do at that depth, deep in
+ * LVGL's input read (the switch to the whole-screen writes, above). Neither logs.
+ */
+static EXT_RAM_BSS_ATTR bool s_slide_painted;
+
+static void slide_paint(lv_event_t *e)
+{
+    if (lv_event_get_target(e) == s_tv) {
+        s_slide_painted = muse_stack_paint();
+    }
+}
+
+static void slide_scan(lv_event_t *e)
+{
+    if (s_slide_painted && lv_event_get_target(e) == s_tv) {
+        s_slide_painted = false;
+        muse_stack_note("slide");
+    }
+}
+#endif
+
 #if CONFIG_MUSE_BENCH
 /*
  * The slide's frames, in a bench build: while the home tileview scrolls, each display refresh (LV_EVENT_REFR_READY) times the
@@ -993,11 +1018,17 @@ static void build_screen(void)
         s_settings = lv_tileview_add_tile(s_tv, col + 1, 0, LV_DIR_LEFT);
         s_pages = col + 2;
         lv_obj_add_event_cb(s_tv, tile_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+#if CONFIG_MUSE_APPS && CONFIG_MUSE_BENCH
+        lv_obj_add_event_cb(s_tv, slide_paint, LV_EVENT_SCROLL_BEGIN, NULL);   /* first: painted before the others */
+#endif
 #if CONFIG_MUSE_APPS
         if (muse_board->frame_mode) {
             lv_obj_add_event_cb(s_tv, slide_begins, LV_EVENT_SCROLL_BEGIN, NULL);
             lv_display_add_event_cb(lv_obj_get_display(s_tv), slide_rests, LV_EVENT_REFR_READY, NULL);
         }
+#endif
+#if CONFIG_MUSE_APPS && CONFIG_MUSE_BENCH
+        lv_obj_add_event_cb(s_tv, slide_scan, LV_EVENT_SCROLL_BEGIN, NULL);    /* last: scanned after them */
 #endif
 #if CONFIG_MUSE_BENCH
         s_page_frames.name = "page";

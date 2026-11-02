@@ -220,7 +220,12 @@ typedef enum {
     LV_EVENT_GESTURE,
     LV_EVENT_KEY,
     LV_EVENT_REFR_EXT_DRAW_SIZE = 27,  /* an object's: its param is the int32_t room it needs past its box, to raise (or cap) */
-    LV_EVENT_REFR_READY = 59,  /* a display's: the end of each refresh, drawn or not (the codes between aren't used) */
+    LV_EVENT_REFR_START = 58,  /* a display's: the start of each refresh, before its layout (the codes between aren't used) */
+    LV_EVENT_REFR_READY = 59,  /* a display's: the end of each refresh, drawn or not */
+    LV_EVENT_RENDER_START = 60,  /* a display's, with something to draw: the layout done, the drawing begins */
+    LV_EVENT_RENDER_READY = 61,  /* and the drawing done, its last band flushed */
+    LV_EVENT_FLUSH_WAIT_START = 64,  /* a display's: LVGL waits for the flush before (the two between aren't used) */
+    LV_EVENT_FLUSH_WAIT_FINISH = 65,  /* and that wait is over */
     LV_EVENT_PREPROCESS = 0x8000,
 } lv_event_code_t;
 

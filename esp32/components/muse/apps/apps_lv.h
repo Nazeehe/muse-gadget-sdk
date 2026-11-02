@@ -239,6 +239,22 @@ typedef struct {
 void apps_lv_stats(apps_lv_stats_t *out);
 
 /*
+ * The bench's apply summary (perf plan Task 2), defined in a MUSE_BENCH build only (this header has no sdkconfig, so they are
+ * declared in every build; only a bench build may call them).
+ * apps_lv_bench_tick: frame_tick's, on the LVGL task, with the calls of the app's that have ended since boot (the app task's
+ * count). Once a second while an app is in front, with no launcher or card over it, it prints (the muse_apps tag)
+ *     apply: calls=<n> applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us>
+ *            stack_peak=<path>:<bytes>
+ * on one line: the calls ended in the second, the passes that ran, the frames skipped mid-callback and for a lock not free within
+ * 2 ms, the display's refreshes, the most time between the ends of two passes that changed something, the passes' average and
+ * longest time, the longest hold of the UI lock apps_lv_bench_dump_hold told, and the deepest stack path so far and what it left
+ * free (muse_bench_mem.h; "none:-1" before there is one).
+ * apps_lv_bench_dump_hold: the app task's, with the UI lock held, after it dumped the table under it (us: how long it held it).
+ */
+void apps_lv_bench_tick(uint32_t calls);
+void apps_lv_bench_dump_hold(uint32_t us);
+
+/*
  * The launcher and the crash card: two cards the firmware draws over the layer (Task 12), full-screen and black, made
  * the first time either is shown, on the screen apps_lv_build was given, just above the layer: over the app, under
  * what muse_ui puts above the layer (the downloaded image, the top layer). They are not on the layer, so

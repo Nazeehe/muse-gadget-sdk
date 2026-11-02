@@ -329,6 +329,74 @@ class HarnessTest(unittest.TestCase):
     def test_a_pass_with_no_memory_for_its_records_is_a_skip(self):
         self.run_case("a_pass_with_no_memory_is_a_skip")
 
+    # ---- Perf plan Task 2: the bench's instruments, none of them in a build without the bench ----
+
+    def test_a_build_without_the_bench_prints_no_apply_summary(self):
+        self.run_case("apply_summary_once_a_second")
+
+    def test_a_build_without_the_bench_logs_the_slow_pass_as_before(self):
+        self.run_case("slow_pass_phases")
+
+    def test_a_build_without_the_bench_times_no_slow_frame(self):  # and adds no callback to the display
+        self.run_case("slow_frame_anatomy")
+
+    def test_a_build_without_the_bench_paints_no_stack(self):  # the fake stack probes are the bench build's: this links without them
+        self.run_case("stack_paint_around_the_paths")
+
+    def test_the_bench_instruments_are_the_bench_builds_alone(self):
+        # Every part of them is inside #if CONFIG_MUSE_BENCH: the state, the phases' callbacks, the stack probes, the summary and the
+        # slow pass's phases. The slow pass's line itself is every build's, with the phases only in the bench's.
+        source = strip_c_comments(APPS_LV.read_text())
+        mentions = [m.start() for m in re.finditer(r"\bs_bench\b|\bs_slow_phases\b|apps_lv_bench_(?:tick|dump_hold)|muse_stack_(?:paint|note|peak)|"
+                                                   r"muse_bench_mem\.h|\bon_phase\b|\btime_slow_frame\b|"
+                                                   r"LV_EVENT_(?:REFR_START|RENDER_START|RENDER_READY|FLUSH_WAIT_START|FLUSH_WAIT_FINISH)|"
+                                                   r"visits=|BENCH_SECOND_US|SLOW_FRAME_MS|visits_us|layout_us|writeback_us", source)]
+        self.assertGreaterEqual(len(mentions), 25)
+        for index in mentions:
+            with self.subTest(source[source.rindex("\n", 0, index) + 1:source.index("\n", index)].strip()):
+                self.assertIn("if CONFIG_MUSE_BENCH", open_conditions(source, index))
+        # Their state is in PSRAM (Internal RAM is never reduced): one block each, of the bench's.
+        self.assertRegex(source, r"static EXT_RAM_BSS_ATTR struct \{[^{}]*\} s_bench;")
+        self.assertRegex(source, r"static EXT_RAM_BSS_ATTR [^;]* s_slow_phases;")
+
+    def test_the_bench_lines_are_the_briefs(self):
+        # The formats Task 3 reads (perf plan Task 2's interfaces), as apps_lv.c prints them, with the tag every line of it has.
+        source = re.sub(r'"\s*\n\s*"', "", strip_c_comments(APPS_LV.read_text()))
+        self.assertIn('ESP_LOGI(TAG, "apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u '
+                      'stack_peak=%s:%d",', source)
+        self.assertIn('ESP_LOGW(TAG, "apply %u us (%u slow since last) visits=%u layout=%u writeback=%u creates=%u texts=%u '
+                      'styles=%u",', source)
+        self.assertIn('ESP_LOGW(TAG, "apply %u us (%u slow since last)", (unsigned)s_slow_worst_us, (unsigned)s_slow_unlogged);',
+                      source)
+        self.assertIn('ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u",', source)
+        self.assertRegex(source, r"(?m)^#define BENCH_SECOND_US 1000000\b")
+        self.assertRegex(source, r"(?m)^#define SLOW_FRAME_MS 50\b")
+        for path in ("apply", "carousel"):
+            self.assertIn(f'muse_stack_note("{path}");', source)
+
+    def test_the_bench_lines_print_from_frame_tick_and_the_refresh_alone(self):
+        # Review Focus 1: the summary prints only from apps_lv_bench_tick, which muse_apps_ui_tick calls from frame_tick
+        # (test_muse_apps_task.py pins that call); the slow frame only from time_slow_frame, which only LV_EVENT_REFR_READY's
+        # on_refresh calls. The phases' callback, deep in the refresh, and the carousel's scroll only record.
+        source = strip_c_comments(APPS_LV.read_text())
+        owner = function_owner(source)
+        self.assertEqual({owner(m.start()) for m in re.finditer(r'"apply: calls=', source)}, {"apps_lv_bench_tick"})
+        self.assertEqual({owner(m.start()) for m in re.finditer(r'"slow frame ', source)}, {"time_slow_frame"})
+        self.assertEqual({owner(m.start()) for m in re.finditer(r"\btime_slow_frame\(", source)} - {"time_slow_frame"},
+                         {"on_refresh"})
+        self.assertEqual({owner(m.start()) for m in re.finditer(r"\bapps_lv_bench_tick\(", source)} - {"apps_lv_bench_tick"}, set())
+        for signature in ("static void on_phase(lv_event_t *e) {", "static void on_carousel_scroll(lv_event_t *e) {",
+                          "void apps_lv_bench_dump_hold(uint32_t us) {"):
+            with self.subTest(signature):
+                self.assertNotRegex(c_function(source, signature), r"ESP_LOG|printf")
+        # The paint stays out of the lock: it is around locked_pass, which takes the lock and gives it back (the harness's stack
+        # fakes fail a paint or a note with the lock held).
+        apply = c_function(source, "static bool apply_pass(void) {")
+        self.assertLess(apply.index("muse_stack_paint()"), apply.index("locked_pass()"))
+        self.assertLess(apply.index("locked_pass()"), apply.index('muse_stack_note("apply")'))
+        self.assertIn("apps_port_ui_trylock(", c_function(source, "static bool locked_pass(void) {"))
+        self.assertIn("return apply_pass();", c_function(source, "bool apps_lv_apply(bool in_callback) {"))
+
     # ---- Events ----
 
     def test_a_widget_is_clickable_only_while_it_is_subscribed(self):
@@ -808,6 +876,32 @@ class BenchHarnessTest(unittest.TestCase):
     def test_the_touchs_scroll_boxes(self):  # app.control tap and drag: the scroll boxes, their y and whether they move
         self.run_case("the_touchs_scroll_boxes")
 
+    # ---- Perf plan Task 2: the bench's instruments ----
+
+    def test_the_apply_summary_comes_once_a_second_with_an_app_in_front(self):
+        self.run_case("apply_summary_once_a_second")
+
+    def test_the_skips_in_a_callback_are_counted_apart(self):
+        self.run_case("skips_mid_callback_at_most_three_frames")
+
+    def test_a_busy_lock_is_a_skip_of_its_own(self):
+        self.run_case("lock_discipline")
+
+    def test_a_lock_refused_after_the_records_is_a_busy_lock(self):
+        self.run_case("the_lock_may_be_refused_after_the_records_are_made")
+
+    def test_no_memory_is_neither_skip(self):
+        self.run_case("a_pass_with_no_memory_is_a_skip")
+
+    def test_the_slow_pass_says_where_its_time_went(self):
+        self.run_case("slow_pass_phases")
+
+    def test_a_slow_frame_prints_its_anatomy(self):
+        self.run_case("slow_frame_anatomy")
+
+    def test_the_stack_is_painted_around_the_apply_and_the_carousel(self):
+        self.run_case("stack_paint_around_the_paths")
+
 
 def function_owner(source):
     """For source's function definitions, a function from an index in source to the name of the function it is in (None: none)."""
@@ -903,7 +997,8 @@ class FakesTest(unittest.TestCase):
         LV_EVENT_SINGLE_CLICKED LV_EVENT_DOUBLE_CLICKED LV_EVENT_TRIPLE_CLICKED LV_EVENT_LONG_PRESSED LV_EVENT_REFR_EXT_DRAW_SIZE
         LV_EVENT_LONG_PRESSED_REPEAT LV_EVENT_CLICKED LV_EVENT_RELEASED LV_EVENT_SCROLL_BEGIN
         LV_EVENT_SCROLL_THROW_BEGIN LV_EVENT_SCROLL_END LV_EVENT_SCROLL LV_EVENT_GESTURE LV_EVENT_KEY
-        LV_EVENT_REFR_READY LV_EVENT_PREPROCESS
+        LV_EVENT_REFR_READY LV_EVENT_PREPROCESS LV_EVENT_REFR_START LV_EVENT_RENDER_START LV_EVENT_RENDER_READY
+        LV_EVENT_FLUSH_WAIT_START LV_EVENT_FLUSH_WAIT_FINISH
         LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_30 LV_OPA_40 LV_OPA_COVER LV_ANIM_OFF LV_ANIM_ON
         LV_IMAGE_ALIGN_DEFAULT LV_IMAGE_ALIGN_CENTER LV_COLOR_FORMAT_A8 LV_COLOR_FORMAT_RGB565A8 LV_IMAGE_FLAGS_PREMULTIPLIED
         sizeof(lv_image_header_t) sizeof(lv_image_dsc_t) sizeof(lv_color_t) sizeof(lv_area_t)

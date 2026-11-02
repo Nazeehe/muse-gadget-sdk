@@ -182,6 +182,337 @@ class FrameStatsTest(unittest.TestCase):
         self.assertEqual(cmake.count("muse_frame_stats.c"), 1)
 
 
+BENCH_MEM = MUSE / "muse_bench_mem.c"
+
+# What muse_bench_mem.c includes of ESP-IDF, FreeRTOS and LVGL: each is a line that includes BENCH_MEM_FAKES.
+BENCH_MEM_HEADERS = ["esp_attr.h", "esp_cpu.h", "esp_err.h", "esp_heap_caps.h", "esp_timer.h", "esp_async_memcpy.h",
+                     "freertos/FreeRTOS.h", "freertos/task.h", "freertos/idf_additions.h", "lvgl.h", "src/core/lv_global.h",
+                     "src/draw/sw/lv_draw_sw_private.h"]
+
+BENCH_MEM_FAKES = r"""
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define EXT_RAM_BSS_ATTR
+/* A task's stack: the fake's, as a case sets it (fake_stack, fake_sp). */
+typedef uint8_t StackType_t;
+typedef void *TaskHandle_t;
+typedef uint32_t TickType_t;
+#define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+extern uint8_t fake_stack[8192];
+extern uint8_t *fake_sp;
+static inline StackType_t *xTaskGetStackStart(TaskHandle_t task) { (void)task; return fake_stack; }
+static inline void *esp_cpu_get_sp(void) { return fake_sp; }
+unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task);
+void vTaskDelay(TickType_t ticks);
+/* The heap: PSRAM only, counted; the clock: a step a read. */
+#define MALLOC_CAP_8BIT (1u << 2)
+#define MALLOC_CAP_SPIRAM (1u << 10)
+size_t heap_caps_get_free_size(uint32_t caps);
+void *heap_caps_aligned_alloc(size_t align, size_t size, uint32_t caps);
+void heap_caps_free(void *p);
+int64_t esp_timer_get_time(void);
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_ERR_NO_MEM 0x101
+#define ESP_ERR_INVALID_ARG 0x102
+const char *esp_err_to_name(esp_err_t err);
+/* esp_async_memcpy, as ESP-IDF v6.0.1's esp_async_memcpy.h has it. */
+typedef struct async_memcpy_context_t *async_memcpy_handle_t;
+typedef struct { void *data; } async_memcpy_event_t;
+typedef bool (*async_memcpy_isr_cb_t)(async_memcpy_handle_t mcp_hdl, async_memcpy_event_t *event, void *cb_args);
+typedef struct { uint32_t backlog; uint32_t weight; size_t dma_burst_size; uint32_t flags; } async_memcpy_config_t;
+#define ASYNC_MEMCPY_DEFAULT_CONFIG() { .backlog = 8, .weight = 0, .dma_burst_size = 16, .flags = 0, }
+esp_err_t esp_async_memcpy_install(const async_memcpy_config_t *config, async_memcpy_handle_t *mcp);
+esp_err_t esp_async_memcpy_uninstall(async_memcpy_handle_t mcp);
+esp_err_t esp_async_memcpy(async_memcpy_handle_t mcp, void *dst, void *src, size_t n, async_memcpy_isr_cb_t cb_isr, void *cb_args);
+/* LVGL 9.5.0's draw units (lv_draw_private.h, lv_draw_sw_private.h, lv_freertos.h, lv_global.h), as far as the swdraw stacks read
+ * them. */
+#define LV_USE_DRAW_SW 1
+#define LV_OS_FREERTOS 2
+#define LV_USE_OS LV_OS_FREERTOS
+#define LV_DRAW_SW_DRAW_UNIT_CNT 2
+typedef struct { void (*pvStartRoutine)(void *); TaskHandle_t xTaskHandle; void *pTaskArg; } lv_thread_t;
+typedef struct _lv_draw_unit_t { struct _lv_draw_unit_t *next; const char *name; } lv_draw_unit_t;
+typedef struct { void *task_act; lv_thread_t thread; } lv_draw_sw_thread_dsc_t;
+typedef struct { lv_draw_unit_t base_unit; lv_draw_sw_thread_dsc_t thread_dscs[LV_DRAW_SW_DRAW_UNIT_CNT]; } lv_draw_sw_unit_t;
+typedef struct { lv_draw_unit_t *unit_head; } lv_draw_global_info_t;
+typedef struct { lv_draw_global_info_t draw_info; } lv_global_t;
+extern lv_global_t lv_global;
+#define LV_GLOBAL_DEFAULT() (&lv_global)
+"""
+
+BENCH_MEM_DRIVER = r"""
+#include "muse_bench_mem.h"
+#include "esp_heap_caps.h"
+
+uint8_t fake_stack[8192];
+uint8_t *fake_sp;
+lv_global_t lv_global;
+
+static int64_t g_now, g_step = 700, g_dma_us = 2500;
+static size_t g_free = 4u << 20;
+static int g_fail_alloc = -1, g_allocs, g_live, g_delays;
+static void *g_blocks[8];
+static esp_err_t g_install = ESP_OK, g_copy = ESP_OK;
+static bool g_ends = true, g_copies = true, g_installed;
+static size_t g_burst, g_copied;
+unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task) { return (unsigned)(uintptr_t)task * 100u; }
+void vTaskDelay(TickType_t ticks) { g_delays += (int)ticks; }
+size_t heap_caps_get_free_size(uint32_t caps) { return caps == MALLOC_CAP_SPIRAM ? g_free : 0; }
+void *heap_caps_aligned_alloc(size_t align, size_t size, uint32_t caps)
+{
+    if (g_allocs++ == g_fail_alloc) return NULL;
+    void *p = aligned_alloc(align, (size + align - 1) / align * align);
+    printf("alloc %zu align %zu caps %u\n", size, align, (unsigned)caps);
+    for (int i = 0; i < 8; i++) if (!g_blocks[i]) { g_blocks[i] = p; break; }
+    g_live++;
+    return p;
+}
+void heap_caps_free(void *p)
+{
+    for (int i = 0; i < 8; i++) if (g_blocks[i] == p && p) { g_blocks[i] = NULL; g_live--; }
+    free(p);
+}
+int64_t esp_timer_get_time(void) { return g_now += g_step; }
+const char *esp_err_to_name(esp_err_t err) { return err == ESP_ERR_NO_MEM ? "ESP_ERR_NO_MEM" : "ESP_ERR_INVALID_ARG"; }
+esp_err_t esp_async_memcpy_install(const async_memcpy_config_t *config, async_memcpy_handle_t *mcp)
+{
+    g_burst = config->dma_burst_size;
+    if (g_install != ESP_OK) return g_install;
+    g_installed = true;
+    *mcp = (async_memcpy_handle_t)&g_installed;
+    return ESP_OK;
+}
+esp_err_t esp_async_memcpy_uninstall(async_memcpy_handle_t mcp) { (void)mcp; g_installed = false; return ESP_OK; }
+esp_err_t esp_async_memcpy(async_memcpy_handle_t mcp, void *dst, void *src, size_t n, async_memcpy_isr_cb_t cb_isr, void *cb_args)
+{
+    if (g_copy != ESP_OK) return g_copy;
+    g_copied = n;
+    if (g_copies) memcpy(dst, src, n);
+    if (g_ends) { g_now += g_dma_us; async_memcpy_event_t e = {0}; cb_isr(mcp, &e, cb_args); }
+    return ESP_OK;
+}
+
+/* One step a line:
+ *   stack SP HWM     a fresh stack: 0xA5 below HWM, used (0x11) from it up; the stack pointer SP bytes from its start
+ *   sp N             the stack pointer at N
+ *   use N            the path writes from N up to the stack pointer
+ *   paint | note PATH | peak | hwm (FreeRTOS's high-water mark: 0xA5 bytes from the start) | byte N
+ *   draw A B C D     LVGL's units: one "SW" with threads A and B, one "other" with C and D (0: none); prints the swdraw stacks
+ *   free N | failalloc K | install ok|nomem | copy ok|bad | ends 0|1 | copies 0|1 | memtest */
+int main(void)
+{
+    char cmd[16], arg[16];
+    long n, m;
+    lv_draw_sw_unit_t sw = {{NULL, "SW"}, {{0}, {0}}}, other = {{NULL, "other"}, {{0}, {0}}};
+    while (scanf("%15s", cmd) == 1) {
+        if (!strcmp(cmd, "stack") && scanf("%ld %ld", &n, &m) == 2) {
+            memset(fake_stack, 0xA5, (size_t)m);
+            memset(fake_stack + m, 0x11, sizeof fake_stack - (size_t)m);
+            fake_sp = fake_stack + n;
+        } else if (!strcmp(cmd, "sp") && scanf("%ld", &n) == 1) {
+            fake_sp = fake_stack + n;
+        } else if (!strcmp(cmd, "use") && scanf("%ld", &n) == 1) {
+            memset(fake_stack + n, 0x22, (size_t)(fake_sp - fake_stack - n));
+        } else if (!strcmp(cmd, "paint")) {
+            printf("paint %d\n", muse_stack_paint());
+        } else if (!strcmp(cmd, "note") && scanf("%15s", arg) == 1) {
+            static char paths[16][16];
+            static int k;
+            strcpy(paths[k % 16], arg);
+            muse_stack_note(paths[k++ % 16]);
+        } else if (!strcmp(cmd, "peak")) {
+            int free_bytes = 0;
+            const char *path = muse_stack_peak(&free_bytes);
+            printf("peak %s %d\n", path ? path : "none", free_bytes);
+        } else if (!strcmp(cmd, "hwm")) {
+            size_t i = 0;
+            while (i < sizeof fake_stack && fake_stack[i] == 0xA5) i++;
+            printf("hwm %zu\n", i);
+        } else if (!strcmp(cmd, "byte") && scanf("%ld", &n) == 1) {
+            printf("byte %ld 0x%02x\n", n, fake_stack[n]);
+        } else if (!strcmp(cmd, "draw")) {
+            long t[4];
+            if (scanf("%ld %ld %ld %ld", &t[0], &t[1], &t[2], &t[3]) != 4) return 2;
+            sw.thread_dscs[0].thread.xTaskHandle = (TaskHandle_t)(uintptr_t)t[0];
+            sw.thread_dscs[1].thread.xTaskHandle = (TaskHandle_t)(uintptr_t)t[1];
+            other.thread_dscs[0].thread.xTaskHandle = (TaskHandle_t)(uintptr_t)t[2];
+            other.thread_dscs[1].thread.xTaskHandle = (TaskHandle_t)(uintptr_t)t[3];
+            other.base_unit.next = t[0] || t[1] ? &sw.base_unit : NULL;
+            lv_global.draw_info.unit_head = &other.base_unit;
+            int free_bytes[2] = {0, 0};
+            muse_bench_draw_stacks(free_bytes);
+            printf("draw %d %d\n", free_bytes[0], free_bytes[1]);
+        } else if (!strcmp(cmd, "free") && scanf("%ld", &n) == 1) {
+            g_free = (size_t)n;
+        } else if (!strcmp(cmd, "failalloc") && scanf("%ld", &n) == 1) {
+            g_fail_alloc = (int)n;
+            g_allocs = 0;
+        } else if (!strcmp(cmd, "install") && scanf("%15s", arg) == 1) {
+            g_install = strcmp(arg, "ok") ? ESP_ERR_NO_MEM : ESP_OK;
+        } else if (!strcmp(cmd, "copy") && scanf("%15s", arg) == 1) {
+            g_copy = strcmp(arg, "ok") ? ESP_ERR_INVALID_ARG : ESP_OK;
+        } else if (!strcmp(cmd, "ends") && scanf("%ld", &n) == 1) {
+            g_ends = n != 0;
+        } else if (!strcmp(cmd, "copies") && scanf("%ld", &n) == 1) {
+            g_copies = n != 0;
+        } else if (!strcmp(cmd, "memtest")) {
+            g_delays = 0;
+            muse_bench_memtest();
+            printf("live %d installed %d burst %zu copied %zu delays %d\n", g_live, g_installed, g_burst, g_copied, g_delays);
+            for (int i = 0; i < 8; i++) heap_caps_free(g_blocks[i]);   /* what a copy that never ended left, for the leak check */
+            g_installed = false;
+            g_burst = g_copied = 0;
+        }
+    }
+    return 0;
+}
+"""
+
+
+class BenchMemTest(unittest.TestCase):
+    """muse_bench_mem.c (Task 2 of the perf plan), compiled with its ESP-IDF, FreeRTOS and LVGL calls faked: the stack paint that
+    names the LVGL task's deepest path, the swdraw tasks' stacks for >mem, and >memtest's PSRAM copies."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.exes = {}
+        for name, config in (("bench_mem", "#define CONFIG_SOC_ASYNC_MEMCPY_SUPPORTED 1\n"), ("bench_mem_nodma", "")):
+            include = Path(cls.tmp.name) / f"{name}_include"
+            for header in BENCH_MEM_HEADERS:
+                (include / header).parent.mkdir(parents=True, exist_ok=True)
+                (include / header).write_text('#include "bench_mem_fakes.h"\n')
+            (include / "bench_mem_fakes.h").write_text(BENCH_MEM_FAKES)
+            (include / "sdkconfig.h").write_text("#pragma once\n#define CONFIG_MUSE_BENCH 1\n" + config)
+            driver = Path(cls.tmp.name) / f"{name}_driver.c"
+            driver.write_text(BENCH_MEM_DRIVER)
+            cls.exes[name] = apps_host.build(name, [driver, BENCH_MEM], cls.tmp.name, include_dirs=[include, MUSE])
+
+    def play(self, steps, exe="bench_mem"):
+        done = apps_host.run(self.exes[exe], input="\n".join(steps) + "\n")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return done.stdout.splitlines()
+
+    def test_a_paint_finds_the_deepest_path_and_keeps_freertoss_mark(self):
+        margin = int(re.search(r"(?m)^#define MUSE_STACK_MARGIN (\d+)", (MUSE / "muse_bench_mem.h").read_text()).group(1))
+        self.assertEqual(margin, 256)
+        out = self.play([
+            "stack 6000 3000", "hwm",
+            # The first: painted from the mark FreeRTOS keeps (3000) to 256 B under the stack pointer, never above it.
+            "paint", "byte 5743", f"byte {6000 - margin}", "use 4000", "note apply", "peak", "hwm",
+            # A shallower path isn't kept; the paint goes no higher than the deepest so far.
+            "paint", "byte 4000", "use 4500", "note carousel", "peak", "hwm",
+            # A deeper one is, and one deeper than FreeRTOS's mark moves that mark itself.
+            "paint", "use 3500", "note carousel", "peak", "hwm",
+            "paint", "use 2000", "note slide", "peak", "hwm",
+            # One paint at a time: a path inside another counts toward the outer's.
+            "paint", "paint", "use 1500", "note snapshot", "note apply", "peak", "hwm",
+            # A note with no paint, or a stack pointer within the margin of the start, does nothing.
+            "note apply", f"sp {margin - 1}", "paint", "use 10", "note apply", "peak",
+        ])
+        self.assertEqual(out, [
+            "hwm 3000",
+            "paint 1", "byte 5743 0xa5", "byte 5744 0x11", "peak apply 4000", "hwm 3000",
+            "paint 1", "byte 4000 0x22", "peak apply 4000", "hwm 3000",
+            "paint 1", "peak carousel 3500", "hwm 3000",
+            "paint 1", "peak slide 2000", "hwm 2000",
+            "paint 1", "paint 0", "peak snapshot 1500", "hwm 1500",
+            "paint 0", "peak snapshot 1500",
+        ])
+
+    def test_a_path_that_stays_above_the_paint_keeps_nothing(self):
+        out = self.play(["stack 6000 5900", "paint", "note apply", "peak", "hwm", "paint", "use 5800", "note apply", "peak",
+                         "hwm"])
+        self.assertEqual(out, ["paint 1", "peak none -1", "hwm 5900", "paint 1", "peak none -1", "hwm 5800"])
+
+    def test_the_swdraw_stacks_are_lvgls_draw_threads(self):
+        # The two threads of LVGL's SW draw unit, found through its list of units (no task walk: xTaskGetHandle finds one "swdraw").
+        self.assertEqual(self.play(["draw 12 34 5 6", "draw 0 0 5 6", "draw 12 0 5 6"]),
+                         ["draw 1200 3400", "draw -1 -1", "draw 1200 -1"])
+
+    def test_memtest_times_a_cpu_copy_and_a_dma_copy(self):
+        out = self.play(["memtest"])
+        self.assertEqual(out, [
+            "alloc 109976 align 64 caps 1028", "alloc 109976 align 64 caps 1028",
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy 107520 B 3200 us",
+            "live 0 installed 0 burst 64 copied 107520 delays 0",
+        ])
+        self.assertEqual(109976, 466 * 118 * 2, "a band of the slide: LVGL's draw buffer")
+        self.assertEqual(107520 % 64, 0)
+
+    def test_memtest_says_why_it_copies_less(self):
+        need = 2 * 109976 + 1024 * 1024
+        self.assertEqual(self.play([f"free {need - 1}", "memtest"]), [
+            f"memtest: no room ({need - 1} B of PSRAM free, {need} needed)", "live 0 installed 0 burst 0 copied 0 delays 0"])
+        self.assertEqual(self.play(["failalloc 1", "memtest"])[1:], [
+            f"memtest: no room (4194304 B of PSRAM free, {need} needed)", "live 0 installed 0 burst 0 copied 0 delays 0"])
+        self.assertEqual(self.play(["install nomem", "memtest"])[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy skipped (install: ESP_ERR_NO_MEM)",
+            "live 0 installed 0 burst 64 copied 0 delays 0"])
+        self.assertEqual(self.play(["copy bad", "memtest"])[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy skipped (copy: ESP_ERR_INVALID_ARG)",
+            "live 0 installed 0 burst 64 copied 0 delays 0"])
+        self.assertEqual(self.play(["copies 0", "memtest"])[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy skipped (the copy differs)",
+            "live 0 installed 0 burst 64 copied 107520 delays 0"])
+        # A copy that never ends is waited for a second, and its buffers and driver are left: the DMA may still write them.
+        self.assertEqual(self.play(["ends 0", "memtest"])[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy skipped (no end in 1000 ms)",
+            "live 2 installed 1 burst 64 copied 107520 delays 1000"])
+        self.assertEqual(self.play(["memtest"], exe="bench_mem_nodma")[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy skipped (none on this chip)",
+            "live 0 installed 0 burst 0 copied 0 delays 0"])
+
+    def test_the_probes_are_the_benchs_alone(self):
+        header = (MUSE / "muse_bench_mem.h").read_text()
+        source = BENCH_MEM.read_text()
+        for name in ("bool muse_stack_paint(void);", "void muse_stack_note(const char *path);",
+                     "const char *muse_stack_peak(int *free_bytes);", "void muse_bench_draw_stacks(int free_bytes[2]);",
+                     "void muse_bench_memtest(void);"):
+            with self.subTest(name):
+                self.assertEqual(open_conditions(header, header.index(name)), ["if CONFIG_MUSE_BENCH"])
+        self.assertIn('#include "sdkconfig.h"', header)
+        # New buffers are PSRAM's (the global constraint): the paint's state and memtest's flag, and the copies' blocks.
+        code = re.sub(r"/\*.*?\*/", " ", source, flags=re.S)
+        self.assertNotRegex(code, r"MALLOC_CAP_(INTERNAL|DMA)\b|\bmalloc\(|\bcalloc\(")
+        self.assertEqual(re.findall(r"(?m)^static (?!EXT_RAM_BSS_ATTR)(?!inline)[^(;]*;", code), [], "statics in PSRAM")
+        # The two paths painted outside apps_lv.c (test_muse_apps_lv.py has the apply's and the carousel's), in an apps bench build
+        # alone (the summary that prints the deepest is the apps'): the home slide's LV_EVENT_SCROLL_BEGIN, painted by the tileview's
+        # first callback for it and noted by its last, with slide_begins between, and app.control's snapshot, around its drawing.
+        ui = (MUSE / "muse_ui.c").read_text()
+        for needle in ("static void slide_paint(lv_event_t *e)", "static void slide_scan(lv_event_t *e)", 'muse_stack_note("slide");',
+                       "lv_obj_add_event_cb(s_tv, slide_paint, LV_EVENT_SCROLL_BEGIN, NULL);",
+                       "lv_obj_add_event_cb(s_tv, slide_scan, LV_EVENT_SCROLL_BEGIN, NULL);"):
+            with self.subTest(needle):
+                self.assertEqual(open_conditions(ui, ui.index(needle)), ["if CONFIG_MUSE_APPS && CONFIG_MUSE_BENCH"])
+        self.assertIn("muse_bench_mem.h", ui[ui.index("#if CONFIG_MUSE_BENCH\n"):ui.index("#endif", ui.index("#if CONFIG_MUSE_BENCH\n"))])
+        build = ui[ui.index("lv_obj_add_event_cb(s_tv, slide_paint,"):]
+        self.assertLess(build.index("slide_paint"), build.index("slide_begins"))
+        self.assertLess(build.index("slide_begins"), build.index("slide_scan"))
+        self.assertIn("s_slide_painted = muse_stack_paint();", c_function(ui, "static void slide_paint(lv_event_t *e)"))
+        snapshot = (MUSE / "apps/apps_snapshot.c").read_text()
+        take = c_function(snapshot, "void apps_snapshot_take_pending(void) {")
+        self.assertLess(take.index("CAP_TAKING)) {"), take.index("muse_stack_paint()"))
+        self.assertLess(take.index("muse_stack_paint()"), take.index("lv_snapshot_take_to_draw_buf("))
+        self.assertLess(take.index("lv_snapshot_take_to_draw_buf("), take.index('muse_stack_note("snapshot");'))
+        for needle in ("muse_stack_paint()", 'muse_stack_note("snapshot");', '#include "muse_bench_mem.h"'):
+            with self.subTest(needle):
+                self.assertEqual(open_conditions(snapshot, snapshot.index(needle)), ["if CONFIG_MUSE_BENCH"])
+        self.assertIn('#include "sdkconfig.h"', snapshot)
+        # Built only into a bench build, every UI's (its swdraw part is LVGL's).
+        cmake = (MUSE / "CMakeLists.txt").read_text()
+        self.assertEqual(cmake.count("muse_bench_mem.c"), 1)
+        at = cmake.index('"muse_bench_mem.c"')
+        self.assertIn("if(CONFIG_MUSE_BENCH)", cmake[cmake.rindex("\n    if(", 0, at):at])
+
+
 class ConsoleBaudTest(unittest.TestCase):
     """The 1.75C's console UART (ruling P2 of the perf plan): every line the console prints spins the task that prints it until
     UART0, the primary console, with no driver, has sent it. The board's overlay runs it at 1,000,000 baud, the most ESP-IDF's
@@ -413,7 +744,7 @@ class MuseBenchTest(unittest.TestCase):
         inp = (MUSE / "muse_input.c").read_text()
         printed = inp[inp.index('printf("@mem '):]
         fields = re.findall(r'\\"(\w+_stack_free)\\"', printed[:printed.index(");")])
-        self.assertEqual(fields, ["lvgl_stack_free", "serial_stack_free"])
+        self.assertEqual(fields, ["lvgl_stack_free", "serial_stack_free", "swdraw_stack_free"])
         kconfig = (MUSE / "Kconfig").read_text()
         help_text = kconfig[kconfig.index("    config MUSE_BENCH\n"):]
         help_text = help_text[:help_text.index("    config MUSE_JC3248W535_MIC_GPIO")]
@@ -423,6 +754,7 @@ class MuseBenchTest(unittest.TestCase):
             for field in fields:
                 self.assertIn(field, text, f"{name} doesn't name {field}")
             self.assertIn("muse_serial", text, f"{name} doesn't say which task the second stack is")
+            self.assertIn("swdraw", text, f"{name} doesn't say which tasks the last are")
             self.assertIn("console", text)
 
     def test_register_size_is_logged(self):
@@ -442,7 +774,7 @@ class MuseBenchTest(unittest.TestCase):
         command = c_function(source, "static bool console_command(char *line, bool whole)")
         base = source.index(command)
         for text in ('"mem"', '"ui.demo=1"', '"ui=settings"', '"ui=clock"', '"tap "', '"longpress "', '"swipe "',
-                     '"drag "'):
+                     '"drag "', '"frame"', '"frame copy on"', '"memtest"', "muse_bench_memtest();", "muse_bench_draw_stacks("):
             with self.subTest(text):
                 self.assertIn(text, command)
                 self.assertEqual(open_conditions(source, base + command.index(text)), ["if CONFIG_MUSE_BENCH"])
@@ -555,8 +887,11 @@ static TaskHandle_t xTaskGetHandle(const char *name)
     return strcmp(name, "lvgl") && strcmp(name, "muse_serial") ? NULL : (TaskHandle_t)name;
 }
 static unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task) { return strcmp((const char *)task, "lvgl") ? 321 : 970; }
-static const struct { int width, height; } board = { 466, 466 };
+static void frame_copy(bool on) { printf("frame_copy %d\n", on); }
+static struct { int width, height; void (*frame_copy)(bool on); } board = { 466, 466, frame_copy };
 #define muse_board (&board)
+static void muse_bench_memtest(void) { printf("memtest\n"); }
+static void muse_bench_draw_stacks(int free_bytes[2]) { free_bytes[0] = 7000; free_bytes[1] = -1; }
 void muse_ui_bench_page(muse_ui_page_t page) { printf("page %d\n", (int)page); }
 void muse_ui_bench_demo(bool enabled) { printf("demo %d\n", enabled); }
 void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y) { printf("touch %d %d %d\n", (int)kind, x, y); }
@@ -573,6 +908,10 @@ int main(void)
     char line[256];
     while (fgets(line, sizeof line, stdin)) {
         line[strcspn(line, "\n")] = 0;
+        if (!strcmp(line, "!noframe")) {   /* a build with no frame mode: the board has no frame_copy */
+            board.frame_copy = NULL;
+            continue;
+        }
         printf("[%s] taken=%d\n", line, bench_commands(line));
     }
     return 0;
@@ -644,8 +983,34 @@ int main(void)
         # Each task's unused stack, in bytes: the LVGL task's (970 words of 4 bytes here) and muse_serial's, the task
         # that runs the console and so every >app.* command (Task 15 reads it after a session of pushes).
         self.assertEqual(out[0], '@mem {"int_free":1001,"int_min":101,"int_largest":11,"dma_free":1002,'
-                                 '"psram_free":1004,"psram_min":104,"lvgl_stack_free":3880,"serial_stack_free":1284}')
+                                 '"psram_free":1004,"psram_min":104,"lvgl_stack_free":3880,"serial_stack_free":1284,'
+                                 '"swdraw_stack_free":[7000,-1]}')
         self.assertEqual(out[1], "[mem] taken=1")
+
+    def test_frame_copy_parses_and_validates(self):
+        # Task 2 of the perf plan: '>frame copy off' sends the slide's whole-screen refreshes on the band path, uncopied, and
+        # '>frame copy on' puts the copy back (muse_board_t frame_copy, muse_lcd_bands_set_frame_copy). Anything else that starts
+        # with the word gets the usage line; a build with no frame mode says so.
+        usage = "@frame.error usage: frame copy on|off"
+        bad = ["frame", "frame ", "frame copy", "frame copy maybe", "frame copy on ", "frame on", "frame copy off x"]
+        out = self.run_bench_block(["frame copy off", "frame copy on", *bad, "framex", "frames copy on", "!noframe",
+                                    "frame copy off", "frame copy on", "frame x"])
+        self.assertEqual(out, [
+            "frame_copy 0", "@frame copy off", "[frame copy off] taken=1",
+            "frame_copy 1", "@frame copy on", "[frame copy on] taken=1",
+            *[x for line in bad for x in (usage, f"[{line}] taken=1")],
+            "[framex] taken=0", "[frames copy on] taken=0",
+            "@frame.error this build has no frame mode", "[frame copy off] taken=1",
+            "@frame.error this build has no frame mode", "[frame copy on] taken=1",
+            usage, "[frame x] taken=1",
+        ])
+
+    def test_memtest_parses_and_validates(self):
+        # Task 2 of the perf plan: '>memtest' runs muse_bench_memtest (muse_bench_mem.c prints its line); it takes no argument.
+        usage = "@memtest.error usage: memtest"
+        out = self.run_bench_block(["memtest", "memtest ", "memtest 3", "memtests", "memtes"])
+        self.assertEqual(out, ["memtest", "[memtest] taken=1", usage, "[memtest ] taken=1", usage, "[memtest 3] taken=1",
+                               "[memtests] taken=0", "[memtes] taken=0"])
 
     # ---- Task 14: touch scripts through LVGL's read callback ----
 

@@ -29,6 +29,10 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
+#if CONFIG_MUSE_BENCH
+#include "esp_timer.h"
+#endif
 
 #include "apps_alarm.h"
 #include "apps_ask.h"
@@ -485,6 +489,25 @@ static bool wanted(req_t *r) {
 
 /* ---- The record ---- */
 
+#if CONFIG_MUSE_BENCH
+/* The bench's apply summary (perf plan Task 2): the calls of the app's that have ended since boot, counted here alone (call_finish)
+ * and read by the LVGL task (muse_apps_ui_tick). */
+static EXT_RAM_BSS_ATTR volatile uint32_t s_calls_ended;
+
+/* apps_ui_dump, with the time it holds the UI lock handed to apps_lv before the lock is let go, for the summary's dump_hold. */
+static size_t dump_timed(const apps_ui_t *ui, char *out, size_t cap, int *dropped) {
+    if (ui == NULL) {
+        return apps_ui_dump(ui, out, cap, dropped);
+    }
+    apps_port_ui_lock();
+    int64_t t0 = esp_timer_get_time();
+    size_t len = apps_ui_dump_held(ui, out, cap, dropped);
+    apps_lv_bench_dump_hold((uint32_t)(esp_timer_get_time() - t0));
+    apps_port_ui_unlock();
+    return len;
+}
+#endif
+
 /* The current app's status from its runtime, into st: the record's (its lock held) or a caller's copy (the request's
  * lock held). What the launch set (who the app is, its limit, its warnings) stays. */
 static void fill_status(apps_status_t *st) {
@@ -494,7 +517,11 @@ static void fill_status(apps_status_t *st) {
     put_text(st->last_error, sizeof st->last_error, apps_rt_last_error(T.rt));
     apps_rt_log_tail(T.rt, INT_MAX, st->log_tail, sizeof st->log_tail);
     int dropped = 0;
+#if CONFIG_MUSE_BENCH
+    dump_timed(ui, st->ui_dump, sizeof st->ui_dump, &dropped);
+#else
     apps_ui_dump(ui, st->ui_dump, sizeof st->ui_dump, &dropped);
+#endif
     st->ui_truncated = dropped;
     st->instructions = apps_vm_instructions(vm);
     st->mem_kb = kb(apps_vm_mem_used(vm));
@@ -748,6 +775,9 @@ static void call_begin(void) {
  * call's time (apps_rt_steal_ms), for the worst call as for the duty cycle. */
 static void call_finish(void) {
     atomic_store(&s_rec->in_call, 0);
+#if CONFIG_MUSE_BENCH
+    s_calls_ended++;
+#endif
     int64_t took = apps_port_mono_ms() - T.call_began - (int64_t)(uint32_t)(apps_rt_stolen_ms() - T.call_stolen);
     if (took < 0) {
         took = 0;
@@ -1979,6 +2009,9 @@ bool muse_apps_ui_tick(void) {
             end_hold();
         }
     }
+#if CONFIG_MUSE_BENCH
+    apps_lv_bench_tick(s_calls_ended);  /* the apply summary, once a second while an app is in front */
+#endif
     return update_covering();
 }
 

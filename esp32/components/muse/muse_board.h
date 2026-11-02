@@ -142,6 +142,14 @@ typedef struct {
      */
     void (*frame_mode)(bool on);
 #endif
+#if CONFIG_MUSE_BENCH
+    /*
+     * The bench's '>frame copy on|off' (muse_lcd_bands_set_frame_copy):
+     * off, frame mode's whole-screen refreshes go as bands, uncopied. NULL:
+     * the board has no frame mode.
+     */
+    void (*frame_copy)(bool on);
+#endif
 
     /* Codec handles for one duplex, 2-slot I2S bus, not yet opened. */
     esp_err_t (*audio_init)(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic);

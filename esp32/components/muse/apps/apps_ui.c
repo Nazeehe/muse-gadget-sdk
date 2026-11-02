@@ -1977,7 +1977,7 @@ static void put_entry(out_t *o, const apps_widget_t *w, int slot) {
     put_str(o, "}");
 }
 
-size_t apps_ui_dump(const apps_ui_t *ui, char *out, size_t cap, int *dropped) {
+size_t apps_ui_dump_held(const apps_ui_t *ui, char *out, size_t cap, int *dropped) {
     int alive = 0, written = 0;
     size_t len = 0;
     if (ui == NULL) {
@@ -1989,7 +1989,6 @@ size_t apps_ui_dump(const apps_ui_t *ui, char *out, size_t cap, int *dropped) {
         }
         return 0;
     }
-    apps_port_ui_lock();
     for (int i = 0; i < APPS_UI_SLOTS; i++) {
         alive += ui->w[i].alive ? 1 : 0;
     }
@@ -2017,9 +2016,18 @@ size_t apps_ui_dump(const apps_ui_t *ui, char *out, size_t cap, int *dropped) {
     } else if (out != NULL && cap > 0) {
         out[0] = '\0';
     }
-    apps_port_ui_unlock();
     if (dropped != NULL) {
         *dropped = alive - written;
     }
+    return len;
+}
+
+size_t apps_ui_dump(const apps_ui_t *ui, char *out, size_t cap, int *dropped) {
+    if (ui == NULL) {
+        return apps_ui_dump_held(NULL, out, cap, dropped);  /* nothing to read: no lock */
+    }
+    apps_port_ui_lock();
+    size_t len = apps_ui_dump_held(ui, out, cap, dropped);
+    apps_port_ui_unlock();
     return len;
 }

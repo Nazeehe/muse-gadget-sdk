@@ -113,6 +113,17 @@ void muse_lcd_bands_set_pairing(bool on);
  * screen turns it on while its pages slide (muse_board_t frame_mode).
  */
 void muse_lcd_bands_set_frame_mode(bool on);
+#if CONFIG_MUSE_BENCH
+/*
+ * The bench's switch of frame mode's copy (perf plan Task 2, the console's
+ * ">frame copy on|off"): off, a whole-screen refresh in frame mode goes on
+ * the band path instead, each band sent as LVGL flushes it and nothing
+ * copied, so it tears, and the batch line's render is the slide's without
+ * the copies. On (the default), frame mode as above. Any task: it takes
+ * effect at the next refresh's LV_EVENT_RENDER_START.
+ */
+void muse_lcd_bands_set_frame_copy(bool on);
+#endif
 #endif
 
 /*

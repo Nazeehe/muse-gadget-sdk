@@ -334,6 +334,8 @@ bool apps_ui_push_handler(lua_State *L, apps_ui_t *ui, uint16_t slot, uint16_t g
  * caller must not hold it, and the laid-out geometry it reads is one pass's. An entry is under 2 KB.
  */
 size_t apps_ui_dump(const apps_ui_t *ui, char *out, size_t cap, int *dropped);
+/* The same with the lock already held by the caller (the bench times the hold: apps_task.c). */
+size_t apps_ui_dump_held(const apps_ui_t *ui, char *out, size_t cap, int *dropped);
 
 /* The number of alive widgets. Not under the lock: it may be a moment stale on another task. */
 int apps_ui_count(const apps_ui_t *ui);

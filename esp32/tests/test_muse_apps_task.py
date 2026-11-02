@@ -566,6 +566,46 @@ class AppTaskTest(HarnessCase):
         self.assertEqual(sorted(tested - cases), [], "tests that run a case the harness doesn't have")
 
 
+class AppTaskBenchTest(HarnessCase):
+    """The harness built as a MUSE_BENCH build is (CONFIG_MUSE_BENCH): the app task's part of the bench's apply summary (perf plan
+    Task 2), the calls that ended and the dump's hold of the UI lock."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.harness = build_harness(cls, "muse_apps_task_harness_bench", console=False, defines=["CONFIG_MUSE_BENCH=1"])
+
+    def test_the_tick_hands_on_the_calls_and_the_dump_its_hold(self):
+        self.run_case("bench_counts_calls_and_times_the_dump")
+
+    def test_the_summary_is_handed_on_from_frame_tick_alone(self):
+        # Review Focus 1: apps_lv prints the summary from apps_lv_bench_tick, which only muse_apps_ui_tick calls, whatever the hang
+        # (the hung app's second still ends), and muse_apps_ui_tick is frame_tick's.
+        from test_muse_apps_lv import function_owner
+        from test_muse_apps_wiring import c_function, open_conditions, strip_c_comments
+        source = strip_c_comments((APPS / "apps_task.c").read_text())
+        owner = function_owner(source)
+        calls = [m.start() for m in re.finditer(r"\bapps_lv_bench_tick\(", source)]
+        self.assertEqual([owner(i) for i in calls], ["muse_apps_ui_tick"])
+        self.assertEqual(open_conditions(source, calls[0]), ["if CONFIG_MUSE_BENCH"])
+        tick = c_function(source, "bool muse_apps_ui_tick(void) {")
+        self.assertGreater(tick.index("apps_lv_bench_tick(s_calls_ended);"), tick.index("end_hold();"))
+        self.assertIn('#include "sdkconfig.h"', source)
+        ui = strip_c_comments((MUSE / "muse_ui.c").read_text())
+        self.assertIn("muse_apps_ui_tick()", c_function(ui, "static void frame_tick(lv_timer_t *timer)"))
+        # The count is the app task's alone (one writer, read on the LVGL task), in PSRAM; the dump's hold is timed with the lock
+        # held, and handed over before it is let go.
+        self.assertIn("static EXT_RAM_BSS_ATTR volatile uint32_t s_calls_ended;", source)
+        self.assertEqual([owner(m.start()) for m in re.finditer(r"\bs_calls_ended\+\+", source)], ["call_finish"])
+        dump = c_function(source, "static size_t dump_timed(")
+        self.assertLess(dump.index("apps_port_ui_lock()"), dump.index("apps_ui_dump_held("))
+        self.assertLess(dump.index("apps_lv_bench_dump_hold("), dump.index("apps_port_ui_unlock()"))
+        self.assertNotRegex(dump, r"ESP_LOG|printf")
+        for name in ("s_calls_ended", "dump_timed", "apps_lv_bench_dump_hold", "esp_timer.h"):
+            for m in re.finditer(re.escape(name), source):
+                with self.subTest(name=name, at=m.start()):
+                    self.assertIn("if CONFIG_MUSE_BENCH", open_conditions(source, m.start()))
+
+
 class AppTaskTickTest(HarnessCase):
     """The loop's waits on a build whose tick is 10 ms (CONFIG_FREERTOS_HZ=100, ESP-IDF's default: the board's is 1000), where a
     wait of 1 to 9 ms is no tick at all (pdMS_TO_TICKS rounds down) and the loop must still wait."""

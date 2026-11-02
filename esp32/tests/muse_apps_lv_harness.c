@@ -607,6 +607,63 @@ static void esp_clear(void) {
     (void)tb_take(&esp_log_text);
 }
 
+#if CONFIG_MUSE_BENCH
+#include "muse_bench_mem.h"
+
+/* The stack probes of muse_bench_mem.c (tests/test_muse_bench.py runs the real ones), faked for the bench build's cases (perf plan
+ * Task 2): each paint and note is a line of stack_log ("paint", "note <path>"), a paint is refused while one is open, and a note
+ * finds the free a case set in stack_free_next (-1: the path went no deeper than the paint), kept when it is the least so far.
+ * Neither may come with the UI lock held: a paint is a memset, which would lengthen the hold. */
+static textbuf_t stack_log;
+static bool stack_open;
+static int stack_free_next = -1;
+static const char *stack_path;
+static int stack_free = -1;
+
+static void stack_line(const char *what, const char *path) {
+    char line[64];
+    snprintf(line, sizeof line, "%s%s%s\n", what, path != NULL ? " " : "", path != NULL ? path : "");
+    tb_append(&stack_log, line, strlen(line));
+}
+
+bool muse_stack_paint(void) {
+    if (lock_held) {
+        lock_error("a stack paint with the UI lock held");
+    }
+    if (stack_open) {
+        stack_line("paint refused", NULL);
+        return false;
+    }
+    stack_open = true;
+    stack_line("paint", NULL);
+    return true;
+}
+
+void muse_stack_note(const char *path) {
+    if (lock_held) {
+        lock_error("a stack note with the UI lock held");
+    }
+    if (!stack_open) {
+        stack_line("note unpainted", path);
+        return;
+    }
+    stack_open = false;
+    stack_line("note", path);
+    if (stack_free_next >= 0 && (stack_path == NULL || stack_free_next < stack_free)) {
+        stack_path = path;
+        stack_free = stack_free_next;
+    }
+    stack_free_next = -1;
+}
+
+const char *muse_stack_peak(int *free_bytes) {
+    if (free_bytes != NULL) {
+        *free_bytes = stack_path != NULL ? stack_free : -1;
+    }
+    return stack_path;
+}
+#endif
+
 /* ---- The fake LVGL ---- */
 
 typedef struct {
@@ -675,7 +732,7 @@ struct lv_indev {
 
 /* The one display. Its callbacks outlive the objects (fake_reset leaves them), as a display outlives a screen's. */
 struct lv_display {
-    fake_cb_t cbs[4];
+    fake_cb_t cbs[12];
     int n_cbs;
 };
 
@@ -874,6 +931,11 @@ static const char *code_name(lv_event_code_t c) {
         case LV_EVENT_GESTURE: return "gesture";
         case LV_EVENT_REFR_EXT_DRAW_SIZE: return "refr_ext_draw_size";
         case LV_EVENT_REFR_READY: return "refr_ready";
+        case LV_EVENT_REFR_START: return "refr_start";
+        case LV_EVENT_RENDER_START: return "render_start";
+        case LV_EVENT_RENDER_READY: return "render_ready";
+        case LV_EVENT_FLUSH_WAIT_START: return "flush_wait_start";
+        case LV_EVENT_FLUSH_WAIT_FINISH: return "flush_wait_finish";
         default: break;
     }
     return "?";
@@ -2606,16 +2668,30 @@ void lv_display_add_event_cb(lv_display_t *disp, lv_event_cb_t event_cb, lv_even
     logline("display_add_event_cb %s", code_name(filter));
 }
 
-/* One refresh of the display as lv_display_refr_timer ends it (lv_refr.c): LV_EVENT_REFR_READY to the display's callbacks, sent
- * whether or not anything was drawn. LVGL runs it at most every LV_DEF_REFR_PERIOD while something is invalid; a case says when. */
-static void fake_refresh(void) {
-    lv_event_t e = {LV_EVENT_REFR_READY, NULL, NULL, false, NULL};
+/* One of the display's events (lv_display_send_event) to the callbacks that filter for it, in the order they were added. */
+static void fake_display_event(lv_event_code_t code) {
+    lv_event_t e = {code, NULL, NULL, false, NULL};
     for (int i = 0; i < display_obj.n_cbs && !e.stopped; i++) {
-        if (display_obj.cbs[i].filter == LV_EVENT_ALL || display_obj.cbs[i].filter == LV_EVENT_REFR_READY) {
+        if (display_obj.cbs[i].filter == LV_EVENT_ALL || display_obj.cbs[i].filter == code) {
             e.ud = display_obj.cbs[i].ud;
             display_obj.cbs[i].cb(&e);
         }
     }
+}
+
+/* One refresh of the display as lv_display_refr_timer ends it (lv_refr.c): LV_EVENT_REFR_READY to the display's callbacks, sent
+ * whether or not anything was drawn. LVGL runs it at most every LV_DEF_REFR_PERIOD while something is invalid; a case says when. */
+static void fake_refresh(void) {
+    fake_display_event(LV_EVENT_REFR_READY);
+}
+
+/* The display's callbacks for one event. */
+static int display_cbs_for(lv_event_code_t code) {
+    int n = 0;
+    for (int i = 0; i < display_obj.n_cbs; i++) {
+        n += display_obj.cbs[i].filter == code;
+    }
+    return n;
 }
 
 lv_indev_t *lv_indev_active(void) {
@@ -4341,11 +4417,75 @@ static void a_create_that_fails_is_tried_again(void) {
     FINISH(&e);
 }
 
+/* ---- The bench's apply summary (perf plan Task 2), in a MUSE_BENCH build ---- */
+
+#if CONFIG_MUSE_BENCH
+/* The summary as apps_lv.c prints it once a second while an app is in front: "I muse_apps: apply: calls=<n> applies=<n>
+ * skips=<in call>/<lock busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us> stack_peak=<path>:<bytes>". */
+typedef struct {
+    unsigned calls, applies, in_call, lock_busy, refr;
+    int gap_max;
+    unsigned avg, max, dump;
+    char path[16];
+    int peak;
+} apply_line_t;
+
+/* The summaries logged since the last esp_clear, in order, into out (at most cap); how many there were. A line of another shape after
+ * the prefix is a failure. */
+static int apply_lines_at(int line, apply_line_t *out, int cap) {
+    static const char prefix[] = "I muse_apps: apply: ";
+    int n = 0;
+    for (const char *at = esp_peek(); (at = strstr(at, prefix)) != NULL; at += sizeof prefix - 1) {
+        apply_line_t s = {0};
+        int used = 0;
+        int got = sscanf(at + sizeof prefix - 1, "calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u "
+                                                 "stack_peak=%15[a-z]:%d%n",
+                         &s.calls, &s.applies, &s.in_call, &s.lock_busy, &s.refr, &s.gap_max, &s.avg, &s.max, &s.dump, s.path,
+                         &s.peak, &used);
+        CHECK_AT(line, got == 11 && at[sizeof prefix - 1 + used] == '\n', "a summary of another shape:\n%s", at);
+        if (n < cap) {
+            out[n] = s;
+        }
+        n++;
+    }
+    return n;
+}
+#define APPLY_LINES(out, cap) apply_lines_at(__LINE__, (out), (cap))
+
+static uint32_t bench_calls;  /* the app task's calls ended, as a case says muse_apps_ui_tick would give them */
+
+/* A second of the summary from now: the layer behind (no second runs), then in front, and the tick that starts its second. */
+static void second_begin(void) {
+    apps_lv_set_front(false);
+    apps_lv_bench_tick(bench_calls);
+    apps_lv_set_front(true);
+    apps_lv_bench_tick(bench_calls);
+    log_clear();
+    esp_clear();
+}
+
+/* That second's summary, printed by the tick a second later (what else the log has is dropped). */
+static apply_line_t second_end_at(int line) {
+    apply_line_t got[2] = {0};
+    esp_clear();
+    clock_us += 1000000;
+    apps_lv_bench_tick(bench_calls);
+    int n = apply_lines_at(line, got, 2);
+    CHECK_AT(line, n == 1, "one summary at the second's end, not %d:\n%s", n, esp_peek());
+    esp_clear();
+    return got[0];
+}
+#define SECOND_END() second_end_at(__LINE__)
+#endif
+
 /* ---- Frames: the lock and the callback ---- */
 
 static void skips_mid_callback_at_most_three_frames(void) {
     env_t e;
     scene(&e);
+#if CONFIG_MUSE_BENCH
+    second_begin();  /* the bench's summary counts the skips apart: in a callback, and the lock busy */
+#endif
     RUN(&e, "a = ui.label{text = 'x'}");
     long trylocks = trylock_calls;
     for (int frame = 1; frame <= 3; frame++) {
@@ -4384,12 +4524,20 @@ static void skips_mid_callback_at_most_three_frames(void) {
     CHECK(!APPLY_CB(&e), "the lock is not free at the 4th frame");
     CHECK(stats_since().skips == skips + 1, "a skip, counted");
     CHECK(APPLY_CB(&e) && log_has_line("text 2 \"v\""), "the next frame applies at once\n%s", log_peek());
+#if CONFIG_MUSE_BENCH
+    apply_line_t second = SECOND_END();
+    CHECK(second.in_call == 14 && second.lock_busy == 1 && second.applies == 5, "skips %u/%u, applies %u", second.in_call,
+          second.lock_busy, second.applies);
+#endif
     FINISH(&e);
 }
 
 static void lock_discipline(void) {
     env_t e;
     scene(&e);
+#if CONFIG_MUSE_BENCH
+    second_begin();
+#endif
     RUN(&e, "a = ui.label{text = 'x'} b = ui.arc{} c = ui.button{text = 'go'}");
     long calls = trylock_calls, takes = lock_takes;
     CHECK(APPLY(&e), "the pass ran");
@@ -4413,6 +4561,11 @@ static void lock_discipline(void) {
     unpublish();
     CHECK(!APPLY(&e), "no table");
     CHECK(stats_since().skips == 1 && stats_since().applies == 2, "not counted: skips %u applies %u", stats_since().skips, stats_since().applies);
+#if CONFIG_MUSE_BENCH
+    apply_line_t second = SECOND_END();
+    CHECK(second.in_call == 0 && second.lock_busy == 1 && second.applies == 2, "the lock busy once: skips %u/%u, applies %u",
+          second.in_call, second.lock_busy, second.applies);
+#endif
     FINISH(&e);
 }
 
@@ -4524,6 +4677,9 @@ static void refuse_the_next_lock(void *arg) {
 static void the_lock_may_be_refused_after_the_records_are_made(void) {
     env_t e;
     scene_raw(&e);
+#if CONFIG_MUSE_BENCH
+    second_begin();
+#endif
     RUN(&e, "a = ui.label{text = 'x'}");
     apps_lv_stats_t base = stats_since();
     long calls = lvgl_calls;
@@ -4533,6 +4689,11 @@ static void the_lock_may_be_refused_after_the_records_are_made(void) {
     CHECK(lvgl_calls == calls && s.skips == base.skips + 1 && s.applies == base.applies, "no call, a skip: %ld calls, skips %u applies %u",
           lvgl_calls - calls, s.skips - base.skips, s.applies - base.applies);
     CHECK(APPLY(&e) && log_count("create label") == 1, "the next frame applies it\n%s", log_peek());
+#if CONFIG_MUSE_BENCH
+    apply_line_t second = SECOND_END();
+    CHECK(second.in_call == 0 && second.lock_busy == 1 && second.applies == 1, "the lock busy the second time: skips %u/%u, applies %u",
+          second.in_call, second.lock_busy, second.applies);
+#endif
     FINISH(&e);
 }
 
@@ -6060,6 +6221,9 @@ static void a_pass_with_no_memory_is_a_skip(void) {
     scene(&e);
     RUN(&e, "a = ui.label{text = 'x'}");
     apps_lv_reset();  /* the records are freed: the next pass has to make them */
+#if CONFIG_MUSE_BENCH
+    second_begin();
+#endif
     log_clear();
     refuse_from = growths + 1;
     long trylocks = trylock_calls, calls = lvgl_calls;
@@ -6073,6 +6237,11 @@ static void a_pass_with_no_memory_is_a_skip(void) {
     refuse_from = -1;
     CHECK(APPLY(&e), "there is room");
     CHECK(log_count("create label") == 1, "made\n%s", log_peek());
+#if CONFIG_MUSE_BENCH
+    apply_line_t second = SECOND_END();
+    CHECK(second.in_call == 0 && second.lock_busy == 0 && second.applies == 1,
+          "no memory is neither a callback nor the lock: skips %u/%u, applies %u", second.in_call, second.lock_busy, second.applies);
+#endif
     FINISH(&e);
 }
 
@@ -8252,6 +8421,293 @@ static void refresh_after(int64_t gap_us) {
     fake_refresh();
 }
 
+/* ---- Perf plan Task 2: the bench's instruments, in a MUSE_BENCH build only ---- */
+
+/* A refresh with its phases as lv_display_refr_timer sends them (lv_refr.c): LV_EVENT_REFR_START gap_us after the last refresh; its
+ * layout; then, with something to draw, LV_EVENT_RENDER_START, the drawing (render_us) with a wait for the flush before in its middle
+ * (LV_EVENT_FLUSH_WAIT_START to _FINISH, flush_us), and LV_EVENT_RENDER_READY; and LV_EVENT_REFR_READY. */
+static void refresh_phases(int64_t gap_us, int64_t layout_us, int64_t render_us, int64_t flush_us) {
+    clock_us += gap_us;
+    fake_display_event(LV_EVENT_REFR_START);
+    clock_us += layout_us;
+    if (render_us > 0 || flush_us > 0) {
+        fake_display_event(LV_EVENT_RENDER_START);
+        clock_us += render_us / 2;
+        fake_display_event(LV_EVENT_FLUSH_WAIT_START);
+        clock_us += flush_us;
+        fake_display_event(LV_EVENT_FLUSH_WAIT_FINISH);
+        clock_us += render_us - render_us / 2;
+        fake_display_event(LV_EVENT_RENDER_READY);
+    }
+    fake_display_event(LV_EVENT_REFR_READY);
+}
+
+/* Once a second while an app is in front (the layer in front, no launcher or card over it), frame_tick's muse_apps_ui_tick hands
+ * apps_lv_bench_tick the app task's calls ended, and it prints the second's summary: those calls, the passes that ran, the frames
+ * skipped in a callback and for a busy lock, the display's refreshes, the most time between two passes that changed something, the
+ * passes' average and longest, the longest hold of the UI lock the app task's dump told, and the deepest stack path so far. Nothing
+ * while no app is in front, and a second that begins in front counts only its own. Nothing at all without the bench. */
+static void apply_summary_once_a_second(void) {
+    env_t e;
+    scene(&e);
+#if CONFIG_MUSE_BENCH
+    apply_line_t got[4];
+    bench_calls = 100;
+    second_begin();
+    int64_t t0 = clock_us;
+    /* A pass that makes a label, 2 ms; 40 ms later one that sets its text, 1 ms: 41 ms between the two changes' ends. */
+    RUN(&e, "a = ui.label{text = 'x'}");
+    extra_us_next = 2000;
+    CHECK(APPLY(&e), "made");
+    clock_us += 40000;
+    RUN(&e, "a:set{text = 'y'}");
+    extra_us_next = 1000;
+    CHECK(APPLY(&e), "set");
+    /* A pass with nothing to do runs (an apply, 0 us) and changes nothing. */
+    clock_us += 100000;
+    CHECK(APPLY(&e), "nothing to do");
+    /* Three frames skipped in a callback, the fourth applies 20 ms later, 3 ms: 123 ms since the last change. */
+    RUN(&e, "a:set{text = 'z'}");
+    CHECK(!APPLY_CB(&e) && !APPLY_CB(&e) && !APPLY_CB(&e), "three skipped");
+    clock_us += 20000;
+    extra_us_next = 3000;
+    CHECK(APPLY_CB(&e), "the fourth");
+    /* Two frames the lock isn't free. */
+    trylock_refusals = 2;
+    CHECK(!APPLY(&e) && !APPLY(&e), "the lock busy");
+    /* The app task's dump held the lock 1234 us, then 800: told under the lock, taken in by the next pass. */
+    apps_port_ui_lock();
+    apps_lv_bench_dump_hold(1234);
+    apps_port_ui_unlock();
+    apps_port_ui_lock();
+    apps_lv_bench_dump_hold(800);
+    apps_port_ui_unlock();
+    CHECK(APPLY(&e), "a pass takes the holds in");
+    fake_refresh();
+    fake_refresh();
+    fake_refresh();
+    /* 7 calls of the app's ended. A microsecond short of the second: nothing yet. */
+    bench_calls = 107;
+    clock_us = t0 + 999999;
+    apps_lv_bench_tick(bench_calls);
+    CHECK(APPLY_LINES(got, 4) == 0, "not yet:\n%s", esp_peek());
+    clock_us = t0 + 1000000;
+    apps_lv_bench_tick(bench_calls);
+    CHECK(APPLY_LINES(got, 4) == 1, "one summary:\n%s", esp_peek());
+    CHECK(got[0].calls == 7 && got[0].applies == 5 && got[0].in_call == 3 && got[0].lock_busy == 2 && got[0].refr == 3 &&
+              got[0].gap_max == 123 && got[0].avg == 1200 && got[0].max == 3000 && got[0].dump == 1234 &&
+              strcmp(got[0].path, "none") == 0 && got[0].peak == -1,
+          "the second:\n%s", esp_peek());
+    CHECK(strstr(esp_peek(), "I muse_apps: apply: calls=7 applies=5 skips=3/2 refr=3 gap_max=123 avg=1200 max=3000 dump_hold=1234 "
+                             "stack_peak=none:-1\n") != NULL, "the line as Task 3 reads it:\n%s", esp_peek());
+    esp_clear();
+    /* The next second has its own: one pass, 0.5 ms, 835 ms after the last change (the gap goes on across seconds), with the stack
+     * found 2345 B from its end. */
+    stack_free_next = 2345;
+    RUN(&e, "a:set{text = 'w'}");
+    extra_us_next = 500;
+    CHECK(APPLY(&e), "the next second's");
+    clock_us = t0 + 2000000;
+    apps_lv_bench_tick(bench_calls);
+    CHECK(APPLY_LINES(got, 4) == 1 && got[0].calls == 0 && got[0].applies == 1 && got[0].in_call == 0 && got[0].lock_busy == 0 &&
+              got[0].refr == 0 && got[0].gap_max == 835 && got[0].avg == 500 && got[0].max == 500 && got[0].dump == 0 &&
+              strcmp(got[0].path, "apply") == 0 && got[0].peak == 2345,
+          "the next second:\n%s", esp_peek());
+    esp_clear();
+    /* Behind: no second, and nothing printed however long. */
+    apps_lv_set_front(false);
+    apps_lv_bench_tick(bench_calls);
+    RUN(&e, "a:set{text = 'v'}");
+    CHECK(APPLY(&e), "behind");
+    clock_us += 3000000;
+    apps_lv_bench_tick(bench_calls);
+    CHECK(APPLY_LINES(got, 4) == 0, "nothing behind:\n%s", esp_peek());
+    /* In front again: a second of its own, whose first change isn't timed against the last one behind. */
+    apps_lv_set_front(true);
+    apps_lv_bench_tick(bench_calls);
+    RUN(&e, "a:set{text = 'u'}");
+    CHECK(APPLY(&e), "in front again");
+    clock_us += 1000000;
+    apps_lv_bench_tick(bench_calls);
+    CHECK(APPLY_LINES(got, 4) == 1 && got[0].applies == 1 && got[0].gap_max == 0, "its own second:\n%s", esp_peek());
+    esp_clear();
+    /* A card over the layer: no app in front. */
+    apps_lv_show_crash("Test", NULL);
+    clock_us += 3000000;
+    apps_lv_bench_tick(bench_calls);
+    CHECK(APPLY_LINES(got, 4) == 0, "nothing under a card:\n%s", esp_peek());
+    apps_lv_hide_cards();
+#else
+    apps_lv_set_front(true);
+    RUN(&e, "a = ui.label{text = 'x'}");
+    CHECK(APPLY(&e), "made");
+    fake_refresh();
+    CHECK(esp_count("I muse_apps: apply:") == 0, "no summary without the bench:\n%s", esp_peek());
+#endif
+    FINISH(&e);
+}
+
+/* The slow pass's line (over 2 ms, at most one a second) says how the longest pass since the last line went, in a bench build: its
+ * visits (the deletes, the visits and what came before them), the layout of the layer, the write-back (the scrolls and every widget's
+ * place and overflow), and the objects it made, the texts it set and the styles it applied. Without the bench, the line as before. */
+static void slow_pass_phases(void) {
+    env_t e;
+    scene(&e);
+    call_cost_us = 100;
+    RUN(&e, "a = ui.label{text = 'x'} b = ui.label{text = 'y'}");
+    long before = lvgl_calls;
+    CHECK(APPLY(&e), "made");
+    long total = (lvgl_calls - before) * 100;
+    CHECK(total > 2000, "two labels made in %ld us: slow", total);
+    char want[200];
+    /* The layout is one call of 100 us, the write-back one lv_obj_get_coords each (two), the visits the rest. */
+#if CONFIG_MUSE_BENCH
+    snprintf(want, sizeof want, "W muse_apps: apply %ld us (1 slow since last) visits=%ld layout=100 writeback=200 creates=2 texts=2 "
+                                "styles=2", total, total - 300);
+#else
+    snprintf(want, sizeof want, "W muse_apps: apply %ld us (1 slow since last)", total);
+#endif
+    CHECK(esp_has_line(want) && esp_count("") == 1, "wanted \"%s\"\n%s", want, esp_peek());
+    esp_clear();
+    /* Within the second after it: a colour's pass at 1000 us a call, the longest; a text's at 600 us a call; neither logged. */
+    call_cost_us = 1000;
+    RUN(&e, "a:set{color = 0x00ff00}");
+    before = lvgl_calls;
+    CHECK(APPLY(&e), "a colour");
+    long worst = (lvgl_calls - before) * 1000;
+    call_cost_us = 600;
+    RUN(&e, "b:set{text = 'z'}");
+    before = lvgl_calls;
+    CHECK(APPLY(&e), "a text");
+    long text = (lvgl_calls - before) * 600;
+    CHECK(text > 2000 && text < worst && esp_count("") == 0, "both slow, the colour's the longest: %ld, %ld\n%s", worst, text,
+          esp_peek());
+    /* A second on, a slow pass logs the longest's: the colour's, a style and nothing else. */
+    call_cost_us = 0;
+    clock_us += 1000000;
+    RUN(&e, "b:set{text = 'q'}");
+    extra_us_next = 2100;
+    CHECK(APPLY(&e), "2.1 ms");
+#if CONFIG_MUSE_BENCH
+    snprintf(want, sizeof want, "W muse_apps: apply %ld us (3 slow since last) visits=%ld layout=1000 writeback=2000 creates=0 texts=0 "
+                                "styles=1", worst, worst - 3000);
+#else
+    snprintf(want, sizeof want, "W muse_apps: apply %ld us (3 slow since last)", worst);
+#endif
+    CHECK(esp_has_line(want) && esp_count("") == 1, "wanted \"%s\"\n%s", want, esp_peek());
+    FINISH(&e);
+}
+
+/* A refresh over 50 ms with an app in front, in a bench build, prints its anatomy from LV_EVENT_REFR_READY: the frame (from the
+ * refresh before, which must have had the app in front too), the gap from that refresh to this one's start (the timers, the apply),
+ * the layout (to the drawing's start, or the end with nothing to draw), the drawing less its waits for the wire, those waits, and the
+ * passes that ran in the frame and their time. Nothing at 50 ms, behind or under a card, and nothing without the bench. */
+static void slow_frame_anatomy(void) {
+    env_t e;
+    scene(&e);
+    apps_lv_set_front(true);
+    esp_clear();
+    RUN(&e, "a = ui.label{text = 'x'}");
+    CHECK(APPLY(&e), "made");
+    refresh_phases(5000, 1000, 10000, 2000);   /* the first in front: not timed */
+    refresh_phases(25000, 1000, 12000, 2000);  /* 40 ms */
+    refresh_phases(30000, 2000, 15000, 3000);  /* 50 ms: not over */
+    CHECK(esp_count("W muse_apps: slow frame ") == 0, "none yet:\n%s", esp_peek());
+    /* 81 ms: 10 ms, a pass of 4 ms, 37 ms more to the refresh's start; 3 ms of layout; 20 ms of drawing and 7 of waiting. */
+    clock_us += 10000;
+    RUN(&e, "a:set{text = 'y'}");
+    extra_us_next = 4000;
+    CHECK(APPLY(&e), "the pass in the frame");
+    refresh_phases(37000, 3000, 20000, 7000);
+    /* 51 ms with nothing to draw. */
+    refresh_phases(50000, 1000, 0, 0);
+#if CONFIG_MUSE_BENCH
+    CHECK(esp_count("W muse_apps: slow frame ") == 2 &&
+              esp_has_line("W muse_apps: slow frame 81 ms: gap=51 layout=3 render=20 flush=7 applies=1/4000") &&
+              esp_has_line("W muse_apps: slow frame 51 ms: gap=50 layout=1 render=0 flush=0 applies=0/0"),
+          "the two slow frames:\n%s", esp_peek());
+#endif
+    esp_clear();
+    /* Behind, nothing; in front again, its first refresh isn't timed. */
+    apps_lv_set_front(false);
+    refresh_phases(100000, 1000, 10000, 0);
+    apps_lv_set_front(true);
+    refresh_phases(100000, 1000, 10000, 0);
+    CHECK(esp_count("W muse_apps: slow frame ") == 0, "nothing behind, nor the first in front:\n%s", esp_peek());
+    refresh_phases(55000, 1000, 4000, 0);
+#if CONFIG_MUSE_BENCH
+    CHECK(esp_count("W muse_apps: slow frame ") == 1 && esp_has_line("W muse_apps: slow frame 60 ms: gap=55 layout=1 render=4 flush=0 "
+                                                                    "applies=0/0"),
+          "timed again:\n%s", esp_peek());
+#endif
+    esp_clear();
+    /* Under a card, nothing. */
+    apps_lv_show_crash("Test", NULL);
+    refresh_phases(100000, 1000, 10000, 0);
+    apps_lv_hide_cards();
+    refresh_phases(100000, 1000, 10000, 0);
+    CHECK(esp_count("W muse_apps: slow frame ") == 0, "nothing under a card, nor the first after it:\n%s", esp_peek());
+#if CONFIG_MUSE_BENCH
+    CHECK(display_cbs_for(LV_EVENT_REFR_START) == 1 && display_cbs_for(LV_EVENT_RENDER_START) == 1 &&
+              display_cbs_for(LV_EVENT_RENDER_READY) == 1 && display_cbs_for(LV_EVENT_FLUSH_WAIT_START) == 1 &&
+              display_cbs_for(LV_EVENT_FLUSH_WAIT_FINISH) == 1,
+          "one callback for each phase: %d on the display", display_obj.n_cbs);
+#else
+    CHECK(display_obj.n_cbs == 0, "nothing on the display without the bench: %d", display_obj.n_cbs);
+#endif
+    FINISH(&e);
+}
+
+/* W1's stack paint, in a bench build: the apply pass and the launcher carousel's scroll are each painted before (muse_stack_paint,
+ * never with the UI lock held) and noted after (muse_stack_note, with the path's name), and the summary names the deepest so far. A
+ * frame skipped in a callback paints nothing; one that waits for the lock in vain is the apply's too. */
+static void stack_paint_around_the_paths(void) {
+#if CONFIG_MUSE_BENCH
+    env_t e;
+    scene(&e);
+    (void)tb_take(&stack_log);
+    RUN(&e, "a = ui.label{text = 'x'}");
+    CHECK(APPLY(&e), "made");
+    CHECK(strcmp(tb_take(&stack_log), "paint\nnote apply\n") == 0, "around the pass:\n%s", tb_peek(&stack_log));
+    RUN(&e, "a:set{text = 'y'}");
+    CHECK(!APPLY_CB(&e) && !APPLY_CB(&e) && !APPLY_CB(&e), "skipped in a callback");
+    CHECK(tb_peek(&stack_log)[0] == '\0', "nothing painted for a skip in a callback:\n%s", tb_peek(&stack_log));
+    trylock_refusals = 1;
+    CHECK(!APPLY_CB(&e), "the lock busy");
+    CHECK(strcmp(tb_take(&stack_log), "paint\nnote apply\n") == 0, "the lock's wait is the apply's:\n%s", tb_peek(&stack_log));
+    stack_free_next = 3000;
+    CHECK(APPLY(&e), "applied");
+    stack_free_next = 3500;
+    CHECK(APPLY(&e), "again");
+    int free_bytes = 0;
+    const char *path = muse_stack_peak(&free_bytes);
+    CHECK(path != NULL && strcmp(path, "apply") == 0 && free_bytes == 3000, "the deepest: %s %d", path ? path : "none", free_bytes);
+    FINISH(&e);
+
+    /* The carousel's scroll: every LV_EVENT_SCROLL of its row. */
+    cards_scene();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    (void)tb_take(&stack_log);
+    lv_point_t p = face_at(0);
+    stack_free_next = 2000;
+    fake_down(p.x, p.y);
+    fake_move(p.x - 12, p.y);
+    fake_move(p.x - 24, p.y);
+    const char *log = tb_peek(&stack_log);
+    CHECK(tb_count(&stack_log, "paint") >= 2 && tb_count(&stack_log, "paint") == tb_count(&stack_log, "note carousel") &&
+              tb_count(&stack_log, "paint refused") == 0 && strncmp(log, "paint\nnote carousel\n", 20) == 0,
+          "around each scroll:\n%s", log);
+    path = muse_stack_peak(&free_bytes);
+    CHECK(path != NULL && strcmp(path, "carousel") == 0 && free_bytes == 2000, "the deepest: %s %d", path ? path : "none", free_bytes);
+    fake_lift();
+    for (int frames = 0; frames < 100 && (throw_pending || n_anims > 0); frames++) {
+        clock_us += 16000;
+        fake_frame(16);
+    }
+    LAUNCHER_END();
+#endif
+}
+
 /* While the carousel scrolls (a drag, a fling's snap), each display refresh times the gap since the refresh before it, rounded to the
  * ms, when that one found it scrolling too (the first refresh of a scroll follows a rest of any length and isn't timed), and the
  * refresh that finds it at rest prints the scroll's frames as one summary, "launcher frames: n=... p50=... p95=... max=...
@@ -8261,7 +8717,7 @@ static void launcher_frame_log(void) {
     cards_scene();
     cards_scene();  /* the layer built again (a new screen on the same display) */
     if (FRAMES_LOGGED) {
-        CHECK(display_obj.n_cbs == 1 && display_obj.cbs[0].filter == LV_EVENT_REFR_READY,
+        CHECK(display_cbs_for(LV_EVENT_REFR_READY) == 1 && display_cbs_for(LV_EVENT_REFR_START) == 1,
               "a bench build watches the display's refreshes, once: %d callbacks", display_obj.n_cbs);
     } else {
         CHECK(display_obj.n_cbs == 0, "a build without the bench adds nothing to the display: %d callbacks", display_obj.n_cbs);
@@ -8705,8 +9161,7 @@ static void spin_frame_log(void) {
     env_t e;
     scene(&e);
     if (FRAMES_LOGGED) {
-        CHECK(display_obj.n_cbs == 1 && display_obj.cbs[0].filter == LV_EVENT_REFR_READY, "one callback on the display: %d",
-              display_obj.n_cbs);
+        CHECK(display_cbs_for(LV_EVENT_REFR_READY) == 1, "one refresh callback on the display: %d", display_obj.n_cbs);
     } else {
         CHECK(display_obj.n_cbs == 0, "a build without the bench adds nothing to the display: %d callbacks", display_obj.n_cbs);
     }
@@ -10334,8 +10789,7 @@ static void scroll_frame_log(void) {
     list_scene(&e, 10, true);  /* 500 px of rows in 200, each with a tap: a drag that begins on one scrolls the list */
     int list = BOX_OBJ(0);
     if (FRAMES_LOGGED) {
-        CHECK(display_obj.n_cbs == 1 && display_obj.cbs[0].filter == LV_EVENT_REFR_READY, "one callback on the display: %d",
-              display_obj.n_cbs);
+        CHECK(display_cbs_for(LV_EVENT_REFR_READY) == 1, "one refresh callback on the display: %d", display_obj.n_cbs);
     } else {
         CHECK(display_obj.n_cbs == 0, "a build without the bench adds nothing to the display: %d callbacks", display_obj.n_cbs);
     }
@@ -10697,6 +11151,10 @@ int main(int argc, char **argv) {
         {"create_pending_has_no_object", create_pending_has_no_object},
         {"a_create_that_fails_is_tried_again", a_create_that_fails_is_tried_again},
         {"skips_mid_callback_at_most_three_frames", skips_mid_callback_at_most_three_frames},
+        {"apply_summary_once_a_second", apply_summary_once_a_second},
+        {"slow_pass_phases", slow_pass_phases},
+        {"slow_frame_anatomy", slow_frame_anatomy},
+        {"stack_paint_around_the_paths", stack_paint_around_the_paths},
         {"lock_discipline", lock_discipline},
         {"no_layer_no_pass", no_layer_no_pass},
         {"a_cleared_table_can_be_freed", a_cleared_table_can_be_freed},
@@ -10830,6 +11288,10 @@ int main(int argc, char **argv) {
             free(lvgl_log.taken);
             free(esp_log_text.data);
             free(esp_log_text.taken);
+#if CONFIG_MUSE_BENCH
+            free(stack_log.data);
+            free(stack_log.taken);
+#endif
             return failures != 0 ? 1 : 0;
         }
     }

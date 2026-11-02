@@ -1838,6 +1838,25 @@ void apps_lv_set_pairing_cb(void (*cb)(bool on)) {
     event("pairing cb %s", cb != NULL ? "set" : "NULL");
 }
 
+#if CONFIG_MUSE_BENCH
+/* The bench's apply summary (perf plan Task 2): muse_apps_ui_tick hands apps_lv the app task's calls ended, on the LVGL task, each
+ * frame; the app task's dump tells it how long it held the UI lock, before it lets go. */
+static atomic_uint bench_ticks, bench_calls_seen;
+
+void apps_lv_bench_tick(uint32_t calls) {
+    lvgl_only("apps_lv_bench_tick");
+    atomic_store(&bench_calls_seen, calls);
+    atomic_fetch_add(&bench_ticks, 1);
+}
+
+void apps_lv_bench_dump_hold(uint32_t us) {
+    if (app_task_of_thread() == NULL || !ui_held_by_me()) {
+        error("apps_lv_bench_dump_hold off the app task or without the UI lock");
+    }
+    event("dump hold %u", (unsigned)us);
+}
+#endif
+
 void apps_lv_set_ui(apps_ui_t *ui) {
     if (!ui_held_by_me()) {
         error("apps_lv_set_ui without the UI lock");
@@ -4465,6 +4484,33 @@ static void a_message_gets_its_reply(void) {
     WAIT(from, "print msg show");
     heap_caps_free(st);
 }
+
+#if CONFIG_MUSE_BENCH
+/* The bench's apply summary (perf plan Task 2): every call that ends counts once in what muse_apps_ui_tick hands apps_lv each frame,
+ * and the status's dump of the table, on the app task, says how long it held the UI lock. */
+static void bench_counts_calls_and_times_the_dump(void) {
+    char err[300];
+    CHECK(apps_task_run(make_pkg("msg", "Msg", MSG, 1), false, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT_FRAMES(2);
+    unsigned ticks = atomic_load(&bench_ticks), before = atomic_load(&bench_calls_seen);
+    CHECK(ticks > 0, "the tick hands the calls on each frame");
+    for (int k = 0; k < 3; k++) {
+        char *reply = apps_task_message("msg", "add", "{\"by\":1}", false, 0, err, sizeof err);
+        CHECK(reply != NULL, "add: %s", err);
+        apps_port_free(reply);
+    }
+    WAIT_FRAMES(2);
+    unsigned after = atomic_load(&bench_calls_seen);
+    CHECK(after - before == 3, "three calls ended: %u", after - before);
+    int from = mark();
+    clock_jump(1001);
+    FIFO_SYNC();
+    apps_status_t *st = new_status();
+    apps_task_status(st);
+    WAIT(from, "dump hold ");
+    heap_caps_free(st);
+}
+#endif
 
 /* apps_task_run_for_send (app.send's launch): by id and behind, and bound by what it is given. An app of that id that runs stays as it is
  * (its state is kept); a stopped one is started, behind; and a launch the app task doesn't answer within its bound fails with the wait's
@@ -8131,6 +8177,9 @@ int main(int argc, char **argv) {
         {"a_front_launch_hidden_before_its_show_is_behind", a_front_launch_hidden_before_its_show_is_behind},
         {"a_turn_brings_back_the_app_that_was_in_front", a_turn_brings_back_the_app_that_was_in_front},
         {"a_message_gets_its_reply", a_message_gets_its_reply},
+#if CONFIG_MUSE_BENCH
+        {"bench_counts_calls_and_times_the_dump", bench_counts_calls_and_times_the_dump},
+#endif
         {"run_for_send_is_by_id_behind_and_bounded", run_for_send_is_by_id_behind_and_bounded},
         {"a_message_after_its_caller_gave_up", a_message_after_its_caller_gave_up},
         {"io_runs_jobs_in_order", io_runs_jobs_in_order},

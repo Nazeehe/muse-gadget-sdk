@@ -59,6 +59,10 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
     endif()
     list(APPEND srcs "muse_chat_text.c")
+    if(CONFIG_MUSE_BENCH)
+        # The bench's stack paint, the drawing tasks' stacks for >mem and >memtest (muse_bench_mem.h).
+        list(APPEND srcs "muse_bench_mem.c")
+    endif()
     if(CONFIG_MUSE_CJK_FONT)
         list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback
     endif()
@@ -209,6 +213,12 @@ idf_component_register(
     REQUIRES esp_driver_gpio esp_driver_i2c
     PRIV_REQUIRES ${muse_priv_requires}
 )
+
+if(CONFIG_MUSE_BENCH)
+    # >memtest's esp_async_memcpy (muse_bench_mem.h). After the registration, where the Kconfig values are known, so a build
+    # without the bench is as it was; optional, since only a build with a DMA driver in it (esp_lcd's) has the component.
+    idf_component_optional_requires(PRIVATE esp_driver_dma)
+endif()
 
 if(CONFIG_MUSE_UI_FREEINK)
     # FreeInk's board profile, for the panel and its pins. PUBLIC: FreeInk's

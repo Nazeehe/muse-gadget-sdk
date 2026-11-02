@@ -33,6 +33,7 @@
 #endif
 
 #include "muse_battery.h"
+#include "muse_bench_mem.h"
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_chat.h"
@@ -872,8 +873,11 @@ static bool console_command(char *line, bool whole)
     /* Memory report for the bench, in bytes: internal RAM free, lowest ever and
      * largest block, DMA and PSRAM free (PSRAM's lowest ever too), and the unused
      * stack of the LVGL task and of this one (muse_serial, which runs every console
-     * command, the >app.* ones too), each -1 when no task has that name. Both are
-     * high-water marks: the least that was free since boot. The free figures are
+     * command, the >app.* ones too), each -1 when no task has that name, and of
+     * LVGL's two drawing tasks (swdraw, muse_bench_mem.h), each -1 when there is no
+     * such thread. All are high-water marks: the least that was free since boot.
+     * While a stack paint is open (an apply pass, a scroll's work) the LVGL task's
+     * can read high (muse_bench_mem.h). The free figures are
      * taken while this command's own SERIAL_LINE (1 KB) buffer is held, in PSRAM
      * (MUSE_BIG_CAPS) or, on a board without it, internal RAM: they are that much
      * lower than the heartbeat's, so don't compare the two. */
@@ -884,16 +888,44 @@ static bool console_command(char *line, bool whole)
             lvgl ? (int)(uxTaskGetStackHighWaterMark(lvgl) * sizeof(StackType_t)) : -1;
         int serial_stack_free =
             serial ? (int)(uxTaskGetStackHighWaterMark(serial) * sizeof(StackType_t)) : -1;
+        int swdraw_stack_free[2];
+        muse_bench_draw_stacks(swdraw_stack_free);
         printf("@mem {\"int_free\":%u,\"int_min\":%u,\"int_largest\":%u,\"dma_free\":%u,"
-               "\"psram_free\":%u,\"psram_min\":%u,\"lvgl_stack_free\":%d,\"serial_stack_free\":%d}\n",
+               "\"psram_free\":%u,\"psram_min\":%u,\"lvgl_stack_free\":%d,\"serial_stack_free\":%d,"
+               "\"swdraw_stack_free\":[%d,%d]}\n",
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), lvgl_stack_free,
-               serial_stack_free);
+               serial_stack_free, swdraw_stack_free[0], swdraw_stack_free[1]);
         fflush(stdout);
+        return true;
+    }
+    /* Frame mode's copy (perf plan Task 2): "frame copy off" sends the home slide's whole-screen refreshes as LVGL's bands, with
+     * no copy (they tear), and "frame copy on" puts the copy back (muse_board_t frame_copy). */
+    if (!strncmp(line, "frame", 5) && (line[5] == '\0' || line[5] == ' ')) {
+        bool on = !strcmp(line, "frame copy on"), off = !strcmp(line, "frame copy off");
+        if ((on || off) && muse_board->frame_copy) {
+            muse_board->frame_copy(on);
+            printf("@frame copy %s\n", on ? "on" : "off");
+        } else if (on || off) {
+            printf("@frame.error this build has no frame mode\n");
+        } else {
+            printf("@frame.error usage: frame copy on|off\n");
+        }
+        fflush(stdout);
+        return true;
+    }
+    /* A CPU copy and a DMA copy in PSRAM, timed (muse_bench_mem.h): one "memtest: ..." line. */
+    if (!strncmp(line, "memtest", 7) && (line[7] == '\0' || line[7] == ' ')) {
+        if (line[7] == '\0') {
+            muse_bench_memtest();
+        } else {
+            printf("@memtest.error usage: memtest\n");
+            fflush(stdout);
+        }
         return true;
     }
     /* The touch page ("ui=settings", "ui=face", "ui=clock") and a display-only demo name, for screenshots. */
@@ -988,9 +1020,10 @@ static bool console_command(char *line, bool whole)
  * "power.reset" starts it over, "nap" sleeps and leaves Wi-Fi at once (as
  * two minutes asleep on battery would; 'w' rejoins), "face=" shows a face
  * (see set_face), and "chat=" sends a typed message to Hatch (see chat_line
- * and tools/muse/chat.py). A bench build (CONFIG_MUSE_BENCH) adds "mem", "ui="
- * and the touch commands "tap", "longpress", "swipe" and "drag", which
- * tools/muse/snap.py sends before it takes a screenshot.
+ * and tools/muse/chat.py). A bench build (CONFIG_MUSE_BENCH) adds "mem", "ui=",
+ * the touch commands "tap", "longpress", "swipe" and "drag", which
+ * tools/muse/snap.py sends before it takes a screenshot, and "frame copy on|off"
+ * and "memtest".
  */
 static void serial_task(void *arg)
 {

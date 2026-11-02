@@ -1051,6 +1051,60 @@ class GuideAndSkill(unittest.TestCase):
                 self.assertIn(phrase, bench)
         self.assertEqual(window // 1000000, 1, "\"a second\"")
 
+    def test_agents_md_has_the_apply_instruments(self):
+        # Task 2 of the perf plan: the bench's apply summary, the slow pass's phases, the slow frame, the stack paint, and the console's
+        # >mem field, >frame copy and >memtest. D12: the lines as apps_lv.c and muse_bench_mem.c print them, and every number beside
+        # them (the skips in a row, the lock's wait, the slow pass, the slow frame, the margin, the fill, the copies' sizes) the code's.
+        lv = re.sub(r'"\s*\n\s*"', "", strip_c_comments((APPS / "apps_lv.c").read_text()))
+        mem_c = (MUSE / "muse_bench_mem.c").read_text()
+        mem_h = (MUSE / "muse_bench_mem.h").read_text()
+        number = lambda text, name: int(re.search(rf"(?m)^#define {name} (0x[0-9A-Fa-f]+|\d+)", text).group(1), 0)
+        skips, lock_ms, slow_us = (number(lv, n) for n in ("MAX_CALLBACK_SKIPS", "LOCK_MS", "SLOW_US"))
+        slow_frame, second = number(lv, "SLOW_FRAME_MS"), number(lv, "BENCH_SECOND_US")
+        margin, fill = number(mem_h, "MUSE_STACK_MARGIN"), number(mem_h, "MUSE_STACK_FILL")
+        cpu, dma = number(mem_h, "MUSE_MEMTEST_BYTES"), number(mem_h, "MUSE_MEMTEST_DMA_BYTES")
+        self.assertEqual((skips, lock_ms, slow_us, slow_frame, second, margin, fill), (3, 2, 2000, 50, 1000000, 256, 0xA5))
+        self.assertIn('static const char *TAG = "muse_apps";', lv)
+        self.assertIn('"apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u stack_peak=%s:%d"', lv)
+        self.assertIn('"apply %u us (%u slow since last) visits=%u layout=%u writeback=%u creates=%u texts=%u styles=%u"', lv)
+        self.assertIn('"slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u"', lv)
+        self.assertIn('printf("memtest: memcpy psram %u B %lld us; %s\\n"', mem_c)
+        self.assertIn('"async_memcpy %u B %lld us"', mem_c)
+        ui = (MUSE / "muse_ui.c").read_text()
+        snapshot = (APPS / "apps_snapshot.c").read_text()
+        for path, source in (("apply", lv), ("carousel", lv), ("slide", ui), ("snapshot", snapshot)):
+            self.assertIn(f'muse_stack_note("{path}");', source)
+        agents = (ROOT / "AGENTS.md").read_text()
+        bench = " ".join(agents[:agents.index("\n## Muse apps\n")].split())
+        for phrase in (
+                "With the apps, a bench build also measures the apply step and the frames under an app (`apps_lv.c`, the `muse_apps` "
+                "tag).",
+                "Once a second while an app is in front with no launcher or card over it, `frame_tick` has it print `apply: calls=<n> "
+                "applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us> "
+                "stack_peak=<path>:<bytes>`:",
+                f"the frames skipped while the app was in a call (at most {skips} in a row) and for a UI lock not free within "
+                f"{lock_ms} ms,",
+                "the most time between the ends of two passes that changed something,",
+                "the longest the app task's dump of its table (`>app.status`) held the UI lock,",
+                "and the deepest stack path so far with the bytes it left free (`none:-1` before one is found).",
+                f"The slow pass's line (a pass over {slow_us} us, at most one line a second) adds `visits=<us> layout=<us> "
+                "writeback=<us> creates=<n> texts=<n> styles=<n>` for the longest pass since the last line.",
+                f"A refresh over {slow_frame} ms with an app in front, timed from the refresh before it (which must have had the app in "
+                "front too), prints `slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us>` from "
+                "`LV_EVENT_REFR_READY`:",
+                "A refresh after a rest counts too: its gap is the rest.",
+                "The stack paths are the apply pass, the home pages' slide (`LV_EVENT_SCROLL_BEGIN`), the launcher carousel's scroll "
+                "and app.control's snapshot (`muse_bench_mem.c`):",
+                f"the LVGL task's stack is filled with 0x{fill:X} from its start up to {margin} B under the stack pointer,",
+                "`>mem` adds `swdraw_stack_free`, the high-water marks of LVGL's two drawing tasks.",
+                "`>frame copy off` sends the home slide's whole-screen refreshes as bands, with no copy (they tear), and `>frame copy "
+                "on` puts the copy back.",
+                f"`>memtest` times a {cpu} B memcpy within PSRAM and a {dma} B `esp_async_memcpy` (GDMA): `memtest: memcpy psram "
+                f"{cpu} B <us> us; async_memcpy {dma} B <us> us`, or the reason the second was skipped."):
+            with self.subTest(phrase[:50]):
+                self.assertIn(phrase, bench)
+        self.assertEqual(second // 1000000, 1, "\"once a second\"")
+
     def test_guide_icon_numbers_are_the_headers(self):
         # D12: the icon's size limit is APPS_ICON_MAX_PX, and its largest file is the LVGL header and that square of RGB565A8. The size
         # the guide recommends is the launcher's centre, APPS_LV_ICON_PX (launcher carousel Task 6: 160, up from 120, which the centre

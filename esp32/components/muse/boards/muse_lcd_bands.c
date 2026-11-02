@@ -183,6 +183,7 @@ static struct {
 #if CONFIG_MUSE_BENCH
 /* LVGL's drawing of the refresh under way (on the LVGL task): its start, and the time it has waited for the wire. */
 static int64_t s_render_t0, s_render_waited, s_wait_t0;
+static EXT_RAM_BSS_ATTR bool s_copy_off;   /* the bench's '>frame copy off': frame mode's refreshes go as bands (set_frame_copy) */
 /* The bench's line every FRAME_BATCH refreshes: each figure's sum and most. */
 #define FRAME_BATCH 30
 static struct {
@@ -361,6 +362,9 @@ static void on_render_event(lv_event_t *e)
                                             s_disp->buf_act->data_size)
                             : 0;
         s_framed = s_framing && refresh_whole(s_disp->inv_areas, s_disp->inv_area_joined, (int)s_disp->inv_p, s_cols, s_rows);
+#if CONFIG_MUSE_BENCH
+        s_framed = s_framed && !s_copy_off;
+#endif
         s_whole.at = 0;
         s_flushed = 0;
 #if CONFIG_MUSE_BENCH
@@ -1250,6 +1254,13 @@ void muse_lcd_bands_set_frame_mode(bool on)
     }
     s_framing = on && s_whole.px;
 }
+
+#if CONFIG_MUSE_BENCH
+void muse_lcd_bands_set_frame_copy(bool on)
+{
+    s_copy_off = !on;
+}
+#endif
 
 /* On the send task, at the top of its loop (its shallowest frame): what muse_lcd_bands_set_frame_mode noted of the frame, each once.
  * Each flag is set once by the LVGL task and cleared here only after it was seen set, so neither line is lost. */

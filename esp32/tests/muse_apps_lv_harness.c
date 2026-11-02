@@ -10293,6 +10293,125 @@ static void scroll_frame_log(void) {
     FINISH(&e);
 }
 
+/* The SCROLL_END callbacks on an object, the scroll frame log's (ruling R5f). */
+static int scroll_end_cbs(int id) {
+    const lv_obj_t *o = fake_obj(id);
+    int n = 0;
+    for (int i = 0; i < o->n_cbs; i++) {
+        n += o->cbs[i].filter == LV_EVENT_SCROLL_END;
+    }
+    return n;
+}
+
+/* A step of LVGL's timers 16 ms on, and a refresh only when it moved the list: LVGL refreshes the display only after something was
+ * invalidated (lv_display_refr_timer pauses itself, and an invalidation starts it again), so a step that moves nothing gets none.
+ * Whether it refreshed. */
+static bool step_and_refresh_if_moved(int list) {
+    int32_t before = fake_obj(list)->scroll_y;
+    fake_frame(16);
+    clock_us += 16000;
+    if (fake_obj(list)->scroll_y == before) {
+        return false;
+    }
+    fake_refresh();
+    return true;
+}
+
+/* Ruling R5f: a throw that stops short of the list's ends ends at an input read that moves nothing (lv_indev_scroll_throw_handler's
+ * 0 px step), so no refresh sees it end; LVGL sends SCROLL_END there, and that is what ends the timing. After a rest with no refresh
+ * at all, the next drag's first refresh isn't timed. A throw that reaches an end springs back in an animation that starts as the
+ * throw ends, before its SCROLL_END: the spring-back's first refresh isn't timed (the one line this costs), the rest are, and its own
+ * end is seen. Each box has one SCROLL_END callback in a bench build, however often its scroll changes, and none in any other. */
+static void a_throw_that_ends_unseen_times_no_rest(void) {
+    env_t e;
+    list_scene(&e, 10, true);  /* 500 px of rows in 200: it scrolls up to 300 */
+    int list = BOX_OBJ(0);
+    RUN(&e, "list:set{scroll = 'none'}");
+    CHECK(APPLY(&e), "no scroll");
+    RUN(&e, "list:set{scroll = 'y'}");
+    CHECK(APPLY(&e), "scroll again");
+    CHECK(scroll_end_cbs(list) == (FRAMES_LOGGED ? 1 : 0) && scroll_end_cbs(BOX_OBJ(1)) == (FRAMES_LOGGED ? 1 : 0),
+          "SCROLL_END callbacks: the list %d, a row %d", scroll_end_cbs(list), scroll_end_cbs(BOX_OBJ(1)));
+    int ms[64];
+
+    /* A drag and its throw, which stops in the list's middle. */
+    esp_clear();
+    fake_down(233, 200);
+    fake_move(233, 188);
+    refresh_after(15000);
+    for (int i = 1; i <= 4; i++) {
+        fake_move(233, 188 - 8 * i);
+        refresh_after(16000);
+    }
+    fake_lift();
+    int frames = 0;
+    for (; frames < 100 && fake_scrolling(list); frames++) {
+        step_and_refresh_if_moved(list);
+    }
+    int32_t y = fake_obj(list)->scroll_y;
+    CHECK(!fake_scrolling(list) && y > 0 && y < 300, "the throw ended in the middle: at %d after %d steps", (int)y, frames);
+    int n = SCROLL_LINES(ms, 64);
+    if (FRAMES_LOGGED) {
+        CHECK(n == 4 + frames - 1, "the drag's 4 and the throw's moving steps: %d lines, %d steps\n%s", n, frames, esp_peek());
+        for (int i = 0; i < n && i < 64; i++) {
+            CHECK(ms[i] == 16, "frame %d: %d ms", i, ms[i]);
+        }
+    } else {
+        CHECK(n == 0, "no scroll frame line without the bench:\n%s", esp_peek());
+    }
+
+    /* 800 ms with no refresh, then a drag: its first refresh isn't a frame of 800 ms. */
+    esp_clear();
+    clock_us += 800000;
+    fake_down(233, 200);
+    fake_move(233, 188);
+    refresh_after(16000);
+    fake_move(233, 180);
+    refresh_after(20000);
+    n = SCROLL_LINES(ms, 64);
+    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || ms[0] == 20), "the next drag: %d lines, the first %d ms\n%s", n,
+          n > 0 ? ms[0] : -1, esp_peek());
+    fake_lift();
+    SETTLE();
+
+    /* Past the end with the finger stopped, then the lift: the throw has nothing to throw and springs back at once. */
+    RUN(&e, "list:scroll_to('end')");
+    CHECK(APPLY(&e), "to the end");
+    esp_clear();
+    fake_down(233, 300);
+    fake_move(233, 288);
+    refresh_after(16000);
+    for (int i = 1; i <= 3; i++) {
+        fake_move(233, 288 - 12 * i);
+        refresh_after(16000);
+    }
+    fake_move(233, 252);  /* still: a read that moves nothing */
+    CHECK(fake_obj(list)->scroll_y > 300, "pulled past the end: %d", (int)fake_obj(list)->scroll_y);
+    fake_lift();
+    int spring = 0, moving = 0;  /* the spring-back's steps, and its refreshes that found it moving */
+    for (; spring < 100 && fake_scrolling(list); spring++) {
+        if (step_and_refresh_if_moved(list) && fake_scrolling(list)) {
+            moving++;
+        }
+    }
+    CHECK(!fake_scrolling(list) && fake_obj(list)->scroll_y == 300 && moving >= 5, "sprang back to %d: %d steps, %d refreshes moving",
+          (int)fake_obj(list)->scroll_y, spring, moving);
+    n = SCROLL_LINES(ms, 64);
+    if (FRAMES_LOGGED) {
+        /* The drag's first refresh follows the throw's unseen end (the SETTLE above) and isn't timed, and nor is the spring-back's
+         * first: the throw's SCROLL_END came as it started. Every other refresh that found it moving is, at 16 ms or, after a step of
+         * the ease-out that moved nothing and so had no refresh, a multiple of it. */
+        CHECK(n == 3 + moving - 1, "the drag's 3, then the spring-back's moving refreshes but its first: %d lines, %d moving\n%s", n,
+              moving, esp_peek());
+        for (int i = 0; i < n && i < 64; i++) {
+            CHECK(ms[i] % 16 == 0 && ms[i] <= 64, "frame %d: %d ms", i, ms[i]);
+        }
+    } else {
+        CHECK(n == 0, "no scroll frame line without the bench:\n%s", esp_peek());
+    }
+    FINISH(&e);
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -10426,6 +10545,7 @@ int main(int argc, char **argv) {
         {"layout_none_undoes_the_column", layout_none_undoes_the_column},
         {"children_of_a_scroll_box_get_no_overflow_warning", children_of_a_scroll_box_get_no_overflow_warning},
         {"scroll_frame_log", scroll_frame_log},
+        {"a_throw_that_ends_unseen_times_no_rest", a_throw_that_ends_unseen_times_no_rest},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

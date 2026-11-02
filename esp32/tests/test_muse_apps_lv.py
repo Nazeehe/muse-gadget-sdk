@@ -468,14 +468,17 @@ class HarnessTest(unittest.TestCase):
         pairing_end = source.index(watch_spin) + len(watch_spin)
         self.assertIn("s_pairing_cb != NULL && screen != NULL ? lv_obj_get_display(screen) : NULL", watch_spin)
         mentions = [m.start() for m in re.finditer(r"on_refresh|watch_frames|s_frames|launcher frame|spin frame|scroll frame|"
-                                                   r"scroll_box_scrolling|LV_EVENT_REFR_READY|lv_display_add_event_cb|"
-                                                   r"lv_obj_get_display", source)
+                                                   r"scroll_box_scrolling|watch_scroll_end|on_scroll_end|LV_EVENT_SCROLL_END|"
+                                                   r"LV_EVENT_REFR_READY|lv_display_add_event_cb|lv_obj_get_display", source)
                     if not pairing_start <= m.start() < pairing_end]
         self.assertGreaterEqual(len(mentions), 10)
         self.assertIn("spin frame", " ".join(source[i:i + 12] for i in mentions))
         # Games Task 5: the list's line and the walk that finds a scroll box scrolling are the bench's too.
         self.assertIn('ESP_LOGI(TAG, "scroll frame %d ms"', source)
         self.assertIn("scroll_box_scrolling", " ".join(source[i:i + 20] for i in mentions))
+        # R5f: the SCROLL_END callback that ends a list's timing, and its registration on every box, are the bench's too.
+        self.assertIn("watch_scroll_end", " ".join(source[i:i + 20] for i in mentions))
+        self.assertIn("lv_obj_add_event_cb(obj, on_scroll_end, LV_EVENT_SCROLL_END, NULL);", source)
         for index in mentions:
             with self.subTest(source[source.rindex("\n", 0, index) + 1:source.index("\n", index)].strip()):
                 self.assertEqual(open_conditions(source, index), ["if CONFIG_MUSE_BENCH"])
@@ -571,6 +574,9 @@ class HarnessTest(unittest.TestCase):
 
     def test_a_build_without_the_bench_logs_no_scroll_frames(self):  # games Task 5: nothing on the display, whatever scrolls
         self.run_case("scroll_frame_log")
+
+    def test_a_build_without_the_bench_adds_no_scroll_end_callback(self):  # R5f: no SCROLL_END callback, no line, whatever ends
+        self.run_case("a_throw_that_ends_unseen_times_no_rest")
 
     def test_spin_is_on_the_lvgl_task_only(self):
         # The animation is the apply step's: every lv_anim_ call of the apps' sources is apps_lv.c's, in apply_turn or start_spin,
@@ -675,6 +681,9 @@ class BenchHarnessTest(unittest.TestCase):
 
     def test_a_scroll_box_logs_its_frames_while_it_scrolls(self):  # games Task 5: "scroll frame <ms> ms", only while an app's list moves
         self.run_case("scroll_frame_log")
+
+    def test_a_throw_that_ends_unseen_times_no_rest(self):  # R5f: SCROLL_END ends the timing; the next drag's first refresh isn't timed
+        self.run_case("a_throw_that_ends_unseen_times_no_rest")
 
 
 # ---- The fakes against the real headers ----

@@ -129,6 +129,7 @@ static lv_display_t *s_pairing_display;
 static void watch_spin(lv_obj_t *screen);
 #if CONFIG_MUSE_BENCH
 static void watch_frames(lv_obj_t *screen);
+static void watch_scroll_end(lv_obj_t *obj);
 #endif
 
 /* One pass: what it works on and what it found. */
@@ -390,6 +391,11 @@ static lv_obj_t *new_object(uint8_t kind, lv_obj_t *parent, lv_obj_t **label) {
     lv_obj_remove_style_all(obj);
     lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+#if CONFIG_MUSE_BENCH
+    if (kind == APPS_W_BOX) {
+        watch_scroll_end(obj);  /* once for the object, whatever its scroll is set to later */
+    }
+#endif
     if (kind == APPS_W_IMAGE) {
         /* In a box that is not its size an image is centred, and a scale is drawn about its middle: so a box of the
          * scaled size is exactly filled (apply_geom). That is LVGL's default for an image, said here because the
@@ -1697,7 +1703,12 @@ static void watch_spin(lv_obj_t *screen) {
  * - The spin's (connected apps Task 1): while an image spins on the layer in front, with no card over it, each refresh logs
  *   "spin frame <ms> ms" the same way. Behind, under a card or with no image spinning, nothing is.
  * - A list's (games Task 5): while an app's box with scroll = "y" scrolls on the layer in front (a drag, its throw, an elastic end,
- *   an animated scroll_to), with no launcher or card over it, each refresh logs "scroll frame <ms> ms" the same way.
+ *   an animated scroll_to), with no launcher or card over it, each refresh logs "scroll frame <ms> ms" the same way. Its scroll can
+ *   also end with no refresh to see it (R5f): a throw that stops short of the ends stops at an input read that moves nothing, so
+ *   nothing is invalidated and LVGL draws nothing more. So a box's LV_EVENT_SCROLL_END (the throw's end, in
+ *   lv_indev_scroll_throw_handler, and any scroll animation's, completed or deleted) ends the timing too: the refresh after it isn't
+ *   timed. A scroll that goes on past one costs that refresh's line: the spring-back from an elastic end, which starts just before the
+ *   throw's SCROLL_END, a scroll_to that replaces a running one, a press that catches the list moving.
  * One test each refresh, and a line only while something moves. */
 static EXT_RAM_BSS_ATTR struct {
     lv_display_t *display;  /* the display on_refresh is on: once, however often the layer is built */
@@ -1705,6 +1716,17 @@ static EXT_RAM_BSS_ATTR struct {
     int64_t spin_last_us;   /* the same for an image spinning in front */
     int64_t scroll_last_us; /* and for an app's scroll box scrolling in front */
 } s_frames;
+
+/* LV_EVENT_SCROLL_END on an app's box: its scroll ended, seen by a refresh or not. */
+static void on_scroll_end(lv_event_t *e) {
+    (void)e;
+    s_frames.scroll_last_us = 0;
+}
+
+/* Every box gets the callback as it is made, so one that turns scroll off and on doesn't collect more. */
+static void watch_scroll_end(lv_obj_t *obj) {
+    lv_obj_add_event_cb(obj, on_scroll_end, LV_EVENT_SCROLL_END, NULL);
+}
 
 /* An app's box with scroll = "y" scrolls on the layer in front, with no launcher or card over it (spin_in_front's test of what
  * covers it). The records' walk, as spinner_in_front's: what style_box applied, read on the LVGL task with no UI lock. */

@@ -24,11 +24,12 @@ Bench touch boards use '>ui=settings' / '>ui=face' / '>ui=clock' to select the t
 A bench build also injects touch through LVGL's input, as a finger would arrive:
 '>tap X Y' presses that point for 80 ms, '>longpress X Y' for 900 ms (LVGL's long press
 is 400 ms), '>swipe left' / '>swipe right' drags across the screen along y=233 in
-about 240 ms (a left swipe starts at the right), and '>swipe up' drags 200 px up from 8 px
-above the bottom, at the middle, in as long. The screen is woken with 'w' first, since
-LVGL doesn't read its input while it sleeps on battery, and the picture is taken once the
-script has run and 0.6 s more have passed. --settle S sets that wait, in seconds, for any
-command (the others take 0.35 s).
+about 240 ms (a left swipe starts at the right), '>swipe up' drags 200 px up from 8 px
+above the bottom, at the middle, in as long, and '>drag X1 Y1 X2 Y2 MS' presses at
+(X1,Y1), moves straight to (X2,Y2) over MS ms (50 to 2000) and lets go. The screen is
+woken with 'w' first, since LVGL doesn't read its input while it sleeps on battery, and
+the picture is taken once the script has run and 0.6 s more have passed. --settle S sets
+that wait, in seconds, for any command (the others take 0.35 s).
 Screenshots are off by default; build and flash with MUSE_BENCH=1 tools/muse/board.sh.
 Each one ends with a CRC-32 of its pixels, and a capture that doesn't match is retaken
 (three tries). The firmware holds the console while it streams one over USB, so what the log
@@ -58,7 +59,7 @@ CRC_MISMATCH = 'crc mismatch'
 CUT_SHORT = 'snapshot cut short'
 DAMAGED = 'the screenshot arrived damaged'   # its END came, and no BEGIN a screen can be read from
 AFTER_TOUCH = 0.6   # seconds after a touch script has run, before the picture
-TOUCH_MS = {'tap': 80, 'longpress': 900, 'swipe': 240}   # how long each script runs (muse_ui.c)
+TOUCH_MS = {'tap': 80, 'longpress': 900, 'swipe': 240}   # how long each script runs (muse_ui.c); a drag runs its MS
 DEFAULT_PER_LINE = 144    # bytes per base64 line; older firmware doesn't say
 STALE_MAX = 64      # a USB packet left in the FIFO while no program had the port open
 MAX_SIDE = 4096
@@ -91,9 +92,17 @@ DEFAULT_SETTLE = _Pace(PACE)
 
 
 def touch_command(keys):
-    """The touch command that `keys` ends with ('tap', 'longpress' or 'swipe'), else None."""
+    """The touch command that `keys` ends with ('tap', 'longpress', 'swipe' or 'drag'), else None."""
     command = keys.partition('>')[2].split(None, 1)
-    return command[0] if command and command[0] in TOUCH_MS else None
+    return command[0] if command and (command[0] in TOUCH_MS or command[0] == 'drag') else None
+
+
+def touch_ms(keys, touch):
+    """How long the touch script runs, in ms: TOUCH_MS's, or a drag's own MS (0 for a drag the firmware refuses)."""
+    if touch != 'drag':
+        return TOUCH_MS[touch]
+    fields = keys.partition('>')[2].split()
+    return int(fields[5]) if len(fields) == 6 and fields[5].isdigit() else 0
 
 
 def prepare(keys, settle=None):
@@ -107,7 +116,7 @@ def prepare(keys, settle=None):
     if touch:
         plain, sep, line = keys.partition('>')
         keys = plain + ('' if plain.endswith('w') else 'w') + sep + line
-    wait = TOUCH_MS[touch] / 1000 + AFTER_TOUCH if touch else PACE
+    wait = touch_ms(keys, touch) / 1000 + AFTER_TOUCH if touch else PACE
     return keys, wait if settle is None else settle
 
 

@@ -908,14 +908,28 @@ static bool console_command(char *line, bool whole)
         return true;
     }
     /* Touch, played through LVGL's input (muse_ui.h): "tap X Y" presses that point for 80 ms, "longpress X Y" for
-     * 900 ms, "swipe left" / "swipe right" drags across the screen in about 240 ms, and "swipe up" drags up from the
-     * bottom edge in as long. Wake the screen first ('w'). Nothing is printed unless the line is wrong. */
+     * 900 ms, "swipe left" / "swipe right" drags across the screen in about 240 ms, "swipe up" drags up from the
+     * bottom edge in as long, and "drag X1 Y1 X2 Y2 MS" presses at the first point, moves straight to the second over
+     * MS ms (MUSE_UI_DRAG_MS_MIN to _MAX) and lets go. Wake the screen first ('w'). Nothing is printed unless the line
+     * is wrong. */
     bool tap = !strncmp(line, "tap ", 4), hold = !strncmp(line, "longpress ", 10), swipe = !strncmp(line, "swipe ", 6);
-    if (tap || hold || swipe) {
+    bool drag = !strncmp(line, "drag ", 5);
+    if (tap || hold || swipe || drag) {
         muse_ui_touch_t kind = tap ? MUSE_UI_TOUCH_TAP : MUSE_UI_TOUCH_LONG;
-        long x = 0, y = 0;
+        long x = 0, y = 0, to[3] = {0};   /* a drag's second point and its ms */
         bool ok;
-        if (swipe) {
+        if (drag) {
+            char *end = line + 4;
+            long *field[5] = {&x, &y, &to[0], &to[1], &to[2]};
+            ok = true;
+            for (int i = 0; i < 5 && ok; i++) {
+                ok = *end == ' ';
+                *field[i] = ok ? strtol(end, &end, 10) : -1;
+            }
+            ok = ok && !*end && x >= 0 && y >= 0 && to[0] >= 0 && to[1] >= 0 && x < muse_board->width &&
+                 to[0] < muse_board->width && y < muse_board->height && to[1] < muse_board->height &&
+                 to[2] >= MUSE_UI_DRAG_MS_MIN && to[2] <= MUSE_UI_DRAG_MS_MAX;
+        } else if (swipe) {
             bool left = !strcmp(line + 6, "left"), up = !strcmp(line + 6, "up");
             kind = left ? MUSE_UI_TOUCH_SWIPE_LEFT : up ? MUSE_UI_TOUCH_SWIPE_UP : MUSE_UI_TOUCH_SWIPE_RIGHT;
             ok = left || up || !strcmp(line + 6, "right");
@@ -925,10 +939,13 @@ static bool console_command(char *line, bool whole)
             y = *end == ' ' ? strtol(end, &end, 10) : -1;
             ok = !*end && x >= 0 && y >= 0 && x < muse_board->width && y < muse_board->height;
         }
-        if (ok) {
+        if (ok && drag) {
+            muse_ui_bench_drag((int)x, (int)y, (int)to[0], (int)to[1], (int)to[2]);
+        } else if (ok) {
             muse_ui_bench_touch(kind, (int)x, (int)y);
         } else {
-            printf("@touch.error usage: tap X Y | longpress X Y (X 0..%d, Y 0..%d) | swipe left|right|up\n",
+            printf("@touch.error usage: tap X Y | longpress X Y (X 0..%d, Y 0..%d) | swipe left|right|up"
+                   " | drag X1 Y1 X2 Y2 MS\n",
                    muse_board->width - 1, muse_board->height - 1);
             fflush(stdout);
         }
@@ -972,8 +989,8 @@ static bool console_command(char *line, bool whole)
  * two minutes asleep on battery would; 'w' rejoins), "face=" shows a face
  * (see set_face), and "chat=" sends a typed message to Hatch (see chat_line
  * and tools/muse/chat.py). A bench build (CONFIG_MUSE_BENCH) adds "mem", "ui="
- * and the touch commands "tap", "longpress" and "swipe", which tools/muse/snap.py
- * sends before it takes a screenshot.
+ * and the touch commands "tap", "longpress", "swipe" and "drag", which
+ * tools/muse/snap.py sends before it takes a screenshot.
  */
 static void serial_task(void *arg)
 {

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The bench's console commands (>mem, >ui=, >tap, >longpress, >swipe), the touch scripts played through LVGL's
+"""The bench's console commands (>mem, >ui=, >tap, >longpress, >swipe, >drag), the touch scripts played through LVGL's
 read callback, the screenshot stream's CRC and tools/muse/snap.py, and the size of link.register in the log."""
 
 import base64
@@ -249,13 +249,14 @@ class MuseBenchTest(unittest.TestCase):
     # ---- Task 14: the bench commands sit on their own option ----
 
     def test_bench_commands_gated_by_bench(self):
-        # E19: mem, ui.demo, ui=, tap, longpress and swipe are one #if CONFIG_MUSE_BENCH block of console_command, with
-        # no nested #if, and nothing about them depends on LVGL's snapshot option.
+        # E19: mem, ui.demo, ui=, tap, longpress, swipe and drag are one #if CONFIG_MUSE_BENCH block of console_command,
+        # with no nested #if, and nothing about them depends on LVGL's snapshot option.
         source = (MUSE / "muse_input.c").read_text()
         self.assertEqual(source.count("#if CONFIG_MUSE_BENCH"), 1)
         command = c_function(source, "static bool console_command(char *line, bool whole)")
         base = source.index(command)
-        for text in ('"mem"', '"ui.demo=1"', '"ui=settings"', '"ui=clock"', '"tap "', '"longpress "', '"swipe "'):
+        for text in ('"mem"', '"ui.demo=1"', '"ui=settings"', '"ui=clock"', '"tap "', '"longpress "', '"swipe "',
+                     '"drag "'):
             with self.subTest(text):
                 self.assertIn(text, command)
                 self.assertEqual(open_conditions(source, base + command.index(text)), ["if CONFIG_MUSE_BENCH"])
@@ -265,15 +266,16 @@ class MuseBenchTest(unittest.TestCase):
     def test_page_demo_and_touch_api_sit_on_the_bench_option(self):
         header = (MUSE / "muse_ui.h").read_text()
         for text in ("muse_ui_page_t;", "void muse_ui_bench_page(", "void muse_ui_bench_demo(", "muse_ui_touch_t;",
-                     "void muse_ui_bench_touch("):
+                     "void muse_ui_bench_touch(", "void muse_ui_bench_drag(", "MUSE_UI_DRAG_MS_MIN", "MUSE_UI_DRAG_MS_MAX"):
             with self.subTest(text):
                 self.assertEqual(open_conditions(header, header.index(text)), ["if CONFIG_MUSE_BENCH"])
         self.assertRegex(header, r"MUSE_UI_TOUCH_TAP,\s*MUSE_UI_TOUCH_LONG,\s*MUSE_UI_TOUCH_SWIPE_LEFT,\s*"
-                                 r"MUSE_UI_TOUCH_SWIPE_RIGHT,\s*MUSE_UI_TOUCH_SWIPE_UP,")
+                                 r"MUSE_UI_TOUCH_SWIPE_RIGHT,\s*MUSE_UI_TOUCH_SWIPE_UP,\s*(?:/\*.*?\*/\s*)?MUSE_UI_TOUCH_DRAG,")
         # Streaming a screenshot is not a bench option's: it stays declared for every build.
         self.assertEqual(open_conditions(header, header.index("void muse_ui_request_snapshot(void)")), [])
         ui = (MUSE / "muse_ui.c").read_text()
-        for text in ("void muse_ui_bench_page(", "void muse_ui_bench_demo(", "void muse_ui_bench_touch("):
+        for text in ("void muse_ui_bench_page(", "void muse_ui_bench_demo(", "void muse_ui_bench_touch(",
+                     "void muse_ui_bench_drag("):
             with self.subTest(text):
                 self.assertEqual(open_conditions(ui, ui.index(text)), ["if CONFIG_MUSE_BENCH"])
         uses = [m.start() for m in re.finditer(r"s_bench_(?:demo|page)", ui)]
@@ -287,8 +289,9 @@ class MuseBenchTest(unittest.TestCase):
         # wrapper goes in after the display exists, under the display lock muse_ui_start() already holds.
         ui = (MUSE / "muse_ui.c").read_text()
         mentions = [m.start() for m in re.finditer(r"bench_touch_install|bench_read|s_real_read|s_touch\b|"
-                                                   r"s_touch_request|BENCH_[A-Z_]+|muse_ui_bench_touch", ui)]
-        self.assertGreaterEqual(len(mentions), 20)
+                                                   r"s_touch_request|BENCH_[A-Z_]+|muse_ui_bench_touch|"
+                                                   r"muse_ui_bench_drag|s_drag_(?:end|ms)|MUSE_UI_DRAG_MS_\w+", ui)]
+        self.assertGreaterEqual(len(mentions), 26)
         for index in mentions:
             with self.subTest(ui[ui.rindex("\n", 0, index) + 1:ui.index("\n", index)].strip()):
                 self.assertEqual(open_conditions(ui, index), ["if CONFIG_MUSE_BENCH"])
@@ -301,7 +304,7 @@ class MuseBenchTest(unittest.TestCase):
         # FreeInk boards have no LVGL touch screen but link the same console: with the option on they get no-ops.
         eink = (MUSE / "eink/muse_eink_ui.cpp").read_text()
         for text in ('extern "C" void muse_ui_bench_page(', 'extern "C" void muse_ui_bench_demo(',
-                     'extern "C" void muse_ui_bench_touch('):
+                     'extern "C" void muse_ui_bench_touch(', 'extern "C" void muse_ui_bench_drag('):
             with self.subTest(text):
                 self.assertEqual(open_conditions(eink, eink.index(text)), ["if CONFIG_MUSE_BENCH"])
         # They are the header's declarations' twins. Compiled as C against muse_ui.h, a signature that drifts from
@@ -316,6 +319,7 @@ int main(void)
     muse_ui_bench_page(MUSE_UI_PAGE_CLOCK);
     muse_ui_bench_demo(true);
     muse_ui_bench_touch(MUSE_UI_TOUCH_SWIPE_LEFT, 1, 2);
+    muse_ui_bench_drag(1, 2, 3, 4, 100);
     return 0;
 }
 """
@@ -353,6 +357,7 @@ static const struct { int width, height; } board = { 466, 466 };
 void muse_ui_bench_page(muse_ui_page_t page) { printf("page %d\n", (int)page); }
 void muse_ui_bench_demo(bool enabled) { printf("demo %d\n", enabled); }
 void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y) { printf("touch %d %d %d\n", (int)kind, x, y); }
+void muse_ui_bench_drag(int x1, int y1, int x2, int y2, int ms) { printf("drag %d %d %d %d %d\n", x1, y1, x2, y2, ms); }
 
 static bool bench_commands(char *line)
 {
@@ -376,7 +381,7 @@ int main(void)
         return done.stdout.splitlines()
 
     def test_touch_and_page_commands_parse_and_validate(self):
-        usage = "@touch.error usage: tap X Y | longpress X Y (X 0..465, Y 0..465) | swipe left|right|up"
+        usage = "@touch.error usage: tap X Y | longpress X Y (X 0..465, Y 0..465) | swipe left|right|up | drag X1 Y1 X2 Y2 MS"
         out = self.run_bench_block([
             "tap 233 300", "longpress 10 20", "tap  5   6", "swipe left", "swipe right", "swipe up", "tap 0 465",
             "ui=settings", "ui=face", "ui=clock", "ui.demo=1", "ui.demo=0",
@@ -402,6 +407,32 @@ int main(void)
                              "swipe leftx", "swipe left ", "swipe upx", "swipe up ")
               for x in (usage, f"[{line}] taken=1")],
             "[tapx 1 2] taken=0", "[swipes left] taken=0", "[taps] taken=0", "[swipe] taken=0", "[other] taken=0",
+        ])
+
+    def test_drag_parses_and_validates(self):
+        # Games Task 5: '>drag X1 Y1 X2 Y2 MS' presses at (X1,Y1), moves straight to (X2,Y2) over MS ms and lifts. The points are on
+        # the screen (0 to 465 on the 1.75C) and MS is 50 to 2000 (muse_ui.h); anything else, a missing or extra field or one that
+        # isn't a whole number, gets the touch commands' usage line, which names the drag too.
+        usage = "@touch.error usage: tap X Y | longpress X Y (X 0..465, Y 0..465) | swipe left|right|up | drag X1 Y1 X2 Y2 MS"
+        header = (MUSE / "muse_ui.h").read_text()
+        low = int(re.search(r"#define MUSE_UI_DRAG_MS_MIN (\d+)", header).group(1))
+        high = int(re.search(r"#define MUSE_UI_DRAG_MS_MAX (\d+)", header).group(1))
+        self.assertEqual((low, high), (50, 2000))
+        good = ["drag 233 333 233 133 300", "drag 233 383 233 83 120", "drag 0 0 465 465 50", "drag 465 465 0 0 2000",
+                "drag  1  2   3 4  100"]
+        bad = ["drag 1 2 3 4", "drag 1 2 3 4 49", "drag 1 2 3 4 2001", "drag 1 2 3 4 -100", "drag 1 2 3 4 0",
+               "drag 466 0 0 0 100", "drag 0 466 0 0 100", "drag 0 0 466 0 100", "drag 0 0 0 466 100", "drag -1 0 0 0 100",
+               "drag 0 0 0 -1 100", "drag 1 2 3 4 100 5", "drag 1 2 3 4 100x", "drag 1 2 3 4 100 ", "drag 1 2 a 4 100",
+               "drag a b c d e", "drag ", "drag 1", "drag 1 2 3 4 99999999999999999999", "drag 99999999999999999999 1 2 3 100"]
+        out = self.run_bench_block(good + bad + ["drag", "drags 1 2 3 4 100", "dragx"])
+        self.assertEqual(out, [
+            "drag 233 333 233 133 300", "[drag 233 333 233 133 300] taken=1",
+            "drag 233 383 233 83 120", "[drag 233 383 233 83 120] taken=1",
+            "drag 0 0 465 465 50", "[drag 0 0 465 465 50] taken=1",
+            "drag 465 465 0 0 2000", "[drag 465 465 0 0 2000] taken=1",
+            "drag 1 2 3 4 100", "[drag  1  2   3 4  100] taken=1",
+            *[x for line in bad for x in (usage, f"[{line}] taken=1")],
+            "[drag] taken=0", "[drags 1 2 3 4 100] taken=0", "[dragx] taken=0",
         ])
 
     def test_mem_stays_in_the_block(self):
@@ -508,6 +539,7 @@ int main(int argc, char **argv)
     if (!strcmp(what, "no_driver")) {
         printf("installed=%d\n", g_cb != NULL);
         muse_ui_bench_touch(MUSE_UI_TOUCH_TAP, 1, 1);
+        muse_ui_bench_drag(1, 1, 2, 2, 100);
         return 0;
     }
     if (!strcmp(what, "event_mode")) {
@@ -541,6 +573,17 @@ int main(int argc, char **argv)
     } else if (!strcmp(what, "swipe_up")) {
         muse_ui_bench_touch(MUSE_UI_TOUCH_SWIPE_UP, 5, 5);
         play("swipe_up", step);
+    } else if (!strcmp(what, "drag") && argc > 7) {
+        muse_ui_bench_drag(atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), atoi(argv[7]));
+        play("drag", step);
+    } else if (!strcmp(what, "drag_by_touch")) {
+        muse_ui_bench_touch(MUSE_UI_TOUCH_DRAG, 1, 1);   /* a drag has an end and a time: only muse_ui_bench_drag makes one */
+        real_calls = 0;
+        uint32_t t0 = g_tick;
+        lv_indev_data_t d = read_now();
+        printf("drag_by_touch:");
+        show("", d, t0);
+        printf(" real=%d\n", real_calls);
     } else if (!strcmp(what, "clamp")) {
         muse_ui_bench_touch(MUSE_UI_TOUCH_TAP, 9999, -5);
         play("clamp", step);
@@ -743,6 +786,52 @@ int main(int argc, char **argv)
         out = self.run_touch_harness({"none": ("no_driver",)})["none"]
         self.assertEqual(out[0], "installed=0")
         self.assertRegex(out[1], r"^W muse_ui: .*no touch")
+        self.assertRegex(out[2], r"^W muse_ui: .*no touch")   # a drag says so too
+        self.assertEqual(len(out), 3)
+
+    def test_a_drag_follows_the_clock_from_its_start_to_its_end(self):
+        # Games Task 5 (R5b): '>drag X1 Y1 X2 Y2 MS' presses at (X1,Y1), and its point follows LVGL's clock on the straight line to
+        # (X2,Y2) over MS, as a swipe's does, so no read stands still while it is drawn; it lets go at the end, on the first read at
+        # or after MS, and the real touch is read again after it. The board's drags (200 px over 300 ms in the list's middle, and
+        # flings of 300 px over 120 ms) move at least 3 px on every read at each of these read periods, what LVGL's gesture needs
+        # (LV_DEF_REFR_PERIOD is 15 ms on the board); a slower drag isn't held to that, as a slow finger isn't.
+        periods = (5, 10, 15, 20, 33, 100)
+        drags = {"up": (233, 333, 233, 133, 300), "down": (233, 133, 233, 333, 300), "fling": (233, 383, 233, 83, 120),
+                 "slant": (10, 20, 400, 300, 1000)}
+        out = self.run_touch_harness({f"{name}_{p}": ("drag", p, *map(str, d)) for name, d in drags.items() for p in periods})
+        for name, (x1, y1, x2, y2, ms) in drags.items():
+            for p in periods:
+                with self.subTest(drag=name, period=p):
+                    lines = out[f"{name}_{p}"]
+                    self.assertEqual(lines[:2], ["installed=1", "idle: P7,9@0 real=1"])
+                    reads = self.reads(lines[2])
+                    pressed, release = reads[:-1], reads[-1]
+                    self.assertEqual(pressed[0], ("P", x1, y1, 0))
+                    self.assertEqual(release, ("R", x2, y2, -(-ms // p) * p))
+                    self.assertTrue(lines[2].endswith("real=0"))
+                    self.assertTrue(lines[3].startswith(" after:P7,9@"), lines[3])
+
+                    def along(a, b, t):  # the clock's share of the way, truncated as C divides
+                        return a + (abs(b - a) * t // ms) * (1 if b >= a else -1)
+                    self.assertEqual([(r[1], r[2]) for r in pressed], [(along(x1, x2, r[3]), along(y1, y2, r[3])) for r in pressed])
+                    steps = [max(abs(b[1] - a[1]), abs(b[2] - a[2])) for a, b in zip(pressed, pressed[1:])]
+                    self.assertTrue(all(step > 0 for step in steps), steps)   # every read moves
+                    if name != "slant":
+                        self.assertGreaterEqual(min(steps), 3, steps)
+        # The board's up drag at LVGL's 15 ms: 10 px a read, an up gesture's worth of distance (the list scrolls it instead).
+        self.assertEqual(self.lvgl_gesture_2d(self.reads(out["up_15"][2]))[0], "up")
+
+    def test_a_drag_is_clamped_to_the_screen_and_its_time_to_the_limits(self):
+        # A caller other than the console's parser (which refuses them) gets the nearest edge for a point off the screen and the
+        # nearest limit for a time outside 50 to 2000 ms; muse_ui_bench_touch takes no drag, which has an end and a time.
+        out = self.run_touch_harness({"short": ("drag", 15, "-5", "9999", "9999", "-5", "10"),
+                                      "long": ("drag", 100, "0", "0", "100", "0", "5000"),
+                                      "by_touch": ("drag_by_touch",)})
+        short = self.reads(out["short"][2])
+        self.assertEqual((short[0], short[-1]), (("P", 0, 465, 0), ("R", 465, 0, 60)))
+        long = self.reads(out["long"][2])
+        self.assertEqual((long[0], long[-2], long[-1]), (("P", 0, 0, 0), ("P", 95, 0, 1900), ("R", 100, 0, 2000)))
+        self.assertEqual(out["by_touch"][2], "drag_by_touch: P7,9@0 real=1")
 
     # ---- Task 14: the screenshot stream's CRC ----
 
@@ -1414,11 +1503,13 @@ int main(void)
         # pyserial is imported inside the functions that open a port, never at the top.
         self.assertEqual(len(re.findall(r"^import serial|^from serial", source, re.M)), 0)
         self.assertIn('if __name__ == "__main__":', source)
-        for command in (">tap", ">longpress", ">swipe", ">swipe up"):
+        for command in (">tap", ">longpress", ">swipe", ">swipe up", "'>drag X1 Y1 X2 Y2 MS'"):
             with self.subTest(command):
                 self.assertIn(command, snap.__doc__)
-        # Task 6a: the bench's touch line in AGENTS.md names the up swipe with the sideways ones.
-        self.assertIn("`>swipe left|right|up`", (ROOT / "AGENTS.md").read_text())
+        # Task 6a: the bench's touch line in AGENTS.md names the up swipe with the sideways ones; games Task 5 the drag.
+        agents = (ROOT / "AGENTS.md").read_text()
+        self.assertIn("`>swipe left|right|up`", agents)
+        self.assertIn("`>drag X1 Y1 X2 Y2 MS`", agents)
 
     def test_snap_parse_detects_corruption(self):
         snap = load_snap()
@@ -1837,10 +1928,11 @@ int main(void)
 
     def test_touch_commands_wake_first_and_wait_for_the_script(self):
         # C13 and the controller's "wake first": the read callback doesn't run while LVGL is paused, so a touch
-        # command is preceded by 'w', and 'p' waits the script's length (80, 900 or 240 ms) plus 600 ms.
+        # command is preceded by 'w', and 'p' waits the script's length (80, 900 or 240 ms, a drag its own MS) plus 600 ms.
         snap = load_snap()
         for command, ms in (("tap 233 233", 80), ("longpress 233 233", 900), ("swipe left", 240),
-                            ("swipe right", 240), ("swipe up", 240)):
+                            ("swipe right", 240), ("swipe up", 240), ("drag 233 333 233 133 300", 300),
+                            ("drag 233 383 233 83 120", 120), ("drag 1 2", 0)):
             with self.subTest(command):
                 keys, settle = snap.prepare(">" + command)
                 self.assertEqual(keys, "w>" + command)
@@ -1848,7 +1940,7 @@ int main(void)
         keys, settle = snap.prepare("a>swipe left")
         self.assertEqual(keys, "aw>swipe left")   # the keys in front stay in front of the wake
         # Everything else keeps its pace and its keys.
-        for keys in ("", "a", "as", ">face=happy", "a>ui=clock", ">mem", ">tapx 1 2", ">ui=face"):
+        for keys in ("", "a", "as", ">face=happy", "a>ui=clock", ">mem", ">tapx 1 2", ">ui=face", ">dragx 1 2 3 4 300"):
             with self.subTest(keys):
                 self.assertEqual(snap.prepare(keys), (keys, 0.35))
         # --settle S replaces the wait, touch or not.

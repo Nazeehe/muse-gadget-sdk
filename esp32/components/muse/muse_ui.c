@@ -1674,10 +1674,11 @@ void muse_ui_bench_page(muse_ui_page_t page)
  * release has gone out. The real touch isn't read while a script plays, and is
  * again, untouched, from the next read. The script goes by LVGL's clock, not by
  * the number of reads, so a busy frame delays a step or the release and no
- * more. LVGL's long press fires after 400 ms of press. A swipe's point is
- * where the clock says it is on every read, whatever the read period, so no
- * read stands still: LVGL forgets a gesture's distance on a read that moves
- * under 3 px and fires it past 50 px (indev_gesture).
+ * more. LVGL's long press fires after 400 ms of press. A swipe's point, and a
+ * drag's, is where the clock says it is on every read, whatever the read
+ * period, so no read stands still: LVGL forgets a gesture's distance on a read
+ * that moves under 3 px and fires it past 50 px (indev_gesture). A drag slower
+ * than that a read builds no gesture, as a slow finger doesn't.
  */
 #define BENCH_TAP_MS 80
 #define BENCH_LONG_MS 900
@@ -1691,16 +1692,27 @@ void muse_ui_bench_page(muse_ui_page_t page)
 
 static lv_indev_read_cb_t s_real_read;   /* the touch driver's, found in place by muse_ui_start() */
 static atomic_uint s_touch_request;      /* waiting for the LVGL task: 0, or BENCH_PENDING and the rest */
+/* A drag's end (x in bits 12-23, y in 0-11) and its ms, which don't fit the request: stored before the request that
+ * names the drag, and read once the LVGL task has taken it. */
+static atomic_uint s_drag_end, s_drag_ms;
 static struct {
     bool running;                        /* the LVGL task's alone, from here on */
     muse_ui_touch_t kind;
     int x, y;
+    int x2, y2;                          /* a drag's end */
+    uint32_t ms;                         /* and its time */
     uint32_t start;                      /* lv_tick_get() at the script's first read */
 } s_touch;
 
 static int bench_clamp(int v, int size)
 {
     return v < 0 ? 0 : v >= size ? size - 1 : v;
+}
+
+/* (x, y) on the screen, in a request's bits: x in 12-23, y in 0-11. */
+static unsigned bench_point(int x, int y)
+{
+    return ((unsigned)bench_clamp(x, s_w) << 12) | (unsigned)bench_clamp(y, s_h);
 }
 
 void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y)
@@ -1712,8 +1724,19 @@ void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y)
     if ((unsigned)kind > MUSE_UI_TOUCH_SWIPE_UP) {
         return;
     }
-    atomic_store(&s_touch_request, BENCH_PENDING | ((unsigned)kind << 24) | ((unsigned)bench_clamp(x, s_w) << 12) |
-                                       (unsigned)bench_clamp(y, s_h));
+    atomic_store(&s_touch_request, BENCH_PENDING | ((unsigned)kind << 24) | bench_point(x, y));
+}
+
+void muse_ui_bench_drag(int x1, int y1, int x2, int y2, int ms)
+{
+    if (!s_real_read) {
+        ESP_LOGW(TAG, "bench touch: no touch input to script on this board");
+        return;
+    }
+    ms = ms < MUSE_UI_DRAG_MS_MIN ? MUSE_UI_DRAG_MS_MIN : ms > MUSE_UI_DRAG_MS_MAX ? MUSE_UI_DRAG_MS_MAX : ms;
+    atomic_store(&s_drag_end, bench_point(x2, y2));
+    atomic_store(&s_drag_ms, (unsigned)ms);
+    atomic_store(&s_touch_request, BENCH_PENDING | ((unsigned)MUSE_UI_TOUCH_DRAG << 24) | bench_point(x1, y1));
 }
 
 static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
@@ -1724,6 +1747,12 @@ static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
             s_touch.kind = (muse_ui_touch_t)((request >> 24) & 7);
             s_touch.x = (int)((request >> 12) & 0xfff);
             s_touch.y = (int)(request & 0xfff);
+            if (s_touch.kind == MUSE_UI_TOUCH_DRAG) {
+                unsigned end = atomic_load(&s_drag_end);
+                s_touch.x2 = (int)((end >> 12) & 0xfff);
+                s_touch.y2 = (int)(end & 0xfff);
+                s_touch.ms = atomic_load(&s_drag_ms);
+            }
             s_touch.start = lv_tick_get();
             s_touch.running = true;
         }
@@ -1735,9 +1764,13 @@ static void bench_read(lv_indev_t *indev, lv_indev_data_t *data)
     uint32_t t = lv_tick_elaps(s_touch.start);
     uint32_t hold = s_touch.kind == MUSE_UI_TOUCH_TAP    ? BENCH_TAP_MS
                     : s_touch.kind == MUSE_UI_TOUCH_LONG ? BENCH_LONG_MS
+                    : s_touch.kind == MUSE_UI_TOUCH_DRAG ? s_touch.ms
                                                          : BENCH_SWIPE_MS;
     int x = s_touch.x, y = s_touch.y;
-    if (s_touch.kind == MUSE_UI_TOUCH_SWIPE_UP) {
+    if (s_touch.kind == MUSE_UI_TOUCH_DRAG) {
+        x = t >= hold ? s_touch.x2 : x + (s_touch.x2 - x) * (int)t / (int)hold;
+        y = t >= hold ? s_touch.y2 : y + (s_touch.y2 - y) * (int)t / (int)hold;
+    } else if (s_touch.kind == MUSE_UI_TOUCH_SWIPE_UP) {
         int from = s_h - BENCH_SWIPE_UP_FROM, to = from - BENCH_SWIPE_UP_PX;
         x = s_w / 2;
         y = t >= hold ? to : from + (to - from) * (int)t / (int)hold;

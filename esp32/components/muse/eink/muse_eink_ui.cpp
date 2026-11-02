@@ -1179,6 +1179,15 @@ extern "C" void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y)
     (void)x;
     (void)y;
 }
+
+extern "C" void muse_ui_bench_drag(int x1, int y1, int x2, int y2, int ms)
+{
+    (void)x1;
+    (void)y1;
+    (void)x2;
+    (void)y2;
+    (void)ms;
+}
 #endif
 
 /* The button menu is for boards without touch; FreeInk boards have Settings. */

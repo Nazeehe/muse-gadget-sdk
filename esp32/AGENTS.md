@@ -174,10 +174,12 @@ and saves the screen, and `>face=thinking` (or `idle`, `listening`,
 `speaking`, `error`, `boot`, `off`, `happy`) in KEYS picks the avatar mode first.
 Screenshots are off in normal builds because each one takes a buffer the size
 of the screen. `>face=` works in any build. A bench build also takes touch from
-the Mac, through LVGL's own input: `>tap X Y`, `>longpress X Y` and
-`>swipe left|right|up` in KEYS (`snap.py PORT '>swipe left' OUT.png`) press and drag
-as a finger would, on a touch screen that LVGL polls (`>swipe up` from the bottom
-edge, at the middle, as the launcher's close takes it). `snap.py` sends `w` first,
+the Mac, through LVGL's own input: `>tap X Y`, `>longpress X Y`,
+`>swipe left|right|up` and `>drag X1 Y1 X2 Y2 MS` in KEYS
+(`snap.py PORT '>swipe left' OUT.png`) press and drag as a finger would, on a
+touch screen that LVGL polls (`>swipe up` from the bottom edge, at the middle, as
+the launcher's close takes it; `>drag` from the first point straight to the
+second in MS ms, 50 to 2000). `snap.py` sends `w` first,
 since LVGL doesn't read its input while the screen sleeps on battery, and waits
 for the script to finish before the picture (`snap.capture()` does both for
 every caller). Each screenshot ends with a CRC-32 that `snap.py` checks, retaking
@@ -817,6 +819,35 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   which the voice task writes first), and a talk press stopped the clip
   cleanly, by ear; the app was hidden for the turn and shown again after it,
   silent.
+- **Lists:** a box with `scroll = "y"` scrolls up and down with LVGL's own
+  drag, throw and elastic edge (`style_box` in `apps_lv.c`), and takes the
+  touches on it, so a drag that begins on it or on a row in it scrolls it: the
+  row hears press and release, and no tap. `>drag X1 Y1 X2 Y2 MS` (a bench
+  build's console) presses at the first point, moves straight to the second
+  over MS ms and lifts, as a finger that drags would (MS is 50 to 2000,
+  `MUSE_UI_DRAG_MS_MIN` and `_MAX` in `muse_ui.h`). A bench build logs
+  `scroll frame <ms> ms` (the `muse_apps` tag) at each display refresh while an
+  app's box with `scroll = "y"` scrolls on the layer in front, with no card or
+  launcher over it: the time since the refresh before. Measured on the 1.75C
+  on 2026-11-01 (apps+bench build, `tests/muse_apps_fixtures/list`: 40 rows of
+  wrapped text in bubbles at the left and the right by turns, 121 widgets; 10
+  drags up and 10 down of 200 px over 300 ms in the list's middle, then 5
+  flings of 300 px over 120 ms): 711 frames while it moved, a median of 26 ms
+  and a 95th percentile of 33 ms (the longest 50), inside the frame gate of 33
+  and 50 ms. The log had 20 more lines, of 801 to 1,312 ms, each the first of
+  a drag after a throw that stopped short of the list's ends: such a throw
+  ends at an input read that moves nothing, so no refresh sees it end, and the
+  next drag's first refresh is timed from the throw's last one (a throw that
+  reaches an end springs back in an animation, whose end a refresh sees).
+  Leave those out (with them the 95th percentile is 37 ms). While it scrolled,
+  314 of the 720 refreshes in the bands' `tearing effect:` batches were torn
+  (two bands each, none paired), and a render took 19 ms on average (the
+  longest 30). Taps on 13 rows at rest each printed the row tapped, and none
+  of the 25 drags tapped one. `>mem`'s internal and DMA free didn't move
+  before, during or after the drags; PSRAM moved only with the app's Lua heap,
+  and was back to within 40 bytes of its free before the install once the app
+  stopped. The LVGL task's unused stack fell from 3,884 to 2,860 bytes with
+  the list made, and to 2,796 while it scrolled.
 - **Boot:** the apps' storage waits for the Link (`muse_apps.h`). The app task
   mounts the FAT and `apps_nvs`, and the I/O worker that does it is made, once
   the reply to the first `link.register` has come, accepted or not

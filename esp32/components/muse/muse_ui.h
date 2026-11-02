@@ -98,6 +98,14 @@ typedef enum {
     MUSE_UI_TOUCH_SWIPE_LEFT,
     MUSE_UI_TOUCH_SWIPE_RIGHT,
     MUSE_UI_TOUCH_SWIPE_UP,
+    MUSE_UI_TOUCH_DRAG,   /* muse_ui_bench_drag's: muse_ui_bench_touch drops it */
 } muse_ui_touch_t;
 void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y);
+/* A drag, played as the touches above are: it presses at (x1, y1), its point
+ * follows the clock on the straight line to (x2, y2) over ms, and it lets go
+ * there. Points off the screen go to its edge, and ms to the nearest of these
+ * limits. */
+#define MUSE_UI_DRAG_MS_MIN 50
+#define MUSE_UI_DRAG_MS_MAX 2000
+void muse_ui_bench_drag(int x1, int y1, int x2, int y2, int ms);
 #endif

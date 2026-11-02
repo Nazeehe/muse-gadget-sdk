@@ -802,6 +802,46 @@ class GuideAndSkill(unittest.TestCase):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
 
+    def test_agents_md_has_the_list_paragraph(self):
+        # Games Task 5: a list's scroll and the bench's log line as apps_lv.c prints it (D12), and the drag that measures it as the
+        # console takes it (muse_input.c), its time's limits muse_ui.h's. The numbers measured on the board (2026-11-01) are
+        # measurements, pinned as they were written; the fixture's 121 widgets are its 40 rows of three and the list.
+        self.assertIn('ESP_LOGI(TAG, "scroll frame %d ms"', (APPS / "apps_lv.c").read_text())
+        self.assertIn('!strncmp(line, "drag ", 5)', (MUSE / "muse_input.c").read_text())
+        ui_h = (MUSE / "muse_ui.h").read_text()
+        low = int(re.search(r"(?m)^#define MUSE_UI_DRAG_MS_MIN (\d+)", ui_h).group(1))
+        high = int(re.search(r"(?m)^#define MUSE_UI_DRAG_MS_MAX (\d+)", ui_h).group(1))
+        rows = int(re.search(r"(?m)^local ROWS = (\d+)$", (ROOT / "tests/muse_apps_fixtures/list/main.lua").read_text()).group(1))
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        for phrase in ("**Lists:** a box with `scroll = \"y\"` scrolls up and down with LVGL's own drag, throw and elastic edge "
+                       "(`style_box` in `apps_lv.c`)",
+                       "A bench build logs `scroll frame <ms> ms` (the `muse_apps` tag) at each display refresh while an app's box with "
+                       "`scroll = \"y\"` scrolls on the layer in front, with no card or launcher over it: the time since the refresh "
+                       "before.",
+                       "`>drag X1 Y1 X2 Y2 MS` (a bench build's console) presses at the first point, moves straight to the second over MS "
+                       f"ms and lifts, as a finger that drags would (MS is {low} to {high}, `MUSE_UI_DRAG_MS_MIN` and `_MAX` in "
+                       "`muse_ui.h`).",
+                       f"Measured on the 1.75C on 2026-11-01 (apps+bench build, `tests/muse_apps_fixtures/list`: {rows} rows of wrapped "
+                       f"text in bubbles at the left and the right by turns, {1 + 3 * rows} widgets; 10 drags up and 10 down of 200 px "
+                       "over 300 ms in the list's middle, then 5 flings of 300 px over 120 ms): 711 frames while it moved, a median of "
+                       "26 ms and a 95th percentile of 33 ms (the longest 50), inside the frame gate of 33 and 50 ms.",
+                       "The log had 20 more lines, of 801 to 1,312 ms, each the first of a drag after a throw that stopped short of the "
+                       "list's ends: such a throw ends at an input read that moves nothing, so no refresh sees it end, and the next "
+                       "drag's first refresh is timed from the throw's last one (a throw that reaches an end springs back in an "
+                       "animation, whose end a refresh sees). Leave those out (with them the 95th percentile is 37 ms).",
+                       "While it scrolled, 314 of the 720 refreshes in the bands' `tearing effect:` batches were torn (two bands each, "
+                       "none paired), and a render took 19 ms on average (the longest 30).",
+                       "Taps on 13 rows at rest each printed the row tapped, and none of the 25 drags tapped one. `>mem`'s internal and "
+                       "DMA free didn't move before, during or after the drags; PSRAM moved only with the app's Lua heap, and was back "
+                       "to within 40 bytes of its free before the install once the app stopped. The LVGL task's unused stack fell from "
+                       "3,884 to 2,860 bytes with the list made, and to 2,796 while it scrolled."):
+            with self.subTest(phrase):
+                self.assertIn(phrase, section)
+        # The bench's touch line names the drag's limits too.
+        bench = " ".join(agents[:agents.index("\n## Muse apps\n")].split())
+        self.assertIn(f"`>drag` from the first point straight to the second in MS ms, {low} to {high})", bench)
+
     def test_agents_md_has_the_launcher_paragraph(self):
         # Launcher carousel Task 6: AGENTS.md's launcher paragraph (its gestures, icons, memory and the frame gate measured on the
         # board). D12 for what it quotes of the code: the layout (apps_lv.h), the icons' window (apps_icons.h), the size the guide asks

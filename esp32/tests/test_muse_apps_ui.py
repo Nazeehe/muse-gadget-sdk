@@ -1517,6 +1517,33 @@ class UiTest(UiTestCase):
                 self.assertEqual(run.kinds()[-1], "dump")
 
 
+class ListFixtureTest(UiTestCase):
+    def test_the_board_fixture_runs_here(self):
+        # Games Task 5: tests/muse_apps_fixtures/list, which the board's scroll measurement drives. It is the guide's Lists pattern:
+        # a column that scrolls, 40 rows of wrapped text, each a row box, a bubble at its left or right and a label (121 widgets of
+        # the 128), a tap on a row prints its number, and `to` and `end` scroll it to a y or to its end.
+        rows = 40
+        run = self.host(FIXTURES / "list", script=["dump", "tap #1", "tap #4", f"tap #{3 * rows - 2}", "tap #2", "tap #3",
+                                                   "message end", 'message to {"y":700}', "message to"])
+        self.assertEqual([k for k in run.kinds() if k in ("warning", "error", "crash")], [], run.events)
+        widgets = run.of("dump")[0]["widgets"]
+        self.assertEqual(len(widgets), 1 + 3 * rows)
+        self.assertEqual(len(widgets), header_number("apps_ui.h", "APPS_UI_SLOTS") - 7)
+        self.assertEqual(widgets[0]["kind"], "box")
+        self.assertEqual([w["kind"] for w in widgets[1:]], ["box", "box", "label"] * rows)
+        # The texts are of one to three lines in a bubble (the label wraps at 200 px; about 9 px a character in sans16).
+        lengths = [len(w["text"]) for w in widgets[3::3]]
+        self.assertTrue(min(lengths) < 20 < 50 < max(lengths), lengths)
+        # A tap on a row prints its number. Its bubble and label have no handler, so a tap on them prints nothing here; on the
+        # gadget they take no touch, and the row under them gets it.
+        self.assertEqual(run.logs(), ["tap 1", "tap 2", f"tap {rows}"])
+        self.assertEqual([e["data"] for e in run.of("reply")], [{"at": "end"}, {"at": 700}, {"at": 0}])
+        manifest = json.loads((FIXTURES / "list/manifest.json").read_text())
+        self.assertEqual(sorted(manifest["messages"]), ["end", "to"])
+        main = (FIXTURES / "list/main.lua").read_text().splitlines()
+        self.assertEqual(main[:2], ["-- Copyright (c) Meta Platforms, Inc. and affiliates.", "-- SPDX-License-Identifier: Apache-2.0"])
+
+
 class HarnessTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -10147,6 +10147,152 @@ static void children_of_a_scroll_box_get_no_overflow_warning(void) {
     FINISH(&e);
 }
 
+/* ---- Games Task 5: the list gate's measurement, in a MUSE_BENCH build only ---- */
+
+/* The ms of each "scroll frame <ms> ms" line apps_lv.c logged since the last esp_clear, as frame_lines_at reads the launcher's. */
+static int scroll_lines_at(int line, int *ms, int cap) {
+    static const char prefix[] = "I muse_apps: scroll frame ";
+    int n = 0;
+    for (const char *at = esp_peek(); (at = strstr(at, prefix)) != NULL; at += sizeof prefix - 1) {
+        char *end;
+        long v = strtol(at + sizeof prefix - 1, &end, 10);
+        CHECK_AT(line, end != at + sizeof prefix - 1 && strncmp(end, " ms\n", 4) == 0, "a scroll frame line of another shape:\n%s",
+                 at);
+        if (n < cap) {
+            ms[n] = (int)v;
+        }
+        n++;
+    }
+    return n;
+}
+#define SCROLL_LINES(ms, cap) scroll_lines_at(__LINE__, (ms), (cap))
+
+/* One run of LVGL's timers gap_us after the last refresh: the animations and a throw's step, then the refresh. */
+static void frame_then_refresh(int64_t gap_us) {
+    fake_frame((int)(gap_us / 1000));
+    refresh_after(gap_us);
+}
+
+/* While an app's box with scroll = "y" scrolls on the layer in front (a drag, its throw, an animated scroll_to), each display refresh
+ * logs "scroll frame <ms> ms", the time since the refresh before it, when that one found a box scrolling there too: the first refresh of
+ * a scroll follows a rest of any length and isn't timed. Nothing at rest, nothing while only an image spins, nothing while the layer is
+ * behind or a card or the launcher is over it, and nothing at all, with no callback on the display, without the bench. */
+static void scroll_frame_log(void) {
+    env_t e;
+    list_scene(&e, 10, true);  /* 500 px of rows in 200, each with a tap: a drag that begins on one scrolls the list */
+    int list = BOX_OBJ(0);
+    if (FRAMES_LOGGED) {
+        CHECK(display_obj.n_cbs == 1 && display_obj.cbs[0].filter == LV_EVENT_REFR_READY, "one callback on the display: %d",
+              display_obj.n_cbs);
+    } else {
+        CHECK(display_obj.n_cbs == 0, "a build without the bench adds nothing to the display: %d callbacks", display_obj.n_cbs);
+    }
+    int ms[64];
+    esp_clear();
+    refresh_after(1000000);
+    refresh_after(16000);
+    CHECK(SCROLL_LINES(ms, 64) == 0, "nothing at rest:\n%s", esp_peek());
+
+    /* A drag that begins on a row. Its first refresh follows the rest; the rest are timed, to the nearest ms. */
+    int id = fake_down(233, 200);
+    fake_move(233, 188);
+    CHECK(id == BOX_OBJ(2) && fake_scrolling(list), "the drag began on %d, not row 2 (%d), or scrolled nothing", id, BOX_OBJ(2));
+    refresh_after(15000);
+    static const int64_t gaps_us[] = {20000, 33000, 16400, 16600, 51000};
+    static const int want[] = {20, 33, 16, 17, 51};
+    for (size_t i = 0; i < ARRAY_LEN(gaps_us); i++) {
+        fake_move(233, 188 - 8 * (int32_t)(i + 1));
+        refresh_after(gaps_us[i]);
+    }
+    int n = SCROLL_LINES(ms, 64);
+    if (FRAMES_LOGGED) {
+        CHECK(n == 5, "the drag's frames after its first: %d lines\n%s", n, esp_peek());
+        for (int i = 0; i < 5 && i < n; i++) {
+            CHECK(ms[i] == want[i], "frame %d of the drag: %d ms, want %d", i, ms[i], want[i]);
+        }
+    } else {
+        CHECK(n == 0, "no scroll frame line without the bench:\n%s", esp_peek());
+    }
+    CHECK(FRAME_LINES(ms, 64) == 0 && SPIN_LINES(ms, 64) == 0, "no launcher or spin frame line for a list:\n%s", esp_peek());
+
+    /* The throw after the lift: a refresh after each of its frames, each timed but the one after the frame that ends it. The row
+     * heard press and release, and no tap. */
+    esp_clear();
+    fake_lift();
+    int frames = 0;
+    for (; frames < 100 && fake_scrolling(list); frames++) {
+        frame_then_refresh(16000);
+    }
+    CHECK(!fake_scrolling(list) && frames >= 5, "the throw ran %d frames and ended", frames);
+    n = SCROLL_LINES(ms, 64);
+    if (FRAMES_LOGGED) {
+        CHECK(n == frames - 1, "every frame of the throw but the one that ended it: %d lines, %d frames\n%s", n, frames, esp_peek());
+        for (int i = 0; i < n && i < 64; i++) {
+            CHECK(ms[i] == 16, "frame %d of the throw: %d ms", i, ms[i]);
+        }
+    } else {
+        CHECK(n == 0, "no scroll frame line without the bench:\n%s", esp_peek());
+    }
+    CHECK(n_evs == 2 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE, "press, release and no tap: %d events",
+          n_evs);
+
+    /* At rest again, for 5 s: nothing, and the next scroll's first refresh isn't a 5,000 ms frame. */
+    esp_clear();
+    for (int i = 0; i < 5; i++) {
+        refresh_after(1000000);
+    }
+    CHECK(SCROLL_LINES(ms, 64) == 0, "nothing at rest after the throw:\n%s", esp_peek());
+
+    /* An animated scroll_to is timed as a drag is (to the end, 400 ms of animation: what follows needs it to run). */
+    RUN(&e, "list:scroll_to('end', true)");
+    CHECK(APPLY(&e), "animated");
+    CHECK(fake_scrolling(list), "it animates");
+    esp_clear();
+    refresh_after(16000);  /* after the rest: not timed */
+    frame_then_refresh(16000);
+    frame_then_refresh(20000);
+    n = SCROLL_LINES(ms, 64);
+    CHECK(n == (FRAMES_LOGGED ? 2 : 0) && (!FRAMES_LOGGED || (ms[0] == 16 && ms[1] == 20)), "an animated scroll_to: %d lines\n%s", n,
+          esp_peek());
+
+    /* Behind (another page shows): nothing; in front again, the first refresh isn't timed. */
+    esp_clear();
+    apps_lv_set_front(false);
+    frame_then_refresh(16000);
+    frame_then_refresh(16000);
+    CHECK(SCROLL_LINES(ms, 64) == 0, "nothing while the layer is behind:\n%s", esp_peek());
+    apps_lv_set_front(true);
+    frame_then_refresh(16000);
+    frame_then_refresh(20000);
+    n = SCROLL_LINES(ms, 64);
+    CHECK(n == (FRAMES_LOGGED ? 1 : 0) && (!FRAMES_LOGGED || ms[0] == 20), "in front again: %d lines\n%s", n, esp_peek());
+
+    /* A card over it, then the launcher: nothing, while the list still moves under them. */
+    esp_clear();
+    apps_lv_show_crash("List", NULL);
+    frame_then_refresh(16000);
+    frame_then_refresh(16000);
+    apps_lv_hide_cards();
+    apps_lv_show_launcher(FIVE, 5, NULL, pick);
+    frame_then_refresh(16000);
+    frame_then_refresh(16000);
+    CHECK(fake_scrolling(list), "the list's animation still runs");
+    apps_lv_hide_cards();
+    run_io();
+    CHECK(SCROLL_LINES(ms, 64) == 0, "nothing under a card or the launcher:\n%s", esp_peek());
+    SETTLE();
+
+    /* At rest with an image spinning in front: the spin's lines, not the list's. */
+    RUN(&e, "ui.image{src = 'a.bin', spin = 33}");
+    CHECK(APPLY(&e), "a spin");
+    esp_clear();
+    for (int i = 0; i < 3; i++) {
+        frame_then_refresh(33000);
+    }
+    CHECK(SCROLL_LINES(ms, 64) == 0 && SPIN_LINES(ms, 64) == (FRAMES_LOGGED ? 2 : 0), "a spin by a list at rest:\n%s", esp_peek());
+    FINISH(&e);
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -10279,6 +10425,7 @@ int main(int argc, char **argv) {
         {"scroll_to_waits_for_a_hidden_box", scroll_to_waits_for_a_hidden_box},
         {"layout_none_undoes_the_column", layout_none_undoes_the_column},
         {"children_of_a_scroll_box_get_no_overflow_warning", children_of_a_scroll_box_get_no_overflow_warning},
+        {"scroll_frame_log", scroll_frame_log},
     };
     if (argc != 2) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);

@@ -1696,19 +1696,38 @@ static void watch_spin(lv_obj_t *screen) {
  *   on a hidden row) or holding (the row is still) nothing is logged.
  * - The spin's (connected apps Task 1): while an image spins on the layer in front, with no card over it, each refresh logs
  *   "spin frame <ms> ms" the same way. Behind, under a card or with no image spinning, nothing is.
+ * - A list's (games Task 5): while an app's box with scroll = "y" scrolls on the layer in front (a drag, its throw, an elastic end,
+ *   an animated scroll_to), with no launcher or card over it, each refresh logs "scroll frame <ms> ms" the same way.
  * One test each refresh, and a line only while something moves. */
 static EXT_RAM_BSS_ATTR struct {
     lv_display_t *display;  /* the display on_refresh is on: once, however often the layer is built */
     int64_t last_us;        /* esp_timer_get_time() of the last refresh that found the row scrolling; 0: the last one didn't */
     int64_t spin_last_us;   /* the same for an image spinning in front */
+    int64_t scroll_last_us; /* and for an app's scroll box scrolling in front */
 } s_frames;
+
+/* An app's box with scroll = "y" scrolls on the layer in front, with no launcher or card over it (spin_in_front's test of what
+ * covers it). The records' walk, as spinner_in_front's: what style_box applied, read on the LVGL task with no UI lock. */
+static bool scroll_box_scrolling(void) {
+    if (s_state == NULL || !s_front || s_launcher_shown || s_crash_shown) {
+        return false;
+    }
+    for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
+        const node_t *n = &s_state->node[slot];
+        if (n->obj != NULL && n->kind == APPS_W_BOX && n->scrolls && lv_obj_is_scrolling(n->obj)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void on_refresh(lv_event_t *e) {
     (void)e;
     bool scrolling = s_launcher_shown && C.row != NULL && lv_obj_is_scrolling(C.row);
     bool spinning = spin_in_front();
-    if (!scrolling && !spinning) {
-        s_frames.last_us = s_frames.spin_last_us = 0;
+    bool listing = scroll_box_scrolling();
+    if (!scrolling && !spinning && !listing) {
+        s_frames.last_us = s_frames.spin_last_us = s_frames.scroll_last_us = 0;
         return;
     }
     int64_t now = esp_timer_get_time();
@@ -1718,8 +1737,12 @@ static void on_refresh(lv_event_t *e) {
     if (spinning && s_frames.spin_last_us != 0) {
         ESP_LOGI(TAG, "spin frame %d ms", (int)((now - s_frames.spin_last_us + 500) / 1000));
     }
+    if (listing && s_frames.scroll_last_us != 0) {
+        ESP_LOGI(TAG, "scroll frame %d ms", (int)((now - s_frames.scroll_last_us + 500) / 1000));
+    }
     s_frames.last_us = scrolling ? now : 0;
     s_frames.spin_last_us = spinning ? now : 0;
+    s_frames.scroll_last_us = listing ? now : 0;
 }
 
 static void watch_frames(lv_obj_t *screen) {

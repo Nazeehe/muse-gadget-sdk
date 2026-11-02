@@ -1221,10 +1221,18 @@ static void on_camera_hint_clicked(lv_event_t *e)
 }
 #endif
 
+#if CONFIG_MUSE_BENCH || CONFIG_MUSE_APPS
+static bool guarded_playing(void);   /* the touch player's (below): Muse's own touch is playing */
+#else
+#define guarded_playing() false
+#endif
+
 static void on_any_press(lv_event_t *e)
 {
     (void)e;
-    if (muse_board->touch_talk && muse_link_state() == MUSE_LINK_CONFIRM) {
+    /* On a touch-talk board a press confirms pairing, which only a person may do: never Muse's own touch (app.control tap or
+     * drag), whose press LVGL sends while the guarded drag plays. */
+    if (muse_board->touch_talk && muse_link_state() == MUSE_LINK_CONFIRM && !guarded_playing()) {
         muse_input_touch_talk(true);
         muse_input_touch_talk(false);
     }
@@ -1872,9 +1880,17 @@ bool muse_ui_guarded_withdraw(void)
     return (atomic_exchange(&s_guarded_request, 0) & BENCH_PENDING) != 0;
 }
 
+/* Muse's own touch plays: a guarded drag from the read that takes it to its release (on_any_press, the LVGL task's). */
+static bool guarded_playing(void)
+{
+    return s_touch.running && s_touch.guard != NULL;
+}
+
 /* The guarded drag waiting, if one is, at the read that would start it: false when it doesn't (it was withdrawn just now, a
  * finger is down, or the guard's admit says no), its end said for the last two, with data the real read, which LVGL then gets
- * as it is. */
+ * as it is. A finger is down when this read says so, or when LVGL's last read did (lv_indev_get_state: LVGL sets it from a
+ * read only after the callback returns): one that lifts on this very read still holds its object in LVGL, which, with
+ * PRESS_LOCK, would carry the drag's first point on as that object's press. Given the finger's release, LVGL ends it. */
 static bool guarded_take(lv_indev_t *indev, lv_indev_data_t *data)
 {
     unsigned request = atomic_exchange(&s_guarded_request, 0);
@@ -1884,7 +1900,7 @@ static bool guarded_take(lv_indev_t *indev, lv_indev_data_t *data)
     }
     const muse_ui_guard_t *guard = atomic_load(&s_guarded_guard);
     int x = (int)((request >> 12) & 0xfff), y = (int)(request & 0xfff);
-    if (data->state == LV_INDEV_STATE_PRESSED) {
+    if (data->state == LV_INDEV_STATE_PRESSED || lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
         guard->end(MUSE_UI_GUARD_FINGER, 0);
         return false;
     }

@@ -881,7 +881,10 @@ class GuideAndSkill(unittest.TestCase):
                 "that stops, with a release and no tap. When it can't play, nothing is touched: `unavailable` says why, "
                 "`not_running` that the app isn't running, and `busy` that another touch is playing.",
                 "The app's handlers hear your touches as a finger's, but they aren't the user's taps: `muse.ask` and `sys.show` "
-                "refuse after them, as they would with no tap at all."):
+                "refuse after them, as they would with no tap at all.",
+                # Ruling U1d (review M7): the handlers run for real.
+                "Your taps run the app's handlers for real, so its connectors, its sound and its store act as if the user had "
+                "tapped: mind what a test tap triggers in a real app, such as a music app's play button."):
             with self.subTest(phrase[:40]):
                 self.assertIn(phrase, loop)
         ui = " ".join(guide[guide.index("\n### ui\n"):guide.index("\n### time\n")].split())
@@ -929,7 +932,10 @@ class GuideAndSkill(unittest.TestCase):
                 f"{define('MUSE_APPS_TOUCH_TAP_MS')} ms by default, and the whole touch has "
                 f"{define('MUSE_APPS_TOUCH_TOTAL_MS') // 1000} s (`MUSE_APPS_TOUCH_TOTAL_MS`) of `app.control`'s {control_s}.",
                 "The events it sends reach the app tagged (`APPS_UI_INJECTED`): its handlers hear them, but they open neither "
-                "`muse.ask`'s nor `sys.show`'s tap gate."):
+                "`muse.ask`'s nor `sys.show`'s tap gate, and its presses never confirm a pairing on a touch-talk board "
+                "(`on_any_press` in `muse_ui.c`).",
+                "A finger LVGL still holds from its last read (`lv_indev_get_state`) refuses the touch too, as one on the "
+                "screen does."):
             with self.subTest(phrase[:40]):
                 self.assertIn(phrase, section)
         bench = " ".join(agents[:agents.index("\n## Muse apps\n")].split())

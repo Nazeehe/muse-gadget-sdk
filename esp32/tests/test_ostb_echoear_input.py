@@ -55,6 +55,8 @@ static bool muse_link_talk_press(void) { if (pending_pair) { confirmed++; return
 static bool muse_state_asleep(void) { return false; }
 static bool muse_menu_is_open(void) { return false; }
 static void muse_state_poke(void) {}
+static bool guarded;
+static bool guarded_playing(void) { return guarded; }
 static void muse_menu_key(int key) { (void)key; }
 static bool on_clock;
 static int faces;
@@ -94,7 +96,9 @@ int main(void) {
     event=LV_EVENT_RELEASED;on_touch_mic(&event);
     talk_button(atomic_exchange(&s_touch_talk_events,0));assert(down==4 && up==4);
     on_any_press(&event);assert(atomic_load(&s_touch_talk_events)==0);
-    pending_pair=true;link_state=MUSE_LINK_CONFIRM;on_any_press(&event);
+    pending_pair=true;link_state=MUSE_LINK_CONFIRM;guarded=true;on_any_press(&event);
+    assert(atomic_load(&s_touch_talk_events)==0 && confirmed==1);guarded=false;
+    on_any_press(&event);
     talk_button(atomic_exchange(&s_touch_talk_events,0));
     assert(confirmed==2 && down==4 && up==4 && !s_talk_down);
     pending_pair=false; on_clock=true;

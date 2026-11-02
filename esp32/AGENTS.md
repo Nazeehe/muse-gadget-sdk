@@ -888,7 +888,10 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   50 to 2000, a tap 80 ms by default, and the whole touch has 15 s
   (`MUSE_APPS_TOUCH_TOTAL_MS`) of `app.control`'s 30. The events it sends
   reach the app tagged (`APPS_UI_INJECTED`): its handlers hear them, but they
-  open neither `muse.ask`'s nor `sys.show`'s tap gate.
+  open neither `muse.ask`'s nor `sys.show`'s tap gate, and its presses never
+  confirm a pairing on a touch-talk board (`on_any_press` in `muse_ui.c`). A
+  finger LVGL still holds from its last read (`lv_indev_get_state`) refuses
+  the touch too, as one on the screen does.
 - **Boot:** the apps' storage waits for the Link (`muse_apps.h`). The app task
   mounts the FAT and `apps_nvs`, and the I/O worker that does it is made, once
   the reply to the first `link.register` has come, accepted or not

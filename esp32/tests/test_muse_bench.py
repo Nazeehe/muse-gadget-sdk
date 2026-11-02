@@ -493,7 +493,11 @@ class MuseBenchTest(unittest.TestCase):
         for index in mentions:
             with self.subTest(ui[ui.rindex("\n", 0, index) + 1:ui.index("\n", index)].strip()):
                 self.assertEqual(open_conditions(ui, index), [PLAYER])
-        self.assertEqual(ui.count("#if " + PLAYER[3:]), 2, "the player's block and its install")
+        self.assertEqual(ui.count("#if " + PLAYER[3:]), 3, "the player's block, its install and on_any_press's helper")
+        # on_any_press's helper (review I1) is the player's, declared above the press under the same option, and false without it.
+        self.assertEqual(open_conditions(ui, ui.index("static bool guarded_playing(void);")), [PLAYER])
+        self.assertEqual(open_conditions(ui, ui.index("static bool guarded_playing(void)\n{")), [PLAYER])
+        self.assertIn("#else\n#define guarded_playing() false\n#endif", ui)
         start = c_function(ui, "esp_err_t muse_ui_start(void)")
         self.assertLess(start.index("display_start(&s_indev)"), start.index("bench_touch_install();"))
         self.assertLess(start.index("display_lock(-1)"), start.index("bench_touch_install();"))
@@ -687,17 +691,25 @@ static void real_read(lv_indev_t *indev, lv_indev_data_t *data)
 }
 static int g_waits;            /* lv_indev_wait_release calls */
 __attribute__((unused)) static void lv_indev_wait_release(lv_indev_t *indev) { (void)indev; g_waits++; printf(" wait"); }
+/* What LVGL 9.5.0 last processed: indev->state, which it sets from the read's data only after the read callback returns
+ * (lv_indev_read), so inside the callback it is the last read's. */
+static lv_indev_state_t g_lvgl_state = LV_INDEV_STATE_RELEASED;
+__attribute__((unused)) static lv_indev_state_t lv_indev_get_state(const lv_indev_t *indev) { (void)indev; return g_lvgl_state; }
 
 """
 
     TOUCH_HELPERS = r"""
 
-/* One read, the way LVGL makes it: the data starts zeroed. */
+/* on_any_press's (muse_ui.c, outside the block: test_muses_touch_never_confirms_a_pairing compiles it in). */
+__attribute__((unused)) static bool (*const g_playing)(void) = guarded_playing;
+
+/* One read, the way LVGL makes it: the data starts zeroed, and LVGL keeps its state once the callback has returned. */
 static lv_indev_data_t read_now(void)
 {
     lv_indev_data_t d;
     memset(&d, 0, sizeof d);
     g_cb(NULL, &d);
+    g_lvgl_state = d.state;
     return d;
 }
 
@@ -835,13 +847,13 @@ int main(int argc, char **argv)
 }
 """
 
-    def run_touch_harness(self, scenario, main=None):
+    def run_touch_harness(self, scenario, main=None, prefix=""):
         """muse_ui.c's touch player block (from its comment to its #endif), compiled over a fake LVGL with `main` (TOUCH_MAIN, or a
-        case's own), and run once a scenario: its output lines."""
+        case's own) and `prefix` before the block, and run once a scenario: its output lines."""
         source = (MUSE / "muse_ui.c").read_text()
         start = source.index("/*\n * Bench touch")
         block = source[start:source.index("\n#endif", start)]
-        program = self.TOUCH_PRELUDE + block + self.TOUCH_HELPERS + (main or self.TOUCH_MAIN)
+        program = self.TOUCH_PRELUDE + prefix + block + self.TOUCH_HELPERS + (main or self.TOUCH_MAIN)
         with tempfile.TemporaryDirectory() as tmp:
             exe = build_bench("bench_touch", program, tmp)
             cases = {name: apps_host.run(exe, *args) for name, args in scenario.items()}
@@ -1090,6 +1102,20 @@ int main(int argc, char **argv)
     } else if (!strcmp(what, "finger_at_take")) {
         printf("queued=%d\n", muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD));
         reads("finger_at_take", 2, 15, 1);
+    } else if (!strcmp(what, "finger_lifts_at_take")) {
+        /* A finger holds an object (LVGL's last read was its press), and lifts on the very read that takes the drag. */
+        g_finger = true;
+        uint32_t t0 = g_tick;
+        real_calls = 0;
+        printf("finger_lifts_at_take:");
+        show("", read_now(), t0);
+        printf(" queued=%d", muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD));
+        g_finger = false;
+        for (int i = 0; i < 2; i++) {
+            g_tick += 15;
+            show("", read_now(), t0);
+        }
+        printf(" real=%d waits=%d\n", real_calls, g_waits);
     } else if (!strcmp(what, "refused")) {
         g_admit = 0;
         printf("queued=%d\n", muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD));
@@ -1172,6 +1198,15 @@ int main(int argc, char **argv)
         out = self.run_guarded("finger_at_take")["finger_at_take"]
         self.assertEqual(self.tokens(out[1]), ["end2@0", "P7,9@0", "P7,9@15"])
 
+    def test_a_finger_lifting_at_the_take_refuses_a_guarded_drag(self):
+        # Review C1: LVGL still holds the finger's press while the take's read runs (its state is the last read's), and with
+        # PRESS_LOCK it would carry the injected point on as that object's press. So LVGL's own state counts too: a finger whose
+        # lift is this very read refuses the drag (MUSE_UI_GUARD_FINGER, 2) before admit is asked, and LVGL gets the finger's
+        # release, so its press ends as a finger's does.
+        out = self.run_guarded("finger_lifts_at_take")["finger_lifts_at_take"]
+        self.assertEqual(self.tokens(out[0]), ["P7,9@0", "queued=1", "end2@0", "R7,9@15", "R7,9@30"])
+        self.assertTrue(out[0].endswith("real=3 waits=0"), out[0])
+
     def test_an_admit_that_says_no_presses_nothing(self):
         # MUSE_UI_GUARD_REFUSED (1): the end at once, and LVGL gets the real read, a bare screen.
         out = self.run_guarded("refused")["refused"]
@@ -1225,6 +1260,78 @@ int main(int argc, char **argv)
         self.assertEqual(first[:2], ["admit233,300", "P233,300@0"])
         release = first.index("R233,300@90")
         self.assertEqual(first[release + 1:release + 3], ["end0@90", "P100,100@105"])
+
+    # The touch-talk boards' pairing confirm (review I1): on_any_press, LVGL's PRESSED of every touch, presses talk while the Link
+    # waits for a person's press to confirm pairing. Compiled from muse_ui.c with its declaration of the player's helper, over fakes.
+    PRESS_FAKES = r"""
+typedef struct { int unused; } lv_event_t;
+typedef enum { MUSE_LINK_IDLE = 0, MUSE_LINK_CONFIRM } muse_link_state_t;
+typedef struct { bool touch_talk; } fake_board_t;
+static const fake_board_t fake_board = {true};
+static const fake_board_t *muse_board = &fake_board;
+static muse_link_state_t g_link = MUSE_LINK_CONFIRM;
+static muse_link_state_t muse_link_state(void) { return g_link; }
+static void muse_input_touch_talk(bool down) { printf(" talk%d", down ? 1 : 0); }
+static void muse_state_poke(void) { printf(" poke"); }
+"""
+
+    PRESS_MAIN = r"""
+static bool admit(int x, int y) { (void)x, (void)y; return true; }
+static bool keep(int x, int y) { (void)x, (void)y; return true; }
+static void end(muse_ui_guard_end_t how, uint32_t ms) { printf(" end%d@%u", (int)how, (unsigned)ms); }
+static const muse_ui_guard_t GUARD = {admit, keep, end};
+
+int main(void)
+{
+    s_indev = (lv_indev_t *)&g_tick;
+    g_cb = real_read;
+    g_finger = false;
+    bench_touch_install();
+    printf("person:");
+    on_any_press(NULL);                       /* a finger's press: the talk press and release that confirm pairing */
+    printf("\nmuse:");
+    muse_ui_guarded_drag(233, 300, 233, 300, 80, &GUARD);
+    read_now();                               /* the take: the drag plays from this read */
+    on_any_press(NULL);                       /* LVGL's PRESSED of Muse's touch: no talk */
+    for (int i = 0; i < 5; i++) {             /* to 75 ms: still pressed */
+        g_tick += 15;
+        read_now();
+    }
+    on_any_press(NULL);                       /* still Muse's, up to its release */
+    g_tick += 15;
+    read_now();                               /* the release */
+    g_tick += 15;
+    read_now();                               /* its end */
+    printf("\nafter:");
+    on_any_press(NULL);                       /* a person's again */
+    printf("\nbench:");
+    muse_ui_bench_touch(MUSE_UI_TOUCH_TAP, 100, 100);
+    read_now();
+    on_any_press(NULL);                       /* a bench script isn't Muse's touch: as before */
+    printf("\nunpaired:");
+    g_link = MUSE_LINK_IDLE;
+    on_any_press(NULL);
+    printf("\n");
+    return 0;
+}
+"""
+
+    def test_muses_touch_never_confirms_a_pairing(self):
+        # Review I1: on a touch-talk board, while the Link waits for a person's press to confirm pairing, a press is a talk press
+        # and release. Muse's own touch (a guarded drag, from its take to its end) presses nothing of the kind; a person's press
+        # and a bench script still do. Every press still pokes the idle timer.
+        ui = (MUSE / "muse_ui.c").read_text()
+        press = c_function(ui, "static void on_any_press(lv_event_t *e)")
+        decl_at = ui.index("static bool guarded_playing(void);")
+        decl = ui[ui.rindex("\n#if ", 0, decl_at) + 1:ui.index("#endif", decl_at) + len("#endif")]
+        self.assertLess(ui.index(decl), ui.index(press))
+        self.assertIn("!guarded_playing()", press)
+        out = self.run_touch_harness({"press": ()}, main=self.PRESS_MAIN, prefix=self.PRESS_FAKES + decl + "\n" + press + "\n")
+        lines = [line for line in out["press"] if line != "installed=1"]
+        self.assertEqual(lines, ["person: talk1 talk0 poke", "muse: poke poke end0@90", "after: talk1 talk0 poke",
+                                 "bench: talk1 talk0 poke", "unpaired: poke"])
+        # A build with neither option has no player: the helper is false there, and nothing of the player is compiled in.
+        self.assertIn("#else\n#define guarded_playing() false\n#endif", decl)
 
     # ---- The clock and Muse's slide: the page frames summary (Task 1 of the perf plan) ----
 

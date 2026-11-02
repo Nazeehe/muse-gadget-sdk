@@ -119,8 +119,9 @@ void muse_ui_bench_drag(int x1, int y1, int x2, int y2, int ms);
  * to its own point), from a slot of its own that a bench request never replaces, with three checks of its caller's, all called
  * on the LVGL task from inside the input read, with nothing of LVGL's in between:
  * - At the read that takes it, the real touch is read first: a finger on the screen refuses it (MUSE_UI_GUARD_FINGER) and LVGL
- *   gets that read, the finger's own. Otherwise admit(x1, y1) says whether it may press there, before LVGL sees the point
- *   (false: MUSE_UI_GUARD_REFUSED, and LVGL gets the real read).
+ *   gets that read, the finger's own; so does a finger LVGL still holds from its last read (lv_indev_get_state), one lifting
+ *   on this very read, whose press LVGL would otherwise carry on with the drag's point. Otherwise admit(x1, y1) says whether
+ *   it may press there, before LVGL sees the point (false: MUSE_UI_GUARD_REFUSED, and LVGL gets the real read).
  * - At every read after that, the real touch is read into a read of its own, which LVGL never sees, and keep(x, y) is asked
  *   about the point this read would give, its release's included. A finger on the screen, or a keep that says false, cuts the
  *   drag: lv_indev_wait_release, then a release at the last point given, so LVGL sends the object pressed PRESS_LOST and no

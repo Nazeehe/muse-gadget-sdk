@@ -30,10 +30,11 @@
  *    began to come to rest, at most MUSE_APPS_TOUCH_SETTLE_MS, before it answers.
  *
  * The guard (the player calls it on the LVGL task, from inside LVGL's input read, before LVGL sees the point):
- * - admit, at the read that would press the first point (the player has seen no finger on the screen by then): id must be the app
- *   that runs with its table on the layer and not hung (apps_task_touch_target, which reads its app_gen with the id), its layer in
- *   front with no card over it (apps_lv_front, apps_lv_cards_shown), no voice turn on (apps_port_in_turn), the screen lit, and the
- *   point on the app (apps_lv_hit: what LVGL would press there is the layer or inside it). Each refusal names what failed.
+ * - admit, at the read that would press the first point (the player has seen no finger on the screen by then, in this read or in
+ *   LVGL's last one): id must be the app that runs with its table on the layer and not hung (apps_task_touch_target, which reads
+ *   its app_gen with the id), its layer in front with no card over it (apps_lv_front, apps_lv_cards_shown), no voice turn on
+ *   (apps_port_in_turn), the screen lit, and the point on the app (apps_lv_hit: what LVGL would press there is the layer or inside
+ *   it). Each refusal names what failed.
  * - keep, at every read after, with the point that read gives (the release's too): the same but the names lock, so atomics and the
  *   LVGL task's own state only, the app by its app_gen (apps_task_touch_alive). A keep that says no cuts the touch.
  * - end: the touch is over (played, refused or cut), at the first read after its release, when LVGL has sent all it made it send.

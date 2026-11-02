@@ -312,14 +312,14 @@ void apps_port_free(void *ptr) {
 }
 
 /*
- * The console echo. On the 1.75C the console is UART0 at 115200 with no driver installed, so printf busy-waits on the
- * UART's FIFO, about 87 us a byte: a whole line (236 bytes) is about 20 ms. So the echo takes at most 1,024 bytes a
- * second (apps_echo.h). A line that doesn't fit isn't echoed and is counted; the next echoed line comes after
+ * The console echo. On the 1.75C the console is UART0 at 1,000,000 baud with no driver installed, so printf busy-waits on
+ * the UART's FIFO, about 10 us a byte: a whole line (236 bytes) is about 2.4 ms, and was 20 ms at the 115200 the budget
+ * was set for. So the echo takes at most 1,024 bytes a second (apps_echo.h). A line that doesn't fit isn't echoed and is counted; the next echoed line comes after
  * "@app.log <id> (<N> lines not echoed)", which takes its bytes too, <id> being the app of the last line not echoed.
  * The log ring and the status keep every line.
  *
  * The app task never waits for the console inside a call (Task 13's F3). picolibc holds stdout's lock for a whole
- * printf, so a print there would wait behind another task's 6 KB reply (about 0.53 s) with the call's 1 s wall clock
+ * printf, so a print there would wait behind another task's 6 KB reply (about 61 ms) with the call's 1 s wall clock
  * running. So apps_port_log only queues the line, with its note, in a block of APPS_ECHO_QUEUE bytes as the console
  * sends them (CRLF counted): what the bucket lets a call echo, a burst and a second of the rate. A line the queue has no
  * room for is counted as one past the bucket is. apps_port_log_drain, which the app task calls after every call and in
@@ -385,7 +385,7 @@ void apps_port_log_drain(void) {
  * host hands a transfer to the reader only once a packet shorter than 64 bytes ends it. A line whose length, CRLF
  * included, is a multiple of 64 ends on a full packet, so the host kept it until the console printed again. ESP-IDF's
  * console forwards fsync to that port, which waits (50 ms at most) for the host to take the last packet and then sends
- * a zero-length one. The UART's fsync waits for its FIFO to empty, about 11 ms at most at 115200 baud.
+ * a zero-length one. The UART's fsync waits for its FIFO to empty, about 1.3 ms at most at 1,000,000 baud.
  *
  * Both calls are made holding stdout's lock. fflush takes it for itself, but fsync takes none, and its flushes reach
  * the USB port's FIFO while another task may be filling it. A screenshot (muse_console_hold) streams through that

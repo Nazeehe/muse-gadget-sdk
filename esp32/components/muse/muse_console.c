@@ -48,8 +48,8 @@ void muse_console_write(const void *buf, size_t n)
  * nothing here can bound it: ftrylockfile in this libc takes a global lock and returns 0 whatever the stream, so it
  * neither tells that stdout is busy nor holds it (a board run showed the log landing inside the stream, and the global
  * lock never given back), and the FILE's own lock is internal to the libc. The wait is for another task's line, which
- * the console bounds: a reply takes 0.5 s at most (6 KB at 115200 baud), the app echo's queue about 0.2 s, and each
- * flush after one of its lines 50 ms at most. */
+ * the console bounds: a reply takes 0.5 s at most (6 KB at 115200 baud; about 61 ms at the 1.75C's 1,000,000), the app
+ * echo's queue about 0.2 s, and each flush after one of its lines 50 ms at most. */
 void muse_console_hold(void)
 {
     flockfile(stdout);

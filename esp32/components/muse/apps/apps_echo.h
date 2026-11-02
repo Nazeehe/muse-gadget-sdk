@@ -18,8 +18,8 @@
 
 /*
  * The budget of the gadget's console echo of app log lines (apps_port_idf.c): a token bucket of bytes. On the 1.75C the
- * console is UART0 at 115200 with no driver, so each byte is a busy-wait of about 87 us on the task that prints (the app
- * task, inside the call's wall clock). The echo takes at most APPS_ECHO_RATE bytes a second, from a burst of
+ * console is UART0 with no driver, so each byte is a busy-wait on the task that prints (the app task, inside the call's wall
+ * clock): about 10 us at its 1,000,000 baud, and 87 us at the 115200 the budget was set for. The echo takes at most APPS_ECHO_RATE bytes a second, from a burst of
  * APPS_ECHO_BURST; the log ring and the status keep every line, echoed or not. Portable C, so tests/test_muse_apps_port.py
  * checks the arithmetic on the host.
  */

@@ -182,6 +182,70 @@ class FrameStatsTest(unittest.TestCase):
         self.assertEqual(cmake.count("muse_frame_stats.c"), 1)
 
 
+class ConsoleBaudTest(unittest.TestCase):
+    """The 1.75C's console UART (ruling P2 of the perf plan): every line the console prints spins the task that prints it until
+    UART0, the primary console, with no driver, has sent it. The board's overlay runs it at 1,000,000 baud, the most ESP-IDF's
+    Kconfig allows with power management on, and the rate takes only with the custom UART chosen: with the default one the baud
+    has no prompt, and kconfgen drops a value set for it ("not visible"). USB-Serial-JTAG stays the secondary output, which the
+    console's input and the tools use."""
+
+    OVERLAY = ROOT / "devices/sdkconfig.muse-waveshare-s3-175c"
+    BAUD = 1000000
+
+    def test_the_175c_console_uart_runs_at_1_mbaud(self):
+        overlay = self.OVERLAY.read_text()
+        self.assertRegex(overlay, r"(?m)^CONFIG_ESP_CONSOLE_UART_CUSTOM=y$")
+        self.assertRegex(overlay, rf"(?m)^CONFIG_ESP_CONSOLE_UART_BAUDRATE={self.BAUD}$")
+        self.assertRegex(overlay, r"(?m)^CONFIG_PM_ENABLE=y$")   # which ends the baud's range at 1,000,000
+        self.assertNotIn("2000000", overlay)
+        # UART0 on its usual pins (the custom UART's defaults), and USB-Serial-JTAG the secondary output, never the primary.
+        self.assertNotRegex(overlay, r"(?m)^CONFIG_ESP_CONSOLE_(UART_DEFAULT|USB_SERIAL_JTAG|USB_CDC|NONE|UART_CUSTOM_NUM_1|"
+                                     r"SECONDARY_NONE|UART_TX_GPIO|UART_RX_GPIO)=")
+        self.assertEqual(len(re.findall(r"(?m)^CONFIG_ESP_CONSOLE_\w+=", overlay)), 2)
+        # Nothing else the 1.75C's builds load (board.sh: defaults, muse, the board's, muse-apps, muse-bench) sets the console.
+        for other in ("sdkconfig.defaults", "devices/sdkconfig.muse", "devices/sdkconfig.muse-apps", "devices/sdkconfig.muse-bench"):
+            with self.subTest(other):
+                self.assertNotIn("CONFIG_ESP_CONSOLE", (ROOT / other).read_text())
+        board = (TOOLS / "board.sh").read_text()
+        self.assertIn('defaults="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-$profile"', board)
+        self.assertIn("s3)      profile=waveshare-s3-175c;", board)
+
+    def test_the_baud_is_in_kconfigs_range(self):
+        # What ESP-IDF's Kconfig says of the baud in a 1.75C build (its kconfig_menus.json, when a build left one): a prompt with the
+        # custom UART, and a range that ends at 1,000,000 with PM_ENABLE.
+        menus = [ROOT / f"build-muse-waveshare-s3-175c{suffix}/config/kconfig_menus.json" for suffix in ("-apps-bench", "")]
+        menus = [path for path in menus if path.is_file()]
+        if not menus:
+            self.skipTest("no 1.75C build here")
+        import json
+
+        def find(nodes):
+            for node in nodes:
+                if node.get("name") == "ESP_CONSOLE_UART_BAUDRATE":
+                    return node
+                found = find(node.get("children", []))
+                if found:
+                    return found
+            return None
+
+        for path in menus:
+            with self.subTest(path.parent.parent.name):
+                node = find(json.loads(path.read_text()))
+                self.assertIsNotNone(node)
+                self.assertEqual(node["range"], [1200, self.BAUD])
+
+    def test_agents_md_says_how_fast_the_console_is(self):
+        agents = " ".join((ROOT / "AGENTS.md").read_text().split())
+        per_byte = round(10 * 1e6 / self.BAUD)       # 10 bits a byte, in us
+        default = round(10 * 1e6 / 115200)           # ESP-IDF's default baud
+        self.assertEqual((per_byte, default), (10, 87))
+        self.assertIn(f"On the 1.75C that UART, UART0 and the primary console, runs at {self.BAUD:,} baud "
+                      "(`CONFIG_ESP_CONSOLE_UART_CUSTOM` and `CONFIG_ESP_CONSOLE_UART_BAUDRATE` in "
+                      "`devices/sdkconfig.muse-waveshare-s3-175c`), the most ESP-IDF allows with power management on: "
+                      f"{per_byte} us a byte, where the default 115200 took {default}. Nothing reads it: the console's input and the "
+                      "tools use USB-Serial-JTAG, the secondary output, which the baud doesn't touch.", agents)
+
+
 SNAPSHOT_PRELUDE = r"""
 #include <pthread.h>
 #include <stdbool.h>

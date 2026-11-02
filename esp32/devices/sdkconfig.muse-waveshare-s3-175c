@@ -66,6 +66,15 @@ CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
 CONFIG_PM_PROFILING=y
 
+# The console's UART0, its primary output, has no driver: every line printed
+# spins the task that prints it until the UART has sent it, at 87 us a byte at
+# the default 115200. Nothing reads it (the console's input and the tools use
+# USB-Serial-JTAG, its secondary output), so it runs at 1,000,000 baud, 10 us a
+# byte: the most Kconfig allows with PM_ENABLE. The baud takes only with the
+# custom UART (UART0 on its usual pins), which gives it a prompt.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=1000000
+
 # It looks like a pocket watch, so it starts on one: an analog dial left of
 # Muse's face. Set CONFIG_MUSE_CLOCK_TZ to your time zone (UTC by default).
 CONFIG_MUSE_CLOCK=y

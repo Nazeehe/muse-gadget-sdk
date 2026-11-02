@@ -23,7 +23,7 @@
  * the snapshot's upload from Task 25.
  *
  * The task has a stack of APPS_IO_STACK bytes in PSRAM (its TCB is in internal RAM, as every TCB is) and priority
- * APPS_IO_PRIORITY, on core APPS_IO_CORE: its long console lines (a 6 KB reply spins about 0.53 s on the driverless UART)
+ * APPS_IO_PRIORITY, on core APPS_IO_CORE: its long console lines (a 6 KB reply spins about 61 ms on the driverless UART)
  * and its heavy steps (SHA-256, package copies, the result's trim) never come in front of the app task or LVGL, on core 1.
  * A stack in PSRAM may write flash on this firmware (ruling X18): code and rodata run from PSRAM, so IDF keeps the cache on
  * through a flash write (apps_io.c refuses to build otherwise). So the worker takes none of the internal RAM the Link needs

@@ -207,7 +207,13 @@ frame, or at its 128th frame, and only from LVGL's `LV_EVENT_REFR_READY`, never
 from a scroll or input callback. For the same reason the bands print
 `tearing effect: torn refresh of ...` only for the first torn refresh of each
 batch of 30, which the batch line counts: every line the console prints spins
-the task that prints it until the UART has sent it.
+the task that prints it until the UART has sent it. On the 1.75C that UART,
+UART0 and the primary console, runs at 1,000,000 baud
+(`CONFIG_ESP_CONSOLE_UART_CUSTOM` and `CONFIG_ESP_CONSOLE_UART_BAUDRATE` in
+`devices/sdkconfig.muse-waveshare-s3-175c`), the most ESP-IDF allows with
+power management on: 10 us a byte, where the default 115200 took 87. Nothing
+reads it: the console's input and the tools use USB-Serial-JTAG, the secondary
+output, which the baud doesn't touch.
 
 Or run `idf.py` directly:
 

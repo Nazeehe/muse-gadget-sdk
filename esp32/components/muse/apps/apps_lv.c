@@ -1264,8 +1264,8 @@ bool apps_lv_apply(bool in_callback) {
     }
     if (took > SLOW_US) {
         s_slow++;
-        /* Every slow pass is counted, and the log has one line a second: a console at 115200 baud that is written to
-         * at the frame rate blocks the LVGL task, which makes the passes slower. The line says how many there were
+        /* Every slow pass is counted, and the log has one line a second: a console that is written to at the frame
+         * rate blocks the LVGL task (its UART spins the task that prints), which makes the passes slower. The line says how many there were
          * since the last and the longest of them. */
         s_slow_unlogged++;
         s_slow_worst_us = took > s_slow_worst_us ? took : s_slow_worst_us;

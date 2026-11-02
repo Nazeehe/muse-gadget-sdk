@@ -48,8 +48,8 @@
  *   for each voice. What the I2S queue adds after the render is the board's to measure.
  * - "sound render <us> us (<n> frames, <v> voices)": how long a render held the lock, once for each number of voices (and tails) it
  *   rendered, so that the most the voice task, or a task that waits for the lock, can be held up shows on the board.
- * - "sound cut <n> voices (<ms> ms fade)": apps_mix_stop_all faded n voices that played (a ring, a talk press, the app going behind
- *   or covered), logged at the next render, the one that begins their fades.
+ * - "sound cut <n> voices (<ms> ms fade)": apps_mix_stop_all stopped n voices (a ring, a talk press, the app going behind or
+ *   covered), those that had rendered fading out, logged at the next render.
  */
 
 #define FRAMES_PER_MS (APPS_MIX_RATE / 1000)
@@ -110,7 +110,7 @@ static EXT_RAM_BSS_ATTR struct {
     uint32_t starts;           /* starts so far */
 #if CONFIG_MUSE_BENCH
     uint32_t held_logged;      /* bit n: a render of n voices and tails has logged its hold */
-    uint32_t cut;              /* voices apps_mix_stop_all faded since the last render */
+    uint32_t cut;              /* voices apps_mix_stop_all stopped since the last render */
 #endif
 } M;
 static atomic_bool s_active;

@@ -796,8 +796,8 @@ class GuideAndSkill(unittest.TestCase):
                        "sound, against 865 us and 2 muted; `>mem`'s internal and DMA free moved 0 and 0 bytes while it played, and PSRAM "
                        "only with the app's Lua heap.",
                        f"The fixture's alarm cut its looping clip at the ring (`sound cut 1 voices ({fade} ms fade)`, 55 ms after the "
-                       "ring's chirp, which the voice task writes first), and a talk press stopped the clip cleanly, by ear; the app was "
-                       "hidden for the turn and shown again after it, silent.",
+                       "ring's chirp, which the voice task writes first), and a talk press stopped the clip cleanly, by ear (the voice "
+                       "path's `sound cut` line was not captured); the app was hidden for the turn and shown again after it, silent.",
                        "`apps_svc.c` (`time`, `os`, `timer`, `alarm`, `store`, `sys`), `apps_sound.c` (`sound`) and `apps_mix.c`"):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)

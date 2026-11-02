@@ -817,8 +817,8 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   only with the app's Lua heap. The fixture's alarm cut its looping clip at
   the ring (`sound cut 1 voices (5 ms fade)`, 55 ms after the ring's chirp,
   which the voice task writes first), and a talk press stopped the clip
-  cleanly, by ear; the app was hidden for the turn and shown again after it,
-  silent.
+  cleanly, by ear (the voice path's `sound cut` line was not captured); the
+  app was hidden for the turn and shown again after it, silent.
 - **Lists:** a box with `scroll = "y"` scrolls up and down with LVGL's own
   drag, throw and elastic edge (`style_box` in `apps_lv.c`), and takes the
   touches on it, so a drag that begins on it or on a row in it scrolls it: the

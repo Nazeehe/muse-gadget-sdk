@@ -1870,6 +1870,26 @@ void apps_lv_bench_dump_hold(uint32_t us) {
     }
     event("dump hold %u", (unsigned)us);
 }
+
+/* Fix round 1 (ruling P15): each call that ends, by its kind, from the app task (for the slow frame's ended=), and each pass the apply
+ * step forced on a change held mid-call, from the LVGL task (the summary's forced=). */
+static atomic_uint bench_ended[APPS_LV_CALL_KINDS], bench_forced;
+
+void apps_lv_bench_call_ended(int kind) {
+    if (app_task_of_thread() == NULL) {
+        error("apps_lv_bench_call_ended off the app task");
+    }
+    if (kind < 0 || kind >= APPS_LV_CALL_KINDS) {
+        error("apps_lv_bench_call_ended with kind %d", kind);
+        return;
+    }
+    atomic_fetch_add(&bench_ended[kind], 1);
+}
+
+void apps_lv_bench_forced(void) {
+    lvgl_only("apps_lv_bench_forced");
+    atomic_fetch_add(&bench_forced, 1);
+}
 #endif
 
 void apps_lv_set_ui(apps_ui_t *ui) {
@@ -4650,6 +4670,137 @@ static void bench_counts_calls_and_times_the_dump(void) {
     apps_task_status(st);
     WAIT(from, "dump hold ");
     heap_caps_free(st);
+}
+#endif
+
+#if CONFIG_MUSE_BENCH
+/* Fix round 1 (ruling P15). Each call that ends is told to apps_lv by its kind, for the slow frame's ended=: a widget's event, a
+ * timer's, and any other (main.lua, start, show, a message). A pass the apply step forces on a change held mid-call (the 4th frame
+ * that finds it held) is noted once, for the summary's forced=; a pass at a call's end isn't one. And the bench's '>apply poll off'
+ * (muse_apps_bench_poll) holds the poll off: the next tick turns it off even with the app in front, the poll's step asks for nothing
+ * when a call ends, and frame_tick's tick alone applies; '>apply poll on' puts it back. */
+static const char APP_KINDS[] =
+    "local app = {}\n"
+    "function app.start()\n"
+    "  local b = ui.button{text = 'Set'}\n"
+    "  b:on('tap', function() b:set{text = 'Done'} print('set') end)\n"
+    "  ui.button{text = 'Hang'}:on('tap', function() print('hang') end)\n"
+    "end\n"
+    "function app.message(event, data)\n"
+    "  if event == 'later' then timer.after(40, function() print('fired') end) end\n"
+    "  return {}\n"
+    "end\n"
+    "return app\n";
+
+/* The calls that ended, by kind, since `before`: into d. */
+static void ended_since(const unsigned before[APPS_LV_CALL_KINDS], unsigned d[APPS_LV_CALL_KINDS]) {
+    for (int k = 0; k < APPS_LV_CALL_KINDS; k++) {
+        d[k] = atomic_load(&bench_ended[k]) - before[k];
+    }
+}
+
+static void ended_now(unsigned out[APPS_LV_CALL_KINDS]) {
+    for (int k = 0; k < APPS_LV_CALL_KINDS; k++) {
+        out[k] = atomic_load(&bench_ended[k]);
+    }
+}
+
+static void bench_tells_call_kinds_forced_passes_and_holds_the_poll(void) {
+    CHECK(lv_poll_cb != NULL, "muse_apps_ui_build hands apps_lv the apply step for its poll");
+    if (lv_poll_cb == NULL) {
+        return;
+    }
+    const file_t files[] = {LUA("main.lua", APP_KINDS)};
+    char err[200];
+    unsigned before[APPS_LV_CALL_KINDS], d[APPS_LV_CALL_KINDS];
+    ended_now(before);
+    CHECK(apps_task_run(make_pkg("kinds", "Kinds", files, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "front 1");
+    WAIT_FRAMES(3);
+    ended_since(before, d);
+    CHECK(d[APPS_LV_CALL_TIMER] == 0 && d[APPS_LV_CALL_EVENT] == 0 && d[APPS_LV_CALL_OTHER] >= 2,
+          "main.lua and start() are others: %u/%u/%u", d[0], d[1], d[2]);
+    /* A tap: one event call. */
+    ended_now(before);
+    int from = mark();
+    TAP(0);
+    WAIT(from, "echo kinds set");
+    ended_since(before, d);
+    CHECK(d[APPS_LV_CALL_TIMER] == 0 && d[APPS_LV_CALL_EVENT] == 1 && d[APPS_LV_CALL_OTHER] == 0, "a tap: %u/%u/%u", d[0], d[1],
+          d[2]);
+    /* A message (an other) that sets a timer, which fires once (a timer's). */
+    ended_now(before);
+    from = mark();
+    char *reply = apps_task_message("kinds", "later", NULL, false, 0, err, sizeof err);
+    CHECK(reply != NULL, "later: %s", err);
+    apps_port_free(reply);
+    WAIT(from, "echo kinds fired");
+    ended_since(before, d);
+    CHECK(d[APPS_LV_CALL_TIMER] == 1 && d[APPS_LV_CALL_EVENT] == 0 && d[APPS_LV_CALL_OTHER] == 1, "a message and its timer: %u/%u/%u",
+          d[0], d[1], d[2]);
+    /* Forced: a pass at a call's end isn't; the 4th frame's pass on a change held by a call that runs is, once. */
+    atomic_store(&lvgl_ticks_off, true);
+    WAIT_FRAMES(2);
+    ON_LVGL(run_tick, NULL);
+    unsigned forced = atomic_load(&bench_forced);
+    from = mark();
+    TAP(0);
+    WAIT(from, "echo kinds set");
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 1 && asked_in_callback == 0, "the call's end: a pass: %d, %d", asked, asked_in_callback);
+    CHECK(atomic_load(&bench_forced) == forced, "not a forced one: %u", atomic_load(&bench_forced) - forced);
+    from = mark();
+    TAP(0);
+    WAIT(from, "echo kinds set");
+    const int64_t t0 = ((int64_t)3 << 32) - 1000;
+    clock_stop_at(t0);
+    block_print("hang");
+    TAP(1);
+    WAIT_PRINT_BLOCKED();
+    for (int frame = 1; frame <= 3; frame++) {
+        ON_LVGL(run_tick, NULL);
+        CHECK(asked_in_callback == (frame == 1) && asked == (frame == 1), "frame %d: held: %d, %d", frame, asked, asked_in_callback);
+    }
+    CHECK(atomic_load(&bench_forced) == forced, "nothing forced yet: %u", atomic_load(&bench_forced) - forced);
+    ON_LVGL(run_tick, NULL);
+    CHECK(asked == 1 && asked_in_callback == 0, "the 4th: a pass, mid-call: %d, %d", asked, asked_in_callback);
+    CHECK(atomic_load(&bench_forced) == forced + 1, "forced, once: %u", atomic_load(&bench_forced) - forced);
+    ON_LVGL(run_tick, NULL);
+    CHECK(asked == 0 && atomic_load(&bench_forced) == forced + 1, "and nothing more: %d, %u", asked,
+          atomic_load(&bench_forced) - forced);
+    ended_now(before);
+    from = mark();
+    release_print();
+    WAIT(from, "echo kinds hang");
+    ended_since(before, d);
+    CHECK(d[APPS_LV_CALL_EVENT] == 1, "the held call was a tap: %u/%u/%u", d[0], d[1], d[2]);
+    clock_go();
+    ON_LVGL(run_tick, NULL);
+    /* The switch: off, the next tick turns the poll off with the app in front, the poll's step asks for nothing, and the tick applies. */
+    CHECK(atomic_load(&lv_poll_on), "on: the app in front");
+    muse_apps_bench_poll(false);
+    ON_LVGL(run_tick, NULL);
+    CHECK(!atomic_load(&lv_poll_on), "held off: the tick turns the poll off");
+    from = mark();
+    TAP(0);
+    WAIT(from, "echo kinds set");
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 0, "held off: the poll asks for nothing: %d", asked);
+    ON_LVGL(run_tick, NULL);
+    CHECK(asked == 1 && asked_in_callback == 0, "the tick applies: %d, %d", asked, asked_in_callback);
+    CHECK(!atomic_load(&lv_poll_on), "and keeps it off");
+    muse_apps_bench_poll(true);
+    ON_LVGL(run_tick, NULL);
+    CHECK(atomic_load(&lv_poll_on), "on again at the next tick");
+    from = mark();
+    TAP(0);
+    WAIT(from, "echo kinds set");
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 1 && asked_in_callback == 0, "and the poll applies at the call's end: %d, %d", asked, asked_in_callback);
+    atomic_store(&lvgl_ticks_off, false);
+    from = mark();
+    CHECK(apps_task_stop(err, sizeof err), "stop: %s", err);
+    WAIT(from, "free pkg kinds");
 }
 #endif
 
@@ -8322,6 +8473,7 @@ int main(int argc, char **argv) {
         {"a_message_gets_its_reply", a_message_gets_its_reply},
 #if CONFIG_MUSE_BENCH
         {"bench_counts_calls_and_times_the_dump", bench_counts_calls_and_times_the_dump},
+        {"bench_tells_call_kinds_forced_passes_and_holds_the_poll", bench_tells_call_kinds_forced_passes_and_holds_the_poll},
 #endif
         {"run_for_send_is_by_id_behind_and_bounded", run_for_send_is_by_id_behind_and_bounded},
         {"a_message_after_its_caller_gave_up", a_message_after_its_caller_gave_up},

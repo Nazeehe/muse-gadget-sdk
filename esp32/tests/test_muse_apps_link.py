@@ -1070,9 +1070,21 @@ class GuideAndSkill(unittest.TestCase):
         self.assertEqual((lock_ms, slow_us, slow_frame, second, margin, fill), (2, 2000, 50, 1000000, 256, 0xA5))
         self.assertEqual(rest, 1000)
         self.assertIn('static const char *TAG = "muse_apps";', lv)
-        self.assertIn('"apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u stack_peak=%s:%d"', lv)
+        self.assertIn('"apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u stack_peak=%s:%d forced=%u"',
+                      lv)
         self.assertIn('"apply %u us (%u slow since last) visits=%u layout=%u writeback=%u creates=%u texts=%u styles=%u"', lv)
-        self.assertIn('"slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u scroll=%d"', lv)
+        self.assertIn('"slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u scroll=%d inv=%d ended=%u/%u/%u"', lv)
+        # Fix round 1 (ruling P15): ended= prints the kinds in this order; the frames a held change waits before a forced pass, the
+        # refresh period and the switch's words are the code's.
+        self.assertIn("(unsigned)s_frames.ended_in_gap[APPS_LV_CALL_TIMER], (unsigned)s_frames.ended_in_gap[APPS_LV_CALL_EVENT], "
+                      "(unsigned)s_frames.ended_in_gap[APPS_LV_CALL_OTHER]", " ".join(lv.split()))
+        held = number(strip_c_comments((APPS / "apps_task.c").read_text()), "HELD_FRAMES_MAX")
+        refr_period = int(re.search(r"(?m)^CONFIG_LV_DEF_REFR_PERIOD=(\d+)$", (ROOT / "devices/sdkconfig.muse").read_text()).group(1))
+        self.assertEqual((held, refr_period), (3, 15))
+        console = (APPS / "apps_console.c").read_text()
+        for line in ('printf("@apply poll %s\\n", on ? "on" : "off");', 'printf("@apply.error usage: apply poll on|off\\n");',
+                     'strcmp(line, "apply poll on") == 0', 'strcmp(line, "apply poll off") == 0'):
+            self.assertIn(line, console)
         self.assertIn('printf("memtest: memcpy psram %u B %lld us; %s\\n"', mem_c)
         self.assertIn('"async_memcpy %u B %lld us"', mem_c)
         self.assertIn('" (uninstall failed: %s)"', mem_c)  # ruling P8 (m3): a driver that stays is said on the line
@@ -1087,12 +1099,13 @@ class GuideAndSkill(unittest.TestCase):
                 "tag).",
                 "Once a second while an app is in front with no launcher or card over it, `frame_tick` has it print `apply: calls=<n> "
                 "applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us> "
-                "stack_peak=<path>:<bytes>`:",
+                "stack_peak=<path>:<bytes> forced=<n>`:",
                 "the passes that ran (a frame's or the call-end poll's: \"The apply step\" under Muse apps), the skips (each ended call "
                 f"whose changes waited for a call that ran, and each pass a UI lock not free within {lock_ms} ms held back),",
                 "the most time between the ends of two passes that changed something,",
                 "the longest the app task's dump of its table (`>app.status`) held the UI lock,",
-                "and the deepest stack path so far with the bytes it left free (`none:-1` before one is found).",
+                "and the deepest stack path so far with the bytes it left free (`none:-1` before one is found), and the passes the "
+                f"apply step forced, mid-call, on a change that calls running back to back had held for {held} frames.",
                 f"The slow pass's line (a pass over {slow_us} us, at most one line a second) adds `visits=<us> layout=<us> "
                 "writeback=<us> creates=<n> texts=<n> styles=<n>` for the longest pass since the last line.",
                 # Ruling P5b: a frame over 50 ms after motion, or 50 ms of a refresh's own work; a rest of a second never prints.
@@ -1102,9 +1115,18 @@ class GuideAndSkill(unittest.TestCase):
                 f"`LV_EVENT_REFR_START` to `LV_EVENT_REFR_READY`, is over {slow_frame} ms, whatever came before.",
                 f"A rest of {rest} ms or more never prints, but a pause of {slow_frame} to {rest - 1} ms after motion can: it reads as small "
                 "work, no applies and `scroll=0`.",
-                "A slow frame prints `slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us> scroll=<0|1>` "
+                "A slow frame prints `slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us> scroll=<0|1> "
+                "inv=<ms> ended=<timer>/<event>/<other>` "
                 "from `LV_EVENT_REFR_READY`: its time, the gap (from the refresh before to this one's `LV_EVENT_REFR_START`),",
-                "and whether an app's scroll box was scrolling (the `scroll frames` test).",
+                "whether an app's scroll box was scrolling (the `scroll frames` test), when the display was first marked for redraw "
+                "after the refresh before (its first `LV_EVENT_INVALIDATE_AREA` outside a refresh, from that refresh's end; -1 with "
+                "none), and the app's calls that ended in the gap, by kind: a timer's, a widget's event (a tap, a press, a release) "
+                "and any other.",
+                "LVGL pauses its refresh timer at each refresh and resumes it at the next invalidation, so `inv` near `gap` says the "
+                "refresh waited for something to change, and a `gap` more than a refresh period (`CONFIG_LV_DEF_REFR_PERIOD`, "
+                f"{refr_period} ms) past `inv` says something held the LVGL task after the change.",
+                "`>apply poll off` holds the call-end poll off, so frame_tick's pass alone applies an app's changes, and `>apply poll "
+                "on` puts it back (on as it boots).",
                 "The stack paths are the apply pass (with an app on the layer in front), the home pages' slide (`LV_EVENT_SCROLL_BEGIN`), "
                 "the launcher carousel's scroll "
                 "and app.control's snapshot (`muse_bench_mem.c`):",

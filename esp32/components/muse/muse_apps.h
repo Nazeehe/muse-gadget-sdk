@@ -76,8 +76,18 @@ bool muse_apps_starting(void);
  *   app.tap <id> <x> <y> [ms]            app.control's tap (muse_apps_touch, ms MUSE_APPS_TOUCH_TAP_MS when it has none): the
  *                                        I/O worker prints the payload as "@app {"op":"tap",...}", or "@app.err" with its code
  *   app.drag <id> <x1> <y1> <x2> <y2> <ms>  app.control's drag, the same way ("op":"drag")
+ * A bench build (CONFIG_MUSE_BENCH) takes one more line, which doesn't start "app.":
+ *   apply poll on|off                    the call-end poll on (as it boots) or held off (muse_apps_bench_poll), replying
+ *                                        "@apply poll on|off"; anything else that starts "apply" replies
+ *                                        "@apply.error usage: apply poll on|off"
  */
 bool muse_apps_console(const char *line);
+
+#if CONFIG_MUSE_BENCH
+/* The bench's '>apply poll on|off' (perf plan Task 4, ruling P15): off, the call-end poll is held off and frame_tick's pass alone
+ * applies an app's changes (muse_apps_ui_tick turns the poll off at the next frame); on puts it back. Any task. */
+void muse_apps_bench_poll(bool on);
+#endif
 
 /* The console's stage (the files app.put sent, waiting for app.commit) is freed once it has had no put for this long, with one log
  * line: a sender that stopped half-way would otherwise hold up to 2 MB of PSRAM until the next put for another id or a commit. The app

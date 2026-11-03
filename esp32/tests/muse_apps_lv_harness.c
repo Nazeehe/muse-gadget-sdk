@@ -4528,6 +4528,7 @@ typedef struct {
     unsigned avg, max, dump;
     char path[16];
     int peak;
+    unsigned forced;  /* fix round 1 (ruling P15): the forced passes of the second */
 } apply_line_t;
 
 /* The summaries logged since the last esp_clear, in order, into out (at most cap); how many there were. A line of another shape after
@@ -4539,10 +4540,10 @@ static int apply_lines_at(int line, apply_line_t *out, int cap) {
         apply_line_t s = {0};
         int used = 0;
         int got = sscanf(at + sizeof prefix - 1, "calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u "
-                                                 "stack_peak=%15[a-z]:%d%n",
+                                                 "stack_peak=%15[a-z]:%d forced=%u%n",
                          &s.calls, &s.applies, &s.in_call, &s.lock_busy, &s.refr, &s.gap_max, &s.avg, &s.max, &s.dump, s.path,
-                         &s.peak, &used);
-        CHECK_AT(line, got == 11 && at[sizeof prefix - 1 + used] == '\n', "a summary of another shape:\n%s", at);
+                         &s.peak, &s.forced, &used);
+        CHECK_AT(line, got == 12 && at[sizeof prefix - 1 + used] == '\n', "a summary of another shape:\n%s", at);
         if (n < cap) {
             out[n] = s;
         }
@@ -8764,6 +8765,7 @@ static void apply_summary_once_a_second(void) {
     apps_lv_bench_dump_hold(800);
     apps_port_ui_unlock();
     CHECK(APPLY(&e), "a pass takes the holds in");
+    apps_lv_bench_forced();  /* fix round 1 (ruling P15): the app task's step says that pass was a forced one */
     fake_refresh();
     fake_refresh();
     fake_refresh();
@@ -8777,10 +8779,10 @@ static void apply_summary_once_a_second(void) {
     CHECK(APPLY_LINES(got, 4) == 1, "one summary:\n%s", esp_peek());
     CHECK(got[0].calls == 7 && got[0].applies == 5 && got[0].in_call == 3 && got[0].lock_busy == 2 && got[0].refr == 3 &&
               got[0].gap_max == 123 && got[0].avg == 1200 && got[0].max == 3000 && got[0].dump == 1234 &&
-              strcmp(got[0].path, "none") == 0 && got[0].peak == -1,
+              strcmp(got[0].path, "none") == 0 && got[0].peak == -1 && got[0].forced == 1,
           "the second:\n%s", esp_peek());
     CHECK(strstr(esp_peek(), "I muse_apps: apply: calls=7 applies=5 skips=3/2 refr=3 gap_max=123 avg=1200 max=3000 dump_hold=1234 "
-                             "stack_peak=none:-1\n") != NULL, "the line as Task 3 reads it:\n%s", esp_peek());
+                             "stack_peak=none:-1 forced=1\n") != NULL, "the line as Task 3 reads it:\n%s", esp_peek());
     esp_clear();
     /* The next second has its own: one pass, 0.5 ms, 835 ms after the last change (the gap goes on across seconds), with the stack
      * found 2345 B from its end. */
@@ -8792,7 +8794,7 @@ static void apply_summary_once_a_second(void) {
     apps_lv_bench_tick(bench_calls);
     CHECK(APPLY_LINES(got, 4) == 1 && got[0].calls == 0 && got[0].applies == 1 && got[0].in_call == 0 && got[0].lock_busy == 0 &&
               got[0].refr == 0 && got[0].gap_max == 835 && got[0].avg == 500 && got[0].max == 500 && got[0].dump == 0 &&
-              strcmp(got[0].path, "apply") == 0 && got[0].peak == 2345,
+              strcmp(got[0].path, "apply") == 0 && got[0].peak == 2345 && got[0].forced == 0,
           "the next second:\n%s", esp_peek());
     esp_clear();
     /* Behind: no second, and nothing printed however long. */
@@ -8905,8 +8907,8 @@ static void slow_frame_anatomy(void) {
     refresh_phases(60000, 1000, 0, 0);
 #if CONFIG_MUSE_BENCH
     CHECK(esp_count("W muse_apps: slow frame ") == 2 &&
-              esp_has_line("W muse_apps: slow frame 81 ms: gap=51 layout=3 render=20 flush=7 applies=1/4000 scroll=0") &&
-              esp_has_line("W muse_apps: slow frame 61 ms: gap=60 layout=1 render=0 flush=0 applies=0/0 scroll=0"),
+              esp_has_line("W muse_apps: slow frame 81 ms: gap=51 layout=3 render=20 flush=7 applies=1/4000 scroll=0 inv=-1 ended=0/0/0") &&
+              esp_has_line("W muse_apps: slow frame 61 ms: gap=60 layout=1 render=0 flush=0 applies=0/0 scroll=0 inv=-1 ended=0/0/0"),
           "the two slow frames:\n%s", esp_peek());
 #endif
     esp_clear();
@@ -8920,7 +8922,7 @@ static void slow_frame_anatomy(void) {
     refresh_phases(55000, 1000, 4000, 0);
 #if CONFIG_MUSE_BENCH
     CHECK(esp_count("W muse_apps: slow frame ") == 1 && esp_has_line("W muse_apps: slow frame 60 ms: gap=55 layout=1 render=4 flush=0 "
-                                                                    "applies=0/0 scroll=0"),
+                                                                    "applies=0/0 scroll=0 inv=-1 ended=0/0/0"),
           "timed again:\n%s", esp_peek());
 #endif
     esp_clear();
@@ -8933,10 +8935,71 @@ static void slow_frame_anatomy(void) {
 #if CONFIG_MUSE_BENCH
     CHECK(display_cbs_for(LV_EVENT_REFR_START) == 1 && display_cbs_for(LV_EVENT_RENDER_START) == 1 &&
               display_cbs_for(LV_EVENT_RENDER_READY) == 1 && display_cbs_for(LV_EVENT_FLUSH_WAIT_START) == 1 &&
-              display_cbs_for(LV_EVENT_FLUSH_WAIT_FINISH) == 1,
-          "one callback for each phase: %d on the display", display_obj.n_cbs);
+              display_cbs_for(LV_EVENT_FLUSH_WAIT_FINISH) == 1 && display_cbs_for(LV_EVENT_INVALIDATE_AREA) == 1,
+          "one callback for each phase, and one for the invalidations: %d on the display", display_obj.n_cbs);
 #else
     CHECK(display_obj.n_cbs == 0, "nothing on the display without the bench: %d", display_obj.n_cbs);
+#endif
+    FINISH(&e);
+}
+
+/* Fix round 1 (ruling P15), a bench build's: the slow frame says when the display was first invalidated after the refresh before
+ * (inv=<ms>: from that refresh's LV_EVENT_REFR_READY to the first LV_EVENT_INVALIDATE_AREA before this one's LV_EVENT_REFR_START, -1 with
+ * none), and the app's calls that ended in its gap (that READY to this START), by kind (ended=<timer>/<event>/<other>, as the app task
+ * tells apps_lv_bench_call_ended). An invalidation inside a refresh (a layout's, or LVGL's probe of the rounder) is neither that
+ * refresh's nor the next one's first, and a call that ends inside a refresh is in neither gap. */
+static void slow_frame_says_when_it_was_dirty_and_what_ended(void) {
+    env_t e;
+    scene(&e);
+    apps_lv_set_front(true);
+    esp_clear();
+#if CONFIG_MUSE_BENCH
+    refresh_phases(5000, 1000, 9000, 0);   /* the first in front: not timed */
+    refresh_phases(30000, 1000, 9000, 0);  /* motion */
+    /* 80 ms: a timer's call ends at 10 ms; the first invalidation at 30, another at 40; two taps' calls end at 45 and 50, and another
+     * call at 55; the refresh starts at 70, invalidates and sees a timer's call end inside it, draws for 9 ms and ends at 80. */
+    clock_us += 10000;
+    apps_lv_bench_call_ended(APPS_LV_CALL_TIMER);
+    clock_us += 20000;
+    fake_display_event(LV_EVENT_INVALIDATE_AREA);
+    clock_us += 10000;
+    fake_display_event(LV_EVENT_INVALIDATE_AREA);
+    clock_us += 5000;
+    apps_lv_bench_call_ended(APPS_LV_CALL_EVENT);
+    clock_us += 5000;
+    apps_lv_bench_call_ended(APPS_LV_CALL_EVENT);
+    clock_us += 5000;
+    apps_lv_bench_call_ended(APPS_LV_CALL_OTHER);
+    clock_us += 15000;
+    fake_display_event(LV_EVENT_REFR_START);
+    clock_us += 1000;
+    fake_display_event(LV_EVENT_INVALIDATE_AREA);
+    apps_lv_bench_call_ended(APPS_LV_CALL_TIMER);
+    fake_display_event(LV_EVENT_RENDER_START);
+    clock_us += 9000;
+    fake_display_event(LV_EVENT_RENDER_READY);
+    fake_display_event(LV_EVENT_REFR_READY);
+    /* 60 ms with nothing invalidated in its gap and nothing ended in it: its layout invalidates, inside the refresh, which is no gap's. */
+    clock_us += 55000;
+    fake_display_event(LV_EVENT_REFR_START);
+    clock_us += 1000;
+    fake_display_event(LV_EVENT_INVALIDATE_AREA);
+    fake_display_event(LV_EVENT_RENDER_START);
+    clock_us += 4000;
+    fake_display_event(LV_EVENT_RENDER_READY);
+    fake_display_event(LV_EVENT_REFR_READY);
+    /* 70 ms: invalidated the moment the refresh before ended, and a timer's call ended at 60. */
+    fake_display_event(LV_EVENT_INVALIDATE_AREA);
+    clock_us += 60000;
+    apps_lv_bench_call_ended(APPS_LV_CALL_TIMER);
+    refresh_phases(5000, 1000, 4000, 0);
+    CHECK(esp_count("W muse_apps: slow frame ") == 3 &&
+              esp_has_line("W muse_apps: slow frame 80 ms: gap=70 layout=1 render=9 flush=0 applies=0/0 scroll=0 inv=30 ended=1/2/1") &&
+              esp_has_line("W muse_apps: slow frame 60 ms: gap=55 layout=1 render=4 flush=0 applies=0/0 scroll=0 inv=-1 ended=0/0/0") &&
+              esp_has_line("W muse_apps: slow frame 70 ms: gap=65 layout=1 render=4 flush=0 applies=0/0 scroll=0 inv=0 ended=1/0/0"),
+          "the three slow frames:\n%s", esp_peek());
+#else
+    CHECK(display_cbs_for(LV_EVENT_INVALIDATE_AREA) == 0, "nothing follows the invalidations without the bench");
 #endif
     FINISH(&e);
 }
@@ -8974,9 +9037,9 @@ static void slow_frame_follows_motion(void) {
     }
 #if CONFIG_MUSE_BENCH
     CHECK(esp_count("W muse_apps: slow frame ") == 3 &&
-              esp_has_line("W muse_apps: slow frame 70 ms: gap=30 layout=2 render=35 flush=3 applies=0/0 scroll=0") &&
-              esp_has_line("W muse_apps: slow frame 160 ms: gap=150 layout=1 render=9 flush=0 applies=0/0 scroll=0") &&
-              esp_has_line("W muse_apps: slow frame 210 ms: gap=200 layout=1 render=9 flush=0 applies=0/0 scroll=0"),
+              esp_has_line("W muse_apps: slow frame 70 ms: gap=30 layout=2 render=35 flush=3 applies=0/0 scroll=0 inv=-1 ended=0/0/0") &&
+              esp_has_line("W muse_apps: slow frame 160 ms: gap=150 layout=1 render=9 flush=0 applies=0/0 scroll=0 inv=-1 ended=0/0/0") &&
+              esp_has_line("W muse_apps: slow frame 210 ms: gap=200 layout=1 render=9 flush=0 applies=0/0 scroll=0 inv=-1 ended=0/0/0"),
           "a split frame and two stalls:\n%s", esp_peek());
 #endif
     esp_clear();
@@ -8991,7 +9054,7 @@ static void slow_frame_follows_motion(void) {
     refresh_phases(990000, 1000, 9000, 0);
 #if CONFIG_MUSE_BENCH
     CHECK(esp_count("W muse_apps: slow frame ") == 1 &&
-              esp_has_line("W muse_apps: slow frame 999 ms: gap=989 layout=1 render=9 flush=0 applies=0/0 scroll=0"),
+              esp_has_line("W muse_apps: slow frame 999 ms: gap=989 layout=1 render=9 flush=0 applies=0/0 scroll=0 inv=-1 ended=0/0/0"),
           "999 ms after motion prints, 1000 doesn't:\n%s", esp_peek());
 #endif
     esp_clear();
@@ -9002,7 +9065,7 @@ static void slow_frame_follows_motion(void) {
     refresh_phases(2000000, 5000, 40000, 5000);
 #if CONFIG_MUSE_BENCH
     CHECK(esp_count("W muse_apps: slow frame ") == 1 &&
-              esp_has_line("W muse_apps: slow frame 2060 ms: gap=2000 layout=5 render=50 flush=5 applies=0/0 scroll=0"),
+              esp_has_line("W muse_apps: slow frame 2060 ms: gap=2000 layout=5 render=50 flush=5 applies=0/0 scroll=0 inv=-1 ended=0/0/0"),
           "60 ms of work after a rest:\n%s", esp_peek());
 #else
     CHECK(esp_count("W muse_apps: slow frame ") == 0, "nothing without the bench:\n%s", esp_peek());
@@ -11309,7 +11372,7 @@ static void slow_frame_says_whether_a_list_scrolls(void) {
     refresh_phases(80000, 1000, 9000, 0);  /* a stall while the finger drags the list */
 #if CONFIG_MUSE_BENCH
     CHECK(esp_count("W muse_apps: slow frame ") == 1 &&
-              esp_has_line("W muse_apps: slow frame 90 ms: gap=80 layout=1 render=9 flush=0 applies=0/0 scroll=1"),
+              esp_has_line("W muse_apps: slow frame 90 ms: gap=80 layout=1 render=9 flush=0 applies=0/0 scroll=1 inv=-1 ended=0/0/0"),
           "a stall in the drag:\n%s", esp_peek());
 #endif
     esp_clear();
@@ -11323,7 +11386,7 @@ static void slow_frame_says_whether_a_list_scrolls(void) {
     refresh_phases(80000, 1000, 9000, 0);  /* a stall with the list at rest */
 #if CONFIG_MUSE_BENCH
     CHECK(esp_count("W muse_apps: slow frame ") == 1 &&
-              esp_has_line("W muse_apps: slow frame 90 ms: gap=80 layout=1 render=9 flush=0 applies=0/0 scroll=0"),
+              esp_has_line("W muse_apps: slow frame 90 ms: gap=80 layout=1 render=9 flush=0 applies=0/0 scroll=0 inv=-1 ended=0/0/0"),
           "a stall at rest:\n%s", esp_peek());
 #else
     CHECK(esp_count("W muse_apps: slow frame ") == 0, "nothing without the bench:\n%s", esp_peek());
@@ -11575,6 +11638,7 @@ int main(int argc, char **argv) {
         {"slow_pass_phases", slow_pass_phases},
         {"slow_frame_anatomy", slow_frame_anatomy},
         {"slow_frame_follows_motion", slow_frame_follows_motion},
+        {"slow_frame_says_when_it_was_dirty_and_what_ended", slow_frame_says_when_it_was_dirty_and_what_ended},
         {"slow_frame_says_whether_a_list_scrolls", slow_frame_says_whether_a_list_scrolls},
         {"stack_paint_around_the_paths", stack_paint_around_the_paths},
         {"the_apply_paints_only_for_an_app_in_front", the_apply_paints_only_for_an_app_in_front},

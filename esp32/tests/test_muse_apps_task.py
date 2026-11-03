@@ -631,10 +631,38 @@ class AppTaskBenchTest(HarnessCase):
         self.assertLess(dump.index("apps_port_ui_lock()"), dump.index("apps_ui_dump_held("))
         self.assertLess(dump.index("apps_lv_bench_dump_hold("), dump.index("apps_port_ui_unlock()"))
         self.assertNotRegex(dump, r"ESP_LOG|printf")
-        for name in ("s_calls_ended", "dump_timed", "apps_lv_bench_dump_hold", "esp_timer.h"):
+        for name in ("s_calls_ended", "dump_timed", "apps_lv_bench_dump_hold", "esp_timer.h", "s_call_kind", "s_poll_held",
+                     "apps_lv_bench_call_ended", "apps_lv_bench_forced", "muse_apps_bench_poll"):
             for m in re.finditer(re.escape(name), source):
                 with self.subTest(name=name, at=m.start()):
                     self.assertIn("if CONFIG_MUSE_BENCH", open_conditions(source, m.start()))
+
+    def test_calls_are_told_by_kind_a_forced_pass_is_noted_and_the_poll_can_be_held_off(self):
+        # Fix round 1 (ruling P15): the slow frame's ended=, the summary's forced= and the bench's '>apply poll on|off'.
+        self.run_case("bench_tells_call_kinds_forced_passes_and_holds_the_poll")
+        from test_muse_apps_lv import function_owner
+        from test_muse_apps_wiring import c_function, open_conditions, strip_c_comments
+        source = strip_c_comments((APPS / "apps_task.c").read_text())
+        owner = function_owner(source)
+        # The kind is the app task's (one writer), set just before the call begins, told and put back to "other" when it ends.
+        self.assertIn("static EXT_RAM_BSS_ATTR uint8_t s_call_kind;", source)
+        self.assertEqual([owner(m.start()) for m in re.finditer(r"\bapps_lv_bench_call_ended\(", source)], ["call_finish"])
+        finish = c_function(source, "static void call_finish(void) {")
+        self.assertLess(finish.index("atomic_store(&s_rec->in_call, 0);"), finish.index("apps_lv_bench_call_ended(s_call_kind);"))
+        self.assertLess(finish.index("apps_lv_bench_call_ended(s_call_kind);"), finish.index("s_call_kind = APPS_LV_CALL_OTHER;"))
+        kinds = {m.group(1): owner(m.start()) for m in re.finditer(r"call_kind\((APPS_LV_CALL_\w+)\);\s*call_begin\(\);", source)}
+        self.assertEqual(kinds, {"APPS_LV_CALL_EVENT": "handle", "APPS_LV_CALL_TIMER": "run_timers"})
+        # A forced pass is noted on the LVGL task, only when the pass that was forced ran.
+        self.assertEqual([owner(m.start()) for m in re.finditer(r"\bapps_lv_bench_forced\(", source)], ["apply_step"])
+        step = c_function(source, "static void apply_step(bool frame) {")
+        self.assertLess(step.index("if (apps_lv_apply(false)) {"), step.index("apps_lv_bench_forced();"))
+        # The switch: held off, the poll's step returns and the tick turns the poll off; the flag in PSRAM.
+        self.assertIn("static EXT_RAM_BSS_ATTR atomic_bool s_poll_held;", source)
+        self.assertIn("atomic_load(&s_poll_held)", c_function(source, "static void poll_step(void) {"))
+        self.assertIn("poll = poll && !atomic_load(&s_poll_held);", c_function(source, "bool muse_apps_ui_tick(void) {"))
+        header = strip_c_comments((MUSE / "muse_apps.h").read_text())
+        self.assertEqual(open_conditions(header, header.index("void muse_apps_bench_poll(bool on);")),
+                         ["if CONFIG_MUSE_APPS", "if CONFIG_MUSE_BENCH"])
 
 
 class AppTaskTickTest(HarnessCase):

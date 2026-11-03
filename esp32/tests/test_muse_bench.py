@@ -1054,6 +1054,63 @@ int main(void)
         self.assertEqual(out, ["memtest", "[memtest] taken=1", usage, "[memtest ] taken=1", usage, "[memtest 3] taken=1",
                                "[memtests] taken=0", "[memtes] taken=0"])
 
+    def run_apply_command(self, lines):
+        """apps_console.c's bench_command, compiled on its own with muse_apps_bench_poll faked: what each line calls and prints."""
+        source = (MUSE / "apps/apps_console.c").read_text()
+        command = c_function(source, "static bool bench_command(const char *line) {")
+        program = r"""
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+static void muse_apps_bench_poll(bool on) { printf("poll %d\n", on); }
+static void apps_port_console_flush(void) { fflush(stdout); }
+""" + command + r"""
+int main(void)
+{
+    char line[256];
+    while (fgets(line, sizeof line, stdin)) {
+        line[strcspn(line, "\n")] = 0;
+        printf("[%s] taken=%d\n", line, bench_command(line));
+    }
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            done = apps_host.run(build_bench("apply_command", program, tmp), input="\n".join(lines) + "\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.splitlines()
+
+    def test_apply_poll_parses_and_validates(self):
+        # Task 4's fix round 1 (ruling P15): '>apply poll off' holds the call-end poll off (frame_tick's pass alone applies an app's
+        # changes) and '>apply poll on' puts it back (muse_apps_bench_poll). Anything else that starts with the word gets the usage
+        # line, and a line that only starts with its letters isn't the bench's (an "app." line is the console's).
+        usage = "@apply.error usage: apply poll on|off"
+        bad = ["apply", "apply ", "apply poll", "apply poll maybe", "apply poll on ", "apply on", "apply poll off x"]
+        out = self.run_apply_command(["apply poll off", "apply poll on", *bad, "applyx", "applies poll on", "app.status", "app"])
+        self.assertEqual(out, [
+            "poll 0", "@apply poll off", "[apply poll off] taken=1",
+            "poll 1", "@apply poll on", "[apply poll on] taken=1",
+            *[x for line in bad for x in (usage, f"[{line}] taken=1")],
+            "[applyx] taken=0", "[applies poll on] taken=0", "[app.status] taken=0", "[app] taken=0",
+        ])
+
+    def test_apply_poll_is_the_bench_builds_alone(self):
+        # The switch, its flag and its line are in a bench build alone (CONFIG_MUSE_BENCH): an apps build without the bench takes no
+        # "apply" line and has no way to hold the poll off. The console's hook asks it first, and only its "app." lines follow.
+        from test_muse_apps_wiring import strip_c_comments
+        console = strip_c_comments((MUSE / "apps/apps_console.c").read_text())
+        self.assertEqual(open_conditions(console, console.index("static bool bench_command(const char *line) {")),
+                         ["if CONFIG_MUSE_BENCH"])
+        hook = c_function(console, "bool muse_apps_console(const char *line) {")
+        self.assertLess(hook.index("bench_command(line)"), hook.index('strncmp(line, "app.", 4)'))
+        self.assertEqual(open_conditions(hook, hook.index("bench_command(line)")), ["if CONFIG_MUSE_BENCH"])
+        self.assertIn('#include "sdkconfig.h"', console)
+        task = strip_c_comments((MUSE / "apps/apps_task.c").read_text())
+        for name in ("muse_apps_bench_poll", "s_poll_held"):
+            for m in re.finditer(name, task):
+                with self.subTest(name=name, at=m.start()):
+                    self.assertIn("if CONFIG_MUSE_BENCH", open_conditions(task, m.start()))
+
     # ---- Task 14: touch scripts through LVGL's read callback ----
 
     TOUCH_PRELUDE = r"""

@@ -360,6 +360,9 @@ class HarnessTest(unittest.TestCase):
     def test_a_build_without_the_bench_times_no_motion(self):
         self.run_case("slow_frame_follows_motion")
 
+    def test_a_build_without_the_bench_follows_no_invalidation(self):  # fix round 1 (ruling P15)
+        self.run_case("slow_frame_says_when_it_was_dirty_and_what_ended")
+
     def test_a_build_without_the_bench_says_nothing_of_a_list(self):
         self.run_case("slow_frame_says_whether_a_list_scrolls")
 
@@ -389,12 +392,13 @@ class HarnessTest(unittest.TestCase):
         # The formats Task 3 reads (perf plan Task 2's interfaces), as apps_lv.c prints them, with the tag every line of it has.
         source = re.sub(r'"\s*\n\s*"', "", strip_c_comments(APPS_LV.read_text()))
         self.assertIn('ESP_LOGI(TAG, "apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u '
-                      'stack_peak=%s:%d",', source)
+                      'stack_peak=%s:%d forced=%u",', source)
         self.assertIn('ESP_LOGW(TAG, "apply %u us (%u slow since last) visits=%u layout=%u writeback=%u creates=%u texts=%u '
                       'styles=%u",', source)
         self.assertIn('ESP_LOGW(TAG, "apply %u us (%u slow since last)", (unsigned)s_slow_worst_us, (unsigned)s_slow_unlogged);',
                       source)
-        self.assertIn('ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u scroll=%d",', source)
+        self.assertIn('ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u scroll=%d inv=%d '
+                      'ended=%u/%u/%u",', source)
         self.assertRegex(source, r"(?m)^#define BENCH_SECOND_US 1000000\b")
         self.assertRegex(source, r"(?m)^#define SLOW_FRAME_MS 50\b")
         self.assertRegex(source, r"(?m)^#define SLOW_FRAME_REST_MS 1000\b")  # ruling P5b: a frame this long ends a rest
@@ -413,7 +417,8 @@ class HarnessTest(unittest.TestCase):
                          {"on_refresh"})
         self.assertEqual({owner(m.start()) for m in re.finditer(r"\bapps_lv_bench_tick\(", source)} - {"apps_lv_bench_tick"}, set())
         for signature in ("static void on_phase(lv_event_t *e) {", "static void on_carousel_scroll(lv_event_t *e) {",
-                          "void apps_lv_bench_dump_hold(uint32_t us) {"):
+                          "void apps_lv_bench_dump_hold(uint32_t us) {", "static void on_invalidate(lv_event_t *e) {",
+                          "void apps_lv_bench_call_ended(int kind) {", "void apps_lv_bench_forced(void) {"):
             with self.subTest(signature):
                 self.assertNotRegex(c_function(source, signature), r"ESP_LOG|printf")
         # The paint stays out of the lock: it is around locked_pass, which takes the lock and gives it back (the harness's stack
@@ -942,6 +947,9 @@ class BenchHarnessTest(unittest.TestCase):
     def test_a_slow_frame_is_its_own_work_or_a_frame_after_motion(self):  # ruling P5b: a rest of a second or more never prints
         self.run_case("slow_frame_follows_motion")
 
+    def test_a_slow_frame_says_when_it_was_dirty_and_what_ended(self):  # fix round 1 (ruling P15): inv=<ms> ended=<t>/<e>/<o>
+        self.run_case("slow_frame_says_when_it_was_dirty_and_what_ended")
+
     def test_a_slow_frame_says_whether_a_list_scrolls(self):  # ruling P5b's scroll=<0|1>
         self.run_case("slow_frame_says_whether_a_list_scrolls")
 
@@ -1047,7 +1055,7 @@ class FakesTest(unittest.TestCase):
         LV_EVENT_LONG_PRESSED_REPEAT LV_EVENT_CLICKED LV_EVENT_RELEASED LV_EVENT_SCROLL_BEGIN
         LV_EVENT_SCROLL_THROW_BEGIN LV_EVENT_SCROLL_END LV_EVENT_SCROLL LV_EVENT_GESTURE LV_EVENT_KEY
         LV_EVENT_REFR_READY LV_EVENT_PREPROCESS LV_EVENT_REFR_START LV_EVENT_RENDER_START LV_EVENT_RENDER_READY
-        LV_EVENT_FLUSH_WAIT_START LV_EVENT_FLUSH_WAIT_FINISH
+        LV_EVENT_FLUSH_WAIT_START LV_EVENT_FLUSH_WAIT_FINISH LV_EVENT_INVALIDATE_AREA
         LV_COORD_MAX LV_SIZE_CONTENT LV_RADIUS_CIRCLE LV_OPA_TRANSP LV_OPA_30 LV_OPA_40 LV_OPA_COVER LV_ANIM_OFF LV_ANIM_ON
         LV_IMAGE_ALIGN_DEFAULT LV_IMAGE_ALIGN_CENTER LV_COLOR_FORMAT_A8 LV_COLOR_FORMAT_RGB565A8 LV_IMAGE_FLAGS_PREMULTIPLIED
         sizeof(lv_image_header_t) sizeof(lv_image_dsc_t) sizeof(lv_color_t) sizeof(lv_area_t)

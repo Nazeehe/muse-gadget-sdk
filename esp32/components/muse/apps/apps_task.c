@@ -498,6 +498,18 @@ static bool wanted(req_t *r) {
 /* The bench's apply summary (perf plan Task 2): the calls of the app's that have ended since boot, counted here alone (call_finish)
  * and read by the LVGL task (muse_apps_ui_tick). */
 static EXT_RAM_BSS_ATTR volatile uint32_t s_calls_ended;
+/* Fix round 1 (ruling P15): the kind of the call that runs, told to apps_lv at its end for the slow frame's ended= (apps_lv.h,
+ * APPS_LV_CALL_*): a timer's or a widget event's when the call is begun as one (call_kind), any other otherwise (other is zero, so the
+ * first call since boot is one too). The app task's. */
+static EXT_RAM_BSS_ATTR uint8_t s_call_kind;
+_Static_assert(APPS_LV_CALL_OTHER == 0, "a call begun as no kind is an other, from boot on");
+/* The bench's '>apply poll on|off' (muse_apps_bench_poll): held off, the call-end poll doesn't run and frame_tick's pass alone applies.
+ * The console's task alone writes it, the LVGL task reads it. */
+static EXT_RAM_BSS_ATTR atomic_bool s_poll_held;
+
+static void call_kind(uint8_t kind) {
+    s_call_kind = kind;
+}
 
 /* apps_ui_dump, with the time it holds the UI lock handed to apps_lv before the lock is let go, for the summary's dump_hold. */
 static size_t dump_timed(const apps_ui_t *ui, char *out, size_t cap, int *dropped) {
@@ -510,6 +522,10 @@ static size_t dump_timed(const apps_ui_t *ui, char *out, size_t cap, int *droppe
     apps_lv_bench_dump_hold((uint32_t)(esp_timer_get_time() - t0));
     apps_port_ui_unlock();
     return len;
+}
+#else
+static inline void call_kind(uint8_t kind) {
+    (void)kind;
 }
 #endif
 
@@ -783,6 +799,8 @@ static void call_finish(void) {
     atomic_store(&s_rec->committed, atomic_load(&s_rec->committed) + 1);  /* the app task's alone: a plain load and store */
 #if CONFIG_MUSE_BENCH
     s_calls_ended++;
+    apps_lv_bench_call_ended(s_call_kind);
+    s_call_kind = APPS_LV_CALL_OTHER;
 #endif
     int64_t took = apps_port_mono_ms() - T.call_began - (int64_t)(uint32_t)(apps_rt_stolen_ms() - T.call_stolen);
     if (took < 0) {
@@ -1249,6 +1267,7 @@ static void handle(const apps_event_t *ev) {
     switch (ev->type) {
     case APPS_EV_TOUCH:
         if (app_runs(ev->app_gen)) {
+            call_kind(APPS_LV_CALL_EVENT);
             call_begin();
             apps_rt_touch(T.rt, ev->slot, ev->gen, ev->code);
             (void)call_end();
@@ -1641,6 +1660,7 @@ static void run_timers(void) {
     apps_rt_store_tick(T.rt, now);  /* a save of the store that is due: no call of the app, so no bracket (the port only queues it) */
     apps_rt_image_collect(T.rt);    /* freed images the screen has let go of give their bytes back: no call of the app either */
     if (apps_rt_has_work(T.rt, now)) {
+        call_kind(APPS_LV_CALL_TIMER);
         call_begin();
         (void)apps_rt_run_one_timer(T.rt, now);
         (void)call_end();
@@ -2026,6 +2046,7 @@ static void apply_step(bool frame) {
     }
     uint32_t committed = atomic_load(&s_rec->committed);
     bool waiting = committed != L.applied;  /* a call has ended since the last pass */
+    bool forced = false;                    /* the pass below is a held change's, mid-call */
     if (!frame && !waiting) {
         return;
     }
@@ -2040,8 +2061,16 @@ static void apply_step(bool frame) {
         if (!frame || ++L.held_frames <= HELD_FRAMES_MAX) {
             return;
         }
+        forced = true;
     }
     if (apps_lv_apply(false)) {
+#if CONFIG_MUSE_BENCH
+        if (forced) {
+            apps_lv_bench_forced();
+        }
+#else
+        (void)forced;
+#endif
         L.applied = committed;
         L.held_frames = 0;
         /* The app's first frame: a pass ran on its table with the layer in front (a skipped one isn't: the layer may be bare). The
@@ -2053,8 +2082,19 @@ static void apply_step(bool frame) {
 }
 
 static void poll_step(void) {
+#if CONFIG_MUSE_BENCH
+    if (atomic_load(&s_poll_held)) {
+        return;  /* the bench's '>apply poll off': the tick turns it off at the next frame */
+    }
+#endif
     apply_step(false);
 }
+
+#if CONFIG_MUSE_BENCH
+void muse_apps_bench_poll(bool on) {
+    atomic_store(&s_poll_held, !on);
+}
+#endif
 
 bool muse_apps_ui_tick(void) {
     if (!atomic_load(&s_up)) {
@@ -2063,7 +2103,11 @@ bool muse_apps_ui_tick(void) {
     apply_step(true);
     /* The poll runs while it can find something: the app's table published on the layer in front, the app not hung (the screen is lit:
      * frame_tick doesn't tick while it's dark, and the supervisor turns the poll off then). */
-    apps_lv_poll(atomic_load(&s_rec->published) && apps_lv_front() && !atomic_load(&s_rec->hung));
+    bool poll = atomic_load(&s_rec->published) && apps_lv_front() && !atomic_load(&s_rec->hung);
+#if CONFIG_MUSE_BENCH
+    poll = poll && !atomic_load(&s_poll_held);  /* the bench's '>apply poll off' */
+#endif
+    apps_lv_poll(poll);
 #if CONFIG_MUSE_BENCH
     apps_lv_bench_tick(s_calls_ended);  /* the apply summary, once a second while an app is in front */
 #endif

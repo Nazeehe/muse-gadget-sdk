@@ -218,7 +218,7 @@ output, which the baud doesn't touch.
 With the apps, a bench build also measures the apply step and the frames under
 an app (`apps_lv.c`, the `muse_apps` tag). Once a second while an app is in
 front with no launcher or card over it, `frame_tick` has it print
-`apply: calls=<n> applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us> stack_peak=<path>:<bytes>`:
+`apply: calls=<n> applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us> stack_peak=<path>:<bytes> forced=<n>`:
 the app's calls that ended in the second, the passes that ran (a frame's or
 the call-end poll's: "The apply step" under Muse apps), the skips (each ended
 call whose changes waited for a call that ran, and each pass a UI lock not
@@ -226,7 +226,8 @@ free within 2 ms held back), the display's refreshes, the most time between
 the ends of two passes that changed something, the passes' average and longest time, the
 longest the app task's dump of its table (`>app.status`) held the UI lock, and
 the deepest stack path so far with the bytes it left free (`none:-1` before one
-is found). The slow pass's line (a pass over 2000 us, at most one line a
+is found), and the passes the apply step forced, mid-call, on a change that
+calls running back to back had held for 3 frames. The slow pass's line (a pass over 2000 us, at most one line a
 second) adds
 `visits=<us> layout=<us> writeback=<us> creates=<n> texts=<n> styles=<n>` for
 the longest pass since the last line. A refresh's time is from the refresh
@@ -238,11 +239,22 @@ predecessor (it followed motion), or when its own work, from
 before. A rest of 1000 ms or more never prints, but a pause of 50 to 999 ms
 after motion can: it reads as small work, no applies and `scroll=0`. A slow
 frame prints
-`slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us> scroll=<0|1>`
+`slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us> scroll=<0|1> inv=<ms> ended=<timer>/<event>/<other>`
 from `LV_EVENT_REFR_READY`: its time, the gap (from the refresh before to this
 one's `LV_EVENT_REFR_START`), its layout, its drawing less its waits for the
-panel, those waits, the passes since the refresh before and their time, and
-whether an app's scroll box was scrolling (the `scroll frames` test). The stack
+panel, those waits, the passes since the refresh before and their time,
+whether an app's scroll box was scrolling (the `scroll frames` test), when the
+display was first marked for redraw after the refresh before (its first
+`LV_EVENT_INVALIDATE_AREA` outside a refresh, from that refresh's end; -1 with
+none), and the app's calls that ended in the gap, by kind: a timer's, a
+widget's event (a tap, a press, a release) and any other. LVGL pauses its
+refresh timer at each refresh and resumes it at the next invalidation, so
+`inv` near `gap` says the refresh waited for something to change, and a `gap`
+more than a refresh period (`CONFIG_LV_DEF_REFR_PERIOD`, 15 ms) past `inv`
+says something held the LVGL task after the change.
+`>apply poll off` holds the call-end poll off, so frame_tick's pass alone
+applies an app's changes, and `>apply poll on` puts it back (on as it boots).
+The stack
 paths are the apply pass (with an app on the layer in front), the home pages'
 slide (`LV_EVENT_SCROLL_BEGIN`), the launcher carousel's scroll and
 app.control's snapshot (`muse_bench_mem.c`): before each, the LVGL task's stack

@@ -191,7 +191,11 @@ static EXT_RAM_BSS_ATTR struct {
     uint32_t dump_pending_us;   /* the longest told since a pass last took them in */
     uint32_t frame_applies;     /* the passes since the last refresh, and their time: the slow frame's */
     int64_t frame_apply_us;
+    uint32_t forced;            /* the forced passes of the second (apps_lv_bench_forced) */
 } s_bench;
+/* The app's calls that have ended since boot, by kind (apps_lv_bench_call_ended): the app task's alone to write, a word each, read by
+ * the slow frame on the LVGL task. */
+static EXT_RAM_BSS_ATTR volatile uint32_t s_ended[APPS_LV_CALL_KINDS];
 
 /* The slow pass's phases: visits (the deletes, the visits and what came before them), the layout, the write-back (the scrolls and
  * every widget's place and overflow), and what the pass made, set and styled. The longest slow pass's since the last line. */
@@ -2095,6 +2099,11 @@ static EXT_RAM_BSS_ATTR struct {
     bool ready_in_front;              /* the last refresh ended with an app in front, */
     int64_t ready_us;                 /* then, */
     bool followed;                    /* and came within SLOW_FRAME_REST_MS of the one before it (both timed): motion */
+    /* Fix round 1 (ruling P15): the first invalidation of the display after the last refresh's end, outside a refresh; the app's calls
+     * ended by then (s_ended's counts), and those that ended between it and this refresh's start. */
+    bool inv_seen;
+    int64_t inv_us;
+    uint32_t ended_at_ready[APPS_LV_CALL_KINDS], ended_in_gap[APPS_LV_CALL_KINDS];
 } s_frames;
 
 /* LV_EVENT_SCROLL_END on an app's box: its scroll ended, seen by a refresh or not. The next refresh prints its summary. A throw that
@@ -2152,6 +2161,9 @@ static void on_phase(lv_event_t *e) {
             s_frames.rendered = false;
             s_frames.refr_start_us = now;
             s_frames.flush_us = 0;
+            for (int k = 0; k < APPS_LV_CALL_KINDS; k++) {
+                s_frames.ended_in_gap[k] = s_ended[k] - s_frames.ended_at_ready[k];
+            }
             break;
         case LV_EVENT_RENDER_START:
             s_frames.rendered = true;
@@ -2169,6 +2181,16 @@ static int ms_of(int64_t us) {
     return us <= 0 ? 0 : (int)((us + 500) / 1000);
 }
 
+/* LV_EVENT_INVALIDATE_AREA on the display (lv_inv_area: every area marked for redraw): the first after a refresh's end, outside a
+ * refresh (not a layout's, nor LVGL's probe of the rounder in it), for the slow frame's inv=. A time and a flag, at every invalidation. */
+static void on_invalidate(lv_event_t *e) {
+    (void)e;
+    if (!s_frames.started && !s_frames.inv_seen) {
+        s_frames.inv_seen = true;
+        s_frames.inv_us = esp_timer_get_time();
+    }
+}
+
 /* An app on the layer in front, with no launcher or card over it: what the apply summary and the slow frame follow. */
 static bool app_in_front(void) {
     return s_front && !s_launcher_shown && !s_crash_shown;
@@ -2181,10 +2203,13 @@ static bool app_in_front(void) {
  * predecessor (it followed motion), or when its own work (LV_EVENT_REFR_START to _READY) is over SLOW_FRAME_MS, whatever came before.
  * A rest of a second or more never prints; a pause under a second after motion can, and reads as small work, no applies and scroll=0.
  * It prints
- *     slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us> scroll=<0|1>
+ *     slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us> scroll=<0|1> inv=<ms> ended=<t>/<e>/<o>
  * its time, the gap (from the refresh before to this one's start: the timers, the apply), its layout (to the drawing's start, or its
  * end with nothing to draw), the drawing less its waits for the panel, those waits, the passes since the refresh before and their
- * time, and whether an app's scroll box was scrolling (listing: scroll_box_scrolling, the scroll frames' test).
+ * time, whether an app's scroll box was scrolling (listing: scroll_box_scrolling, the scroll frames' test), when the display was first
+ * invalidated after the refresh before (from its end, outside a refresh: on_invalidate; -1 with none), and the app's calls that ended
+ * in the gap, by kind: a timer's, a widget event's and any other (apps_lv_bench_call_ended; a call that ends inside a refresh is in
+ * neither gap).
  */
 static void time_slow_frame(int64_t now, bool listing) {
     bool front = app_in_front();
@@ -2196,9 +2221,12 @@ static void time_slow_frame(int64_t now, bool listing) {
         if (in_motion || work > SLOW_FRAME_MS) {
             int64_t layout_end = s_frames.rendered ? s_frames.render_start_us : now;
             int64_t render = s_frames.rendered ? s_frames.render_ready_us - s_frames.render_start_us - s_frames.flush_us : 0;
-            ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u scroll=%d", ms,
+            int inv = s_frames.inv_seen ? ms_of(s_frames.inv_us - s_frames.ready_us) : -1;
+            ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u scroll=%d inv=%d ended=%u/%u/%u", ms,
                      ms_of(s_frames.refr_start_us - s_frames.ready_us), ms_of(layout_end - s_frames.refr_start_us), ms_of(render),
-                     ms_of(s_frames.flush_us), (unsigned)s_bench.frame_applies, (unsigned)s_bench.frame_apply_us, listing ? 1 : 0);
+                     ms_of(s_frames.flush_us), (unsigned)s_bench.frame_applies, (unsigned)s_bench.frame_apply_us, listing ? 1 : 0, inv,
+                     (unsigned)s_frames.ended_in_gap[APPS_LV_CALL_TIMER], (unsigned)s_frames.ended_in_gap[APPS_LV_CALL_EVENT],
+                     (unsigned)s_frames.ended_in_gap[APPS_LV_CALL_OTHER]);
         }
         followed = ms < SLOW_FRAME_REST_MS;
     }
@@ -2206,6 +2234,10 @@ static void time_slow_frame(int64_t now, bool listing) {
     s_frames.started = false;
     s_frames.ready_in_front = front;
     s_frames.ready_us = now;
+    s_frames.inv_seen = false;
+    for (int k = 0; k < APPS_LV_CALL_KINDS; k++) {
+        s_frames.ended_at_ready[k] = s_ended[k];
+    }
     s_bench.frame_applies = 0;
     s_bench.frame_apply_us = 0;
 }
@@ -2239,6 +2271,7 @@ static void watch_frames(lv_obj_t *screen) {
         for (size_t i = 0; i < ARRAY_LEN(phases); i++) {
             lv_display_add_event_cb(display, on_phase, phases[i], NULL);
         }
+        lv_display_add_event_cb(display, on_invalidate, LV_EVENT_INVALIDATE_AREA, NULL);
         s_frames.display = display;
     }
 }
@@ -2256,10 +2289,11 @@ void apps_lv_bench_tick(uint32_t calls) {
         int peak = -1;
         const char *path = muse_stack_peak(&peak);
         uint32_t avg = s_bench.applies != 0 ? (uint32_t)(s_bench.pass_us / s_bench.applies) : 0;
-        ESP_LOGI(TAG, "apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u stack_peak=%s:%d",
+        ESP_LOGI(TAG, "apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u stack_peak=%s:%d forced=%u",
                  (unsigned)(calls - s_bench.calls_at), (unsigned)s_bench.applies, (unsigned)s_bench.skips_in_call,
                  (unsigned)s_bench.skips_lock_busy, (unsigned)s_bench.refr, ms_of(s_bench.gap_max_us), (unsigned)avg,
-                 (unsigned)s_bench.pass_max_us, (unsigned)s_bench.dump_max_us, path != NULL ? path : "none", peak);
+                 (unsigned)s_bench.pass_max_us, (unsigned)s_bench.dump_max_us, path != NULL ? path : "none", peak,
+                 (unsigned)s_bench.forced);
     } else {
         s_bench.changed_seen = false;  /* the app has just come in front: no gap from before */
     }
@@ -2269,6 +2303,17 @@ void apps_lv_bench_tick(uint32_t calls) {
     s_bench.applies = s_bench.skips_in_call = s_bench.skips_lock_busy = s_bench.refr = 0;
     s_bench.pass_us = s_bench.pass_max_us = s_bench.gap_max_us = 0;
     s_bench.dump_max_us = 0;
+    s_bench.forced = 0;
+}
+
+void apps_lv_bench_call_ended(int kind) {
+    if (kind >= 0 && kind < APPS_LV_CALL_KINDS) {
+        s_ended[kind] = s_ended[kind] + 1;  /* the app task alone writes it: a plain load and store */
+    }
+}
+
+void apps_lv_bench_forced(void) {
+    s_bench.forced++;
 }
 #endif
 

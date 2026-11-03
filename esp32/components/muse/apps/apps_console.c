@@ -31,6 +31,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "muse_apps.h"
+#include "sdkconfig.h"
 
 /*
  * The USB console's ">app.*" lines (muse_apps.h has the commands). muse_input's serial task calls the hook with each
@@ -1049,7 +1050,30 @@ cJSON *muse_apps_health(void) {
     return h;
 }
 
+#if CONFIG_MUSE_BENCH
+/* The bench's '>apply poll on|off' (muse_apps.h): true for a line that starts "apply", which it answers. */
+static bool bench_command(const char *line) {
+    if (strncmp(line, "apply", 5) != 0 || (line[5] != '\0' && line[5] != ' ')) {
+        return false;
+    }
+    bool on = strcmp(line, "apply poll on") == 0, off = strcmp(line, "apply poll off") == 0;
+    if (on || off) {
+        muse_apps_bench_poll(on);
+        printf("@apply poll %s\n", on ? "on" : "off");
+    } else {
+        printf("@apply.error usage: apply poll on|off\n");
+    }
+    apps_port_console_flush();
+    return true;
+}
+#endif
+
 bool muse_apps_console(const char *line) {
+#if CONFIG_MUSE_BENCH
+    if (line != NULL && bench_command(line)) {
+        return true;
+    }
+#endif
     if (line == NULL || strncmp(line, "app.", 4) != 0) {
         return false;
     }

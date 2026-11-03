@@ -214,11 +214,10 @@ idf_component_register(
     PRIV_REQUIRES ${muse_priv_requires}
 )
 
-if(CONFIG_MUSE_BENCH OR CONFIG_MUSE_APPS)
-    # esp_async_memcpy: >memtest's (muse_bench_mem.h) and, with the apps, frame mode's copies by DMA and their cache write-back
-    # (boards/muse_lcd_bands.c). After the registration, where the Kconfig values are known, so a build with neither is as it was;
-    # optional, since only a build with a DMA driver in it (esp_lcd's) has the component.
-    idf_component_optional_requires(PRIVATE esp_driver_dma esp_mm)
+if(CONFIG_MUSE_BENCH)
+    # >memtest's esp_async_memcpy (muse_bench_mem.h). After the registration, where the Kconfig values are known, so a build
+    # without the bench is as it was; optional, since only a build with a DMA driver in it (esp_lcd's) has the component.
+    idf_component_optional_requires(PRIVATE esp_driver_dma)
 endif()
 
 if(CONFIG_MUSE_UI_FREEINK)

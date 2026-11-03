@@ -23,7 +23,9 @@
  * - the touch player (muse_ui_guarded_drag and _withdraw): it keeps the guard and plays the drag as muse_ui.c's does
  *   (test_muse_bench.py has the real one): at its take a finger refuses it, then admit; at each read after, a finger or keep cuts it;
  *   the end at the read after the release. It plays LVGL's part too: the events a widget with a handler gets go through
- *   apps_touch_tag, as apps_task.c's on_widget_event sends them, and their tagged codes are kept for the case;
+ *   apps_touch_tag, as apps_task.c's on_widget_event sends them, and their tagged codes are kept for the case; and a drag that is
+ *   LVGL's gesture is the app layer's swipe (apps_lv.c's on_gesture): the touch taken, and the close from the left edge, or the
+ *   swipe the app hears;
  * - the screen's sleep (dark until a time on that clock, and a wake that lights it some ms later), the voice turn, the layer's place
  *   and its cards, what LVGL would press at a point (apps_lv_hit: the fake screen's widgets), the widgets' kinds, the scroll boxes
  *   (one that a drag on it scrolls, and that then settles), the app that runs and its app_gen, muse_input_wake.
@@ -120,6 +122,15 @@ void apps_port_free(void *ptr) {
         blocks--;
         free(ptr);
     }
+}
+
+/* apps_ui.c is linked for its direction names (apps_ui_dir_name): the touch never takes the UI lock. */
+void apps_port_ui_lock(void) {
+    fail_at(__LINE__, "the touch took the UI lock");
+}
+
+void apps_port_ui_unlock(void) {
+    fail_at(__LINE__, "the touch let go of the UI lock");
 }
 
 /* ---- The log ---- */
@@ -273,6 +284,11 @@ int apps_lv_scrolls(apps_lv_scroll_t *out, int max) {
 
 /* ---- The touch player, with LVGL's part ---- */
 
+/* LVGL 9.5.0's gesture (indev_gesture), as tests/muse_apps_lv_harness.c's fake has it: test_muse_apps_touch.py pins these to that
+ * fake's, which test_muse_apps_lv.py pins to LVGL's. */
+#define FAKE_GESTURE_LIMIT 50         /* LV_INDEV_DEF_GESTURE_LIMIT: past this far on one axis a drag is a gesture */
+#define FAKE_GESTURE_MIN_VELOCITY 3   /* LV_INDEV_DEF_GESTURE_MIN_VELOCITY: a read that moves less on both starts it again */
+
 static const muse_ui_guard_t *guard;
 static bool pending, playing, ending, no_input;
 static int px1, py1, px2, py2, pms;
@@ -282,6 +298,10 @@ static uint32_t end_ms;
 static int last_x, last_y;
 static int pressed_slot;        /* what LVGL pressed at the take (a widget's slot, or -1) */
 static bool scrolled, long_sent;
+static int sum_x, sum_y;        /* the gesture's movement so far (pointer.gesture_sum) */
+static bool gesture_sent;       /* pointer.gesture_sent */
+static bool waiting;            /* the layer took the touch (lv_indev_wait_release): nothing more but the lift's PRESS_LOST */
+static int closes;              /* the layer's closes (apps_task.c's on_close) */
 static int finger_from;         /* a finger is on the screen from this read of a touch on (1: at the take; 0: never) */
 static int takes, admits, keeps, ends, withdraws;
 static bool reads_paused;
@@ -289,15 +309,66 @@ static uint8_t sent[64];        /* the codes apps_touch_tag gave back, in order 
 static int n_sent;
 static int heard_slots[64];
 
+/* What apps_task.c's on_widget_event does with an event the layer sends the app: the tag, whose code is kept for the case. */
+static void app_hears(int slot, uint8_t event) {
+    uint8_t code = apps_touch_tag((uint16_t)slot, event);
+    CHECK((code & ~APPS_UI_INJECTED) == event, "the tag changed the event: %#x for %#x", code, event);
+    if (n_sent < (int)ARRAY_LEN(sent)) {
+        heard_slots[n_sent] = slot;
+        sent[n_sent++] = code;
+    }
+}
+
+/* A widget's own event (apps_lv.c's on_touch): only a widget with a handler has the callbacks. */
 static void lvgl_event(int slot, uint8_t bit) {
     if (slot < 0 || !has_handler(slot)) {
         return;
     }
-    uint8_t code = apps_touch_tag((uint16_t)slot, bit);
-    CHECK((code & ~APPS_UI_INJECTED) == bit, "the tag changed the event: %#x for %#x", code, bit);
-    if (n_sent < (int)ARRAY_LEN(sent)) {
-        heard_slots[n_sent] = slot;
-        sent[n_sent++] = code;
+    app_hears(slot, bit);
+}
+
+/* apps_task.c's on_close: the layer's right swipe from the left edge puts the app behind. */
+static void on_close(void) {
+    closes++;
+    apps_touch_closed();
+    layer_front = false;
+}
+
+/* apps_lv.c's in_left_edge: x < APPS_LV_CLOSE_EDGE_PX, inside the circle. */
+static bool in_left_edge(int x, int y) {
+    int dx = x - 233, dy = y - 233;
+    return x < APPS_LV_CLOSE_EDGE_PX && dx * dx + dy * dy <= 233 * 233;
+}
+
+/* apps_lv.c's on_gesture: the touch is taken, whichever way the swipe goes; then nothing more while the layer is behind or a card
+ * covers it; a right swipe whose press went down at the left edge closes, and any other is the app's, for the widget pressed (a
+ * widget with a handler or the scroll box: the bare layer is nobody's). */
+static void layer_swipe(int dir) {
+    waiting = true;
+    if (!layer_front || cards) {
+        return;
+    }
+    if (dir == APPS_UI_RIGHT && in_left_edge(px1, py1)) {
+        on_close();
+    } else if (pressed_slot >= 0) {
+        app_hears(pressed_slot, (uint8_t)APPS_UI_SWIPE_CODE(dir));
+    }
+}
+
+/* indev_gesture: while nothing scrolls, the reads' movement adds up, and past FAKE_GESTURE_LIMIT on either axis it is a swipe, sent
+ * once, its way the larger axis's. */
+static void gesture(int vx, int vy) {
+    if (scrolled || gesture_sent) {
+        return;
+    }
+    if (abs(vx) < FAKE_GESTURE_MIN_VELOCITY && abs(vy) < FAKE_GESTURE_MIN_VELOCITY) {
+        sum_x = sum_y = 0;
+    }
+    sum_x += vx;
+    sum_y += vy;
+    if (abs(sum_x) > FAKE_GESTURE_LIMIT || abs(sum_y) > FAKE_GESTURE_LIMIT) {
+        gesture_sent = true;
+        layer_swipe(abs(sum_x) > abs(sum_y) ? (sum_x > 0 ? APPS_UI_RIGHT : APPS_UI_LEFT) : (sum_y > 0 ? APPS_UI_DOWN : APPS_UI_UP));
     }
 }
 
@@ -347,7 +418,8 @@ static void fake_read(void) {
         pstart = now_ms;
         last_x = px1;
         last_y = py1;
-        scrolled = long_sent = false;
+        scrolled = long_sent = gesture_sent = waiting = false;
+        sum_x = sum_y = 0;
         pressed_slot = apps_lv_hit(px1, py1);
         lvgl_event(pressed_slot, APPS_UI_PRESS);
         return;
@@ -370,16 +442,23 @@ static void fake_read(void) {
         lvgl_event(pressed_slot, APPS_UI_RELEASE);  /* PRESS_LOST, which the app hears as a release, and no tap */
         return;
     }
-    /* A drag up or down of more than LVGL's 10 px that began in the box scrolls it; a long press past 400 ms. */
-    bool in_list = pressed_slot == LIST || (pressed_slot >= ROW0 && pressed_slot < ROW0 + 20);
-    if (in_list && abs(y - py1) > 10) {
-        int32_t want = list_y + (last_y - y);
-        list_y = want < 0 ? 0 : want > list_y_max ? list_y_max : want;
-        scrolled = list_dragging = true;
-    }
-    if (!scrolled && !long_sent && t >= 400 && t < pms) {
-        long_sent = true;
-        lvgl_event(pressed_slot, APPS_UI_LONG_PRESS);
+    /* Until the layer takes the touch (after lv_indev_wait_release LVGL's indev_proc_press returns at once): a drag up or down of more
+     * than LVGL's 10 px that began in the box scrolls it; a drag that doesn't is a gesture past 50 px (not at the release's read);
+     * and a press past 400 ms is a long press, on a gesture's read too, as LVGL checks it after the gesture. */
+    if (!waiting) {
+        bool in_list = pressed_slot == LIST || (pressed_slot >= ROW0 && pressed_slot < ROW0 + 20);
+        if (in_list && abs(y - py1) > 10) {
+            int32_t want = list_y + (last_y - y);
+            list_y = want < 0 ? 0 : want > list_y_max ? list_y_max : want;
+            scrolled = list_dragging = true;
+        }
+        if (t < pms) {
+            gesture(x - last_x, y - last_y);
+        }
+        if (!scrolled && !long_sent && t >= 400 && t < pms) {
+            long_sent = true;
+            lvgl_event(pressed_slot, APPS_UI_LONG_PRESS);
+        }
     }
     last_x = x, last_y = y;
     if (t >= pms) {
@@ -387,8 +466,8 @@ static void fake_read(void) {
         ending = true;
         end_how = MUSE_UI_GUARD_PLAYED;
         end_ms = (uint32_t)t;
-        lvgl_event(pressed_slot, APPS_UI_RELEASE);
-        if (!scrolled && !long_sent) {
+        lvgl_event(pressed_slot, APPS_UI_RELEASE);  /* PRESS_LOST once the layer has taken the touch */
+        if (!waiting && !scrolled && !long_sent) {
             lvgl_event(pressed_slot, APPS_UI_TAP);
         }
         if (list_dragging) {
@@ -498,6 +577,9 @@ static void reset(void) {
     guard = NULL;
     pending = playing = ending = no_input = false;
     finger_from = 0;
+    sum_x = sum_y = 0;
+    gesture_sent = waiting = false;
+    closes = 0;
     takes = admits = keeps = ends = withdraws = 0;
     reads_paused = false;
     n_sent = 0;
@@ -847,8 +929,7 @@ static void a_turn(void) {
     in_turn = true;
 }
 static void swiped(void) {
-    apps_touch_closed();  /* the layer's right swipe, inside LVGL's gesture: on_close */
-    layer_front = false;
+    on_close();  /* the layer's right swipe from the left edge, inside LVGL's gesture */
 }
 
 static void cut_mid_touch(void) {
@@ -865,7 +946,7 @@ static void cut_mid_touch(void) {
                         "screen); the press ended with a release and no tap, and nothing else was touched"},
         {a_turn, false, "cut short: 'list' left the front (it ended, or another app, the launcher, a card or a voice turn took the "
                         "screen); the press ended with a release and no tap, and nothing else was touched"},
-        {swiped, false, "the drag was a right swipe: 'list' went behind, as a finger's would"},
+        {swiped, false, "the drag was a right swipe from the left edge: 'list' went behind, as a finger's would"},
     };
     each_step = at_the_read;
     for (size_t i = 0; i < ARRAY_LEN(ways); i++) {
@@ -901,6 +982,64 @@ static void cut_mid_touch(void) {
                    "someone touched the screen; the press ended with a release and no tap\"]}");
     finger_from = 0;
     each_step = NULL;
+    /* The swiped way, played: a right swipe from the left edge (the board's drag of 10,233 to 300,233 over 250 ms) is LVGL's gesture
+     * at the read 58 px in, 50 ms on; the layer closes, and the next read cuts the touch: the same answer. It pressed the list's
+     * first row, at y 233. */
+    n_sent = 0;
+    const int closed = closes;  /* the swiped way's one */
+    CHECK(touch("list", true, drag_at(10, 233, 300, 233, 250), &c, &e), "%s %s", c, e);
+    EXPECT_PAYLOAD("{\"id\":\"list\",\"action\":\"drag\",\"pressed\":\"label#9\",\"heard\":[\"label#9 press\","
+                   "\"label#9 release\"],\"front\":false,\"cut\":true,\"played_ms\":60,\"scroll\":[],\"warnings\":[\"the drag was "
+                   "a right swipe from the left edge: 'list' went behind, as a finger's would\"]}");
+    EXPECT_SENT_TAGGED(2);
+    CHECK(closes == closed + 1, "closed %d times", closes - closed);
+    layer_front = true;
+    /* Its twin, from x = APPS_LV_CLOSE_EDGE_PX: no edge, so the swipe is the app's, and the touch plays to its end. */
+    n_sent = 0;
+    CHECK(touch("list", true, drag_at(APPS_LV_CLOSE_EDGE_PX, 233, 330, 233, 250), &c, &e), "%s %s", c, e);
+    EXPECT_PAYLOAD("{\"id\":\"list\",\"action\":\"drag\",\"pressed\":\"label#9\",\"heard\":[\"label#9 press\","
+                   "\"label#9 swipe right\",\"label#9 release\"],\"front\":true,\"cut\":false,\"played_ms\":250,\"scroll\":[],"
+                   "\"warnings\":[]}");
+    EXPECT_SENT_TAGGED(3);
+    CHECK(closes == closed + 1, "the twin closed: %d", closes - closed - 1);
+    EXPECT_CLEAN();
+}
+
+/* A drag that is a swipe (more than 50 px at 3 px or more a read) is heard as press, swipe and its way, release, and no tap, each of
+ * the four ways, on the widget it pressed; a swipe from the middle leaves the app in front. The code the app gets has the direction
+ * and the tag together. A drag slower than 3 px a read is no swipe, and taps at the lift. */
+static void drag_that_swipes_is_heard_with_its_direction(void) {
+    static const struct {
+        muse_apps_at_t at;
+        int dir;
+        const char *name;
+    } swipes[] = {
+        {{330, 140, 130, 140, 200}, APPS_UI_LEFT, "left"},
+        {{130, 140, 330, 140, 200}, APPS_UI_RIGHT, "right"},
+        {{233, 170, 233, 20, 150}, APPS_UI_UP, "up"},
+        {{233, 110, 233, 260, 150}, APPS_UI_DOWN, "down"},  /* over the list, which doesn't scroll: the button keeps the press */
+    };
+    const char *c, *e;
+    for (size_t i = 0; i < ARRAY_LEN(swipes); i++) {
+        n_sent = 0;
+        CHECK(touch("list", true, swipes[i].at, &c, &e), "%s %s", c, e);
+        char want[1024];
+        snprintf(want, sizeof want, "{\"id\":\"list\",\"action\":\"drag\",\"pressed\":\"button#4\",\"heard\":[\"button#4 press\","
+                                    "\"button#4 swipe %s\",\"button#4 release\"],\"front\":true,\"cut\":false,\"played_ms\":%d,"
+                                    "\"scroll\":[],\"warnings\":[]}", swipes[i].name, swipes[i].at.ms);
+        EXPECT_PAYLOAD(want);
+        EXPECT_SENT_TAGGED(3);
+        CHECK(sent[1] == (uint8_t)(APPS_UI_SWIPE_CODE(swipes[i].dir) | APPS_UI_INJECTED), "the swipe %s reached the app as %#x",
+              swipes[i].name, sent[1]);
+    }
+    CHECK(closes == 0, "a swipe from the middle closed the app %d times", closes);
+    /* 2 px a read: no swipe, and a tap. */
+    n_sent = 0;
+    CHECK(touch("list", true, drag_at(300, 140, 240, 140, 300), &c, &e), "%s %s", c, e);
+    EXPECT_PAYLOAD("{\"id\":\"list\",\"action\":\"drag\",\"pressed\":\"button#4\",\"heard\":[\"button#4 press\","
+                   "\"button#4 release\",\"button#4 tap\"],\"front\":true,\"cut\":false,\"played_ms\":300,\"scroll\":[],"
+                   "\"warnings\":[]}");
+    EXPECT_SENT_TAGGED(3);
     EXPECT_CLEAN();
 }
 
@@ -1022,6 +1161,7 @@ static const struct {
     {"dark_past_the_deadline", dark_past_the_deadline},
     {"withdrawn_at_the_deadline", withdrawn_at_the_deadline},
     {"cut_mid_touch", cut_mid_touch},
+    {"drag_that_swipes_is_heard_with_its_direction", drag_that_swipes_is_heard_with_its_direction},
     {"the_tag_is_only_the_touchs", the_tag_is_only_the_touchs},
     {"heard_more_than_listed", heard_more_than_listed},
     {"waited_too_long", waited_too_long},

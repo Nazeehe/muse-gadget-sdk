@@ -1811,7 +1811,7 @@ void muse_ui_bench_page(muse_ui_page_t page)
  * caller's; this is only where each comes. The real touch is read at its take
  * into LVGL's own read, which LVGL gets as it is when the drag doesn't start,
  * and at each read after into a read of its own, which LVGL never sees. A cut
- * ends it as the apps' right swipe ends a finger's touch (apps_lv.c's
+ * ends it as an app's swipe ends a finger's touch (apps_lv.c's
  * on_gesture): lv_indev_wait_release, which in LVGL 9.5.0 only sets the
  * indev's wait_until_release, read when LVGL handles this read's data right
  * after the callback returns, so it may be called from inside it. While it is

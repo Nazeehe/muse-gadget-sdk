@@ -631,6 +631,38 @@ static void an_injected_tap_opens_no_gate(void) {
     expect_nothing_said();
 }
 
+/* app.control's drag that is a swipe (swipes Task 3): its code reaches apps_rt_touch with the direction and the tag together. The tag
+ * comes off and the direction stays: the button's swipe handler hears (w, "swipe", "left"), and no gate opens, as for Muse's tap. A
+ * person's swipe opens both, as any touch of a person's does. */
+static const char *const SWIPE_APP = APP("function app.start()\n"
+                                         "  ui.button{text = 'Ask'}:on('swipe', function(w, name, dir)\n"
+                                         "    print('heard', name, dir) try(sys.show) try(muse.ask, 'from a swipe', cb('reply')) end)\n"
+                                         "end\n"
+                                         "T.ask = function() try(muse.ask, 'hello', cb('reply')) end\n");
+
+static void an_injected_swipe_opens_no_gate(void) {
+    words();
+    const char *no_show = "false\tsys.show: allowed only in message() or alarm(), or within 10 s of a tap";
+    start_app(SWIPE_APP);
+    const uint16_t gen = apps_ui_slot(apps_rt_ui(rt), 0)->gen;
+    apps_rt_touch(rt, 0, gen, (uint8_t)(APPS_UI_SWIPE_CODE(APPS_UI_LEFT) | APPS_UI_INJECTED));
+    expect_logged("heard\tswipe\tleft", no_show, ok_tap);
+    call("ask");  /* in message(), after Muse's swipe: no person has touched yet */
+    expect_logged(ok_tap);
+    CHECK(asks == 0, "an ask after Muse's swipe was sent: %d", asks);
+    /* A person's swipe opens both. */
+    clock_ms += 1000;
+    apps_rt_touch(rt, 0, gen, (uint8_t)APPS_UI_SWIPE_CODE(APPS_UI_DOWN));
+    expect_logged("heard\tswipe\tdown", "true\tnil", "true\tnil");
+    CHECK(asks == 1, "the person's swipe's ask wasn't sent: %d", asks);
+    chat_done(NULL);
+    settle();
+    expect_logged("reply\t[]\tnil");
+    expect_said("ask app: done (0 bytes)");
+    finish();
+    expect_nothing_said();
+}
+
 /* One ask at a time, of any app (P17: a turn the apps have let go of still counts until its end), and APPS_ASK_GAP_MS from one
  * accepted ask's start to the next, any app's, with the seconds left rounded up (P18). */
 static void one_ask_at_a_time_and_30_s_gap(void) {
@@ -1178,6 +1210,7 @@ int main(int argc, char **argv) {
     } cases[] = {
         {"ask_needs_a_recent_tap", ask_needs_a_recent_tap},
         {"an_injected_tap_opens_no_gate", an_injected_tap_opens_no_gate},
+        {"an_injected_swipe_opens_no_gate", an_injected_swipe_opens_no_gate},
         {"one_ask_at_a_time_and_30_s_gap", one_ask_at_a_time_and_30_s_gap},
         {"text_and_reply_limits", text_and_reply_limits},
         {"ask_text_line_breaks_are_flattened", ask_text_line_breaks_are_flattened},

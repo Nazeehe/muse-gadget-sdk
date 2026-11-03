@@ -1758,8 +1758,8 @@ static void on_widget_event(uint16_t slot, uint16_t gen, uint8_t event) {
     }
 }
 
-/* A right swipe on the layer, inside LVGL's gesture event. It only backgrounds (Task 11's ruling): no teardown, and no
- * wait for the app task, which may be waiting for this task. */
+/* A right swipe from the left edge on the layer (apps_lv.h's Swipes), inside LVGL's gesture event. It only backgrounds (Task
+ * 11's ruling): no teardown, and no wait for the app task, which may be waiting for this task. */
 static void on_close(void) {
     if (!atomic_load(&s_up)) {
         return;

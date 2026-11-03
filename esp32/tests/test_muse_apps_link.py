@@ -221,6 +221,36 @@ def c_table(source, name):
     return re.findall(r'"(\w+)"', match.group(1))
 
 
+def swipe_numbers():
+    """What a swipe is, each number from where it is pinned (D12): LVGL 9.5.0's gesture distance and speed as the lv harness's fake
+    has them (test_muse_apps_lv.py pins those to LVGL's), the board's read of the touch (devices/sdkconfig.muse's refresh period),
+    LVGL's long press as muse_apps.h quotes it, and the left edge's band (apps_lv.h)."""
+    lv = (TESTS / "muse_apps_lv_harness.c").read_text()
+
+    def fake(name):
+        return int(re.search(rf"(?m)^#define {name} (\d+)\b", lv).group(1))
+
+    sdkconfig = (ROOT / "devices/sdkconfig.muse").read_text()
+    return {"gesture": fake("FAKE_GESTURE_LIMIT"), "velocity": fake("FAKE_GESTURE_MIN_VELOCITY"),
+            "refresh": int(re.search(r"(?m)^CONFIG_LV_DEF_REFR_PERIOD=(\d+)$", sdkconfig).group(1)),
+            "long": int(re.search(r"LVGL makes a press\s+\* a long press (\d+) ms into it", (MUSE / "muse_apps.h").read_text()).group(1)),
+            "edge": header_number("apps_lv.h", "APPS_LV_CLOSE_EDGE_PX")}
+
+
+def swipe_of(x1, y1, x2, y2, ms):
+    """How a drag of the touch player's (straight, its point following the clock, read every refresh period) ends, by LVGL's rule as
+    apps_lv.c's on_gesture takes it: "edge" for a right swipe whose press is in the left edge's band inside the circle, else the
+    swipe's way, or None for no swipe (the larger axis not past the gesture distance, or under the gesture speed a read)."""
+    n = swipe_numbers()
+    dx, dy = x2 - x1, y2 - y1
+    run = max(abs(dx), abs(dy))
+    if run <= n["gesture"] or run * n["refresh"] < n["velocity"] * ms:
+        return None
+    way = ("right" if dx > 0 else "left") if abs(dx) > abs(dy) else ("down" if dy > 0 else "up")
+    edge = x1 < n["edge"] and (x1 - 233) ** 2 + (y1 - 233) ** 2 <= 233 ** 2
+    return "edge" if way == "right" and edge else way
+
+
 def adapter_default_stack():
     """esp_lvgl_adapter 0.6.4's ESP_LV_ADAPTER_DEFAULT_STACK_SIZE as its esp_lv_adapter.h has it, or None when no tree of that
     version is on this machine: what a device build left in managed_components/, or the component manager's cache
@@ -331,7 +361,7 @@ class GuideAndSkill(unittest.TestCase):
                 "return a sound that is already done, and nothing plays.",
                 # M2: a cut loop isn't started again and the app isn't told; only a hide is followed by show().
                 "A loop stopped this way stays stopped, and nothing tells the app: start it again in `show()`, which comes when the "
-                "app is back from a swipe or a voice turn.",
+                "app is back in front after a swipe from the left edge or a voice turn.",
                 "The dark, an alarm's ring and a talk press that starts no voice turn don't put the app behind, so no `show()` "
                 "follows them: keep the screen lit with `sys.keep_awake(true)` (the `keep_awake` permission) while a loop should "
                 "play, and let a tap start it again."):
@@ -427,10 +457,12 @@ class GuideAndSkill(unittest.TestCase):
                 '`"end"` (at its right).',
                 '- `w:scroll_to(where, animate)` scrolls a box with `scroll = "y"`: where is `"start"`, `"end"` or a number of px',
                 # The final review's M3: LVGL 9.5 takes a box for a drag only when it has more to show (lv_indev_find_scroll_obj's
-                # st > 0 || sb > 0); with nothing to scroll the release clicks (drag_in_a_list_that_fits_taps_the_row).
+                # st > 0 || sb > 0), and sends no gesture while a drag scrolls; with nothing to scroll the drag is a swipe past 50 px
+                # and a tap under it (swipes S3: the lv harness's scroll_is_not_a_swipe).
                 'A drag up or down that begins on a widget in a box with `scroll = "y"` scrolls the box when the box holds more than '
-                'it shows: the widget hears press, then release, and no tap.',
-                "When all that is in the box fits in it, nothing scrolls, and the drag is heard as press, release, tap."):
+                'it shows: that drag is a scroll, not a swipe, and the widget hears press, then release, and no tap.',
+                "When all that is in the box fits in it, nothing scrolls: a drag up or down on it is a swipe or a tap by the rules "
+                "above."):
             with self.subTest(sentence):
                 self.assertIn(sentence, reference)
         patterns = " ".join(guide_section(guide, "Patterns").split())
@@ -844,8 +876,54 @@ class GuideAndSkill(unittest.TestCase):
         # below); the right swipe is still an app's, unchanged, and closes no launcher.
         guide = " ".join(GUIDE.read_text().split())
         self.assertIn("There a tap on the app in the middle opens it, a tap on one at a side brings it to the middle, and a swipe up from "
-                      "the bottom edge closes the launcher. A right swipe puts the app behind, where it keeps running.", guide)
+                      "the bottom edge closes the launcher. A right swipe that starts at the screen's left edge puts the app behind, "
+                      "where it keeps running.", guide)
         self.assertNotRegex(guide, r"(?i)right swipe[^.]*\bcloses? the launcher")
+
+    def test_guide_says_how_swipes_are_heard(self):
+        # Swipes Task 3 (D12): Touches says what a swipe is and how it is heard, each number from where it is pinned (swipe_numbers);
+        # S3's effect on every app in plain words; where a swipe goes (S2) and the left edge's way out (S4); Games' 2048 note at the
+        # game loop's rate; and nothing left of the old rule that any right swipe leaves and a left one taps.
+        n = swipe_numbers()
+        guide = GUIDE.read_text()
+        ui = " ".join(guide[guide.index("\n### ui\n"):guide.index("\n### time\n")].split())
+        for sentence in (
+                f"Touches. A tap is heard as press, release, tap, in that order; a long press ({n['long']} ms) as press, long_press, "
+                "release, with no tap.",
+                f"A swipe is a drag of more than {n['gesture']} px left, right, up or down that moves at least {n['velocity']} px "
+                f"every {n['refresh']} ms (each time the gadget reads the touch): it is heard as press, swipe, release, with no tap.",
+                "So in every app, a quick flick on a button is a swipe, not a tap.",
+                "A shorter or slower drag is no swipe: it is heard as a press that stays put is, a tap or a long press.",
+                f"A press held {n['long']} ms before it swipes hears long_press first: press, long_press, swipe, release (when the "
+                f"swipe comes just as the press turns {n['long']} ms old, long_press can come right after the swipe instead).",
+                "The swipe goes to the widget the touch went down on when that widget has a `swipe` handler, else to the nearest box "
+                "around it, up its boxes, that has one, with that box as `w`; with none, nobody hears it.",
+                f"A right swipe that starts within {n['edge']} px of the screen's left edge puts the app behind: the app hears "
+                "`hide()`, not the swipe. Any other right swipe is the app's."):
+            with self.subTest(sentence[:50]):
+                self.assertIn(sentence, ui)
+        for old in ("A right swipe that begins on a widget puts the app behind", "A left swipe that begins on a widget is heard as "
+                    "press, release, tap", "A right swipe puts the app behind"):
+            with self.subTest(old=old):
+                self.assertNotIn(old, " ".join(guide.split()))
+        # Going behind is the left edge's swipe wherever the guide names it.
+        self.assertIn("function app.hide() end                -- the app went behind (a swipe from the left edge, a voice turn, "
+                      "the launcher)", guide)
+        games = " ".join(guide_section(guide, "Games").split())
+        tick = header_number("apps_rt.h", "APPS_TIMER_MIN_MS")
+        for sentence in (
+                "For a game of swipes, like 2048, put the tiles, which have no handlers, inside one full-screen box with a `swipe` "
+                "handler: the box hears every swipe, whichever tile it starts on, as `fn(w, \"swipe\", dir)`.",
+                f"Slide the tiles a step each tick of the game's loop (at most {1000 // tick} times a second: One tick), not all the "
+                "way in the handler.",
+                "`hide()` comes with a swipe from the left edge or a voice turn: pause the game there,",
+                "A `drag` of 200 px over 200 ms on the box is a swipe, heard as `box#0 swipe left` or the like."):
+            with self.subTest(sentence[:50]):
+                self.assertIn(sentence, games)
+        self.assertEqual(swipe_of(333, 233, 133, 233, 200), "left")  # Testing it's drag of 200 px over 200 ms
+        self.assertEqual(swipe_of(300, 233, 240, 233, 300), "left", "3 px a read, 60 px over 300 ms, is the slowest swipe")
+        self.assertIsNone(swipe_of(300, 233, 240, 233, 450), "2 px a read is none")
+        self.assertIsNone(swipe_of(300, 233, 250, 233, 50), "50 px is none")
 
     def test_agents_md_says_how_the_launcher_is_used(self):
         # D12: the bottom band AGENTS.md quotes is APPS_LV_CLOSE_EDGE_PX.
@@ -858,7 +936,9 @@ class GuideAndSkill(unittest.TestCase):
         for phrase in ("the most recently used first; a tap on the app in the middle opens it and a tap on one at a side brings it to "
                        "the middle;",
                        f"a swipe up that starts in the bottom {edge} px of the screen (`APPS_LV_CLOSE_EDGE_PX`) closes it; a right swipe "
-                       "puts the app behind, where it keeps running.",
+                       f"that starts in the left {edge} px of the screen (the same `APPS_LV_CLOSE_EDGE_PX`, inside the circle) puts the "
+                       "app behind, where it keeps running, and any other swipe is the app's (`fn(w, \"swipe\", dir)`, with no tap: "
+                       "`on_gesture` in `apps_lv.c`).",
                        # Task 6a: the launch hold's bound is APPS_LV_LAUNCH_HOLD_MS.
                        f"until the app's first frame, for at most {hold // 1000} s (`APPS_LV_LAUNCH_HOLD_MS`)"):
             with self.subTest(phrase):
@@ -947,6 +1027,11 @@ class GuideAndSkill(unittest.TestCase):
         tap, long_ms, heard = define("MUSE_APPS_TOUCH_TAP_MS"), define("MUSE_APPS_TOUCH_LONG_MS"), define("MUSE_APPS_TOUCH_HEARD_MAX")
         settle_s = define("MUSE_APPS_TOUCH_SETTLE_MS") / 1000
         lvgl_long = int(re.search(r"LVGL makes a press\s+\* a long press (\d+) ms into it", header).group(1))
+        n = swipe_numbers()
+        gesture, velocity, refresh, edge = n["gesture"], n["velocity"], n["refresh"], n["edge"]
+        self.assertEqual(refresh % velocity, 0, "an ms of at most refresh / velocity times the length is the speed's rule exactly")
+        x1, y1, x2, y2, ms = 10, 233, 300, 233, 250  # the edge swipe The loop gives (and AGENTS.md's board scripts)
+        self.assertEqual(swipe_of(x1, y1, x2, y2, ms), "edge")
         guide = GUIDE.read_text()
         loop = " ".join(guide_section(guide, "The loop").split())
         for phrase in (
@@ -959,8 +1044,11 @@ class GuideAndSkill(unittest.TestCase):
                 "in front after it), `cut`, `played_ms`, `scroll` and `warnings`. A dark screen is woken for it.",
                 f"- `drag`: presses `at`'s `{{x, y}}`, moves straight to its `{{x2, y2}}` over `ms` ({low} to {high}, which a drag "
                 "must give), and lifts: drag up on a list to scroll it. `scroll` lists each box with `scroll = \"y\"` that moved, "
-                f"with its `y` once it has come to rest (at most {settle_s:g} s after the lift). A right swipe puts the app behind, "
-                "as a finger's does: `front` is false.",
+                f"with its `y` once it has come to rest (at most {settle_s:g} s after the lift). A drag that is a swipe (Touches: "
+                f"more than {gesture} px, with an `ms` of at most {refresh // velocity} times that length in px) is heard as one, like "
+                "`box#0 swipe left`, with no tap, and the app stays in front. A right swipe that starts within "
+                f"{edge} px of the left edge, inside the round screen, puts the app behind, as a finger's does: `front` is false. "
+                f"A drag from {x1}, {y1} to {x2}, {y2} over {ms} ms is one.",
                 "A touch lands only on the app: it plays only while the app runs in front, with no launcher, card or picture over "
                 "it, no voice turn and no finger on the screen, and it is cut (`cut` is true, and a warning says why) the moment "
                 "that stops, with a release and no tap. When it can't play, nothing is touched: `unavailable` says why, "
@@ -1023,9 +1111,32 @@ class GuideAndSkill(unittest.TestCase):
                 "screen does."):
             with self.subTest(phrase[:40]):
                 self.assertIn(phrase, section)
+        # Swipes Task 3: a drag that is a swipe, and the left edge's way out, which the layer's close tells the touch (D12: the
+        # gesture's numbers as swipe_numbers has them; the close, the cut and its warning as the sources have them).
+        n = swipe_numbers()
+        self.assertIn("apps_touch_closed();", c_function((APPS / "apps_task.c").read_text(), "static void on_close(void) {"))
+        self.assertIn("case CUT_SWIPE: cut = \"the drag was a right swipe from the left edge: '%s' went behind, as a finger's "
+                      "would\"; break;", (APPS / "apps_touch.c").read_text())
+        self.assertIn(f"A drag that is LVGL's gesture (more than {n['gesture']} px on one axis, at {n['velocity']} px or more a read) is "
+                      "the app's swipe: `heard` lists it as `box#0 swipe left`, with no tap, and the app stays in front. A right swipe "
+                      "from the left edge puts the app behind as a finger's does: the layer's close (`on_close` in `apps_task.c`) tells "
+                      "the touch (`apps_touch_closed`), the next read cuts it, and the reply has `front` false, `cut` true and a "
+                      "warning that says so.", section)
         bench = " ".join(agents[:agents.index("\n## Muse apps\n")].split())
         self.assertIn("An apps build has the same player for `app.control`'s `tap` and `drag` (Muse's touches, under Muse apps), "
                       "but not these lines.", bench)
+        # S6: the bench's right swipe starts at BENCH_SWIPE_TO, outside the edge, and goes to BENCH_SWIPE_FROM; the board's way out is
+        # an edge swipe by the rule.
+        ui_c = (MUSE / "muse_ui.c").read_text()
+        start, end = (int(re.search(rf"(?m)^#define {name} (\d+)", ui_c).group(1)) for name in ("BENCH_SWIPE_TO", "BENCH_SWIPE_FROM"))
+        y = int(re.search(r"(?m)^#define BENCH_SWIPE_Y (\d+)", ui_c).group(1))
+        bench_ms = int(re.search(r"(?m)^#define BENCH_SWIPE_MS (\d+)", ui_c).group(1))
+        self.assertIn("a right swipe goes the other way", ui_c)
+        self.assertEqual(swipe_of(start, y, end, y, bench_ms), "right")
+        self.assertEqual(swipe_of(10, 233, 300, 233, 250), "edge")
+        self.assertIn(f"`>swipe right` starts at x {start}, not in the left edge's {n['edge']} px, so it no longer puts an app "
+                      "behind: it is the app's swipe (Muse apps). Board scripts that leave an app use "
+                      "`>app.drag <id> 10 233 300 233 250` instead.", bench)
         kconfig = " ".join((MUSE / "Kconfig").read_text().split())
         self.assertIn("An apps build (MUSE_APPS) has the same player, for Muse's own touches (app.control tap and drag), but not "
                       "these lines.", kconfig)
@@ -1048,6 +1159,9 @@ class GuideAndSkill(unittest.TestCase):
         self.assertNotIn("Leave those out", section)
         for phrase in ("**Lists:** a box with `scroll = \"y\"` scrolls up and down with LVGL's own drag, throw and elastic edge "
                        "(`style_box` in `apps_lv.c`)",
+                       # Swipes Task 3: only a box that holds more than it shows takes a drag, and a scroll is no swipe.
+                       "so a drag up or down that begins on it or on a row in it scrolls it when it holds more than it shows: the row "
+                       "hears press and release, and no tap and no swipe (LVGL sends no gesture while a drag scrolls).",
                        "A bench build sums up the frames of an app's box with `scroll = \"y\"` while it scrolls on the layer in front, "
                        "with no card or launcher over it, in `scroll frames:` lines (the bench's frame summaries, under Build); the box's "
                        "`LV_EVENT_SCROLL_END` ends a scroll's summary too, since a throw that stops short of the list's ends sends it at "

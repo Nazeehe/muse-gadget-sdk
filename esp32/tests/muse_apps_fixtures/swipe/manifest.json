@@ -1,0 +1,13 @@
+{
+  "id": "swipe",
+  "name": "Swipe",
+  "version": "1",
+  "api": 1,
+  "permissions": [
+    "keep_awake"
+  ],
+  "memory_kb": 64,
+  "messages": {
+    "last": "Replies {last, count}: the last swipe or tap heard (\"swipe left\", \"tap\" or null), and how many have come."
+  }
+}

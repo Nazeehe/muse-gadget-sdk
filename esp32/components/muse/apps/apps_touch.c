@@ -67,7 +67,7 @@ typedef enum { CUT_NONE, CUT_LEFT, CUT_COVERED, CUT_FINGER, CUT_SWIPE, CUT_LATE 
 typedef struct {
     int16_t slot;
     int8_t kind;    /* apps_ui.h's APPS_W_*, -1 for none */
-    uint8_t event;  /* its bit, without the tag */
+    uint8_t event;  /* its bit, or a swipe's code with its direction (apps_ui.h), without the tag */
 } heard_t;
 
 /* The LVGL task's answer, from the hand-off to DONE: then the job's. */
@@ -90,7 +90,7 @@ static EXT_RAM_BSS_ATTR struct {
     char id[APPS_ID_MAX + 1];
     int x1, y1, x2, y2, ms;
     uint32_t gen;      /* the app's app_gen, read with its id at admit */
-    bool swiped;       /* its drag was the layer's right swipe (apps_touch_closed) */
+    bool swiped;       /* its drag was the layer's right swipe from the left edge (apps_touch_closed) */
     bool ended;        /* the player's end came */
     int64_t lift_ms;
     answer_t a;
@@ -267,11 +267,13 @@ static const char *kind_name(int kind) {
     return kind >= 0 && kind <= APPS_W_SPINNER ? KINDS[kind] : "widget";
 }
 
-static const char *event_name(uint8_t bit) {
-    switch (bit) {
+/* An event's name as heard lists it; a swipe's direction (apps_ui_dir_name) goes after it. */
+static const char *event_name(uint8_t code) {
+    switch (code & ~APPS_UI_DIR_MASK) {
         case APPS_UI_TAP: return "tap";
         case APPS_UI_LONG_PRESS: return "long_press";
         case APPS_UI_PRESS: return "press";
+        case APPS_UI_SWIPE: return "swipe";
         default: return "release";
     }
 }
@@ -394,7 +396,10 @@ static cJSON *payload(const touch_job_t *job, const answer_t *a) {
     }
     ok = ok && (heard = cJSON_AddArrayToObject(p, "heard")) != NULL;
     for (int i = 0; ok && i < a->n_heard; i++) {
-        snprintf(item, sizeof item, "%s#%d %s", kind_name(a->heard[i].kind), (int)a->heard[i].slot, event_name(a->heard[i].event));
+        const uint8_t code = a->heard[i].event;
+        const bool swipe = (code & ~APPS_UI_DIR_MASK) == APPS_UI_SWIPE;
+        snprintf(item, sizeof item, "%s#%d %s%s%s", kind_name(a->heard[i].kind), (int)a->heard[i].slot, event_name(code),
+                 swipe ? " " : "", swipe ? apps_ui_dir_name(code) : "");
         ok = add_text(heard, item);
     }
     ok = ok && cJSON_AddBoolToObject(p, "front", a->front) != NULL &&
@@ -412,7 +417,7 @@ static cJSON *payload(const touch_job_t *job, const answer_t *a) {
                   "ended with a release and no tap, and nothing else was touched";
             break;
         case CUT_FINGER: cut = "cut short: someone touched the screen; the press ended with a release and no tap"; break;
-        case CUT_SWIPE: cut = "the drag was a right swipe: '%s' went behind, as a finger's would"; break;
+        case CUT_SWIPE: cut = "the drag was a right swipe from the left edge: '%s' went behind, as a finger's would"; break;
         default: break;
     }
     if (ok && cut != NULL) {

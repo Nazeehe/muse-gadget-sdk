@@ -108,13 +108,16 @@
  * hears press, release, tap, or press, long_press, release. Every swipe on the layer ends its press (the layer's
  * lv_indev_wait_release, whichever way it goes: Swipes, below), and the lift then sends PRESS_LOST and nothing else,
  * which is why that is a release too: a press is never left open, and a swipe is heard as press, swipe, release
- * (press, long_press, swipe, release after a long press), never with a tap. The swipe itself is the layer's to send,
- * not the widget's (Swipes). The callback's user data is slot | gen << 16, and it calls the event callback with that
- * slot and gen, and the APPS_UI_* bit. It doesn't check the gen: an object deleted since can't send one, and an event
- * already queued meets Task 9's dispatch, which drops a slot that is gone or on another gen. An arc also gets a
- * guard that stops its own handling of a moving press: LVGL turns an arc's value to a finger on it, and the value
- * is the app's. It also keeps lv_arc's drag code, which divides by the radius, from ever running on an app's arc: an
- * arc with no w and h has a radius of 0 and can still be pressed, and the division would be a CPU exception.
+ * (press, long_press, swipe, release after a long press), never with a tap. A swipe that comes on the read at which
+ * the press turns 400 ms old has its long_press after it, on that same read: LVGL checks the long press after the
+ * gesture, and lv_indev_wait_release stops only the reads after (press, swipe, long_press, release). The swipe
+ * itself is the layer's to send, not the widget's (Swipes). The callback's user data is slot | gen << 16, and it
+ * calls the event callback with that slot and gen, and the APPS_UI_* bit. It doesn't check the gen: an object
+ * deleted since can't send one, and an event already queued meets Task 9's dispatch, which drops a slot that is gone
+ * or on another gen. An arc also gets a guard that stops its own handling of a moving press: LVGL turns an arc's
+ * value to a finger on it, and the value is the app's. It also keeps lv_arc's drag code, which divides by the
+ * radius, from ever running on an app's arc: an arc with no w and h has a radius of 0 and can still be pressed, and
+ * the division would be a CPU exception.
  *
  * Round-screen feedback: overflow is how far the widget goes past the round edge, in px, to the nearest (0 when it
  * fits, and for a hidden widget or one inside a hidden box). A rectangle goes as far as its farthest corner from
@@ -127,8 +130,8 @@
  * hidden (the app is behind) the pass still runs, so the layout is current when it comes to the front.
  *
  * Swipes. Every swipe on the app comes to the layer, whatever it began on (widgets pass a swipe up: only the layer stops one), as LVGL
- * 9.5.0 makes it: a drag past 50 px on one axis, at 3 px or more a read (a slower drag is no swipe, and taps at the lift, as any slide
- * that isn't one does), and never one that scrolls a box with scroll = "y" (LVGL sends no gesture while a drag scrolls). The layer
+ * 9.5.0 makes it: a drag past 50 px on one axis, at 3 px or more a read (a slower drag is no swipe, and is a tap or a long press
+ * unless it scrolls a box), and never one that scrolls a box with scroll = "y" (LVGL sends no gesture while a drag scrolls). The layer
  * takes the touch at once, whichever way the swipe goes (lv_indev_wait_release: no tap at the lift). Then nothing more while the layer
  * is behind or a card is shown (a voice turn hides it, mid-touch too: LVGL doesn't end a touch for a hide), or for a press that went
  * down before the last apps_lv_reset or apps_lv_build (an alarm's launch of another app mid-touch). Otherwise a right swipe whose press

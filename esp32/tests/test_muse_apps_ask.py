@@ -68,6 +68,9 @@ class AskHarness(unittest.TestCase):
     def test_an_injected_tap_opens_no_gate(self):  # app.control's tap: heard as a tap, but neither muse.ask's gate nor sys.show's opens
         self.run_case("an_injected_tap_opens_no_gate")
 
+    def test_an_injected_swipe_opens_no_gate(self):  # app.control's drag that swipes: (w, "swipe", dir), and no gate opens
+        self.run_case("an_injected_swipe_opens_no_gate")
+
     def test_one_ask_at_a_time_and_30_s_gap(self):  # P17: a detached turn counts until its end; P18: the gap from the start, rounded up
         self.run_case("one_ask_at_a_time_and_30_s_gap")
 

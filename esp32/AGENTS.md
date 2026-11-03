@@ -179,7 +179,10 @@ the Mac, through LVGL's own input: `>tap X Y`, `>longpress X Y`,
 (`snap.py PORT '>swipe left' OUT.png`) press and drag as a finger would, on a
 touch screen that LVGL polls (`>swipe up` from the bottom edge, at the middle, as
 the launcher's close takes it; `>drag` from the first point straight to the
-second in MS ms, 50 to 2000). An apps build has the same player for
+second in MS ms, 50 to 2000). `>swipe right` starts at x 60, not in the left
+edge's 40 px, so it no longer puts an app behind: it is the app's swipe (Muse
+apps). Board scripts that leave an app use `>app.drag <id> 10 233 300 233 250`
+instead. An apps build has the same player for
 `app.control`'s `tap` and `drag` (Muse's touches, under Muse apps), but not
 these lines. `snap.py` sends `w` first,
 since LVGL doesn't read its input while the screen sleeps on battery, and waits
@@ -820,7 +823,10 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   carousel of every app, the most recently used first; a tap on the app in the
   middle opens it and a tap on one at a side brings it to the middle; a swipe
   up that starts in the bottom 40 px of the screen (`APPS_LV_CLOSE_EDGE_PX`)
-  closes it; a right swipe puts the app behind, where it keeps running. After
+  closes it; a right swipe that starts in the left 40 px of the screen (the
+  same `APPS_LV_CLOSE_EDGE_PX`, inside the circle) puts the app behind, where
+  it keeps running, and any other swipe is the app's (`fn(w, "swipe", dir)`,
+  with no tap: `on_gesture` in `apps_lv.c`). After
   the tap the launcher stays up, taking no touch, until the app's first frame,
   for at most 3 s (`APPS_LV_LAUNCH_HOLD_MS`), so the watch doesn't flash
   between them. Muse uses four Link commands:
@@ -909,11 +915,13 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   app was hidden for the turn and shown again after it, silent.
 - **Lists:** a box with `scroll = "y"` scrolls up and down with LVGL's own
   drag, throw and elastic edge (`style_box` in `apps_lv.c`), and takes the
-  touches on it, so a drag that begins on it or on a row in it scrolls it: the
-  row hears press and release, and no tap. `>drag X1 Y1 X2 Y2 MS` (a bench
-  build's console) presses at the first point, moves straight to the second
-  over MS ms and lifts, as a finger that drags would (MS is 50 to 2000,
-  `MUSE_UI_DRAG_MS_MIN` and `_MAX` in `muse_ui.h`). A bench build sums up the
+  touches on it, so a drag up or down that begins on it or on a row in it
+  scrolls it when it holds more than it shows: the row hears press and release,
+  and no tap and no swipe (LVGL sends no gesture while a drag scrolls).
+  `>drag X1 Y1 X2 Y2 MS` (a bench build's console) presses at the first
+  point, moves straight to the second over MS ms and lifts, as a finger that
+  drags would (MS is 50 to 2000, `MUSE_UI_DRAG_MS_MIN` and `_MAX` in
+  `muse_ui.h`). A bench build sums up the
   frames of an app's box with `scroll = "y"` while it scrolls on the layer in
   front, with no card or launcher over it, in `scroll frames:` lines (the
   bench's frame summaries, under Build); the box's `LV_EVENT_SCROLL_END` ends a
@@ -993,7 +1001,13 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   open neither `muse.ask`'s nor `sys.show`'s tap gate, and its presses never
   confirm a pairing on a touch-talk board (`on_any_press` in `muse_ui.c`). A
   finger LVGL still holds from its last read (`lv_indev_get_state`) refuses
-  the touch too, as one on the screen does.
+  the touch too, as one on the screen does. A drag that is LVGL's gesture
+  (more than 50 px on one axis, at 3 px or more a read) is the app's swipe:
+  `heard` lists it as `box#0 swipe left`, with no tap, and the app stays in
+  front. A right swipe from the left edge puts the app behind as a finger's
+  does: the layer's close (`on_close` in `apps_task.c`) tells the touch
+  (`apps_touch_closed`), the next read cuts it, and the reply has `front`
+  false, `cut` true and a warning that says so.
 - **Boot:** the apps' storage waits for the Link (`muse_apps.h`). The app task
   mounts the FAT and `apps_nvs`, and the I/O worker that does it is made, once
   the reply to the first `link.register` has come, accepted or not

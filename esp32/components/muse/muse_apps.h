@@ -336,12 +336,13 @@ bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void 
 
 /*
  * Link's app.control tap and drag (apps/apps_touch.h has how it runs): Muse's touches on the app it tests, played through LVGL's own
- * input as a finger's would be (muse_ui.h's guarded drag), so the app's widgets hear press, release, tap and long_press and its boxes
+ * input as a finger's would be (muse_ui.h's guarded drag), so the app's widgets hear their events (a swipe too) and its boxes
  * scroll, throw and spring back. A tap presses (x, y) for at's ms; a drag presses (x, y) and moves straight to (x2, y2) over ms, its
  * point following the clock, and lifts there. x, y, x2 and y2 are the screen's pixels, 0 to MUSE_APPS_TOUCH_XY_MAX, as status's ui
  * has them; ms is MUSE_APPS_TOUCH_MS_MIN to _MAX (a tap's at->ms MUSE_APPS_TOUCH_TAP_MS when the caller has none). LVGL makes a press
  * a long press 400 ms into it, at a read of the touch that comes every 15 ms: a tap of MUSE_APPS_TOUCH_LONG_MS or more is always one,
- * and one under 400 ms never is. A drag that is a right swipe puts the app behind, as a finger's does.
+ * and one under 400 ms never is. A drag that is a swipe (apps_lv.h's Swipes) is heard as one; a right swipe from the screen's left
+ * edge puts the app behind instead, as a finger's does.
  *
  * Any task, the Noise session's and the console's included: it never waits. True once queued: done then runs exactly once, on the
  * I/O worker; false, with nothing queued and done never called, and *code and *err (literals) saying why:
@@ -360,8 +361,9 @@ bool muse_apps_snapshot(const char *id, int scale, muse_apps_done_cb done, void 
  *   {"ok":true,"payload":{"id","action":"tap"|"drag","pressed","heard":[...],"front","cut","played_ms","scroll":[...],
  *    "warnings":[...]}}
  * pressed the widget the touch went down on, as the "kind#slot" status's ui names it (null for the layer, where no widget is);
- * heard the events the app was sent, "kind#slot event" in their order, at most MUSE_APPS_TOUCH_HEARD_MAX (a warning counts the
- * rest); front whether id is the app on screen once the touch is over (false after a right swipe); cut whether the touch was cut,
+ * heard the events the app was sent, "kind#slot event" in their order ("kind#slot swipe dir" for a swipe, dir "left", "right", "up"
+ * or "down"), at most MUSE_APPS_TOUCH_HEARD_MAX (a warning counts the rest); front whether id is the app on screen once the touch
+ * is over (false after a right swipe from the left edge: no other swipe puts the app behind); cut whether the touch was cut,
  * a warning saying why; played_ms how long it pressed; scroll, for each box with scroll = "y" whose scroll the touch moved,
  * {"id","y"}: its scroll y once it has come to rest, or MUSE_APPS_TOUCH_SETTLE_MS after the lift (a warning says it was still
  * moving). Or {"ok":false,"error":{"code","message"}}:

@@ -67,5 +67,6 @@ void apps_touch_supervise(void);
  * is otherwise. */
 uint8_t apps_touch_tag(uint16_t slot, uint8_t event);
 
-/* The LVGL task, inside the layer's right swipe (apps_task.c's on_close): while a touch of Muse's plays, its drag was the swipe. */
+/* The LVGL task, inside the layer's right swipe from the left edge (apps_task.c's on_close, apps_lv.h's Swipes): while a touch of
+ * Muse's plays, its drag was the swipe. */
 void apps_touch_closed(void);

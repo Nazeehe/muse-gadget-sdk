@@ -1572,6 +1572,42 @@ class ListFixtureTest(UiTestCase):
         self.assertEqual(main[:2], ["-- Copyright (c) Meta Platforms, Inc. and affiliates.", "-- SPDX-License-Identifier: Apache-2.0"])
 
 
+class SwipeFixtureTest(UiTestCase):
+    def test_the_board_fixture_runs_here(self):
+        # Swipes Task 3: tests/muse_apps_fixtures/swipe, which the board's swipe check drives with >app.drag. A full-screen box hears
+        # every swipe and tap off the list and prints "swipe <dir>" or "tap"; the list that scrolls has no handler in it and isn't
+        # inside the box, so a swipe on it is nobody's (on the gadget a drag up or down on it scrolls it, and is no swipe at all).
+        # `last` replies with the last print and the count. Silent: its only permission is keep_awake.
+        main_text = (FIXTURES / "swipe/main.lua").read_text()
+        rows = int(re.search(r"(?m)^local ROWS = (\d+)$", main_text).group(1))
+        dirs = ["left", "right", "up", "down"]
+        script = ["message last", "dump", *(f"swipe #0 {d}" for d in dirs), "tap #0", "swipe #1 up", f"swipe #{1 + rows} down",
+                  "tap #1", "tap #2", "message last"]
+        run = self.host(FIXTURES / "swipe", script=script)
+        self.assertEqual([k for k in run.kinds() if k in ("warning", "error", "crash")], [], run.events)
+        self.assertEqual(run.logs(), [f"swipe {d}" for d in dirs] + ["tap"])
+        self.assertEqual([e["data"] for e in run.of("reply")], [{"last": None, "count": 0}, {"last": "tap", "count": 5}])
+        widgets = run.of("dump")[0]["widgets"]
+        self.assertEqual([w["kind"] for w in widgets], ["box", "box"] + ["label"] * rows)
+        board, box = widgets[0], widgets[1]
+        self.assertEqual((board["x"], board["y"], board["w"], board["h"]), (0, 0, 466, 466))
+        # Ruling F1: the list, at the right and in the middle (align = "right"), is off the swipes' paths, which run along y 233 from
+        # x 10 to 330 and along x 233 from y 130 to 330 (the report's board table), so every swipe starts and runs on the board.
+        self.assertRegex(main_text, r'local list = ui\.box\{align = "right", x = -?\d+, w = \d+, h = \d+, scroll = "y"')
+        left, top = 466 + box["x"] - box["w"], (466 - box["h"]) // 2
+        self.assertGreater(left, 330)
+        self.assertLess(left + box["w"], 466)
+        corner = max((left + box["w"] - 233) ** 2, (left - 233) ** 2) + (top - 233) ** 2
+        self.assertLessEqual(corner, 233 * 233, "the list's corners are on the round screen")
+        # It overflows, so a drag on it scrolls: each row is a line of sans16, at least 16 px.
+        self.assertGreater(rows * 16, box["h"])
+        manifest = json.loads((FIXTURES / "swipe/manifest.json").read_text())
+        self.assertEqual(manifest["permissions"], ["keep_awake"])
+        self.assertEqual(sorted(manifest["messages"]), ["last"])
+        self.assertEqual(main_text.splitlines()[:2],
+                         ["-- Copyright (c) Meta Platforms, Inc. and affiliates.", "-- SPDX-License-Identifier: Apache-2.0"])
+
+
 class HarnessTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

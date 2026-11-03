@@ -39,7 +39,7 @@ APPS = MUSE / "apps"
 TESTS = ROOT / "tests"
 HARNESS = TESTS / "muse_apps_touch_harness.c"
 SOURCES = [HARNESS, APPS / "apps_touch.c", APPS / "apps_result.c", APPS / "apps_pkg.c", APPS / "apps_json.c", APPS / "apps_vm.c",
-           APPS / "apps_suggest.c"]
+           APPS / "apps_suggest.c", APPS / "apps_ui.c"]  # apps_ui.c for a swipe's direction's name (apps_ui_dir_name)
 
 # What apps_touch.c and the headers it includes need of ESP-IDF, FreeRTOS, LVGL and the input task: the little they use, each
 # declared here and defined by the harness.
@@ -114,8 +114,11 @@ class Touch(unittest.TestCase):
     def test_a_touch_not_taken_in_time_is_withdrawn(self):  # the player never read: withdrawn at the screen's deadline
         self.run_case("withdrawn_at_the_deadline")
 
-    def test_the_cuts_mid_touch(self):  # behind, a new app, a card, a turn, a right swipe, covered, a finger: a release, no tap
+    def test_the_cuts_mid_touch(self):  # behind, a new app, a card, a turn, an edge swipe (played too), covered, a finger: no tap
         self.run_case("cut_mid_touch")
+
+    def test_a_drag_that_swipes_is_heard_with_its_direction(self):  # swipes: press, swipe <dir>, release, no tap; front; slow taps
+        self.run_case("drag_that_swipes_is_heard_with_its_direction")
 
     def test_the_tag_is_only_the_touchs(self):  # tagged from the admit to the end, never before or after or for a finger's
         self.run_case("the_tag_is_only_the_touchs")
@@ -195,6 +198,14 @@ class Pins(unittest.TestCase):
         self.assertIn("A tap and a long press hold the point (x, y) for 80 and 900 ms", self.ui)
         self.assertEqual(self.define("MUSE_APPS_TOUCH_LONG_MS"), 500)
         self.assertGreaterEqual(self.define("MUSE_APPS_TOUCH_LONG_MS"), 400 + 15)
+
+    def test_the_fakes_gesture_is_lvgl_9_5_0s(self):
+        # The fake read's swipe uses the lv harness's gesture numbers, which test_muse_apps_lv.py pins to LVGL 9.5.0's.
+        lv = (TESTS / "muse_apps_lv_harness.c").read_text()
+        touch = HARNESS.read_text()
+        for name in ("FAKE_GESTURE_LIMIT", "FAKE_GESTURE_MIN_VELOCITY"):
+            with self.subTest(name):
+                self.assertEqual(self.define(name, touch), self.define(name, lv))
 
     def test_the_deadlines_fit_app_controls(self):
         link = (ROOT / "main/apps_link.c").read_text()

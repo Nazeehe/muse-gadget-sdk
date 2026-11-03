@@ -3,7 +3,7 @@
 
 -- The list fixture (games Task 5): the board's check of a scrolling list. The guide's Lists pattern at its size: a column that
 -- scrolls, and 40 rows of wrapped text, each a row box, a bubble at its left or right, by turns, and a label (121 widgets of the
--- 128). The board drags it with the bench's >drag and reads its "scroll frame <ms> ms" lines; a tap on a row prints "tap <n>",
+-- 128). The board drags it with the bench's >drag and reads its "scroll frames: ..." summaries; a tap on a row prints "tap <n>",
 -- the row's number from the top, and a drag that scrolls taps nothing. `to` scrolls it to a y, and `end` to its end, so the
 -- board knows where the rows are when it taps them.
 -- The screen stays lit while it is in front. Nothing here is an example of how to write an app.

@@ -40,7 +40,9 @@ CONFIG_NVS_ALLOCATE_CACHE_IN_SPIRAM=y
 # LVGL's two drawing tasks (swdraw) get 6 KB of stack each, 2 KB less than
 # LVGL's 8 KB: the 2 KB more of the LVGL task's (LVGL_STACK_APPS in
 # board_waveshare_s3_175c.c) comes out of them, so internal RAM gains 2 KB.
-# Each has been measured using under 2 KB.
+# Each was measured using under 2 KB with Flappy, whatsapp, the launcher and
+# the slides; Settings, a crash card and a snapshot weren't measured on these
+# stacks, and FreeRTOS checks them for overflow by canary only.
 CONFIG_LV_DRAW_THREAD_STACK_SIZE=6144
 
 # app.control's snapshot draws the screen with LVGL's snapshot (apps_snapshot.c);

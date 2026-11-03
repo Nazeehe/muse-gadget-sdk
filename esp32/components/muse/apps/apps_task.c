@@ -2036,7 +2036,10 @@ void muse_apps_ui_supervise(void) {
  * every frame out of a call. No pass while the app is hung, nor while a call runs (its widgets may be half changed): a call that ended
  * before it is held back, a skip counted once (apps_lv_apply's in_callback), and if calls keep running back to back the frame that
  * finds it held for the HELD_FRAMES_MAX + 1st time applies it anyway, mid-call. committed is read before in_call, and call_finish
- * clears in_call before it counts, so a call seen ended is seen out of its call.
+ * clears in_call before it counts, so a call seen ended is seen out of its call. Only scheduling keeps a call from starting between
+ * that in_call read and the pass: the app task runs on LVGL's core (APPS_TASK_CORE is MUSE_UI_CORE on the 1.75C) at a lower priority
+ * (APPS_TASK_PRIORITY under MUSE_UI_PRIORITY), so it can't run until this step returns. An app task pinned to the other core could
+ * start a call mid-pass, and the pass would read a half-changed table.
  */
 #define HELD_FRAMES_MAX 3
 

@@ -330,7 +330,7 @@ menu "Muse"
             of normal builds; devices/sdkconfig.muse-bench turns them on.
             ">mem" prints one "@mem" line of JSON, in bytes: free, lowest-ever
             free and largest free internal RAM, free DMA-capable RAM, free and
-            lowest-ever free PSRAM, and the least that was left of two task
+            lowest-ever free PSRAM, and the least that was left of four task
             stacks since boot: the LVGL task's (lvgl_stack_free),
             muse_serial's (serial_stack_free), the console task that runs every
             ">app.*" command, and those of LVGL's two drawing tasks, the swdraw

@@ -897,13 +897,13 @@ class BenchHarnessTest(unittest.TestCase):
 
     run_case = HarnessTest.run_case
 
-    def test_the_launcher_logs_its_frames_while_it_scrolls(self):  # Task 6: "launcher frame <ms> ms", only while the row moves
+    def test_the_launcher_logs_its_frames_while_it_scrolls(self):  # Task 6: "launcher frames: ...", timed only while the row moves
         self.run_case("launcher_frame_log")
 
-    def test_an_image_logs_its_frames_while_it_spins(self):  # connected apps Task 1: "spin frame <ms> ms", only while one spins in front
+    def test_an_image_logs_its_frames_while_it_spins(self):  # connected apps Task 1: "spin frames: ...", timed only while one spins in front
         self.run_case("spin_frame_log")
 
-    def test_a_scroll_box_logs_its_frames_while_it_scrolls(self):  # games Task 5: "scroll frame <ms> ms", only while an app's list moves
+    def test_a_scroll_box_logs_its_frames_while_it_scrolls(self):  # games Task 5: "scroll frames: ...", timed only while an app's list moves
         self.run_case("scroll_frame_log")
 
     def test_a_throw_that_ends_unseen_times_no_rest(self):  # R5f: SCROLL_END ends the timing; the next drag's first refresh isn't timed

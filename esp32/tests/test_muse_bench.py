@@ -798,6 +798,11 @@ class MuseBenchTest(unittest.TestCase):
             self.assertIn("muse_serial", text, f"{name} doesn't say which task the second stack is")
             self.assertIn("swdraw", text, f"{name} doesn't say which tasks the last are")
             self.assertIn("console", text)
+        # D12: the help counts the stacks the line prints, swdraw_stack_free being a pair (one for each of LVGL's drawing tasks).
+        pair = re.search(r'\\"swdraw_stack_free\\":\[([%d,]+)\]', printed[:printed.index(");")]).group(1).count("%d")
+        stacks = len(fields) - 1 + pair
+        self.assertIn(f"the least that was left of {['two', 'three', 'four'][stacks - 2]} task stacks since boot",
+                      " ".join(help_text.split()))
 
     def test_register_size_is_logged(self):
         # The size comes from the log line every session already prints when it sends

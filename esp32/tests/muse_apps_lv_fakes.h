@@ -236,7 +236,7 @@ typedef enum {
 
 typedef void (*lv_event_cb_t)(lv_event_t *e);
 
-/* lv_timer.h: a timer's callback (the apply's retry, perf plan Task 4). */
+/* lv_timer.h: a timer's callback (the apply step's poll, perf plan Task 4). */
 typedef void (*lv_timer_cb_t)(lv_timer_t *);
 
 /* lv_image.h: where an image sits in a box that is not its size (the others transform it, and are not used). */

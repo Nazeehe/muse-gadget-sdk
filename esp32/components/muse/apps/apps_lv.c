@@ -2066,8 +2066,8 @@ static void watch_spin(lv_obj_t *screen) {
 
 #if CONFIG_MUSE_BENCH
 /* The frame gates' measurements, in a bench build only. LVGL sends LV_EVENT_REFR_READY at the end of every refresh, drawn or not, and
- * refreshes at most every LV_DEF_REFR_PERIOD while something is invalid, so while something moves the gap between two is the frame's
- * time. A gap is timed only when the refresh before it found the same motion: the first refresh of one follows a rest of any length.
+ * refreshes at most every LV_DEF_REFR_PERIOD while something is invalid, unless an apply pass that changed something makes its timer
+ * ready sooner (locked_pass), so while something moves the gap between two is the frame's time. A gap is timed only when the refresh before it found the same motion: the first refresh of one follows a rest of any length.
  * Each motion's frames go into its summary (muse_frame_stats.h), printed at the refresh that finds the motion stopped, a second into
  * it, or at 128 frames: one line, where a line a frame spun the console in this task and stalled the screen it measured.
  * - The launcher's (launcher carousel Task 6), "launcher frames: ...": while the carousel scrolls (a drag, a fling's snap, a side tap's

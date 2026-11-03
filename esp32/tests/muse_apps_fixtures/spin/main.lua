@@ -10,7 +10,7 @@
 -- - "cover": the 180 px record spinning over a still, dimmed 400 px picture (cover.bin), as a now-playing screen.
 -- - "square": a 180 px square of spokes with no alpha (square.bin), whose corners swing as it spins: LVGL draws each step in
 --   two bands, and a tear between them would break the spokes.
--- The board's gate reads a bench build's "spin frame <ms> ms" and "tearing effect:" lines while it spins, and taps the
+-- The board's gate reads a bench build's "spin frames: ..." summaries and "tearing effect:" lines while it spins, and taps the
 -- button: each tap counts on the button and prints "tap <n> <time.mono()>", so the host can time its answer.
 -- "layout" picks one, and so does a long press on the button, in turn (for an eye on the board, with no console); "spin",
 -- "rotation" and "scale" change the picture that spins, and "state" says what get says.

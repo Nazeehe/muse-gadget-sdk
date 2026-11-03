@@ -27,10 +27,11 @@
  * The stack paint names the deepest of a few paths on the LVGL task, which FreeRTOS's high-water mark can't: before a path,
  * muse_stack_paint fills the calling task's stack with MUSE_STACK_FILL from the lowest byte still unused up to MUSE_STACK_MARGIN
  * bytes under the stack pointer (the margin is for the calls it makes, and an interrupt's frame), and after it, muse_stack_note
- * scans for the first byte the path changed. The deepest path so far is kept, with the bytes it left free; once there is one, a
- * paint goes no higher than it, since only a deeper path is news. The paint ends where FreeRTOS's own fill (the same byte) ended,
- * and the note puts a byte back there, so its high-water mark (>mem's lvgl_stack_free) still says what it said, except while a
- * paint is open. One paint at a time: a path painted inside another counts toward the outer one. Call the note where the paint
+ * scans for the first byte the path changed. The deepest path so far is kept, with the bytes it left free: the since-boot record of
+ * the painted paths alone (the apply summary's stack_peak); once there is one, a paint goes no higher than it, since only a deeper
+ * path is news. The paint ends where FreeRTOS's own fill (the same byte) ended, and the note puts a byte back there, so its
+ * high-water mark (>mem's lvgl_stack_free) stays the least free since boot, except while a paint is open, when it can read high
+ * (ruling P6). One paint at a time: a path painted inside another counts toward the outer one. Call the note where the paint
  * was called, at the same depth, on the same task. Neither logs; neither may run under the UI lock (the paint is a memset).
  */
 #define MUSE_STACK_MARGIN 256

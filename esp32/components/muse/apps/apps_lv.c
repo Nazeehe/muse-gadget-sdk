@@ -59,7 +59,8 @@ static const char *TAG = "muse_apps";
 #define MAX_CALLBACK_SKIPS 3
 #if CONFIG_MUSE_BENCH
 #define BENCH_SECOND_US 1000000  /* the apply summary's second */
-#define SLOW_FRAME_MS 50         /* a refresh longer than this, with an app in front, prints its anatomy */
+#define SLOW_FRAME_MS 50         /* a refresh's own work, or a gap in a chain, longer than this is a slow frame */
+#define SLOW_FRAME_REST_MS 1000  /* a gap this long ends a rest: never a slow frame */
 #endif
 
 /* The bits that name a group of properties (and SCROLL, a w:scroll_to), as opposed to CREATE and DELETE. */
@@ -1941,7 +1942,8 @@ static EXT_RAM_BSS_ATTR struct {
     int64_t refr_start_us, render_start_us, render_ready_us;
     int64_t wait_start_us, flush_us;  /* the wait for the panel under way, and the waits so far */
     bool ready_in_front;              /* the last refresh ended with an app in front, */
-    int64_t ready_us;                 /* then */
+    int64_t ready_us;                 /* then, */
+    bool in_chain;                    /* and came within SLOW_FRAME_MS of the one before it (both timed) */
 } s_frames;
 
 /* LV_EVENT_SCROLL_END on an app's box: its scroll ended, seen by a refresh or not. The next refresh prints its summary. A throw that
@@ -2022,25 +2024,32 @@ static bool app_in_front(void) {
 }
 
 /*
- * The slow frame (perf plan Task 2), at a refresh's LV_EVENT_REFR_READY: a refresh over SLOW_FRAME_MS from the end of the one before,
- * both with an app in front, prints
+ * The slow frame (perf plan Task 2, ruling P5), at a refresh's LV_EVENT_REFR_READY, with an app in front at it and at the refresh
+ * before it, and its start seen by on_phase. It is slow when its own work (LV_EVENT_REFR_START to _READY) is over SLOW_FRAME_MS, or
+ * when its gap (the time since the refresh before) is over SLOW_FRAME_MS and under SLOW_FRAME_REST_MS while that refresh came within
+ * SLOW_FRAME_MS of the one before it: a chain, as a scroll, an animation or a game makes, that stalled. A refresh that ends a rest
+ * (no chain before it, or a gap of a second or more) is never slow. It prints
  *     slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us>
- * the gap from that refresh to this one's start (the timers, the apply), its layout (to the drawing's start, or its end with nothing
- * to draw), the drawing less its waits for the panel, those waits, and the passes since the refresh before and their time. A
- * refresh after a rest counts too: its gap is the rest. Only a refresh whose start on_phase saw is timed.
+ * the time since the refresh before, the gap (the timers, the apply), its layout (to the drawing's start, or its end with nothing to
+ * draw), the drawing less its waits for the panel, those waits, and the passes since the refresh before and their time.
  */
 static void time_slow_frame(int64_t now) {
     bool front = app_in_front();
+    bool in_chain = false;
     if (front && s_frames.ready_in_front && s_frames.started) {
-        int ms = ms_of(now - s_frames.ready_us);
-        if (ms > SLOW_FRAME_MS) {
+        int gap = ms_of(s_frames.refr_start_us - s_frames.ready_us);
+        int work = ms_of(now - s_frames.refr_start_us);
+        bool stalled = s_frames.in_chain && gap > SLOW_FRAME_MS && gap < SLOW_FRAME_REST_MS;
+        if (work > SLOW_FRAME_MS || stalled) {
             int64_t layout_end = s_frames.rendered ? s_frames.render_start_us : now;
             int64_t render = s_frames.rendered ? s_frames.render_ready_us - s_frames.render_start_us - s_frames.flush_us : 0;
-            ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u", ms,
-                     ms_of(s_frames.refr_start_us - s_frames.ready_us), ms_of(layout_end - s_frames.refr_start_us), ms_of(render),
-                     ms_of(s_frames.flush_us), (unsigned)s_bench.frame_applies, (unsigned)s_bench.frame_apply_us);
+            ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u", ms_of(now - s_frames.ready_us), gap,
+                     ms_of(layout_end - s_frames.refr_start_us), ms_of(render), ms_of(s_frames.flush_us),
+                     (unsigned)s_bench.frame_applies, (unsigned)s_bench.frame_apply_us);
         }
+        in_chain = gap <= SLOW_FRAME_MS;
     }
+    s_frames.in_chain = in_chain;
     s_frames.started = false;
     s_frames.ready_in_front = front;
     s_frames.ready_us = now;

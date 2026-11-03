@@ -228,23 +228,28 @@ the deepest stack path so far with the bytes it left free (`none:-1` before one
 is found). The slow pass's line (a pass over 2000 us, at most one line a
 second) adds
 `visits=<us> layout=<us> writeback=<us> creates=<n> texts=<n> styles=<n>` for
-the longest pass since the last line. A refresh over 50 ms with an app in
-front, timed from the refresh before it (which must have had the app in front
-too), prints
+the longest pass since the last line. With an app in front, at it and at the
+refresh before it, a refresh is a slow frame when its own work, from
+`LV_EVENT_REFR_START` to `LV_EVENT_REFR_READY`, is over 50 ms, or when its gap,
+the time since the refresh before, is over 50 ms and under 1000 ms while that
+refresh came within 50 ms of the one before it: a chain, as a scroll, an
+animation or a game makes. A refresh that ends a rest is never slow. A slow
+frame prints
 `slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us>`
-from `LV_EVENT_REFR_READY`: the time to the refresh's start, its layout, its
-drawing less its waits for the panel, those waits, and the passes since the
-refresh before and their time. A refresh after a rest counts too: its gap is
-the rest. The stack paths are the apply pass, the home pages' slide
-(`LV_EVENT_SCROLL_BEGIN`), the launcher carousel's scroll and app.control's
-snapshot (`muse_bench_mem.c`): before each, the LVGL task's stack is filled
-with 0xA5 from its start up to 256 B under the stack pointer, and after it the
-first byte changed says how deep it went; FreeRTOS's own high-water mark is
-kept, except while a paint is open. `>mem` adds `swdraw_stack_free`, the
-high-water marks of LVGL's two drawing tasks. `>frame copy off` sends the home
-slide's whole-screen refreshes as bands, with no copy (they tear), and
-`>frame copy on` puts the copy back. `>memtest` times a 109976 B memcpy within
-PSRAM and a 107520 B `esp_async_memcpy` (GDMA):
+from `LV_EVENT_REFR_READY`: the time since the refresh before, the gap, its
+layout, its drawing less its waits for the panel, those waits, and the passes
+since the refresh before and their time. The stack paths are the apply pass,
+the home pages' slide (`LV_EVENT_SCROLL_BEGIN`), the launcher carousel's scroll
+and app.control's snapshot (`muse_bench_mem.c`): before each, the LVGL task's
+stack is filled with 0xA5 from its start up to 256 B under the stack pointer,
+and after it the first byte changed says how deep it went; the note puts a byte
+back where FreeRTOS's fill ended, so `>mem`'s `lvgl_stack_free` stays the least
+free since boot, except while a paint is open, when it can read high.
+`stack_peak` is the since-boot record of the painted paths alone. `>mem` adds
+`swdraw_stack_free`, the high-water marks of LVGL's two drawing tasks.
+`>frame copy off` sends the home slide's whole-screen refreshes as bands, with
+no copy (they tear), and `>frame copy on` puts the copy back. `>memtest` times
+a 109976 B memcpy within PSRAM and a 107520 B `esp_async_memcpy` (GDMA):
 `memtest: memcpy psram 109976 B <us> us; async_memcpy 107520 B <us> us`, or the
 reason the second was skipped. The DMA driver takes some internal RAM while it
 is installed, for the length of the test.

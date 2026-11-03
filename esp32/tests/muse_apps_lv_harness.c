@@ -8598,10 +8598,11 @@ static void slow_pass_phases(void) {
     FINISH(&e);
 }
 
-/* A refresh over 50 ms with an app in front, in a bench build, prints its anatomy from LV_EVENT_REFR_READY: the frame (from the
- * refresh before, which must have had the app in front too), the gap from that refresh to this one's start (the timers, the apply),
- * the layout (to the drawing's start, or the end with nothing to draw), the drawing less its waits for the wire, those waits, and the
- * passes that ran in the frame and their time. Nothing at 50 ms, behind or under a card, and nothing without the bench. */
+/* A slow frame with an app in front, in a bench build, prints its anatomy from LV_EVENT_REFR_READY: the frame (from the refresh
+ * before, which must have had the app in front too), the gap from that refresh to this one's start (the timers, the apply), the layout
+ * (to the drawing's start, or the end with nothing to draw), the drawing less its waits for the wire, those waits, and the passes that
+ * ran in the frame and their time. Here a gap over 50 ms inside a chain (ruling P5: slow_frame_needs_a_chain has the rest). Nothing at
+ * 50 ms, behind or under a card, and nothing without the bench. */
 static void slow_frame_anatomy(void) {
     env_t e;
     scene(&e);
@@ -8619,20 +8620,23 @@ static void slow_frame_anatomy(void) {
     extra_us_next = 4000;
     CHECK(APPLY(&e), "the pass in the frame");
     refresh_phases(37000, 3000, 20000, 7000);
-    /* 51 ms with nothing to draw. */
-    refresh_phases(50000, 1000, 0, 0);
+    /* A second long gap in a row is no chain's; the chain starts again, and then 61 ms with nothing to draw. */
+    refresh_phases(55000, 1000, 0, 0);
+    refresh_phases(20000, 1000, 5000, 0);
+    refresh_phases(60000, 1000, 0, 0);
 #if CONFIG_MUSE_BENCH
     CHECK(esp_count("W muse_apps: slow frame ") == 2 &&
               esp_has_line("W muse_apps: slow frame 81 ms: gap=51 layout=3 render=20 flush=7 applies=1/4000") &&
-              esp_has_line("W muse_apps: slow frame 51 ms: gap=50 layout=1 render=0 flush=0 applies=0/0"),
+              esp_has_line("W muse_apps: slow frame 61 ms: gap=60 layout=1 render=0 flush=0 applies=0/0"),
           "the two slow frames:\n%s", esp_peek());
 #endif
     esp_clear();
-    /* Behind, nothing; in front again, its first refresh isn't timed. */
+    /* Behind, nothing; in front again, its first refresh isn't timed, and the next starts a chain. */
     apps_lv_set_front(false);
     refresh_phases(100000, 1000, 10000, 0);
     apps_lv_set_front(true);
     refresh_phases(100000, 1000, 10000, 0);
+    refresh_phases(20000, 1000, 4000, 0);
     CHECK(esp_count("W muse_apps: slow frame ") == 0, "nothing behind, nor the first in front:\n%s", esp_peek());
     refresh_phases(55000, 1000, 4000, 0);
 #if CONFIG_MUSE_BENCH
@@ -8654,6 +8658,66 @@ static void slow_frame_anatomy(void) {
           "one callback for each phase: %d on the display", display_obj.n_cbs);
 #else
     CHECK(display_obj.n_cbs == 0, "nothing on the display without the bench: %d", display_obj.n_cbs);
+#endif
+    FINISH(&e);
+}
+
+/* Ruling P5 of the perf plan: a refresh with an app in front is a slow frame when its own work (LV_EVENT_REFR_START to _READY) is over
+ * 50 ms, or when its gap is over 50 ms while the refresh before it came within 50 ms of the one before that (a chain: a scroll, an
+ * animation, a 25 fps game) and is under a second. A refresh that ends a rest is never slow. Nothing at all without the bench. */
+static void slow_frame_needs_a_chain(void) {
+    env_t e;
+    scene(&e);
+    apps_lv_set_front(true);
+    esp_clear();
+    /* A lone refresh 2 s after the one before: a rest. */
+    refresh_phases(5000, 1000, 9000, 0);
+    refresh_phases(2000000, 1000, 9000, 0);
+    CHECK(esp_count("W muse_apps: slow frame ") == 0, "a lone refresh after a rest:\n%s", esp_peek());
+    /* A chain at 25 fps (30 ms between refreshes, 10 of work), then 2 s idle: the refresh that ends the rest isn't slow either. */
+    for (int i = 0; i < 5; i++) {
+        refresh_phases(30000, 1000, 9000, 0);
+    }
+    refresh_phases(2000000, 1000, 9000, 0);
+    CHECK(esp_count("W muse_apps: slow frame ") == 0, "a chain, then a rest:\n%s", esp_peek());
+    /* A chain with one 80 ms gap in it: one line, and the chain goes on with none. */
+    for (int i = 0; i < 5; i++) {
+        refresh_phases(30000, 1000, 9000, 0);
+    }
+    refresh_phases(80000, 1000, 9000, 0);
+    for (int i = 0; i < 5; i++) {
+        refresh_phases(30000, 1000, 9000, 0);
+    }
+#if CONFIG_MUSE_BENCH
+    CHECK(esp_count("W muse_apps: slow frame ") == 1 &&
+              esp_has_line("W muse_apps: slow frame 90 ms: gap=80 layout=1 render=9 flush=0 applies=0/0"),
+          "one gap in the chain:\n%s", esp_peek());
+#endif
+    esp_clear();
+    /* The rest's bound: a 999 ms gap in a chain is a stall, a 1000 ms one ends a rest. */
+    for (int i = 0; i < 3; i++) {
+        refresh_phases(30000, 1000, 9000, 0);
+    }
+    refresh_phases(999000, 1000, 9000, 0);
+    for (int i = 0; i < 3; i++) {
+        refresh_phases(30000, 1000, 9000, 0);
+    }
+    refresh_phases(1000000, 1000, 9000, 0);
+#if CONFIG_MUSE_BENCH
+    CHECK(esp_count("W muse_apps: slow frame ") == 1 &&
+              esp_has_line("W muse_apps: slow frame 1009 ms: gap=999 layout=1 render=9 flush=0 applies=0/0"),
+          "999 ms is a stall, 1000 a rest:\n%s", esp_peek());
+#endif
+    esp_clear();
+    /* A refresh whose own work is 60 ms (5 of layout, 50 of drawing, 5 of waiting) is slow even after a rest; 50 ms of work isn't. */
+    refresh_phases(2000000, 5000, 50000, 5000);
+    refresh_phases(2000000, 5000, 40000, 5000);
+#if CONFIG_MUSE_BENCH
+    CHECK(esp_count("W muse_apps: slow frame ") == 1 &&
+              esp_has_line("W muse_apps: slow frame 2060 ms: gap=2000 layout=5 render=50 flush=5 applies=0/0"),
+          "60 ms of work after a rest:\n%s", esp_peek());
+#else
+    CHECK(esp_count("W muse_apps: slow frame ") == 0, "nothing without the bench:\n%s", esp_peek());
 #endif
     FINISH(&e);
 }
@@ -11154,6 +11218,7 @@ int main(int argc, char **argv) {
         {"apply_summary_once_a_second", apply_summary_once_a_second},
         {"slow_pass_phases", slow_pass_phases},
         {"slow_frame_anatomy", slow_frame_anatomy},
+        {"slow_frame_needs_a_chain", slow_frame_needs_a_chain},
         {"stack_paint_around_the_paths", stack_paint_around_the_paths},
         {"lock_discipline", lock_discipline},
         {"no_layer_no_pass", no_layer_no_pass},

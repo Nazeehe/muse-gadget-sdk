@@ -248,7 +248,7 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * on one line: the calls ended in the second, the passes that ran, the frames skipped mid-callback and for a lock not free within
  * 2 ms, the display's refreshes, the most time between the ends of two passes that changed something, the passes' average and
  * longest time, the longest hold of the UI lock apps_lv_bench_dump_hold told, and the deepest stack path so far and what it left
- * free (muse_bench_mem.h; "none:-1" before there is one).
+ * free: the since-boot record of the painted paths alone (muse_bench_mem.h; "none:-1" before there is one).
  * apps_lv_bench_dump_hold: the app task's, with the UI lock held, after it dumped the table under it (us: how long it held it).
  */
 void apps_lv_bench_tick(uint32_t calls);

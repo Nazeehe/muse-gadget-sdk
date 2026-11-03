@@ -1061,9 +1061,11 @@ class GuideAndSkill(unittest.TestCase):
         number = lambda text, name: int(re.search(rf"(?m)^#define {name} (0x[0-9A-Fa-f]+|\d+)", text).group(1), 0)
         skips, lock_ms, slow_us = (number(lv, n) for n in ("MAX_CALLBACK_SKIPS", "LOCK_MS", "SLOW_US"))
         slow_frame, second = number(lv, "SLOW_FRAME_MS"), number(lv, "BENCH_SECOND_US")
+        rest = number(lv, "SLOW_FRAME_REST_MS")
         margin, fill = number(mem_h, "MUSE_STACK_MARGIN"), number(mem_h, "MUSE_STACK_FILL")
         cpu, dma = number(mem_h, "MUSE_MEMTEST_BYTES"), number(mem_h, "MUSE_MEMTEST_DMA_BYTES")
         self.assertEqual((skips, lock_ms, slow_us, slow_frame, second, margin, fill), (3, 2, 2000, 50, 1000000, 256, 0xA5))
+        self.assertEqual(rest, 1000)
         self.assertIn('static const char *TAG = "muse_apps";', lv)
         self.assertIn('"apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u stack_peak=%s:%d"', lv)
         self.assertIn('"apply %u us (%u slow since last) visits=%u layout=%u writeback=%u creates=%u texts=%u styles=%u"', lv)
@@ -1089,13 +1091,19 @@ class GuideAndSkill(unittest.TestCase):
                 "and the deepest stack path so far with the bytes it left free (`none:-1` before one is found).",
                 f"The slow pass's line (a pass over {slow_us} us, at most one line a second) adds `visits=<us> layout=<us> "
                 "writeback=<us> creates=<n> texts=<n> styles=<n>` for the longest pass since the last line.",
-                f"A refresh over {slow_frame} ms with an app in front, timed from the refresh before it (which must have had the app in "
-                "front too), prints `slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us>` from "
-                "`LV_EVENT_REFR_READY`:",
-                "A refresh after a rest counts too: its gap is the rest.",
+                # Ruling P5: a slow frame is its own work, or a gap in a chain; a refresh that ends a rest is never slow.
+                "With an app in front, at it and at the refresh before it, a refresh is a slow frame when its own work, from "
+                f"`LV_EVENT_REFR_START` to `LV_EVENT_REFR_READY`, is over {slow_frame} ms, or when its gap, the time since the refresh "
+                f"before, is over {slow_frame} ms and under {rest} ms while that refresh came within {slow_frame} ms of the one before it: "
+                "a chain, as a scroll, an animation or a game makes. A refresh that ends a rest is never slow.",
+                "A slow frame prints `slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us>` from "
+                "`LV_EVENT_REFR_READY`: the time since the refresh before, the gap,",
                 "The stack paths are the apply pass, the home pages' slide (`LV_EVENT_SCROLL_BEGIN`), the launcher carousel's scroll "
                 "and app.control's snapshot (`muse_bench_mem.c`):",
                 f"the LVGL task's stack is filled with 0x{fill:X} from its start up to {margin} B under the stack pointer,",
+                # Ruling P6: what the paint leaves of FreeRTOS's mark, and what stack_peak is.
+                "the note puts a byte back where FreeRTOS's fill ended, so `>mem`'s `lvgl_stack_free` stays the least free since boot, "
+                "except while a paint is open, when it can read high. `stack_peak` is the since-boot record of the painted paths alone.",
                 "`>mem` adds `swdraw_stack_free`, the high-water marks of LVGL's two drawing tasks.",
                 "`>frame copy off` sends the home slide's whole-screen refreshes as bands, with no copy (they tear), and `>frame copy "
                 "on` puts the copy back.",

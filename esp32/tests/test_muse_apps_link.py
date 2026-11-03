@@ -237,17 +237,37 @@ def swipe_numbers():
             "edge": header_number("apps_lv.h", "APPS_LV_CLOSE_EDGE_PX")}
 
 
-def swipe_of(x1, y1, x2, y2, ms):
-    """How a drag of the touch player's (straight, its point following the clock, read every refresh period) ends, by LVGL's rule as
-    apps_lv.c's on_gesture takes it: "edge" for a right swipe whose press is in the left edge's band inside the circle, else the
-    swipe's way, or None for no swipe (the larger axis not past the gesture distance, or under the gesture speed a read)."""
+def swipe_reads(x1, y1, x2, y2, ms, read_ms):
+    """The touch player's reads of a straight drag (muse_ui.c bench_read) fed through LVGL's gesture rule (the lv harness's
+    indev_gesture): a read at 0, then one every read_ms, the finger down while the clock is under ms (the read at ms or later is the
+    release, and LVGL counts no movement there), each read's point the line's at that time (truncated, as C does). The movement of
+    the reads adds up, and a read under the gesture speed on both axes starts the sum again. Returns the swipe's way, or None."""
     n = swipe_numbers()
-    dx, dy = x2 - x1, y2 - y1
-    run = max(abs(dx), abs(dy))
-    if run <= n["gesture"] or run * n["refresh"] < n["velocity"] * ms:
+    sx = sy = 0
+    px, py = x1, y1
+    for t in range(0, ms, read_ms):
+        x, y = x1 + int((x2 - x1) * t / ms), y1 + int((y2 - y1) * t / ms)
+        vx, vy = x - px, y - py
+        px, py = x, y
+        if abs(vx) < n["velocity"] and abs(vy) < n["velocity"]:
+            sx = sy = 0
+        sx, sy = sx + vx, sy + vy
+        if abs(sx) > n["gesture"] or abs(sy) > n["gesture"]:
+            return ("right" if sx > 0 else "left") if abs(sx) > abs(sy) else ("down" if sy > 0 else "up")
+    return None
+
+
+def swipe_of(x1, y1, x2, y2, ms):
+    """How a drag of the touch player's (straight, its point following the clock, read about every refresh period) ends, by LVGL's rule
+    as apps_lv.c's on_gesture takes it: "edge" for a right swipe whose press is in the left edge's band inside the circle, else the
+    swipe's way, or None for no swipe. A drag is a swipe only if it is one however the reads fall: a read can come a ms early (lv_timer
+    fires at the period, the player reads the tick inside the callback), and a busy frame a third late."""
+    refresh = swipe_numbers()["refresh"]
+    ways = {swipe_reads(x1, y1, x2, y2, ms, r) for r in (refresh - 1, refresh, refresh * 4 // 3)}
+    if len(ways) != 1 or None in ways:
         return None
-    way = ("right" if dx > 0 else "left") if abs(dx) > abs(dy) else ("down" if dy > 0 else "up")
-    edge = x1 < n["edge"] and (x1 - 233) ** 2 + (y1 - 233) ** 2 <= 233 ** 2
+    way = ways.pop()
+    edge = x1 < swipe_numbers()["edge"] and (x1 - 233) ** 2 + (y1 - 233) ** 2 <= 233 ** 2
     return "edge" if way == "right" and edge else way
 
 
@@ -893,7 +913,7 @@ class GuideAndSkill(unittest.TestCase):
                 f"A swipe is a drag of more than {n['gesture']} px left, right, up or down that moves at least {n['velocity']} px "
                 f"every {n['refresh']} ms (each time the gadget reads the touch): it is heard as press, swipe, release, with no tap.",
                 "So in every app, a quick flick on a button is a swipe, not a tap.",
-                "A shorter or slower drag is no swipe: it is heard as a press that stays put is, a tap or a long press.",
+                f"A shorter or slower drag is no swipe: it is heard as a tap, or as a long press when held {n['long']} ms.",
                 f"A press held {n['long']} ms before it swipes hears long_press first: press, long_press, swipe, release (when the "
                 f"swipe comes just as the press turns {n['long']} ms old, long_press can come right after the swipe instead).",
                 "The swipe goes to the widget the touch went down on when that widget has a `swipe` handler, else to the nearest box "
@@ -917,13 +937,49 @@ class GuideAndSkill(unittest.TestCase):
                 f"Slide the tiles a step each tick of the game's loop (at most {1000 // tick} times a second: One tick), not all the "
                 "way in the handler.",
                 "`hide()` comes with a swipe from the left edge or a voice turn: pause the game there,",
-                "A `drag` of 200 px over 200 ms on the box is a swipe, heard as `box#0 swipe left` or the like."):
+                "A `drag` of 200 px over 200 ms on the box is a swipe, heard as `box#0 swipe left` or the like.",
+                # M3: a widget with its own handlers goes inside the box, where it keeps them and its swipe goes up (swipe_target).
+                "Make that box first and put every other widget inside it, buttons too: a widget with its own handlers keeps them, "
+                "and a swipe that starts on it still goes up to the box."):
             with self.subTest(sentence[:50]):
                 self.assertIn(sentence, games)
         self.assertEqual(swipe_of(333, 233, 133, 233, 200), "left")  # Testing it's drag of 200 px over 200 ms
-        self.assertEqual(swipe_of(300, 233, 240, 233, 300), "left", "3 px a read, 60 px over 300 ms, is the slowest swipe")
         self.assertIsNone(swipe_of(300, 233, 240, 233, 450), "2 px a read is none")
         self.assertIsNone(swipe_of(300, 233, 250, 233, 50), "50 px is none")
+        # M2: the player's last read is the release, so the drag's last stretch never counts: 60 px over 60 ms is 45 px of movement.
+        self.assertIsNone(swipe_of(300, 233, 240, 233, 60), "the last read is the release")
+        self.assertIsNone(swipe_of(300, 233, 248, 233, 100), "52 px over 100 ms is 37 px of movement")
+        # And exactly 3 px a read has no slack: a read a ms early moves 2 px and starts LVGL's sum again.
+        self.assertEqual(swipe_reads(300, 233, 240, 233, 300, 15), "left")
+        self.assertIsNone(swipe_reads(300, 233, 240, 233, 300, 14))
+        self.assertIsNone(swipe_of(300, 233, 240, 233, 300), "60 px over 300 ms is a swipe only on a good read")
+
+    def test_guide_drag_rule_is_a_swipe_however_the_reads_fall(self):
+        # M2: the guide's drag rule (100 px or more, an ms from 100 to twice the length) is read from the guide, and every drag it
+        # allows, in every direction, is a swipe by swipe_of (reads a ms early, on time, or a third late); the old rule's limits are not.
+        n = swipe_numbers()
+        guide = " ".join(GUIDE.read_text().split())
+        m = re.search(r"A drag that is a swipe \(Touches: (\d+) px or more, with an `ms` from (\d+) to (twice|\d+ times) that length in px\)", guide)
+        self.assertIsNotNone(m)
+        least, slow = int(m.group(1)), int(m.group(2))
+        self.assertEqual(m.group(3), "twice")
+        self.assertGreater(least, n["gesture"])
+        high = int(re.search(r"(?m)^#define MUSE_APPS_TOUCH_MS_MAX (\d+)", (MUSE / "muse_apps.h").read_text()).group(1))
+        checked = 0
+        for run in range(least, 465, 17):
+            for ms in sorted({slow, slow + 1, run, run + 7, 2 * run - 1, 2 * run}):
+                if not slow <= ms <= min(2 * run, high):
+                    continue
+                for sx, sy, ex, ey, way in ((300, 233, 300 - run, 233, "left"), (100, 233, 100 + run, 233, "right"),
+                                            (233, 300, 233, 300 - run, "up"), (233, 100, 233, 100 + run, "down")):
+                    if min(ex, ey) < 0:
+                        continue
+                    with self.subTest(run=run, ms=ms, way=way):
+                        self.assertEqual(swipe_of(sx, sy, ex, ey, ms), way)
+                    checked += 1
+        self.assertGreater(checked, 100)
+        self.assertIsNone(swipe_of(300, 233, 300 - n["gesture"] - 10, 233, slow), "a short, quick drag is not promised")
+        self.assertIsNone(swipe_of(300, 233, 300 - least, 233, 5 * least), "5 times the length, the old rule's limit")
 
     def test_agents_md_says_how_the_launcher_is_used(self):
         # D12: the bottom band AGENTS.md quotes is APPS_LV_CLOSE_EDGE_PX.
@@ -1029,7 +1085,6 @@ class GuideAndSkill(unittest.TestCase):
         lvgl_long = int(re.search(r"LVGL makes a press\s+\* a long press (\d+) ms into it", header).group(1))
         n = swipe_numbers()
         gesture, velocity, refresh, edge = n["gesture"], n["velocity"], n["refresh"], n["edge"]
-        self.assertEqual(refresh % velocity, 0, "an ms of at most refresh / velocity times the length is the speed's rule exactly")
         x1, y1, x2, y2, ms = 10, 233, 300, 233, 250  # the edge swipe The loop gives (and AGENTS.md's board scripts)
         self.assertEqual(swipe_of(x1, y1, x2, y2, ms), "edge")
         guide = GUIDE.read_text()
@@ -1045,8 +1100,9 @@ class GuideAndSkill(unittest.TestCase):
                 f"- `drag`: presses `at`'s `{{x, y}}`, moves straight to its `{{x2, y2}}` over `ms` ({low} to {high}, which a drag "
                 "must give), and lifts: drag up on a list to scroll it. `scroll` lists each box with `scroll = \"y\"` that moved, "
                 f"with its `y` once it has come to rest (at most {settle_s:g} s after the lift). A drag that is a swipe (Touches: "
-                f"more than {gesture} px, with an `ms` of at most {refresh // velocity} times that length in px) is heard as one, like "
-                "`box#0 swipe left`, with no tap, and the app stays in front. A right swipe that starts within "
+                "100 px or more, with an `ms` from 100 to twice that length in px) is heard as one, like `box#0 swipe left`, with no "
+                "tap, and the app stays in front. `heard` names the widget pressed, which can be inside the box whose `swipe` "
+                "handler ran: a swipe goes up its boxes (Touches). A right swipe that starts within "
                 f"{edge} px of the left edge, inside the round screen, puts the app behind, as a finger's does: `front` is false. "
                 f"A drag from {x1}, {y1} to {x2}, {y2} over {ms} ms is one.",
                 "A touch lands only on the app: it plays only while the app runs in front, with no launcher, card or picture over "

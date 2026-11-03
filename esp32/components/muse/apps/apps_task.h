@@ -159,7 +159,8 @@ typedef struct {
 /* What the app task's queue carries. Touches, show and hide come from the LVGL task and carry the app_gen of the app
  * they were meant for (one that has ended since drops them); requests carry req. Later tasks add types. */
 typedef enum {
-    APPS_EV_TOUCH = 1,  /* a widget event: slot, gen, code (one APPS_UI_* bit) */
+    APPS_EV_TOUCH = 1,  /* a widget event: slot, gen, code (one APPS_UI_* bit or a swipe's
+                        * APPS_UI_SWIPE_CODE, with APPS_UI_INJECTED for Muse's touch) */
     APPS_EV_RUN,        /* a run or a launch */
     APPS_EV_STOP,
     APPS_EV_COMPILE,

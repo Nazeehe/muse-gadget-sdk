@@ -1095,7 +1095,24 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   The deepest stacks seen: the app task 13,012 bytes free of 57,344, the I/O
   worker 3,968 of 8,192, and the LVGL task 1,240 free
   after 128 widgets, Settings, the launcher, a crash card, a snapshot and a
-  `display.draw_file`.
+  `display.draw_file` (of 8,192, while deep callbacks still logged). An apps
+  build gives the LVGL task 10,240 bytes of stack (`LVGL_STACK_APPS` in
+  `board_waveshare_s3_175c.c`), 2,048 more than the adapter's 8,192, in
+  internal RAM, since Settings' handlers write NVS on that task (ruling P21:
+  a PSRAM stack would rely on code and constant data running from PSRAM to
+  keep the cache on through those writes), and LVGL's two drawing tasks
+  6,144 bytes each (`CONFIG_LV_DRAW_THREAD_STACK_SIZE` in
+  `devices/sdkconfig.muse-apps`), 2,048 less than LVGL's 8,192: 2,048 bytes
+  more internal RAM free in all. Measured on the 1.75C on 2026-11-02 (perf
+  plan Task 6, apps+bench build, each from a fresh boot: Flappy with 2 min of
+  taps, `whatsapp`'s first chat and its 20 drags, the launcher opened, browsed
+  and closed twice, and 20 swipe pairs from the clock), the LVGL task's least
+  unused stack was 2,668 bytes of 8,192 before and 4,828 of 10,240 after,
+  with the launcher both times; the apply pass's painted record
+  (`stack_peak`) was 5,468 and 7,500, in Flappy; and the drawing tasks' least
+  was 6,264 of 8,192 and 4,216 of 6,144, 1,928 used both times. At boot the
+  UI left 54,303 bytes of internal RAM free (`UI built: free internal`),
+  against 52,263 before.
 - **Storage:** `partitions_muse_apps.csv` is `partitions_muse.csv` with two
   partitions added and no offset moved: `apps`, a 6 MB FAT at `0x830000` (a
   folder per app), and `apps_nvs`, 64 KB at `0xE30000` (the apps' saved values

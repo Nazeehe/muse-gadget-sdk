@@ -958,6 +958,43 @@ class MuseAppsWiringTest(unittest.TestCase):
                 for other in ("sdkconfig.defaults", "devices/sdkconfig.muse", "devices/sdkconfig.muse-apps", "devices/sdkconfig.muse-bench"):
                     self.assertNotRegex((ROOT / other).read_text(), rf"(?m)^(# {option} is not set|{option}=n)$", other)
 
+    def test_the_lvgl_task_takes_2_kb_of_the_drawing_tasks_stacks(self):  # perf plan Task 6 (W1), rulings P11 and P21: fix B
+        # An apps build gives the LVGL task 2 KB of stack over the adapter's 8 KB and LVGL's two drawing tasks 2 KB less each, so
+        # internal RAM gains 2 KB. The stack stays internal (the adapter's stack_in_psram is false by default and never set):
+        # Settings' handlers write NVS on that task (P21). A build without the apps keeps both defaults.
+        adapter_default = 8192  # esp_lvgl_adapter 0.6.4: ESP_LV_ADAPTER_DEFAULT_STACK_SIZE (8 * 1024), esp_lv_adapter.h
+        draw_default = 8192     # LVGL 9.5.0's Kconfig: LV_DRAW_THREAD_STACK_SIZE "default 8192"
+        board = strip_c_comments((MUSE / "boards/board_waveshare_s3_175c.c").read_text())
+        defined = re.search(r"(?m)^#define LVGL_STACK_APPS (\d+)$", board)
+        self.assertIsNotNone(defined, "no LVGL_STACK_APPS in the 1.75C's board file")
+        stack = int(defined.group(1))
+        self.assertEqual(open_conditions(board, defined.start()), ["if CONFIG_MUSE_APPS"])
+        given = board.index("adapter_cfg.task_stack_size = LVGL_STACK_APPS;")
+        self.assertEqual(open_conditions(board, given), ["if CONFIG_MUSE_APPS"])
+        self.assertLess(board.index("ESP_LV_ADAPTER_DEFAULT_CONFIG()"), given)
+        self.assertLess(given, board.index("esp_lv_adapter_init(&adapter_cfg)"))
+        self.assertEqual(board.count("task_stack_size"), 1)
+        self.assertNotIn("stack_in_psram", board)
+        apps = (ROOT / "devices/sdkconfig.muse-apps").read_text()
+        draw = int(re.search(r"(?m)^CONFIG_LV_DRAW_THREAD_STACK_SIZE=(\d+)$", apps).group(1))
+        units = int(re.search(r"(?m)^CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=(\d+)$",
+                              (ROOT / "devices/sdkconfig.muse-waveshare-s3-175c").read_text()).group(1))
+        self.assertEqual((stack, draw, units), (10240, 6144, 2))
+        self.assertEqual(stack - adapter_default, 2048)
+        self.assertEqual(units * (draw_default - draw) - (stack - adapter_default), 2048, "internal RAM gains 2 KB in all")
+        # A build whose drawing tasks kept more (a build dir's sdkconfig that shadows the overlay) stops, rather than give the LVGL
+        # task its 2 KB out of everything else's internal RAM.
+        guard = re.search(r'(?m)^#if CONFIG_LV_DRAW_THREAD_STACK_SIZE > (\d+)\n#error "([^"\n]*)"\n#endif$', board)
+        self.assertIsNotNone(guard, "no guard on the drawing tasks' stacks")
+        self.assertEqual(int(guard.group(1)), draw)
+        self.assertEqual(open_conditions(board, guard.start()), ["if CONFIG_MUSE_APPS"])
+        self.assertIn(f"CONFIG_LV_DRAW_THREAD_STACK_SIZE={draw} (devices/sdkconfig.muse-apps)", guard.group(2))
+        # Only the apps' overlay sets it: the plain image's drawing tasks keep LVGL's default, and its LVGL task the adapter's.
+        for other in ("sdkconfig.defaults", "devices/sdkconfig.muse", "devices/sdkconfig.muse-waveshare-s3-175c",
+                      "devices/sdkconfig.muse-bench"):
+            with self.subTest(other):
+                self.assertNotIn("LV_DRAW_THREAD_STACK_SIZE", (ROOT / other).read_text())
+
     def test_sntp_left_the_clock(self):  # Task 16: the watch and the apps' time module share one SNTP helper
         clock = strip_c_comments((MUSE / "muse_clock.c").read_text())
         sntp_source = (MUSE / "muse_sntp.c").read_text()

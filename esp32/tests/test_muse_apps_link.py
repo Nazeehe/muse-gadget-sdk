@@ -748,6 +748,44 @@ class GuideAndSkill(unittest.TestCase):
             with self.subTest(phrase):
                 self.assertIn(phrase, kconfig)
 
+    def test_agents_md_gives_the_lvgl_tasks_stack_as_the_build_has_it(self):
+        # Perf plan Task 6 (W1, rulings P11 and P21, fix B). D12: the stacks are the board file's and the apps overlay's, and the
+        # defaults they replace are the adapter's and LVGL's (esp_lvgl_adapter 0.6.4's ESP_LV_ADAPTER_DEFAULT_STACK_SIZE, LVGL
+        # 9.5.0's Kconfig default; test_muse_apps_wiring pins the same).
+        adapter_default, draw_default = 8192, 8192
+        board = strip_c_comments((MUSE / "boards/board_waveshare_s3_175c.c").read_text())
+        stack = int(re.search(r"(?m)^#define LVGL_STACK_APPS (\d+)$", board).group(1))
+        draw = int(re.search(r"(?m)^CONFIG_LV_DRAW_THREAD_STACK_SIZE=(\d+)$", (ROOT / "devices/sdkconfig.muse-apps").read_text()).group(1))
+        net = 2 * (draw_default - draw) - (stack - adapter_default)
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        for phrase in (
+                f"An apps build gives the LVGL task {stack:,} bytes of stack (`LVGL_STACK_APPS` in `board_waveshare_s3_175c.c`), "
+                f"{stack - adapter_default:,} more than the adapter's {adapter_default:,}, in internal RAM, since Settings' handlers "
+                "write NVS on that task (ruling P21: a PSRAM stack would rely on code and constant data running from PSRAM to keep "
+                f"the cache on through those writes), and LVGL's two drawing tasks {draw:,} bytes each (`CONFIG_LV_DRAW_THREAD_STACK_SIZE` in "
+                f"`devices/sdkconfig.muse-apps`), {draw_default - draw:,} less than LVGL's {draw_default:,}: {net:,} bytes more "
+                "internal RAM free in all.",):
+            with self.subTest(phrase[:60]):
+                self.assertIn(phrase, section)
+        # Measured on the board (perf plan Task 6, task-6-report.md), pinned as written. The gates: at least 2 KB of the LVGL task's
+        # stack left on every path, painted or not, and the drawing tasks at least 1 KB above their deepest use.
+        lvgl_before, lvgl_after, peak_before, peak_after = 2668, 4828, 5468, 7500
+        draw_before, draw_after, ui_before, ui_after = 6264, 4216, 52263, 54303
+        used = draw_default - draw_before
+        self.assertEqual(draw - draw_after, used)
+        self.assertGreaterEqual(min(lvgl_after, peak_after), 2048)
+        self.assertGreaterEqual(draw_after, 1024)
+        self.assertTrue(0 < ui_after - ui_before <= net)
+        self.assertIn(
+            "Measured on the 1.75C on 2026-11-02 (perf plan Task 6, apps+bench build, each from a fresh boot: Flappy with 2 min of "
+            "taps, `whatsapp`'s first chat and its 20 drags, the launcher opened, browsed and closed twice, and 20 swipe pairs from "
+            f"the clock), the LVGL task's least unused stack was {lvgl_before:,} bytes of {adapter_default:,} before and "
+            f"{lvgl_after:,} of {stack:,} after, with the launcher both times; the apply pass's painted record (`stack_peak`) was "
+            f"{peak_before:,} and {peak_after:,}, in Flappy; and the drawing tasks' least was {draw_before:,} of {draw_default:,} "
+            f"and {draw_after:,} of {draw:,}, {used:,} used both times. At boot the UI left {ui_after:,} bytes of internal RAM free "
+            f"(`UI built: free internal`), against {ui_before:,} before.", section)
+
     def test_guide_says_the_launcher_is_a_carousel_of_every_app(self):
         # Launcher carousel Task 4: no row count any more (APPS_LV_LAUNCHER_ROWS is gone); every app, the most recent first.
         guide = " ".join(GUIDE.read_text().split())

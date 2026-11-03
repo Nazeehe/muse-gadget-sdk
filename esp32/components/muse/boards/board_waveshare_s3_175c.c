@@ -98,6 +98,22 @@ static void round_area(lv_event_t *e)
     a->y2 |= 1;
 }
 
+#if CONFIG_MUSE_APPS
+/*
+ * The LVGL task's stack with the apps: 2 KB over the adapter's 8 KB, of which
+ * the launcher and an app's scroll leave about 2.7 KB unused, and Settings, a
+ * crash card, a snapshot and draw_file together once left 1.2 KB. It stays in
+ * internal RAM: Settings' handlers write NVS on this task, which a PSRAM stack
+ * survives only while code and rodata run from PSRAM (the cache stays on).
+ * LVGL's two drawing tasks pay for it with 2 KB less each
+ * (devices/sdkconfig.muse-apps), so internal RAM gains 2 KB in all.
+ */
+#define LVGL_STACK_APPS 10240
+#if CONFIG_LV_DRAW_THREAD_STACK_SIZE > 6144
+#error "board_waveshare_s3_175c.c: the LVGL task's 2 KB more stack comes out of LVGL's drawing tasks: set CONFIG_LV_DRAW_THREAD_STACK_SIZE=6144 (devices/sdkconfig.muse-apps), or the apps build has less internal RAM"
+#endif
+#endif
+
 /*
  * bsp_display_start(), less its draw buffers: the BSP's are PSRAM, and every
  * flush from them needs a fresh 46 KB internal DMA bounce buffer, which can't
@@ -109,6 +125,9 @@ static lv_display_t *display_start(lv_indev_t **touch)
     esp_lv_adapter_config_t adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
     adapter_cfg.task_core_id = MUSE_UI_CORE;
     adapter_cfg.task_priority = MUSE_UI_PRIORITY;
+#if CONFIG_MUSE_APPS
+    adapter_cfg.task_stack_size = LVGL_STACK_APPS;
+#endif
     if (esp_lv_adapter_init(&adapter_cfg) != ESP_OK) {
         return NULL;
     }

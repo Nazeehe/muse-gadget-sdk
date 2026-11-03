@@ -1061,14 +1061,13 @@ class GuideAndSkill(unittest.TestCase):
         mem_c = (MUSE / "muse_bench_mem.c").read_text()
         mem_h = (MUSE / "muse_bench_mem.h").read_text()
         number = lambda text, name: int(re.search(rf"(?m)^#define {name} (0x[0-9A-Fa-f]+|\d+)", text).group(1), 0)
-        skips, lock_ms, slow_us = (number(lv, n) for n in ("MAX_CALLBACK_SKIPS", "LOCK_MS", "SLOW_US"))
+        lock_ms, slow_us = (number(lv, n) for n in ("LOCK_MS", "SLOW_US"))
         slow_frame, second = number(lv, "SLOW_FRAME_MS"), number(lv, "BENCH_SECOND_US")
         rest = number(lv, "SLOW_FRAME_REST_MS")
-        retry_ms = header_number("apps_lv.h", "APPS_APPLY_RETRY_MS")  # perf plan Task 4: a skipped frame's pass tried again
-        self.assertEqual(retry_ms, 5)
+        self.assertNotIn("MAX_CALLBACK_SKIPS", lv)  # perf plan Task 4, ruling P12: no pass while a call runs, none forced here
         margin, fill = number(mem_h, "MUSE_STACK_MARGIN"), number(mem_h, "MUSE_STACK_FILL")
         cpu, dma = number(mem_h, "MUSE_MEMTEST_BYTES"), number(mem_h, "MUSE_MEMTEST_DMA_BYTES")
-        self.assertEqual((skips, lock_ms, slow_us, slow_frame, second, margin, fill), (3, 2, 2000, 50, 1000000, 256, 0xA5))
+        self.assertEqual((lock_ms, slow_us, slow_frame, second, margin, fill), (2, 2000, 50, 1000000, 256, 0xA5))
         self.assertEqual(rest, 1000)
         self.assertIn('static const char *TAG = "muse_apps";', lv)
         self.assertIn('"apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u stack_peak=%s:%d"', lv)
@@ -1089,10 +1088,8 @@ class GuideAndSkill(unittest.TestCase):
                 "Once a second while an app is in front with no launcher or card over it, `frame_tick` has it print `apply: calls=<n> "
                 "applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us> "
                 "stack_peak=<path>:<bytes>`:",
-                f"the frames skipped while the app was in a call (at most {skips} in a row) and for a UI lock not free within "
-                f"{lock_ms} ms, each with its retry's skip when that is skipped too (a frame skipped either way has its pass tried once "
-                f"more {retry_ms} ms later, `APPS_APPLY_RETRY_MS`, and a retry that runs is a pass that ran: \"The apply step\" under "
-                "Muse apps),",
+                "the passes that ran (a frame's or the call-end poll's: \"The apply step\" under Muse apps), the skips (each ended call "
+                f"whose changes waited for a call that ran, and each pass a UI lock not free within {lock_ms} ms held back),",
                 "the most time between the ends of two passes that changed something,",
                 "the longest the app task's dump of its table (`>app.status`) held the UI lock,",
                 "and the deepest stack path so far with the bytes it left free (`none:-1` before one is found).",
@@ -1127,55 +1124,64 @@ class GuideAndSkill(unittest.TestCase):
         self.assertEqual(second // 1000000, 1, "\"once a second\"")
 
     def test_agents_md_has_the_apply_step_paragraph(self):
-        # Perf plan Task 4: the apply step's retry and its only-what-changed pass. D12: the frame (the 1.75C's frame_ms), the skips in a
-        # row, the lock's wait and the retry's delay are the code's, and the code has the shape the paragraph tells (one timer, made at
-        # the first skip; the app task's step as what it runs; its state in PSRAM; the same text dropped in w_set). The numbers measured
-        # on the board (2026-11-02, against f0a1b35's run in the perf plan's measurements) are measurements, pinned as they were written.
+        # Perf plan Task 4: the apply step's call-end pass (PF1 a, ruling P12) and its only-what-changed pass (PF2). D12: the frame (the
+        # 1.75C's frame_ms), the poll's period, the frames a waiting change may be held for and the lock's wait are the code's, and the
+        # code has the shape the paragraph tells (call_finish clears in_call before it counts; one poll timer, its state in PSRAM; the
+        # app task's step as what it runs; a changed pass makes the refresh timer ready; the same text dropped in w_set). The numbers
+        # measured on the board (2026-11-02, against f0a1b35's run in the perf plan's measurements) are measurements, pinned as written.
         lv = strip_c_comments((APPS / "apps_lv.c").read_text())
+        task = strip_c_comments((APPS / "apps_task.c").read_text())
         number = lambda text, name: int(re.search(rf"(?m)^#define {name} (\d+)", text).group(1))
-        skips, lock_ms = number(lv, "MAX_CALLBACK_SKIPS"), number(lv, "LOCK_MS")
-        retry_ms = header_number("apps_lv.h", "APPS_APPLY_RETRY_MS")
+        lock_ms, held = number(lv, "LOCK_MS"), number(task, "HELD_FRAMES_MAX")
+        poll_ms = header_number("apps_lv.h", "APPS_APPLY_POLL_MS")
         board = (MUSE / "boards/board_waveshare_s3_175c.c").read_text()
         frame_ms = int(re.search(r"\.frame_ms = (\d+),", board).group(1))
-        self.assertEqual((frame_ms, skips, lock_ms, retry_ms), (40, 3, 2, 5))
-        self.assertIn("s_retry.timer = lv_timer_create(on_retry, APPS_APPLY_RETRY_MS, NULL);", lv)
-        self.assertRegex(lv, r"static EXT_RAM_BSS_ATTR struct \{[^}]*\} s_retry;")
-        self.assertIn("apps_lv_set_retry_cb(apply_step);", (APPS / "apps_task.c").read_text())
+        self.assertEqual((frame_ms, poll_ms, held, lock_ms), (40, 5, 3, 2))
+        finish = c_function(task, "static void call_finish(void) {")
+        self.assertLess(finish.index("atomic_store(&s_rec->in_call, 0);"),
+                        finish.index("atomic_store(&s_rec->committed, atomic_load(&s_rec->committed) + 1);"))
+        self.assertIn("s_poll.timer = lv_timer_create(on_poll, APPS_APPLY_POLL_MS, NULL);", lv)
+        self.assertRegex(lv, r"static EXT_RAM_BSS_ATTR struct \{[^}]*\} s_poll;")
+        self.assertIn("lv_timer_ready(s_refr_timer);", c_function(lv, "static bool locked_pass(void) {"))
+        self.assertIn("apps_lv_set_poll_cb(poll_step);", task)
+        self.assertIn("++L.held_frames <= HELD_FRAMES_MAX", c_function(task, "static void apply_step(bool frame) {"))
         self.assertIn("c.set &= ~BIT(P_TEXT);", c_function((APPS / "apps_ui.c").read_text(), "static int w_set(lua_State *L)"))
         agents = (ROOT / "AGENTS.md").read_text()
         section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
         for phrase in (
                 f"**The apply step:** `frame_tick` (the board's `frame_ms`, {frame_ms} ms on the 1.75C) runs the app task's apply step "
                 "(`apply_step` in `apps_task.c`): a pass that puts what the app's calls changed onto LVGL (`apps_lv_apply`).",
-                f"The pass is skipped while the app is in a call, for at most {skips} frames in a row (`MAX_CALLBACK_SKIPS` in "
-                f"`apps_lv.c`; the next frame runs it anyway), and when the UI lock isn't free within {lock_ms} ms (`LOCK_MS`).",
-                f"A frame skipped either way has its pass tried once more {retry_ms} ms later (`APPS_APPLY_RETRY_MS` in `apps_lv.h`), "
-                "from one LVGL timer made at the first skip and kept, paused while no retry is armed.",
-                "At most one is armed; a retry that is skipped too arms nothing, leaves the pass to the next frame and isn't one of the "
-                "frames a call may hold it for; a pass, a build or a reset disarms it.",
-                "The bench counts a retry that runs as a pass (`applies`) and one that is skipped as a skip of its cause "
-                "(`skips=<in_call>/<lock_busy>`).",
+                "An app's changes are applied when its call ends: `call_finish` clears `in_call` and then counts the call (`committed`), "
+                f"and while the app's table is published on the layer in front of a lit screen an LVGL timer of {poll_ms} ms "
+                "(`APPS_APPLY_POLL_MS` in `apps_lv.h`) runs the step, which asks for a pass when a call has ended since the last pass "
+                "and none runs now.",
+                "A pass that changed something makes the display's refresh timer ready (`lv_timer_ready`), so its frame goes out in "
+                "the same walk of LVGL's timers.",
+                "`frame_tick`'s pass is the backstop for what changes outside a call: a pass at every frame out of a call.",
+                "No pass runs while a call does (its widgets may be half changed): the changes of a call that ended before it wait, one "
+                "skip (`skips=<in_call>`), and if calls keep running back to back the frame that finds them waiting for the "
+                f"{held + 1}th time applies them anyway (`HELD_FRAMES_MAX`, {held}, in `apps_task.c`).",
+                f"A pass is skipped too when the UI lock isn't free within {lock_ms} ms (`LOCK_MS`), and the poll tries again "
+                f"{poll_ms} ms later while a call's changes wait.",
                 "A pass sets only what changed: a text set to what it was marks nothing (`w_set` in `apps_ui.c`), and a widget's style "
                 "sets only the properties that changed since its last pass (its node keeps what was set), all of them at its first.",
                 "A font, a `text_align` or a `wrap` set still measures a label's text again; a colour alone measures nothing.",
                 "Measured on the 1.75C on 2026-11-02 (apps+bench build; Flappy with sound, two runs of 2 min of taps, against one at "
-                "f0a1b35, before the retry): frames of three skips in a row (about 160 ms) fell from 15 to 0, and frames of one skipped "
-                "tick (about 80 ms) from 14 to 3 and 2.",
-                "The slow frames of 75 ms or more outside its game overs fell from 34 to 16 and 13, the longest from 168 to 131 and 90 "
-                "ms, and a second with 10 to 20 in-call skips kept 20 to 26 refreshes, where before one fell to 9 or 13.",
-                f"A retry that runs a pass leaves the next frame {frame_ms - retry_ms} ms after it, and the app's ticks came about 36 ms "
-                "apart (about 30 calls a second, under 3 of them taps), so the next frame's pass can find nothing new and the frame is "
-                "lost a frame later instead: frames whose gap of 50 to 99 ms held one changed pass and one empty one (two passes of "
-                "about 3 ms in all) rose from 1 to 13 and 10.",
-                "The median of each second's average pass fell from 3,352 to 2,985 and 2,944 us, and of each second's longest (a pipe "
-                "pair made) from 6,651 to 5,369 and 5,402 us.",
-                "`whatsapp`'s first chat opened in a pass of 51,611 and 50,787 us against 57,394 (visits 23,862 and 22,912 against "
-                "28,015; its layout, 27,379 and 27,494 us against 28,986, barely moved).",
-                "Its 20 list drags were as before: 587 and 605 frames with a 95th percentile of 28 to 35 and 27 to 32 ms against 27 to "
-                "33, two frames over 50 ms in the first run (67 and 64 ms, each as a drag began, with the apply step idle) and none in "
-                "the second."):
+                "f0a1b35, before the call-end pass): while it played, refreshes rose from a median of 23 to 26 a second, about one for "
+                "each of the app's ticks, and passes from 25 to about 51 (the frame's and the poll's).",
+                "Outside its game-over waits, frames over 100 ms fell from 14 to 0 in both runs, and frames of 75 to 100 ms from 12 to 0.",
+                "A game-over wait is a frame of 3 or more passes with a gap of 100 ms or more whose drawing began 0 to 150 ms after a "
+                "tap, or one with a gap of 50 ms or more whose drawing began 0 to 40 ms after a tap: the restart's call, its pass and "
+                "the frame (the 26 frames of 75 to 118 ms that the second test adds here each hold the restart's pass, 5.4 to 6.7 ms "
+                "of passes).",
+                "The skips in a call fell from 62 to 14 and 20, never more than 2 in a second.",
+                "`whatsapp`'s first chat opened in a pass of 55,431 and 52,140 us against 57,394.",
+                "Its 20 list drags gave 590 and 597 frames with a median of 18 to 19 ms and a 95th percentile of 27 to 34 ms, but for "
+                "the first drag up after the ten down, which had frames over 50 ms in both runs (67 and 51, then 52) with the apply "
+                "step idle: no calls, and empty passes."):
             with self.subTest(phrase[:50]):
                 self.assertIn(phrase, section)
+        self.assertNotIn("APPS_APPLY_RETRY_MS", agents)
         # The bench's summary sends its reader here.
         self.assertIn("\"The apply step\" under Muse apps", " ".join(agents[:agents.index("\n## Muse apps\n")].split()))
         self.assertLess(section.index("**The apply step:**"), section.index("**Muse's touches:**"))

@@ -224,23 +224,36 @@ class AppTaskTest(HarnessCase):
     def test_a_hung_call_is_abandoned_and_calls_fail_fast(self):  # C7, the supervisor's 3000 ms rule
         self.run_case("a_hung_call_is_abandoned")
 
-    def test_the_retry_runs_the_ticks_apply_step(self):  # perf plan Task 4, Review Focus 2: nothing for a hung app
-        self.run_case("the_retry_runs_the_ticks_apply_step")
+    def test_the_poll_applies_when_a_call_ends(self):  # perf plan Task 4, ruling P12: held back by a call, the 4th frame, hung
+        self.run_case("the_poll_applies_when_a_call_ends")
 
-    def test_the_tick_and_the_retry_share_one_apply_step(self):  # perf plan Task 4 (PF1 b)
-        # frame_tick's muse_apps_ui_tick and the retry's timer run the same step: no apply while the app is hung, apps_lv_apply with
-        # whether a call runs now, and the launcher's hold ended by a pass with the layer in front. muse_apps_ui_build hands it on.
+    def test_the_poll_is_on_for_an_app_in_front(self):  # perf plan Task 4, ruling P12: off when dark or ended
+        self.run_case("the_poll_is_on_for_an_app_in_front")
+
+    def test_the_tick_and_the_poll_share_one_apply_step(self):  # perf plan Task 4 (PF1 a, ruling P12)
+        # call_finish clears in_call, then counts the call (committed): the apply step reads committed first, so a call it sees ended it
+        # sees out of its call. frame_tick's muse_apps_ui_tick and the poll's timer run the same step: no apply while the app is hung,
+        # committed read before in_call, a skip asked for in a call and a pass out of one, and the launcher's hold ended by a pass with
+        # the layer in front. muse_apps_ui_build hands it on; the tick turns the poll on or off, and the supervisor off when it's dark.
         from test_muse_apps_wiring import c_function, strip_c_comments
         source = strip_c_comments((APPS / "apps_task.c").read_text())
-        step = c_function(source, "static void apply_step(void) {")
+        finish = c_function(source, "static void call_finish(void) {")
+        self.assertLess(finish.index("atomic_store(&s_rec->in_call, 0);"),
+                        finish.index("atomic_store(&s_rec->committed, atomic_load(&s_rec->committed) + 1);"))
+        step = c_function(source, "static void apply_step(bool frame) {")
         self.assertLess(step.index("atomic_load(&s_rec->hung)"), step.index("apps_lv_apply("))
-        self.assertIn("apps_lv_apply(published && atomic_load(&s_rec->in_call) != 0)", step)
-        self.assertLess(step.index("apps_lv_apply("), step.index("end_hold();"))
+        self.assertLess(step.index("atomic_load(&s_rec->committed)"), step.index("atomic_load(&s_rec->in_call)"))
+        self.assertLess(step.index("apps_lv_apply(true)"), step.index("apps_lv_apply(false)"))
+        self.assertLess(step.index("apps_lv_apply(false)"), step.index("end_hold();"))
+        self.assertIn("apply_step(false);", c_function(source, "static void poll_step(void) {"))
         tick = c_function(source, "bool muse_apps_ui_tick(void) {")
-        self.assertIn("apply_step();", tick)
+        self.assertIn("apply_step(true);", tick)
+        self.assertIn("apps_lv_poll(", tick)
         self.assertNotIn("apps_lv_apply(", tick)
-        self.assertEqual(len(re.findall(r"\bapps_lv_apply\(", source)), 1, "apps_lv_apply is called from apply_step alone")
-        self.assertIn("apps_lv_set_retry_cb(apply_step);", c_function(source, "void muse_apps_ui_build(lv_obj_t *screen) {"))
+        self.assertIn("apps_lv_poll(false);", c_function(source, "void muse_apps_ui_supervise(void) {"))
+        self.assertEqual(len(re.findall(r"\bapps_lv_apply\(", source)), 2, "apps_lv_apply is called from apply_step alone")
+        self.assertIn("apps_lv_set_poll_cb(poll_step);", c_function(source, "void muse_apps_ui_build(lv_obj_t *screen) {"))
+        self.assertNotIn("apps_lv_set_retry_cb", source)
 
     def test_a_stop_that_hangs_is_abandoned(self):
         self.run_case("a_hung_stop_is_abandoned")
@@ -606,7 +619,7 @@ class AppTaskBenchTest(HarnessCase):
         self.assertEqual([owner(i) for i in calls], ["muse_apps_ui_tick"])
         self.assertEqual(open_conditions(source, calls[0]), ["if CONFIG_MUSE_BENCH"])
         tick = c_function(source, "bool muse_apps_ui_tick(void) {")
-        self.assertGreater(tick.index("apps_lv_bench_tick(s_calls_ended);"), tick.index("apply_step();"))
+        self.assertGreater(tick.index("apps_lv_bench_tick(s_calls_ended);"), tick.index("apply_step(true);"))
         self.assertIn('#include "sdkconfig.h"', source)
         ui = strip_c_comments((MUSE / "muse_ui.c").read_text())
         self.assertIn("muse_apps_ui_tick()", c_function(ui, "static void frame_tick(lv_timer_t *timer)"))

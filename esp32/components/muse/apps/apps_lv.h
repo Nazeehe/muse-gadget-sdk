@@ -184,32 +184,29 @@ void apps_lv_set_pairing_cb(void (*cb)(bool on));
 void apps_lv_set_ui(apps_ui_t *ui);
 
 /*
- * One pass over the published table, the apply step above. in_callback says the app task is inside a callback (its
- * widgets may be half changed): the pass is skipped for up to 3 frames in a row, and the 4th applies anyway. It
- * takes the lock, reads the pointer with it held, and applies. False when no pass ran: it was skipped (the lock
- * was not free within 2 ms, the app is mid-callback, or the pass's records couldn't be made: each counted as a
- * skip), or there was nothing to apply (no layer, or no table published: neither counted, not a reject either).
- * The mid-callback skip comes first, before the lock is asked for and the pointer read, so with no table
- * published up to 3 in-callback frames in a row are still counted as skips: with no app published pass false, as
- * no callback can run without one.
+ * One pass over the published table, the apply step above. in_callback says a call of the app's runs now and the changes of one
+ * that has ended wait for it (perf plan Task 4, ruling P12: no pass while a call runs, its widgets may be half changed): no pass,
+ * counted as a skip, before the lock is asked for and the pointer read; the app task asks for the pass once the call has ended.
+ * Otherwise it takes the lock, reads the pointer with it held, and applies. False when no pass ran: it was skipped (in_callback, the
+ * lock not free within 2 ms, or the pass's records couldn't be made: each counted as a skip), or there was nothing to apply (no
+ * layer, or no table published: neither counted, not a reject either).
+ * A pass that changed something makes the display's refresh timer ready (lv_timer_ready), so the frame goes out in the same walk of
+ * LVGL's timers rather than up to a refresh period later.
  * A pass that took more than 2 ms counts slow, every time, and logs at most one line a second:
  * "apply %u us (%u slow since last)", the longest of the slow passes since the last line and how many there were.
- * A frame's pass skipped mid-callback or for the lock is tried again once, APPS_APPLY_RETRY_MS later (below).
  */
 bool apps_lv_apply(bool in_callback);
 
 /*
- * The retry of a skipped pass (perf plan Task 4, PF1 b), on the LVGL task. When a frame's pass is skipped mid-callback or for a lock
- * not free within 2 ms, one LVGL timer of APPS_APPLY_RETRY_MS is armed (made at the first skip and kept, paused while no retry is
- * armed), and when it runs it calls cb once: the app task's apply step, the one frame_tick's muse_apps_ui_tick runs, which calls
- * apps_lv_apply again with whether a callback runs now. At most one retry is armed: a frame skipped while one is, leaves it as it is.
- * Inside the retry, a skip arms nothing and isn't one of the 3 frames a callback may hold the pass for: the next frame decides. A
- * pass that runs, apps_lv_reset and apps_lv_build disarm it. The retry's pass is an apply, and its skip a skip of its cause, in
- * apps_lv_stats and in the bench's summary. With no cb (NULL, before muse_apps_ui_build) or no timer to be had, nothing is armed and
- * a skip waits for the next frame.
+ * The call-end poll (perf plan Task 4, PF1 a, ruling P12), on the LVGL task: one LVGL timer of APPS_APPLY_POLL_MS that runs cb while
+ * it is on: the app task's apply step, the one frame_tick's muse_apps_ui_tick runs, which asks for a pass when one of the app's calls
+ * has ended since the last pass and none runs now. apps_lv_poll(true) turns it on (the timer made the first time, then kept and
+ * resumed), apps_lv_poll(false) off (paused). With no cb (NULL, before muse_apps_ui_build: it turns the poll off too) or no timer to be
+ * had, nothing runs, and frame_tick's pass is the only one.
  */
-#define APPS_APPLY_RETRY_MS 5
-void apps_lv_set_retry_cb(void (*cb)(void));
+#define APPS_APPLY_POLL_MS 5
+void apps_lv_set_poll_cb(void (*cb)(void));
+void apps_lv_poll(bool on);
 
 /* Deletes every app object and forgets them, and puts the layer back to black. Call it when an app ends, with its
  * table no longer published, on the LVGL task. Whether the layer is in front is not changed. */
@@ -259,9 +256,9 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * count). Once a second while an app is in front, with no launcher or card over it, it prints (the muse_apps tag)
  *     apply: calls=<n> applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us>
  *            stack_peak=<path>:<bytes>
- * on one line: the calls ended in the second, the passes that ran (a frame's or its retry's), the passes skipped mid-callback and for
- * a lock not free within 2 ms (a frame's or its retry's: apps_lv_set_retry_cb), the display's refreshes, the most time between the
- * ends of two passes that changed something, the passes' average and longest time, the longest hold of the UI lock
+ * on one line: the calls ended in the second, the passes that ran (a frame's or the poll's: apps_lv_set_poll_cb), the passes skipped
+ * for a call that ran (each ended call whose changes waited for one, apps_lv_apply's in_callback) and for a lock not free within 2 ms,
+ * the display's refreshes, the most time between the ends of two passes that changed something, the passes' average and longest time, the longest hold of the UI lock
  * apps_lv_bench_dump_hold told, and the deepest stack path so far and what it left free: the since-boot record of the painted paths
  * alone (muse_bench_mem.h; "none:-1" before there is one).
  * apps_lv_bench_dump_hold: the app task's, with the UI lock held, after it dumped the table under it (us: how long it held it).

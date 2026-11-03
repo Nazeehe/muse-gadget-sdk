@@ -56,7 +56,6 @@ static const char *TAG = "muse_apps";
 #define LOCK_MS 2
 #define SLOW_US 2000
 #define SLOW_LOG_US 1000000  /* a slow pass is logged at most this often */
-#define MAX_CALLBACK_SKIPS 3
 #if CONFIG_MUSE_BENCH
 #define BENCH_SECOND_US 1000000  /* the apply summary's second */
 #define SLOW_FRAME_MS 50         /* a frame after motion, or a refresh's own work, longer than this is a slow frame */
@@ -128,19 +127,19 @@ static state_t *s_state;
 static apps_lv_event_cb_t s_event_cb;
 static void (*s_close_cb)(void);
 static volatile bool s_front;
-static uint8_t s_skip_run;       /* frames skipped in a row for a callback */
 static bool s_reject_logged;     /* the app's first reject is in the log */
 static int64_t s_slow_next_log;  /* the esp_timer time a slow pass may be logged from (0: any) */
 static uint32_t s_slow_unlogged; /* slow passes since the last line, and the longest of them */
 static int64_t s_slow_worst_us;
 
 static volatile uint32_t s_applies, s_skips, s_rejects, s_refused, s_slow;
-/* The retry of a frame's skipped pass (apps_lv_set_retry_cb, perf plan Task 4's PF1 b): the LVGL task's. */
+/* The call-end poll (apps_lv_set_poll_cb, perf plan Task 4's PF1 a, ruling P12), and the display's refresh timer a pass that changed
+ * something makes ready (taken at apps_lv_build: the display outlives the layer). The LVGL task's. */
 static EXT_RAM_BSS_ATTR struct {
-    lv_timer_t *timer;  /* made at the first skip and kept; paused while no retry is armed */
-    void (*cb)(void);   /* what it runs: the app task's apply step, which calls apps_lv_apply */
-    bool running;       /* inside it: a skip arms nothing, and isn't one of the frames a callback may hold the pass for */
-} s_retry;
+    lv_timer_t *timer;  /* made at the first apps_lv_poll(true) and kept; paused while off */
+    void (*cb)(void);   /* what it runs: the app task's apply step, which calls apps_lv_apply when a call has ended */
+} s_poll;
+static lv_timer_t *s_refr_timer;
 /* The images whose spin animates now: one up as an animation starts, one down in its deleted callback, which LVGL calls however it
  * goes (apps_lv's delete, or its object's). The LVGL task's alone; read by apps_lv_stats on any task. */
 static EXT_RAM_BSS_ATTR volatile uint32_t s_spinning;
@@ -164,6 +163,7 @@ typedef struct {
     apps_ui_t *ui;
     state_t *st;
     bool changed;            /* LVGL was called for a widget: lay out and write back */
+    bool recoloured;         /* the layer's background was set: nothing to lay out, but a frame to draw */
     uint32_t rejects, refused;
     int reject_slot;         /* the first slot dropped, or -1 */
     const char *reject_why;
@@ -1351,6 +1351,7 @@ static void run_pass(pass_t *p) {
     uint32_t bg = apps_ui_take_bg(p->ui, &bg_changed);
     if (bg_changed) {
         lv_obj_set_style_bg_color(s_layer, colour(bg), LV_PART_MAIN);
+        p->recoloured = true;
     }
 
     for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
@@ -1412,47 +1413,38 @@ static phases_t phases_of(const pass_t *p, int64_t took) {
 }
 #endif
 
-/* ---- The retry of a skipped pass (apps_lv.h) ---- */
+/* ---- The call-end poll (apps_lv.h) ---- */
 
-static void on_retry(lv_timer_t *timer) {
-    lv_timer_pause(timer);  /* once: the next skip arms it again */
-    void (*cb)(void) = s_retry.cb;
-    if (cb == NULL) {
+static void on_poll(lv_timer_t *timer) {
+    (void)timer;
+    void (*cb)(void) = s_poll.cb;
+    if (cb != NULL) {
+        cb();
+    }
+}
+
+void apps_lv_poll(bool on) {
+    if (!on || s_poll.cb == NULL) {
+        if (s_poll.timer != NULL) {
+            lv_timer_pause(s_poll.timer);
+        }
         return;
     }
-    s_retry.running = true;
-    cb();
-    s_retry.running = false;
-}
-
-/* A frame's pass was skipped: its retry, APPS_APPLY_RETRY_MS from now. Not from the retry itself, and not again while one is armed
- * (it stays due when it was). No timer to be had leaves the skip to the next frame. */
-static void arm_retry(void) {
-    if (s_retry.running || s_retry.cb == NULL) {
-        return;
-    }
-    if (s_retry.timer == NULL) {
-        s_retry.timer = lv_timer_create(on_retry, APPS_APPLY_RETRY_MS, NULL);  /* running, due a period from now */
-    } else if (lv_timer_get_paused(s_retry.timer)) {
-        lv_timer_reset(s_retry.timer);
-        lv_timer_resume(s_retry.timer);
+    if (s_poll.timer == NULL) {
+        s_poll.timer = lv_timer_create(on_poll, APPS_APPLY_POLL_MS, NULL);  /* running, due a period from now; NULL: none to be had */
+    } else if (lv_timer_get_paused(s_poll.timer)) {
+        lv_timer_resume(s_poll.timer);
     }
 }
 
-static void disarm_retry(void) {
-    if (s_retry.timer != NULL) {
-        lv_timer_pause(s_retry.timer);
-    }
-}
-
-void apps_lv_set_retry_cb(void (*cb)(void)) {
-    s_retry.cb = cb;
+void apps_lv_set_poll_cb(void (*cb)(void)) {
+    s_poll.cb = cb;
     if (cb == NULL) {
-        disarm_retry();
+        apps_lv_poll(false);
     }
 }
 
-/* A pass skipped mid-callback, and one skipped for the lock (its retry armed: a frame's, not the retry's own). */
+/* A pass skipped for a call that runs (the changes of one that has ended wait for it), and one skipped for the lock. */
 static void skip_in_call(void) {
     s_skips++;
 #if CONFIG_MUSE_BENCH
@@ -1465,10 +1457,9 @@ static void skip_busy(void) {
 #if CONFIG_MUSE_BENCH
     s_bench.skips_lock_busy++;
 #endif
-    arm_retry();
 }
 
-/* The pass, once the callback's skip has let it through: the lock, the records, run_pass and what it found. */
+/* The pass: the lock, the records, run_pass and what it found. */
 static bool locked_pass(void) {
     /* The table is read with the lock held. The app task clears the pointer under it before it frees the table, so
      * a table seen here stays until the unlock: a pass that holds the lock finishes first, a later one sees NULL. */
@@ -1509,9 +1500,10 @@ static bool locked_pass(void) {
     int64_t took = end - start;
     apps_port_ui_unlock();
 
-    s_skip_run = 0;
-    disarm_retry();  /* a pass ran: nothing is left to try again */
     s_applies++;
+    if ((pass.changed || pass.recoloured) && s_refr_timer != NULL) {
+        lv_timer_ready(s_refr_timer);  /* the frame goes out in this walk of LVGL's timers, not up to a refresh period later */
+    }
     s_rejects += pass.rejects;
     s_refused += pass.refused;
 #if CONFIG_MUSE_BENCH
@@ -1550,7 +1542,7 @@ static bool locked_pass(void) {
     return true;
 }
 
-/* The pass after the callback's skip. In a bench build, W1's stack paint is around it (perf plan Task 2), outside the lock (the
+/* The pass. In a bench build, W1's stack paint is around it (perf plan Task 2), outside the lock (the
  * paint is a memset, which would lengthen the hold), and only for an app on the layer in front: the layer shown and the app's records
  * made (s_state, the LVGL task's, read without the lock). A layer behind, or one no app is on, runs its frames unpainted. */
 static bool apply_pass(void) {
@@ -1570,15 +1562,8 @@ bool apps_lv_apply(bool in_callback) {
     if (s_layer == NULL) {
         return false;
     }
-    if (!in_callback) {
-        s_skip_run = 0;
-    } else if (s_retry.running) {
-        skip_in_call();  /* the retry, and the callback still runs: the next frame decides */
-        return false;
-    } else if (s_skip_run < MAX_CALLBACK_SKIPS) {
-        s_skip_run++;
-        skip_in_call();
-        arm_retry();
+    if (in_callback) {
+        skip_in_call();  /* no pass while a call runs: the app task asks again once it has ended */
         return false;
     }
     return apply_pass();
@@ -1612,11 +1597,10 @@ void apps_lv_build(lv_obj_t *screen) {
     /* Records belong to the layer they were made on, and the cards to the screen. */
     apps_port_free(s_state);
     s_state = NULL;
-    s_skip_run = 0;
-    disarm_retry();
     s_reject_logged = false;
     s_front = false;
     s_screen = screen;
+    s_refr_timer = lv_display_get_refr_timer(lv_obj_get_display(screen));  /* NULL: none, and no pass makes one ready */
     forget_cards();
     watch_spin(screen);
 #if CONFIG_MUSE_BENCH
@@ -1665,8 +1649,6 @@ void apps_lv_reset(void) {
     }
     apps_port_free(s_state);
     s_state = NULL;
-    s_skip_run = 0;
-    disarm_retry();
     s_reject_logged = false;
 }
 

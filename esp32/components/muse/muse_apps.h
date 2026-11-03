@@ -400,8 +400,8 @@ void muse_apps_ui_build(lv_obj_t *screen);
  * (apps_lv_set_pairing_cb). After muse_apps_ui_build, under the same lock. */
 void muse_apps_ui_pairing(void (*pairing)(bool on));
 
-/* The LVGL task, every frame, before update_sleep(): the hang supervisor (a call into the app that has run more than
- * APPS_TASK_HUNG_MS), the reset of an app that ended (before any apply in the frame), the front and back the app task
+/* The LVGL task, every frame, before update_sleep(): the call-end poll off while the screen is dark, the hang supervisor (a call into
+ * the app that has run more than APPS_TASK_HUNG_MS), the reset of an app that ended (before any apply in the frame), the front and back the app task
  * asked for (a front once the app's table is published), the layer's place after a voice turn has ended, and the
  * cards (neither of these two during a turn); a launcher left open while the screen is dark closes, which frees its
  * icons (not one that holds for a pick); last, a snapshot app.control asked for, on the first frame the screen isn't dark
@@ -409,8 +409,9 @@ void muse_apps_ui_pairing(void (*pairing)(bool on));
  * scroll it began has come to rest (apps_touch_supervise). */
 void muse_apps_ui_supervise(void);
 
-/* The LVGL task, every frame the screen is awake: the apply step (apps_lv_apply). True while the app layer or a card
- * covers the screen, and frame_tick then draws nothing under it. */
+/* The LVGL task, every frame the screen is awake: the apply step (apps_lv_apply: a pass out of a call; the app's changes come with
+ * the end of its call, by the call-end poll this turns on while the app's table is published on the layer in front). True while the
+ * app layer or a card covers the screen, and frame_tick then draws nothing under it. */
 bool muse_apps_ui_tick(void);
 
 /* The LVGL task, when the voice mode changes: in_turn while Muse listens, thinks or speaks. A turn hides an app that is

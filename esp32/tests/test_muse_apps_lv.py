@@ -173,8 +173,8 @@ class HarnessTest(unittest.TestCase):
     def test_psram_floor_refuses_creates(self):
         self.run_case("psram_floor_refuses_creates")
 
-    def test_skips_mid_callback_at_most_three_frames(self):
-        self.run_case("skips_mid_callback_at_most_three_frames")
+    def test_a_frame_in_a_call_is_a_skip(self):  # perf plan Task 4, ruling P12: no pass while a call runs, and no 4th frame here
+        self.run_case("a_frame_in_a_call_is_a_skip")
 
     def test_overflow_from_coords(self):
         self.run_case("overflow_from_coords")
@@ -329,16 +329,13 @@ class HarnessTest(unittest.TestCase):
     def test_a_pass_with_no_memory_for_its_records_is_a_skip(self):
         self.run_case("a_pass_with_no_memory_is_a_skip")
 
-    # ---- Perf plan Task 4: the apply path (PF1 b, PF2) ----
+    # ---- Perf plan Task 4: the apply path (PF1 a, ruling P12; PF2) ----
 
-    def test_a_skipped_frame_is_tried_again_5_ms_later(self):  # PF1 b: a callback's skip or a busy lock's
-        self.run_case("a_skip_is_tried_again_soon")
+    def test_the_poll_runs_every_5_ms_while_on(self):  # one timer, made once; off is paused; nothing with no callback or no timer
+        self.run_case("the_poll_runs_every_5_ms_while_on")
 
-    def test_never_two_retries_armed(self):  # and the 3 frames a callback may hold the pass for are frames
-        self.run_case("never_two_retries_armed")
-
-    def test_a_busy_app_gets_one_retry_a_frame(self):  # Review Focus 2: bounded, no busy loop, every retry counted
-        self.run_case("a_busy_app_gets_one_retry_a_frame")
+    def test_a_pass_that_changes_something_refreshes_at_once(self):  # lv_timer_ready on the display's refresh timer
+        self.run_case("a_pass_that_changes_something_refreshes_at_once")
 
     def test_the_same_text_marks_nothing(self):  # PF2 a
         self.run_case("the_same_text_marks_nothing")
@@ -623,10 +620,17 @@ class HarnessTest(unittest.TestCase):
         self.assertNotIn("add_event_cb", hit)
         hit_start = source.index(hit)
         hit_end = hit_start + len(hit)
+        # Perf plan Task 4 (ruling P12): apps_lv_build takes the display's refresh timer, which a pass that changed something makes
+        # ready, in every apps build: it registers nothing either.
+        refr = "s_refr_timer = lv_display_get_refr_timer(lv_obj_get_display(screen));"
+        self.assertIn(refr, c_function(source, "void apps_lv_build(lv_obj_t *screen)"))
+        refr_start = source.index(refr)
+        refr_end = refr_start + len(refr)
         mentions = [m.start() for m in re.finditer(r"on_refresh|watch_frames|s_frames|time_frame|muse_frame_stats|"
                                                    r"scroll_box_scrolling|watch_scroll_end|on_scroll_end|LV_EVENT_SCROLL_END|"
                                                    r"LV_EVENT_REFR_READY|lv_display_add_event_cb|lv_obj_get_display", source)
-                    if not pairing_start <= m.start() < pairing_end and not hit_start <= m.start() < hit_end]
+                    if not pairing_start <= m.start() < pairing_end and not hit_start <= m.start() < hit_end
+                    and not refr_start <= m.start() < refr_end]
         self.assertGreaterEqual(len(mentions), 10)
         # Task 1 of the perf plan: each motion's frames go into a summary (muse_frame_stats.h, the bench's alone), named as the line
         # prints it, and no line is printed a frame.
@@ -912,7 +916,7 @@ class BenchHarnessTest(unittest.TestCase):
         self.run_case("apply_summary_once_a_second")
 
     def test_the_skips_in_a_callback_are_counted_apart(self):
-        self.run_case("skips_mid_callback_at_most_three_frames")
+        self.run_case("a_frame_in_a_call_is_a_skip")
 
     def test_a_busy_lock_is_a_skip_of_its_own(self):
         self.run_case("lock_discipline")
@@ -923,11 +927,11 @@ class BenchHarnessTest(unittest.TestCase):
     def test_no_memory_is_neither_skip(self):
         self.run_case("a_pass_with_no_memory_is_a_skip")
 
-    def test_a_retry_is_counted_as_what_it_was(self):  # perf plan Task 4, ruling P1: an apply, or a skip of its cause
-        self.run_case("a_skip_is_tried_again_soon")
+    def test_the_poll_runs_every_5_ms_in_a_bench_build(self):  # perf plan Task 4, ruling P12
+        self.run_case("the_poll_runs_every_5_ms_while_on")
 
-    def test_the_retry_stays_bounded_in_a_bench_build(self):  # Review Focus 2, with the stack paint around every pass
-        self.run_case("a_busy_app_gets_one_retry_a_frame")
+    def test_a_changed_pass_refreshes_at_once_in_a_bench_build(self):  # with the stack paint around every pass
+        self.run_case("a_pass_that_changes_something_refreshes_at_once")
 
     def test_the_slow_pass_says_where_its_time_went(self):
         self.run_case("slow_pass_phases")
@@ -1473,8 +1477,11 @@ class FakesTest(unittest.TestCase):
         (lv_label_mark_need_refr_text) at lv_label_set_text, at lv_label_set_long_mode and at an LV_EVENT_STYLE_CHANGED, which
         lv_obj_refresh_style sends for a property of the main part with LV_STYLE_PROP_FLAG_LAYOUT_UPDATE: text_font and text_align
         have it, text_color doesn't. So a font, a text_align or a wrap set alone measures the same text again, and a colour alone
-        doesn't. The retry (PF1 b): a timer is made running, paused and resumed by a flag, reset to a whole period from now, and run
-        when it isn't paused and its period has gone since it last ran. The fake (the harness's lines) does the same."""
+        doesn't. The call-end poll (ruling P12): a timer is made running, at the head of the timers' list (so one made after the
+        display's refresh timer comes before it in a walk of the timers), paused and resumed by a flag, reset to a whole period from
+        now, and run when it isn't paused and its period has gone since it last ran. lv_timer_ready makes one due at once (a period
+        and a tick ago), and the display's refresh timer is the one it made with LV_DEF_REFR_PERIOD. The fake (the harness's lines)
+        does the same."""
         def code(path):
             return _strip_comments((self.lvgl / path).read_text(errors="replace"))
 
@@ -1501,8 +1508,8 @@ class FakesTest(unittest.TestCase):
         self.assertIn("lv_label_mark_need_refr_text(obj);", definition(label, "static void set_text_internal(lv_obj_t * obj, const char * text)"))
         timer = code("src/misc/lv_timer.c")
         create = definition(timer, "lv_timer_t * lv_timer_create(lv_timer_cb_t timer_xcb, uint32_t period, void * user_data)")
-        for line in ("new_timer->period = period;", "new_timer->timer_cb = timer_xcb;", "new_timer->repeat_count = -1;",
-                     "new_timer->paused = 0;", "new_timer->last_run = lv_tick_get();"):
+        for line in ("new_timer = lv_ll_ins_head(timer_ll_p);", "new_timer->period = period;", "new_timer->timer_cb = timer_xcb;",
+                     "new_timer->repeat_count = -1;", "new_timer->paused = 0;", "new_timer->last_run = lv_tick_get();"):
             with self.subTest(line):
                 self.assertIn(line, create)
         self.assertIn("timer->paused = true;", definition(timer, "void lv_timer_pause(lv_timer_t * timer)"))
@@ -1515,10 +1522,15 @@ class FakesTest(unittest.TestCase):
             with self.subTest(line):
                 self.assertIn(line, run)
         self.assertIn("if(elp >= timer->period) return 0;", definition(timer, "static uint32_t lv_timer_time_remaining(lv_timer_t * timer)"))
+        self.assertIn("timer->last_run = lv_tick_get() - timer->period - 1;", definition(timer, "void lv_timer_ready(lv_timer_t * timer)"))
+        display = code("src/display/lv_display.c")
+        self.assertIn("disp->refr_timer = lv_timer_create(lv_display_refr_timer, LV_DEF_REFR_PERIOD, disp);", display)
+        self.assertIn("return disp->refr_timer;", definition(display, "lv_timer_t * lv_display_get_refr_timer(lv_display_t * disp)"))
         # And the fake says the same (the harness's own lines).
         harness = " ".join(strip_c_comments(HARNESS.read_text()).split())
         for line in (".paused = false, .last_run_us = clock_us};", "timer->paused = true;", "timer->paused = false;",
                      "timer->last_run_us = clock_us;", "if (!t->paused && clock_us - t->last_run_us >= (int64_t)t->period * 1000) {",
+                     "timer->last_run_us = clock_us - (int64_t)timer->period * 1000 - 1000;", "return &fake_refr_timer;",
                      'style_log(obj, "text_font", selector, "%s", value->name); need_refr_text(obj, selector);',
                      'style_log(obj, "text_align", selector, "%s", names[value]); need_refr_text(obj, selector);',
                      "obj->text = strdup(text); need_refr_text(obj, LV_PART_MAIN);",

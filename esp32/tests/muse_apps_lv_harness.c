@@ -890,18 +890,21 @@ static lv_obj_t *use(lv_obj_t *o, const char *fn, const char *cls) {
     return o;
 }
 
-/* ---- lv_timer: LVGL 9.5.0's (lv_timer.c), for the apply's retry (perf plan Task 4) ----
+/* ---- lv_timer: LVGL 9.5.0's (lv_timer.c), for the apply's call-end poll (perf plan Task 4, ruling P12) ----
  *
  * A timer runs when a case runs the timers (run_timers_after_us: the clock moves on, then each one that is due runs), as lv_timer_exec
  * runs it: not paused, and its period gone since it last ran, was made or was reset (lv_timer_reset). Made running (lv_timer_create),
  * kept by fake_reset (LVGL's timers outlive a screen). Its calls read nothing of an app's table: they aren't object calls, so they
- * neither cost the clock time nor count in lvgl_calls, and they are good without the UI lock. */
+ * neither cost the clock time nor count in lvgl_calls, and they are good without the UI lock. lv_timer_ready makes one due at once,
+ * and counts. The display's refresh timer (lv_display.c's, LV_DEF_REFR_PERIOD, made with the display) is one of its own: never run
+ * here, a case reads how often it was made ready. */
 struct lv_timer {
     lv_timer_cb_t cb;
     uint32_t period;      /* ms */
     void *user_data;
     bool paused;
     int64_t last_run_us;  /* clock_us when it last ran, was made or was reset */
+    int ready;            /* lv_timer_ready's calls */
 };
 
 #define FAKE_TIMERS_MAX 4
@@ -936,6 +939,22 @@ void lv_timer_reset(lv_timer_t *timer) {
 
 bool lv_timer_get_paused(lv_timer_t *timer) {
     return timer->paused;
+}
+
+/* lv_timer.c's: last_run a period and a tick ago, so it runs at the next walk of the timers. */
+void lv_timer_ready(lv_timer_t *timer) {
+    timer->ready++;
+    timer->last_run_us = clock_us - (int64_t)timer->period * 1000 - 1000;
+}
+
+static lv_timer_t fake_refr_timer = {.period = 15};  /* LV_DEF_REFR_PERIOD, CONFIG_LV_DEF_REFR_PERIOD=15 on the 1.75C */
+
+lv_timer_t *lv_display_get_refr_timer(lv_display_t *disp) {
+    if (disp != &display_obj) {
+        fake_error("lv_display_get_refr_timer on %p, not the display", (void *)disp);
+        return NULL;
+    }
+    return &fake_refr_timer;
 }
 
 /* The clock moves on us, then every timer due runs (lv_timer_handler's walk, once). How many ran. */
@@ -3760,6 +3779,7 @@ static void fake_free_all(void) {
 static void fake_reset(void) {
     fake_free_all();
     log_clear();
+    fake_refr_timer.ready = 0;  /* the timer is the display's, and stays; what a case counts is its own */
     esp_clear();
     call_cost_us = 0;
     extra_us_next = 0;
@@ -4558,235 +4578,118 @@ static apply_line_t second_end_at(int line) {
 #define SECOND_END() second_end_at(__LINE__)
 #endif
 
-/* ---- Frames: the lock and the callback ---- */
+/* ---- Frames: the lock and the call ---- */
 
-static void skips_mid_callback_at_most_three_frames(void) {
+/* Perf plan Task 4, ruling P12: no pass runs while a call of the app's runs (its widgets may be half changed). The app task's apply
+ * step asks with in_callback once for each finished call whose changes wait for one that runs: a skip (the bench's in_call), before
+ * the lock is asked for, reading and changing nothing, however often it comes. No 4th frame applies anyway here: the pass after the
+ * call (the app task's to ask for) applies them. A lock not free within 2 ms is a skip of its own. */
+static void a_frame_in_a_call_is_a_skip(void) {
     env_t e;
     scene(&e);
 #if CONFIG_MUSE_BENCH
-    second_begin();  /* the bench's summary counts the skips apart: in a callback, and the lock busy */
+    second_begin();  /* the bench's summary counts the skips apart: in a call, and the lock busy */
 #endif
     RUN(&e, "a = ui.label{text = 'x'}");
     long trylocks = trylock_calls;
-    for (int frame = 1; frame <= 3; frame++) {
-        CHECK(!APPLY_CB(&e), "frame %d is skipped", frame);
+    for (int skip = 1; skip <= 5; skip++) {
+        CHECK(!APPLY_CB(&e), "skip %d: no pass", skip);
     }
-    CHECK(stats_since().skips == 3 && stats_since().applies == 0, "skips %u applies %u", stats_since().skips, stats_since().applies);
+    CHECK(stats_since().skips == 5 && stats_since().applies == 0, "skips %u applies %u", stats_since().skips, stats_since().applies);
     LOG_EMPTY();
-    CHECK(W(&e, 0)->dirty != 0 && trylock_calls == trylocks, "a skipped frame reads and changes nothing, and doesn't ask for the lock: bits %u, %ld trylocks",
-          W(&e, 0)->dirty, trylock_calls - trylocks);
-    CHECK(APPLY_CB(&e), "the 4th frame applies anyway");
-    CHECK(log_count("create label 2 in 1") == 1 && stats_since().applies == 1 && stats_since().skips == 3, "applied\n%s", log_peek());
+    CHECK(W(&e, 0)->dirty != 0 && trylock_calls == trylocks,
+          "a skip reads and changes nothing, and doesn't ask for the lock: bits %u, %ld trylocks", W(&e, 0)->dirty,
+          trylock_calls - trylocks);
+    CHECK(APPLY(&e), "the pass after the call applies");
+    CHECK(log_count("create label 2 in 1") == 1 && stats_since().applies == 1 && stats_since().skips == 5, "applied\n%s", log_peek());
     log_clear();
 
-    /* The run starts over after an apply: three more skipped, then one applied. */
-    RUN(&e, "a:set{text = 'y'}");
-    CHECK(!APPLY_CB(&e) && !APPLY_CB(&e) && !APPLY_CB(&e), "three skipped again");
-    CHECK(APPLY_CB(&e) && log_has_line("text 2 \"y\""), "and the fourth applies\n%s", log_peek());
-    CHECK(stats_since().skips == 6 && stats_since().applies == 2, "skips %u applies %u", stats_since().skips, stats_since().applies);
-    log_clear();
-
-    /* A frame outside a callback is never skipped, and it ends the run. */
-    RUN(&e, "a:set{text = 'z'}");
-    CHECK(!APPLY_CB(&e) && !APPLY_CB(&e), "two skipped");
-    CHECK(APPLY(&e) && log_has_line("text 2 \"z\""), "a frame outside a callback applies at once\n%s", log_peek());
-    log_clear();
-    RUN(&e, "a:set{text = 'w'}");
-    CHECK(!APPLY_CB(&e) && !APPLY_CB(&e) && !APPLY_CB(&e), "the run starts over: three skipped");
-    CHECK(APPLY_CB(&e) && log_has_line("text 2 \"w\""), "and the fourth applies\n%s", log_peek());
-    log_clear();
-
-    /* The 4th frame that can't get the lock is a skip too, but the run is over: the next frame applies. */
+    /* The lock not free: a skip of its own, and the next pass applies. */
     RUN(&e, "a:set{text = 'v'}");
-    CHECK(!APPLY_CB(&e) && !APPLY_CB(&e) && !APPLY_CB(&e), "three skipped");
     trylock_refusals = 1;
-    uint32_t skips = stats_since().skips;
-    CHECK(!APPLY_CB(&e), "the lock is not free at the 4th frame");
-    CHECK(stats_since().skips == skips + 1, "a skip, counted");
-    CHECK(APPLY_CB(&e) && log_has_line("text 2 \"v\""), "the next frame applies at once\n%s", log_peek());
+    CHECK(!APPLY(&e) && stats_since().skips == 6, "the lock is not free: a skip, counted: %u", stats_since().skips);
+    CHECK(APPLY(&e) && log_has_line("text 2 \"v\""), "the next pass applies\n%s", log_peek());
 #if CONFIG_MUSE_BENCH
     apply_line_t second = SECOND_END();
-    CHECK(second.in_call == 14 && second.lock_busy == 1 && second.applies == 5, "skips %u/%u, applies %u", second.in_call,
+    CHECK(second.in_call == 5 && second.lock_busy == 1 && second.applies == 2, "skips %u/%u, applies %u", second.in_call,
           second.lock_busy, second.applies);
 #endif
     FINISH(&e);
 }
 
-/* ---- Perf plan Task 4 (PF1 b): a skipped frame's pass is tried again APPS_APPLY_RETRY_MS later, once ----
+/* ---- Perf plan Task 4 (ruling P12): the call-end poll ----
  *
- * The retry's callback here is what the app task's apply step is (muse_apps_ui_tick's, which apps_task.c hands apps_lv): apps_lv_apply
- * with whether the app is in a callback now (retry_in_call, the case's), inside the step as apply_at has it. */
-static bool retry_in_call;
-static int retries_run;     /* the callback's runs */
-static bool retry_applied;  /* what its last apps_lv_apply said */
+ * apps_lv_poll(true) runs the callback apps_lv_set_poll_cb gave (the app task's apply step, which looks whether one of the app's calls
+ * has ended since the last pass) every APPS_APPLY_POLL_MS (5 ms), from one timer made the first time and kept; apps_lv_poll(false)
+ * pauses it. With no callback, or no timer to be had (LVGL's memory), nothing runs, and frame_tick's pass is the only one. */
+static int polls_run;
 
-static void retry_step(void) {
-    retries_run++;
-    apply_active = true;
-    retry_applied = apps_lv_apply(retry_in_call);
-    apply_active = false;
+static void poll_step(void) {
+    polls_run++;
 }
 
-/* The apply's retry timer: the one timer apps_lv has made, or NULL. */
-static lv_timer_t *retry_timer(void) {
+/* The poll's timer: the one timer apps_lv has made, or NULL. */
+static lv_timer_t *poll_timer(void) {
     return n_fake_timers == 1 ? &fake_timers[0] : NULL;
 }
 
-/* A frame skipped in a callback, or for a lock that isn't free, arms one timer of APPS_APPLY_RETRY_MS (5 ms); when it runs, the apply
- * step runs once more: the pass, if the callback has ended and the lock is free, and the timer is paused. A retry that applies is an
- * apply, and one that is skipped is a skip of its cause (ruling P1), in the stats and in the bench's summary. With no callback given
- * (apps_lv_set_retry_cb), nothing is armed: the skip waits for the next frame, as before. */
-static void a_skip_is_tried_again_soon(void) {
+static void the_poll_runs_every_5_ms_while_on(void) {
     env_t e;
     scene(&e);
-    retry_in_call = false;
-    RUN(&e, "a = ui.label{text = 'x'}");
-    CHECK(!APPLY_CB(&e) && n_fake_timers == 0, "no callback: nothing armed (%d timers)", n_fake_timers);
-    CHECK(APPLY(&e) && log_count("create label 2 in 1") == 1, "the next frame applies\n%s", log_peek());
-    log_clear();
-    apps_lv_set_retry_cb(retry_step);
-    stats_base = stats_now();
-#if CONFIG_MUSE_BENCH
-    second_begin();
-#endif
-    /* A frame in a callback: skipped, and the retry armed. */
-    RUN(&e, "a:set{text = 'y'}");
-    CHECK(!APPLY_CB(&e), "the frame is skipped");
-    lv_timer_t *t = retry_timer();
-    CHECK(t != NULL && APPS_APPLY_RETRY_MS == 5 && t->period == APPS_APPLY_RETRY_MS && !t->paused, "one timer of %d ms, armed: %d timers",
-          APPS_APPLY_RETRY_MS, n_fake_timers);
-    if (t == NULL) {
-        FINISH(&e);
-        return;
-    }
-    CHECK(run_timers_after_us(APPS_APPLY_RETRY_MS * 1000 - 1) == 0 && retries_run == 0, "not before 5 ms");
-    CHECK(run_timers_after_us(1) == 1 && retries_run == 1 && retry_applied, "the retry ran at 5 ms, and the callback had ended: applied");
-    CHECK(log_has_line("text 2 \"y\"") && stats_since().applies == 1 && stats_since().skips == 1, "applied: applies %u skips %u\n%s",
-          stats_since().applies, stats_since().skips, log_peek());
-    CHECK(t->paused && run_timers_after_us(1000000) == 0 && retries_run == 1, "once: nothing more runs");
-    log_clear();
-    /* A frame the lock isn't free for: the same, with the same timer. */
-    RUN(&e, "a:set{text = 'z'}");
-    trylock_refusals = 1;
-    CHECK(!APPLY(&e) && !t->paused && n_fake_timers == 1, "the lock busy: the retry armed");
-    CHECK(run_timers_after_us(5000) == 1 && retry_applied && log_has_line("text 2 \"z\""), "applied 5 ms later\n%s", log_peek());
-    /* A retry that finds the callback still running is a callback's skip; one the lock still isn't free for, a busy lock's. Either way
-     * the next frame decides. */
-    RUN(&e, "a:set{text = 'w'}");
-    retry_in_call = true;
-    CHECK(!APPLY_CB(&e) && run_timers_after_us(5000) == 1 && !retry_applied, "the retry is skipped: the callback still runs");
-    CHECK(t->paused, "and arms nothing");
-    CHECK(APPLY(&e) && log_has_line("text 2 \"w\""), "the next frame, out of the callback, applies\n%s", log_peek());
-    RUN(&e, "a:set{text = 'v'}");
-    retry_in_call = false;
-    trylock_refusals = 2;
-    CHECK(!APPLY(&e) && run_timers_after_us(5000) == 1 && !retry_applied, "the retry is skipped: the lock still busy");
-    CHECK(t->paused, "and arms nothing");
-    CHECK(APPLY(&e) && log_has_line("text 2 \"v\""), "the next frame applies\n%s", log_peek());
-    CHECK(stats_since().applies == 4 && stats_since().skips == 6, "applies %u skips %u", stats_since().applies, stats_since().skips);
-#if CONFIG_MUSE_BENCH
-    apply_line_t second = SECOND_END();
-    CHECK(second.applies == 4 && second.in_call == 3 && second.lock_busy == 3, "applies %u, skips %u/%u", second.applies,
-          second.in_call, second.lock_busy);
-#endif
-    apps_lv_set_retry_cb(NULL);
-    FINISH(&e);
-}
-
-/* At most one retry is armed: a frame skipped while one is armed leaves it as it is (due when it was), a retry that is skipped arms
- * nothing, and a pass that runs, a reset and a new layer disarm it. The 3 frames a callback may hold the pass for are frames: its
- * retries don't count toward them, so the 4th frame applies as before. One timer is made, once. */
-static void never_two_retries_armed(void) {
-    env_t e;
-    scene(&e);
-    apps_lv_set_retry_cb(retry_step);
-    retry_in_call = true;
-    RUN(&e, "a = ui.label{text = 'x'}");
-    /* No timer to be had (LVGL's memory): nothing armed, and the skip waits for the next frame, as before. */
+    polls_run = 0;
+    apps_lv_poll(true);
+    CHECK(n_fake_timers == 0, "no callback: no timer (%d)", n_fake_timers);
+    apps_lv_set_poll_cb(poll_step);
     timer_create_fails = true;
-    CHECK(!APPLY_CB(&e) && n_fake_timers == 0, "no timer: %d", n_fake_timers);
+    apps_lv_poll(true);
     timer_create_fails = false;
-    CHECK(APPLY(&e) && log_count("create label 2 in 1") == 1 && retries_run == 0, "the next frame applies\n%s", log_peek());
-    log_clear();
-    stats_base = stats_now();
-    RUN(&e, "a:set{text = 'x2'}");
-    CHECK(!APPLY_CB(&e), "frame 1 skipped");
-    lv_timer_t *t = retry_timer();
-    CHECK(t != NULL && !t->paused, "armed");
+    CHECK(n_fake_timers == 0 && run_timers_after_us(100000) == 0 && polls_run == 0, "no timer to be had: nothing runs");
+    apps_lv_poll(true);
+    lv_timer_t *t = poll_timer();
+    CHECK(t != NULL && APPS_APPLY_POLL_MS == 5 && t->period == APPS_APPLY_POLL_MS && !t->paused, "one timer of %d ms, on: %d timers",
+          APPS_APPLY_POLL_MS, n_fake_timers);
     if (t == NULL) {
+        apps_lv_set_poll_cb(NULL);
         FINISH(&e);
         return;
     }
-    int64_t armed_at = t->last_run_us;
-    clock_us += 3000;
-    CHECK(!APPLY_CB(&e), "frame 2, late, skipped before the retry ran");
-    CHECK(n_fake_timers == 1 && !t->paused && t->last_run_us == armed_at, "still one retry, due when it was");
-    CHECK(run_timers_after_us(2000) == 1 && retries_run == 1 && !retry_applied, "it ran 5 ms after the first skip, and was skipped");
-    CHECK(t->paused && run_timers_after_us(1000000) == 0 && retries_run == 1, "a retry that is skipped arms nothing");
-    CHECK(!APPLY_CB(&e), "frame 3 skipped");
-    CHECK(run_timers_after_us(5000) == 1 && retries_run == 2 && !retry_applied, "its retry skipped");
-    CHECK(APPLY_CB(&e) && log_has_line("text 2 \"x2\""), "the 4th frame applies anyway, as before\n%s", log_peek());
-    CHECK(t->paused && run_timers_after_us(1000000) == 0, "nothing armed after a pass");
-    CHECK(stats_since().skips == 5 && stats_since().applies == 1, "skips %u applies %u", stats_since().skips, stats_since().applies);
-    log_clear();
-    /* A frame out of the callback applies, and takes the armed retry with it. */
-    RUN(&e, "a:set{text = 'y'}");
-    CHECK(!APPLY_CB(&e) && !t->paused, "armed");
-    CHECK(APPLY(&e) && t->paused && log_has_line("text 2 \"y\""), "applied, and disarmed\n%s", log_peek());
-    CHECK(run_timers_after_us(1000000) == 0 && retries_run == 2, "nothing ran");
-    /* The app's end (the reset), and a new layer. */
-    RUN(&e, "a:set{text = 'z'}");
-    CHECK(!APPLY_CB(&e) && !t->paused, "armed");
-    apps_lv_reset();
-    CHECK(t->paused, "the reset disarms it");
-    CHECK(APPLY_CB(&e) == false && !t->paused, "armed again");
-    apps_lv_build(fake_screen());
-    CHECK(t->paused, "a new layer disarms it");
-    CHECK(n_fake_timers == 1, "one timer, made once: %d", n_fake_timers);
-    apps_lv_set_retry_cb(NULL);
+    CHECK(run_timers_after_us(APPS_APPLY_POLL_MS * 1000 - 1) == 0 && polls_run == 0, "not before 5 ms");
+    CHECK(run_timers_after_us(1) == 1 && polls_run == 1, "at 5 ms");
+    for (int i = 0; i < 9; i++) {
+        run_timers_after_us(5000);
+    }
+    CHECK(polls_run == 10, "every 5 ms: %d runs in 50 ms", polls_run);
+    apps_lv_poll(true);  /* on while it is on: as it was, due when it was */
+    CHECK(run_timers_after_us(4999) == 0 && run_timers_after_us(1) == 1 && polls_run == 11, "on again changes nothing: %d", polls_run);
+    apps_lv_poll(false);
+    CHECK(t->paused && run_timers_after_us(1000000) == 0 && polls_run == 11, "off: nothing runs");
+    apps_lv_poll(false);
+    apps_lv_poll(true);
+    CHECK(!t->paused && n_fake_timers == 1, "on: the same timer, made once (%d)", n_fake_timers);
+    CHECK(run_timers_after_us(0) == 1 && polls_run == 12, "its period long gone: it runs at the next walk");
+    apps_lv_set_poll_cb(NULL);
+    CHECK(t->paused, "no callback: off");
+    apps_lv_poll(true);
+    CHECK(t->paused && run_timers_after_us(1000000) == 0 && polls_run == 12, "and it stays off with none");
     FINISH(&e);
 }
 
-/* Review Focus 2: an app in a callback at every frame (one that never returns until the supervisor's 3 s, or one always busy), or a
- * lock that is never free, under the retry: one retry a skipped frame and no more (no busy loop, LVGL's loop running every ms between
- * the frames), every 4th frame applying as before, and every retry counted. */
-static void a_busy_app_gets_one_retry_a_frame(void) {
+/* A pass that changed something makes the display's refresh timer ready (lv_timer_ready: due at once), so the frame goes out in the
+ * same walk of LVGL's timers, not up to a refresh period (15 ms) later; a pass that changed nothing, and a skip, leave it be. */
+static void a_pass_that_changes_something_refreshes_at_once(void) {
     env_t e;
     scene(&e);
-    apps_lv_set_retry_cb(retry_step);
-    retry_in_call = true;
-    RUN(&e, "a = ui.label{text = '0'}");
-    int ran = 0, skipped = 0, applied = 0;
-    for (int frame = 0; frame < 40; frame++) {
-        if (APPLY_CB(&e)) {
-            applied++;
-        } else {
-            skipped++;
-        }
-        for (int ms = 0; ms < 40; ms++) {
-            ran += run_timers_after_us(1000);
-        }
-    }
-    CHECK(applied == 10 && skipped == 30, "every 4th frame applies, as before: %d applied, %d skipped", applied, skipped);
-    CHECK(ran == 30 && retries_run == 30 && !retry_applied, "one retry a skipped frame and no more: %d ran", ran);
-    CHECK(stats_since().skips == 60 && stats_since().applies == 10, "every retry counted: skips %u applies %u", stats_since().skips,
-          stats_since().applies);
-    /* The lock never free. */
-    retry_in_call = false;
-    ran = 0;
-    long trylocks = trylock_calls;
-    trylock_refusals = 1000;
-    for (int frame = 0; frame < 10; frame++) {
-        CHECK(!APPLY(&e), "frame %d: the lock busy", frame);
-        for (int ms = 0; ms < 40; ms++) {
-            ran += run_timers_after_us(1000);
-        }
-    }
-    trylock_refusals = 0;
-    CHECK(ran == 10 && trylock_calls - trylocks == 20, "one retry a frame: %d ran, %ld trylocks", ran, trylock_calls - trylocks);
-    CHECK(n_fake_timers == 1, "one timer: %d", n_fake_timers);
-    CHECK(APPLY(&e), "the lock free: applied");
-    apps_lv_set_retry_cb(NULL);
+    fake_refr_timer.ready = 0;
+    RUN(&e, "a = ui.label{text = 'x'}");
+    CHECK(APPLY(&e) && fake_refr_timer.ready == 1, "made: the refresh made ready (%d)", fake_refr_timer.ready);
+    CHECK(APPLY(&e) && fake_refr_timer.ready == 1, "nothing to do: left be (%d)", fake_refr_timer.ready);
+    RUN(&e, "a:set{text = 'y'}");
+    CHECK(!APPLY_CB(&e) && fake_refr_timer.ready == 1, "a skip in a call: left be (%d)", fake_refr_timer.ready);
+    trylock_refusals = 1;
+    CHECK(!APPLY(&e) && fake_refr_timer.ready == 1, "the lock busy: left be (%d)", fake_refr_timer.ready);
+    CHECK(APPLY(&e) && log_has_line("text 2 \"y\"") && fake_refr_timer.ready == 2, "set: made ready (%d)", fake_refr_timer.ready);
+    RUN(&e, "ui.bg('#112233')");
+    CHECK(APPLY(&e) && fake_refr_timer.ready == 3, "a background: made ready (%d)", fake_refr_timer.ready);
     FINISH(&e);
 }
 
@@ -5097,27 +5000,24 @@ static void no_table_is_no_pass(void) {
     FINISH(&e);
 }
 
-/* A frame inside a callback is skipped before the lock is asked for and before the table is read, so with no table
- * published up to three such frames in a row still count as skips (Task 12 passes in_callback = false when no app is
- * published: no callback can run without one). The 4th goes on to read the pointer and finds nothing: not a skip. */
+/* A skip in a call comes before the lock is asked for and before the table is read, so with no table published it still counts
+ * (the app task asks with in_callback only for an app whose table is published: no call of an app runs without one). A pass goes on
+ * to read the pointer and finds nothing: not a skip. */
 static void a_callback_frame_is_skipped_before_the_table_is_read(void) {
     env_t e;
     scene_raw(&e);
     unpublish();
     long trylocks = trylock_calls;
-    for (int frame = 1; frame <= 3; frame++) {
-        CHECK(!APPLY_CB(&e), "frame %d is skipped", frame);
+    for (int skip = 1; skip <= 5; skip++) {
+        CHECK(!APPLY_CB(&e), "skip %d", skip);
     }
-    CHECK(trylock_calls == trylocks && stats_since().skips == 3, "skipped before the lock: %ld trylocks, %u skips",
+    CHECK(trylock_calls == trylocks && stats_since().skips == 5, "skipped before the lock: %ld trylocks, %u skips",
           trylock_calls - trylocks, stats_since().skips);
-    CHECK(!APPLY_CB(&e), "the 4th has no table");
-    CHECK(trylock_calls == trylocks + 1 && stats_since().skips == 3 && stats_since().applies == 0,
+    CHECK(!APPLY(&e), "a pass has no table");
+    CHECK(trylock_calls == trylocks + 1 && stats_since().skips == 5 && stats_since().applies == 0,
           "it read the pointer under the lock and counted nothing: %ld trylocks, %u skips, %u applies", trylock_calls - trylocks,
           stats_since().skips, stats_since().applies);
-    CHECK(!APPLY_CB(&e) && trylock_calls == trylocks + 2 && stats_since().skips == 3, "and so does every frame after it");
-    /* A frame outside a callback is no skip, and it ends the run: the next three in a callback are skipped again. */
-    CHECK(!APPLY(&e) && stats_since().skips == 3, "outside a callback nothing is counted");
-    CHECK(!APPLY_CB(&e) && stats_since().skips == 4 && trylock_calls == trylocks + 3, "a new run: skipped, before the lock");
+    CHECK(!APPLY_CB(&e) && stats_since().skips == 6 && trylock_calls == trylocks + 1, "a skip again: counted, before the lock");
     FINISH(&e);
 }
 
@@ -8847,12 +8747,12 @@ static void apply_summary_once_a_second(void) {
     /* A pass with nothing to do runs (an apply, 0 us) and changes nothing. */
     clock_us += 100000;
     CHECK(APPLY(&e), "nothing to do");
-    /* Three frames skipped in a callback, the fourth applies 20 ms later, 3 ms: 123 ms since the last change. */
+    /* Three skips in a call, then the pass after it 20 ms later, 3 ms: 123 ms since the last change. */
     RUN(&e, "a:set{text = 'z'}");
     CHECK(!APPLY_CB(&e) && !APPLY_CB(&e) && !APPLY_CB(&e), "three skipped");
     clock_us += 20000;
     extra_us_next = 3000;
-    CHECK(APPLY_CB(&e), "the fourth");
+    CHECK(APPLY(&e), "the pass after the call");
     /* Two frames the lock isn't free. */
     trylock_refusals = 2;
     CHECK(!APPLY(&e) && !APPLY(&e), "the lock busy");
@@ -9146,10 +9046,10 @@ static void stack_paint_around_the_paths(void) {
     CHECK(APPLY(&e), "made");
     CHECK(strcmp(tb_take(&stack_log), "paint\nnote apply\n") == 0, "around the pass:\n%s", tb_peek(&stack_log));
     RUN(&e, "a:set{text = 'y'}");
-    CHECK(!APPLY_CB(&e) && !APPLY_CB(&e) && !APPLY_CB(&e), "skipped in a callback");
-    CHECK(tb_peek(&stack_log)[0] == '\0', "nothing painted for a skip in a callback:\n%s", tb_peek(&stack_log));
+    CHECK(!APPLY_CB(&e) && !APPLY_CB(&e) && !APPLY_CB(&e), "skipped in a call");
+    CHECK(tb_peek(&stack_log)[0] == '\0', "nothing painted for a skip in a call:\n%s", tb_peek(&stack_log));
     trylock_refusals = 1;
-    CHECK(!APPLY_CB(&e), "the lock busy");
+    CHECK(!APPLY(&e), "the lock busy");
     CHECK(strcmp(tb_take(&stack_log), "paint\nnote apply\n") == 0, "the lock's wait is the apply's:\n%s", tb_peek(&stack_log));
     stack_free_next = 3000;
     CHECK(APPLY(&e), "applied");
@@ -11665,10 +11565,9 @@ int main(int argc, char **argv) {
         {"psram_floor_refuses_creates", psram_floor_refuses_creates},
         {"create_pending_has_no_object", create_pending_has_no_object},
         {"a_create_that_fails_is_tried_again", a_create_that_fails_is_tried_again},
-        {"skips_mid_callback_at_most_three_frames", skips_mid_callback_at_most_three_frames},
-        {"a_skip_is_tried_again_soon", a_skip_is_tried_again_soon},
-        {"never_two_retries_armed", never_two_retries_armed},
-        {"a_busy_app_gets_one_retry_a_frame", a_busy_app_gets_one_retry_a_frame},
+        {"a_frame_in_a_call_is_a_skip", a_frame_in_a_call_is_a_skip},
+        {"the_poll_runs_every_5_ms_while_on", the_poll_runs_every_5_ms_while_on},
+        {"a_pass_that_changes_something_refreshes_at_once", a_pass_that_changes_something_refreshes_at_once},
         {"the_same_text_marks_nothing", the_same_text_marks_nothing},
         {"a_restyle_measures_the_same_text_again", a_restyle_measures_the_same_text_again},
         {"a_style_change_calls_what_changed", a_style_change_calls_what_changed},

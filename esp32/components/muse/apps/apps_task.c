@@ -186,6 +186,8 @@ typedef struct {
 
 typedef struct {
     atomic_uint in_call;       /* app task: a call into the app runs */
+    atomic_uint committed;     /* app task: calls into the app that have ended (call_finish), stored after in_call's 0: the apply
+                                * step's cue (apply_step) */
     atomic_uint call_started;  /* app task: when it began, apps_port_mono_ms's low 32 bits; stored before in_call */
     atomic_uint call_stolen;   /* app task: apps_rt_stolen_ms then; stored before call_started */
     atomic_uint app_gen;       /* app task: the current app's number; touches, show and hide carry it */
@@ -298,6 +300,9 @@ static EXT_RAM_BSS_ATTR struct {
     uint32_t hold_refusals;  /* s_launch_refusals when the launcher's last pick was made: a refusal since ends its hold */
     uint32_t hold_memory_refusals;  /* s_launch_memory_refusals then: one since tries the pick once more (I1) */
     char hold_id[APPS_ID_MAX + 1];  /* the app it picked */
+    uint32_t applied;        /* s_rec->committed at the last pass of the apply step: what is on the layer */
+    uint32_t held;           /* the committed count last counted as held back by a call (a skip) */
+    uint8_t held_frames;     /* frames that found a change held back since the last pass */
 } L;
 
 _Static_assert(APPS_TASK_LIST_MAX <= APPS_LV_LAUNCHER_MAX, "the carousel holds every app of the list");
@@ -775,6 +780,7 @@ static void call_begin(void) {
  * call's time (apps_rt_steal_ms), for the worst call as for the duty cycle. */
 static void call_finish(void) {
     atomic_store(&s_rec->in_call, 0);
+    atomic_store(&s_rec->committed, atomic_load(&s_rec->committed) + 1);  /* the app task's alone: a plain load and store */
 #if CONFIG_MUSE_BENCH
     s_calls_ended++;
 #endif
@@ -1967,13 +1973,13 @@ static void show_cards(void) {
     }
 }
 
-static void apply_step(void);
+static void poll_step(void);
 
 void muse_apps_ui_build(lv_obj_t *screen) {
     apps_lv_build(screen);
     apps_lv_set_event_cb(on_widget_event);
     apps_lv_set_close_cb(on_close);
-    apps_lv_set_retry_cb(apply_step);  /* a skipped pass's retry runs the step again (perf plan Task 4) */
+    apps_lv_set_poll_cb(poll_step);  /* the call-end poll runs the apply step (perf plan Task 4, ruling P12) */
 }
 
 void muse_apps_ui_pairing(void (*pairing)(bool on)) {
@@ -1983,6 +1989,9 @@ void muse_apps_ui_pairing(void (*pairing)(bool on)) {
 void muse_apps_ui_supervise(void) {
     if (!atomic_load(&s_up)) {
         return;
+    }
+    if (apps_port_dark()) {
+        apps_lv_poll(false);  /* the tick, which turns it on, doesn't run while the screen is dark */
     }
     watch_for_hang();
     run_reset();
@@ -1999,26 +2008,62 @@ void muse_apps_ui_supervise(void) {
     apps_touch_supervise();        /* app.control tap and drag's: handed on at the first lit frame, answered once settled */
 }
 
-/* The apply step, frame_tick's (muse_apps_ui_tick) and its retry's (apps_lv_set_retry_cb: a skipped pass tried again), on the LVGL
- * task: no pass while the app is hung, and apps_lv_apply told whether a call runs now. */
-static void apply_step(void) {
-    if (!atomic_load(&s_up) || atomic_load(&s_rec->hung)) {
+/*
+ * The apply step (perf plan Task 4, PF1 a, ruling P12), on the LVGL task: the app's changes are applied when its call ends. The poll
+ * (apps_lv_set_poll_cb, every APPS_APPLY_POLL_MS while the app's table is published on the layer in front of a lit screen) runs it
+ * with frame false, and asks for a pass only when a call has ended since the last one (s_rec->committed moved); frame_tick's tick runs
+ * it with frame true, the backstop for what changes outside a call (the table published, a runtime image, a reset), with a pass at
+ * every frame out of a call. No pass while the app is hung, nor while a call runs (its widgets may be half changed): a call that ended
+ * before it is held back, a skip counted once (apps_lv_apply's in_callback), and if calls keep running back to back the frame that
+ * finds it held for the HELD_FRAMES_MAX + 1st time applies it anyway, mid-call. committed is read before in_call, and call_finish
+ * clears in_call before it counts, so a call seen ended is seen out of its call.
+ */
+#define HELD_FRAMES_MAX 3
+
+static void apply_step(bool frame) {
+    if (!atomic_load(&s_up) || atomic_load(&s_rec->hung) || (!frame && apps_port_dark())) {
         return;
     }
-    bool published = atomic_load(&s_rec->published) != 0;
-    bool passed = apps_lv_apply(published && atomic_load(&s_rec->in_call) != 0);
-    /* The app's first frame: a pass ran on its table with the layer in front (a skipped one isn't: the layer may be bare). The
-     * launcher that held over it closes now, before LVGL draws this frame. */
-    if (passed && apps_lv_front()) {
-        end_hold();
+    uint32_t committed = atomic_load(&s_rec->committed);
+    bool waiting = committed != L.applied;  /* a call has ended since the last pass */
+    if (!frame && !waiting) {
+        return;
     }
+    if (atomic_load(&s_rec->published) && atomic_load(&s_rec->in_call)) {
+        if (!waiting) {
+            return;  /* nothing held: the call's own end brings the pass */
+        }
+        if (committed != L.held) {
+            L.held = committed;
+            (void)apps_lv_apply(true);  /* a skip: the ended call's changes wait for this one */
+        }
+        if (!frame || ++L.held_frames <= HELD_FRAMES_MAX) {
+            return;
+        }
+    }
+    if (apps_lv_apply(false)) {
+        L.applied = committed;
+        L.held_frames = 0;
+        /* The app's first frame: a pass ran on its table with the layer in front (a skipped one isn't: the layer may be bare). The
+         * launcher that held over it closes now, before LVGL draws this frame. */
+        if (apps_lv_front()) {
+            end_hold();
+        }
+    }
+}
+
+static void poll_step(void) {
+    apply_step(false);
 }
 
 bool muse_apps_ui_tick(void) {
     if (!atomic_load(&s_up)) {
         return false;
     }
-    apply_step();
+    apply_step(true);
+    /* The poll runs while it can find something: the app's table published on the layer in front, the app not hung (the screen is lit:
+     * frame_tick doesn't tick while it's dark, and the supervisor turns the poll off then). */
+    apps_lv_poll(atomic_load(&s_rec->published) && apps_lv_front() && !atomic_load(&s_rec->hung));
 #if CONFIG_MUSE_BENCH
     apps_lv_bench_tick(s_calls_ended);  /* the apply summary, once a second while an app is in front */
 #endif

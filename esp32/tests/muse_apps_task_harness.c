@@ -1779,7 +1779,6 @@ static atomic_bool watch_cover;
 static atomic_uint bare_frames;
 static void (*lv_pick)(const char *id);
 static atomic_uint lv_applies;
-static int lv_callback_skips;
 static int (*overflow_rule)(const apps_widget_t *w);  /* the overflow a pass writes back for a visible widget */
 
 /* The image objects a pass made: each points into the package's bytes, or a runtime image's block, until a reset. */
@@ -1832,14 +1831,20 @@ void apps_lv_set_close_cb(void (*cb)(void)) {
     lv_close_cb = cb;
 }
 
-/* Perf plan Task 4 (PF1 b): the apply step a skipped pass's retry runs (muse_apps_ui_build hands it on, on the LVGL task); a case runs
- * it as the retry's timer would (run_retry). */
-static void (*lv_retry_cb)(void);
+/* Perf plan Task 4 (ruling P12): the call-end poll's callback, the app task's apply step (muse_apps_ui_build hands it on, on the LVGL
+ * task), and whether the poll is on (apps_lv_poll); a case runs it as the poll's timer would (run_poll). */
+static void (*lv_poll_cb)(void);
+static atomic_bool lv_poll_on;
 static atomic_uint lv_apply_calls, lv_apply_in_callback;  /* apps_lv_apply's calls, and those that said the app is in a callback */
 
-void apps_lv_set_retry_cb(void (*cb)(void)) {
-    lvgl_only("apps_lv_set_retry_cb");
-    lv_retry_cb = cb;
+void apps_lv_set_poll_cb(void (*cb)(void)) {
+    lvgl_only("apps_lv_set_poll_cb");
+    lv_poll_cb = cb;
+}
+
+void apps_lv_poll(bool on) {
+    lvgl_only("apps_lv_poll");
+    atomic_store(&lv_poll_on, on);
 }
 
 /* The board's frame pairing (Task 7, R7a): muse_apps_ui_pairing hands it on, on the LVGL task. */
@@ -1908,11 +1913,9 @@ bool apps_lv_apply(bool in_callback) {
     if (in_callback) {
         atomic_fetch_add(&lv_apply_in_callback, 1);
     }
-    if (in_callback && lv_callback_skips < 3) {
-        lv_callback_skips++;
-        return false;
+    if (in_callback) {
+        return false;  /* a skip: no pass while a call runs (apps_lv.c's, ruling P12) */
     }
-    lv_callback_skips = 0;
     if (!apps_port_ui_trylock(2)) {
         return false;
     }
@@ -2015,7 +2018,6 @@ void apps_lv_reset(void) {
     pthread_mutex_lock(&lv_mu);
     lv_n_objects = 0;
     lv_objects_table = NULL;
-    lv_callback_skips = 0;
     lv_reported = 0;
     pthread_mutex_unlock(&lv_mu);
     event("reset");
@@ -2115,6 +2117,7 @@ static void (*job)(void *);
 static void *job_arg;
 static bool job_done;
 static atomic_bool lvgl_paused, lvgl_asleep, lvgl_quit;
+static atomic_bool lvgl_ticks_off;  /* a case's: frames run the supervisor alone, and the case runs the tick (run_tick) */
 static atomic_uint frames, paused_rounds;
 
 /* The screen is dark when the case says the LVGL task sleeps: it runs no apply step then, as the real one doesn't. */
@@ -2193,7 +2196,7 @@ static void *lvgl_main(void *arg) {
         if (!atomic_load(&lvgl_paused)) {
             lv_draw();
             muse_apps_ui_supervise();
-            if (!atomic_load(&lvgl_asleep)) {
+            if (!atomic_load(&lvgl_asleep) && !atomic_load(&lvgl_ticks_off)) {
                 atomic_store(&last_tick, muse_apps_ui_tick());
             }
             atomic_fetch_add(&frames, 1);
@@ -2820,49 +2823,128 @@ static void *queued_caller(void *arg) {
     return NULL;
 }
 
-/* Perf plan Task 4 (PF1 b): the retry of a skipped pass runs the app task's apply step, the one muse_apps_ui_tick runs: apps_lv_apply
- * with whether the app is in a callback now, and nothing at all while the app is hung (Review Focus 2: the supervisor's rule and its
- * counting are unchanged). Run here as the retry's timer runs it, on the LVGL task between frames. */
-static int retry_asked, retry_asked_in_callback;  /* what one run of the retry asked apps_lv for */
+/* Perf plan Task 4 (ruling P12): the app's changes are applied when its call ends. call_finish counts the call, and the poll (an LVGL
+ * timer of 5 ms, run here as it runs it, on the LVGL task between frames) asks apps_lv for a pass when a call has ended since the last
+ * pass and none runs now; frame_tick's tick is the backstop, a pass at every frame out of a call. No pass while a call runs: a call
+ * that ended before it is held back, a skip counted once (apps_lv_apply with in_callback), and if calls keep running the 4th frame
+ * that finds it held applies it anyway. Nothing while the app is hung. The poll is on while the app's table is published on the layer
+ * in front of a lit screen, and off when the screen goes dark or the app ends. */
+static const char APP_SET_HANG[] =
+    "local app = {}\n"
+    "function app.start()\n"
+    "  local b = ui.button{text = 'Set'}\n"
+    "  b:on('tap', function() b:set{text = 'Done'} print('set') end)\n"
+    "  ui.button{text = 'Hang'}:on('tap', function() print('hang') end)\n"
+    "end\n"
+    "return app\n";
 
-static void run_retry(void *arg) {
-    (void)arg;
+static int asked, asked_in_callback;  /* what one run of the poll or the tick asked apps_lv for */
+
+static void count_asked(void (*step)(void)) {
     unsigned calls = atomic_load(&lv_apply_calls), in_callback = atomic_load(&lv_apply_in_callback);
-    lv_retry_cb();
-    retry_asked = (int)(atomic_load(&lv_apply_calls) - calls);
-    retry_asked_in_callback = (int)(atomic_load(&lv_apply_in_callback) - in_callback);
+    step();
+    asked = (int)(atomic_load(&lv_apply_calls) - calls);
+    asked_in_callback = (int)(atomic_load(&lv_apply_in_callback) - in_callback);
 }
 
-static void the_retry_runs_the_ticks_apply_step(void) {
-    CHECK(lv_retry_cb != NULL, "muse_apps_ui_build hands apps_lv the apply step for its retry");
-    if (lv_retry_cb == NULL) {
+static void run_poll(void *arg) {
+    (void)arg;
+    count_asked(lv_poll_cb);
+}
+
+static void tick_once(void) {
+    (void)muse_apps_ui_tick();
+}
+
+static void run_tick(void *arg) {
+    (void)arg;
+    count_asked(tick_once);
+}
+
+static void the_poll_applies_when_a_call_ends(void) {
+    CHECK(lv_poll_cb != NULL, "muse_apps_ui_build hands apps_lv the apply step for its poll");
+    if (lv_poll_cb == NULL) {
         return;
     }
-    const file_t files[] = {LUA("main.lua", APP_HANG)};
+    const file_t files[] = {LUA("main.lua", APP_SET_HANG)};
     char err[200];
-    CHECK(apps_task_run(make_pkg("hangy", "Hangy", files, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    CHECK(apps_task_run(make_pkg("sethang", "Sethang", files, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
     WAIT(0, "front 1");
-    ON_LVGL(run_retry, NULL);
-    CHECK(retry_asked == 1 && retry_asked_in_callback == 0, "no call runs: one pass asked for, out of a callback: %d, %d", retry_asked,
-          retry_asked_in_callback);
+    WAIT_FRAMES(3);
+    CHECK(atomic_load(&lv_poll_on), "on: the app's table published on the layer in front, the screen lit");
+    atomic_store(&lvgl_ticks_off, true);
+    WAIT_FRAMES(2);
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 0, "no call has ended since the last pass: nothing asked: %d", asked);
+    /* A call ends: the poll asks for one pass, out of a call, and then nothing more. */
+    int from = mark();
+    TAP(0);
+    WAIT(from, "echo set");
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 1 && asked_in_callback == 0, "a call ended: one pass asked for, out of a call: %d, %d", asked, asked_in_callback);
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 0, "applied: nothing more: %d", asked);
+    /* A call ends and another runs before the poll: held back, a skip counted once, however often the poll comes. */
+    from = mark();
+    TAP(0);
+    WAIT(from, "echo set");
     const int64_t t0 = ((int64_t)3 << 32) - 1000;
     clock_stop_at(t0);
     block_print("hang");
-    int from = mark();
-    TAP(0);
+    TAP(1);
     WAIT_PRINT_BLOCKED();
-    ON_LVGL(run_retry, NULL);
-    CHECK(retry_asked == 1 && retry_asked_in_callback == 1, "a call runs: one pass asked for, in a callback: %d, %d", retry_asked,
-          retry_asked_in_callback);
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 1 && asked_in_callback == 1, "held back by the call that runs: a skip: %d, %d", asked, asked_in_callback);
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 0, "counted once: %d", asked);
+    /* Frames: the call keeps running, so the 4th frame that finds the change held applies it anyway, and then none until it ends. */
+    for (int frame = 1; frame <= 3; frame++) {
+        ON_LVGL(run_tick, NULL);
+        CHECK(asked == 0, "frame %d: nothing asked: %d", frame, asked);
+    }
+    ON_LVGL(run_tick, NULL);
+    CHECK(asked == 1 && asked_in_callback == 0, "the 4th: a pass asked for, out of a call: %d, %d", asked, asked_in_callback);
+    ON_LVGL(run_tick, NULL);
+    CHECK(asked == 0, "nothing held now: nothing asked while the call runs: %d", asked);
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 0, "nor by the poll: %d", asked);
+    /* Hung: nothing at all. */
     clock_stop_at(t0 + 3001);
-    WAIT(from, "crash Hangy | (stopped responding)");
-    ON_LVGL(run_retry, NULL);
-    CHECK(retry_asked == 0, "hung: no pass asked for, as the tick asks none: %d", retry_asked);
+    WAIT(from, "crash Sethang | (stopped responding)");
+    ON_LVGL(run_poll, NULL);
+    CHECK(asked == 0, "hung: no pass asked for by the poll: %d", asked);
+    ON_LVGL(run_tick, NULL);
+    CHECK(asked == 0, "nor by the tick: %d", asked);
+    CHECK(!atomic_load(&lv_poll_on), "and the poll is off");
+    atomic_store(&lvgl_ticks_off, false);
     int back = mark();
     clock_go();
     release_print();
     WAIT(back, "priority muse_apps 2");
-    WAIT(back, "free pkg hangy");
+    WAIT(back, "free pkg sethang");
+}
+
+/* The poll is on only while it can find something: an app's table published on the layer in front of a lit screen. The screen
+ * going dark turns it off (at the supervisor, which runs at a dark frame too), lit again on, and the app's end off. */
+static void the_poll_is_on_for_an_app_in_front(void) {
+    WAIT_FRAMES(3);
+    CHECK(!atomic_load(&lv_poll_on), "no app: off");
+    char err[200];
+    CHECK(apps_task_run(make_pkg("hello", "Hello", HELLO, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "front 1");
+    WAIT_FRAMES(3);
+    CHECK(atomic_load(&lv_poll_on), "in front: on");
+    atomic_store(&lvgl_asleep, true);
+    WAIT_FRAMES(3);
+    CHECK(!atomic_load(&lv_poll_on), "dark: off");
+    atomic_store(&lvgl_asleep, false);
+    WAIT_FRAMES(3);
+    CHECK(atomic_load(&lv_poll_on), "lit: on");
+    int from = mark();
+    CHECK(apps_task_stop(err, sizeof err), "stop: %s", err);
+    WAIT(from, "front 0");
+    WAIT_FRAMES(3);
+    CHECK(!atomic_load(&lv_poll_on), "ended: off");
 }
 
 /* A callback stuck in C (its print doesn't return). The supervisor's 3000 ms rule, across the clock's 32-bit wrap;
@@ -8193,7 +8275,8 @@ int main(int argc, char **argv) {
         {"a_crash_at_the_top_level_is_contained", a_crash_at_the_top_level_is_contained},
         {"a_main_that_does_not_compile_fails_the_run", a_main_that_does_not_compile_fails_the_run},
         {"a_hung_call_is_abandoned", a_hung_call_is_abandoned},
-        {"the_retry_runs_the_ticks_apply_step", the_retry_runs_the_ticks_apply_step},
+        {"the_poll_applies_when_a_call_ends", the_poll_applies_when_a_call_ends},
+        {"the_poll_is_on_for_an_app_in_front", the_poll_is_on_for_an_app_in_front},
         {"a_hung_stop_is_abandoned", a_hung_stop_is_abandoned},
         {"a_launch_never_waits", a_launch_never_waits},
         {"overflow_warnings", overflow_warnings},

@@ -83,6 +83,12 @@ void muse_lcd_bands_set_te(int gpio);
 
 #if CONFIG_MUSE_APPS
 /*
+ * With the apps, LVGL waits for a band's flush blocked on a semaphore that
+ * each flush's end gives (its flush_wait_cb), rather than spinning at the
+ * UI task's priority through the band's write.
+ */
+
+/*
  * Whether a refresh LVGL draws in exactly two bands goes to the panel whole:
  * off until turned on. On, the first band is held, its flush left open,
  * until LVGL has drawn the second into its other buffer; then both go out
@@ -97,20 +103,30 @@ void muse_lcd_bands_set_te(int gpio);
 void muse_lcd_bands_set_pairing(bool on);
 
 /*
+ * Frame mode's frame, made now: 2 bytes a pixel of PSRAM (434,312 bytes on
+ * the 1.75C), if PSRAM keeps 1 MB free after it, and kept, so the apps'
+ * PSRAM budget is the same before and after the first slide. False if it
+ * couldn't be made: frame mode then stays off for the boot, and the bands
+ * say so once. Call it once as frame mode registers, after
+ * muse_lcd_bands_register (the 1.75C's display_start).
+ */
+bool muse_lcd_bands_make_frame(void);
+
+/*
  * Frame mode: whether a refresh of the whole screen goes to the panel as
  * one write, off until turned on. On, the bands of such a refresh (all of
- * them full width, from the top row to the bottom one) are copied into one
- * frame of the screen as LVGL flushes them, each given back to LVGL at
- * once, and the last sends the frame through one window, held to just
- * after a scan's start (muse_lcd_bands_set_te), where a write slower than
- * the scan stays clear of it: no scan shows one band's new picture over
- * another's old one, however long LVGL takes to draw. Any other refresh
- * goes as it does off, and frame mode wins over pairing for a whole screen.
- * The frame is 2 bytes a pixel of PSRAM (434,312 bytes on the 1.75C), made
- * the first time this is turned on and kept; if it can't be made (or would
- * leave less than 1 MB of PSRAM free) it says so once and frame mode stays
- * off, to be tried again at the next turn on. On the LVGL task; the home
- * screen turns it on while its pages slide (muse_board_t frame_mode).
+ * them full width, from the top row to the bottom one) are copied into the
+ * frame as LVGL flushes them, by DMA where it can (by CPU where it can't),
+ * each given back to LVGL once its copy has ended, and the last sends the
+ * frame through one window, held to just after a scan's start
+ * (muse_lcd_bands_set_te), where a write slower than the scan stays clear
+ * of it: no scan shows one band's new picture over another's old one,
+ * however long LVGL takes to draw. Any other refresh goes as it does off,
+ * and frame mode wins over pairing for a whole screen. On only with the
+ * frame (muse_lcd_bands_make_frame); it never allocates. The DMA's driver
+ * is installed at a slide's first copy and uninstalled once frame mode is
+ * off. On the LVGL task; the home screen turns it on while its pages slide
+ * (muse_board_t frame_mode).
  */
 void muse_lcd_bands_set_frame_mode(bool on);
 #if CONFIG_MUSE_BENCH

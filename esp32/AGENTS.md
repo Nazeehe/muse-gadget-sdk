@@ -1172,23 +1172,40 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   tileview's `LV_EVENT_SCROLL_BEGIN` to the end of the first refresh that
   finds it at rest (`muse_ui.c`), the 1.75C's `.frame_mode`
   (`muse_lcd_bands_set_frame_mode`) sends such a refresh whole: each band is
-  copied into one frame of the screen and given back to LVGL at once, and the
-  last sends the frame as one write through one window (video's framing),
-  held to just after a scan's start, where a write slower than the scan stays
-  clear of it (`te_hold` of the frames' learned write at `WHOLE_SPREAD`, 10%,
-  and never more than the longest write a hold can keep clear). Only a
-  refresh of the whole screen goes that way, and it does even if the apps'
-  pairing is on. The frame is 434,312 bytes of PSRAM, made at the first slide
-  if 1 MB of PSRAM stays free after it (`WHOLE_RESERVE`, the apps' floor) and
-  kept; without it every refresh takes the band path, and the bands log
-  `tearing effect: no frame for frame mode` once. That line and
-  `tearing effect: frame mode's frame, <bytes> B of PSRAM` come from the send
-  task at its next band, never from the slide's scroll callback, deep in LVGL's
-  input read. A bench build sums up each slide's frames, its drag's and its
-  snap's together, in `page frames:` lines (the bench's frame summaries, under
-  Build). The bands' batch line
-  then counts the refreshes `framed` and their `copy` into the frame.
-  Measured on the 1.75C on 2026-11-02 (apps+bench build, 20 `>swipe left`
+  copied into one frame of the screen, by DMA while LVGL draws the next band,
+  and given back to LVGL once its copy has ended, and the last sends the frame
+  as one write through one window (video's framing), held to just after a
+  scan's start, where a write slower than the scan stays clear of it
+  (`te_hold` of the frames' learned write at `WHOLE_SPREAD`, 10%, and never
+  more than the longest write a hold can keep clear). Only a refresh of the
+  whole screen goes that way, and it does even if the apps' pairing is on. The
+  frame is 434,312 bytes of PSRAM, made as the display registers
+  (`muse_lcd_bands_make_frame`, from the 1.75C's `display_start`) if 1 MB of
+  PSRAM stays free after it (`WHOLE_RESERVE`, the apps' floor) and kept, so
+  the switch never allocates; without it every refresh takes the band path,
+  and the bands log `tearing effect: no frame for frame mode` once. That line
+  and `tearing effect: frame mode's frame, <bytes> B of PSRAM` come from the
+  send task at its next band, never from the slide's scroll callback, deep in
+  LVGL's input read. The copies are ESP-IDF's `esp_async_memcpy` (GDMA): its
+  driver is installed at a slide's first copy if internal DMA RAM keeps
+  `DMA_KEEP` (20 KB, the Link's TX margin and a VM read's) and `DMA_TAKES`
+  (2 KB) free, used while it keeps `DMA_KEEP`, and uninstalled once frame
+  mode is off. The S3's GDMA writes PSRAM only in whole bursts of
+  `DMA_BURST` (64 bytes), so a band's bulk goes by DMA from its first burst of
+  the frame, and its two ends by CPU. The send task writes the band back from
+  the cache first, `DMA_SYNC_BYTES` (4,096) at a time: the driver's own
+  write-back is one critical section over the band, which would hold off the
+  TE pin's interrupt. A band the DMA can't take is copied by CPU, and the send
+  task logs `tearing effect: frame mode's copy by CPU (DMA <step>: <error>)`
+  once. With the apps, LVGL waits for a band's flush blocked on a semaphore
+  (`flush_wait`, its `flush_wait_cb`), not spinning at the UI task's priority.
+  A bench build sums up each slide's frames, its drag's and its snap's
+  together, in `page frames:` lines (the bench's frame summaries, under
+  Build). The bands' batch line then counts the refreshes `framed`, those of
+  them torn and their bands copied by CPU (`framed (<t> torn, <c> bands by
+  CPU)`), and their `copy` into the frame.
+  Measured on the 1.75C on 2026-11-02 with the copies by CPU and the frame
+  made at the first slide (c5cf24a; apps+bench build, 20 `>swipe left`
   from the clock and 20 `>swipe right` back, and 4 `>drag` from the clock at
   150 and 600 ms): none of the 527 refreshes in frame mode was torn, and no
   torn refresh came during a slide (the 57 torn were the Muse face's small
@@ -1204,6 +1221,23 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   bytes at the first slide, the frame less 20, and stayed there. The send
   task's unused stack fell to 596 bytes, and the LVGL task's from 3,868 to
   2,956.
+  With the copies by DMA (perf plan Task 5, measured the same day: 20 swipe
+  pairs from the clock): none of the 429 refreshes in frame mode was torn and
+  none of their bands went by CPU. 360 page frames had a median of 68 ms
+  (each slide's 66 to 70), 95th percentiles of 68 to 78 ms and the longest
+  78: still four of the panel's scans a frame, as each write waits for a
+  scan's start, and short of the 60 ms. The DMA gives LVGL its core back (the
+  batches' longest drawing fell from about 68 to 63 ms), but three scans would
+  need the next frame's write to start within about 24 ms of the last one's
+  end, and at that end LVGL still has the next refresh's last two bands to
+  draw, one at a time, and to copy. A refresh in frame mode spent 19.5 ms
+  waiting for its copies, the CPU LVGL's meanwhile. Internal RAM is no less
+  than before: the refresh's record (`s_frame`) is in PSRAM now, and `UI
+  built` said 52,247 bytes free at boot against 51,967 (`>mem` 27,095
+  internal and 23,255 DMA), 20 less from the first slide on (the DMA
+  interrupt's descriptor, which ESP-IDF keeps); the driver took 1,176 more
+  while a slide ran, all back after it. The send task's unused stack was 540
+  bytes at its lowest.
 - **Test** with `tests/test_muse_apps_*.py` (the VM and the sandbox, JSON,
   packages, widgets and the apply step, the services, the runtime and its duty
   cycle, the app task, the store, the install, the console and `app.py`, the

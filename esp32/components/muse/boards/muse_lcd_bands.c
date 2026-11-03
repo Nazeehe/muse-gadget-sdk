@@ -32,7 +32,9 @@
 #include "muse_mem.h"
 #if CONFIG_MUSE_APPS
 #include <stdio.h>
+#include "esp_async_memcpy.h"
 #include "esp_attr.h"
+#include "esp_cache.h"
 #include "src/display/lv_display_private.h"   /* a refresh's areas and the band being drawn, for the pair (on_render_event) */
 #endif
 
@@ -134,23 +136,32 @@ static bool s_follows;                   /* send task: the next band is a pair's
 static int s_follow_y1, s_follow_y2;
 static int64_t s_gap_us = 300;           /* from a band's end to the next one's start, when it follows (learned) */
 static esp_timer_handle_t s_wake_timer;  /* ends a hold to the microsecond (sleep_until) */
-static SemaphoreHandle_t s_wake;
+static SemaphoreHandle_t s_wake;         /* wakes the send task: a hold's timer (wake_send), or a copy's end by DMA (on_copied) */
+
+/*
+ * LVGL's wait for the band before to be flushed (flush_wait, its flush_wait_cb) blocks on s_flush_ready, which every
+ * lv_display_flush_ready gives, rather than spinning on disp->flushing at the UI task's priority through a band's write, or in
+ * frame mode through a frame's hold and write (about 34 ms). It checks the flag again at each wake, and every FLUSH_WAIT_MS.
+ */
+#define FLUSH_WAIT_MS 10
+static SemaphoreHandle_t s_flush_ready;
 
 /*
  * Frame mode (muse_lcd_bands_set_frame_mode), while the home screen's pages slide: each step redraws the whole screen, which
  * takes about two scans' time on the wire as LVGL's four bands, so the next scan always overtakes it between two of them. In
- * frame mode such a refresh's bands are copied into one frame as LVGL flushes them, each given back to LVGL at once, and the
- * last sends the frame as one write through one window (send_frame's framing), held to just after a scan's start: slower than
- * the scan, the write stays behind the scan that has just started and ahead of the next one, however long LVGL took to draw.
- * The state is in PSRAM: only the LVGL and send tasks touch it, with plain loads and stores.
+ * frame mode such a refresh's bands are copied into one frame as LVGL flushes them, by DMA where it can (dma_copy), each given
+ * back to LVGL once its copy has ended, and the last sends the frame as one write through one window (send_frame's framing),
+ * held to just after a scan's start: slower than the scan, the write stays behind the scan that has just started and ahead of
+ * the next one, however long LVGL took to draw. The state is in PSRAM: only the LVGL and send tasks touch it, with plain loads
+ * and stores.
  */
 #define WHOLE_SPREAD 10                  /* a frame's write, as a percentage of the frames' learned time, either way */
 #define WHOLE_RESERVE (1024 * 1024)      /* PSRAM the frame leaves free: the apps' floor (APPS_RAM_RESERVE), for Muse's session and LVGL */
 typedef struct {
-    uint8_t *px;               /* the frame: the screen, s_cols x s_rows at 2 bytes, made the first time frame mode is on, and kept */
-    bool failed;               /* it couldn't be made (once) */
-    bool made_untold;          /* set by the LVGL task as the frame is made, cleared by the send task as it logs that (tell_frame) */
-    bool failed_untold;        /* the same for its first failure */
+    uint8_t *px;               /* the frame: the screen, s_cols x s_rows at 2 bytes, made as frame mode registers, and kept */
+    bool failed;               /* it couldn't be made: frame mode is off for the boot */
+    bool made_untold;          /* set as the frame is made (muse_lcd_bands_make_frame), cleared by the send task as it logs that */
+    bool failed_untold;        /* the same for its failure */
     int at;                    /* LVGL task: the rows of the refresh in frame mode flushed so far */
     int staged;                /* send task: the rows copied into px so far */
     int64_t us;                /* send task: a frame's write, learned from the ones before (0: none timed yet) */
@@ -159,14 +170,54 @@ static EXT_RAM_BSS_ATTR whole_t s_whole;
 static EXT_RAM_BSS_ATTR bool s_framing, s_framed;   /* LVGL task: frame mode on (with its frame); the refresh under way in it */
 static EXT_RAM_BSS_ATTR te_stats_t s_te_whole;      /* the frames' writes against the scan ("UI frame") */
 static EXT_RAM_BSS_ATTR int s_cols;                 /* the panel's */
+
+/*
+ * Frame mode's copies by DMA (esp_async_memcpy, ESP-IDF v6.0.1's GDMA driver): the send task starts a band's copy into the frame
+ * and waits for its end, blocked, so the CPU is LVGL's to draw the next band meanwhile; the band goes back to LVGL only then. The
+ * driver takes internal RAM (its context and channels, and each copy's descriptors and stash, kept until the next copy), so it is
+ * installed at a slide's first copy and uninstalled once frame mode is off (dma_end): installed only while internal DMA RAM keeps
+ * DMA_KEEP and DMA_TAKES free, and used only while it keeps DMA_KEEP. A band it can't take (no room, no channel, a copy refused or
+ * never ended) is copied by CPU, as before.
+ *
+ * The driver keeps the caches right (async_memcpy_gdma.c): it writes the band back from the cache before the DMA reads it
+ * (esp_cache_msync, C2M), invalidates the frame's cache lines it writes before it starts (M2C, esp_dma_split_rx_buffer_to_cache_aligned),
+ * and copies the lines it shares at either end through a stash in internal RAM, by CPU in its interrupt
+ * (esp_dma_merge_aligned_rx_buffers). Nothing reads or writes a band's rows of the frame while its copy is under way (the send task
+ * waits for it, and the frame's write comes after the last), so no stale line comes back. The S3's GDMA reads PSRAM at any alignment
+ * but writes it in whole bursts (GDMA_LL_AHB_RX_BURST_NEEDS_ALIGNMENT): the destination and the length must be whole DMA_BURSTs
+ * (check_buffer_alignment), and a band's rows of the frame are 932 B apart. So a band's bulk, from its first byte on a burst of the
+ * frame to its last whole burst, goes by DMA, and its ends, under a burst each and on cache lines of their own, by CPU meanwhile.
+ * The panel's SPI DMA never reads the frame: whole_write copies it into the internal buffers.
+ *
+ * The driver's write-back is one critical section over the whole band (esp_cache_msync.c, with
+ * CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS off, as here): up to the cache's 64 KB of dirty lines to PSRAM with this core's interrupts
+ * held, the TE pin's among them, whose edges time every hold. So the band is written back first DMA_SYNC_BYTES at a time, interrupts
+ * on between the pieces, and the driver's own finds nothing left to write.
+ */
+#define DMA_BURST 64                     /* bytes: the most a PSRAM burst takes (GDMA_LL_MAX_BURST_SIZE_PSRAM), as >memtest timed it */
+#define DMA_WAIT_MS 100                  /* for a band's copy to end, at most: it takes about 3.6 ms */
+#define DMA_KEEP (20 * 1024)             /* internal DMA RAM the copies leave: the Link's TX margin (16 KB) and a VM read's 4 KB */
+#define DMA_TAKES (2 * 1024)             /* about what the driver and a copy take of it, installed */
+#define DMA_SYNC_BYTES 4096              /* the band's write-back from the cache, a piece at a time */
+typedef struct {
+    async_memcpy_handle_t mcp; /* the driver, while frame mode is on (NULL otherwise) */
+    bool off;                  /* the DMA is given up for the boot: no channel, a copy refused, or one that never ended */
+    bool untold;               /* the first band copied by CPU, not logged yet (tell_frame) */
+    const char *why;           /* its step: "room", "install", "copy" or "end" (NULL: none yet) */
+    esp_err_t err;             /* and that step's error */
+} dma_t;
+static EXT_RAM_BSS_ATTR dma_t s_dma;   /* the send task's alone */
+static volatile bool s_copied;         /* the copy under way has ended: set in the DMA's interrupt (on_copied) */
+static void dma_end(void);
 static void whole_band(const band_t *b);
 static void whole_write(int rows, bool hold);
 static void tell_frame(void);
 
 /* A refresh of LVGL's (its bands, the last one marked) as it went to the panel, for the stats: torn if a scan passed
- * between its writes, so that one refresh of the panel showed some of it and the next the rest (frame_meets). */
+ * between its writes, so that one refresh of the panel showed some of it and the next the rest (frame_meets). In PSRAM:
+ * the send task's alone, its interrupts never touch it (and it gives internal RAM back for the flush wait's semaphore). */
 #define FRAME_WRITES_MAX 8
-static struct {
+static EXT_RAM_BSS_ATTR struct {
     write_t w[FRAME_WRITES_MAX];
     int n;                     /* bands so far; past FRAME_WRITES_MAX only counted, and not judged */
     int64_t fall, p, scan;     /* the scans as te_now gave them at its first band; p 0: no TE then */
@@ -178,6 +229,7 @@ static struct {
     bool paired;               /* its first two bands went as a pair */
     bool framed;               /* it went through frame mode, as one write */
     int64_t copy_us;           /* its bands' copies into the frame */
+    uint32_t cpu_bands;        /* of them, those copied by CPU, where the DMA couldn't (dma_copy) */
 #endif
 } s_frame;
 #if CONFIG_MUSE_BENCH
@@ -188,6 +240,7 @@ static EXT_RAM_BSS_ATTR bool s_copy_off;   /* the bench's '>frame copy off': fra
 #define FRAME_BATCH 30
 static struct {
     uint32_t n, torn, bands, paired, framed;
+    uint32_t framed_torn, cpu; /* of the framed, those torn; frame mode's bands copied by CPU */
     int64_t render, render_max, copy, copy_max, held, held_max, wire, wire_max, span, span_max;
 } s_batch;
 #endif
@@ -214,6 +267,11 @@ static bool IRAM_ATTR on_chunk_sent(esp_lcd_panel_io_handle_t io, esp_lcd_panel_
         s_band_end = esp_timer_get_time();
     }
     bool yield = last && esp_lv_adapter_display_notify_color_trans_done_from_isr(s_disp);
+#if CONFIG_MUSE_APPS
+    if (last) {
+        xSemaphoreGiveFromISR(s_flush_ready, &woken);   /* the band's flush is ready (the notify): LVGL's flush wait goes on */
+    }
+#endif
     /* esp_lcd's SPI IO ignores this callback's return value, so the send
      * task, woken here, would wait for the next tick (up to 1 ms a piece,
      * 58 pieces a frame): ask for the switch at the interrupt's exit. */
@@ -391,6 +449,18 @@ static void on_render_event(lv_event_t *e)
 #endif
     default:
         break;
+    }
+}
+
+/*
+ * LVGL's flush_wait_cb, on the LVGL task: LVGL 9.5.0 calls it while the band before is still being flushed (wait_for_flushing,
+ * with disp->flushing set), before it flushes the next. Blocks until that band's lv_display_flush_ready, woken by its give of
+ * s_flush_ready (band_back, on_chunk_sent); a give left from a flush LVGL didn't wait for wakes it at once, and the flag is checked again.
+ */
+static void flush_wait(lv_display_t *disp)
+{
+    while (disp->flushing) {
+        xSemaphoreTake(s_flush_ready, pdMS_TO_TICKS(FLUSH_WAIT_MS));
     }
 }
 #endif
@@ -783,6 +853,8 @@ static void frame_done(const band_t *b)
         s_batch.bands += n;
         s_batch.paired += s_frame.paired;
         s_batch.framed += s_frame.framed;
+        s_batch.framed_torn += torn && s_frame.framed;
+        s_batch.cpu += s_frame.cpu_bands;
         s_batch.render += b->render_us;
         s_batch.render_max = b->render_us > s_batch.render_max ? b->render_us : s_batch.render_max;
         s_batch.copy += s_frame.copy_us;
@@ -794,9 +866,10 @@ static void frame_done(const band_t *b)
         s_batch.span += span;
         s_batch.span_max = span > s_batch.span_max ? span : s_batch.span_max;
         if (s_batch.n == FRAME_BATCH) {
-            ESP_LOGI(TAG, "tearing effect: %u refreshes, %u torn, %u bands, %u paired, %u framed; us avg/max: render %d/%d, "
-                     "copy %d/%d, held %d/%d, wire %d/%d, span %d/%d; gap %d us, send stack %u B free", (unsigned)s_batch.n,
-                     (unsigned)s_batch.torn, (unsigned)s_batch.bands, (unsigned)s_batch.paired, (unsigned)s_batch.framed,
+            ESP_LOGI(TAG, "tearing effect: %u refreshes, %u torn, %u bands, %u paired, %u framed (%u torn, %u bands by CPU); "
+                     "us avg/max: render %d/%d, copy %d/%d, held %d/%d, wire %d/%d, span %d/%d; gap %d us, send stack %u B free",
+                     (unsigned)s_batch.n, (unsigned)s_batch.torn, (unsigned)s_batch.bands, (unsigned)s_batch.paired,
+                     (unsigned)s_batch.framed, (unsigned)s_batch.framed_torn, (unsigned)s_batch.cpu,
                      (int)(s_batch.render / s_batch.n), (int)s_batch.render_max, (int)(s_batch.copy / s_batch.n),
                      (int)s_batch.copy_max, (int)(s_batch.held / s_batch.n),
                      (int)s_batch.held_max, (int)(s_batch.wire / s_batch.n), (int)s_batch.wire_max,
@@ -808,6 +881,7 @@ static void frame_done(const band_t *b)
     s_frame.paired = false;
     s_frame.framed = false;
     s_frame.copy_us = 0;
+    s_frame.cpu_bands = 0;
 #endif
     s_frame.n = 0;
     s_frame.p = 0;
@@ -870,6 +944,9 @@ static void send_bands(void *arg)
         xQueueReceive(s_bands, &b, portMAX_DELAY);
 #if CONFIG_MUSE_APPS
         tell_frame();
+        if (!b.whole) {
+            dma_end();   /* frame mode's copies are over if it is off: their driver goes */
+        }
 #endif
         if (!b.data) {
             wire_idle(0);
@@ -910,6 +987,9 @@ static void send_bands(void *arg)
                 xSemaphoreGive(s_chunk_free);
                 if (chunk_done()) {
                     lv_display_flush_ready(s_disp);
+#if CONFIG_MUSE_APPS
+                    xSemaphoreGive(s_flush_ready);
+#endif
                 }
             }
             k ^= 1;
@@ -937,6 +1017,7 @@ lv_display_t *muse_lcd_bands_register(esp_lv_adapter_display_config_t cfg, int l
 #if CONFIG_MUSE_APPS
     s_drawn_sem = xSemaphoreCreateBinary();
     s_wake = xSemaphoreCreateBinary();
+    s_flush_ready = xSemaphoreCreateBinary();
     /* The hold's timer. Without it each hold sleeps in ticks instead (sleep_until), up to 2 ms late. */
     const esp_timer_create_args_t wake = { .callback = wake_send, .name = "lcd_hold" };
     esp_err_t timer_err = esp_timer_create(&wake, &s_wake_timer);
@@ -950,7 +1031,7 @@ lv_display_t *muse_lcd_bands_register(esp_lv_adapter_display_config_t cfg, int l
     s_chunk[1] = heap_caps_aligned_alloc(16, chunk_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
 #if CONFIG_MUSE_APPS
     /* The send task's stack: 2560 B left 180 B free on the board with the bench's lines (vprintf is the deepest). */
-    if (!s_bands || !s_call_lock || !s_call_done || !s_chunk_free || !s_drawn_sem || !s_wake ||
+    if (!s_bands || !s_call_lock || !s_call_done || !s_chunk_free || !s_drawn_sem || !s_wake || !s_flush_ready ||
         !s_chunk[0] || !s_chunk[1] ||
         xTaskCreatePinnedToCore(send_bands, "lcd_send", 3072, NULL, MUSE_UI_PRIORITY + 1, NULL, MUSE_UI_CORE) != pdPASS) {
         return NULL;
@@ -976,6 +1057,7 @@ lv_display_t *muse_lcd_bands_register(esp_lv_adapter_display_config_t cfg, int l
 #if CONFIG_MUSE_APPS
     s_cols = cfg.profile.hor_res;
     s_te_whole.what = "UI frame";
+    lv_display_set_flush_wait_cb(s_disp, flush_wait);   /* LVGL blocks for a band's flush rather than spinning (TC-m5) */
 #endif
     lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
     const esp_lv_adapter_draw_bitmap_callbacks_t draw_cbs = { .custom_draw_bitmap = queue_band };
@@ -1163,27 +1245,135 @@ static void whole_write(int rows, bool hold)
 #endif
 }
 
+/* The copy's end, in the DMA's interrupt (on MUSE_UI_CORE, where the send task installed the driver): the send task waits for it. */
+static bool on_copied(async_memcpy_handle_t mcp, async_memcpy_event_t *event, void *arg)
+{
+    (void)mcp;
+    (void)event;
+    (void)arg;
+    BaseType_t woken = pdFALSE;
+    s_copied = true;
+    xSemaphoreGiveFromISR(s_wake, &woken);
+    return woken == pdTRUE;
+}
+
+/* On the send task: a band goes by CPU for `why` (err); the first such is logged once, at the send loop's top (tell_frame). */
+static void dma_fell_back(const char *why, esp_err_t err)
+{
+    if (!s_dma.why) {
+        s_dma.why = why;
+        s_dma.err = err;
+        s_dma.untold = true;
+    }
+}
+
 /*
- * On the send task, a band of a refresh in frame mode: copied into the frame and given back to LVGL at once, which draws the next
- * one into its buffer meanwhile; the refresh's last sends the frame whole. This task sends one thing at a time, so the next
- * refresh's first copy waits for that write.
+ * On the send task: n bytes of a band at src copied into the frame at dst, the bulk by DMA (the ends by CPU), the task blocked until
+ * the copy has ended: true then, false if the DMA can't take it (the caller copies it by CPU). The driver is installed here at a
+ * slide's first copy, with room for one copy at a time (LVGL flushes the next band only once this one is back). A copy refused or
+ * one that never ends gives the DMA up for the boot, as no channel does (each tried once, so the driver's own error lines come once
+ * at most); short of room, the next band tries again.
+ */
+static bool dma_copy(uint8_t *dst, const uint8_t *src, size_t n)
+{
+    size_t head = (size_t)(-(uintptr_t)dst & (DMA_BURST - 1));   /* to dst's first burst */
+    size_t bulk = n > head ? (n - head) & ~(size_t)(DMA_BURST - 1) : 0;
+    if (s_dma.off || !bulk) {
+        return false;
+    }
+    /* Room for the driver to go in, and once in (its share then taken), for the copies to go on. */
+    if (heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL) < DMA_KEEP + (s_dma.mcp ? 0 : DMA_TAKES)) {
+        dma_fell_back("room", ESP_ERR_NO_MEM);
+        return false;
+    }
+    esp_err_t err;
+    if (!s_dma.mcp) {
+        async_memcpy_config_t config = ASYNC_MEMCPY_DEFAULT_CONFIG();
+        config.backlog = 1;
+        config.dma_burst_size = DMA_BURST;
+        err = esp_async_memcpy_install(&config, &s_dma.mcp);
+        if (err != ESP_OK) {
+            s_dma.mcp = NULL;
+            s_dma.off = true;
+            dma_fell_back("install", err);
+            return false;
+        }
+    }
+    for (size_t at = 0; at < bulk; at += DMA_SYNC_BYTES) {
+        esp_cache_msync((void *)(src + head + at), bulk - at < DMA_SYNC_BYTES ? bulk - at : DMA_SYNC_BYTES,
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    }
+    s_copied = false;
+    err = esp_async_memcpy(s_dma.mcp, dst + head, (void *)(src + head), bulk, on_copied, NULL);
+    if (err != ESP_OK) {
+        s_dma.off = true;   /* its driver goes at dma_end */
+        dma_fell_back("copy", err);
+        return false;
+    }
+    memcpy(dst, src, head);   /* the ends, meanwhile: under a burst each, on cache lines the DMA's bulk doesn't touch */
+    memcpy(dst + head + bulk, src + head + bulk, n - head - bulk);
+    /* s_wake may hold a give from a hold's timer that fired as its sleep gave up (sleep_until): the flag says. */
+    for (TickType_t start = xTaskGetTickCount(); !s_copied;) {
+        TickType_t waited = xTaskGetTickCount() - start;
+        if (waited >= pdMS_TO_TICKS(DMA_WAIT_MS) || xSemaphoreTake(s_wake, pdMS_TO_TICKS(DMA_WAIT_MS) - waited) != pdTRUE) {
+            break;
+        }
+    }
+    if (!s_copied) {
+        /* The copy never ended. Its driver can't go with it under way: left as it is, never used again. */
+        s_dma.mcp = NULL;
+        s_dma.off = true;
+        dma_fell_back("end", ESP_ERR_TIMEOUT);
+        return false;
+    }
+    return true;
+}
+
+/* On the send task, between copies: the driver goes once frame mode is off (or the DMA is given up), its internal RAM back. One that
+ * won't go yet is tried again at the next item. */
+static void dma_end(void)
+{
+    if (s_dma.mcp && (!s_framing || s_dma.off) && esp_async_memcpy_uninstall(s_dma.mcp) == ESP_OK) {
+        s_dma.mcp = NULL;
+    }
+}
+
+/* On the send task: the band LVGL flushed is back with it, and LVGL's flush wait is woken (flush_wait). */
+static void band_back(void)
+{
+    lv_display_flush_ready(s_disp);
+    xSemaphoreGive(s_flush_ready);
+}
+
+/*
+ * On the send task, a band of a refresh in frame mode: copied into the frame (by DMA, the CPU LVGL's to draw the next band into its
+ * other buffer meanwhile; by CPU where the DMA can't), and given back to LVGL once the copy has ended; the refresh's last sends the
+ * frame whole. This task sends one thing at a time, so the next refresh's first copy waits for that write.
  */
 static void whole_band(const band_t *b)
 {
     size_t row = (size_t)s_cols * 2;   /* the band's: the whole width (frame_band) */
+    uint8_t *dst = s_whole.px + (size_t)b->y1 * row;
+    size_t n = (size_t)(b->y2 - b->y1) * row;
 #if CONFIG_MUSE_BENCH
     int64_t t = esp_timer_get_time();
 #endif
-    memcpy(s_whole.px + (size_t)b->y1 * row, b->data, (size_t)(b->y2 - b->y1) * row);
+    if (!dma_copy(dst, b->data, n)) {
+        memcpy(dst, b->data, n);
+#if CONFIG_MUSE_BENCH
+        s_frame.cpu_bands++;
+#endif
+    }
 #if CONFIG_MUSE_BENCH
     s_frame.copy_us += esp_timer_get_time() - t;
 #endif
     s_whole.staged = b->y2;
-    lv_display_flush_ready(s_disp);
+    band_back();
     if (b->last) {
         whole_write(s_rows, true);
         s_whole.staged = 0;
         frame_done(b);
+        dma_end();
     }
 }
 #endif
@@ -1233,25 +1423,30 @@ void muse_lcd_bands_set_pairing(bool on)
 }
 
 /*
- * On the LVGL task, from the home tileview's LV_EVENT_SCROLL_BEGIN (muse_ui.c's slide_begins), deep in LVGL's input read: nothing is
- * logged here, where vprintf's frame would sit on the LVGL task's thin stack. What became of the frame is noted, and the send task
- * logs it at its next band (tell_frame).
+ * As frame mode registers (the 1.75C's display_start, after muse_lcd_bands_register), once: the frame, from PSRAM alone, and only
+ * while it leaves the rest of the gadget its reserve; kept. Tried once: with none, frame mode stays off for the boot. Nothing is
+ * logged here: what became of the frame is noted, and the send task logs it at its next band (tell_frame), as before.
  */
-void muse_lcd_bands_set_frame_mode(bool on)
+bool muse_lcd_bands_make_frame(void)
 {
     size_t bytes = (size_t)s_cols * (size_t)s_rows * 2;
-    if (on && !s_whole.px && bytes) {
-        /* From PSRAM alone, and only while it leaves the rest of the gadget its reserve; kept once made. */
+    if (!s_whole.px && !s_whole.failed && bytes) {
         if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >= bytes + WHOLE_RESERVE) {
             s_whole.px = heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         }
-        if (s_whole.px) {
-            s_whole.made_untold = true;
-        } else if (!s_whole.failed) {
-            s_whole.failed = true;
-            s_whole.failed_untold = true;
-        }
+        s_whole.failed = !s_whole.px;
+        s_whole.made_untold = !s_whole.failed;
+        s_whole.failed_untold = s_whole.failed;
     }
+    return s_whole.px != NULL;
+}
+
+/*
+ * On the LVGL task, from the home tileview's LV_EVENT_SCROLL_BEGIN (muse_ui.c's slide_begins), deep in LVGL's input read: it never
+ * allocates or logs here, where vprintf's frame would sit on the LVGL task's thin stack. On only with the frame made at register.
+ */
+void muse_lcd_bands_set_frame_mode(bool on)
+{
     s_framing = on && s_whole.px;
 }
 
@@ -1262,8 +1457,9 @@ void muse_lcd_bands_set_frame_copy(bool on)
 }
 #endif
 
-/* On the send task, at the top of its loop (its shallowest frame): what muse_lcd_bands_set_frame_mode noted of the frame, each once.
- * Each flag is set once by the LVGL task and cleared here only after it was seen set, so neither line is lost. */
+/* On the send task, at the top of its loop (its shallowest frame): what muse_lcd_bands_make_frame noted of the frame, and the first
+ * band frame mode copied by CPU (dma_fell_back), each once. Each flag is set once and cleared here only after it was seen set, so no
+ * line is lost. */
 static void tell_frame(void)
 {
     if (s_whole.made_untold) {
@@ -1274,6 +1470,10 @@ static void tell_frame(void)
         s_whole.failed_untold = false;
         ESP_LOGW(TAG, "tearing effect: no frame for frame mode (%u B of PSRAM, %u B kept free): each band goes on its own",
                  (unsigned)((size_t)s_cols * (size_t)s_rows * 2), (unsigned)WHOLE_RESERVE);
+    }
+    if (s_dma.untold) {
+        s_dma.untold = false;
+        ESP_LOGW(TAG, "tearing effect: frame mode's copy by CPU (DMA %s: %s)", s_dma.why, esp_err_to_name(s_dma.err));
     }
 }
 #endif

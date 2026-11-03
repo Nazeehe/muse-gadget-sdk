@@ -608,6 +608,19 @@ class FrameModeTest(unittest.TestCase):
                   for late in (0, 200, JITTER) for w in range(20000, most + 1, 1000)]
         self.assertEqual(sum(WholeHarness.ask(writes)), 0)
 
+    def test_a_frame_held_after_its_last_dma_copy_is_clear_from_every_phase(self):
+        # With the copies by DMA, the last band's copy ends at any moment of the scan, and the send task wakes up to some 300 us after
+        # the DMA's interrupt: whole_write takes its hold only then (FrameDmaTest: the write comes after the last copy's end). From
+        # every phase in 100 us steps, the frame's write, learned at 26.4 ms (the board's, Task 3) and anywhere from 24 to 29 ms on
+        # the wire, starting up to TE_JITTER_US late, meets no scan.
+        est = self.west(26400)
+        nows = list(range(0, P2, 100))
+        delays = WholeHarness.ask([clear_query([(0, 466, est)], now, 0, 0, P2, SCAN2, spread=self.spread) for now in nows])
+        self.assertTrue(all(d >= 0 for d in delays))
+        writes = [frame_query([(0, 466, now + d + late, w)], 0, P2, SCAN2) for now, d in zip(nows, delays)
+                  for late in (0, 300, JITTER) for w in (24000, 26400, 29000)]
+        self.assertEqual(sum(WholeHarness.ask(writes)), 0)
+
     def test_the_slides_whole_screen_tears_as_bands_and_not_as_one_write(self):
         # A step of the slide on the board (the user's capture, 2026-11-01): LVGL's four bands of the whole screen, 8.2 ms each on
         # the band path. No moment keeps them clear sent back to back (FrameTest.test_a_refresh_that_cant_be_kept_clear), and the
@@ -639,19 +652,23 @@ class FrameModeTest(unittest.TestCase):
         self.assertRegex(queue, r"if \(s_framed\) \{\s*b\.whole = frame_band\(s_whole\.at, x1, y1, x2, y2, s_cols, s_rows, b\.last\);"
                                 r"\s*s_framed = b\.whole;\s*s_whole\.at = y2;\s*\}")
         self.assertIn("b.pair = !b.whole && band_pairs(s_pairing, flushed, s_parts, b.last);", queue)
-        # The send task copies such a band into the frame, gives it back to LVGL at once, and at the refresh's last sends the frame
-        # whole; one task sends everything, so the next refresh's first copy comes after that write. A refresh that stopped being
-        # whole has the rows copied so far written first.
+        # The send task copies such a band into the frame (by DMA, or by CPU where the DMA can't: FrameDmaTest), gives it back to
+        # LVGL once the copy has ended, and at the refresh's last sends the frame whole; one task sends everything, so the next
+        # refresh's first copy comes after that write. A refresh that stopped being whole has the rows copied so far written first.
         send = function(source, "send_bands")
         self.assertRegex(send, r"if \(b\.whole\) \{\s*whole_band\(&b\);\s*continue;\s*\}\s*if \(s_whole\.staged\) \{\s*"
                                r"whole_write\(s_whole\.staged, false\);\s*s_whole\.staged = 0;\s*\}")
         band = function(source, "whole_band")
-        copy = band.index("memcpy(s_whole.px + (size_t)b->y1 * row, b->data, (size_t)(b->y2 - b->y1) * row);")
-        ready = band.index("lv_display_flush_ready(s_disp);")
+        self.assertIn("uint8_t *dst = s_whole.px + (size_t)b->y1 * row;", band)
+        self.assertIn("size_t n = (size_t)(b->y2 - b->y1) * row;", band)
+        copy = band.index("if (!dma_copy(dst, b->data, n)) {")
+        self.assertLess(copy, band.index("memcpy(dst, b->data, n);"))
+        ready = band.index("band_back();")
         send_it = band.index("whole_write(s_rows, true);")
-        self.assertLess(copy, ready)
+        self.assertLess(band.index("memcpy(dst, b->data, n);"), ready)
         self.assertLess(ready, send_it)
         self.assertLess(send_it, band.index("frame_done(b);"))
+        self.assertLess(band.index("frame_done(b);"), band.index("dma_end();"))
 
     def test_the_frame_is_one_window_and_counted_as_one_write_of_its_refresh(self):
         # send_frame's framing: the window once (2Ah, 2Bh at the panel's gap), then 2Ch and 3Ch pieces through the two internal
@@ -676,12 +693,13 @@ class FrameModeTest(unittest.TestCase):
                                 r"2 \* w - s_whole\.us : w\)\) / 8 : w;")
 
     def test_the_frame_is_psram_made_once_and_kept(self):
-        # 466 x 466 x 2 bytes, from PSRAM only (never internal or DMA RAM), made the first time frame mode goes on and never freed;
-        # its state is in PSRAM too (only tasks touch it, with plain loads and stores).
+        # 466 x 466 x 2 bytes, from PSRAM only (never internal or DMA RAM), made as frame mode registers (TC-m6) and never freed;
+        # its state is in PSRAM too (only tasks touch it, with plain loads and stores). The switch never allocates.
         source = variant(SOURCE.read_text(), apps=True)
-        on = strip_c(function_text(source, "void muse_lcd_bands_set_frame_mode("))
-        self.assertIn("heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)", on)
-        self.assertNotRegex(on, r"MALLOC_CAP_(INTERNAL|DMA)|\bfree\(|heap_caps_free")
+        make = strip_c(function_text(source, "bool muse_lcd_bands_make_frame(void)"))
+        self.assertIn("heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)", make)
+        self.assertNotRegex(make, r"MALLOC_CAP_(INTERNAL|DMA)|\bfree\(|heap_caps_free")
+        self.assertNotRegex(strip_c(function_text(source, "void muse_lcd_bands_set_frame_mode(")), r"heap_caps|alloc\(")
         self.assertNotRegex(strip_c(source), r"\bfree\(s_whole|heap_caps_free\(s_whole")
         for line in ("static EXT_RAM_BSS_ATTR whole_t s_whole;", "static EXT_RAM_BSS_ATTR bool s_framing, s_framed;",
                      "static EXT_RAM_BSS_ATTR te_stats_t s_te_whole;", "static EXT_RAM_BSS_ATTR int s_cols;"):
@@ -689,10 +707,11 @@ class FrameModeTest(unittest.TestCase):
         self.assertEqual(466 * 466 * 2, 434312)
 
 
-class FrameModeSwitchTest(unittest.TestCase):
-    """muse_lcd_bands_set_frame_mode, compiled with a fake heap: frame mode is on only with its frame. The frame is made from PSRAM
-    the first time it goes on, if PSRAM keeps WHOLE_RESERVE free after it, and kept; with none, frame mode stays off (every
-    refresh takes the band path) and says so once, and a later turn on tries again."""
+class FrameAtRegisterTest(unittest.TestCase):
+    """muse_lcd_bands_make_frame and muse_lcd_bands_set_frame_mode, compiled with a fake heap (TC-m6): the frame is made from PSRAM
+    as frame mode registers (the 1.75C's display_start, once), if PSRAM keeps WHOLE_RESERVE free after it, and kept, so the apps'
+    PSRAM budget is the same before and after the first slide. With none, frame mode stays off for the boot (every refresh takes
+    the band path) and says so once. The switch never allocates: never at the first slide."""
 
     PROGRAM = r'''
 #include <stdbool.h>
@@ -704,9 +723,12 @@ class FrameModeSwitchTest(unittest.TestCase):
 #define EXT_RAM_BSS_ATTR
 #define MALLOC_CAP_8BIT (1u << 2)
 #define MALLOC_CAP_SPIRAM (1u << 10)
+typedef int esp_err_t;
+static const char *esp_err_to_name(esp_err_t e) { (void)e; return "ESP_FAIL"; }
 static const char *TAG = "lcd_bands";
 #define ESP_LOGI(tag, fmt, ...) printf("I %s: " fmt "\n", tag, ##__VA_ARGS__)
 #define ESP_LOGW(tag, fmt, ...) printf("W %s: " fmt "\n", tag, ##__VA_ARGS__)
+typedef struct async_memcpy_context_t *async_memcpy_handle_t;
 static size_t g_free;
 static bool g_fail;
 static int g_allocs;
@@ -734,9 +756,12 @@ int main(void)
             g_fail = v != 0;
         } else if (strcmp(cmd, "tell") == 0) {
             tell_frame();   /* the send task's loop, at its next band */
+        } else if (strcmp(cmd, "make") == 0) {
+            bool made = muse_lcd_bands_make_frame();   /* as frame mode registers */
+            printf("made %d allocs %d caps %u\n", made, g_allocs, g_caps);
         } else {
-            muse_lcd_bands_set_frame_mode(v != 0);
-            printf("framing %d allocs %d caps %u\n", s_framing, g_allocs, g_caps);
+            muse_lcd_bands_set_frame_mode(v != 0);   /* a slide begins (1) or rests (0) */
+            printf("framing %d allocs %d\n", s_framing, g_allocs);
         }
     }
     return 0;
@@ -748,9 +773,10 @@ int main(void)
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
         source = variant(SOURCE.read_text(), apps=True)
-        parts = [typedef(source, "te_stats_t"), typedef(source, "whole_t"),
+        parts = [typedef(source, "te_stats_t"), typedef(source, "whole_t"), typedef(source, "dma_t"),
                  re.search(r"^#define WHOLE_RESERVE .*$", source, re.M).group(0)]
         parts += re.findall(r"^static EXT_RAM_BSS_ATTR [^;\n]*;", source, re.M)
+        parts.append(function_text(source, "bool muse_lcd_bands_make_frame(void)"))
         parts.append(function_text(source, "void muse_lcd_bands_set_frame_mode("))
         parts.append(function(source, "tell_frame"))
         src = Path(cls.tmp.name) / "frame_mode.c"
@@ -764,49 +790,60 @@ int main(void)
         out = subprocess.run([str(self.exe)], input="\n".join(lines) + "\n", check=True, capture_output=True, text=True).stdout
         return out.splitlines()
 
-    def test_no_frame_no_frame_mode_and_it_says_so_once(self):
+    def test_the_frame_is_made_at_register_and_the_switch_never_allocates(self):
+        frame, psram = 466 * 466 * 2, (1 << 10) | (1 << 2)
+        out = self.run_script([f"free {frame + self.reserve}", "on 1", "off 0", "make 0", "tell 0", "make 0", "on 1", "off 0",
+                               "on 1", "tell 0"])
+        self.assertEqual([line for line in out if not line.startswith(("I ", "W "))],
+                         ["framing 0 allocs 0", "framing 0 allocs 0",              # before it registers: no frame, nothing taken
+                          f"made 1 allocs 1 caps {psram}", f"made 1 allocs 1 caps {psram}",   # made once, from PSRAM, and kept
+                          "framing 1 allocs 1", "framing 0 allocs 1", "framing 1 allocs 1"])
+        infos = [line for line in out if line.startswith("I ")]
+        self.assertEqual(infos, [f"I lcd_bands: tearing effect: frame mode's frame, {frame} B of PSRAM"])
+        self.assertEqual(out.index(infos[0]), 3, "told at the send task's next band after it was made")
+        self.assertFalse([line for line in out if line.startswith("W ")])
+
+    def test_without_room_at_register_frame_mode_stays_off_for_the_boot(self):
         frame = 466 * 466 * 2
-        out = self.run_script([f"free {frame + self.reserve - 1}", "on 1", "on 1", "off 0", "on 1"])
-        self.assertEqual([line for line in out if line.startswith("framing")],
-                         ["framing 0 allocs 0 caps 0"] * 4, "PSRAM short of the frame and the reserve: nothing taken, off")
-        self.assertFalse([line for line in out if line.startswith(("I ", "W "))], "the switch itself logs nothing")
-        out = self.run_script([f"free {frame + self.reserve - 1}", "on 1", "tell 0", "on 1", "tell 0", "off 0", "on 1", "tell 0"])
+        out = self.run_script([f"free {frame + self.reserve - 1}", "make 0", "on 1", f"free {10 * frame}", "on 1", "make 0", "on 1",
+                               "tell 0", "tell 0"])
+        self.assertEqual([line for line in out if not line.startswith(("I ", "W "))],
+                         ["made 0 allocs 0 caps 0", "framing 0 allocs 0", "framing 0 allocs 0", "made 0 allocs 0 caps 0",
+                          "framing 0 allocs 0"], "short of the frame and the reserve: nothing taken, then or at a slide")
         warnings = [line for line in out if line.startswith("W ")]
         self.assertEqual(len(warnings), 1, out)
         self.assertIn("lcd_bands: tearing effect: ", warnings[0])   # an allowlisted line
-        self.assertIn(f"{frame} B", warnings[0])
-        self.assertEqual(out.index(warnings[0]), 1, "told at the send task's next band after the first turn on")
-        # The allocation itself failing (no block that large) is the same.
-        out = self.run_script([f"free {10 * frame}", "fail 1", "on 1", "tell 0", "on 1", "tell 0"])
-        self.assertEqual([line for line in out if line.startswith("framing")][-1], f"framing 0 allocs 2 caps {(1 << 10) | (1 << 2)}")
+        self.assertIn(f"{frame} B of PSRAM, {self.reserve} B kept free", warnings[0])
+        self.assertFalse([line for line in out if line.startswith("I ")])
+        # The allocation itself failing (no block that large) is the same: tried once, said once.
+        out = self.run_script([f"free {10 * frame}", "fail 1", "make 0", "fail 0", "on 1", "make 0", "tell 0", "tell 0"])
+        self.assertEqual([line for line in out if line.startswith(("made", "framing"))],
+                         [f"made 0 allocs 1 caps {(1 << 10) | (1 << 2)}", "framing 0 allocs 1",
+                          f"made 0 allocs 1 caps {(1 << 10) | (1 << 2)}"])
         self.assertEqual(sum(line.startswith("W ") for line in out), 1, out)
 
-    def test_the_frame_is_made_once_from_psram_and_kept(self):
-        frame = 466 * 466 * 2
-        out = self.run_script([f"free {frame + self.reserve}", "on 1", "tell 0", "off 0", "tell 0", "on 1", "on 1", "tell 0", "off 0"])
-        states = [line for line in out if line.startswith("framing")]
-        psram = (1 << 10) | (1 << 2)
-        self.assertEqual(states, [f"framing 1 allocs 1 caps {psram}", f"framing 0 allocs 1 caps {psram}",
-                                  f"framing 1 allocs 1 caps {psram}", f"framing 1 allocs 1 caps {psram}",
-                                  f"framing 0 allocs 1 caps {psram}"])
-        infos = [line for line in out if line.startswith("I ")]
-        self.assertEqual(len(infos), 1, out)
-        self.assertIn(f"lcd_bands: tearing effect: frame mode's frame, {frame} B of PSRAM", infos[0])
-        self.assertFalse(any(line.startswith("W ") for line in out))
-        # A frame that couldn't be made the first time is tried again at the next turn on; told after it, neither line is lost.
-        out = self.run_script([f"free {frame}", "on 1", f"free {frame + self.reserve}", "on 1", "tell 0", "tell 0"])
-        self.assertEqual([line for line in out if line.startswith("framing")][-1], f"framing 1 allocs 1 caps {psram}")
-        logged = [line[:2] for line in out if line.startswith(("I ", "W "))]
-        self.assertEqual(sorted(logged), ["I ", "W "], out)
+    def test_the_board_makes_it_as_frame_mode_registers(self):
+        # The 1.75C's display_start, right after the bands register (s_cols and s_rows are set there) and before LVGL starts: an
+        # apps build's alone, as frame mode is.
+        board = BOARD_175C.read_text()
+        start = function_text(board, "static lv_display_t *display_start(lv_indev_t **touch)")
+        make = start.index("muse_lcd_bands_make_frame();")
+        self.assertLess(start.index("muse_lcd_bands_register(disp_cfg, DRAW_BUF_LINES, LCD_CHUNK_BYTES);"), make)
+        self.assertLess(make, start.index("esp_lv_adapter_start()"))
+        self.assertEqual(open_conditions(board, board.index("muse_lcd_bands_make_frame();")), ["if CONFIG_MUSE_APPS"])
+        header = HEADER.read_text()
+        self.assertEqual(open_conditions(header, header.index("bool muse_lcd_bands_make_frame(void);")), ["if CONFIG_MUSE_APPS"])
 
     def test_the_switch_logs_nothing_and_the_send_loop_tells(self):
         # W1 fix C and Review Focus 1 (Task 1 of the perf plan): the switch runs on the LVGL task inside the slide's SCROLL_BEGIN
-        # (muse_ui.c's slide_begins, deep in LVGL's input read), where vprintf's frame would sit on the thin stack, so it logs nothing
-        # and only notes what happened: the send task logs it at the top of its loop, at its next band, its shallowest frame. Nothing
-        # of the bands logs from LVGL's flush or render callbacks either: only the send task's, the registration and the TE pin's
-        # setup do.
+        # (muse_ui.c's slide_begins, deep in LVGL's input read), where vprintf's frame would sit on the thin stack, so it logs nothing;
+        # the frame's making notes what happened, and the send task logs it at the top of its loop, at its next band, its shallowest
+        # frame. Nothing of the bands logs from LVGL's flush or render callbacks either, nor the DMA's copies: only the send task's,
+        # the registration and the TE pin's setup do.
         source = variant(SOURCE.read_text(), apps=True)
-        self.assertNotRegex(strip_c(function_text(source, "void muse_lcd_bands_set_frame_mode(")), r"ESP_LOG|printf")
+        for head in ("void muse_lcd_bands_set_frame_mode(", "bool muse_lcd_bands_make_frame(void)"):
+            with self.subTest(head):
+                self.assertNotRegex(strip_c(function_text(source, head)), r"ESP_LOG|printf")
         self.assertRegex(function(SOURCE.read_text(), "send_bands"),
                          r"xQueueReceive\(s_bands, &b, portMAX_DELAY\);\n#if CONFIG_MUSE_APPS\n\s*tell_frame\(\);")
         self.assertEqual(len(re.findall(r"\btell_frame\(\);", strip_c(source))), 1, "told from the send loop alone")
@@ -863,6 +900,7 @@ typedef void *esp_lcd_panel_handle_t;
 typedef void *SemaphoreHandle_t;
 typedef void *QueueHandle_t;
 typedef int portMUX_TYPE;
+typedef struct async_memcpy_context_t *async_memcpy_handle_t;
 #define portENTER_CRITICAL(lock) (void)(lock)
 #define portEXIT_CRITICAL(lock) (void)(lock)
 #define pdTRUE 1
@@ -924,7 +962,7 @@ int main(void)
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
         source = variant(SOURCE.read_text(), apps=True)
-        types = [typedef(source, "te_stats_t"), typedef(source, "whole_t"), typedef(source, "band_t")]
+        types = [typedef(source, "te_stats_t"), typedef(source, "whole_t"), typedef(source, "dma_t"), typedef(source, "band_t")]
         parts = re.findall(r"^static EXT_RAM_BSS_ATTR [^;\n]*;", source, re.M)
         parts += [function(source, name) for name in ("refresh_parts", "band_pairs", "refresh_whole", "frame_band", "queue_band",
                                                       "on_render_event")]
@@ -965,6 +1003,494 @@ int main(void)
         self.assertNotRegex(strip_c(function_text(variant(text, True), "void muse_lcd_bands_set_frame_copy(")), r"ESP_LOG|printf")
 
 
+class FlushWaitTest(unittest.TestCase):
+    """TC-m5: LVGL's wait for the band before to be flushed (lv_display_set_flush_wait_cb) blocks on a semaphore that every
+    lv_display_flush_ready gives (the band path's last piece, in the SPI interrupt; frame mode's copies, on the send task),
+    instead of LVGL's busy loop on disp->flushing, which held the UI core through each frame's hold and write. flush_wait is
+    compiled with the semaphore faked."""
+
+    PROGRAM = r'''
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+typedef int BaseType_t;
+typedef uint32_t TickType_t;
+#define pdTRUE 1
+#define pdFALSE 0
+#define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+typedef void *SemaphoreHandle_t;
+typedef struct { volatile int flushing; } lv_display_t;
+static lv_display_t g_disp;
+static SemaphoreHandle_t s_flush_ready = (SemaphoreHandle_t)2;
+static int g_takes, g_ready_at, g_stale;
+/* The LVGL task blocks: a give left from a flush LVGL didn't wait for returns at once; the take numbered g_ready_at is woken by
+ * the give that came with the flush's end; any other waits its ticks out with no give. */
+static BaseType_t xSemaphoreTake(SemaphoreHandle_t s, TickType_t ticks)
+{
+    if (s != s_flush_ready || ++g_takes > 50) abort();
+    printf("take %u\n", (unsigned)ticks);
+    if (g_stale) {
+        g_stale = 0;
+        return pdTRUE;
+    }
+    if (g_takes == g_ready_at) {
+        g_disp.flushing = 0;
+        return pdTRUE;
+    }
+    return pdFALSE;
+}
+PARTS
+/* One wait a line: flushing ready_at stale. */
+int main(void)
+{
+    int flushing;
+    while (scanf("%d %d %d", &flushing, &g_ready_at, &g_stale) == 3) {
+        g_disp.flushing = flushing;
+        g_takes = 0;
+        flush_wait(&g_disp);
+        printf("back with flushing %d after %d takes\n", g_disp.flushing, g_takes);
+    }
+    return 0;
+}
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        source = variant(SOURCE.read_text(), apps=True)
+        parts = [re.search(r"^#define FLUSH_WAIT_MS .*$", source, re.M).group(0), function(source, "flush_wait")]
+        src = Path(cls.tmp.name) / "flush_wait.c"
+        src.write_text(cls.PROGRAM.replace("PARTS", "\n".join(parts)))
+        cls.exe = Path(cls.tmp.name) / "flush_wait"
+        subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", "-o", str(cls.exe), str(src)], check=True)
+        cls.ms = source_number("FLUSH_WAIT_MS")
+
+    def wait(self, flushing, ready_at, stale=0):
+        out = subprocess.run([str(self.exe)], input=f"{flushing} {ready_at} {stale}\n", check=True, capture_output=True,
+                             text=True).stdout.splitlines()
+        return out
+
+    def test_the_wait_blocks_until_the_flush_is_ready(self):
+        self.assertGreater(self.ms, 0)
+        take = f"take {self.ms}"
+        self.assertEqual(self.wait(0, 0), ["back with flushing 0 after 0 takes"], "a flush already ready: no wait")
+        self.assertEqual(self.wait(1, 1), [take, "back with flushing 0 after 1 takes"], "woken by the give at the flush's end")
+        self.assertEqual(self.wait(1, 2, stale=1), [take, take, "back with flushing 0 after 2 takes"],
+                         "a give from a flush LVGL didn't wait for returns at once: the flag is checked again, and it blocks again")
+        self.assertEqual(self.wait(1, 4), [take] * 4 + ["back with flushing 0 after 4 takes"],
+                         "each wake without the flush ready blocks again (FLUSH_WAIT_MS each), never a busy loop")
+
+    def test_every_flush_ready_wakes_the_wait(self):
+        source = variant(SOURCE.read_text(), apps=True)
+        code = strip_c(source)
+        register = strip_c(function_text(source, "lv_display_t *muse_lcd_bands_register("))
+        self.assertIn("s_flush_ready = xSemaphoreCreateBinary();", register)
+        self.assertRegex(register, r"if \(([^{]*?)!s_flush_ready[^{]*?xTaskCreatePinnedToCore\(send_bands", "made before the send task, "
+                                   "or registering fails")
+        self.assertLess(register.index("s_disp = esp_lv_adapter_register_display(&cfg);"),
+                        register.index("lv_display_set_flush_wait_cb(s_disp, flush_wait);"))
+        # Every flush_ready in the code gives the semaphore right after it: the send task's (band_back, a failed piece) and the SPI
+        # interrupt's (the adapter's notify, at a band's last piece).
+        readies = len(re.findall(r"lv_display_flush_ready\(s_disp\);", code))
+        self.assertGreaterEqual(readies, 2)
+        self.assertEqual(len(re.findall(r"lv_display_flush_ready\(s_disp\);\s*xSemaphoreGive\(s_flush_ready\);", code)), readies)
+        sent = function(code, "on_chunk_sent")
+        notify = sent.index("esp_lv_adapter_display_notify_color_trans_done_from_isr(s_disp);")
+        self.assertRegex(sent[notify:], r"^[^}]*?if \(last\) \{\s*xSemaphoreGiveFromISR\(s_flush_ready, &woken\);\s*\}")
+        self.assertRegex(sent[notify:], r"if \(yield \|\| woken == pdTRUE\) \{\s*portYIELD_FROM_ISR\(\);")
+        # The adapter's own flush_ready calls come from inside LVGL's flush callback, before LVGL waits: flush_wait isn't called
+        # then (LVGL 9.5.0's wait_for_flushing calls it only while disp->flushing).
+        self.assertIn("lv_display_set_flush_wait_cb", strip_c(variant(SOURCE.read_text(), apps=True)))
+        self.assertNotIn("s_flush_ready", variant(SOURCE.read_text(), apps=False))
+
+
+class FrameDmaTest(unittest.TestCase):
+    """Frame mode's copies by DMA (PF4, ruling P10): whole_band and the DMA's helpers, compiled with esp_async_memcpy, the
+    semaphores and LVGL faked. Each band is copied into the frame by the GDMA while the send task waits, blocked, so the CPU is
+    LVGL's to draw the next band; the band goes back to LVGL only once its copy has ended, and the frame is written only once its
+    last band's copy has. A band the DMA can't take is copied by CPU as before, and the first such is said once. The driver is
+    installed at a slide's first copy and uninstalled once frame mode is off, so its internal RAM is back between slides."""
+
+    PROGRAM = r'''
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define CONFIG_MUSE_BENCH 1
+#define EXT_RAM_BSS_ATTR
+#define MALLOC_CAP_DMA (1u << 3)
+#define MALLOC_CAP_INTERNAL (1u << 11)
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_ERR_NO_MEM 0x101
+#define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_INVALID_STATE 0x103
+#define ESP_ERR_NOT_FOUND 0x105
+#define ESP_ERR_TIMEOUT 0x107
+static const char *esp_err_to_name(esp_err_t e)
+{
+    return e == ESP_ERR_NO_MEM ? "ESP_ERR_NO_MEM" : e == ESP_ERR_INVALID_ARG ? "ESP_ERR_INVALID_ARG"
+         : e == ESP_ERR_NOT_FOUND ? "ESP_ERR_NOT_FOUND" : e == ESP_ERR_TIMEOUT ? "ESP_ERR_TIMEOUT" : "ESP_FAIL";
+}
+static const char *TAG = "lcd_bands";
+#define ESP_LOGI(tag, fmt, ...) printf("I %s: " fmt "\n", tag, ##__VA_ARGS__)
+#define ESP_LOGW(tag, fmt, ...) printf("W %s: " fmt "\n", tag, ##__VA_ARGS__)
+typedef int BaseType_t;
+typedef uint32_t TickType_t;
+#define pdTRUE 1
+#define pdFALSE 0
+#define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+typedef void *SemaphoreHandle_t;
+typedef struct { volatile int flushing; } lv_display_t;
+static lv_display_t g_disp;
+static lv_display_t *s_disp = &g_disp;
+static int64_t esp_timer_get_time(void) { return 0; }
+static size_t g_dma_free = 64 * 1024;
+static size_t heap_caps_get_free_size(unsigned caps) { return caps == (MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL) ? g_dma_free : 0; }
+
+/* esp_async_memcpy, as ESP-IDF v6.0.1's esp_async_memcpy.h has it, faked: a copy lands, and its callback runs as its interrupt
+ * would, once the send task blocks waiting for it (unless copies never end). One copy at a time, on the driver installed. */
+typedef struct async_memcpy_context_t *async_memcpy_handle_t;
+typedef struct { void *data; } async_memcpy_event_t;
+typedef bool (*async_memcpy_isr_cb_t)(async_memcpy_handle_t mcp_hdl, async_memcpy_event_t *event, void *cb_args);
+typedef struct { uint32_t backlog; uint32_t weight; size_t dma_burst_size; uint32_t flags; } async_memcpy_config_t;
+#define ASYNC_MEMCPY_DEFAULT_CONFIG() { .backlog = 8, .weight = 0, .dma_burst_size = 16, .flags = 0 }
+static int g_ctx;
+static bool g_installed;
+static esp_err_t g_install_err, g_copy_err;
+static int g_ends = 1;
+static uint8_t *g_frame, *g_px;   /* the block, and the frame in it */
+static size_t g_burst;
+/* esp_cache_msync's write-back (C2M), recorded: from where, how far, in how many pieces and the largest. */
+#define ESP_CACHE_MSYNC_FLAG_UNALIGNED (1 << 1)
+#define ESP_CACHE_MSYNC_FLAG_DIR_C2M (1 << 2)
+static struct { const uint8_t *from, *to; int pieces; size_t most; bool bad; } g_sync;
+static esp_err_t esp_cache_msync(void *addr, size_t size, int flags)
+{
+    const uint8_t *at = addr;
+    g_sync.bad |= flags != (ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED) || (g_sync.to && at != g_sync.to);
+    g_sync.from = g_sync.from ? g_sync.from : at;
+    g_sync.to = at + size;
+    g_sync.pieces++;
+    g_sync.most = size > g_sync.most ? size : g_sync.most;
+    return ESP_OK;
+}
+static struct { uint8_t *dst; const uint8_t *src; size_t n; async_memcpy_isr_cb_t cb; void *arg; bool on; } g_copy;
+static esp_err_t esp_async_memcpy_install(const async_memcpy_config_t *config, async_memcpy_handle_t *mcp)
+{
+    printf("install backlog %u burst %u%s\n", (unsigned)config->backlog, (unsigned)config->dma_burst_size,
+           g_install_err ? ": refused" : "");
+    if (g_install_err) return g_install_err;
+    if (g_installed) abort();
+    g_installed = true;
+    g_burst = config->dma_burst_size;
+    *mcp = (async_memcpy_handle_t)&g_ctx;
+    return ESP_OK;
+}
+static esp_err_t esp_async_memcpy_uninstall(async_memcpy_handle_t mcp)
+{
+    if (mcp != (async_memcpy_handle_t)&g_ctx || !g_installed) abort();
+    if (g_copy.on) {
+        printf("uninstall: refused, a copy is under way\n");
+        return ESP_ERR_INVALID_STATE;
+    }
+    g_installed = false;
+    printf("uninstall\n");
+    return ESP_OK;
+}
+/* As ESP-IDF v6.0.1 checks on the S3 (check_buffer_alignment): the GDMA writes PSRAM in whole bursts (GDMA_LL_AHB_RX_BURST_NEEDS_ALIGNMENT),
+ * so the destination and the length must be whole bursts; it reads at any alignment (AHB GDMA version 1). */
+static esp_err_t esp_async_memcpy(async_memcpy_handle_t mcp, void *dst, void *src, size_t n, async_memcpy_isr_cb_t cb, void *arg)
+{
+    if (mcp != (async_memcpy_handle_t)&g_ctx || !g_installed || g_copy.on || !cb) abort();
+    if (((uintptr_t)dst & (g_burst - 1)) || (n & (g_burst - 1))) {
+        printf("dma: address|size not aligned\n");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (g_copy_err) {
+        printf("dma: refused\n");
+        return g_copy_err;
+    }
+    g_copy.dst = dst;
+    g_copy.src = src;
+    g_copy.n = n;
+    g_copy.cb = cb;
+    g_copy.arg = arg;
+    g_copy.on = true;
+    bool whole = !g_sync.bad && g_sync.from == src && g_sync.to == (uint8_t *)src + n;
+    printf("dma %ld+%zu, written back first%s in %d pieces of at most %zu\n", (long)((uint8_t *)dst - g_px), n,
+           whole ? "" : " NOT WHOLE", g_sync.pieces, g_sync.most);
+    memset(&g_sync, 0, sizeof g_sync);
+    return ESP_OK;
+}
+static SemaphoreHandle_t s_wake = (SemaphoreHandle_t)1;
+static SemaphoreHandle_t s_flush_ready = (SemaphoreHandle_t)2;
+static int g_wake;
+static TickType_t g_ticks;
+static TickType_t xTaskGetTickCount(void) { return g_ticks; }
+static BaseType_t xSemaphoreGiveFromISR(SemaphoreHandle_t s, BaseType_t *woken)
+{
+    if (s != s_wake) abort();
+    g_wake = 1;
+    *woken = pdTRUE;
+    return pdTRUE;
+}
+static BaseType_t xSemaphoreGive(SemaphoreHandle_t s)
+{
+    if (s != s_flush_ready) abort();
+    printf("flush wait woken\n");
+    return pdTRUE;
+}
+static BaseType_t xSemaphoreTake(SemaphoreHandle_t s, TickType_t ticks)
+{
+    if (s != s_wake) abort();
+    if (g_copy.on && g_ends) {
+        memcpy(g_copy.dst, g_copy.src, g_copy.n);
+        g_copy.on = false;
+        printf("dma end\n");
+        async_memcpy_event_t e = { 0 };
+        g_copy.cb((async_memcpy_handle_t)&g_ctx, &e, g_copy.arg);
+    }
+    if (g_wake) {
+        g_wake = 0;
+        return pdTRUE;
+    }
+    g_ticks += ticks;
+    return pdFALSE;
+}
+
+/* LVGL's two draw buffers, the bands of the screen drawn into them by turns, each a pattern of its own. */
+static uint8_t g_buf[2][466 * 118 * 2];
+static int g_band;
+static bool band_in_frame(int k);
+static void lv_display_flush_ready(lv_display_t *disp)
+{
+    disp->flushing = 0;
+    printf("flush ready: band %s\n", band_in_frame(g_band) ? "in the frame" : "NOT in the frame");
+}
+TYPES
+static void whole_write(int rows, bool hold);
+static void frame_done(const band_t *b);
+PARTS
+static const int g_rows_of[4][2] = { { 0, 118 }, { 118, 236 }, { 236, 354 }, { 354, 466 } };
+static uint8_t pattern(int k, size_t i) { return (uint8_t)(k * 61 + i * 7 + (i >> 9)); }
+static bool band_in_frame(int k)
+{
+    size_t row = 466 * 2, n = (size_t)(g_rows_of[k][1] - g_rows_of[k][0]) * row;
+    const uint8_t *at = g_px + (size_t)g_rows_of[k][0] * row;
+    for (size_t i = 0; i < n; i++) {
+        if (at[i] != pattern(k, i)) return false;
+    }
+    return true;
+}
+static void whole_write(int rows, bool hold)
+{
+    bool all = true;
+    for (int k = 0; k < 4; k++) all = all && band_in_frame(k);
+    printf("write %d%s: %s\n", rows, hold ? " held" : "", all ? "every band in the frame" : "A BAND MISSING");
+}
+static void frame_done(const band_t *b) { printf("frame done%s\n", b->last ? "" : " (not last?)"); }
+/* One step a line: "band K" (LVGL flushes band K of a whole screen, 0 to 3, 3 the last, drawn into buffer K % 2), "frame" (all
+ * four), "item" (the send loop's next item, not a whole band), "tell", "framing 0|1", "free N" (internal DMA RAM), "install E",
+ * "copy E" (the driver's next answers: 0 or an error), "ends 0|1", "cpu" (the bench's count of bands copied by CPU). */
+int main(void)
+{
+    char cmd[16];
+    long long v = 0;
+    s_cols = 466;
+    g_frame = aligned_alloc(64, (466 * 466 * 2 + 64 + 63) & ~63);
+    s_whole.px = g_px = g_frame + 16;   /* as heap_caps_aligned_alloc(16, ...) may give it: 16-aligned, not 64 */
+    while (scanf("%15s", cmd) == 1) {
+        if (!strcmp(cmd, "band") || !strcmp(cmd, "frame")) {
+            int from = 0, to = 3;
+            if (!strcmp(cmd, "band")) {
+                if (scanf("%lld", &v) != 1) return 1;
+                from = to = (int)v;
+            }
+            for (int k = from; k <= to; k++) {
+                uint8_t *buf = g_buf[k % 2];
+                size_t n = (size_t)(g_rows_of[k][1] - g_rows_of[k][0]) * 466 * 2;
+                for (size_t i = 0; i < n; i++) buf[i] = pattern(k, i);   /* LVGL draws it */
+                band_t b = { buf, 0, g_rows_of[k][0], 466, g_rows_of[k][1], k == 3, false, true, 0, 0 };
+                g_band = k;
+                g_disp.flushing = 1;
+                whole_band(&b);
+                if (g_disp.flushing) printf("band %d never went back to LVGL\n", k);
+                memset(buf, 0xEE, n);   /* back with LVGL, which draws the band after next into it */
+            }
+        } else if (!strcmp(cmd, "item")) {
+            tell_frame();
+            dma_end();
+        } else if (!strcmp(cmd, "tell")) {
+            tell_frame();
+        } else if (!strcmp(cmd, "cpu")) {
+            printf("cpu bands %u\n", (unsigned)s_frame.cpu_bands);
+        } else if (scanf("%lld", &v) == 1) {
+            if (!strcmp(cmd, "framing")) s_framing = v != 0;
+            else if (!strcmp(cmd, "free")) g_dma_free = (size_t)v;
+            else if (!strcmp(cmd, "install")) g_install_err = (esp_err_t)v;
+            else if (!strcmp(cmd, "copy")) g_copy_err = (esp_err_t)v;
+            else if (!strcmp(cmd, "ends")) g_ends = (int)v;
+        }
+    }
+    return 0;
+}
+'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        source = variant(SOURCE.read_text(), apps=True)
+        types = [typedef(source, "te_stats_t"), typedef(source, "write_t"), typedef(source, "hold_t"), typedef(source, "whole_t"),
+                 typedef(source, "dma_t"), typedef(source, "band_t")]
+        parts = [re.search(rf"^#define {name} .*$", source, re.M).group(0)
+                 for name in ("FRAME_WRITES_MAX", "WHOLE_RESERVE", "DMA_BURST", "DMA_WAIT_MS", "DMA_KEEP", "DMA_TAKES",
+                              "DMA_SYNC_BYTES")]
+        parts.append(re.search(r"^static EXT_RAM_BSS_ATTR struct \{\n    write_t w\[FRAME_WRITES_MAX\];.*?^\} s_frame;", source, re.M | re.S).group(0))
+        parts += re.findall(r"^static EXT_RAM_BSS_ATTR [^;\n]*;", source, re.M)
+        parts.append(re.search(r"^static volatile bool s_copied;", source, re.M).group(0))
+        parts.append("static int s_rows = 466;")
+        parts += [function(source, name) for name in ("on_copied", "dma_fell_back", "dma_copy", "dma_end", "band_back", "whole_band",
+                                                      "tell_frame")]
+        src = Path(cls.tmp.name) / "frame_dma.c"
+        src.write_text(cls.PROGRAM.replace("TYPES", "\n".join(types)).replace("PARTS", "\n".join(parts)))
+        cls.exe = Path(cls.tmp.name) / "frame_dma"
+        subprocess.run(["cc", "-std=gnu11", "-Wall", "-Werror", "-Wno-unused-variable", "-Wno-unused-function", "-o", str(cls.exe),
+                        str(src)], check=True)
+        cls.keep, cls.takes = source_number("DMA_KEEP"), source_number("DMA_TAKES")
+        cls.wait_ms = source_number("DMA_WAIT_MS")
+
+    def run_script(self, lines):
+        return subprocess.run([str(self.exe)], input="\n".join(lines) + "\n", check=True, capture_output=True,
+                              text=True).stdout.splitlines()
+
+    @classmethod
+    def dma_band(cls, k):
+        """A band's events copied by DMA: the bulk from its first byte on a 64-byte burst of the frame (which is 16 bytes past one
+        here) to its last whole burst, written back from the cache a piece at a time, its copy, its end, then (only then) back to
+        LVGL and its flush wait woken. The ends, under a burst each, by CPU."""
+        rows = [(0, 118), (118, 236), (236, 354), (354, 466)][k]
+        start, end = rows[0] * 932, rows[1] * 932
+        first = start + (-(16 + start)) % 64
+        n = (end - first) - (end - first) % 64
+        sync = source_number("DMA_SYNC_BYTES")
+        return [f"dma {first}+{n}, written back first in {math.ceil(n / sync)} pieces of at most {sync}", "dma end",
+                "flush ready: band in the frame", "flush wait woken"]
+
+    @staticmethod
+    def cpu_band():
+        return ["flush ready: band in the frame", "flush wait woken"]
+
+    WRITE = ["write 466 held: every band in the frame", "frame done"]
+
+    def test_each_band_goes_back_to_lvgl_only_once_its_dma_copy_has_ended(self):
+        out = self.run_script(["framing 1", "frame", "cpu", "frame", "cpu", "item"])
+        slide = self.dma_band(0) + self.dma_band(1) + self.dma_band(2) + self.dma_band(3) + self.WRITE
+        self.assertEqual(out, ["install backlog 1 burst 64"] + slide + ["cpu bands 0"] + slide + ["cpu bands 0"],
+                         "installed at the slide's first copy, one copy at a time; kept while frame mode is on")
+
+    def test_the_driver_goes_once_frame_mode_is_off(self):
+        # A slide's last refresh: frame mode goes off at its LV_EVENT_REFR_READY, as LVGL flushes its last band, so the driver goes
+        # after the frame's write; the next slide installs it again. Frame mode off mid-refresh leaves the refresh's copies as they
+        # are (the driver goes at its end), and an item between slides takes it too.
+        slide = self.dma_band(0) + self.dma_band(1) + self.dma_band(2) + self.dma_band(3) + self.WRITE
+        out = self.run_script(["framing 1", "band 0", "band 1", "band 2", "framing 0", "band 3", "item",
+                               "framing 1", "frame", "framing 0", "item", "item"])
+        self.assertEqual(out, ["install backlog 1 burst 64"] + slide + ["uninstall"] +
+                         ["install backlog 1 burst 64"] + slide + ["uninstall"])
+
+    def test_no_channel_copies_by_cpu_and_says_so_once(self):
+        # No GDMA channel (or no memory for the driver): every band by CPU, back to LVGL after its copy, the frame whole; the DMA is
+        # given up for the boot (one try, so the driver's own error is logged once at most), and the first reason said once.
+        out = self.run_script(["install 261", "framing 1", "frame", "cpu", "tell", "item", "framing 0", "item", "framing 1", "frame",
+                               "tell", "item", "cpu"])
+        cpu = self.cpu_band() * 4 + self.WRITE
+        warning = "W lcd_bands: tearing effect: frame mode's copy by CPU (DMA install: ESP_ERR_NOT_FOUND)"
+        self.assertEqual(out, ["install backlog 1 burst 64: refused"] + cpu + ["cpu bands 4", warning] + cpu + ["cpu bands 8"])
+
+    def test_a_copy_the_dma_refuses_is_copied_by_cpu(self):
+        # An alignment or argument the driver refuses: that band by CPU, the DMA given up for the boot and its driver gone after the
+        # frame's write, every band in the frame.
+        out = self.run_script(["copy 258", "framing 1", "band 0", "copy 0", "band 1", "band 2", "band 3", "cpu", "item", "item"])
+        warning = "W lcd_bands: tearing effect: frame mode's copy by CPU (DMA copy: ESP_ERR_INVALID_ARG)"
+        self.assertEqual(out, ["install backlog 1 burst 64", "dma: refused"] + self.cpu_band() * 4 + self.WRITE +
+                         ["uninstall", "cpu bands 4", warning])
+
+    def test_a_copy_that_never_ends_is_copied_by_cpu_and_the_dma_left_alone(self):
+        # A copy whose end never comes (DMA_WAIT_MS): that band by CPU and back to LVGL, the DMA given up for the boot and its driver
+        # left as it is (it can't be uninstalled with a copy under way), every band in the frame.
+        out = self.run_script(["ends 0", "framing 1", "band 0", "ends 1", "band 1", "band 2", "band 3", "cpu", "item", "framing 0",
+                               "item"])
+        warning = "W lcd_bands: tearing effect: frame mode's copy by CPU (DMA end: ESP_ERR_TIMEOUT)"
+        self.assertEqual(out, ["install backlog 1 burst 64", self.dma_band(0)[0]] + self.cpu_band() * 4 + self.WRITE +
+                         ["cpu bands 4", warning])
+
+    def test_short_of_internal_ram_the_copies_wait_for_room(self):
+        # Installed only while internal DMA RAM keeps DMA_KEEP (the Link's TX margin and a VM read's) and DMA_TAKES (what the driver
+        # and a copy take) free, and run while it keeps DMA_KEEP, the driver's own share then taken (the board's first run counted
+        # it twice, and all but each slide's first band went by CPU): short of that, by CPU, and the DMA is tried again at the next
+        # band.
+        installs, runs, short = self.keep + self.takes, self.keep, self.keep - 1
+        out = self.run_script([f"free {installs - 1}", "framing 1", "band 0", "band 1", f"free {installs}", "band 2", f"free {runs}",
+                               "band 3", "cpu", "tell", f"free {short}", "frame", "cpu", "tell", f"free {runs}", "frame", "cpu"])
+        warning = "W lcd_bands: tearing effect: frame mode's copy by CPU (DMA room: ESP_ERR_NO_MEM)"
+        self.assertEqual(out, self.cpu_band() * 2 + ["install backlog 1 burst 64"] + self.dma_band(2) + self.dma_band(3) +
+                         self.WRITE + ["cpu bands 2", warning] + self.cpu_band() * 4 + self.WRITE + ["cpu bands 6"] +
+                         self.dma_band(0) + self.dma_band(1) + self.dma_band(2) + self.dma_band(3) + self.WRITE + ["cpu bands 6"])
+
+    def test_the_band_is_written_back_a_piece_at_a_time(self):
+        # The driver writes the band back from the cache itself in one critical section (ESP-IDF v6.0.1's esp_cache_msync, with
+        # CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS off as in the 1.75C's builds): up to the cache's 64 KB of dirty lines with the
+        # UI core's interrupts held, the TE pin's among them. Written back first a piece of at most DMA_SYNC_BYTES at a time,
+        # the whole band from its first byte (dma_band's line says so), its own finds nothing to write.
+        sync = source_number("DMA_SYNC_BYTES")
+        self.assertLessEqual(sync, 4096)
+        out = self.run_script(["framing 1", "band 0", "band 3"])
+        self.assertEqual([line for line in out if line.startswith("dma ") and "end" not in line],
+                         [self.dma_band(0)[0], self.dma_band(3)[0]])
+        config = (ROOT / "devices/sdkconfig.muse-waveshare-s3-175c").read_text() + (ROOT / "devices/sdkconfig.muse-apps").read_text()
+        self.assertNotIn("CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS=y", config)
+
+    def test_the_copies_leave_the_links_margin_and_burst_as_memtest_timed(self):
+        noise = re.search(r"^#define NOISE_TX_DMA_RESERVE_BYTES \((\d+) \* (\d+)\)", (ROOT / "main/noise_tunnel_internal.h").read_text(),
+                          re.M)
+        vm = re.search(r"^#define VM_RESERVE_BYTES\s+\((\d+) \* (\d+)\)", (ROOT / "main/vm_file.c").read_text(), re.M)
+        self.assertEqual(self.keep, int(noise.group(1)) * int(noise.group(2)) + int(vm.group(1)) * int(vm.group(2)))
+        bench = (ROOT / "components/muse/muse_bench_mem.h").read_text()
+        self.assertEqual(source_number("DMA_BURST"), int(re.search(r"^#define MUSE_MEMTEST_ALIGN (\d+)", bench, re.M).group(1)))
+        self.assertEqual(source_number("DMA_BURST"), 64)   # ESP-IDF v6.0.1's GDMA_LL_MAX_BURST_SIZE_PSRAM on the S3
+
+    def test_the_refresh_record_is_in_psram_so_internal_ram_is_not_reduced(self):
+        # The flush wait's semaphore and the copies' flag take internal RAM (about 100 B; the board's boot line "UI built: free
+        # internal" fell by 116 B): the refresh's record (s_frame), the send task's alone (its interrupts never touch it), goes to
+        # PSRAM for it, and internal RAM is no less than before.
+        source = variant(SOURCE.read_text(), apps=True)
+        self.assertRegex(source, r"(?m)^static EXT_RAM_BSS_ATTR struct \{\n    write_t w\[FRAME_WRITES_MAX\];")
+        for isr in ("chunk_done", "on_chunk_sent", "on_te", "on_copied"):
+            with self.subTest(isr):
+                self.assertNotIn("s_frame", function(source, isr))
+
+    def test_the_send_loop_gives_the_driver_back_between_slides(self):
+        # Any item that isn't a band of a whole screen (a band, a call, video's frame) lets the driver go once frame mode is off;
+        # the copies' state is the send task's alone, in PSRAM, but for the flag the DMA's interrupt sets (internal RAM).
+        source = variant(SOURCE.read_text(), apps=True)
+        send = function(source, "send_bands")
+        self.assertRegex(send, r"tell_frame\(\);\n\s*if \(!b\.whole\) \{\n\s*dma_end\(\);")
+        self.assertIn("static EXT_RAM_BSS_ATTR dma_t s_dma;", source)
+        self.assertRegex(source, r"(?m)^static volatile bool s_copied;")
+        # The bench's batch line counts the bands copied by CPU.
+        done = strip_c(function(source, "frame_done"))
+        self.assertIn("s_batch.cpu += s_frame.cpu_bands;", done)
+        self.assertIn("s_frame.cpu_bands = 0;", done)
+        self.assertIn("s_batch.framed_torn += torn && s_frame.framed;", done)
+        self.assertIn('%u framed (%u torn, %u bands by CPU); "', source)
+
+
 def logging_functions(source):
     """The names of source's functions (each opening brace on the line after its head, this file's style) that log."""
     names = set()
@@ -991,6 +1517,7 @@ class TornLineTest(unittest.TestCase):
 #include <stdio.h>
 #include <string.h>
 #define CONFIG_MUSE_BENCH 1
+#define EXT_RAM_BSS_ATTR
 static const char *TAG = "lcd_bands";
 #define ESP_LOGI(tag, fmt, ...) printf("I %s: " fmt "\n", tag, ##__VA_ARGS__)
 static unsigned uxTaskGetStackHighWaterMark(void *task) { (void)task; return 596; }
@@ -1034,7 +1561,7 @@ int main(void)
         source = variant(SOURCE.read_text(), apps=True)
         parts = [typedef(source, "band_t"), typedef(source, "write_t"), typedef(source, "hold_t"),
                  re.search(r"^#define FRAME_WRITES_MAX .*$", source, re.M).group(0),
-                 re.search(r"^static struct \{\n    write_t w\[FRAME_WRITES_MAX\];.*?^\} s_frame;", source, re.M | re.S).group(0),
+                 re.search(r"^static EXT_RAM_BSS_ATTR struct \{\n    write_t w\[FRAME_WRITES_MAX\];.*?^\} s_frame;", source, re.M | re.S).group(0),
                  re.search(r"^#define FRAME_BATCH .*$", source, re.M).group(0),
                  re.search(r"^static struct \{\n    uint32_t n, torn, bands, paired, framed;.*?^\} s_batch;", source,
                            re.M | re.S).group(0),
@@ -1076,10 +1603,16 @@ class FrameModeDocTest(unittest.TestCase):
         self.assertIn("round 466 px CO5300", board)
         bands = math.ceil(466 / rows)
         spread, reserve = source_number("WHOLE_SPREAD"), source_number("WHOLE_RESERVE")
+        keep, takes, burst, sync = (source_number(name) for name in ("DMA_KEEP", "DMA_TAKES", "DMA_BURST", "DMA_SYNC_BYTES"))
         frame = 466 * 466 * 2
+        self.assertIn('ESP_LOGW(TAG, "tearing effect: frame mode\'s copy by CPU (DMA %s: %s)", s_dma.why, esp_err_to_name(s_dma.err));',
+                      source)
+        self.assertIn("lv_display_set_flush_wait_cb(s_disp, flush_wait);", source)
+        self.assertIn("muse_lcd_bands_make_frame();", function(BOARD_175C.read_text(), "display_start"))
         self.assertIn('ESP_LOGW(TAG, "tearing effect: no frame for frame mode (%u B of PSRAM, %u B kept free): each band goes on '
                       'its own",', source)
-        self.assertIn("%u paired, %u framed; us avg/max: render %d/%d, \"\n                     \"copy %d/%d,", source)
+        self.assertIn("%u paired, %u framed (%u torn, %u bands by CPU); \"\n                     \"us avg/max: render %d/%d, copy %d/%d,",
+                      source)
         ui = (ROOT / "components/muse/muse_ui.c").read_text()
         self.assertIn('s_page_frames.name = "page";', ui)
         self.assertIn("lv_obj_add_event_cb(s_tv, slide_begins, LV_EVENT_SCROLL_BEGIN, NULL);", ui)
@@ -1091,17 +1624,31 @@ class FrameModeDocTest(unittest.TestCase):
                 "1.75C sets.",
                 f"redraws the whole screen, LVGL's {bands} bands of {rows} rows,",
                 "From the tileview's `LV_EVENT_SCROLL_BEGIN` to the end of the first refresh that finds it at rest (`muse_ui.c`), the "
-                "1.75C's `.frame_mode` (`muse_lcd_bands_set_frame_mode`) sends such a refresh whole:",
+                "1.75C's `.frame_mode` (`muse_lcd_bands_set_frame_mode`) sends such a refresh whole: each band is copied into one "
+                "frame of the screen, by DMA while LVGL draws the next band, and given back to LVGL once its copy has ended,",
                 f"(`te_hold` of the frames' learned write at `WHOLE_SPREAD`, {spread}%, and never more than the longest write a hold "
                 "can keep clear).",
-                f"The frame is {frame:,} bytes of PSRAM, made at the first slide if {reserve // (1024 * 1024)} MB of PSRAM stays free "
-                "after it (`WHOLE_RESERVE`, the apps' floor) and kept;",
+                f"The frame is {frame:,} bytes of PSRAM, made as the display registers (`muse_lcd_bands_make_frame`, from the 1.75C's "
+                f"`display_start`) if {reserve // (1024 * 1024)} MB of PSRAM stays free after it (`WHOLE_RESERVE`, the apps' floor) and "
+                "kept, so the switch never allocates;",
                 "the bands log `tearing effect: no frame for frame mode` once.",
                 "That line and `tearing effect: frame mode's frame, <bytes> B of PSRAM` come from the send task at its next band, never "
                 "from the slide's scroll callback, deep in LVGL's input read.",
                 "A bench build sums up each slide's frames, its drag's and its snap's together, in `page frames:` lines (the bench's "
                 "frame summaries, under Build).",
-                "The bands' batch line then counts the refreshes `framed` and their `copy` into the frame.",
+                "The copies are ESP-IDF's `esp_async_memcpy` (GDMA): its driver is installed at a slide's first copy if internal DMA "
+                f"RAM keeps `DMA_KEEP` ({keep // 1024} KB, the Link's TX margin and a VM read's) and `DMA_TAKES` ({takes // 1024} KB) "
+                "free, used while it keeps `DMA_KEEP`, and uninstalled once frame mode is off.",
+                f"The S3's GDMA writes PSRAM only in whole bursts of `DMA_BURST` ({burst} bytes), so a band's bulk goes by DMA from its "
+                "first burst of the frame, and its two ends by CPU.",
+                f"The send task writes the band back from the cache first, `DMA_SYNC_BYTES` ({sync:,}) at a time: the driver's own "
+                "write-back is one critical section over the band, which would hold off the TE pin's interrupt.",
+                "A band the DMA can't take is copied by CPU, and the send task logs `tearing effect: frame mode's copy by CPU (DMA "
+                "<step>: <error>)` once.",
+                "With the apps, LVGL waits for a band's flush blocked on a semaphore (`flush_wait`, its `flush_wait_cb`), not spinning "
+                "at the UI task's priority.",
+                "The bands' batch line then counts the refreshes `framed`, those of them torn and their bands copied by CPU (`framed "
+                "(<t> torn, <c> bands by CPU)`), and their `copy` into the frame.",
                 # Measured on the board, 2026-11-02 (the task's report): pinned as written.
                 "none of the 527 refreshes in frame mode was torn, and no torn refresh came during a slide (the 57 torn were the Muse "
                 "face's small ones at rest), where the band path, in the same loop on the firmware before, tore 562 whole-screen "
@@ -1110,7 +1657,18 @@ class FrameModeDocTest(unittest.TestCase):
                 "the band path's, about 64 ms between its torn refreshes, and misses the 60 ms the design asked for.",
                 "A refresh in frame mode spent 14.5 ms copying its bands, 7.2 ms held for the scan and 26.4 ms on the wire,",
                 f"PSRAM fell by 434,292 bytes at the first slide, the frame less {frame - 434292}, and stayed there.",
-                "The send task's unused stack fell to 596 bytes, and the LVGL task's from 3,868 to 2,956."):
+                "The send task's unused stack fell to 596 bytes, and the LVGL task's from 3,868 to 2,956.",
+                # With the copies by DMA, measured on the board, 2026-11-02 (perf plan Task 5's report): pinned as written.
+                "none of the 429 refreshes in frame mode was torn and none of their bands went by CPU.",
+                "360 page frames had a median of 68 ms (each slide's 66 to 70), 95th percentiles of 68 to 78 ms and the longest 78: "
+                "still four of the panel's scans a frame, as each write waits for a scan's start, and short of the 60 ms.",
+                "The DMA gives LVGL its core back (the batches' longest drawing fell from about 68 to 63 ms), but three scans would "
+                "need the next frame's write to start within about 24 ms of the last one's end,",
+                "A refresh in frame mode spent 19.5 ms waiting for its copies, the CPU LVGL's meanwhile.",
+                "Internal RAM is no less than before: the refresh's record (`s_frame`) is in PSRAM now, and `UI built` said 52,247 "
+                "bytes free at boot against 51,967 (`>mem` 27,095 internal and 23,255 DMA), 20 less from the first slide on (the DMA "
+                "interrupt's descriptor, which ESP-IDF keeps); the driver took 1,176 more while a slide ran, all back after it.",
+                "The send task's unused stack was 540 bytes at its lowest."):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
 
@@ -1225,7 +1783,12 @@ TASK7_NAMES = ["write_t", "hold_t", "pace_t", "PACE_VAR_MIN", "s_pace", "FRAME_H
 # added. A build without the apps has none of them either.
 FRAME_MODE_NAMES = ["whole_t", "s_whole", "s_framing", "s_framed", "s_te_whole", "s_cols", "WHOLE_SPREAD", "WHOLE_RESERVE",
                     "refresh_whole", "frame_band", "whole_est", "whole_band", "whole_write", "muse_lcd_bands_set_frame_mode",
-                    "EXT_RAM_BSS_ATTR", "MALLOC_CAP_SPIRAM", "heap_caps_get_free_size"]
+                    "EXT_RAM_BSS_ATTR", "MALLOC_CAP_SPIRAM", "heap_caps_get_free_size",
+                    # Task 5 of the perf plan: the frame made as frame mode registers, the blocking flush wait, the copies by DMA.
+                    "muse_lcd_bands_make_frame", "FLUSH_WAIT_MS", "s_flush_ready", "flush_wait", "lv_display_set_flush_wait_cb",
+                    "band_back", "DMA_BURST", "DMA_WAIT_MS", "DMA_KEEP", "DMA_TAKES", "dma_t", "s_dma", "s_copied", "on_copied",
+                    "dma_fell_back", "dma_copy", "dma_end", "esp_async_memcpy", "esp_async_memcpy_install",
+                    "esp_async_memcpy_uninstall", "DMA_SYNC_BYTES", "esp_cache_msync"]
 
 # sha256 of esp32/components/muse/boards/muse_lcd_bands.c at 7e59ee0, the connected apps' base: what a build without the apps
 # compiles. On a mismatch, diff variant(SOURCE, apps=False) with `git show 7e59ee0:esp32/components/muse/boards/muse_lcd_bands.c`.
@@ -1318,8 +1881,8 @@ class PlainBuildTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertRegex(apps, rf"\b{name}\b", "the apps build lost it")
                 self.assertNotRegex(plain, rf"\b{name}\b", "outside the CONFIG_MUSE_APPS guard")
-        for path, names in ((HEADER, ["muse_lcd_bands_set_frame_mode"]), (BOARD_H, ["frame_mode"]),
-                            (BOARD_175C, ["frame_mode", "muse_lcd_bands_set_frame_mode"])):
+        for path, names in ((HEADER, ["muse_lcd_bands_set_frame_mode", "muse_lcd_bands_make_frame"]), (BOARD_H, ["frame_mode"]),
+                            (BOARD_175C, ["frame_mode", "muse_lcd_bands_set_frame_mode", "muse_lcd_bands_make_frame"])):
             text = path.read_text()
             for name in names:
                 with self.subTest(path.name, name=name):

@@ -136,6 +136,9 @@ static lv_display_t *display_start(lv_indev_t **touch)
     if (!disp) {
         return NULL;
     }
+#if CONFIG_MUSE_APPS
+    muse_lcd_bands_make_frame();   /* the slide's frame (.frame_mode), now rather than at the first slide */
+#endif
     lv_display_add_event_cb(disp, round_area, LV_EVENT_INVALIDATE_AREA, NULL);
     /* Tearing effect on (V-blank only), as the 1.75C's BSP already asks. */
     esp_lcd_panel_io_tx_param(s_io, (0x02 << 24) | (0x35 << 8), (uint8_t[]){ 0x00 }, 1);

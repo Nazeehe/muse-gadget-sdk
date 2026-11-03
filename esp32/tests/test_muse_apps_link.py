@@ -31,6 +31,7 @@ IDF build's managed_components.
 
 import codecs
 import json
+import os
 import re
 import subprocess
 import sys
@@ -218,6 +219,27 @@ def c_table(source, name):
     match = re.search(rf"\b{name}\[\]\s*=\s*\{{(.*?)\}};", source, re.S)
     assert match, f"no {name}[] in the source"
     return re.findall(r'"(\w+)"', match.group(1))
+
+
+def adapter_default_stack():
+    """esp_lvgl_adapter 0.6.4's ESP_LV_ADAPTER_DEFAULT_STACK_SIZE as its esp_lv_adapter.h has it, or None when no tree of that
+    version is on this machine: what a device build left in managed_components/, or the component manager's cache
+    ($IDF_COMPONENT_CACHE_PATH, else its usual places)."""
+    candidates = [ROOT / "managed_components/espressif__esp_lvgl_adapter"]
+    caches = [Path.home() / "Library/Caches/Espressif/ComponentManager", Path.home() / ".cache/Espressif/ComponentManager",
+              Path.home() / ".espressif/ComponentManager"]
+    if os.environ.get("IDF_COMPONENT_CACHE_PATH"):
+        caches.insert(0, Path(os.environ["IDF_COMPONENT_CACHE_PATH"]))
+    for cache in caches:
+        candidates += sorted(cache.glob("*/espressif__esp_lvgl_adapter_0.6.4_*"))
+    for tree in candidates:
+        manifest, header = tree / "idf_component.yml", tree / "include/esp_lv_adapter.h"
+        if not (manifest.is_file() and header.is_file()) or not re.search(r'(?m)^version: "?0\.6\.4"?$', manifest.read_text()):
+            continue
+        size = re.search(r"(?m)^#define ESP_LV_ADAPTER_DEFAULT_STACK_SIZE\s+\((\d+) \* (\d+)\)", header.read_text())
+        if size:
+            return int(size.group(1)) * int(size.group(2))
+    return None
 
 
 class GuideAndSkill(unittest.TestCase):
@@ -751,8 +773,12 @@ class GuideAndSkill(unittest.TestCase):
     def test_agents_md_gives_the_lvgl_tasks_stack_as_the_build_has_it(self):
         # Perf plan Task 6 (W1, rulings P11 and P21, fix B). D12: the stacks are the board file's and the apps overlay's, and the
         # defaults they replace are the adapter's and LVGL's (esp_lvgl_adapter 0.6.4's ESP_LV_ADAPTER_DEFAULT_STACK_SIZE, LVGL
-        # 9.5.0's Kconfig default; test_muse_apps_wiring pins the same).
+        # 9.5.0's Kconfig default; test_muse_apps_wiring pins the same). The adapter's is read from its header when its tree is
+        # on this machine.
         adapter_default, draw_default = 8192, 8192
+        from_source = adapter_default_stack()
+        if from_source is not None:
+            self.assertEqual(from_source, adapter_default, "esp_lvgl_adapter 0.6.4's ESP_LV_ADAPTER_DEFAULT_STACK_SIZE")
         board = strip_c_comments((MUSE / "boards/board_waveshare_s3_175c.c").read_text())
         stack = int(re.search(r"(?m)^#define LVGL_STACK_APPS (\d+)$", board).group(1))
         draw = int(re.search(r"(?m)^CONFIG_LV_DRAW_THREAD_STACK_SIZE=(\d+)$", (ROOT / "devices/sdkconfig.muse-apps").read_text()).group(1))
@@ -760,14 +786,22 @@ class GuideAndSkill(unittest.TestCase):
         agents = (ROOT / "AGENTS.md").read_text()
         section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
         for phrase in (
+                # The final review's I3: the LVGL task's deepest record is of the adapter's stack, with no cause given for it
+                # (it wasn't reproduced). The bytes free are the board's, pinned as written; the stacks are the code's, and the
+                # widgets the apps' quota.
+                f"The deepest stacks seen: the app task 13,012 bytes free of {header_number('apps_task.c', 'APPS_TASK_STACK'):,}, the "
+                f"I/O worker 3,968 of {header_number('apps_io.h', 'APPS_IO_STACK'):,}, and the LVGL task 1,240 free after "
+                f"{header_number('apps_ui.h', 'APPS_UI_SLOTS')} widgets, Settings, the launcher, a crash card, a snapshot and a "
+                f"`display.draw_file` (of {adapter_default:,}).",
                 f"An apps build gives the LVGL task {stack:,} bytes of stack (`LVGL_STACK_APPS` in `board_waveshare_s3_175c.c`), "
                 f"{stack - adapter_default:,} more than the adapter's {adapter_default:,}, in internal RAM, since Settings' handlers "
-                "write NVS on that task (ruling P21: a PSRAM stack would rely on code and constant data running from PSRAM to keep "
+                "write NVS on that task (a PSRAM stack would rely on code and constant data running from PSRAM to keep "
                 f"the cache on through those writes), and LVGL's two drawing tasks {draw:,} bytes each (`CONFIG_LV_DRAW_THREAD_STACK_SIZE` in "
                 f"`devices/sdkconfig.muse-apps`), {draw_default - draw:,} less than LVGL's {draw_default:,}: {net:,} bytes more "
                 "internal RAM free in all.",):
             with self.subTest(phrase[:60]):
                 self.assertIn(phrase, section)
+        self.assertNotIn("while deep callbacks still logged", section, "no cause was measured for the 1,240 (the final review's I3)")
         # Measured on the board (perf plan Task 6, task-6-report.md), pinned as written. The gates: at least 2 KB of the LVGL task's
         # stack left on every path, painted or not, and the drawing tasks at least 1 KB above their deepest use.
         lvgl_before, lvgl_after, peak_before, peak_after = 2668, 4828, 5468, 7500
@@ -785,6 +819,12 @@ class GuideAndSkill(unittest.TestCase):
             f"{peak_before:,} and {peak_after:,}, in Flappy; and the drawing tasks' least was {draw_before:,} of {draw_default:,} "
             f"and {draw_after:,} of {draw:,}, {used:,} used both times. At boot the UI left {ui_after:,} bytes of internal RAM free "
             f"(`UI built: free internal`), against {ui_before:,} before.", section)
+
+    def test_agents_md_cites_no_ruling_ids(self):
+        # The final review's Minor 4 (P-T6-M3): rulings live in plan files that aren't committed, so AGENTS.md gives a ruling's
+        # reason in words and never its id.
+        agents = (ROOT / "AGENTS.md").read_text()
+        self.assertEqual(re.findall(r"\b[Rr]ulings? [PR]\d+[a-z]?\b", agents), [])
 
     def test_guide_says_the_launcher_is_a_carousel_of_every_app(self):
         # Launcher carousel Task 4: no row count any more (APPS_LV_LAUNCHER_ROWS is gone); every app, the most recent first.
@@ -1014,6 +1054,9 @@ class GuideAndSkill(unittest.TestCase):
                        f"text in bubbles at the left and the right by turns, {1 + 3 * rows} widgets; 10 drags up and 10 down of 200 px "
                        "over 300 ms in the list's middle, then 5 flings of 300 px over 120 ms): 712 frames, a median of 26 ms and a "
                        "95th percentile of 30 ms (the longest 46), inside the frame gate of 33 and 50 ms.",
+                       # The final review's Minor 10: those frames came from the per-frame lines, which the summaries replaced.
+                       "inside the frame gate of 33 and 50 ms. Those frames were timed by a line printed for each one, before the "
+                       "summaries, so not the same way.",
                        "While it scrolled, 343 of the 750 refreshes in the bands' `tearing effect:` batches were torn (two bands each, "
                        "none paired), and a render took 19 ms on average (the longest 30).",
                        "Taps on 13 rows at rest each printed the row tapped, and no drag tapped one. `>mem`'s internal and DMA free "
@@ -1050,7 +1093,9 @@ class GuideAndSkill(unittest.TestCase):
                 # The final review's hardening (d): the drag's own frames, so later per-frame work isn't sized against the 30 ms median.
                 "That median counts the snap's slow tail, 47 frames under 28 ms: the other 103, while a finger drags and as the snap "
                 "starts, have a median of 33 ms against the 30 of all 150, the gate's own limit, so per-frame work added later has no "
-                "margin to spend."):
+                "margin to spend.",
+                # The final review's Minor 10: those frames came from the per-frame lines, which the summaries replaced.
+                "margin to spend. Those frames were timed by a line printed for each one, before the summaries, so not the same way."):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
 
@@ -1234,7 +1279,11 @@ class GuideAndSkill(unittest.TestCase):
                 "tap, or one with a gap of 50 ms or more whose drawing began 0 to 40 ms after a tap: the restart's call, its pass and "
                 "the frame (the 26 frames of 75 to 118 ms that the second test adds here each hold the restart's pass, 5.4 to 6.7 ms "
                 "of passes).",
-                "The skips in a call fell from 62 to 14 and 20, never more than 2 in a second.",
+                # The final review's I2: the skip counter counts something else since the call-end pass, so its figures are given
+                # apart, each with what it counts (the frame_tick that found a call running, then the ended call held back once).
+                "The skip counts don't compare across the change, since they count different things: at f0a1b35 a skip was a frame "
+                "that found a call running, a frame lost (62 in its run); now it is an ended call whose changes wait for a running "
+                "one, counted once (14 and 20 in the two runs, never more than 2 in a second).",
                 "`whatsapp`'s first chat opened in a pass of 55,431 and 52,140 us against 57,394.",
                 "Its 20 list drags gave 590 and 597 frames with a median of 18 to 19 ms and a 95th percentile of 27 to 34 ms, but for "
                 "the first drag up after the ten down, which had frames over 50 ms in both runs (67 and 51, then 52) with the apply "
@@ -1242,6 +1291,7 @@ class GuideAndSkill(unittest.TestCase):
             with self.subTest(phrase[:50]):
                 self.assertIn(phrase, section)
         self.assertNotIn("APPS_APPLY_RETRY_MS", agents)
+        self.assertNotIn("fell from 62 to", section, "the two skip counters don't compare (the final review's I2)")
         # The bench's summary sends its reader here.
         self.assertIn("\"The apply step\" under Muse apps", " ".join(agents[:agents.index("\n## Muse apps\n")].split()))
         self.assertLess(section.index("**The apply step:**"), section.index("**Muse's touches:**"))

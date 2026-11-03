@@ -867,7 +867,9 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   scales its icons live as they scroll. That median counts the snap's slow
   tail, 47 frames under 28 ms: the other 103, while a finger drags and as the
   snap starts, have a median of 33 ms against the 30 of all 150, the gate's
-  own limit, so per-frame work added later has no margin to spend.
+  own limit, so per-frame work added later has no margin to spend. Those
+  frames were timed by a line printed for each one, before the summaries, so
+  not the same way.
 - **Sound:** `apps_mix.c` (the mixer: 4 voices of tones and clips,
   `APPS_MIX_VOICES`, summed and saturated into one 16 kHz mono stream; a start
   while all 4 play replaces the oldest, and a stop or a replacement fades out
@@ -922,9 +924,11 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   left and the right by turns, 121 widgets; 10 drags up and 10 down of 200 px
   over 300 ms in the list's middle, then 5 flings of 300 px over 120 ms): 712
   frames, a median of 26 ms and a 95th percentile of 30 ms (the longest 46),
-  inside the frame gate of 33 and 50 ms. While it scrolled, 343 of the 750
-  refreshes in the bands' `tearing effect:` batches were torn (two bands each,
-  none paired), and a render took 19 ms on average (the longest 30). Taps on
+  inside the frame gate of 33 and 50 ms. Those frames were timed by a line
+  printed for each one, before the summaries, so not the same way. While it
+  scrolled, 343 of the 750 refreshes in the bands' `tearing effect:` batches
+  were torn (two bands each, none paired), and a render took 19 ms on average
+  (the longest 30). Taps on
   13 rows at rest each printed the row tapped, and no drag tapped one.
   `>mem`'s internal and DMA free didn't move before, during or after the
   drags; PSRAM moved only with the app's Lua heap, and was back to within 44
@@ -962,10 +966,13 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   whose drawing began 0 to 150 ms after a tap, or one with a gap of 50 ms or
   more whose drawing began 0 to 40 ms after a tap: the restart's call, its pass
   and the frame (the 26 frames of 75 to 118 ms that the second test adds here
-  each hold the restart's pass, 5.4 to 6.7 ms of passes). The skips in a call
-  fell from 62 to 14 and 20, never more than 2 in a second. `whatsapp`'s first
-  chat opened in a pass of 55,431 and 52,140 us against 57,394. Its 20 list
-  drags gave 590 and 597 frames with a median of 18 to 19 ms and a 95th
+  each hold the restart's pass, 5.4 to 6.7 ms of passes). The skip counts
+  don't compare across the change, since they count different things: at
+  f0a1b35 a skip was a frame that found a call running, a frame lost (62 in its
+  run); now it is an ended call whose changes wait for a running one, counted
+  once (14 and 20 in the two runs, never more than 2 in a second). `whatsapp`'s
+  first chat opened in a pass of 55,431 and 52,140 us against 57,394. Its 20
+  list drags gave 590 and 597 frames with a median of 18 to 19 ms and a 95th
   percentile of 27 to 34 ms, but for the first drag up after the ten down, which
   had frames over 50 ms in both runs (67 and 51, then 52) with the apply step
   idle: no calls, and empty passes.
@@ -1095,13 +1102,12 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   The deepest stacks seen: the app task 13,012 bytes free of 57,344, the I/O
   worker 3,968 of 8,192, and the LVGL task 1,240 free
   after 128 widgets, Settings, the launcher, a crash card, a snapshot and a
-  `display.draw_file` (of 8,192, while deep callbacks still logged). An apps
-  build gives the LVGL task 10,240 bytes of stack (`LVGL_STACK_APPS` in
-  `board_waveshare_s3_175c.c`), 2,048 more than the adapter's 8,192, in
-  internal RAM, since Settings' handlers write NVS on that task (ruling P21:
-  a PSRAM stack would rely on code and constant data running from PSRAM to
-  keep the cache on through those writes), and LVGL's two drawing tasks
-  6,144 bytes each (`CONFIG_LV_DRAW_THREAD_STACK_SIZE` in
+  `display.draw_file` (of 8,192). An apps build gives the LVGL task 10,240
+  bytes of stack (`LVGL_STACK_APPS` in `board_waveshare_s3_175c.c`), 2,048
+  more than the adapter's 8,192, in internal RAM, since Settings' handlers
+  write NVS on that task (a PSRAM stack would rely on code and constant data
+  running from PSRAM to keep the cache on through those writes), and LVGL's
+  two drawing tasks 6,144 bytes each (`CONFIG_LV_DRAW_THREAD_STACK_SIZE` in
   `devices/sdkconfig.muse-apps`), 2,048 less than LVGL's 8,192: 2,048 bytes
   more internal RAM free in all. Measured on the 1.75C on 2026-11-02 (perf
   plan Task 6, apps+bench build, each from a fresh boot: Flappy with 2 min of
@@ -1219,10 +1225,11 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   each swipe right. 395 page frames had a median of 68 ms and a 95th
   percentile of 75 ms (the longest 84): the slide is no quicker than the band
   path's, about 64 ms between its torn refreshes, and misses the 60 ms the
-  design asked for. A refresh in frame mode spent 14.5 ms copying its bands,
-  7.2 ms held for the scan and 26.4 ms on the wire, and LVGL's drawing of it,
-  with those copies and the frame before's write taking the same core,
-  54 ms. `>mem`'s internal and DMA free didn't move; PSRAM fell by 434,292
+  design asked for. Those frames were timed by a line printed for each one,
+  before the summaries, so not the same way. A refresh in frame mode spent
+  14.5 ms copying its bands, 7.2 ms held for the scan and 26.4 ms on the wire,
+  and LVGL's drawing of it, with those copies and the frame before's write
+  taking the same core, 54 ms. `>mem`'s internal and DMA free didn't move; PSRAM fell by 434,292
   bytes at the first slide, the frame less 20, and stayed there. The send
   task's unused stack fell to 596 bytes, and the LVGL task's from 3,868 to
   2,956.
@@ -1231,10 +1238,11 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   440 refreshes in frame mode was torn. 360 page frames had a median of 70 ms
   (each swipe right's 67 to 69, each swipe left's 71 to 74), 95th percentiles
   of 74 to 83 ms and the longest 83: about four of the panel's scans
-  (67.8 ms) a frame, as each write waits for a scan's start. Ruling P19 takes
-  that as the tear-free floor at today's drawing cost, in place of the 60 ms:
-  three scans (50.85 ms) are at or under LVGL's bare drawing of the screen
-  (the copy-off slides, which tear, had medians of 55 to 62 ms). A refresh
+  (67.8 ms) a frame, as each write waits for a scan's start. That is the
+  tear-free floor at today's drawing cost, and it replaces the 60 ms the
+  design asked for: three scans (50.85 ms) are at or under LVGL's bare
+  drawing of the screen (the copy-off slides, which tear, had medians of 55 to
+  62 ms). A refresh
   in frame mode spent 14.6 ms copying its bands and 7.9 ms held for the scan.
   Internal and DMA free never fell below the boot's before the task (26,835
   internal and 22,995 DMA): 27,127 and 23,287 at boot, in the middle of a 2 s

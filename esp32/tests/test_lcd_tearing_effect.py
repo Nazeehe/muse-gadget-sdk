@@ -1268,6 +1268,9 @@ class FrameModeDocTest(unittest.TestCase):
                 "refreshes, 11 on each swipe left and 12 on each swipe right.",
                 "395 page frames had a median of 68 ms and a 95th percentile of 75 ms (the longest 84): the slide is no quicker than "
                 "the band path's, about 64 ms between its torn refreshes, and misses the 60 ms the design asked for.",
+                # The final review's Minor 10: those frames came from the per-frame lines, which the summaries replaced.
+                "the 60 ms the design asked for. Those frames were timed by a line printed for each one, before the summaries, so "
+                "not the same way.",
                 "A refresh in frame mode spent 14.5 ms copying its bands, 7.2 ms held for the scan and 26.4 ms on the wire,",
                 f"PSRAM fell by 434,292 bytes at the first slide, the frame less {frame - 434292}, and stayed there.",
                 "The send task's unused stack fell to 596 bytes, and the LVGL task's from 3,868 to 2,956.",
@@ -1278,8 +1281,10 @@ class FrameModeDocTest(unittest.TestCase):
                 "360 page frames had a median of 70 ms (each swipe right's 67 to 69, each swipe left's 71 to 74), 95th percentiles of "
                 "74 to 83 ms and the longest 83: about four of the panel's scans (67.8 ms) a frame, as each write waits for a scan's "
                 "start.",
-                "Ruling P19 takes that as the tear-free floor at today's drawing cost, in place of the 60 ms: three scans (50.85 ms) are "
-                "at or under LVGL's bare drawing of the screen (the copy-off slides, which tear, had medians of 55 to 62 ms).",
+                # The final review's Minor 4: the ruling's reason in words, with no ruling id (rulings aren't committed).
+                "That is the tear-free floor at today's drawing cost, and it replaces the 60 ms the design asked for: three scans "
+                "(50.85 ms) are at or under LVGL's bare drawing of the screen (the copy-off slides, which tear, had medians of 55 to "
+                "62 ms).",
                 "A refresh in frame mode spent 14.6 ms copying its bands and 7.9 ms held for the scan.",
                 "Internal and DMA free never fell below the boot's before the task (26,835 internal and 22,995 DMA): 27,127 and 23,287 at "
                 "boot, in the middle of a 2 s drag, after it and after the slides.",

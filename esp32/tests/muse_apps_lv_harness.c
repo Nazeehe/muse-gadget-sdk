@@ -3718,6 +3718,11 @@ static int fake_drag(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int steps, 
     return id;
 }
 
+/* A swipe from (x, y) by (dx, dy), in 8 reads, the finger still down; the id of what it began on. */
+static int swipe_from(int32_t x, int32_t y, int32_t dx, int32_t dy) {
+    return fake_drag(x, y, x + dx, y + dy, 8, 0);
+}
+
 /* Where LVGL 9.5.0's draw_image puts the picture of an image object: the image at its own size, placed in the box by the
  * inner align (lv_area_align), then scaled about its middle (the default pivot). To a pixel: the fake does the sums in
  * whole pixels. */
@@ -4008,6 +4013,34 @@ static bool dispatch(env_t *e, const ev_t *ev) {
     apps_call_t status = apps_vm_call(e->vm, 1, 0, APPS_BUDGET_CALL, err, sizeof err);
     CHECK(status == APPS_CALL_OK, "dispatch: %s", err);
     return p.result > 0;
+}
+
+/* What the layer told the app since n_evs was last cleared, a "<slot> <event>" a touch event, joined by ", ": "0 press, 0 swipe right,
+ * 0 release". */
+static const char *heard(void) {
+    static char out[512];
+    size_t len = 0;
+    out[0] = '\0';
+    for (int i = 0; i < n_evs && len < sizeof out; i++) {
+        uint8_t ev = evs[i].event;
+        bool swipe = (ev & ~APPS_UI_DIR_MASK) == APPS_UI_SWIPE;
+        const char *name = swipe                       ? "swipe"
+                           : ev == APPS_UI_TAP         ? "tap"
+                           : ev == APPS_UI_LONG_PRESS  ? "long_press"
+                           : ev == APPS_UI_PRESS       ? "press"
+                           : ev == APPS_UI_RELEASE     ? "release"
+                                                       : "?";
+        len += (size_t)snprintf(out + len, sizeof out - len, "%s%d %s%s%s", i > 0 ? ", " : "", evs[i].slot, name, swipe ? " " : "",
+                                swipe ? apps_ui_dir_name(ev) : "");
+    }
+    return out;
+}
+
+/* Every event the layer told the app since n_evs was last cleared, through Task 9's dispatch: the app's handlers run. */
+static void dispatch_all(env_t *e) {
+    for (int i = 0; i < n_evs; i++) {
+        dispatch(e, &evs[i]);
+    }
 }
 
 /* ---- The brief's tests ---- */
@@ -5343,6 +5376,11 @@ static void clickable_only_when_subscribed(void) {
         CHECK(APPLY(&e), "subscribed again");
         CHECK(fake_flag(id, LV_OBJ_FLAG_CLICKABLE) && fake_obj(id)->n_cbs == callbacks, "%s: %d callbacks the second time", kinds[i],
               fake_obj(id)->n_cbs);
+        /* A swipe handler alone is a handler: the widget takes the press its swipe begins with (swipes Task 2). */
+        RUN(&e, "w:on('tap', nil) w:on('swipe', function() end)");
+        CHECK(APPLY(&e), "a swipe alone");
+        CHECK(fake_flag(id, LV_OBJ_FLAG_CLICKABLE) && fake_obj(id)->n_cbs == callbacks, "%s: swipe alone: clickable %d, %d callbacks",
+              kinds[i], fake_flag(id, LV_OBJ_FLAG_CLICKABLE), fake_obj(id)->n_cbs);
         FINISH(&e);
     }
 }
@@ -5411,6 +5449,9 @@ static void many_sets_while_dark_apply_once(void) {
 
 /* ---- The swipe ---- */
 
+/* The layer listens for the gesture, and for a press on it: where a touch on no widget went down, for the edge's close (S4). A right
+ * swipe whose press went down at the screen's left edge puts the app behind, before the lift. Every gesture, whichever way it goes and
+ * whatever comes of it, takes the touch (lv_indev_wait_release, S3): the rest of it is nobody's. */
 static void swipe_right_closes(void) {
     fake_reset();
     apps_lv_build(fake_screen());
@@ -5424,54 +5465,63 @@ static void swipe_right_closes(void) {
         "remove_flag 1 scrollable\n"
         "remove_flag 1 gesture_bubble\n"
         "add_event_cb 1 gesture\n"
+        "add_event_cb 1 pressed\n"
         "add_flag 1 hidden\n");
     /* B13: the layer stops the gesture before it reaches the screen, and only then listens for it. */
     CHECK(!fake_flag(1, LV_OBJ_FLAG_GESTURE_BUBBLE) && fake_flag(1, LV_OBJ_FLAG_CLICKABLE) && !fake_flag(1, LV_OBJ_FLAG_SCROLLABLE) &&
               fake_flag(1, LV_OBJ_FLAG_HIDDEN),
           "the layer's flags");
     CHECK(!apps_lv_front(), "behind");
+    apps_lv_set_front(true);  /* S5: an app behind closes nothing */
 
     closes = 0;
     apps_lv_set_close_cb(on_close);
+    CHECK(fake_down(10, 233) == 1, "the press at the edge is the layer's");
+    log_clear();
     gesture_dir = LV_DIR_RIGHT;
     fake_fire(1, LV_EVENT_GESTURE);
-    CHECK(closes == 1, "a right swipe closes: %d", closes);
+    CHECK(closes == 1, "a right swipe from the edge closes: %d", closes);
     LOG_IS("wait_release\n");  /* the rest of the touch is not for whatever comes up under the layer */
     static const lv_dir_t others[] = {LV_DIR_LEFT, LV_DIR_TOP, LV_DIR_BOTTOM, LV_DIR_NONE};
     for (size_t i = 0; i < ARRAY_LEN(others); i++) {
         gesture_dir = others[i];
         fake_fire(1, LV_EVENT_GESTURE);
+        LOG_IS("wait_release\n");  /* each takes the touch too */
     }
-    CHECK(closes == 1, "no other direction does: %d", closes);
-    LOG_EMPTY();
+    CHECK(closes == 1, "no other direction closes: %d", closes);
     /* Other events on the layer are not gestures. */
     gesture_dir = LV_DIR_RIGHT;
     fake_fire(1, LV_EVENT_SHORT_CLICKED);
     fake_fire(1, LV_EVENT_PRESSED);
     CHECK(closes == 1, "a tap isn't a swipe");
+    LOG_EMPTY();
     /* No input device (a gesture sent by code): nothing to ask, no crash. */
     indev_present = false;
     fake_fire(1, LV_EVENT_GESTURE);
     CHECK(closes == 1, "no device, no close");
+    LOG_EMPTY();
     indev_present = true;
-    /* No close callback: nothing happens. */
+    /* No close callback: the touch is still taken, and nothing happens. */
     apps_lv_set_close_cb(NULL);
     fake_fire(1, LV_EVENT_GESTURE);
     CHECK(closes == 1 && fake_errors == 0, "no callback: %s", fake_note);
+    LOG_IS("wait_release\n");
+    fake_lift();
     log_clear();
     apps_lv_reset();
     log_clear();
 }
 
-/* A right swipe that starts on a widget the app listens to. LVGL sends PRESSED when the finger goes down (the app hears
- * press); the swipe climbs to the layer (widgets keep GESTURE_BUBBLE), which closes the app and tells LVGL the rest of the
- * touch is nobody's (lv_indev_wait_release); and the lift then sends the widget PRESS_LOST, not RELEASED, and no click.
- * The app has to hear press, then release, with the close between them: no press left open, no tap made of a swipe. */
+/* A swipe that starts on a widget the app listens to, from the middle of the screen. LVGL sends PRESSED when the finger goes down (the
+ * app hears press); the swipe climbs to the layer (widgets keep GESTURE_BUBBLE), which tells the app and tells LVGL the rest of the touch
+ * is nobody's (lv_indev_wait_release); and the lift then sends the widget PRESS_LOST, not RELEASED, and no click. The app hears press,
+ * swipe, release, whichever way it goes: no press left open, no tap made of a swipe, and no close away from the edge. */
 static void a_swipe_that_starts_on_a_widget_ends_its_press(void) {
     env_t e;
     scene(&e);
     apps_lv_set_event_cb(on_event);
     apps_lv_set_close_cb(on_close);
+    apps_lv_set_front(true);
     closes = 0;
     n_evs = 0;
     /* A button in a box, as a watch app has them: the swipe has to climb past two objects. */
@@ -5482,25 +5532,289 @@ static void a_swipe_that_starts_on_a_widget_ends_its_press(void) {
     fake_press(button);
     CHECK(n_evs == 1 && evs[0].event == APPS_UI_PRESS && evs[0].slot == 1 && closes == 0, "the press: %d events, %d closes", n_evs, closes);
     fake_swipe(LV_DIR_RIGHT);
-    CHECK(closes == 1 && n_evs == 1, "the swipe closes the app and says nothing to the widget: %d closes, %d events", closes, n_evs);
+    CHECK(closes == 0 && strcmp(heard(), "1 press, 1 swipe right") == 0, "the swipe is the widget's: %d closes, heard %s", closes,
+          heard());
     HAS("wait_release");
     fake_lift();
-    CHECK(n_evs == 2 && evs[1].event == APPS_UI_RELEASE && evs[1].slot == 1 && evs[1].gen == 0 && evs[1].closes_before == 1,
-          "press, then release after the close: %d events", n_evs);
-    CHECK(closes == 1, "and it is not closed twice: %d", closes);
+    CHECK(strcmp(heard(), "1 press, 1 swipe right, 1 release") == 0 && evs[2].gen == 0, "press, swipe, then release: %s", heard());
 
-    /* A swipe that is not to the right closes nothing, and the touch ends as any other: press, release, tap. */
+    /* To the left, the same: press, swipe left, release, and no tap. */
     n_evs = 0;
     fake_press(button);
     fake_swipe(LV_DIR_LEFT);
     fake_lift();
-    CHECK(closes == 1 && n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE && evs[2].event == APPS_UI_TAP,
-          "a left swipe: %d closes, %d events", closes, n_evs);
+    CHECK(closes == 0 && strcmp(heard(), "1 press, 1 swipe left, 1 release") == 0, "a left swipe: %d closes, heard %s", closes, heard());
     /* The next touch is an ordinary one: the layer's wish to wait for the release doesn't outlive the touch. */
     n_evs = 0;
     fake_tap(button);
-    CHECK(n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE && evs[2].event == APPS_UI_TAP,
-          "the next tap: %d events", n_evs);
+    CHECK(strcmp(heard(), "1 press, 1 release, 1 tap") == 0, "the next tap: %s", heard());
+    FINISH(&e);
+}
+
+/* ---- Swipes for the app (swipes Task 2) ---- */
+
+/* The layer in front with the app's events and its close heard, nothing heard yet. */
+static void swipe_scene(env_t *e) {
+    scene(e);
+    apps_lv_set_event_cb(on_event);
+    apps_lv_set_close_cb(on_close);
+    apps_lv_set_front(true);
+    closes = 0;
+    n_evs = 0;
+}
+
+/* A box of the size, in the middle, that has a handler of every event: the app's slot 0. Its object's id. */
+static int every_event_box(env_t *e, int side) {
+    char src[300];
+    snprintf(src, sizeof src,
+             "got = {} b = ui.box{w = %d, h = %d}\n"
+             "for _, ev in ipairs{'press', 'release', 'tap', 'long_press', 'swipe'} do\n"
+             "  b:on(ev, function(w, name, dir) got[#got + 1] = (w == b and '' or '?') .. name .. (dir and ' ' .. dir or '') end)\n"
+             "end",
+             side, side);
+    RUN(e, src);
+    CHECK(APPLY(e), "made");
+    int id = -1;
+    for (int i = 0; i < n_objs; i++) {
+        if (strcmp(objs[i]->cls, "obj") == 0 && !objs[i]->deleted) {
+            id = objs[i]->id;  /* the last box made: the layer is made first */
+        }
+    }
+    return id;
+}
+
+/* S3, design 3: a swipe on a widget from the middle of the screen, whichever way it goes, is heard as press, swipe <dir>, release: the
+ * swipe ends the touch (lv_indev_wait_release), so the lift is PRESS_LOST and no tap. Its handler is called as fn(w, "swipe", dir) (S1),
+ * and nothing closes. */
+static void four_swipes_reach_the_widget_and_never_tap(void) {
+    env_t e;
+    swipe_scene(&e);
+    int box = every_event_box(&e, 300);
+    static const struct {
+        int32_t dx, dy;
+        const char *dir;
+    } ways[] = {{-120, 0, "left"}, {120, 0, "right"}, {0, -120, "up"}, {0, 120, "down"}};
+    for (size_t i = 0; i < ARRAY_LEN(ways); i++) {
+        n_evs = 0;
+        log_clear();
+        CHECK(swipe_from(233, 233, ways[i].dx, ways[i].dy) == box, "%s: the press is the box's", ways[i].dir);
+        CHECK(log_count("wait_release") == 1, "%s: the swipe takes the touch\n%s", ways[i].dir, log_peek());
+        fake_lift();
+        char want[64];
+        snprintf(want, sizeof want, "0 press, 0 swipe %s, 0 release", ways[i].dir);
+        CHECK(strcmp(heard(), want) == 0, "%s: heard %s", ways[i].dir, heard());
+        dispatch_all(&e);
+    }
+    CHECK(closes == 0 && apps_lv_front(), "a swipe from the middle closed the app: %d", closes);
+    RUN(&e, "local s = table.concat(got, ', ')\n"
+            "assert(s == 'press, swipe left, release, press, swipe right, release, press, swipe up, release, press, swipe down, release', s)");
+    FINISH(&e);
+}
+
+/* S4: a right swipe whose press went down at x < APPS_LV_CLOSE_EDGE_PX, inside the circle (the launcher's band turned sideways: a lens at
+ * the left middle, y 104 to 362 at x 39), puts the app behind as the gesture comes, before the lift, and the app hears no swipe and no
+ * tap. On the bare layer it hears nothing; on a widget, the press and the release that ends it. Each start has a twin just outside the
+ * rule, which closes nothing and is a swipe right the widget hears. */
+static void edge_right_swipe_closes(void) {
+    static const struct {
+        int32_t x, y, twin_x, twin_y;
+        const char *what;
+    } starts[] = {
+        {10, 233, 40, 233, "the edge's middle"},
+        {39, 120, 39, 100, "the lens's top"},
+        {39, 350, 39, 366, "its bottom"},
+        {39, 104, 39, 103, "the lens's first row at x 39"},
+        {39, 362, 39, 363, "its last row"},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(starts); i++) {
+        env_t e;
+        swipe_scene(&e);
+        CHECK(swipe_from(starts[i].x, starts[i].y, 120, 0) == 1, "%s: on the bare layer", starts[i].what);
+        CHECK(closes == 1 && n_evs == 0, "%s, the bare layer: %d closes before the lift, heard %s", starts[i].what, closes, heard());
+        fake_lift();
+        CHECK(closes == 1 && n_evs == 0, "%s, the bare layer, lifted: %d closes, heard %s", starts[i].what, closes, heard());
+        CHECK(swipe_from(starts[i].twin_x, starts[i].twin_y, 120, 0) == 1 && closes == 1, "%s: its twin on the bare layer closes nothing",
+              starts[i].what);
+        fake_lift();
+        CHECK(n_evs == 0, "the bare layer is no widget's: heard %s", heard());
+
+        /* On a widget that covers the screen and listens to everything. */
+        closes = 0;
+        int box = every_event_box(&e, 466);
+        CHECK(swipe_from(starts[i].x, starts[i].y, 120, 0) == box, "%s: on the box", starts[i].what);
+        CHECK(closes == 1 && strcmp(heard(), "0 press") == 0, "%s, the box: %d closes before the lift, heard %s", starts[i].what, closes,
+              heard());
+        fake_lift();
+        CHECK(closes == 1 && strcmp(heard(), "0 press, 0 release") == 0 && evs[1].closes_before == 1, "%s, the box: heard %s",
+              starts[i].what, heard());
+        n_evs = 0;
+        CHECK(swipe_from(starts[i].twin_x, starts[i].twin_y, 120, 0) == box, "%s: its twin on the box", starts[i].what);
+        fake_lift();
+        CHECK(closes == 1 && strcmp(heard(), "0 press, 0 swipe right, 0 release") == 0, "%s: its twin (%d, %d): %d closes, heard %s",
+              starts[i].what, (int)starts[i].twin_x, (int)starts[i].twin_y, closes, heard());
+        /* From the edge, only right closes: up is the app's. */
+        n_evs = 0;
+        swipe_from(starts[i].x, starts[i].y, 0, -80);
+        fake_lift();
+        CHECK(closes == 1 && strcmp(heard(), "0 press, 0 swipe up, 0 release") == 0, "%s, up: %d closes, heard %s", starts[i].what,
+              closes, heard());
+        FINISH(&e);
+    }
+}
+
+/* S4: a right swipe anywhere but the edge goes to the app, and the app stays in front: from the middle (233, 233), on a widget; and on the
+ * bare layer away from the edge, which no widget has, nothing at all. */
+static void right_swipe_mid_screen_does_not_close(void) {
+    env_t e;
+    swipe_scene(&e);
+    RUN(&e, "b = ui.box{w = 200, h = 200} b:on('swipe', function() end)");
+    CHECK(APPLY(&e), "made");
+    int box = fake_nth("obj", 1);
+    CHECK(swipe_from(233, 233, 120, 0) == box, "the press is the box's");
+    CHECK(closes == 0 && log_has_line("wait_release"), "a right swipe from the middle: %d closes", closes);
+    fake_lift();
+    CHECK(closes == 0 && strcmp(heard(), "0 press, 0 swipe right, 0 release") == 0, "heard %s", heard());
+    n_evs = 0;
+    CHECK(swipe_from(100, 400, 120, 0) == 1, "the press is the layer's");
+    fake_lift();
+    CHECK(closes == 0 && n_evs == 0 && apps_lv_front(), "the bare layer: %d closes, heard %s", closes, heard());
+    FINISH(&e);
+}
+
+/* Review focus 4: a drag under LVGL's 3 px a read (LV_INDEV_DEF_GESTURE_MIN_VELOCITY) starts the gesture's sum again at every read, so it
+ * is never a swipe however far it goes: it taps at the lift, as LVGL clicks after a slide that isn't a gesture. From the edge, it closes
+ * nothing. */
+static void slow_drag_still_taps(void) {
+    env_t e;
+    swipe_scene(&e);
+    int box = every_event_box(&e, 300);  /* x 83 to 382 */
+    CHECK(fake_drag(150, 233, 330, 233, 90, 0) == box, "the drag began on the box");  /* 180 px, 2 px a read */
+    fake_lift();
+    CHECK(closes == 0 && !log_has_line("wait_release") && strcmp(heard(), "0 press, 0 release, 0 tap") == 0, "a slow drag: heard %s\n%s",
+          heard(), log_peek());
+    n_evs = 0;
+    CHECK(fake_drag(10, 233, 190, 233, 90, 0) == 1, "from the edge, on the layer");
+    fake_lift();
+    CHECK(closes == 0 && n_evs == 0, "a slow drag from the edge: %d closes, heard %s", closes, heard());
+    FINISH(&e);
+}
+
+/* Review focus 4: a press held past LVGL's long press time (400 ms) hears long_press first; a swipe after it (LVGL still makes one: it
+ * checks the long press only while nothing scrolls) is heard next, and the lift is the release: press, long_press, swipe, release. */
+static void long_press_then_swipe(void) {
+    env_t e;
+    swipe_scene(&e);
+    int box = every_event_box(&e, 300);
+    CHECK(fake_down(233, 233) == box, "the press is the box's");
+    fake_hold();
+    for (int i = 1; i <= 8; i++) {
+        fake_move(233 - 15 * i, 233);
+    }
+    fake_lift();
+    CHECK(closes == 0 && strcmp(heard(), "0 press, 0 long_press, 0 swipe left, 0 release") == 0, "heard %s", heard());
+    dispatch_all(&e);
+    RUN(&e, "local s = table.concat(got, ', ') assert(s == 'press, long_press, swipe left, release', s)");
+    FINISH(&e);
+}
+
+/* S5, review focus 2: a voice turn hides the layer mid-touch, and LVGL doesn't end a touch for a hide, so the gesture still comes to the
+ * layer. No close (no second on_close), no swipe, and the touch still ends with no tap. A card shown over it mid-touch is the same. */
+static void swipe_while_not_in_front_does_nothing(void) {
+    env_t e;
+    swipe_scene(&e);
+    int box = every_event_box(&e, 466);
+    static const struct {
+        int32_t x, dx;
+        const char *what;
+    } swipes[] = {{10, 120, "a right swipe from the edge"}, {330, -120, "a left swipe"}};
+    for (size_t i = 0; i < ARRAY_LEN(swipes); i++) {
+        n_evs = 0;
+        apps_lv_set_front(true);
+        log_clear();
+        CHECK(fake_down(swipes[i].x, 233) == box, "%s: the press is the box's", swipes[i].what);
+        apps_lv_set_front(false);  /* a voice turn, mid-touch */
+        for (int k = 1; k <= 8; k++) {
+            fake_move(swipes[i].x + swipes[i].dx * k / 8, 233);
+        }
+        CHECK(log_has_line("wait_release"), "%s: the gesture takes the touch\n%s", swipes[i].what, log_peek());
+        fake_lift();
+        CHECK(closes == 0 && strcmp(heard(), "0 press, 0 release") == 0, "%s, behind: %d closes, heard %s", swipes[i].what, closes, heard());
+    }
+    /* In front, with the crash card shown over the layer mid-touch. */
+    for (size_t i = 0; i < ARRAY_LEN(swipes); i++) {
+        n_evs = 0;
+        apps_lv_set_front(true);
+        CHECK(fake_down(swipes[i].x, 233) == box, "%s: the press is the box's", swipes[i].what);
+        apps_lv_show_crash("app", NULL);
+        CHECK(apps_lv_cards_shown(), "the card shows");
+        for (int k = 1; k <= 8; k++) {
+            fake_move(swipes[i].x + swipes[i].dx * k / 8, 233);
+        }
+        fake_lift();
+        CHECK(closes == 0 && strcmp(heard(), "0 press, 0 release") == 0, "%s, under a card: %d closes, heard %s", swipes[i].what, closes,
+              heard());
+        apps_lv_hide_cards();
+    }
+    FINISH(&e);
+}
+
+/* S5, review focus 3: a press on the bare layer outlives an app's reset (an alarm that launches another app mid-touch: lv_obj_clean takes
+ * the widgets, not the layer), and its gesture would reach the next app. It went down before the last reset, so nothing: no close,
+ * though it went down at the edge, and nothing heard. A press on a widget ends with its object (LVGL ends the touch). The next touch is
+ * the new app's, and from the edge it closes. */
+static void swipe_from_a_press_before_reset_is_dropped(void) {
+    env_t e;
+    swipe_scene(&e);
+    every_event_box(&e, 200);
+    CHECK(fake_down(10, 233) == 1, "the press at the edge is the bare layer's");
+    apps_lv_reset();
+    env_close(&e);
+    CHECK(env_open(&e, ASSETS, 2), "the next app");
+    int box = every_event_box(&e, 466);
+    log_clear();
+    for (int k = 1; k <= 8; k++) {
+        fake_move(10 + 15 * k, 233);
+    }
+    CHECK(log_has_line("wait_release"), "the gesture takes the touch\n%s", log_peek());
+    fake_lift();
+    CHECK(closes == 0 && n_evs == 0, "a press from before the reset: %d closes, heard %s", closes, heard());
+
+    /* A press on a widget: the reset deletes its object, and LVGL ends the touch there. */
+    CHECK(fake_down(233, 233) == box, "the press is the box's");
+    apps_lv_reset();
+    env_close(&e);
+    CHECK(env_open(&e, ASSETS, 2), "the app after");
+    box = every_event_box(&e, 466);
+    n_evs = 0;
+    for (int k = 1; k <= 8; k++) {
+        fake_move(233 + 15 * k, 233);
+    }
+    fake_lift();
+    CHECK(closes == 0 && n_evs == 0, "a press on a widget from before the reset: %d closes, heard %s", closes, heard());
+
+    /* The next touch is this app's. */
+    CHECK(swipe_from(10, 233, 120, 0) == box && closes == 1, "a right swipe from the edge after the reset: %d closes", closes);
+    fake_lift();
+    FINISH(&e);
+}
+
+/* A widget whose only handler is swipe takes the press (it is clickable, as any widget with a handler), and with it the swipe: a full-screen
+ * box made over a button takes the button's touches too (Stacking). The app's side calls only the swipe's handler. */
+static void swipe_only_widget_is_clickable(void) {
+    env_t e;
+    swipe_scene(&e);
+    RUN(&e, "got = {} t = ui.button{text = 'tap me'} t:on('tap', function() got[#got + 1] = 'tap' end)\n"
+            "s = ui.box{w = 466, h = 466} s:on('swipe', function(w, name, dir) got[#got + 1] = name .. ' ' .. dir end)");
+    CHECK(APPLY(&e), "made");
+    int box = fake_nth("obj", 1);
+    CHECK(fake_flag(box, LV_OBJ_FLAG_CLICKABLE) && fake_obj(box)->n_cbs == 5, "a swipe-only box: clickable %d, %d callbacks",
+          fake_flag(box, LV_OBJ_FLAG_CLICKABLE), fake_obj(box)->n_cbs);
+    CHECK(fake_tap_at(233, 233) == box, "the box takes the button's tap");
+    CHECK(swipe_from(330, 233, -120, 0) == box, "and the swipe");
+    fake_lift();
+    CHECK(strcmp(heard(), "1 press, 1 release, 1 tap, 1 press, 1 swipe left, 1 release") == 0, "heard %s", heard());
+    dispatch_all(&e);
+    RUN(&e, "local s = table.concat(got, ', ') assert(s == 'swipe left', s)");
     FINISH(&e);
 }
 
@@ -7195,11 +7509,6 @@ static lv_point_t box_at(int k) {
     fake_layout();
     const lv_area_t *a = &fake_obj(carousel_item(k))->area;
     return (lv_point_t){(a->x1 + a->x2 + 1) / 2, (a->y1 + a->y2 + 1) / 2};
-}
-
-/* A swipe from (x, y) by (dx, dy), in 8 reads, the finger still down; the id of what it began on. */
-static int swipe_from(int32_t x, int32_t y, int32_t dx, int32_t dy) {
-    return fake_drag(x, y, x + dx, y + dy, 8, 0);
 }
 
 /* ---- The pure parts ---- */
@@ -10909,7 +11218,7 @@ static void items_place_children_across(void) {
 
 /* A drag up or down on a scroll box scrolls it by the finger's movement; a fling goes on, losing 10% a frame; past an end the content
  * goes a quarter as far and springs back at the lift (LVGL's elastic edge); a sideways swipe scrolls nothing and still reaches the
- * layer, whose right swipe puts the app behind. */
+ * layer, which hands it to the app. */
 static void vertical_drag_scrolls_a_scroll_box(void) {
     env_t e;
     list_scene(&e, 10, false);  /* 500 px of rows in 200: it scrolls up to 300 */
@@ -10947,14 +11256,17 @@ static void vertical_drag_scrolls_a_scroll_box(void) {
     SETTLE();
     CHECK(fake_obj(list)->scroll_y == 0 && fake_obj(BOX_OBJ(1))->area.y1 == 133, "back to the top: %d", (int)fake_obj(list)->scroll_y);
 
-    /* Sideways: nothing scrolls, and the right swipe closes the app. */
+    /* Sideways: nothing scrolls, and the right swipe is the app's, the list's (it has no handler: the app's side finds one up from it),
+     * and doesn't close it (it began in the middle, not at the edge: S4). */
     closes = 0;
+    n_evs = 0;
     apps_lv_set_close_cb(on_close);
     fake_drag(150, 233, 300, 233, 10, 0);
     fake_lift();
     SETTLE();
-    CHECK(closes == 1 && fake_obj(list)->scroll_y == 0 && fake_obj(list)->scroll_x == 0, "a right swipe: %d closes, scrolled %d,%d",
-          closes, (int)fake_obj(list)->scroll_x, (int)fake_obj(list)->scroll_y);
+    CHECK(closes == 0 && fake_obj(list)->scroll_y == 0 && fake_obj(list)->scroll_x == 0 && strcmp(heard(), "0 swipe right") == 0,
+          "a right swipe: %d closes, scrolled %d,%d, heard %s", closes, (int)fake_obj(list)->scroll_x, (int)fake_obj(list)->scroll_y,
+          heard());
     apps_lv_set_close_cb(NULL);
     FINISH(&e);
 }
@@ -10978,22 +11290,37 @@ static void drag_on_a_row_scrolls_and_does_not_tap(void) {
     FINISH(&e);
 }
 
-/* A list whose rows all fit in it (3 of 50 px in a box 200 high) has nothing to scroll: LVGL takes a box for a drag only when what is in
- * it goes past its top or bottom (lv_indev_find_scroll_obj's st > 0 || sb > 0). So the same drag scrolls nothing, and its release taps
- * the row: the guide's Touches says so (the final review's M3). */
-static void drag_in_a_list_that_fits_taps_the_row(void) {
+/* Design 4: a drag up or down that scrolls a box (it holds more than it shows) is a scroll, not a swipe: LVGL sends no gesture while a drag
+ * scrolls, so the row under the finger hears press and release, and no swipe and no tap. With nothing to scroll (the rows fit), the same
+ * drag past LVGL's 50 px is a swipe up or down, the row's (S3: no tap); one of 40 px is neither, and taps the row, as LVGL clicks after a
+ * slide that isn't a gesture. */
+static void scroll_is_not_a_swipe(void) {
     env_t e;
-    list_scene(&e, 3, true);
+    list_scene(&e, 10, true);  /* 500 px of rows in 200 */
     int list = BOX_OBJ(0), row = BOX_OBJ(2);
-    int id = fake_drag(233, 200, 233, 120, 8, 1);
-    CHECK(id == row, "the drag began on %d, not row 2 (%d)", id, row);
-    CHECK(fake_obj(list)->scroll_y == 0 && !fake_scrolling(list), "a list that fits scrolled %d", (int)fake_obj(list)->scroll_y);
+    CHECK(fake_drag(233, 200, 233, 120, 8, 1) == row, "the drag began on row 2");
+    CHECK(fake_obj(list)->scroll_y == 80 && !log_has_line("wait_release"), "scrolled %d, and no gesture\n%s", (int)fake_obj(list)->scroll_y,
+          log_peek());
     fake_lift();
     SETTLE();
-    CHECK(n_evs == 3 && evs[0].event == APPS_UI_PRESS && evs[1].event == APPS_UI_RELEASE && evs[2].event == APPS_UI_TAP &&
-              evs[2].slot == 2,
-          "press, release, tap on row 2: %d events, the last %d of slot %d", n_evs, n_evs > 0 ? evs[n_evs - 1].event : -1,
-          n_evs > 0 ? evs[n_evs - 1].slot : -1);
+    CHECK(strcmp(heard(), "2 press, 2 release") == 0, "a scroll: heard %s", heard());
+    FINISH(&e);
+
+    list_scene(&e, 3, true);  /* 150 px of rows in 200: nothing to scroll */
+    list = BOX_OBJ(0);
+    row = BOX_OBJ(2);  /* y 183 to 232 */
+    static const struct {
+        int32_t to_y;
+        const char *heard;
+    } drags[] = {{120, "2 press, 2 swipe up, 2 release"}, {280, "2 press, 2 swipe down, 2 release"}, {160, "2 press, 2 release, 2 tap"}};
+    for (size_t i = 0; i < ARRAY_LEN(drags); i++) {
+        n_evs = 0;
+        CHECK(fake_drag(233, 200, 233, drags[i].to_y, 8, 1) == row, "to y %d: the drag began on row 2", (int)drags[i].to_y);
+        fake_lift();
+        SETTLE();
+        CHECK(fake_obj(list)->scroll_y == 0 && strcmp(heard(), drags[i].heard) == 0, "to y %d, in a list that fits: scrolled %d, heard %s",
+              (int)drags[i].to_y, (int)fake_obj(list)->scroll_y, heard());
+    }
     FINISH(&e);
 }
 
@@ -11676,6 +12003,14 @@ int main(int argc, char **argv) {
         {"many_sets_while_dark_apply_once", many_sets_while_dark_apply_once},
         {"swipe_right_closes", swipe_right_closes},
         {"a_swipe_that_starts_on_a_widget_ends_its_press", a_swipe_that_starts_on_a_widget_ends_its_press},
+        {"four_swipes_reach_the_widget_and_never_tap", four_swipes_reach_the_widget_and_never_tap},
+        {"edge_right_swipe_closes", edge_right_swipe_closes},
+        {"right_swipe_mid_screen_does_not_close", right_swipe_mid_screen_does_not_close},
+        {"slow_drag_still_taps", slow_drag_still_taps},
+        {"long_press_then_swipe", long_press_then_swipe},
+        {"swipe_while_not_in_front_does_nothing", swipe_while_not_in_front_does_nothing},
+        {"swipe_from_a_press_before_reset_is_dropped", swipe_from_a_press_before_reset_is_dropped},
+        {"swipe_only_widget_is_clickable", swipe_only_widget_is_clickable},
         {"button_shows_its_pressed_state", button_shows_its_pressed_state},
         {"front_and_back", front_and_back},
         {"reset_deletes_every_object", reset_deletes_every_object},
@@ -11760,7 +12095,7 @@ int main(int argc, char **argv) {
         {"items_place_children_across", items_place_children_across},
         {"vertical_drag_scrolls_a_scroll_box", vertical_drag_scrolls_a_scroll_box},
         {"drag_on_a_row_scrolls_and_does_not_tap", drag_on_a_row_scrolls_and_does_not_tap},
-        {"drag_in_a_list_that_fits_taps_the_row", drag_in_a_list_that_fits_taps_the_row},
+        {"scroll_is_not_a_swipe", scroll_is_not_a_swipe},
         {"still_touch_on_a_row_taps", still_touch_on_a_row_taps},
         {"scroll_to_end_after_filling_lands_at_the_end", scroll_to_end_after_filling_lands_at_the_end},
         {"rows_deleted_at_the_end_clamp_the_scroll", rows_deleted_at_the_end_clamp_the_scroll},

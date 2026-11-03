@@ -96,6 +96,7 @@ typedef struct {
     bool capped;       /* an image's: cap_turn is on obj */
     float reach;       /* a turned image's: how far from its centre its picture draws, in px on the screen; 0: no cap */
     bool scrolls;      /* a box's: it was made scrollable up and down (scroll = "y") */
+    bool notes_press;  /* a box's: on_app_press is on obj (from its first scroll = "y" on, once) */
     uint8_t layout, items, gap, pad;  /* a box's: what was last applied of them (a new object's: none, start, 0, 0) */
     uint32_t scroll_sets;  /* a box's: the widget's scroll_sets when its last scroll_to was applied, or dropped */
     /* What apply_style last gave LVGL of the widget's style (perf plan Task 4's PF2 b): a setter is called only for a value that
@@ -127,6 +128,15 @@ static state_t *s_state;
 static apps_lv_event_cb_t s_event_cb;
 static void (*s_close_cb)(void);
 static volatile bool s_front;
+/* Where the touch now down on the layer went down, for the edge's close (on_gesture), noted at the PRESSED of whatever on the layer took
+ * it (note_app_press); and the layer's resets, one up at each apps_lv_reset and apps_lv_build, with the count it went down at, so a press
+ * from before the last reset (on the bare layer, which a reset leaves) is told from the app's own. The LVGL task's plain data, in PSRAM
+ * (no internal RAM); not the launcher's C.press, which its card's touches keep. */
+static EXT_RAM_BSS_ATTR struct {
+    lv_point_t at;
+    uint32_t reset;   /* resets, when it went down */
+    uint32_t resets;
+} s_press;
 static bool s_reject_logged;     /* the app's first reject is in the log */
 static int64_t s_slow_next_log;  /* the esp_timer time a slow pass may be logged from (0: any) */
 static uint32_t s_slow_unlogged; /* slow passes since the last line, and the longest of them */
@@ -409,12 +419,32 @@ static void forget(state_t *st, int slot) {
 
 /* ---- Making objects ---- */
 
+/* The touch now pressing went down on the layer, or on an object in it: where (s_press). Called on the PRESSED of every object there that
+ * LVGL can press: the layer itself, a widget with a handler (on_touch) and a box with scroll = "y" (on_app_press), the only ones that are
+ * clickable, so every press on the layer is noted. */
+static void note_app_press(void) {
+    lv_indev_t *indev = lv_indev_active();
+    if (indev != NULL) {
+        lv_indev_get_point(indev, &s_press.at);
+        s_press.reset = s_press.resets;
+    }
+}
+
+/* The PRESSED of the layer, and of a box with scroll = "y", which is clickable with no handler (style_box). */
+static void on_app_press(lv_event_t *e) {
+    (void)e;
+    note_app_press();
+}
+
 static void on_touch(lv_event_t *e) {
     uint8_t bit = 0;
     switch (lv_event_get_code(e)) {
         case LV_EVENT_SHORT_CLICKED: bit = APPS_UI_TAP; break;
         case LV_EVENT_LONG_PRESSED: bit = APPS_UI_LONG_PRESS; break;
-        case LV_EVENT_PRESSED: bit = APPS_UI_PRESS; break;
+        case LV_EVENT_PRESSED:
+            note_app_press();
+            bit = APPS_UI_PRESS;
+            break;
         case LV_EVENT_RELEASED:
         case LV_EVENT_PRESS_LOST: bit = APPS_UI_RELEASE; break;  /* the lift after lv_indev_wait_release */
         default: return;
@@ -575,6 +605,7 @@ static made_t make_object(pass_t *p, int slot, int depth) {
     n->capped = false;
     n->reach = 0;
     n->scrolls = false;     /* new_object made it neither scrollable nor laid out, with no padding */
+    n->notes_press = false;
     n->layout = APPS_LAYOUT_NONE;
     n->items = APPS_ITEMS_START;
     n->gap = n->pad = 0;
@@ -892,7 +923,8 @@ static lv_flex_align_t items_of(uint8_t items) {
  * A box's scroll, layout, gap, pad and items, each called only when it differs from what the record says was applied. scroll = "y"
  * makes it scrollable up and down only, with LVGL's own scrollbar while its content is taller (AUTO), styled here (the theme's went
  * with lv_obj_remove_style_all), and the elastic edge and the throw lv_obj_constructor gave it; it is clickable whatever its
- * handlers, so a drag that begins on its own area finds it (LVGL's hit test passes over an object that isn't). "none" brings the
+ * handlers, so a drag that begins on its own area finds it (LVGL's hit test passes over an object that isn't), and its press is noted for
+ * the layer's swipe (on_app_press, once for the object, however often its scroll goes off and on). "none" brings the
  * content back to the top first, and leaves it clickable only for a handler. layout = "column" is LVGL's flex column (it sets
  * LV_LAYOUT_FLEX), the children across the box by items; "none" is no layout, which puts them back by their align, x and y. gap is
  * the column's pad_row, pad the four sides' padding (their declared setters: pad_all is inline).
@@ -909,6 +941,10 @@ static void style_box(const apps_widget_t *w, node_t *n) {
         lv_obj_set_style_bg_opa(obj, SCROLLBAR_OPA, LV_PART_SCROLLBAR);
         lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
         lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+        if (!n->notes_press) {
+            lv_obj_add_event_cb(obj, on_app_press, LV_EVENT_PRESSED, NULL);
+            n->notes_press = true;
+        }
     } else if (!scrolls && n->scrolls) {
         lv_obj_scroll_to_y(obj, 0, LV_ANIM_OFF);
         lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
@@ -1583,24 +1619,70 @@ void apps_lv_bench_dump_hold(uint32_t us) {
 
 /* ---- The layer ---- */
 
+static int slot_of(const lv_obj_t *obj);
+
+/* Whether a press at p begins the way out of the app: in the screen's left APPS_LV_CLOSE_EDGE_PX columns, inside its circle (the
+ * launcher's in_close_edge turned sideways: a lens at the left middle, y 104 to 362 at x 39). */
+static bool in_left_edge(lv_point_t p) {
+    int32_t dx = p.x - SCREEN_R, dy = p.y - SCREEN_R;
+    return p.x < APPS_LV_CLOSE_EDGE_PX && dx * dx + dy * dy <= SCREEN_R * SCREEN_R;
+}
+
+/* LVGL's way of a gesture as the app's (apps_ui.h), or -1 for none. */
+static int dir_of(lv_dir_t dir) {
+    switch (dir) {
+        case LV_DIR_LEFT: return APPS_UI_LEFT;
+        case LV_DIR_RIGHT: return APPS_UI_RIGHT;
+        case LV_DIR_TOP: return APPS_UI_UP;
+        case LV_DIR_BOTTOM: return APPS_UI_DOWN;
+        default: return -1;
+    }
+}
+
+/*
+ * Every swipe on the app, whatever it began on (its objects keep GESTURE_BUBBLE: only the layer stops one). It takes the touch first,
+ * whichever way it goes, so no swipe is ever also a tap (S3): the lift sends the pressed object PRESS_LOST and nothing else. Then nothing
+ * more while the app isn't in front or a card covers it (a voice turn that hid the layer mid-touch: LVGL doesn't end a touch for a hide),
+ * or for a press from before the last reset (S5). A right swipe whose press went down at the left edge puts the app behind (S4); any
+ * other is the app's, for the widget pressed (lv_indev_get_active_obj: PRESS_LOCK keeps it for the whole touch): the bare layer is no
+ * widget's, and the app's side takes it from the widget up to the nearest box with a swipe handler. On the LVGL task, deep in its input
+ * read: it posts and returns, and logs nothing.
+ */
 static void on_gesture(lv_event_t *e) {
     (void)e;
-    void (*close_cb)(void) = s_close_cb;
     lv_indev_t *indev = lv_indev_active();
-    if (close_cb == NULL || indev == NULL || lv_indev_get_gesture_dir(indev) != LV_DIR_RIGHT) {
+    if (indev == NULL) {
         return;
     }
-    lv_indev_wait_release(indev);  /* the rest of the touch is not for what shows under the layer */
-    close_cb();
+    lv_indev_wait_release(indev);  /* the rest of the touch is nobody's: not the widget's tap, nor what shows under the layer */
+    if (!s_front || apps_lv_cards_shown() || s_press.reset != s_press.resets) {
+        return;
+    }
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if (dir == LV_DIR_RIGHT && in_left_edge(s_press.at)) {
+        void (*close_cb)(void) = s_close_cb;
+        if (close_cb != NULL) {
+            close_cb();
+        }
+        return;
+    }
+    int way = dir_of(dir);
+    lv_obj_t *pressed = lv_indev_get_active_obj();
+    int slot = pressed != NULL ? slot_of(pressed) : -1;
+    apps_lv_event_cb_t cb = s_event_cb;
+    if (way >= 0 && slot >= 0 && cb != NULL) {
+        cb((uint16_t)slot, s_state->node[slot].gen, (uint8_t)APPS_UI_SWIPE_CODE(way));
+    }
 }
 
 void apps_lv_build(lv_obj_t *screen) {
     if (screen == NULL) {
         return;
     }
-    /* Records belong to the layer they were made on, and the cards to the screen. */
+    /* Records belong to the layer they were made on, and the cards to the screen; and a press to the layer it went down on. */
     apps_port_free(s_state);
     s_state = NULL;
+    s_press.resets++;
     s_reject_logged = false;
     s_front = false;
     s_screen = screen;
@@ -1625,6 +1707,7 @@ void apps_lv_build(lv_obj_t *screen) {
     /* A swipe bubbles up past an object to the screen unless the object stops it. */
     lv_obj_remove_flag(layer, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_event_cb(layer, on_gesture, LV_EVENT_GESTURE, NULL);
+    lv_obj_add_event_cb(layer, on_app_press, LV_EVENT_PRESSED, NULL);  /* a touch on no widget: where, for the edge */
     lv_obj_add_flag(layer, LV_OBJ_FLAG_HIDDEN);
     s_layer = layer;
 }
@@ -1653,6 +1736,7 @@ void apps_lv_reset(void) {
     }
     apps_port_free(s_state);
     s_state = NULL;
+    s_press.resets++;  /* a press still down on the layer was the last app's: its swipe is nobody's (on_gesture) */
     s_reject_logged = false;
 }
 

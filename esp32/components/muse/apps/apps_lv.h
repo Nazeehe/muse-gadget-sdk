@@ -105,10 +105,12 @@
  * (tap), LV_EVENT_LONG_PRESSED, LV_EVENT_PRESSED, LV_EVENT_RELEASED and LV_EVENT_PRESS_LOST (release), registered
  * once. LV_EVENT_CLICKED is not used: it follows a long press too. LVGL's order for a touch is PRESSED when the
  * finger goes down, then on the lift RELEASED, SHORT_CLICKED (when no long press was sent) and CLICKED: the app
- * hears press, release, tap, or press, long_press, release. When a swipe has taken the touch (the layer's
- * lv_indev_wait_release) the lift sends PRESS_LOST and nothing else, which is why that is a release too: a press
- * is never left open. The callback's user data is slot | gen << 16, and it calls the event callback with that slot
- * and gen, and the APPS_UI_* bit. It doesn't check the gen: an object deleted since can't send one, and an event
+ * hears press, release, tap, or press, long_press, release. Every swipe on the layer ends its press (the layer's
+ * lv_indev_wait_release, whichever way it goes: Swipes, below), and the lift then sends PRESS_LOST and nothing else,
+ * which is why that is a release too: a press is never left open, and a swipe is heard as press, swipe, release
+ * (press, long_press, swipe, release after a long press), never with a tap. The swipe itself is the layer's to send,
+ * not the widget's (Swipes). The callback's user data is slot | gen << 16, and it calls the event callback with that
+ * slot and gen, and the APPS_UI_* bit. It doesn't check the gen: an object deleted since can't send one, and an event
  * already queued meets Task 9's dispatch, which drops a slot that is gone or on another gen. An arc also gets a
  * guard that stops its own handling of a moving press: LVGL turns an arc's value to a finger on it, and the value
  * is the app's. It also keeps lv_arc's drag code, which divides by the radius, from ever running on an app's arc: an
@@ -122,8 +124,20 @@
  *
  * The layer. apps_lv_build makes it once, a child of the screen: black, clickable, not scrollable, hidden. It is
  * the only parent of the app's objects, and nothing else is put on it: apps_lv_reset cleans it. While it is
- * hidden (the app is behind) the pass still runs, so the layout is current when it comes to the front. A swipe
- * right on it (one that starts on a widget too: widgets pass a swipe up) calls the close callback.
+ * hidden (the app is behind) the pass still runs, so the layout is current when it comes to the front.
+ *
+ * Swipes. Every swipe on the app comes to the layer, whatever it began on (widgets pass a swipe up: only the layer stops one), as LVGL
+ * 9.5.0 makes it: a drag past 50 px on one axis, at 3 px or more a read (a slower drag is no swipe, and taps at the lift, as any slide
+ * that isn't one does), and never one that scrolls a box with scroll = "y" (LVGL sends no gesture while a drag scrolls). The layer
+ * takes the touch at once, whichever way the swipe goes (lv_indev_wait_release: no tap at the lift). Then nothing more while the layer
+ * is behind or a card is shown (a voice turn hides it, mid-touch too: LVGL doesn't end a touch for a hide), or for a press that went
+ * down before the last apps_lv_reset or apps_lv_build (an alarm's launch of another app mid-touch). Otherwise a right swipe whose press
+ * went down at x < APPS_LV_CLOSE_EDGE_PX, inside the circle (a lens at the left middle, y 104 to 362 at x 39), calls the close
+ * callback and nothing else; any other swipe calls the event callback with APPS_UI_SWIPE_CODE(dir), LV_DIR_LEFT, RIGHT, TOP and BOTTOM
+ * being APPS_UI_LEFT, RIGHT, UP and DOWN, for the slot and gen of the widget the touch pressed (the app's side takes it up to the
+ * nearest box with a swipe handler), and for nobody when it pressed the bare layer. Where the press went down is noted at the PRESSED
+ * of what took it: the layer, a widget with a handler or a box with scroll = "y", the only clickable objects on the layer. None of
+ * this logs.
  *
  * The table's owner. This file holds the pointer to the app's table, and the pass reads it only with the UI lock
  * held, so the app task can end safely: with the lock held it publishes NULL (apps_lv_set_ui), then frees the table.
@@ -158,14 +172,15 @@
  * gate (connected apps Task 1) set it: a longer step can't make a frame that takes longer to draw any faster. */
 #define APPS_SPIN_STEP_MS 33
 
-/* A touch: the widget's slot and gen (what the object was made for), and one APPS_UI_* bit. Called on the LVGL
- * task: post it and return. */
+/* A touch: the widget's slot and gen (what the object was made for), and one APPS_UI_* bit, or a swipe's
+ * APPS_UI_SWIPE_CODE(dir) (Swipes, above). Called on the LVGL task: post it and return. */
 typedef void (*apps_lv_event_cb_t)(uint16_t slot, uint16_t gen, uint8_t event);
 
 /* Makes the app layer on screen: full-screen, black, clickable, not scrollable and hidden. Once. */
 void apps_lv_build(lv_obj_t *screen);
 
-/* Where touches on widgets go (NULL: nowhere), and what a right swipe on the layer does (NULL: nothing). */
+/* Where touches and swipes on widgets go (NULL: nowhere), and what a right swipe from the layer's left edge does (NULL: nothing;
+ * Swipes, above). */
 void apps_lv_set_event_cb(apps_lv_event_cb_t cb);
 void apps_lv_set_close_cb(void (*cb)(void));
 
@@ -345,7 +360,9 @@ void apps_lv_bench_forced(void);
 #define APPS_LV_ICON_SIDE_SCALE 100  /* a neighbour's scale, of 256: about 39%, 63 px */
 #define APPS_LV_ITEM_PITCH 170       /* from one app's centre to the next's: the neighbours inside the circle, the next ones off it */
 #define APPS_LV_LAUNCHER_MAX 32      /* apps the carousel holds (the store's most); more are left out */
-#define APPS_LV_CLOSE_EDGE_PX 40     /* a swipe up closes the launcher when its press went down this close to the bottom */
+/* An edge's band, inside the circle: a swipe up whose press went down this close to the bottom closes the launcher, and a swipe right
+ * whose press went down this close to the left puts the app behind (Swipes, above). */
+#define APPS_LV_CLOSE_EDGE_PX 40
 #define APPS_LV_LAUNCH_HOLD_MS 3000  /* a pick holds the launcher at most this long for the app's first frame */
 #define APPS_LV_HOLD_KEEP 3          /* the icons a pick keeps through its hold: the centre's and one each side, those on the screen */
 

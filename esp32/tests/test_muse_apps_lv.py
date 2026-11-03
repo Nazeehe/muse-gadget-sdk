@@ -443,6 +443,47 @@ class HarnessTest(unittest.TestCase):
     def test_a_swipe_that_starts_on_a_widget_ends_its_press(self):  # F3
         self.run_case("a_swipe_that_starts_on_a_widget_ends_its_press")
 
+    # ---- Swipes for the app (swipes Task 2) ----
+
+    def test_four_swipes_reach_the_widget_and_never_tap(self):  # S1, S3: press, swipe <dir>, release, and fn(w, "swipe", dir)
+        self.run_case("four_swipes_reach_the_widget_and_never_tap")
+
+    def test_edge_right_swipe_closes(self):  # S4: x < APPS_LV_CLOSE_EDGE_PX inside the circle; each beside a twin just outside
+        self.run_case("edge_right_swipe_closes")
+
+    def test_right_swipe_mid_screen_does_not_close(self):  # S4: it is the app's
+        self.run_case("right_swipe_mid_screen_does_not_close")
+
+    def test_slow_drag_still_taps(self):  # review focus 4: under 3 px a read is no swipe
+        self.run_case("slow_drag_still_taps")
+
+    def test_long_press_then_swipe(self):  # review focus 4: long_press first
+        self.run_case("long_press_then_swipe")
+
+    def test_swipe_while_not_in_front_does_nothing(self):  # S5, review focus 2: hidden or under a card mid-touch
+        self.run_case("swipe_while_not_in_front_does_nothing")
+
+    def test_swipe_from_a_press_before_reset_is_dropped(self):  # S5, review focus 3: the press's reset stamp
+        self.run_case("swipe_from_a_press_before_reset_is_dropped")
+
+    def test_swipe_only_widget_is_clickable(self):  # a swipe handler alone takes the press
+        self.run_case("swipe_only_widget_is_clickable")
+
+    def test_the_swipe_logs_nothing_and_its_press_is_in_psram(self):
+        # The global constraints: no logging in LVGL's callbacks (the gesture and the presses run deep in its input read), and no
+        # internal RAM for the press and its reset stamp (ruling F2: the LVGL task's plain data, in PSRAM).
+        source = strip_c_comments(APPS_LV.read_text())
+        for signature in ("static void on_gesture(lv_event_t *e) {", "static void on_app_press(lv_event_t *e) {",
+                          "static void note_app_press(void) {", "static bool in_left_edge(lv_point_t p) {"):
+            with self.subTest(signature):
+                self.assertNotRegex(c_function(source, signature), r"ESP_LOG|printf")
+        self.assertRegex(source, r"static EXT_RAM_BSS_ATTR struct \{[^{}]*\blv_point_t at;[^{}]*\} s_press;")
+        # The edge is the launcher's band turned sideways: the same constant, the same circle.
+        self.assertIn("p.x < APPS_LV_CLOSE_EDGE_PX && dx * dx + dy * dy <= SCREEN_R * SCREEN_R",
+                      c_function(source, "static bool in_left_edge(lv_point_t p) {"))
+        self.assertIn("p.y >= SCREEN_PX - APPS_LV_CLOSE_EDGE_PX && dx * dx + dy * dy <= SCREEN_R * SCREEN_R",
+                      c_function(source, "static bool in_close_edge(lv_point_t p) {"))
+
     # ---- The layer, build and reset ----
 
     def test_front_and_back(self):
@@ -854,8 +895,8 @@ class HarnessTest(unittest.TestCase):
     def test_drag_on_a_row_scrolls_and_does_not_tap(self):  # Review Focus 5, finding 4: press, release, no tap
         self.run_case("drag_on_a_row_scrolls_and_does_not_tap")
 
-    def test_a_drag_in_a_list_that_fits_taps_the_row(self):  # the final review's M3: nothing to scroll, so LVGL clicks
-        self.run_case("drag_in_a_list_that_fits_taps_the_row")
+    def test_scroll_is_not_a_swipe(self):  # design 4; in a list that fits, past 50 px it is a swipe (S3), under it a tap (M3)
+        self.run_case("scroll_is_not_a_swipe")
 
     def test_still_touch_on_a_row_taps(self):  # under LVGL's scroll limit
         self.run_case("still_touch_on_a_row_taps")

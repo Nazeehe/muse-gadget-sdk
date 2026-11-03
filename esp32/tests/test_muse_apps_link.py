@@ -362,7 +362,9 @@ class GuideAndSkill(unittest.TestCase):
         reference = guide_section(GUIDE.read_text(), "API reference")
         self.assertRegex(reference, r'(?m)^- `ui\.button\{\.\.\.\}`: .*It shows itself pressed while touched\.$')
         lv = strip_c_comments((APPS / "apps_lv.c").read_text())
-        self.assertRegex(lv, r"case APPS_W_BUTTON:\s*style_surface\(w, obj\);\s*style_pressed\(w, obj\);")
+        # Perf plan Task 4: set with the rest of a new button's style (all), and again when its background changes.
+        self.assertRegex(lv, r"case APPS_W_BUTTON:\s*style_surface\(w, n, obj, all\);\s*if \(all \|\| n->bg != w->bg[^{]*\) \{\s*"
+                             r"style_pressed\(w, obj\);")
 
     def test_guide_says_how_widgets_stack_and_take_touches(self):
         # Muse's Flappy (2026-11-01) put a handler on every widget and lost its score under pipes it made later. apps_lv.c
@@ -1062,6 +1064,8 @@ class GuideAndSkill(unittest.TestCase):
         skips, lock_ms, slow_us = (number(lv, n) for n in ("MAX_CALLBACK_SKIPS", "LOCK_MS", "SLOW_US"))
         slow_frame, second = number(lv, "SLOW_FRAME_MS"), number(lv, "BENCH_SECOND_US")
         rest = number(lv, "SLOW_FRAME_REST_MS")
+        retry_ms = header_number("apps_lv.h", "APPS_APPLY_RETRY_MS")  # perf plan Task 4: a skipped frame's pass tried again
+        self.assertEqual(retry_ms, 5)
         margin, fill = number(mem_h, "MUSE_STACK_MARGIN"), number(mem_h, "MUSE_STACK_FILL")
         cpu, dma = number(mem_h, "MUSE_MEMTEST_BYTES"), number(mem_h, "MUSE_MEMTEST_DMA_BYTES")
         self.assertEqual((skips, lock_ms, slow_us, slow_frame, second, margin, fill), (3, 2, 2000, 50, 1000000, 256, 0xA5))
@@ -1086,7 +1090,9 @@ class GuideAndSkill(unittest.TestCase):
                 "applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us> "
                 "stack_peak=<path>:<bytes>`:",
                 f"the frames skipped while the app was in a call (at most {skips} in a row) and for a UI lock not free within "
-                f"{lock_ms} ms,",
+                f"{lock_ms} ms, each with its retry's skip when that is skipped too (a frame skipped either way has its pass tried once "
+                f"more {retry_ms} ms later, `APPS_APPLY_RETRY_MS`, and a retry that runs is a pass that ran: \"The apply step\" under "
+                "Muse apps),",
                 "the most time between the ends of two passes that changed something,",
                 "the longest the app task's dump of its table (`>app.status`) held the UI lock,",
                 "and the deepest stack path so far with the bytes it left free (`none:-1` before one is found).",
@@ -1119,6 +1125,60 @@ class GuideAndSkill(unittest.TestCase):
             with self.subTest(phrase[:50]):
                 self.assertIn(phrase, bench)
         self.assertEqual(second // 1000000, 1, "\"once a second\"")
+
+    def test_agents_md_has_the_apply_step_paragraph(self):
+        # Perf plan Task 4: the apply step's retry and its only-what-changed pass. D12: the frame (the 1.75C's frame_ms), the skips in a
+        # row, the lock's wait and the retry's delay are the code's, and the code has the shape the paragraph tells (one timer, made at
+        # the first skip; the app task's step as what it runs; its state in PSRAM; the same text dropped in w_set). The numbers measured
+        # on the board (2026-11-02, against f0a1b35's run in the perf plan's measurements) are measurements, pinned as they were written.
+        lv = strip_c_comments((APPS / "apps_lv.c").read_text())
+        number = lambda text, name: int(re.search(rf"(?m)^#define {name} (\d+)", text).group(1))
+        skips, lock_ms = number(lv, "MAX_CALLBACK_SKIPS"), number(lv, "LOCK_MS")
+        retry_ms = header_number("apps_lv.h", "APPS_APPLY_RETRY_MS")
+        board = (MUSE / "boards/board_waveshare_s3_175c.c").read_text()
+        frame_ms = int(re.search(r"\.frame_ms = (\d+),", board).group(1))
+        self.assertEqual((frame_ms, skips, lock_ms, retry_ms), (40, 3, 2, 5))
+        self.assertIn("s_retry.timer = lv_timer_create(on_retry, APPS_APPLY_RETRY_MS, NULL);", lv)
+        self.assertRegex(lv, r"static EXT_RAM_BSS_ATTR struct \{[^}]*\} s_retry;")
+        self.assertIn("apps_lv_set_retry_cb(apply_step);", (APPS / "apps_task.c").read_text())
+        self.assertIn("c.set &= ~BIT(P_TEXT);", c_function((APPS / "apps_ui.c").read_text(), "static int w_set(lua_State *L)"))
+        agents = (ROOT / "AGENTS.md").read_text()
+        section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
+        for phrase in (
+                f"**The apply step:** `frame_tick` (the board's `frame_ms`, {frame_ms} ms on the 1.75C) runs the app task's apply step "
+                "(`apply_step` in `apps_task.c`): a pass that puts what the app's calls changed onto LVGL (`apps_lv_apply`).",
+                f"The pass is skipped while the app is in a call, for at most {skips} frames in a row (`MAX_CALLBACK_SKIPS` in "
+                f"`apps_lv.c`; the next frame runs it anyway), and when the UI lock isn't free within {lock_ms} ms (`LOCK_MS`).",
+                f"A frame skipped either way has its pass tried once more {retry_ms} ms later (`APPS_APPLY_RETRY_MS` in `apps_lv.h`), "
+                "from one LVGL timer made at the first skip and kept, paused while no retry is armed.",
+                "At most one is armed; a retry that is skipped too arms nothing, leaves the pass to the next frame and isn't one of the "
+                "frames a call may hold it for; a pass, a build or a reset disarms it.",
+                "The bench counts a retry that runs as a pass (`applies`) and one that is skipped as a skip of its cause "
+                "(`skips=<in_call>/<lock_busy>`).",
+                "A pass sets only what changed: a text set to what it was marks nothing (`w_set` in `apps_ui.c`), and a widget's style "
+                "sets only the properties that changed since its last pass (its node keeps what was set), all of them at its first.",
+                "A font, a `text_align` or a `wrap` set still measures a label's text again; a colour alone measures nothing.",
+                "Measured on the 1.75C on 2026-11-02 (apps+bench build; Flappy with sound, two runs of 2 min of taps, against one at "
+                "f0a1b35, before the retry): frames of three skips in a row (about 160 ms) fell from 15 to 0, and frames of one skipped "
+                "tick (about 80 ms) from 14 to 3 and 2.",
+                "The slow frames of 75 ms or more outside its game overs fell from 34 to 16 and 13, the longest from 168 to 131 and 90 "
+                "ms, and a second with 10 to 20 in-call skips kept 20 to 26 refreshes, where before one fell to 9 or 13.",
+                f"A retry that runs a pass leaves the next frame {frame_ms - retry_ms} ms after it, and the app's ticks came about 36 ms "
+                "apart (about 30 calls a second, under 3 of them taps), so the next frame's pass can find nothing new and the frame is "
+                "lost a frame later instead: frames whose gap of 50 to 99 ms held one changed pass and one empty one (two passes of "
+                "about 3 ms in all) rose from 1 to 13 and 10.",
+                "The median of each second's average pass fell from 3,352 to 2,985 and 2,944 us, and of each second's longest (a pipe "
+                "pair made) from 6,651 to 5,369 and 5,402 us.",
+                "`whatsapp`'s first chat opened in a pass of 51,611 and 50,787 us against 57,394 (visits 23,862 and 22,912 against "
+                "28,015; its layout, 27,379 and 27,494 us against 28,986, barely moved).",
+                "Its 20 list drags were as before: 587 and 605 frames with a 95th percentile of 28 to 35 and 27 to 32 ms against 27 to "
+                "33, two frames over 50 ms in the first run (67 and 64 ms, each as a drag began, with the apply step idle) and none in "
+                "the second."):
+            with self.subTest(phrase[:50]):
+                self.assertIn(phrase, section)
+        # The bench's summary sends its reader here.
+        self.assertIn("\"The apply step\" under Muse apps", " ".join(agents[:agents.index("\n## Muse apps\n")].split()))
+        self.assertLess(section.index("**The apply step:**"), section.index("**Muse's touches:**"))
 
     def test_guide_icon_numbers_are_the_headers(self):
         # D12: the icon's size limit is APPS_ICON_MAX_PX, and its largest file is the LVGL header and that square of RGB565A8. The size

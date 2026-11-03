@@ -329,6 +329,26 @@ class HarnessTest(unittest.TestCase):
     def test_a_pass_with_no_memory_for_its_records_is_a_skip(self):
         self.run_case("a_pass_with_no_memory_is_a_skip")
 
+    # ---- Perf plan Task 4: the apply path (PF1 b, PF2) ----
+
+    def test_a_skipped_frame_is_tried_again_5_ms_later(self):  # PF1 b: a callback's skip or a busy lock's
+        self.run_case("a_skip_is_tried_again_soon")
+
+    def test_never_two_retries_armed(self):  # and the 3 frames a callback may hold the pass for are frames
+        self.run_case("never_two_retries_armed")
+
+    def test_a_busy_app_gets_one_retry_a_frame(self):  # Review Focus 2: bounded, no busy loop, every retry counted
+        self.run_case("a_busy_app_gets_one_retry_a_frame")
+
+    def test_the_same_text_marks_nothing(self):  # PF2 a
+        self.run_case("the_same_text_marks_nothing")
+
+    def test_a_restyle_measures_the_same_text_again(self):  # Review Focus 3
+        self.run_case("a_restyle_measures_the_same_text_again")
+
+    def test_a_style_change_calls_what_changed(self):  # PF2 b: a colour alone calls no font or long-mode setter
+        self.run_case("a_style_change_calls_what_changed")
+
     # ---- Perf plan Task 2: the bench's instruments, none of them in a build without the bench ----
 
     def test_a_build_without_the_bench_prints_no_apply_summary(self):
@@ -903,6 +923,12 @@ class BenchHarnessTest(unittest.TestCase):
     def test_no_memory_is_neither_skip(self):
         self.run_case("a_pass_with_no_memory_is_a_skip")
 
+    def test_a_retry_is_counted_as_what_it_was(self):  # perf plan Task 4, ruling P1: an apply, or a skip of its cause
+        self.run_case("a_skip_is_tried_again_soon")
+
+    def test_the_retry_stays_bounded_in_a_bench_build(self):  # Review Focus 2, with the stack paint around every pass
+        self.run_case("a_busy_app_gets_one_retry_a_frame")
+
     def test_the_slow_pass_says_where_its_time_went(self):
         self.run_case("slow_pass_phases")
 
@@ -1441,6 +1467,66 @@ class FakesTest(unittest.TestCase):
                      "lv_flex_align_t track_place = o->w == LV_SIZE_CONTENT ? LV_FLEX_ALIGN_START : o->flex_track;",
                      "abs_x += place_start(track_place, max_cross, track);"):
             self.assertIn(line, harness)
+
+    def test_a_restyle_measures_a_label_and_a_timer_runs_as_lvgl_9_5_0_has_them(self):
+        """Perf plan Task 4 rests on LVGL 9.5.0's own lines. Review Focus 3: a label's text is measured again
+        (lv_label_mark_need_refr_text) at lv_label_set_text, at lv_label_set_long_mode and at an LV_EVENT_STYLE_CHANGED, which
+        lv_obj_refresh_style sends for a property of the main part with LV_STYLE_PROP_FLAG_LAYOUT_UPDATE: text_font and text_align
+        have it, text_color doesn't. So a font, a text_align or a wrap set alone measures the same text again, and a colour alone
+        doesn't. The retry (PF1 b): a timer is made running, paused and resumed by a flag, reset to a whole period from now, and run
+        when it isn't paused and its period has gone since it last ran. The fake (the harness's lines) does the same."""
+        def code(path):
+            return _strip_comments((self.lvgl / path).read_text(errors="replace"))
+
+        def definition(text, signature):
+            return " ".join(c_function(text, signature + "\n{").split())
+
+        style = code("src/misc/lv_style.c")
+        self.assertRegex(style, r"\[LV_STYLE_TEXT_FONT\]\s*=\s*LV_STYLE_PROP_FLAG_INHERITABLE \| LV_STYLE_PROP_FLAG_LAYOUT_UPDATE,")
+        self.assertRegex(style, r"\[LV_STYLE_TEXT_ALIGN\]\s*=\s*LV_STYLE_PROP_FLAG_INHERITABLE \| LV_STYLE_PROP_FLAG_LAYOUT_UPDATE,")
+        self.assertRegex(style, r"\[LV_STYLE_TEXT_COLOR\]\s*=\s*LV_STYLE_PROP_FLAG_INHERITABLE,")
+        refresh = definition(code("src/core/lv_obj_style.c"),
+                             "void lv_obj_refresh_style(lv_obj_t * obj, lv_part_t part, lv_style_prop_t prop)")
+        for line in ("bool is_layout_refr = lv_style_prop_has_flag(prop, LV_STYLE_PROP_FLAG_LAYOUT_UPDATE);",
+                     "if(is_layout_refr) { if(part == LV_PART_ANY || part == LV_PART_MAIN ||",
+                     "lv_obj_send_event(obj, LV_EVENT_STYLE_CHANGED, NULL);"):
+            with self.subTest(line):
+                self.assertIn(line, refresh)
+        label = code("src/widgets/label/lv_label.c")
+        self.assertIn("if((code == LV_EVENT_STYLE_CHANGED) || (code == LV_EVENT_SIZE_CHANGED)) { lv_label_mark_need_refr_text(obj); }",
+                      " ".join(label.split()))
+        self.assertIn("lv_label_mark_need_refr_text(obj);",
+                      definition(label, "void lv_label_set_long_mode(lv_obj_t * obj, lv_label_long_mode_t long_mode)"))
+        self.assertIn("set_text_internal(obj, text);", definition(label, "void lv_label_set_text(lv_obj_t * obj, const char * text)"))
+        self.assertIn("lv_label_mark_need_refr_text(obj);", definition(label, "static void set_text_internal(lv_obj_t * obj, const char * text)"))
+        timer = code("src/misc/lv_timer.c")
+        create = definition(timer, "lv_timer_t * lv_timer_create(lv_timer_cb_t timer_xcb, uint32_t period, void * user_data)")
+        for line in ("new_timer->period = period;", "new_timer->timer_cb = timer_xcb;", "new_timer->repeat_count = -1;",
+                     "new_timer->paused = 0;", "new_timer->last_run = lv_tick_get();"):
+            with self.subTest(line):
+                self.assertIn(line, create)
+        self.assertIn("timer->paused = true;", definition(timer, "void lv_timer_pause(lv_timer_t * timer)"))
+        self.assertIn("timer->paused = false;", definition(timer, "void lv_timer_resume(lv_timer_t * timer)"))
+        self.assertIn("timer->last_run = lv_tick_get();", definition(timer, "void lv_timer_reset(lv_timer_t * timer)"))
+        self.assertIn("return timer->paused;", definition(timer, "bool lv_timer_get_paused(lv_timer_t * timer)"))
+        run = definition(timer, "static bool lv_timer_exec(lv_timer_t * timer)")
+        for line in ("if(timer->paused) return false;", "if(lv_timer_time_remaining(timer) == 0) {", "timer->last_run = lv_tick_get();",
+                     "if(timer->timer_cb && original_repeat_count != 0) {"):
+            with self.subTest(line):
+                self.assertIn(line, run)
+        self.assertIn("if(elp >= timer->period) return 0;", definition(timer, "static uint32_t lv_timer_time_remaining(lv_timer_t * timer)"))
+        # And the fake says the same (the harness's own lines).
+        harness = " ".join(strip_c_comments(HARNESS.read_text()).split())
+        for line in (".paused = false, .last_run_us = clock_us};", "timer->paused = true;", "timer->paused = false;",
+                     "timer->last_run_us = clock_us;", "if (!t->paused && clock_us - t->last_run_us >= (int64_t)t->period * 1000) {",
+                     'style_log(obj, "text_font", selector, "%s", value->name); need_refr_text(obj, selector);',
+                     'style_log(obj, "text_align", selector, "%s", names[value]); need_refr_text(obj, selector);',
+                     "obj->text = strdup(text); need_refr_text(obj, LV_PART_MAIN);",
+                     "obj->long_mode = long_mode; need_refr_text(obj, LV_PART_MAIN);"):
+            with self.subTest(line):
+                self.assertIn(line, harness)
+        self.assertNotIn("need_refr_text", c_function(strip_c_comments(HARNESS.read_text()),
+                                                      "void lv_obj_set_style_text_color(lv_obj_t *obj, lv_color_t value, lv_style_selector_t selector) {"))
 
     def test_apps_lv_compiles_against_the_real_headers(self):
         """The device build compiles apps_lv.c against these: every name, type and argument it uses is checked, a bench build's

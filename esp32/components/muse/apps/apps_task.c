@@ -1967,10 +1967,13 @@ static void show_cards(void) {
     }
 }
 
+static void apply_step(void);
+
 void muse_apps_ui_build(lv_obj_t *screen) {
     apps_lv_build(screen);
     apps_lv_set_event_cb(on_widget_event);
     apps_lv_set_close_cb(on_close);
+    apps_lv_set_retry_cb(apply_step);  /* a skipped pass's retry runs the step again (perf plan Task 4) */
 }
 
 void muse_apps_ui_pairing(void (*pairing)(bool on)) {
@@ -1996,19 +1999,26 @@ void muse_apps_ui_supervise(void) {
     apps_touch_supervise();        /* app.control tap and drag's: handed on at the first lit frame, answered once settled */
 }
 
+/* The apply step, frame_tick's (muse_apps_ui_tick) and its retry's (apps_lv_set_retry_cb: a skipped pass tried again), on the LVGL
+ * task: no pass while the app is hung, and apps_lv_apply told whether a call runs now. */
+static void apply_step(void) {
+    if (!atomic_load(&s_up) || atomic_load(&s_rec->hung)) {
+        return;
+    }
+    bool published = atomic_load(&s_rec->published) != 0;
+    bool passed = apps_lv_apply(published && atomic_load(&s_rec->in_call) != 0);
+    /* The app's first frame: a pass ran on its table with the layer in front (a skipped one isn't: the layer may be bare). The
+     * launcher that held over it closes now, before LVGL draws this frame. */
+    if (passed && apps_lv_front()) {
+        end_hold();
+    }
+}
+
 bool muse_apps_ui_tick(void) {
     if (!atomic_load(&s_up)) {
         return false;
     }
-    if (!atomic_load(&s_rec->hung)) {
-        bool published = atomic_load(&s_rec->published) != 0;
-        bool passed = apps_lv_apply(published && atomic_load(&s_rec->in_call) != 0);
-        /* The app's first frame: a pass ran on its table with the layer in front (a skipped one isn't: the layer may be bare). The
-         * launcher that held over it closes now, before LVGL draws this frame. */
-        if (passed && apps_lv_front()) {
-            end_hold();
-        }
-    }
+    apply_step();
 #if CONFIG_MUSE_BENCH
     apps_lv_bench_tick(s_calls_ended);  /* the apply summary, once a second while an app is in front */
 #endif

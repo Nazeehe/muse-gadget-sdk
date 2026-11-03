@@ -37,6 +37,8 @@
  * the deleted callback called each time. LVGL's own widget with an animation, lv_spinner, is here as lv_spinner.c has it (the
  * constructor's defaults, lv_spinner_set_anim_params's two animations with the bezier path) over an arc whose indicator angles
  * invalidate the box of the arc, which is more than LVGL's changed sector, so what a test says of a spinner holds for LVGL too.
+ * Its timers (lv_timer.c's, for the apply's retry) run when a case runs them and its clock says they are due, as lv_timer_exec
+ * runs them; a label counts each time its text is marked to be measured again (lv_label_mark_need_refr_text).
  */
 
 #include <stdarg.h>
@@ -76,6 +78,7 @@ typedef struct lv_indev lv_indev_t;
 typedef struct lv_event lv_event_t;
 typedef struct lv_event_dsc lv_event_dsc_t;
 typedef struct lv_style lv_style_t;
+typedef struct lv_timer lv_timer_t;
 
 typedef uint8_t lv_opa_t;
 typedef int32_t lv_value_precise_t;  /* LV_USE_FLOAT is off in every Muse build */
@@ -230,6 +233,9 @@ typedef enum {
 } lv_event_code_t;
 
 typedef void (*lv_event_cb_t)(lv_event_t *e);
+
+/* lv_timer.h: a timer's callback (the apply's retry, perf plan Task 4). */
+typedef void (*lv_timer_cb_t)(lv_timer_t *);
 
 /* lv_image.h: where an image sits in a box that is not its size (the others transform it, and are not used). */
 typedef enum {
@@ -463,6 +469,12 @@ lv_obj_t *lv_display_get_layer_top(lv_display_t *disp);
 lv_obj_t *lv_display_get_layer_sys(lv_display_t *disp);
 lv_obj_t *lv_display_get_layer_bottom(lv_display_t *disp);
 void lv_display_rotate_point(lv_display_t *disp, lv_point_t *point);
+
+lv_timer_t *lv_timer_create(lv_timer_cb_t timer_xcb, uint32_t period, void *user_data);
+void lv_timer_pause(lv_timer_t *timer);
+void lv_timer_resume(lv_timer_t *timer);
+void lv_timer_reset(lv_timer_t *timer);
+bool lv_timer_get_paused(lv_timer_t *timer);
 
 lv_indev_t *lv_indev_active(void);
 lv_dir_t lv_indev_get_gesture_dir(const lv_indev_t *indev);

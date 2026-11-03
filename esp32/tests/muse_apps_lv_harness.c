@@ -718,6 +718,10 @@ struct lv_obj {
     int arc_steps;               /* times either changed */
     uint32_t sp_ms, sp_sweep;    /* a spinner's lv_spinner_set_anim_params: duration (ms) and angle (degrees), 0 until set */
     lv_state_t state;            /* LV_STATE_DEFAULT until a press (lv_obj_event): fake_set_state */
+    int measures;                /* a label's: times its text was marked to be measured again (lv_label_mark_need_refr_text), by
+                                  * the calls apps_lv makes that mark it in LVGL 9.5.0: lv_label_set_text, lv_label_set_long_mode and
+                                  * a text_font or text_align of its main part (LAYOUT_UPDATE: LV_EVENT_STYLE_CHANGED). A size change,
+                                  * which marks it too, isn't counted */
     struct {                     /* its local style properties, each as its setter logs it, one for each property and selector */
         const char *prop;
         lv_style_selector_t sel;
@@ -884,6 +888,78 @@ static lv_obj_t *use(lv_obj_t *o, const char *fn, const char *cls) {
         return NULL;
     }
     return o;
+}
+
+/* ---- lv_timer: LVGL 9.5.0's (lv_timer.c), for the apply's retry (perf plan Task 4) ----
+ *
+ * A timer runs when a case runs the timers (run_timers_after_us: the clock moves on, then each one that is due runs), as lv_timer_exec
+ * runs it: not paused, and its period gone since it last ran, was made or was reset (lv_timer_reset). Made running (lv_timer_create),
+ * kept by fake_reset (LVGL's timers outlive a screen). Its calls read nothing of an app's table: they aren't object calls, so they
+ * neither cost the clock time nor count in lvgl_calls, and they are good without the UI lock. */
+struct lv_timer {
+    lv_timer_cb_t cb;
+    uint32_t period;      /* ms */
+    void *user_data;
+    bool paused;
+    int64_t last_run_us;  /* clock_us when it last ran, was made or was reset */
+};
+
+#define FAKE_TIMERS_MAX 4
+static lv_timer_t fake_timers[FAKE_TIMERS_MAX];
+static int n_fake_timers;
+static bool timer_create_fails;  /* lv_timer_create returns NULL, as LVGL does with no memory */
+
+lv_timer_t *lv_timer_create(lv_timer_cb_t timer_xcb, uint32_t period, void *user_data) {
+    if (timer_create_fails) {
+        return NULL;
+    }
+    if (n_fake_timers == FAKE_TIMERS_MAX) {
+        fake_error("more than %d timers made", FAKE_TIMERS_MAX);
+        return NULL;
+    }
+    lv_timer_t *t = &fake_timers[n_fake_timers++];
+    *t = (lv_timer_t){.cb = timer_xcb, .period = period, .user_data = user_data, .paused = false, .last_run_us = clock_us};
+    return t;
+}
+
+void lv_timer_pause(lv_timer_t *timer) {
+    timer->paused = true;
+}
+
+void lv_timer_resume(lv_timer_t *timer) {
+    timer->paused = false;
+}
+
+void lv_timer_reset(lv_timer_t *timer) {
+    timer->last_run_us = clock_us;
+}
+
+bool lv_timer_get_paused(lv_timer_t *timer) {
+    return timer->paused;
+}
+
+/* The clock moves on us, then every timer due runs (lv_timer_handler's walk, once). How many ran. */
+static int run_timers_after_us(int64_t us) {
+    clock_us += us;
+    int ran = 0;
+    for (int i = 0; i < n_fake_timers; i++) {
+        lv_timer_t *t = &fake_timers[i];
+        if (!t->paused && clock_us - t->last_run_us >= (int64_t)t->period * 1000) {
+            t->last_run_us = clock_us;
+            ran++;
+            if (t->cb != NULL) {
+                t->cb(t);
+            }
+        }
+    }
+    return ran;
+}
+
+/* lv_label_mark_need_refr_text, as the calls that do it in LVGL 9.5.0 reach it: a label's text to be measured again. */
+static void need_refr_text(lv_obj_t *obj, lv_style_selector_t selector) {
+    if (strcmp(obj->cls, "label") == 0 && (selector & 0xFF0000u) == LV_PART_MAIN) {
+        obj->measures++;
+    }
 }
 
 static const char *align_name(lv_align_t a) {
@@ -1771,6 +1847,7 @@ void lv_obj_set_style_text_font(lv_obj_t *obj, const lv_font_t *value, lv_style_
             return;
         }
         style_log(obj, "text_font", selector, "%s", value->name);
+        need_refr_text(obj, selector);  /* LAYOUT_UPDATE: lv_obj_refresh_style sends LV_EVENT_STYLE_CHANGED */
     }
 }
 
@@ -1788,6 +1865,7 @@ void lv_obj_set_style_text_align(lv_obj_t *obj, lv_text_align_t value, lv_style_
             return;
         }
         style_log(obj, "text_align", selector, "%s", names[value]);
+        need_refr_text(obj, selector);  /* LAYOUT_UPDATE, as text_font */
     }
 }
 
@@ -1827,6 +1905,7 @@ void lv_label_set_text(lv_obj_t *obj, const char *text) {
     }
     free(obj->text);
     obj->text = strdup(text);
+    need_refr_text(obj, LV_PART_MAIN);
     logline("text %d \"%s\"", obj->id, text);
 }
 
@@ -1839,6 +1918,7 @@ void lv_label_set_long_mode(lv_obj_t *obj, lv_label_long_mode_t long_mode) {
                        : long_mode == LV_LABEL_LONG_MODE_DOTS ? "dots"
                                                               : "other";
     obj->long_mode = long_mode;
+    need_refr_text(obj, LV_PART_MAIN);
     logline("long_mode %d %s", obj->id, name);
 }
 
@@ -4532,6 +4612,300 @@ static void skips_mid_callback_at_most_three_frames(void) {
     FINISH(&e);
 }
 
+/* ---- Perf plan Task 4 (PF1 b): a skipped frame's pass is tried again APPS_APPLY_RETRY_MS later, once ----
+ *
+ * The retry's callback here is what the app task's apply step is (muse_apps_ui_tick's, which apps_task.c hands apps_lv): apps_lv_apply
+ * with whether the app is in a callback now (retry_in_call, the case's), inside the step as apply_at has it. */
+static bool retry_in_call;
+static int retries_run;     /* the callback's runs */
+static bool retry_applied;  /* what its last apps_lv_apply said */
+
+static void retry_step(void) {
+    retries_run++;
+    apply_active = true;
+    retry_applied = apps_lv_apply(retry_in_call);
+    apply_active = false;
+}
+
+/* The apply's retry timer: the one timer apps_lv has made, or NULL. */
+static lv_timer_t *retry_timer(void) {
+    return n_fake_timers == 1 ? &fake_timers[0] : NULL;
+}
+
+/* A frame skipped in a callback, or for a lock that isn't free, arms one timer of APPS_APPLY_RETRY_MS (5 ms); when it runs, the apply
+ * step runs once more: the pass, if the callback has ended and the lock is free, and the timer is paused. A retry that applies is an
+ * apply, and one that is skipped is a skip of its cause (ruling P1), in the stats and in the bench's summary. With no callback given
+ * (apps_lv_set_retry_cb), nothing is armed: the skip waits for the next frame, as before. */
+static void a_skip_is_tried_again_soon(void) {
+    env_t e;
+    scene(&e);
+    retry_in_call = false;
+    RUN(&e, "a = ui.label{text = 'x'}");
+    CHECK(!APPLY_CB(&e) && n_fake_timers == 0, "no callback: nothing armed (%d timers)", n_fake_timers);
+    CHECK(APPLY(&e) && log_count("create label 2 in 1") == 1, "the next frame applies\n%s", log_peek());
+    log_clear();
+    apps_lv_set_retry_cb(retry_step);
+    stats_base = stats_now();
+#if CONFIG_MUSE_BENCH
+    second_begin();
+#endif
+    /* A frame in a callback: skipped, and the retry armed. */
+    RUN(&e, "a:set{text = 'y'}");
+    CHECK(!APPLY_CB(&e), "the frame is skipped");
+    lv_timer_t *t = retry_timer();
+    CHECK(t != NULL && APPS_APPLY_RETRY_MS == 5 && t->period == APPS_APPLY_RETRY_MS && !t->paused, "one timer of %d ms, armed: %d timers",
+          APPS_APPLY_RETRY_MS, n_fake_timers);
+    if (t == NULL) {
+        FINISH(&e);
+        return;
+    }
+    CHECK(run_timers_after_us(APPS_APPLY_RETRY_MS * 1000 - 1) == 0 && retries_run == 0, "not before 5 ms");
+    CHECK(run_timers_after_us(1) == 1 && retries_run == 1 && retry_applied, "the retry ran at 5 ms, and the callback had ended: applied");
+    CHECK(log_has_line("text 2 \"y\"") && stats_since().applies == 1 && stats_since().skips == 1, "applied: applies %u skips %u\n%s",
+          stats_since().applies, stats_since().skips, log_peek());
+    CHECK(t->paused && run_timers_after_us(1000000) == 0 && retries_run == 1, "once: nothing more runs");
+    log_clear();
+    /* A frame the lock isn't free for: the same, with the same timer. */
+    RUN(&e, "a:set{text = 'z'}");
+    trylock_refusals = 1;
+    CHECK(!APPLY(&e) && !t->paused && n_fake_timers == 1, "the lock busy: the retry armed");
+    CHECK(run_timers_after_us(5000) == 1 && retry_applied && log_has_line("text 2 \"z\""), "applied 5 ms later\n%s", log_peek());
+    /* A retry that finds the callback still running is a callback's skip; one the lock still isn't free for, a busy lock's. Either way
+     * the next frame decides. */
+    RUN(&e, "a:set{text = 'w'}");
+    retry_in_call = true;
+    CHECK(!APPLY_CB(&e) && run_timers_after_us(5000) == 1 && !retry_applied, "the retry is skipped: the callback still runs");
+    CHECK(t->paused, "and arms nothing");
+    CHECK(APPLY(&e) && log_has_line("text 2 \"w\""), "the next frame, out of the callback, applies\n%s", log_peek());
+    RUN(&e, "a:set{text = 'v'}");
+    retry_in_call = false;
+    trylock_refusals = 2;
+    CHECK(!APPLY(&e) && run_timers_after_us(5000) == 1 && !retry_applied, "the retry is skipped: the lock still busy");
+    CHECK(t->paused, "and arms nothing");
+    CHECK(APPLY(&e) && log_has_line("text 2 \"v\""), "the next frame applies\n%s", log_peek());
+    CHECK(stats_since().applies == 4 && stats_since().skips == 6, "applies %u skips %u", stats_since().applies, stats_since().skips);
+#if CONFIG_MUSE_BENCH
+    apply_line_t second = SECOND_END();
+    CHECK(second.applies == 4 && second.in_call == 3 && second.lock_busy == 3, "applies %u, skips %u/%u", second.applies,
+          second.in_call, second.lock_busy);
+#endif
+    apps_lv_set_retry_cb(NULL);
+    FINISH(&e);
+}
+
+/* At most one retry is armed: a frame skipped while one is armed leaves it as it is (due when it was), a retry that is skipped arms
+ * nothing, and a pass that runs, a reset and a new layer disarm it. The 3 frames a callback may hold the pass for are frames: its
+ * retries don't count toward them, so the 4th frame applies as before. One timer is made, once. */
+static void never_two_retries_armed(void) {
+    env_t e;
+    scene(&e);
+    apps_lv_set_retry_cb(retry_step);
+    retry_in_call = true;
+    RUN(&e, "a = ui.label{text = 'x'}");
+    /* No timer to be had (LVGL's memory): nothing armed, and the skip waits for the next frame, as before. */
+    timer_create_fails = true;
+    CHECK(!APPLY_CB(&e) && n_fake_timers == 0, "no timer: %d", n_fake_timers);
+    timer_create_fails = false;
+    CHECK(APPLY(&e) && log_count("create label 2 in 1") == 1 && retries_run == 0, "the next frame applies\n%s", log_peek());
+    log_clear();
+    stats_base = stats_now();
+    RUN(&e, "a:set{text = 'x2'}");
+    CHECK(!APPLY_CB(&e), "frame 1 skipped");
+    lv_timer_t *t = retry_timer();
+    CHECK(t != NULL && !t->paused, "armed");
+    if (t == NULL) {
+        FINISH(&e);
+        return;
+    }
+    int64_t armed_at = t->last_run_us;
+    clock_us += 3000;
+    CHECK(!APPLY_CB(&e), "frame 2, late, skipped before the retry ran");
+    CHECK(n_fake_timers == 1 && !t->paused && t->last_run_us == armed_at, "still one retry, due when it was");
+    CHECK(run_timers_after_us(2000) == 1 && retries_run == 1 && !retry_applied, "it ran 5 ms after the first skip, and was skipped");
+    CHECK(t->paused && run_timers_after_us(1000000) == 0 && retries_run == 1, "a retry that is skipped arms nothing");
+    CHECK(!APPLY_CB(&e), "frame 3 skipped");
+    CHECK(run_timers_after_us(5000) == 1 && retries_run == 2 && !retry_applied, "its retry skipped");
+    CHECK(APPLY_CB(&e) && log_has_line("text 2 \"x2\""), "the 4th frame applies anyway, as before\n%s", log_peek());
+    CHECK(t->paused && run_timers_after_us(1000000) == 0, "nothing armed after a pass");
+    CHECK(stats_since().skips == 5 && stats_since().applies == 1, "skips %u applies %u", stats_since().skips, stats_since().applies);
+    log_clear();
+    /* A frame out of the callback applies, and takes the armed retry with it. */
+    RUN(&e, "a:set{text = 'y'}");
+    CHECK(!APPLY_CB(&e) && !t->paused, "armed");
+    CHECK(APPLY(&e) && t->paused && log_has_line("text 2 \"y\""), "applied, and disarmed\n%s", log_peek());
+    CHECK(run_timers_after_us(1000000) == 0 && retries_run == 2, "nothing ran");
+    /* The app's end (the reset), and a new layer. */
+    RUN(&e, "a:set{text = 'z'}");
+    CHECK(!APPLY_CB(&e) && !t->paused, "armed");
+    apps_lv_reset();
+    CHECK(t->paused, "the reset disarms it");
+    CHECK(APPLY_CB(&e) == false && !t->paused, "armed again");
+    apps_lv_build(fake_screen());
+    CHECK(t->paused, "a new layer disarms it");
+    CHECK(n_fake_timers == 1, "one timer, made once: %d", n_fake_timers);
+    apps_lv_set_retry_cb(NULL);
+    FINISH(&e);
+}
+
+/* Review Focus 2: an app in a callback at every frame (one that never returns until the supervisor's 3 s, or one always busy), or a
+ * lock that is never free, under the retry: one retry a skipped frame and no more (no busy loop, LVGL's loop running every ms between
+ * the frames), every 4th frame applying as before, and every retry counted. */
+static void a_busy_app_gets_one_retry_a_frame(void) {
+    env_t e;
+    scene(&e);
+    apps_lv_set_retry_cb(retry_step);
+    retry_in_call = true;
+    RUN(&e, "a = ui.label{text = '0'}");
+    int ran = 0, skipped = 0, applied = 0;
+    for (int frame = 0; frame < 40; frame++) {
+        if (APPLY_CB(&e)) {
+            applied++;
+        } else {
+            skipped++;
+        }
+        for (int ms = 0; ms < 40; ms++) {
+            ran += run_timers_after_us(1000);
+        }
+    }
+    CHECK(applied == 10 && skipped == 30, "every 4th frame applies, as before: %d applied, %d skipped", applied, skipped);
+    CHECK(ran == 30 && retries_run == 30 && !retry_applied, "one retry a skipped frame and no more: %d ran", ran);
+    CHECK(stats_since().skips == 60 && stats_since().applies == 10, "every retry counted: skips %u applies %u", stats_since().skips,
+          stats_since().applies);
+    /* The lock never free. */
+    retry_in_call = false;
+    ran = 0;
+    long trylocks = trylock_calls;
+    trylock_refusals = 1000;
+    for (int frame = 0; frame < 10; frame++) {
+        CHECK(!APPLY(&e), "frame %d: the lock busy", frame);
+        for (int ms = 0; ms < 40; ms++) {
+            ran += run_timers_after_us(1000);
+        }
+    }
+    trylock_refusals = 0;
+    CHECK(ran == 10 && trylock_calls - trylocks == 20, "one retry a frame: %d ran, %ld trylocks", ran, trylock_calls - trylocks);
+    CHECK(n_fake_timers == 1, "one timer: %d", n_fake_timers);
+    CHECK(APPLY(&e), "the lock free: applied");
+    apps_lv_set_retry_cb(NULL);
+    FINISH(&e);
+}
+
+/* ---- Perf plan Task 4 (PF2): only what changed reaches LVGL ---- */
+
+/* The same text set again marks nothing (apps_ui's w:set compares it), so the pass sets no text and measures nothing; another text,
+ * of the same length or not, is set. A button's text too. */
+static void the_same_text_marks_nothing(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "a = ui.label{text = 'hello'} b = ui.button{text = 'go'}");
+    CHECK(APPLY(&e), "made");
+    lv_obj_t *label = fake_obj(2), *text = fake_obj(4);
+    CHECK(strcmp(label->cls, "label") == 0 && strcmp(text->cls, "label") == 0 && text->parent == fake_obj(3), "the labels");
+    int la = label->measures, lb = text->measures;
+    log_clear();
+    RUN(&e, "a:set{text = 'hello'} b:set{text = 'go'}");
+    CHECK(W(&e, 0)->dirty == 0 && W(&e, 1)->dirty == 0, "the same text sets no bit: %u %u", W(&e, 0)->dirty, W(&e, 1)->dirty);
+    CHECK(APPLY(&e), "the pass ran");
+    LOG_EMPTY();
+    CHECK(label->measures == la && text->measures == lb, "nothing measured");
+    RUN(&e, "a:set{text = 'hellp'}");
+    CHECK(W(&e, 0)->dirty == APPS_DIRTY_TEXT && APPLY(&e) && log_has_line("text 2 \"hellp\"") && label->measures == la + 1,
+          "the same length, other bytes: set\n%s", log_peek());
+    RUN(&e, "a:set{text = 'hell'} b:set{text = 'stop'}");
+    CHECK(APPLY(&e) && log_has_line("text 2 \"hell\"") && log_has_line("text 4 \"stop\""), "another length: set\n%s", log_peek());
+    log_clear();
+    RUN(&e, "a:set{text = ''}");
+    CHECK(APPLY(&e) && log_has_line("text 2 \"\""), "empty: set\n%s", log_peek());
+    log_clear();
+    RUN(&e, "a:set{text = ''}");
+    CHECK(W(&e, 0)->dirty == 0 && APPLY(&e), "empty again: no bit");
+    LOG_EMPTY();
+    FINISH(&e);
+}
+
+/* Review Focus 3: a restyle that changes how a label's text lays out still measures it, with its text set again or not. A font, a
+ * text_align (both LAYOUT_UPDATE in LVGL 9.5.0: lv_obj_refresh_style sends LV_EVENT_STYLE_CHANGED, which marks the text) or a wrap
+ * (lv_label_set_long_mode marks it) calls its setter, which marks the label's text to be measured again (FakesTest reads those lines
+ * in LVGL's tree), even when the same text comes with it: the text isn't set again, and needn't be. A button's font, on its label. */
+static void a_restyle_measures_the_same_text_again(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "a = ui.label{text = 'hello', w = 100} b = ui.button{text = 'go'}");
+    CHECK(APPLY(&e), "made");
+    lv_obj_t *label = fake_obj(2), *text = fake_obj(4);
+    int m = label->measures;
+    log_clear();
+    RUN(&e, "a:set{font = 'sans28', text = 'hello'}");
+    CHECK(W(&e, 0)->dirty == APPS_DIRTY_STYLE, "a style, no text: %u", W(&e, 0)->dirty);
+    CHECK(APPLY(&e) && log_has_line("text_font 2 montserrat_28") && log_count("text 2 ") == 0, "the font set, no text\n%s", log_peek());
+    CHECK(label->measures == m + 1, "measured again: %d", label->measures - m);
+    log_clear();
+    RUN(&e, "a:set{text = 'hello'}");
+    CHECK(APPLY(&e), "the same text, later");
+    LOG_EMPTY();
+    CHECK(label->measures == m + 1, "nothing more to measure");
+    RUN(&e, "a:set{wrap = true, text = 'hello'}");
+    CHECK(APPLY(&e) && log_has_line("long_mode 2 wrap") && log_count("text 2 ") == 0 && label->measures == m + 2,
+          "a wrap measures it again\n%s", log_peek());
+    log_clear();
+    RUN(&e, "a:set{text_align = 'left'}");
+    CHECK(APPLY(&e) && log_has_line("text_align 2 left") && label->measures == m + 3, "a text_align measures it again\n%s", log_peek());
+    log_clear();
+    int t = text->measures;
+    RUN(&e, "b:set{font = 'sans14', text = 'go'}");
+    CHECK(APPLY(&e) && log_has_line("text_font 4 montserrat_14") && log_count("text 4 ") == 0 && text->measures == t + 1,
+          "a button's font measures its label again\n%s", log_peek());
+    FINISH(&e);
+}
+
+/* What a style change calls of LVGL is what changed: a label's colour alone calls no font, text_align, long mode, opacity or flag
+ * setter (and measures nothing); a button's colour, its label's colour alone (its pressed fill follows its background); a box's
+ * background, its fill; a turn of an image (Flappy's bird, every tick), its angle alone: no picture, scale, size or place. */
+static void a_style_change_calls_what_changed(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "a = ui.label{text = 'x'} b = ui.button{text = 'go'} c = ui.box{bg = '#112233'} d = ui.arc{} f = ui.bar{} "
+            "g = ui.image{src = 'a.bin', rotation = 10}");
+    CHECK(APPLY(&e), "made");
+    lv_obj_t *label = fake_obj(2);
+    int m = label->measures;
+    log_clear();
+    RUN(&e, "a:set{color = '#ff0000'}");
+    CHECK(APPLY(&e), "a's colour");
+    LOG_IS("text_color 2 #ff0000\nupdate_layout 1\n");
+    CHECK(label->measures == m, "nothing measured");
+    RUN(&e, "b:set{color = '#00ff00'}");
+    CHECK(APPLY(&e), "b's colour");
+    LOG_IS("text_color 4 #00ff00\nupdate_layout 1\n");
+    RUN(&e, "b:set{bg = '#000000'}");
+    CHECK(APPLY(&e), "b's background");
+    LOG_IS("bg_color 3 #000000\nbg_color 3 #4c4c4c pressed\nbg_opa 3 255 pressed\nupdate_layout 1\n");
+    RUN(&e, "c:set{bg = '#445566'}");
+    CHECK(APPLY(&e), "c's background");
+    LOG_IS("bg_color 5 #445566\nupdate_layout 1\n");
+    RUN(&e, "c:set{bg = 'none'}");
+    CHECK(APPLY(&e), "c's background gone");
+    LOG_IS("bg_opa 5 0\nupdate_layout 1\n");
+    RUN(&e, "d:set{color = '#0000ff'}");
+    CHECK(APPLY(&e), "d's colour");
+    LOG_IS("arc_color 6 #0000ff indicator\nupdate_layout 1\n");
+    RUN(&e, "f:set{color = '#0000ff'}");
+    CHECK(APPLY(&e), "f's colour");
+    LOG_IS("bg_color 7 #0000ff indicator\nupdate_layout 1\n");
+    RUN(&e, "g:set{rotation = 20}");
+    CHECK(APPLY(&e), "g turned");
+    LOG_IS("image_rotation 8 200\nupdate_layout 1\n");
+    RUN(&e, "a:set{opacity = 50} c:set{hidden = true}");
+    CHECK(APPLY(&e), "an opacity and a flag");
+    LOG_IS("opa 2 127\nadd_flag 5 hidden\nupdate_layout 1\n");
+    /* A change back is a change: what LVGL has is what the record says. */
+    RUN(&e, "a:set{color = '#ffffff'} g:set{src = 'b.bin'}");
+    CHECK(APPLY(&e) && log_has_line("text_color 2 #ffffff") && log_has_line("image_src 8 3x2 cf=0x0e data=8") &&
+              log_count("size 8 ") == 1 && log_count("align 8 ") == 1,
+          "a colour back, a picture: set, and the picture's box laid out\n%s", log_peek());
+    FINISH(&e);
+}
+
 static void lock_discipline(void) {
     env_t e;
     scene(&e);
@@ -5648,6 +6022,8 @@ static const apps_asset_t ASSETS_FORMATS[] = {{"a.bin", IMG_A, sizeof IMG_A, 2, 
 
 /* LVGL draws an A8 image as a mask filled with the image recolor, which is black unless it is set: invisible on the layer's
  * black. So an A8 image gets white, in full. RGB565 and RGB565A8 have their own colours and are left alone. */
+static const char *fake_style_of(int id, const char *prop, lv_style_selector_t sel);
+
 static void a8_images_are_white(void) {
     env_t e;
     scene_with(&e, ASSETS_FORMATS, 3);
@@ -5662,12 +6038,17 @@ static void a8_images_are_white(void) {
     snprintf(line, sizeof line, "image_recolor_opa %d 255", a8);
     HAS(line);
     CHECK(log_count("image_recolor") == 2, "no other image is recoloured\n%s", log_peek());
-    /* It is the image's style, so a change of style that applies the style again gives the same. */
+    /* It is the image's style, and it stays as it was set: a change of another of its styles sets that alone (perf plan Task 4), and
+     * the image is still white. */
     log_clear();
     RUN(&e, "b:set{opacity = 50}");
     CHECK(APPLY(&e), "changed");
-    snprintf(line, sizeof line, "image_recolor_opa %d 255", a8);
+    snprintf(line, sizeof line, "opa %d 127", a8);
     HAS(line);
+    CHECK(log_count("image_recolor") == 0, "the recolor isn't set again\n%s", log_peek());
+    const char *recolor = fake_style_of(a8, "image_recolor", LV_PART_MAIN), *recolor_opa = fake_style_of(a8, "image_recolor_opa", LV_PART_MAIN);
+    CHECK(recolor != NULL && strcmp(recolor, "#ffffff") == 0 && recolor_opa != NULL && strcmp(recolor_opa, "255") == 0,
+          "still white: %s at %s", recolor != NULL ? recolor : "none", recolor_opa != NULL ? recolor_opa : "none");
 
     /* A src that is not A8 any more is drawn as it is: the recolor that was set goes (opacity 0), and is not set again by a
      * later change of style. And when it is A8 again it is white again. */
@@ -11285,6 +11666,12 @@ int main(int argc, char **argv) {
         {"create_pending_has_no_object", create_pending_has_no_object},
         {"a_create_that_fails_is_tried_again", a_create_that_fails_is_tried_again},
         {"skips_mid_callback_at_most_three_frames", skips_mid_callback_at_most_three_frames},
+        {"a_skip_is_tried_again_soon", a_skip_is_tried_again_soon},
+        {"never_two_retries_armed", never_two_retries_armed},
+        {"a_busy_app_gets_one_retry_a_frame", a_busy_app_gets_one_retry_a_frame},
+        {"the_same_text_marks_nothing", the_same_text_marks_nothing},
+        {"a_restyle_measures_the_same_text_again", a_restyle_measures_the_same_text_again},
+        {"a_style_change_calls_what_changed", a_style_change_calls_what_changed},
         {"apply_summary_once_a_second", apply_summary_once_a_second},
         {"slow_pass_phases", slow_pass_phases},
         {"slow_frame_anatomy", slow_frame_anatomy},

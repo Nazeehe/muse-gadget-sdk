@@ -194,8 +194,22 @@ void apps_lv_set_ui(apps_ui_t *ui);
  * no callback can run without one.
  * A pass that took more than 2 ms counts slow, every time, and logs at most one line a second:
  * "apply %u us (%u slow since last)", the longest of the slow passes since the last line and how many there were.
+ * A frame's pass skipped mid-callback or for the lock is tried again once, APPS_APPLY_RETRY_MS later (below).
  */
 bool apps_lv_apply(bool in_callback);
+
+/*
+ * The retry of a skipped pass (perf plan Task 4, PF1 b), on the LVGL task. When a frame's pass is skipped mid-callback or for a lock
+ * not free within 2 ms, one LVGL timer of APPS_APPLY_RETRY_MS is armed (made at the first skip and kept, paused while no retry is
+ * armed), and when it runs it calls cb once: the app task's apply step, the one frame_tick's muse_apps_ui_tick runs, which calls
+ * apps_lv_apply again with whether a callback runs now. At most one retry is armed: a frame skipped while one is, leaves it as it is.
+ * Inside the retry, a skip arms nothing and isn't one of the 3 frames a callback may hold the pass for: the next frame decides. A
+ * pass that runs, apps_lv_reset and apps_lv_build disarm it. The retry's pass is an apply, and its skip a skip of its cause, in
+ * apps_lv_stats and in the bench's summary. With no cb (NULL, before muse_apps_ui_build) or no timer to be had, nothing is armed and
+ * a skip waits for the next frame.
+ */
+#define APPS_APPLY_RETRY_MS 5
+void apps_lv_set_retry_cb(void (*cb)(void));
 
 /* Deletes every app object and forgets them, and puts the layer back to black. Call it when an app ends, with its
  * table no longer published, on the LVGL task. Whether the layer is in front is not changed. */
@@ -245,10 +259,11 @@ void apps_lv_stats(apps_lv_stats_t *out);
  * count). Once a second while an app is in front, with no launcher or card over it, it prints (the muse_apps tag)
  *     apply: calls=<n> applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us>
  *            stack_peak=<path>:<bytes>
- * on one line: the calls ended in the second, the passes that ran, the frames skipped mid-callback and for a lock not free within
- * 2 ms, the display's refreshes, the most time between the ends of two passes that changed something, the passes' average and
- * longest time, the longest hold of the UI lock apps_lv_bench_dump_hold told, and the deepest stack path so far and what it left
- * free: the since-boot record of the painted paths alone (muse_bench_mem.h; "none:-1" before there is one).
+ * on one line: the calls ended in the second, the passes that ran (a frame's or its retry's), the passes skipped mid-callback and for
+ * a lock not free within 2 ms (a frame's or its retry's: apps_lv_set_retry_cb), the display's refreshes, the most time between the
+ * ends of two passes that changed something, the passes' average and longest time, the longest hold of the UI lock
+ * apps_lv_bench_dump_hold told, and the deepest stack path so far and what it left free: the since-boot record of the painted paths
+ * alone (muse_bench_mem.h; "none:-1" before there is one).
  * apps_lv_bench_dump_hold: the app task's, with the UI lock held, after it dumped the table under it (us: how long it held it).
  */
 void apps_lv_bench_tick(uint32_t calls);

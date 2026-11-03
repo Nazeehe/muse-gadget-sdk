@@ -99,6 +99,18 @@ typedef struct {
     bool scrolls;      /* a box's: it was made scrollable up and down (scroll = "y") */
     uint8_t layout, items, gap, pad;  /* a box's: what was last applied of them (a new object's: none, start, 0, 0) */
     uint32_t scroll_sets;  /* a box's: the widget's scroll_sets when its last scroll_to was applied, or dropped */
+    /* What apply_style last gave LVGL of the widget's style (perf plan Task 4's PF2 b): a setter is called only for a value that
+     * differs from it, since LVGL's setters don't compare (each one refreshes the style: an invalidation, and for a font, a
+     * text_align or a border a layout, which measures a label's text again). styled false: nothing yet, so every one is set (a new
+     * object). */
+    bool styled;
+    bool hidden, wrap;
+    uint8_t opacity, font, text_align, border, thickness;
+    int16_t radius;
+    uint32_t color, bg, border_color, track_color;
+    int16_t image;    /* an image's: the src and scale its picture was set from, */
+    uint16_t scale;
+    bool turned;      /* and whether it turned (a rotation or spin not 0) when its reach was worked out */
 } node_t;
 
 /* The records of the app on the layer, and the descriptors its images are drawn from: one block, from the apps'
@@ -123,6 +135,12 @@ static uint32_t s_slow_unlogged; /* slow passes since the last line, and the lon
 static int64_t s_slow_worst_us;
 
 static volatile uint32_t s_applies, s_skips, s_rejects, s_refused, s_slow;
+/* The retry of a frame's skipped pass (apps_lv_set_retry_cb, perf plan Task 4's PF1 b): the LVGL task's. */
+static EXT_RAM_BSS_ATTR struct {
+    lv_timer_t *timer;  /* made at the first skip and kept; paused while no retry is armed */
+    void (*cb)(void);   /* what it runs: the app task's apply step, which calls apps_lv_apply */
+    bool running;       /* inside it: a skip arms nothing, and isn't one of the frames a callback may hold the pass for */
+} s_retry;
 /* The images whose spin animates now: one up as an animation starts, one down in its deleted callback, which LVGL calls however it
  * goes (apps_lv's delete, or its object's). The LVGL task's alone; read by apps_lv_stats on any task. */
 static EXT_RAM_BSS_ATTR volatile uint32_t s_spinning;
@@ -557,6 +575,7 @@ static made_t make_object(pass_t *p, int slot, int depth) {
     n->items = APPS_ITEMS_START;
     n->gap = n->pad = 0;
     n->scroll_sets = 0;     /* a scroll_to made with the box is still to apply */
+    n->styled = false;      /* new_object took every style off: the first STYLE sets them all */
     w->dirty = (w->dirty & ~(uint32_t)APPS_DIRTY_CREATE) | groups_of_new(w);
     p->changed = true;
 #if CONFIG_MUSE_BENCH
@@ -593,22 +612,40 @@ static void apply_geom(const pass_t *p, const apps_widget_t *w, lv_obj_t *obj) {
     lv_obj_align(obj, align_of(w->align), w->x, w->y);
 }
 
-static void style_text(const apps_widget_t *w, lv_obj_t *text) {
-    lv_obj_set_style_text_font(text, font_of(w->font), LV_PART_MAIN);
-    lv_obj_set_style_text_color(text, colour(w->color), LV_PART_MAIN);
+/* In the style helpers below, n is what was last set (node_t) and all says nothing was yet: each value is set when all, or when it
+ * differs from n's. apply_style brings n up to date after them. */
+
+/* A label's text, or a button's: its font and colour. A font set measures the text again (LVGL: LV_EVENT_STYLE_CHANGED). */
+static void style_text(const apps_widget_t *w, const node_t *n, lv_obj_t *text, bool all) {
+    if (all || n->font != w->font) {
+        lv_obj_set_style_text_font(text, font_of(w->font), LV_PART_MAIN);
+    }
+    if (all || n->color != w->color) {
+        lv_obj_set_style_text_color(text, colour(w->color), LV_PART_MAIN);
+    }
 }
 
 /* The surface of a box or button: its fill, corners and border. */
-static void style_surface(const apps_widget_t *w, lv_obj_t *obj) {
-    if (w->bg == APPS_COLOR_NONE) {
-        lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
-    } else {
-        lv_obj_set_style_bg_color(obj, colour(w->bg), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+static void style_surface(const apps_widget_t *w, const node_t *n, lv_obj_t *obj, bool all) {
+    if (all || n->bg != w->bg) {
+        if (w->bg == APPS_COLOR_NONE) {
+            lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+        } else {
+            lv_obj_set_style_bg_color(obj, colour(w->bg), LV_PART_MAIN);
+            if (all || n->bg == APPS_COLOR_NONE) {
+                lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+            }
+        }
     }
-    lv_obj_set_style_radius(obj, radius_of(w->radius), LV_PART_MAIN);
-    lv_obj_set_style_border_width(obj, w->border, LV_PART_MAIN);
-    lv_obj_set_style_border_color(obj, colour(w->border_color), LV_PART_MAIN);
+    if (all || n->radius != w->radius) {
+        lv_obj_set_style_radius(obj, radius_of(w->radius), LV_PART_MAIN);
+    }
+    if (all || n->border != w->border) {
+        lv_obj_set_style_border_width(obj, w->border, LV_PART_MAIN);
+    }
+    if (all || n->border_color != w->border_color) {
+        lv_obj_set_style_border_color(obj, colour(w->border_color), LV_PART_MAIN);
+    }
 }
 
 /* How a button shows the finger on it: LVGL gives an object LV_STATE_PRESSED from the press to the release (or to a drag
@@ -634,11 +671,19 @@ static void style_pressed(const apps_widget_t *w, lv_obj_t *obj) {
     lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, pressed);
 }
 
-/* A bar's track (LV_PART_MAIN) or its indicator: a filled, rounded bar. */
-static void style_bar_part(lv_obj_t *obj, uint32_t rgb, int32_t radius, lv_style_selector_t part) {
-    lv_obj_set_style_bg_color(obj, colour(rgb), part);
-    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, part);
-    lv_obj_set_style_radius(obj, radius, part);
+/* A bar's track (LV_PART_MAIN) or its indicator: a filled, rounded bar. Its colour when all or recolour, its fill once (all), its
+ * corners when all or reshape. */
+static void style_bar_part(lv_obj_t *obj, uint32_t rgb, int32_t radius, lv_style_selector_t part, bool recolour, bool reshape,
+                           bool all) {
+    if (all || recolour) {
+        lv_obj_set_style_bg_color(obj, colour(rgb), part);
+    }
+    if (all) {
+        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, part);
+    }
+    if (all || reshape) {
+        lv_obj_set_style_radius(obj, radius, part);
+    }
 }
 
 /*
@@ -702,18 +747,38 @@ static void cap_turn(lv_event_t *e) {
     }
 }
 
-/* An image's picture: its descriptor, its scale and the A8 recolor; and, turned, how far it draws (cap_turn). */
-static void apply_image(pass_t *p, const apps_widget_t *w, node_t *n) {
+/* Whether an image's src or scale differs from what its picture was set from, or nothing was set yet: the picture is set again, and
+ * its box laid out again (visit_live). */
+static bool picture_changes(const apps_widget_t *w, const node_t *n) {
+    return !n->styled || n->image != w->image || n->scale != w->scale;
+}
+
+/*
+ * An image's picture: its descriptor, its scale and the A8 recolor, set only when picture_changes (a runtime image's slot holds the
+ * same picture for as long as an object draws it: the runtime frees an image, and gives its slot to the next, only once the pass's
+ * report says no object draws the slot, so the slot's index says the picture); and, turned, how far it draws (cap_turn), worked out
+ * again with the picture or when whether it turns changes. True when that reach was worked out.
+ */
+static bool apply_image(pass_t *p, const apps_widget_t *w, node_t *n) {
     lv_obj_t *obj = n->obj;
     const apps_asset_t *asset = apps_ui_asset(p->ui, w->image);
     if (asset == NULL || w->image >= IMAGES_ALL) {
-        return;
+        return false;
+    }
+    lv_image_dsc_t *dsc = &p->st->image[w->image];
+    bool turned = w->rotation != 0 || w->spin != 0;
+    if (!picture_changes(w, n)) {
+        if (turned == n->turned) {
+            return false;
+        }
+        n->turned = turned;
+        n->reach = turned ? picture_reach(dsc) * w->scale / 100 : 0;
+        return true;
     }
     /* One descriptor per asset, and one per runtime image's slot: its header is the file's first bytes, the pixels are the rest,
      * in place. Made again each time it is set: a slot's next runtime image can be another picture in a block at the same
      * address. Every object that draws from a slot's descriptor draws its current image (the runtime frees an image, and gives
      * its slot to the next, only once no object draws the slot: the report, below). */
-    lv_image_dsc_t *dsc = &p->st->image[w->image];
     memcpy(&dsc->header, asset->data, sizeof dsc->header);
     /* Only premultiplied alpha means anything to an image drawn in place; the others say what the memory is
      * (ALLOCATED: an lv_draw_buf, which this isn't, so LVGL refuses the image and it never shows).
@@ -738,7 +803,11 @@ static void apply_image(pass_t *p, const apps_widget_t *w, node_t *n) {
         lv_obj_set_style_image_recolor_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
         n->recolored = false;
     }
-    n->reach = w->rotation != 0 || w->spin != 0 ? picture_reach(dsc) * w->scale / 100 : 0;
+    n->image = w->image;
+    n->scale = w->scale;
+    n->turned = turned;
+    n->reach = turned ? picture_reach(dsc) * w->scale / 100 : 0;
+    return true;
 }
 
 /*
@@ -870,54 +939,99 @@ static void style_box(const apps_widget_t *w, node_t *n) {
     }
 }
 
+/*
+ * The STYLE group: only what differs from what was last set (node_t), every value for a new object. A font, a text_align or a wrap set
+ * measures a label's text again (in LVGL: the first two by LV_EVENT_STYLE_CHANGED, the last by lv_label_set_long_mode), whether its
+ * text is set again or not (Review Focus 3); a colour alone measures nothing.
+ */
 static void apply_style(pass_t *p, const apps_widget_t *w, node_t *n) {
     lv_obj_t *obj = n->obj;
-    if (w->hidden) {
-        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    bool all = !n->styled;
+    if (all || n->hidden != w->hidden) {
+        if (w->hidden) {
+            lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        }
     }
-    lv_obj_set_style_opa(obj, (lv_opa_t)((unsigned)w->opacity * 255 / 100), LV_PART_MAIN);
+    if (all || n->opacity != w->opacity) {
+        lv_obj_set_style_opa(obj, (lv_opa_t)((unsigned)w->opacity * 255 / 100), LV_PART_MAIN);
+    }
     switch (w->kind) {
         case APPS_W_LABEL:
-            style_text(w, obj);
-            lv_obj_set_style_text_align(obj, text_align_of(w->text_align), LV_PART_MAIN);
-            lv_label_set_long_mode(obj, w->wrap ? LV_LABEL_LONG_MODE_WRAP : LV_LABEL_LONG_MODE_CLIP);
+            style_text(w, n, obj, all);
+            if (all || n->text_align != w->text_align) {
+                lv_obj_set_style_text_align(obj, text_align_of(w->text_align), LV_PART_MAIN);
+            }
+            if (all || n->wrap != w->wrap) {
+                lv_label_set_long_mode(obj, w->wrap ? LV_LABEL_LONG_MODE_WRAP : LV_LABEL_LONG_MODE_CLIP);
+            }
             break;
         case APPS_W_BUTTON:
-            style_surface(w, obj);
-            style_pressed(w, obj);
-            style_text(w, n->label);  /* the text is the button's label's */
+            style_surface(w, n, obj, all);
+            /* The pressed fill follows the background, and the text colour when there is none. */
+            if (all || n->bg != w->bg || (w->bg == APPS_COLOR_NONE && n->color != w->color)) {
+                style_pressed(w, obj);
+            }
+            style_text(w, n, n->label, all);  /* the text is the button's label's */
             break;
         case APPS_W_BOX:
-            style_surface(w, obj);
+            style_surface(w, n, obj, all);
             style_box(w, n);
             break;
         case APPS_W_ARC:
-        case APPS_W_SPINNER:
-            lv_obj_set_style_arc_width(obj, w->thickness, LV_PART_MAIN);
-            lv_obj_set_style_arc_color(obj, colour(w->track_color), LV_PART_MAIN);
-            lv_obj_set_style_arc_width(obj, w->thickness, LV_PART_INDICATOR);
-            lv_obj_set_style_arc_color(obj, colour(w->color), LV_PART_INDICATOR);
+        case APPS_W_SPINNER: {
+            bool thick = all || n->thickness != w->thickness;
+            if (thick) {
+                lv_obj_set_style_arc_width(obj, w->thickness, LV_PART_MAIN);
+            }
+            if (all || n->track_color != w->track_color) {
+                lv_obj_set_style_arc_color(obj, colour(w->track_color), LV_PART_MAIN);
+            }
+            if (thick) {
+                lv_obj_set_style_arc_width(obj, w->thickness, LV_PART_INDICATOR);
+            }
+            if (all || n->color != w->color) {
+                lv_obj_set_style_arc_color(obj, colour(w->color), LV_PART_INDICATOR);
+            }
             break;
-        case APPS_W_BAR:
-            style_bar_part(obj, w->track_color, radius_of(w->radius), LV_PART_MAIN);
-            style_bar_part(obj, w->color, radius_of(w->radius), LV_PART_INDICATOR);
+        }
+        case APPS_W_BAR: {
+            bool reshape = n->radius != w->radius;
+            style_bar_part(obj, w->track_color, radius_of(w->radius), LV_PART_MAIN, n->track_color != w->track_color, reshape, all);
+            style_bar_part(obj, w->color, radius_of(w->radius), LV_PART_INDICATOR, n->color != w->color, reshape, all);
             break;
-        case APPS_W_IMAGE:
-            apply_image(p, w, n);
+        }
+        case APPS_W_IMAGE: {
+            bool reached = apply_image(p, w, n);
             apply_turn(w, n);  /* the object's own angle, whatever its picture's descriptor came from */
             if (n->reach > 0 && !n->capped) {
                 lv_obj_add_event_cb(obj, cap_turn, LV_EVENT_REFR_EXT_DRAW_SIZE, (void *)(uintptr_t)(n - p->st->node));
                 n->capped = true;
             }
-            if (n->capped) {
-                lv_obj_refresh_ext_draw_size(obj);  /* the room for this picture, at this scale, now */
+            if (n->capped && reached) {
+                /* The room for this picture, at this scale, now. A turn alone needs none: lv_image_set_rotation sends for it
+                 * itself. */
+                lv_obj_refresh_ext_draw_size(obj);
             }
             break;
+        }
         default:
             break;
     }
+    n->styled = true;
+    n->hidden = w->hidden;
+    n->wrap = w->wrap;
+    n->opacity = w->opacity;
+    n->font = w->font;
+    n->text_align = w->text_align;
+    n->border = w->border;
+    n->thickness = w->thickness;
+    n->radius = w->radius;
+    n->color = w->color;
+    n->bg = w->bg;
+    n->border_color = w->border_color;
+    n->track_color = w->track_color;
 }
 
 static void apply_text(const apps_widget_t *w, const node_t *n) {
@@ -1034,7 +1148,7 @@ static void visit_live(pass_t *p, int slot, apps_widget_t *w) {
         }
     }
     uint32_t todo = w->dirty & GROUPS;
-    if (w->kind == APPS_W_IMAGE && (todo & APPS_DIRTY_STYLE) != 0) {
+    if (w->kind == APPS_W_IMAGE && (todo & APPS_DIRTY_STYLE) != 0 && picture_changes(w, n)) {
         todo |= APPS_DIRTY_GEOM;  /* a src or a scale (both are STYLE) changes the size an image's box is made */
     }
     if ((todo & APPS_DIRTY_GEOM) != 0) {
@@ -1298,15 +1412,68 @@ static phases_t phases_of(const pass_t *p, int64_t took) {
 }
 #endif
 
+/* ---- The retry of a skipped pass (apps_lv.h) ---- */
+
+static void on_retry(lv_timer_t *timer) {
+    lv_timer_pause(timer);  /* once: the next skip arms it again */
+    void (*cb)(void) = s_retry.cb;
+    if (cb == NULL) {
+        return;
+    }
+    s_retry.running = true;
+    cb();
+    s_retry.running = false;
+}
+
+/* A frame's pass was skipped: its retry, APPS_APPLY_RETRY_MS from now. Not from the retry itself, and not again while one is armed
+ * (it stays due when it was). No timer to be had leaves the skip to the next frame. */
+static void arm_retry(void) {
+    if (s_retry.running || s_retry.cb == NULL) {
+        return;
+    }
+    if (s_retry.timer == NULL) {
+        s_retry.timer = lv_timer_create(on_retry, APPS_APPLY_RETRY_MS, NULL);  /* running, due a period from now */
+    } else if (lv_timer_get_paused(s_retry.timer)) {
+        lv_timer_reset(s_retry.timer);
+        lv_timer_resume(s_retry.timer);
+    }
+}
+
+static void disarm_retry(void) {
+    if (s_retry.timer != NULL) {
+        lv_timer_pause(s_retry.timer);
+    }
+}
+
+void apps_lv_set_retry_cb(void (*cb)(void)) {
+    s_retry.cb = cb;
+    if (cb == NULL) {
+        disarm_retry();
+    }
+}
+
+/* A pass skipped mid-callback, and one skipped for the lock (its retry armed: a frame's, not the retry's own). */
+static void skip_in_call(void) {
+    s_skips++;
+#if CONFIG_MUSE_BENCH
+    s_bench.skips_in_call++;
+#endif
+}
+
+static void skip_busy(void) {
+    s_skips++;
+#if CONFIG_MUSE_BENCH
+    s_bench.skips_lock_busy++;
+#endif
+    arm_retry();
+}
+
 /* The pass, once the callback's skip has let it through: the lock, the records, run_pass and what it found. */
 static bool locked_pass(void) {
     /* The table is read with the lock held. The app task clears the pointer under it before it frees the table, so
      * a table seen here stays until the unlock: a pass that holds the lock finishes first, a later one sees NULL. */
     if (!apps_port_ui_trylock(LOCK_MS)) {
-        s_skips++;
-#if CONFIG_MUSE_BENCH
-        s_bench.skips_lock_busy++;
-#endif
+        skip_busy();
         return false;
     }
     apps_ui_t *ui = s_ui;
@@ -1319,10 +1486,7 @@ static bool locked_pass(void) {
             return false;
         }
         if (!apps_port_ui_trylock(LOCK_MS)) {
-            s_skips++;
-#if CONFIG_MUSE_BENCH
-            s_bench.skips_lock_busy++;
-#endif
+            skip_busy();
             return false;
         }
         ui = s_ui;
@@ -1346,6 +1510,7 @@ static bool locked_pass(void) {
     apps_port_ui_unlock();
 
     s_skip_run = 0;
+    disarm_retry();  /* a pass ran: nothing is left to try again */
     s_applies++;
     s_rejects += pass.rejects;
     s_refused += pass.refused;
@@ -1407,12 +1572,13 @@ bool apps_lv_apply(bool in_callback) {
     }
     if (!in_callback) {
         s_skip_run = 0;
+    } else if (s_retry.running) {
+        skip_in_call();  /* the retry, and the callback still runs: the next frame decides */
+        return false;
     } else if (s_skip_run < MAX_CALLBACK_SKIPS) {
         s_skip_run++;
-        s_skips++;
-#if CONFIG_MUSE_BENCH
-        s_bench.skips_in_call++;
-#endif
+        skip_in_call();
+        arm_retry();
         return false;
     }
     return apply_pass();
@@ -1447,6 +1613,7 @@ void apps_lv_build(lv_obj_t *screen) {
     apps_port_free(s_state);
     s_state = NULL;
     s_skip_run = 0;
+    disarm_retry();
     s_reject_logged = false;
     s_front = false;
     s_screen = screen;
@@ -1499,6 +1666,7 @@ void apps_lv_reset(void) {
     apps_port_free(s_state);
     s_state = NULL;
     s_skip_run = 0;
+    disarm_retry();
     s_reject_logged = false;
 }
 

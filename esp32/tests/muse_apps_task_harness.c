@@ -1832,6 +1832,16 @@ void apps_lv_set_close_cb(void (*cb)(void)) {
     lv_close_cb = cb;
 }
 
+/* Perf plan Task 4 (PF1 b): the apply step a skipped pass's retry runs (muse_apps_ui_build hands it on, on the LVGL task); a case runs
+ * it as the retry's timer would (run_retry). */
+static void (*lv_retry_cb)(void);
+static atomic_uint lv_apply_calls, lv_apply_in_callback;  /* apps_lv_apply's calls, and those that said the app is in a callback */
+
+void apps_lv_set_retry_cb(void (*cb)(void)) {
+    lvgl_only("apps_lv_set_retry_cb");
+    lv_retry_cb = cb;
+}
+
 /* The board's frame pairing (Task 7, R7a): muse_apps_ui_pairing hands it on, on the LVGL task. */
 void apps_lv_set_pairing_cb(void (*cb)(bool on)) {
     lvgl_only("apps_lv_set_pairing_cb");
@@ -1894,6 +1904,10 @@ static void drop_object(int slot) {
 
 bool apps_lv_apply(bool in_callback) {
     lvgl_only("apps_lv_apply");
+    atomic_fetch_add(&lv_apply_calls, 1);
+    if (in_callback) {
+        atomic_fetch_add(&lv_apply_in_callback, 1);
+    }
     if (in_callback && lv_callback_skips < 3) {
         lv_callback_skips++;
         return false;
@@ -2804,6 +2818,51 @@ static void *queued_caller(void *arg) {
     heap_caps_free(st);
     atomic_store(&queued_done, true);
     return NULL;
+}
+
+/* Perf plan Task 4 (PF1 b): the retry of a skipped pass runs the app task's apply step, the one muse_apps_ui_tick runs: apps_lv_apply
+ * with whether the app is in a callback now, and nothing at all while the app is hung (Review Focus 2: the supervisor's rule and its
+ * counting are unchanged). Run here as the retry's timer runs it, on the LVGL task between frames. */
+static int retry_asked, retry_asked_in_callback;  /* what one run of the retry asked apps_lv for */
+
+static void run_retry(void *arg) {
+    (void)arg;
+    unsigned calls = atomic_load(&lv_apply_calls), in_callback = atomic_load(&lv_apply_in_callback);
+    lv_retry_cb();
+    retry_asked = (int)(atomic_load(&lv_apply_calls) - calls);
+    retry_asked_in_callback = (int)(atomic_load(&lv_apply_in_callback) - in_callback);
+}
+
+static void the_retry_runs_the_ticks_apply_step(void) {
+    CHECK(lv_retry_cb != NULL, "muse_apps_ui_build hands apps_lv the apply step for its retry");
+    if (lv_retry_cb == NULL) {
+        return;
+    }
+    const file_t files[] = {LUA("main.lua", APP_HANG)};
+    char err[200];
+    CHECK(apps_task_run(make_pkg("hangy", "Hangy", files, 1), true, 50, NULL, err, sizeof err), "run: %s", err);
+    WAIT(0, "front 1");
+    ON_LVGL(run_retry, NULL);
+    CHECK(retry_asked == 1 && retry_asked_in_callback == 0, "no call runs: one pass asked for, out of a callback: %d, %d", retry_asked,
+          retry_asked_in_callback);
+    const int64_t t0 = ((int64_t)3 << 32) - 1000;
+    clock_stop_at(t0);
+    block_print("hang");
+    int from = mark();
+    TAP(0);
+    WAIT_PRINT_BLOCKED();
+    ON_LVGL(run_retry, NULL);
+    CHECK(retry_asked == 1 && retry_asked_in_callback == 1, "a call runs: one pass asked for, in a callback: %d, %d", retry_asked,
+          retry_asked_in_callback);
+    clock_stop_at(t0 + 3001);
+    WAIT(from, "crash Hangy | (stopped responding)");
+    ON_LVGL(run_retry, NULL);
+    CHECK(retry_asked == 0, "hung: no pass asked for, as the tick asks none: %d", retry_asked);
+    int back = mark();
+    clock_go();
+    release_print();
+    WAIT(back, "priority muse_apps 2");
+    WAIT(back, "free pkg hangy");
 }
 
 /* A callback stuck in C (its print doesn't return). The supervisor's 3000 ms rule, across the clock's 32-bit wrap;
@@ -8134,6 +8193,7 @@ int main(int argc, char **argv) {
         {"a_crash_at_the_top_level_is_contained", a_crash_at_the_top_level_is_contained},
         {"a_main_that_does_not_compile_fails_the_run", a_main_that_does_not_compile_fails_the_run},
         {"a_hung_call_is_abandoned", a_hung_call_is_abandoned},
+        {"the_retry_runs_the_ticks_apply_step", the_retry_runs_the_ticks_apply_step},
         {"a_hung_stop_is_abandoned", a_hung_stop_is_abandoned},
         {"a_launch_never_waits", a_launch_never_waits},
         {"overflow_warnings", overflow_warnings},

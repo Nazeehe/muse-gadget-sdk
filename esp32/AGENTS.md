@@ -221,7 +221,10 @@ front with no launcher or card over it, `frame_tick` has it print
 `apply: calls=<n> applies=<n> skips=<in_call>/<lock_busy> refr=<n> gap_max=<ms> avg=<us> max=<us> dump_hold=<us> stack_peak=<path>:<bytes>`:
 the app's calls that ended in the second, the passes that ran, the frames
 skipped while the app was in a call (at most 3 in a row) and for a UI lock not
-free within 2 ms, the display's refreshes, the most time between the ends of
+free within 2 ms, each with its retry's skip when that is skipped too (a frame
+skipped either way has its pass tried once more 5 ms later,
+`APPS_APPLY_RETRY_MS`, and a retry that runs is a pass that ran: "The apply
+step" under Muse apps), the display's refreshes, the most time between the ends of
 two passes that changed something, the passes' average and longest time, the
 longest the app task's dump of its table (`>app.status`) held the UI lock, and
 the deepest stack path so far with the bytes it left free (`none:-1` before one
@@ -918,6 +921,42 @@ hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
   bytes of its free before the install once the app stopped. The LVGL task's
   unused stack fell from 3,916 to 2,972 bytes with the list made, and to 2,796
   while it scrolled.
+- **The apply step:** `frame_tick` (the board's `frame_ms`, 40 ms on the 1.75C)
+  runs the app task's apply step (`apply_step` in `apps_task.c`): a pass that
+  puts what the app's calls changed onto LVGL (`apps_lv_apply`). The pass is
+  skipped while the app is in a call, for at most 3 frames in a row
+  (`MAX_CALLBACK_SKIPS` in `apps_lv.c`; the next frame runs it anyway), and when
+  the UI lock isn't free within 2 ms (`LOCK_MS`). A frame skipped either way has
+  its pass tried once more 5 ms later (`APPS_APPLY_RETRY_MS` in `apps_lv.h`),
+  from one LVGL timer made at the first skip and kept, paused while no retry is
+  armed. At most one is armed; a retry that is skipped too arms nothing, leaves
+  the pass to the next frame and isn't one of the frames a call may hold it for;
+  a pass, a build or a reset disarms it. The bench counts a retry that runs as a
+  pass (`applies`) and one that is skipped as a skip of its cause
+  (`skips=<in_call>/<lock_busy>`). A pass sets only what changed: a text set to
+  what it was marks nothing (`w_set` in `apps_ui.c`), and a widget's style sets
+  only the properties that changed since its last pass (its node keeps what was
+  set), all of them at its first. A font, a `text_align` or a `wrap` set still
+  measures a label's text again; a colour alone measures nothing. Measured on
+  the 1.75C on 2026-11-02 (apps+bench build; Flappy with sound, two runs of 2
+  min of taps, against one at f0a1b35, before the retry): frames of three skips
+  in a row (about 160 ms) fell from 15 to 0, and frames of one skipped tick
+  (about 80 ms) from 14 to 3 and 2. The slow frames of 75 ms or more outside its
+  game overs fell from 34 to 16 and 13, the longest from 168 to 131 and 90 ms,
+  and a second with 10 to 20 in-call skips kept 20 to 26 refreshes, where before
+  one fell to 9 or 13. A retry that runs a pass leaves the next frame 35 ms
+  after it, and the app's ticks came about 36 ms apart (about 30 calls a second,
+  under 3 of them taps), so the next frame's pass can find nothing new and the
+  frame is lost a frame later instead: frames whose gap of 50 to 99 ms held one
+  changed pass and one empty one (two passes of about 3 ms in all) rose from 1
+  to 13 and 10. The median of each second's average pass fell from 3,352 to
+  2,985 and 2,944 us, and of each second's longest (a pipe pair made) from 6,651
+  to 5,369 and 5,402 us. `whatsapp`'s first chat opened in a pass of 51,611 and
+  50,787 us against 57,394 (visits 23,862 and 22,912 against 28,015; its layout,
+  27,379 and 27,494 us against 28,986, barely moved). Its 20 list drags were as
+  before: 587 and 605 frames with a 95th percentile of 28 to 35 and 27 to 32 ms
+  against 27 to 33, two frames over 50 ms in the first run (67 and 64 ms, each
+  as a drag began, with the apply step idle) and none in the second.
 - **Muse's touches:** `app.control`'s `tap` and `drag` (`apps_touch.c`) play
   through the bench's touch player (`muse_ui.c`, built for
   `CONFIG_MUSE_BENCH || CONFIG_MUSE_APPS`) as a guarded drag: inside LVGL's

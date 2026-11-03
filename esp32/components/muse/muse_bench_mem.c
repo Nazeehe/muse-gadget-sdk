@@ -41,6 +41,7 @@
 
 #define FILL_WORD (0x01010101u * MUSE_STACK_FILL)
 #define MEMTEST_WAIT_MS 1000
+#define MEMTEST_UNINSTALL_TRIES 10   /* ticks a busy driver is waited for before its uninstall is given up */
 
 /* ---- The stack paint ---- */
 
@@ -48,7 +49,7 @@
 static EXT_RAM_BSS_ATTR struct {
     bool open;
     uint8_t *start;   /* the stack's lowest byte */
-    uint8_t *mark;    /* where the paint began: the first byte that was not the fill */
+    uint8_t *mark;    /* the first byte that was not the fill (FreeRTOS's mark, or top): the paint begins after it */
     uint8_t *top;     /* where it ended */
     const char *path; /* the deepest path so far; NULL: none */
     int free_bytes;   /* what it left */
@@ -88,8 +89,12 @@ bool muse_stack_paint(void)
     if (s_paint.path != NULL && start + s_paint.free_bytes < top) {
         top = start + s_paint.free_bytes;   /* only a path deeper than the deepest is news */
     }
+    /* From the byte after the first one FreeRTOS's fill didn't reach, which stays as it was: its high-water mark reads the same even
+     * while the paint is open (ruling P8). */
     uint8_t *mark = first_used(start, top);
-    memset(mark, MUSE_STACK_FILL, (size_t)(top - mark));
+    if (mark < top) {
+        memset(mark + 1, MUSE_STACK_FILL, (size_t)(top - mark - 1));
+    }
     s_paint.start = start;
     s_paint.mark = mark;
     s_paint.top = top;
@@ -103,15 +108,14 @@ void muse_stack_note(const char *path)
         return;
     }
     s_paint.open = false;
-    uint8_t *used = first_used(s_paint.start, s_paint.top);
+    /* Below the mark first (a path deeper than any before), then the paint above it. */
+    uint8_t *used = first_used(s_paint.start, s_paint.mark);
+    if (used == s_paint.mark && s_paint.mark < s_paint.top) {
+        used = first_used(s_paint.mark + 1, s_paint.top);
+    }
     if (used < s_paint.top && (s_paint.path == NULL || used - s_paint.start < s_paint.free_bytes)) {
         s_paint.path = path;
         s_paint.free_bytes = (int)(used - s_paint.start);
-    }
-    if (s_paint.mark < s_paint.top && used > s_paint.mark) {
-        /* The path stayed above where FreeRTOS's fill ended: a byte that isn't the fill goes back there, so its high-water mark
-         * doesn't take the paint for stack never used. */
-        *s_paint.mark = (uint8_t)~MUSE_STACK_FILL;
     }
 }
 
@@ -148,6 +152,8 @@ void muse_bench_draw_stacks(int free_bytes[2])
 
 /* ---- >memtest ---- */
 
+static EXT_RAM_BSS_ATTR char s_dma_why[128];   /* the line's DMA half, in PSRAM rather than on the console task's stack */
+
 #if MEMTEST_DMA
 static EXT_RAM_BSS_ATTR volatile int64_t s_dma_end_us;
 static EXT_RAM_BSS_ATTR volatile bool s_dma_done;
@@ -161,6 +167,27 @@ static bool on_copied(async_memcpy_handle_t mcp, async_memcpy_event_t *event, vo
     s_dma_end_us = esp_timer_get_time();
     s_dma_done = true;
     return false;
+}
+
+/* The driver goes: ESP_OK when it went. One whose interrupt is still ending the copy (on the other core, perhaps, just after the
+ * callback the task saw) says ESP_ERR_INVALID_STATE, and is waited for a tick at a time, briefly (ruling P8). */
+static esp_err_t uninstall(async_memcpy_handle_t mcp)
+{
+    esp_err_t err = esp_async_memcpy_uninstall(mcp);
+    for (int i = 0; err == ESP_ERR_INVALID_STATE && i < MEMTEST_UNINSTALL_TRIES; i++) {
+        vTaskDelay(1);
+        err = esp_async_memcpy_uninstall(mcp);
+    }
+    return err;
+}
+
+/* A driver that didn't go is said on the line, never left silently: it keeps its internal RAM and its DMA channel. */
+static void tell_uninstall(char *why, size_t cap, esp_err_t err)
+{
+    size_t len = strlen(why);
+    if (err != ESP_OK && len < cap) {
+        snprintf(why + len, cap - len, " (uninstall failed: %s)", esp_err_to_name(err));
+    }
 }
 
 /* The DMA copy from src to dst, timed, into why: true when the blocks must be left (the copy never ended). */
@@ -181,8 +208,8 @@ static bool dma_copy(uint8_t *src, uint8_t *dst, char *why, size_t cap)
     int64_t t0 = esp_timer_get_time();
     err = esp_async_memcpy(mcp, dst, src, MUSE_MEMTEST_DMA_BYTES, on_copied, NULL);
     if (err != ESP_OK) {
-        esp_async_memcpy_uninstall(mcp);
         snprintf(why, cap, "async_memcpy skipped (copy: %s)", esp_err_to_name(err));
+        tell_uninstall(why, cap, uninstall(mcp));
         return false;
     }
     for (TickType_t waited = 0; !s_dma_done && waited < pdMS_TO_TICKS(MEMTEST_WAIT_MS); waited++) {
@@ -193,12 +220,13 @@ static bool dma_copy(uint8_t *src, uint8_t *dst, char *why, size_t cap)
         return true;
     }
     int64_t took = s_dma_end_us - t0;
-    esp_async_memcpy_uninstall(mcp);
+    esp_err_t gone = uninstall(mcp);
     if (memcmp(dst, src, MUSE_MEMTEST_DMA_BYTES) != 0) {
         snprintf(why, cap, "async_memcpy skipped (the copy differs)");
-        return false;
+    } else {
+        snprintf(why, cap, "async_memcpy %u B %lld us", (unsigned)MUSE_MEMTEST_DMA_BYTES, (long long)took);
     }
-    snprintf(why, cap, "async_memcpy %u B %lld us", (unsigned)MUSE_MEMTEST_DMA_BYTES, (long long)took);
+    tell_uninstall(why, cap, gone);
     return false;
 }
 #endif
@@ -227,14 +255,14 @@ void muse_bench_memtest(void)
     memcpy(dst, src, n);
     __asm__ volatile("" : : "r"(dst) : "memory");
     int64_t cpu_us = esp_timer_get_time() - t0;
-    char dma[64];
+    char *dma = s_dma_why;
     bool keep = false;
 #if MEMTEST_DMA
-    keep = dma_copy(src, dst, dma, sizeof dma);
+    keep = dma_copy(src, dst, dma, sizeof s_dma_why);
 #elif !CONFIG_SOC_ASYNC_MEMCPY_SUPPORTED
-    snprintf(dma, sizeof dma, "async_memcpy skipped (none on this chip)");
+    snprintf(dma, sizeof s_dma_why, "async_memcpy skipped (none on this chip)");
 #else
-    snprintf(dma, sizeof dma, "async_memcpy skipped (not in this build)");
+    snprintf(dma, sizeof s_dma_why, "async_memcpy skipped (not in this build)");
 #endif
     printf("memtest: memcpy psram %u B %lld us; %s\n", (unsigned)n, (long long)cpu_us, dma);
     fflush(stdout);

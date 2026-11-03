@@ -220,6 +220,7 @@ typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_ERR_NO_MEM 0x101
 #define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_INVALID_STATE 0x103
 const char *esp_err_to_name(esp_err_t err);
 /* esp_async_memcpy, as ESP-IDF v6.0.1's esp_async_memcpy.h has it. */
 typedef struct async_memcpy_context_t *async_memcpy_handle_t;
@@ -258,7 +259,8 @@ static int64_t g_now, g_step = 700, g_dma_us = 2500;
 static size_t g_free = 4u << 20;
 static int g_fail_alloc = -1, g_allocs, g_live, g_delays;
 static void *g_blocks[8];
-static esp_err_t g_install = ESP_OK, g_copy = ESP_OK;
+static esp_err_t g_install = ESP_OK, g_copy = ESP_OK, g_uninstall = ESP_OK;
+static int g_uninstall_fails;  /* how many uninstalls return g_uninstall before one succeeds; -1: all */
 static bool g_ends = true, g_copies = true, g_installed;
 static size_t g_burst, g_copied;
 unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task) { return (unsigned)(uintptr_t)task * 100u; }
@@ -279,7 +281,10 @@ void heap_caps_free(void *p)
     free(p);
 }
 int64_t esp_timer_get_time(void) { return g_now += g_step; }
-const char *esp_err_to_name(esp_err_t err) { return err == ESP_ERR_NO_MEM ? "ESP_ERR_NO_MEM" : "ESP_ERR_INVALID_ARG"; }
+const char *esp_err_to_name(esp_err_t err)
+{
+    return err == ESP_ERR_NO_MEM ? "ESP_ERR_NO_MEM" : err == ESP_ERR_INVALID_STATE ? "ESP_ERR_INVALID_STATE" : "ESP_ERR_INVALID_ARG";
+}
 esp_err_t esp_async_memcpy_install(const async_memcpy_config_t *config, async_memcpy_handle_t *mcp)
 {
     g_burst = config->dma_burst_size;
@@ -288,7 +293,16 @@ esp_err_t esp_async_memcpy_install(const async_memcpy_config_t *config, async_me
     *mcp = (async_memcpy_handle_t)&g_installed;
     return ESP_OK;
 }
-esp_err_t esp_async_memcpy_uninstall(async_memcpy_handle_t mcp) { (void)mcp; g_installed = false; return ESP_OK; }
+esp_err_t esp_async_memcpy_uninstall(async_memcpy_handle_t mcp)
+{
+    (void)mcp;
+    if (g_uninstall_fails != 0) {
+        g_uninstall_fails -= g_uninstall_fails > 0;
+        return g_uninstall;
+    }
+    g_installed = false;
+    return ESP_OK;
+}
 esp_err_t esp_async_memcpy(async_memcpy_handle_t mcp, void *dst, void *src, size_t n, async_memcpy_isr_cb_t cb_isr, void *cb_args)
 {
     if (g_copy != ESP_OK) return g_copy;
@@ -304,7 +318,8 @@ esp_err_t esp_async_memcpy(async_memcpy_handle_t mcp, void *dst, void *src, size
  *   use N            the path writes from N up to the stack pointer
  *   paint | note PATH | peak | hwm (FreeRTOS's high-water mark: 0xA5 bytes from the start) | byte N
  *   draw A B C D     LVGL's units: one "SW" with threads A and B, one "other" with C and D (0: none); prints the swdraw stacks
- *   free N | failalloc K | install ok|nomem | copy ok|bad | ends 0|1 | copies 0|1 | memtest */
+ *   free N | failalloc K | install ok|nomem | copy ok|bad | ends 0|1 | copies 0|1 | memtest
+ *   uninstall busy N | uninstall bad    the next N uninstalls say ESP_ERR_INVALID_STATE; every one says ESP_ERR_INVALID_ARG */
 int main(void)
 {
     char cmd[16], arg[16];
@@ -357,6 +372,14 @@ int main(void)
             g_install = strcmp(arg, "ok") ? ESP_ERR_NO_MEM : ESP_OK;
         } else if (!strcmp(cmd, "copy") && scanf("%15s", arg) == 1) {
             g_copy = strcmp(arg, "ok") ? ESP_ERR_INVALID_ARG : ESP_OK;
+        } else if (!strcmp(cmd, "uninstall") && scanf("%15s", arg) == 1) {
+            if (!strcmp(arg, "busy") && scanf("%ld", &n) == 1) {
+                g_uninstall = ESP_ERR_INVALID_STATE;
+                g_uninstall_fails = (int)n;
+            } else {
+                g_uninstall = ESP_ERR_INVALID_ARG;
+                g_uninstall_fails = -1;
+            }
         } else if (!strcmp(cmd, "ends") && scanf("%ld", &n) == 1) {
             g_ends = n != 0;
         } else if (!strcmp(cmd, "copies") && scanf("%ld", &n) == 1) {
@@ -406,7 +429,8 @@ class BenchMemTest(unittest.TestCase):
         out = self.play([
             "stack 6000 3000", "hwm",
             # The first: painted from the mark FreeRTOS keeps (3000) to 256 B under the stack pointer, never above it.
-            "paint", "byte 5743", f"byte {6000 - margin}", "use 4000", "note apply", "peak", "hwm",
+            # FreeRTOS's mark byte stays as it was, so its high-water mark reads the same even while the paint is open.
+            "paint", "hwm", "byte 3000", "byte 3001", "byte 5743", f"byte {6000 - margin}", "use 4000", "note apply", "peak", "hwm",
             # A shallower path isn't kept; the paint goes no higher than the deepest so far.
             "paint", "byte 4000", "use 4500", "note carousel", "peak", "hwm",
             # A deeper one is, and one deeper than FreeRTOS's mark moves that mark itself.
@@ -419,7 +443,7 @@ class BenchMemTest(unittest.TestCase):
         ])
         self.assertEqual(out, [
             "hwm 3000",
-            "paint 1", "byte 5743 0xa5", "byte 5744 0x11", "peak apply 4000", "hwm 3000",
+            "paint 1", "hwm 3000", "byte 3000 0x11", "byte 3001 0xa5", "byte 5743 0xa5", "byte 5744 0x11", "peak apply 4000", "hwm 3000",
             "paint 1", "byte 4000 0x22", "peak apply 4000", "hwm 3000",
             "paint 1", "peak carousel 3500", "hwm 3000",
             "paint 1", "peak slide 2000", "hwm 2000",
@@ -466,6 +490,24 @@ class BenchMemTest(unittest.TestCase):
         self.assertEqual(self.play(["ends 0", "memtest"])[2:], [
             "memtest: memcpy psram 109976 B 700 us; async_memcpy skipped (no end in 1000 ms)",
             "live 2 installed 1 burst 64 copied 107520 delays 1000"])
+        # The driver's uninstall is checked (ruling P8, m3): one still busy with the copy's interrupt is waited for a tick at a time,
+        # up to 10, and one that fails says so on the line; the copy itself ended, so its blocks are freed.
+        self.assertEqual(self.play(["uninstall busy 2", "memtest"])[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy 107520 B 3200 us",
+            "live 0 installed 0 burst 64 copied 107520 delays 2"])
+        self.assertEqual(self.play(["uninstall busy 50", "memtest"])[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy 107520 B 3200 us (uninstall failed: ESP_ERR_INVALID_STATE)",
+            "live 0 installed 1 burst 64 copied 107520 delays 10"])
+        self.assertEqual(self.play(["uninstall bad", "memtest"])[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy 107520 B 3200 us (uninstall failed: ESP_ERR_INVALID_ARG)",
+            "live 0 installed 1 burst 64 copied 107520 delays 0"])
+        self.assertEqual(self.play(["uninstall bad", "copy bad", "memtest"])[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy skipped (copy: ESP_ERR_INVALID_ARG) (uninstall failed: "
+            "ESP_ERR_INVALID_ARG)",
+            "live 0 installed 1 burst 64 copied 0 delays 0"])
+        self.assertEqual(self.play(["uninstall bad", "copies 0", "memtest"])[2:], [
+            "memtest: memcpy psram 109976 B 700 us; async_memcpy skipped (the copy differs) (uninstall failed: ESP_ERR_INVALID_ARG)",
+            "live 0 installed 1 burst 64 copied 107520 delays 0"])
         self.assertEqual(self.play(["memtest"], exe="bench_mem_nodma")[2:], [
             "memtest: memcpy psram 109976 B 700 us; async_memcpy skipped (none on this chip)",
             "live 0 installed 0 burst 0 copied 0 delays 0"])

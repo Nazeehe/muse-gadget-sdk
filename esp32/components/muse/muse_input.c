@@ -875,9 +875,9 @@ static bool console_command(char *line, bool whole)
      * stack of the LVGL task and of this one (muse_serial, which runs every console
      * command, the >app.* ones too), each -1 when no task has that name, and of
      * LVGL's two drawing tasks (swdraw, muse_bench_mem.h), each -1 when there is no
-     * such thread. All are high-water marks: the least that was free since boot.
-     * While a stack paint is open (an apply pass, a scroll's work) the LVGL task's
-     * can read high (muse_bench_mem.h). The free figures are
+     * such thread. All are high-water marks: the least that was free since boot
+     * (the bench's stack paint leaves the LVGL task's as it is: muse_bench_mem.h).
+     * The free figures are
      * taken while this command's own SERIAL_LINE (1 KB) buffer is held, in PSRAM
      * (MUSE_BIG_CAPS) or, on a board without it, internal RAM: they are that much
      * lower than the heartbeat's, so don't compare the two. */

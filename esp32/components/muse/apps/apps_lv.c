@@ -59,8 +59,8 @@ static const char *TAG = "muse_apps";
 #define MAX_CALLBACK_SKIPS 3
 #if CONFIG_MUSE_BENCH
 #define BENCH_SECOND_US 1000000  /* the apply summary's second */
-#define SLOW_FRAME_MS 50         /* a refresh's own work, or a gap in a chain, longer than this is a slow frame */
-#define SLOW_FRAME_REST_MS 1000  /* a gap this long ends a rest: never a slow frame */
+#define SLOW_FRAME_MS 50         /* a frame after motion, or a refresh's own work, longer than this is a slow frame */
+#define SLOW_FRAME_REST_MS 1000  /* a frame this long ends a rest: never slow for its time alone */
 #endif
 
 /* The bits that name a group of properties (and SCROLL, a w:scroll_to), as opposed to CREATE and DELETE. */
@@ -1385,11 +1385,12 @@ static bool locked_pass(void) {
     return true;
 }
 
-/* The pass after the callback's skip. In a bench build, W1's stack paint is around it (perf plan Task 2), outside the lock: the
- * paint is a memset, which would lengthen the hold. */
+/* The pass after the callback's skip. In a bench build, W1's stack paint is around it (perf plan Task 2), outside the lock (the
+ * paint is a memset, which would lengthen the hold), and only for an app on the layer in front: the layer shown and the app's records
+ * made (s_state, the LVGL task's, read without the lock). A layer behind, or one no app is on, runs its frames unpainted. */
 static bool apply_pass(void) {
 #if CONFIG_MUSE_BENCH
-    bool painted = muse_stack_paint();
+    bool painted = s_front && s_state != NULL && muse_stack_paint();
     bool ran = locked_pass();
     if (painted) {
         muse_stack_note("apply");
@@ -1943,7 +1944,7 @@ static EXT_RAM_BSS_ATTR struct {
     int64_t wait_start_us, flush_us;  /* the wait for the panel under way, and the waits so far */
     bool ready_in_front;              /* the last refresh ended with an app in front, */
     int64_t ready_us;                 /* then, */
-    bool in_chain;                    /* and came within SLOW_FRAME_MS of the one before it (both timed) */
+    bool followed;                    /* and came within SLOW_FRAME_REST_MS of the one before it (both timed): motion */
 } s_frames;
 
 /* LV_EVENT_SCROLL_END on an app's box: its scroll ended, seen by a refresh or not. The next refresh prints its summary. A throw that
@@ -2024,32 +2025,34 @@ static bool app_in_front(void) {
 }
 
 /*
- * The slow frame (perf plan Task 2, ruling P5), at a refresh's LV_EVENT_REFR_READY, with an app in front at it and at the refresh
- * before it, and its start seen by on_phase. It is slow when its own work (LV_EVENT_REFR_START to _READY) is over SLOW_FRAME_MS, or
- * when its gap (the time since the refresh before) is over SLOW_FRAME_MS and under SLOW_FRAME_REST_MS while that refresh came within
- * SLOW_FRAME_MS of the one before it: a chain, as a scroll, an animation or a game makes, that stalled. A refresh that ends a rest
- * (no chain before it, or a gap of a second or more) is never slow. It prints
- *     slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us>
- * the time since the refresh before, the gap (the timers, the apply), its layout (to the drawing's start, or its end with nothing to
- * draw), the drawing less its waits for the panel, those waits, and the passes since the refresh before and their time.
+ * The slow frame (perf plan Task 2, ruling P5b), at a refresh's LV_EVENT_REFR_READY, with an app in front at it and at the refresh
+ * before it, and its start seen by on_phase. Its time is from the refresh before's LV_EVENT_REFR_READY to its own. It is slow when
+ * that time is over SLOW_FRAME_MS and under SLOW_FRAME_REST_MS and the refresh before came within SLOW_FRAME_REST_MS of its own
+ * predecessor (it followed motion), or when its own work (LV_EVENT_REFR_START to _READY) is over SLOW_FRAME_MS, whatever came before.
+ * A rest of a second or more never prints; a pause under a second after motion can, and reads as small work, no applies and scroll=0.
+ * It prints
+ *     slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us> scroll=<0|1>
+ * its time, the gap (from the refresh before to this one's start: the timers, the apply), its layout (to the drawing's start, or its
+ * end with nothing to draw), the drawing less its waits for the panel, those waits, the passes since the refresh before and their
+ * time, and whether an app's scroll box was scrolling (listing: scroll_box_scrolling, the scroll frames' test).
  */
-static void time_slow_frame(int64_t now) {
+static void time_slow_frame(int64_t now, bool listing) {
     bool front = app_in_front();
-    bool in_chain = false;
+    bool followed = false;
     if (front && s_frames.ready_in_front && s_frames.started) {
-        int gap = ms_of(s_frames.refr_start_us - s_frames.ready_us);
+        int ms = ms_of(now - s_frames.ready_us);
         int work = ms_of(now - s_frames.refr_start_us);
-        bool stalled = s_frames.in_chain && gap > SLOW_FRAME_MS && gap < SLOW_FRAME_REST_MS;
-        if (work > SLOW_FRAME_MS || stalled) {
+        bool in_motion = s_frames.followed && ms > SLOW_FRAME_MS && ms < SLOW_FRAME_REST_MS;
+        if (in_motion || work > SLOW_FRAME_MS) {
             int64_t layout_end = s_frames.rendered ? s_frames.render_start_us : now;
             int64_t render = s_frames.rendered ? s_frames.render_ready_us - s_frames.render_start_us - s_frames.flush_us : 0;
-            ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u", ms_of(now - s_frames.ready_us), gap,
-                     ms_of(layout_end - s_frames.refr_start_us), ms_of(render), ms_of(s_frames.flush_us),
-                     (unsigned)s_bench.frame_applies, (unsigned)s_bench.frame_apply_us);
+            ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u scroll=%d", ms,
+                     ms_of(s_frames.refr_start_us - s_frames.ready_us), ms_of(layout_end - s_frames.refr_start_us), ms_of(render),
+                     ms_of(s_frames.flush_us), (unsigned)s_bench.frame_applies, (unsigned)s_bench.frame_apply_us, listing ? 1 : 0);
         }
-        in_chain = gap <= SLOW_FRAME_MS;
+        followed = ms < SLOW_FRAME_REST_MS;
     }
-    s_frames.in_chain = in_chain;
+    s_frames.followed = followed;
     s_frames.started = false;
     s_frames.ready_in_front = front;
     s_frames.ready_us = now;
@@ -2059,11 +2062,11 @@ static void time_slow_frame(int64_t now) {
 
 static void on_refresh(lv_event_t *e) {
     (void)e;
-    s_bench.refr++;
-    time_slow_frame(esp_timer_get_time());
     bool scrolling = s_launcher_shown && C.row != NULL && lv_obj_is_scrolling(C.row);
     bool spinning = spin_in_front();
     bool listing = scroll_box_scrolling();
+    s_bench.refr++;
+    time_slow_frame(esp_timer_get_time(), listing);
     if (s_frames.scroll_ended) {
         s_frames.scroll_ended = false;
         muse_frame_stats_flush(&s_frames.scroll);

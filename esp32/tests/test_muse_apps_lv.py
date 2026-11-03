@@ -340,11 +340,17 @@ class HarnessTest(unittest.TestCase):
     def test_a_build_without_the_bench_times_no_slow_frame(self):  # and adds no callback to the display
         self.run_case("slow_frame_anatomy")
 
-    def test_a_build_without_the_bench_times_no_chain(self):
-        self.run_case("slow_frame_needs_a_chain")
+    def test_a_build_without_the_bench_times_no_motion(self):
+        self.run_case("slow_frame_follows_motion")
+
+    def test_a_build_without_the_bench_says_nothing_of_a_list(self):
+        self.run_case("slow_frame_says_whether_a_list_scrolls")
 
     def test_a_build_without_the_bench_paints_no_stack(self):  # the fake stack probes are the bench build's: this links without them
         self.run_case("stack_paint_around_the_paths")
+
+    def test_a_build_without_the_bench_paints_no_layer(self):
+        self.run_case("the_apply_paints_only_for_an_app_in_front")
 
     def test_the_bench_instruments_are_the_bench_builds_alone(self):
         # Every part of them is inside #if CONFIG_MUSE_BENCH: the state, the phases' callbacks, the stack probes, the summary and the
@@ -353,7 +359,7 @@ class HarnessTest(unittest.TestCase):
         mentions = [m.start() for m in re.finditer(r"\bs_bench\b|\bs_slow_phases\b|apps_lv_bench_(?:tick|dump_hold)|muse_stack_(?:paint|note|peak)|"
                                                    r"muse_bench_mem\.h|\bon_phase\b|\btime_slow_frame\b|"
                                                    r"LV_EVENT_(?:REFR_START|RENDER_START|RENDER_READY|FLUSH_WAIT_START|FLUSH_WAIT_FINISH)|"
-                                                   r"visits=|BENCH_SECOND_US|SLOW_FRAME_MS|SLOW_FRAME_REST_MS|in_chain|visits_us|layout_us|writeback_us", source)]
+                                                   r"visits=|BENCH_SECOND_US|SLOW_FRAME_MS|SLOW_FRAME_REST_MS|followed|visits_us|layout_us|writeback_us", source)]
         self.assertGreaterEqual(len(mentions), 25)
         for index in mentions:
             with self.subTest(source[source.rindex("\n", 0, index) + 1:source.index("\n", index)].strip()):
@@ -371,10 +377,10 @@ class HarnessTest(unittest.TestCase):
                       'styles=%u",', source)
         self.assertIn('ESP_LOGW(TAG, "apply %u us (%u slow since last)", (unsigned)s_slow_worst_us, (unsigned)s_slow_unlogged);',
                       source)
-        self.assertIn('ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u",', source)
+        self.assertIn('ESP_LOGW(TAG, "slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u scroll=%d",', source)
         self.assertRegex(source, r"(?m)^#define BENCH_SECOND_US 1000000\b")
         self.assertRegex(source, r"(?m)^#define SLOW_FRAME_MS 50\b")
-        self.assertRegex(source, r"(?m)^#define SLOW_FRAME_REST_MS 1000\b")  # ruling P5: a gap this long ends a rest
+        self.assertRegex(source, r"(?m)^#define SLOW_FRAME_REST_MS 1000\b")  # ruling P5b: a frame this long ends a rest
         for path in ("apply", "carousel"):
             self.assertIn(f'muse_stack_note("{path}");', source)
 
@@ -903,11 +909,17 @@ class BenchHarnessTest(unittest.TestCase):
     def test_a_slow_frame_prints_its_anatomy(self):
         self.run_case("slow_frame_anatomy")
 
-    def test_a_slow_frame_is_its_own_work_or_a_gap_in_a_chain(self):  # ruling P5: a refresh that ends a rest is never slow
-        self.run_case("slow_frame_needs_a_chain")
+    def test_a_slow_frame_is_its_own_work_or_a_frame_after_motion(self):  # ruling P5b: a rest of a second or more never prints
+        self.run_case("slow_frame_follows_motion")
+
+    def test_a_slow_frame_says_whether_a_list_scrolls(self):  # ruling P5b's scroll=<0|1>
+        self.run_case("slow_frame_says_whether_a_list_scrolls")
 
     def test_the_stack_is_painted_around_the_apply_and_the_carousel(self):
         self.run_case("stack_paint_around_the_paths")
+
+    def test_no_paint_with_no_app_in_front(self):  # the board session: a layer behind, or with no app on it, isn't painted
+        self.run_case("the_apply_paints_only_for_an_app_in_front")
 
 
 def function_owner(source):

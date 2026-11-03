@@ -1069,9 +1069,10 @@ class GuideAndSkill(unittest.TestCase):
         self.assertIn('static const char *TAG = "muse_apps";', lv)
         self.assertIn('"apply: calls=%u applies=%u skips=%u/%u refr=%u gap_max=%d avg=%u max=%u dump_hold=%u stack_peak=%s:%d"', lv)
         self.assertIn('"apply %u us (%u slow since last) visits=%u layout=%u writeback=%u creates=%u texts=%u styles=%u"', lv)
-        self.assertIn('"slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u"', lv)
+        self.assertIn('"slow frame %d ms: gap=%d layout=%d render=%d flush=%d applies=%u/%u scroll=%d"', lv)
         self.assertIn('printf("memtest: memcpy psram %u B %lld us; %s\\n"', mem_c)
         self.assertIn('"async_memcpy %u B %lld us"', mem_c)
+        self.assertIn('" (uninstall failed: %s)"', mem_c)  # ruling P8 (m3): a driver that stays is said on the line
         ui = (MUSE / "muse_ui.c").read_text()
         snapshot = (APPS / "apps_snapshot.c").read_text()
         for path, source in (("apply", lv), ("carousel", lv), ("slide", ui), ("snapshot", snapshot)):
@@ -1091,24 +1092,30 @@ class GuideAndSkill(unittest.TestCase):
                 "and the deepest stack path so far with the bytes it left free (`none:-1` before one is found).",
                 f"The slow pass's line (a pass over {slow_us} us, at most one line a second) adds `visits=<us> layout=<us> "
                 "writeback=<us> creates=<n> texts=<n> styles=<n>` for the longest pass since the last line.",
-                # Ruling P5: a slow frame is its own work, or a gap in a chain; a refresh that ends a rest is never slow.
-                "With an app in front, at it and at the refresh before it, a refresh is a slow frame when its own work, from "
-                f"`LV_EVENT_REFR_START` to `LV_EVENT_REFR_READY`, is over {slow_frame} ms, or when its gap, the time since the refresh "
-                f"before, is over {slow_frame} ms and under {rest} ms while that refresh came within {slow_frame} ms of the one before it: "
-                "a chain, as a scroll, an animation or a game makes. A refresh that ends a rest is never slow.",
-                "A slow frame prints `slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us>` from "
-                "`LV_EVENT_REFR_READY`: the time since the refresh before, the gap,",
-                "The stack paths are the apply pass, the home pages' slide (`LV_EVENT_SCROLL_BEGIN`), the launcher carousel's scroll "
+                # Ruling P5b: a frame over 50 ms after motion, or 50 ms of a refresh's own work; a rest of a second never prints.
+                "A refresh's time is from the refresh before it to its own end (`LV_EVENT_REFR_READY` to `LV_EVENT_REFR_READY`), with an "
+                f"app in front at both. A refresh is a slow frame when its time is over {slow_frame} ms and under {rest} ms and the "
+                f"refresh before it came within {rest} ms of its own predecessor (it followed motion), or when its own work, from "
+                f"`LV_EVENT_REFR_START` to `LV_EVENT_REFR_READY`, is over {slow_frame} ms, whatever came before.",
+                f"A rest of {rest} ms or more never prints, but a pause of {slow_frame} to {rest - 1} ms after motion can: it reads as small "
+                "work, no applies and `scroll=0`.",
+                "A slow frame prints `slow frame <ms> ms: gap=<ms> layout=<ms> render=<ms> flush=<ms> applies=<n>/<us> scroll=<0|1>` "
+                "from `LV_EVENT_REFR_READY`: its time, the gap (from the refresh before to this one's `LV_EVENT_REFR_START`),",
+                "and whether an app's scroll box was scrolling (the `scroll frames` test).",
+                "The stack paths are the apply pass (with an app on the layer in front), the home pages' slide (`LV_EVENT_SCROLL_BEGIN`), "
+                "the launcher carousel's scroll "
                 "and app.control's snapshot (`muse_bench_mem.c`):",
                 f"the LVGL task's stack is filled with 0x{fill:X} from its start up to {margin} B under the stack pointer,",
-                # Ruling P6: what the paint leaves of FreeRTOS's mark, and what stack_peak is.
-                "the note puts a byte back where FreeRTOS's fill ended, so `>mem`'s `lvgl_stack_free` stays the least free since boot, "
-                "except while a paint is open, when it can read high. `stack_peak` is the since-boot record of the painted paths alone.",
+                # Rulings P6 and P8 (m1): the paint leaves FreeRTOS's mark alone, and stack_peak is the painted paths' record.
+                "the paint leaves the byte where FreeRTOS's fill ended as it was, so `>mem`'s `lvgl_stack_free` stays the least free since "
+                "boot, even while a paint is open. `stack_peak` is the since-boot record of the painted paths alone.",
                 "`>mem` adds `swdraw_stack_free`, the high-water marks of LVGL's two drawing tasks.",
                 "`>frame copy off` sends the home slide's whole-screen refreshes as bands, with no copy (they tear), and `>frame copy "
                 "on` puts the copy back.",
                 f"`>memtest` times a {cpu} B memcpy within PSRAM and a {dma} B `esp_async_memcpy` (GDMA): `memtest: memcpy psram "
-                f"{cpu} B <us> us; async_memcpy {dma} B <us> us`, or the reason the second was skipped."):
+                f"{cpu} B <us> us; async_memcpy {dma} B <us> us`, or the reason the second was skipped.",
+                "The DMA driver takes some internal RAM while it is installed, for the length of the test, and a line that ends "
+                "`(uninstall failed: <err>)` says it kept it."):
             with self.subTest(phrase[:50]):
                 self.assertIn(phrase, bench)
         self.assertEqual(second // 1000000, 1, "\"once a second\"")

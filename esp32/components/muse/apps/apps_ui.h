@@ -75,9 +75,10 @@
  *   platform or from muse.ask. An app shows one while it waits and hides it in its callback.
  * - min < max is kept: a create or a set that would leave min >= max on an arc or a bar is an error, and value
  *   follows min and max (it is clamped again when they change).
- * - Events: tap (and click, the same), long_press, press and release, on a widget of any kind. A handler gets
- *   (w, event) with the event's own name, "tap" for a click too. w:on replaces the event's handler. Deleting a
- *   widget drops its handlers.
+ * - Events: tap (and click, the same), long_press, press, release and swipe, on a widget of any kind. A handler gets
+ *   (w, event) with the event's own name, "tap" for a click too; a swipe's gets (w, "swipe", dir), dir "left", "right",
+ *   "up" or "down". A swipe goes to the widget's own swipe handler, or else to the nearest box around it that has one,
+ *   with that box as w (apps_ui_push_handler). w:on replaces the event's handler. Deleting a widget drops its handlers.
  * - w:scroll_to(where, animate): where is "start", "end" or a number of px from the top (rounded, and clamped to
  *   0..APPS_UI_SCROLL_MAX: LVGL bounds it to the content), animate a boolean (nil: false). It is a command, as a set of rotation
  *   is (The apply step's side, below): the box scrolls after the pass's layout, so "end" is the end of what was made before it,
@@ -114,7 +115,7 @@
  *   w:scroll_to: where must be "start", "end" or a number of px, got <type>      also "got NaN"
  *   w:scroll_to: where '<s>' is not "start", "end" or a number of px
  *   w:scroll_to: animate must be a boolean, got <type>
- *   ui.<kind>: unknown event '<s>' (valid: tap, long_press, press, release)
+ *   ui.<kind>: unknown event '<s>' (valid: tap, long_press, press, release, swipe)
  *   ui.<kind>: handler for '<event>' must be a function (or nil to remove it), got <type>
  *   ui: no more than 128 widgets per app            (with fewer alive, because deleted widgets still hold their
  *                                                    slots, it ends " (a deleted widget keeps its slot until
@@ -228,9 +229,15 @@ typedef enum { APPS_SCROLL_NONE, APPS_SCROLL_Y } apps_scroll_t;
 typedef enum { APPS_LAYOUT_NONE, APPS_LAYOUT_COLUMN } apps_layout_t;
 typedef enum { APPS_ITEMS_START, APPS_ITEMS_CENTER, APPS_ITEMS_END } apps_items_t;
 
-/* Widget events; APPS_EV_* are task events. An event's bit is 1 << its index in {tap, long_press, press, release}. */
-enum { APPS_UI_TAP = 1, APPS_UI_LONG_PRESS = 2, APPS_UI_PRESS = 4, APPS_UI_RELEASE = 8 };
-/* With an event's bit, on its way from the LVGL task to apps_rt_touch: the touch was Muse's own (app.control tap or drag,
+/* Widget events; APPS_EV_* are task events. An event's bit is 1 << its index in {tap, long_press, press, release, swipe}. */
+enum { APPS_UI_TAP = 1, APPS_UI_LONG_PRESS = 2, APPS_UI_PRESS = 4, APPS_UI_RELEASE = 8, APPS_UI_SWIPE = 16 };
+/* A swipe's direction rides in the event's byte, in the two bits over the events' and under APPS_UI_INJECTED: an event's code is
+ * its bit, and a swipe's is APPS_UI_SWIPE_CODE(dir). No other event has these bits. */
+#define APPS_UI_DIR_SHIFT 5
+#define APPS_UI_DIR_MASK 0x60
+typedef enum { APPS_UI_LEFT = 0, APPS_UI_RIGHT = 1, APPS_UI_UP = 2, APPS_UI_DOWN = 3 } apps_ui_dir_t;
+#define APPS_UI_SWIPE_CODE(dir) (APPS_UI_SWIPE | ((dir) << APPS_UI_DIR_SHIFT))
+/* With an event's code, on its way from the LVGL task to apps_rt_touch: the touch was Muse's own (app.control tap or drag,
  * apps_touch.h), not a person's. The app's handler hears it as any other; it opens none of the gates that are there to show a
  * person tapped (apps_rt_touch). */
 #define APPS_UI_INJECTED 0x80
@@ -315,16 +322,22 @@ bool apps_ui_take_clear(apps_ui_t *ui);
 
 /*
  * For apps_vm_call, inside a C function the call runs; it reserves the 5 stack slots it uses at most (checking a
- * handle the app holds). When the widget at slot is alive on that gen and subscribed to event (one APPS_UI_* bit)
- * with a handler, pushes the handler, the widget (the handle the app already holds, if it does) and the event's
- * name, returns true, and the caller calls it with nargs 2. Otherwise (a slot that is gone, a gen that isn't its,
- * an event nobody asked for, or no room) returns
- * false and pushes nothing. It allocates (the handle, the name), so it raises when the app's heap refuses: only
- * inside a protected call.
+ * handle the app holds; a swipe's 4 values come after that). event is one APPS_UI_* bit, or a swipe's
+ * APPS_UI_SWIPE_CODE, without APPS_UI_INJECTED. When the widget at slot is alive on that gen and subscribed to the
+ * event with a handler, pushes the handler, the widget (the handle the app already holds, if it does) and the event's
+ * name, and returns 2: the caller calls it with that many arguments. A swipe goes to the widget's own swipe handler,
+ * else to the nearest box around it with one (its parent, then that box's, up to the layer), and pushes that handler,
+ * that box as the widget, "swipe" and the direction's name, and returns 3: fn(w, "swipe", dir). Otherwise (a slot that
+ * is gone, a gen that isn't its, an event nobody asked for, a code that isn't one event, a direction's bits on another
+ * event, or no room) returns 0 and pushes nothing. It allocates (the handle, the names), so it raises when the app's
+ * heap refuses: only inside a protected call.
  */
-bool apps_ui_push_handler(lua_State *L, apps_ui_t *ui, uint16_t slot, uint16_t gen, uint8_t event);
+int apps_ui_push_handler(lua_State *L, apps_ui_t *ui, uint16_t slot, uint16_t gen, uint8_t event);
 
 /* ---- Any task ---- */
+
+/* "left", "right", "up" or "down": the direction in a swipe's code (APPS_UI_SWIPE_CODE), whatever else the byte has. */
+const char *apps_ui_dir_name(uint8_t code);
 
 /*
  * The dump (above) into out, which gets at most cap bytes with the NUL, and the length written. Whole entries

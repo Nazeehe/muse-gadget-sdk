@@ -118,15 +118,15 @@ return app
 - `ui.clear()`: removes every widget.
 - `ui.polar(deg, r)`: the x and y offsets, as integers, of the point r px from the centre at deg clock degrees, for a widget with `align = "center"`: `ui.polar(90, 100)` is `100, 0`, and `ui.polar(0, 100)` is `0, -100`.
 - `ui.W` and `ui.H` are 466, `ui.R` is 233 and `ui.SAFE` is 330.
-- `w:set{...}` changes properties, `w:get(name)` reads one (colours as `"#rrggbb"`), `w:on(event, fn)` calls `fn(w, event)` for the event (nil removes it), and `w:delete()` removes the widget and everything inside it. `set` and `on` return w, so calls chain.
+- `w:set{...}` changes properties, `w:get(name)` reads one (colours as `"#rrggbb"`), and `w:delete()` removes the widget and everything inside it. `w:on(event, fn)` calls `fn(w, event)`; a swipe calls `fn(w, "swipe", dir)`, dir is left, right, up or down. A nil fn removes the handler. `set` and `on` return w, so calls chain.
 - `w:scroll_to(where, animate)` scrolls a box with `scroll = "y"`: where is `"start"`, `"end"` or a number of px from the top, and animate (false by default) scrolls smoothly instead of at once. Call it in the callback that adds the rows: it scrolls once the screen has laid them out, so `"end"` is their end. A hidden box scrolls when it shows. It returns w.
-- `ui.label` properties: align, x, y, w, h, hidden, opacity, parent, text, font, color, text_align, wrap; events: tap, long_press, press, release
-- `ui.button` properties: align, x, y, w, h, hidden, opacity, parent, text, font, color, bg, radius, border, border_color; events: tap, long_press, press, release
-- `ui.box` properties: align, x, y, w, h, hidden, opacity, parent, bg, radius, border, border_color, scroll, layout, gap, pad, items; events: tap, long_press, press, release
-- `ui.arc` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, start_angle, end_angle, thickness, color, track_color; events: tap, long_press, press, release
-- `ui.bar` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, color, track_color, radius; events: tap, long_press, press, release
-- `ui.image` properties: align, x, y, w, h, hidden, opacity, parent, src, scale, rotation, spin; events: tap, long_press, press, release
-- `ui.spinner` properties: align, x, y, w, h, hidden, opacity, parent, thickness, color, track_color; events: tap, long_press, press, release
+- `ui.label` properties: align, x, y, w, h, hidden, opacity, parent, text, font, color, text_align, wrap; events: tap, long_press, press, release, swipe
+- `ui.button` properties: align, x, y, w, h, hidden, opacity, parent, text, font, color, bg, radius, border, border_color; events: tap, long_press, press, release, swipe
+- `ui.box` properties: align, x, y, w, h, hidden, opacity, parent, bg, radius, border, border_color, scroll, layout, gap, pad, items; events: tap, long_press, press, release, swipe
+- `ui.arc` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, start_angle, end_angle, thickness, color, track_color; events: tap, long_press, press, release, swipe
+- `ui.bar` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, color, track_color, radius; events: tap, long_press, press, release, swipe
+- `ui.image` properties: align, x, y, w, h, hidden, opacity, parent, src, scale, rotation, spin; events: tap, long_press, press, release, swipe
+- `ui.spinner` properties: align, x, y, w, h, hidden, opacity, parent, thickness, color, track_color; events: tap, long_press, press, release, swipe
 
 The values:
 

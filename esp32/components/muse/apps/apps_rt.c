@@ -1233,12 +1233,13 @@ typedef struct {
     uint8_t event;
 } touch_call_t;
 
-/* Runs under apps_vm_call: the handler, the widget and the event's name are pushed in here, since the widget's
- * handle is made in the app's heap. */
+/* Runs under apps_vm_call: the handler, the widget and the event's name (and a swipe's direction) are pushed in here,
+ * since the widget's handle is made in the app's heap. */
 static int touch_trampoline(lua_State *L) {
     const touch_call_t *t = lua_touserdata(L, 1);
-    if (apps_ui_push_handler(L, t->rt->ui, t->slot, t->gen, t->event)) {
-        lua_call(L, 2, 0);
+    int nargs = apps_ui_push_handler(L, t->rt->ui, t->slot, t->gen, t->event);
+    if (nargs > 0) {
+        lua_call(L, nargs, 0);
     }
     return 0;
 }
@@ -1253,7 +1254,7 @@ void apps_rt_touch(apps_rt_t *rt, uint16_t slot, uint16_t gen, uint8_t event) {
         rt->touched = true;
         rt->touch_ms = apps_port_mono_ms();
     }
-    touch_call_t t = {rt, slot, gen, (uint8_t)(event & ~APPS_UI_INJECTED)};
+    touch_call_t t = {rt, slot, gen, (uint8_t)(event & ~APPS_UI_INJECTED)};  /* the tag only: a swipe keeps its direction */
     if (vm_run(rt, touch_trampoline, &t, APPS_BUDGET_CALL) != APPS_CALL_OK) {
         crash(rt);
     }

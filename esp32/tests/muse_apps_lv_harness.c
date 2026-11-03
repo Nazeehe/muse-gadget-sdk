@@ -3982,19 +3982,19 @@ static void on_close(void) {
 }
 
 /* What apps_rt_touch does with an event, for one touch: apps_ui_push_handler inside a call, and the handler it
- * pushes called. result: whether a handler ran. */
+ * pushes called with the arguments it says. result: that count, 0 when no handler ran. */
 typedef struct {
     apps_ui_t *ui;
     uint16_t slot, gen;
     uint8_t event;
-    bool result;
+    int result;
 } probe_t;
 
 static int probe_trampoline(lua_State *L) {
     probe_t *p = lua_touserdata(L, 1);
     p->result = apps_ui_push_handler(L, p->ui, p->slot, p->gen, p->event);
-    if (p->result) {
-        lua_call(L, 2, 0);
+    if (p->result > 0) {
+        lua_call(L, p->result, 0);
     }
     return 0;
 }
@@ -4007,7 +4007,7 @@ static bool dispatch(env_t *e, const ev_t *ev) {
     lua_pushlightuserdata(L, &p);
     apps_call_t status = apps_vm_call(e->vm, 1, 0, APPS_BUDGET_CALL, err, sizeof err);
     CHECK(status == APPS_CALL_OK, "dispatch: %s", err);
-    return p.result;
+    return p.result > 0;
 }
 
 /* ---- The brief's tests ---- */
@@ -4109,7 +4109,7 @@ POKE(h_minus_2, w->h = -2)
 POKE(font_8, w->font = 8)
 POKE(text_align_3, w->text_align = 3)
 POKE(color_past_white, w->color = 0x1000000)
-POKE(events_16, w->events = 16)
+POKE(events_32, w->events = 32)
 POKE(text_257, {
     char big[257];
     memset(big, 'a', sizeof big);
@@ -4185,7 +4185,7 @@ static const bad_t BAD[] = {
     {"font 8 on a button", "w = ui.button{text = 'go'}", 0, font_8, 0, 1},
     {"text_align 3", "w = ui.label{}", 0, text_align_3, 0, 1},
     {"a colour past white", "w = ui.label{}", 0, color_past_white, 0, 1},
-    {"an events mask of 16", "w = ui.label{}", 0, events_16, 0, 1},
+    {"an events mask of 32", "w = ui.label{}", 0, events_32, 0, 1},
     {"a text of 257 bytes", "w = ui.label{}", 0, text_257, 0, 1},
     {"a button's text of 257 bytes", "w = ui.button{}", 0, text_257, 0, 1},
     {"text that isn't UTF-8", "w = ui.label{}", 0, text_not_utf8, 0, 1},
@@ -4278,6 +4278,18 @@ static void parent_chain_of_four_is_drawn(void) {
     CHECK(APPLY(&e), "the pass ran");
     CHECK(log_count("create ") == 6 && stats_since().rejects == 0, "six objects, no reject\n%s", log_peek());
     CHECK(log_has_line("create label 7 in 5"), "the label is inside box 3 (object 5)\n%s", log_peek());
+    FINISH(&e);
+}
+
+/* The events mask holds every event's bit (apps_ui.h): a widget with a handler for each, a swipe's the highest, is drawn,
+ * where the bit over them is a reject (BAD's events_32). */
+static void every_events_bit_is_drawn(void) {
+    env_t e;
+    scene(&e);
+    RUN(&e, "w = ui.box{} for _, ev in ipairs({'tap', 'long_press', 'press', 'release', 'swipe'}) do w:on(ev, function() end) end");
+    CHECK(W(&e, 0)->events == 31, "the mask: %d", W(&e, 0)->events);
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_count("create ") == 1 && stats_since().rejects == 0, "made, no reject\n%s", log_peek());
     FINISH(&e);
 }
 
@@ -11622,6 +11634,7 @@ int main(int argc, char **argv) {
         {"create_update_delete_sequence", create_update_delete_sequence},
         {"revalidation_drops_bad_slot", revalidation_drops_bad_slot},
         {"parent_chain_of_four_is_drawn", parent_chain_of_four_is_drawn},
+        {"every_events_bit_is_drawn", every_events_bit_is_drawn},
         {"revalidation_after_the_object_exists", revalidation_after_the_object_exists},
         {"reject_logged_once_per_app", reject_logged_once_per_app},
         {"empty_text_is_made_and_set", empty_text_is_made_and_set},

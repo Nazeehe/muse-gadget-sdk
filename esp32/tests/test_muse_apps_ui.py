@@ -54,7 +54,7 @@ KINDS = list(PROPS)
 
 FONTS = "sans14, sans16, sans20, sans28, mono8, mono16, digits48, digits96"
 ALIGNS = "center, top, bottom, left, right, top_left, top_right, bottom_left, bottom_right"
-EVENTS = "tap, long_press, press, release"
+EVENTS = "tap, long_press, press, release, swipe"
 METHODS = "set, get, on, delete, scroll_to"
 UI_HAS = "label, button, box, arc, bar, image, spinner, bg, clear, polar, W, H, R, SAFE"
 COLOUR_HINT = '(use "#rgb", "#rrggbb" or 0xRRGGBB)'
@@ -119,7 +119,7 @@ class UiTest(UiTestCase):
             ("parent_not_a_box", "ui.label: parent must be a ui.box"),
             ("image_not_in_package", "ui.image: src 'nope.bin' is not one of this app's images "
                                      '(manifest.json "files")'),
-            ("unknown_event", f"ui.button: unknown event 'swipe' (valid: {EVENTS})"),
+            ("unknown_event", f"ui.button: unknown event 'fling' (valid: {EVENTS})"),
             ("missing_name", f"ui.labl doesn't exist (ui has: {UI_HAS})"),
             # B12: min stays under max.
             ("arc_min_max_create", "ui.arc: min must be less than max"),
@@ -641,6 +641,7 @@ class UiTest(UiTestCase):
         self.assertEqual(strings("apps_ui_items"), ["start", "center", "end"])
         self.assertEqual(strings("apps_ui_kinds"), KINDS)
         self.assertEqual(strings("apps_ui_events"), EVENTS.split(", "))
+        self.assertEqual(strings("apps_ui_dirs"), ["left", "right", "up", "down"])  # a swipe's, by apps_ui_dir_t
         for kind in KINDS:
             self.assertEqual(strings(f"apps_ui_props_{kind}"), PROPS[kind], kind)
 
@@ -1322,27 +1323,37 @@ class UiTest(UiTestCase):
             local app = {}
             local hits = {}
             function app.start()
-                for _, kind in ipairs({"label", "button", "box", "arc", "bar"}) do
+                for _, kind in ipairs({"label", "button", "box", "arc", "bar", "spinner"}) do
                     local w = ui[kind]{y = #hits * 20}
                     hits[#hits + 1] = w
-                    for _, event in ipairs({"tap", "click", "long_press", "press", "release"}) do
-                        print(kind, event, w:on(event, function(self, name) print("ran", kind, event, name) end) == w)
+                    for _, event in ipairs({"tap", "click", "long_press", "press", "release", "swipe"}) do
+                        print(kind, event, w:on(event, function(self, ...) print("ran", kind, event, ...) end) == w)
                     end
                 end
                 local img = ui.image{src = "a.bin"}
                 img:on("tap", function() print("image tapped") end)
+                img:on("swipe", function(self, name, dir) print("image", name, dir) end)
             end
             return app
         """
+        swipes = ["swipe #0 left", "swipe #1 right", "swipe #2 up", "swipe #3 down", "swipe #4 left", "swipe #5 right",
+                  "swipe #6 up"]
         run = self.host(self.make_app("scratch", main, files={"a.bin": lvgl_image()}),
-                        script=["tap #0", "tap #1", "tap #2", "tap #3", "tap #4", "tap #5"])
+                        script=[f"tap #{slot}" for slot in range(7)] + swipes)
         logs = run.logs()
-        self.assertEqual(len(logs), 25 + 6)
-        self.assertEqual(logs[:5], [f"label\t{e}\ttrue" for e in ("tap", "click", "long_press", "press", "release")])
+        events = ("tap", "click", "long_press", "press", "release", "swipe")
+        self.assertEqual(len(logs), 36 + 7 + 7)
+        self.assertEqual(logs[:6], [f"label\t{e}\ttrue" for e in events])
         # The handler of "click" replaced the one of "tap", on every kind (it names the event it was given for), and
-        # a tap still reaches it as "tap".
-        self.assertEqual(logs[25:], ["ran\tlabel\tclick\ttap", "ran\tbutton\tclick\ttap", "ran\tbox\tclick\ttap",
-                                     "ran\tarc\tclick\ttap", "ran\tbar\tclick\ttap", "image tapped"])
+        # a tap still reaches it as "tap", with nothing after it.
+        self.assertEqual(logs[36:43], ["ran\tlabel\tclick\ttap", "ran\tbutton\tclick\ttap", "ran\tbox\tclick\ttap",
+                                       "ran\tarc\tclick\ttap", "ran\tbar\tclick\ttap", "ran\tspinner\tclick\ttap",
+                                       "image tapped"])
+        # A swipe reaches every kind's swipe handler as (w, "swipe", dir).
+        self.assertEqual(logs[43:], ["ran\tlabel\tswipe\tswipe\tleft", "ran\tbutton\tswipe\tswipe\tright",
+                                     "ran\tbox\tswipe\tswipe\tup", "ran\tarc\tswipe\tswipe\tdown",
+                                     "ran\tbar\tswipe\tswipe\tleft", "ran\tspinner\tswipe\tswipe\tright",
+                                     "image\tswipe\tup"])
 
     def test_on_replaces_and_nil_removes(self):  # R9.7
         main = """
@@ -1359,11 +1370,18 @@ class UiTest(UiTestCase):
                 c:on("press", nil)
                 local d = ui.button{text = "D", y = 100}
                 d:on("click", function(w, name) print("d", name) d:on("tap", nil) end)
+                -- A swipe on f, inside e: f's second handler, which removes itself; then e's, up the boxes.
+                local e = ui.box{y = 150}
+                local f = ui.box{parent = e}
+                e:on("swipe", function(w, name, dir) print("e", w == e, dir) end)
+                f:on("swipe", function() print("f first") end)
+                f:on("swipe", function(w, name, dir) print("f", w == f, dir) f:on("swipe", nil) end)
             end
             return app
         """
-        run = self.host(self.make_app("scratch", main), script=['tap "B"', 'tap "C"', 'tap "D"', 'tap "D"', 'tap "B"'])
-        self.assertEqual(run.logs(), ["second", "d\ttap", "second"])
+        run = self.host(self.make_app("scratch", main), script=['tap "B"', 'tap "C"', 'tap "D"', 'tap "D"', 'tap "B"',
+                                                                "swipe #4 left", "swipe #4 right"])
+        self.assertEqual(run.logs(), ["second", "d\ttap", "second", "f\ttrue\tleft", "e\ttrue\tright"])
 
     def test_tap_in_a_handler_that_fails_crashes_the_app(self):
         main = """
@@ -1436,6 +1454,16 @@ class UiTest(UiTestCase):
             "no widget in slot 5", "dump needs a number of bytes: dump [n]", "dump needs a number of bytes: dump [n]",
             "dump needs a number of bytes: dump [n]",
         ])
+
+    def test_the_swipe_command_says_what_is_wrong(self):
+        lines = ['swipe', 'swipe left', 'swipe #0', 'swipe #0 sideways', 'swipe #0 left up', 'swipe #0 Left', 'swipe #x left',
+                 'swipe #128 left', 'swipe #0@ left', 'swipe #0@65536 left', 'swipe "Go" left', 'swipe #5 left',
+                 'swipe #0@0 left', 'swipe #0 left']
+        run = self.lua_app("ui.button{text = 'Go'}", script=lines)
+        usage = "swipe needs #<slot>[@<gen>] and left, right, up or down: swipe #3 left or swipe #3@1 up"
+        # The last two are a swipe on a button with no swipe handler: nobody hears it, and nothing is said.
+        self.assertEqual(run.messages("error"), [usage] * 11 + ["no widget in slot 5"])
+        self.assertEqual(run.logs(), [])
 
     def test_cycles_of_apps_with_widgets_leak_nothing(self):
         main = """
@@ -1611,9 +1639,18 @@ class HarnessTest(unittest.TestCase):
     def test_push_handler_checks_slot_gen_and_event(self):
         self.run_case("push_handler")
 
+    def test_a_swipe_calls_its_handler_with_the_direction(self):  # swipes Task 1, S1: (w, "swipe", dir)
+        self.run_case("swipe_calls_with_its_direction")
+
+    def test_a_swipe_goes_to_the_nearest_box_with_a_handler(self):  # S2: up the widget's boxes
+        self.run_case("swipe_goes_to_the_nearest_box_with_a_handler")
+
+    def test_a_swipes_direction_reaches_no_other_event(self):
+        self.run_case("swipe_bits_do_not_reach_other_events")
+
     def test_push_handler_reserves_the_slots_it_pushes(self):
         # Ledger 36: on a Lua with LUA_USE_APICHECK a push past the slots a C function reserved aborts; the case
-        # leaves push_handler 0 to 6 free slots on its highest path (a handle the app holds: 5).
+        # leaves push_handler 0 to 6 free slots on its highest path (a handle the app holds: 5), for a tap and a swipe.
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         exe = apps_host.build("muse_apps_ui_harness_apicheck", [*HARNESS_SOURCES, *apps_host.lua_sources()], tmp.name,

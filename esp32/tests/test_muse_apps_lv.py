@@ -219,6 +219,9 @@ class HarnessTest(unittest.TestCase):
     def test_a_chain_of_four_boxes_is_drawn(self):
         self.run_case("parent_chain_of_four_is_drawn")
 
+    def test_a_widget_with_every_event_is_drawn(self):  # swipes Task 1: the swipe's bit is the mask's
+        self.run_case("every_events_bit_is_drawn")
+
     def test_a_slot_that_goes_bad_after_its_object_exists_is_dropped(self):
         self.run_case("revalidation_after_the_object_exists")
 

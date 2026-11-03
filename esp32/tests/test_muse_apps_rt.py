@@ -104,7 +104,7 @@ def budget_message(n):
 BUDGET_CALL = budget_message(CALL)
 BUDGET_START = budget_message(START)
 # The commands apphost lists when it doesn't know one.
-COMMANDS = ("(commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, sync, timers, restart, "
+COMMANDS = ("(commands: message, stop, start, show, hide, state, log, tap, swipe, dump, advance, dark, sync, timers, restart, "
             "install, other_alarm, other_cancel, hold_alarms)")
 # The ring: a line takes its length plus one of 8192 bytes; print cuts a line at 200 bytes.
 RING_BYTES = 8192

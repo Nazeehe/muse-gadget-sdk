@@ -83,9 +83,15 @@ static const char *const apps_ui_items[] = {"start", "center", "end"};
 _Static_assert(ARRAY_LEN(apps_ui_items) == APPS_ITEMS_END + 1, "a name for each place across");
 
 /* An event's bit is 1 << its index here. "click" is "tap" under another name. */
-static const char *const apps_ui_events[] = {"tap", "long_press", "press", "release"};
-_Static_assert(ARRAY_LEN(apps_ui_events) == 4, "four events fit the events mask");
+static const char *const apps_ui_events[] = {"tap", "long_press", "press", "release", "swipe"};
+_Static_assert(ARRAY_LEN(apps_ui_events) == 5 && APPS_UI_SWIPE == 1 << 4, "five events fit the events mask");
 #define EVENT_COUNT ARRAY_LEN(apps_ui_events)
+/* A swipe's direction, by its apps_ui_dir_t. */
+static const char *const apps_ui_dirs[] = {"left", "right", "up", "down"};
+_Static_assert(ARRAY_LEN(apps_ui_dirs) == APPS_UI_DOWN + 1 && APPS_UI_DIR_MASK == APPS_UI_DOWN << APPS_UI_DIR_SHIFT,
+               "a name for each direction, and the direction's bits hold them all");
+_Static_assert((APPS_UI_DIR_MASK & ((1 << EVENT_COUNT) - 1)) == 0 && (APPS_UI_DIR_MASK & APPS_UI_INJECTED) == 0,
+               "the events' bits, a swipe's direction and Muse's tag share the event's byte without overlapping");
 
 /* What each kind takes, in the order the unknown-property message lists them. */
 static const char *const apps_ui_props_label[] = {
@@ -1846,33 +1852,72 @@ int apps_ui_count(const apps_ui_t *ui) {
     return ui != NULL ? ui->count : 0;
 }
 
-bool apps_ui_push_handler(lua_State *L, apps_ui_t *ui, uint16_t slot, uint16_t gen, uint8_t event) {
+const char *apps_ui_dir_name(uint8_t code) {
+    return apps_ui_dirs[(code & APPS_UI_DIR_MASK) >> APPS_UI_DIR_SHIFT];
+}
+
+/* The slot whose swipe handler hears a swipe on the alive widget at slot: its own, else the nearest box around it with one, else -1.
+ * A box's delete takes what is inside it, so the boxes of an alive widget are alive, on the gens they have now. A widget has at most
+ * APPS_UI_BOX_DEPTH_MAX boxes above it, so the walk stops there; a box that isn't alive, or a parent out of the table, ends it too.
+ * Neither can happen (the invariants), but each check stands alone, as push_handler's do. */
+static int swipe_target(const apps_ui_t *ui, int slot) {
+    for (int up = 0; up <= APPS_UI_BOX_DEPTH_MAX; up++) {
+        const apps_widget_t *w = &ui->w[slot];
+        if (!w->alive) {
+            return -1;
+        }
+        if ((w->events & APPS_UI_SWIPE) != 0) {
+            return slot;
+        }
+        if (w->parent < 0 || w->parent >= APPS_UI_SLOTS) {
+            return -1;
+        }
+        slot = w->parent;
+    }
+    return -1;
+}
+
+int apps_ui_push_handler(lua_State *L, apps_ui_t *ui, uint16_t slot, uint16_t gen, uint8_t event) {
+    uint8_t bit = (uint8_t)(event & ~APPS_UI_DIR_MASK);
     int index = -1;
     for (int i = 0; i < (int)EVENT_COUNT; i++) {
-        if (event == (1u << i)) {
+        if (bit == (1u << i)) {
             index = i;
         }
     }
-    if (ui == NULL || index < 0 || slot >= APPS_UI_SLOTS) {
-        return false;
+    /* The direction's bits are a swipe's alone. */
+    if (ui == NULL || index < 0 || (bit != APPS_UI_SWIPE && bit != event) || slot >= APPS_UI_SLOTS) {
+        return 0;
     }
     const apps_widget_t *w = &ui->w[slot];
-    if (!w->alive || w->gen != gen || (w->events & event) == 0 || !lua_checkstack(L, 5)) {
-        return false;
+    if (!w->alive || w->gen != gen) {
+        return 0;
+    }
+    int target = bit == APPS_UI_SWIPE ? swipe_target(ui, slot) : slot;
+    if (target < 0) {
+        return 0;
+    }
+    w = &ui->w[target];
+    if ((w->events & bit) == 0 || !lua_checkstack(L, 5)) {
+        return 0;
     }
     if (lua_rawgetp(L, LUA_REGISTRYINDEX, ui) != LUA_TTABLE) {
         lua_pop(L, 1);
-        return false;
+        return 0;
     }
-    int type = lua_rawgeti(L, -1, handler_key(slot, index));
+    int type = lua_rawgeti(L, -1, handler_key(target, index));
     lua_remove(L, -2);
     if (type != LUA_TFUNCTION) {
         lua_pop(L, 1);
-        return false;
+        return 0;
     }
-    push_widget(L, ui, slot, gen, w->kind);
+    push_widget(L, ui, target, w->gen, w->kind);
     lua_pushstring(L, apps_ui_events[index]);
-    return true;
+    if (bit != APPS_UI_SWIPE) {
+        return 2;
+    }
+    lua_pushstring(L, apps_ui_dir_name(event));
+    return 3;
 }
 
 /* ---- The dump ---- */

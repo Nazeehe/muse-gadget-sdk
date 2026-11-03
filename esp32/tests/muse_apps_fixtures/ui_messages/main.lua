@@ -30,7 +30,7 @@ case("text_not_utf8", function() ui.label{text = "\xff"} end)
 case("deleted_widget", function() w.gone_label:get("text") end)
 case("parent_not_a_box", function() ui.label{parent = w.label} end)
 case("image_not_in_package", function() ui.image{src = "nope.bin"} end)
-case("unknown_event", function() w.button:on("swipe", print) end)
+case("unknown_event", function() w.button:on("fling", print) end)
 case("missing_name", function() local _ = ui.labl end)
 
 case("arc_min_max_create", function() ui.arc{min = 5, max = 5} end)

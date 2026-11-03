@@ -323,7 +323,7 @@ static const char *check_widget(const pass_t *p, int slot, const apps_widget_t *
     if (w->spin > APPS_SPIN_RPM_MAX) {
         return "spin";
     }
-    if (w->events > (APPS_UI_TAP | APPS_UI_LONG_PRESS | APPS_UI_PRESS | APPS_UI_RELEASE)) {
+    if (w->events > (APPS_UI_TAP | APPS_UI_LONG_PRESS | APPS_UI_PRESS | APPS_UI_RELEASE | APPS_UI_SWIPE)) {
         return "events";
     }
     if (w->scroll > APPS_SCROLL_Y || w->layout > APPS_LAYOUT_COLUMN || w->items > APPS_ITEMS_END) {

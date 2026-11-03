@@ -266,7 +266,7 @@ static void check_invariants(int line, env_t *e) {
         CHECK_AT(line, w->min < w->max && w->min >= -APPS_UI_VALUE_MAX && w->max <= APPS_UI_VALUE_MAX &&
                            w->value >= w->min && w->value <= w->max,
                  "slot %d: min %d max %d value %d", i, w->min, w->max, w->value);
-        CHECK_AT(line, w->events <= (APPS_UI_TAP | APPS_UI_LONG_PRESS | APPS_UI_PRESS | APPS_UI_RELEASE),
+        CHECK_AT(line, w->events <= (APPS_UI_TAP | APPS_UI_LONG_PRESS | APPS_UI_PRESS | APPS_UI_RELEASE | APPS_UI_SWIPE),
                  "slot %d: events %d", i, w->events);
         CHECK_AT(line, w->scroll <= APPS_SCROLL_Y && w->layout <= APPS_LAYOUT_COLUMN && w->items <= APPS_ITEMS_END &&
                            w->gap <= APPS_UI_SPACE_MAX && w->pad <= APPS_UI_SPACE_MAX,
@@ -791,7 +791,7 @@ static void vm_check(void) {
         "f_set(w, 'not a table') probe()",
         "f_set(w, {nothing = 1}) probe()",
         "f_on(w, 5, probe) probe()",
-        "f_on(w, 'swipe', probe) probe()",
+        "f_on(w, 'fling', probe) probe()",
         "f_on(w, 'tap', 'not a function') probe()",
         "f_delete(5) probe()",
         "f_scroll(5, 'end') probe()",
@@ -990,7 +990,7 @@ typedef struct {
     uint16_t slot, gen;
     uint8_t event;
     int fill;  /* nils pushed first, to leave the call LUA_MINSTACK - fill free slots */
-    bool result;
+    int result;  /* what push_handler returned: the arguments it pushed after the handler, or 0 */
     int top_before, top_after;
 } probe_t;
 
@@ -1003,8 +1003,8 @@ static int probe_trampoline(lua_State *L) {
     p->top_before = lua_gettop(L);
     p->result = apps_ui_push_handler(L, p->ui, p->slot, p->gen, p->event);
     p->top_after = lua_gettop(L);
-    if (p->result) {
-        lua_call(L, 2, 0);
+    if (p->result > 0) {
+        lua_call(L, p->result, 0);
     }
     return 0;
 }
@@ -1044,10 +1044,10 @@ static void push_handler(void) {
         "a:on('long_press', function(w, ev) hits = hits + 10 last_event = ev end)\n"
         "b = ui.label{}");
     probe_t p = PROBE(&e, 0, 0, APPS_UI_TAP);
-    CHECK(p.result && p.top_after == p.top_before + 3, "tap: %d, %d values pushed", p.result, p.top_after - p.top_before);
+    CHECK(p.result == 2 && p.top_after == p.top_before + 3, "tap: %d, %d values pushed", p.result, p.top_after - p.top_before);
     RUN(&e, "assert(hits == 1 and last_event == 'tap' and last_widget == 'button#0', last_event)");
     p = PROBE(&e, 0, 0, APPS_UI_LONG_PRESS);
-    CHECK(p.result, "long_press");
+    CHECK(p.result == 2, "long_press: %d", p.result);
     RUN(&e, "assert(hits == 11 and last_event == 'long_press')");
 
     /* Nothing is pushed for what isn't there to run. */
@@ -1064,7 +1064,7 @@ static void push_handler(void) {
         {"a slot out of range", APPS_UI_SLOTS, 0, APPS_UI_TAP},
         {"no event", 0, 0, 0},
         {"two events", 0, 0, APPS_UI_TAP | APPS_UI_LONG_PRESS},
-        {"an event that isn't one", 0, 0, 16},
+        {"an event that isn't one", 0, 0, 32},
     };
     for (size_t i = 0; i < ARRAY_LEN(nothing); i++) {
         probe_t q = PROBE(&e, nothing[i].slot, nothing[i].gen, nothing[i].event);
@@ -1089,7 +1089,7 @@ static void push_handler(void) {
           "a mask that says no, with the handler still in the registry: %d, %s", p.result, err);
     W(&e, 0)->events = subscribed;
     p = PROBE(&e, 0, 0, APPS_UI_TAP);
-    CHECK(p.result, "the same slot, put back");
+    CHECK(p.result == 2, "the same slot, put back: %d", p.result);
     RUN(&e, "assert(hits == 12)");
 
     /* Deleted, and the slot lived again: the old gen finds nothing, the new one finds the new handler. */
@@ -1104,7 +1104,7 @@ static void push_handler(void) {
     p = PROBE(&e, 0, 0, APPS_UI_TAP);
     CHECK(!p.result, "the old gen on the new widget");
     p = PROBE(&e, 0, 1, APPS_UI_TAP);
-    CHECK(p.result, "the new widget's tap");
+    CHECK(p.result == 2, "the new widget's tap: %d", p.result);
     RUN(&e, "assert(hits == 100)");
 
     /* Unsubscribed: gone from the mask and from the registry. */
@@ -1114,21 +1114,206 @@ static void push_handler(void) {
     finish(&e);
 }
 
+/* A swipe calls its handler with (w, "swipe", dir), the direction read from the code's own two bits (APPS_UI_SWIPE_CODE): one
+ * argument more than another event's, and push_handler's count says so. */
+static void swipe_calls_with_its_direction(void) {
+    CHECK(APPS_UI_SWIPE_CODE(APPS_UI_LEFT) == 0x10 && APPS_UI_SWIPE_CODE(APPS_UI_RIGHT) == 0x30 &&
+              APPS_UI_SWIPE_CODE(APPS_UI_UP) == 0x50 && APPS_UI_SWIPE_CODE(APPS_UI_DOWN) == 0x70,
+          "the codes: %#x %#x %#x %#x", APPS_UI_SWIPE_CODE(APPS_UI_LEFT), APPS_UI_SWIPE_CODE(APPS_UI_RIGHT),
+          APPS_UI_SWIPE_CODE(APPS_UI_UP), APPS_UI_SWIPE_CODE(APPS_UI_DOWN));
+    OPEN(e);
+    RUN(&e,
+        "calls = 0\n"
+        "b = ui.box{w = 466, h = 466}\n"
+        "b:on('swipe', function(...) calls = calls + 1 n = select('#', ...) got, ev, dir = ... end)");
+    static const struct {
+        apps_ui_dir_t dir;
+        const char *name;
+    } dirs[] = {{APPS_UI_LEFT, "left"}, {APPS_UI_RIGHT, "right"}, {APPS_UI_UP, "up"}, {APPS_UI_DOWN, "down"}};
+    for (size_t i = 0; i < ARRAY_LEN(dirs); i++) {
+        uint8_t code = (uint8_t)APPS_UI_SWIPE_CODE(dirs[i].dir);
+        probe_t p = PROBE(&e, 0, 0, code);
+        CHECK(p.result == 3 && p.top_after == p.top_before + 4, "swipe %s: %d, %d values pushed", dirs[i].name, p.result,
+              p.top_after - p.top_before);
+        char check[160];
+        snprintf(check, sizeof check,
+                 "assert(calls == %d and n == 3 and got == b and ev == 'swipe' and dir == '%s', tostring(dir))", (int)i + 1,
+                 dirs[i].name);
+        RUN(&e, check);
+        /* The name is the bits', with Muse's tag on the code too. */
+        CHECK(strcmp(apps_ui_dir_name(code), dirs[i].name) == 0 &&
+                  strcmp(apps_ui_dir_name((uint8_t)(code | APPS_UI_INJECTED)), dirs[i].name) == 0,
+              "apps_ui_dir_name(%#x): %s", code, apps_ui_dir_name(code));
+    }
+    finish(&e);
+}
+
+/* A swipe on a widget with no swipe handler goes up its boxes to the nearest one that has one, which hears it as its own: w is the
+ * box. With none up to the top it is nobody's, and so is one on a widget beside the box rather than inside it. The event's gen is
+ * the pressed widget's, so a swipe of a widget that has gone is dropped, whatever its boxes would hear. */
+static void swipe_goes_to_the_nearest_box_with_a_handler(void) {
+    OPEN(e);
+    RUN(&e,
+        "heard = ''\n"
+        "function hear(name)\n"
+        "    return function(w, ev, dir, more) heard = heard .. name .. ' ' .. tostring(w) .. ' ' .. ev .. ' ' .. dir ..\n"
+        "        (more ~= nil and ' and more' or '') .. ';' end\n"
+        "end\n"
+        "a = ui.box{w = 466, h = 466}\n"
+        "b = ui.box{parent = a}\n"
+        "tile = ui.label{parent = b, text = '2'}\n"
+        "beside = ui.label{text = 'x'}\n"
+        "a:on('swipe', hear('a'))");
+    CHECK(W(&e, 2)->parent == 1 && W(&e, 1)->parent == 0 && W(&e, 0)->parent == -1 && W(&e, 3)->parent == -1,
+          "the slots: tile 2 in b 1 in a 0, beside 3");
+    const uint8_t left = (uint8_t)APPS_UI_SWIPE_CODE(APPS_UI_LEFT);
+    probe_t p = PROBE(&e, 2, 0, left);
+    CHECK(p.result == 3 && p.top_after == p.top_before + 4, "the tile's swipe: %d", p.result);
+    RUN(&e, "assert(heard == 'a box#0 swipe left;', heard) heard = ''");
+    p = PROBE(&e, 1, 0, (uint8_t)APPS_UI_SWIPE_CODE(APPS_UI_UP));
+    CHECK(p.result == 3, "b's own swipe: %d", p.result);
+    RUN(&e, "assert(heard == 'a box#0 swipe up;', heard) heard = ''");
+
+    /* The nearest: b's handler takes the tile's swipe from a, and the tile's own from both. nil removes one, and the swipe goes on
+     * up past it. */
+    RUN(&e, "b:on('swipe', hear('b'))");
+    p = PROBE(&e, 2, 0, left);
+    RUN(&e, "assert(heard == 'b box#1 swipe left;', heard) heard = ''");
+    RUN(&e, "tile:on('swipe', hear('tile'))");
+    p = PROBE(&e, 2, 0, (uint8_t)APPS_UI_SWIPE_CODE(APPS_UI_RIGHT));
+    RUN(&e, "assert(heard == 'tile label#2 swipe right;', heard) heard = ''");
+    RUN(&e, "tile:on('swipe', nil) b:on('swipe', nil)");
+    p = PROBE(&e, 2, 0, (uint8_t)APPS_UI_SWIPE_CODE(APPS_UI_DOWN));
+    CHECK(p.result == 3, "past the handlers removed: %d", p.result);
+    RUN(&e, "assert(heard == 'a box#0 swipe down;', heard) heard = ''");
+
+    /* Nobody's: a widget inside no box, a gen that isn't the tile's, and, with a's handler gone too, the tile's. */
+    static const struct {
+        const char *why;
+        int slot, gen;
+    } nobody[] = {{"beside the box", 3, 0}, {"a gen that isn't the tile's", 2, 1}};
+    for (size_t i = 0; i < ARRAY_LEN(nobody); i++) {
+        probe_t q = PROBE(&e, nobody[i].slot, nobody[i].gen, left);
+        CHECK(q.result == 0 && q.top_after == q.top_before, "%s: %d, %d values pushed", nobody[i].why, q.result,
+              q.top_after - q.top_before);
+    }
+    RUN(&e, "a:on('swipe', nil)");
+    p = PROBE(&e, 2, 0, left);
+    CHECK(p.result == 0 && p.top_after == p.top_before, "no handler up to the top: %d, %d values pushed", p.result,
+          p.top_after - p.top_before);
+    RUN(&e, "assert(heard == '', heard)");
+
+    /* As deep as boxes nest: a label with four boxes above it reaches the outermost. */
+    RUN(&e,
+        "d1 = ui.box{} d2 = ui.box{parent = d1} d3 = ui.box{parent = d2} d4 = ui.box{parent = d3}\n"
+        "deep = ui.label{parent = d4}\n"
+        "d1:on('swipe', hear('d1'))");
+    CHECK(W(&e, 8)->parent == 7 && W(&e, 4)->parent == -1, "the slots: deep 8, d1 4");
+    const uint8_t up = (uint8_t)APPS_UI_SWIPE_CODE(APPS_UI_UP);
+    p = PROBE(&e, 8, 0, up);
+    CHECK(p.result == 3, "four boxes up: %d", p.result);
+    RUN(&e, "assert(heard == 'd1 box#4 swipe up;', heard) heard = ''");
+
+    /* Each check stands alone, in a table no Lua call can make (so the invariants are not checked while it is so): a dead box
+     * in the chain ends the walk short of d1, and a chain that loops ends. */
+    char err[256] = "";
+    apps_call_t status;
+    W(&e, 6)->alive = false;
+    p = probe_status(&e, 8, 0, up, &status, err, sizeof err);
+    CHECK(status == APPS_CALL_OK && p.result == 0 && p.top_after == p.top_before, "a dead box in the chain: %d, %s",
+          p.result, err);
+    W(&e, 6)->alive = true;
+    RUN(&e, "d1:on('swipe', nil)");
+    W(&e, 4)->parent = 8;  /* d1 inside deep, which is inside d4: a ring of five */
+    p = probe_status(&e, 8, 0, up, &status, err, sizeof err);
+    CHECK(status == APPS_CALL_OK && p.result == 0 && p.top_after == p.top_before, "a chain that loops: %d, %s", p.result,
+          err);
+    W(&e, 4)->parent = -1;
+    RUN(&e, "assert(heard == '', heard)");
+
+    /* A deleted tile's swipe isn't its box's, whose handler is back. */
+    RUN(&e, "tile:delete() a:on('swipe', hear('a'))");
+    p = PROBE(&e, 2, 0, left);
+    CHECK(p.result == 0, "a deleted widget's swipe: %d", p.result);
+    RUN(&e, "assert(heard == '', heard)");
+    finish(&e);
+}
+
+/* A swipe's direction is in bits that only a swipe has: another event with them is no event, and a swipe is no other event's (a
+ * widget with every other handler and no swipe handler up its boxes hears nothing of it). Muse's tag (APPS_UI_INJECTED) is
+ * apps_rt_touch's to take off: a code that still has it is refused, a swipe's as a tap's. */
+static void swipe_bits_do_not_reach_other_events(void) {
+    OPEN(e);
+    RUN(&e,
+        "hits = 0\n"
+        "box = ui.box{}\n"
+        "go = ui.button{parent = box, text = 'Go'}\n"
+        "for _, ev in ipairs({'tap', 'long_press', 'press', 'release'}) do go:on(ev, function() hits = hits + 1 end) end\n"
+        "s = ui.box{}\n"
+        "s:on('swipe', function() hits = hits + 100 end)");
+    static const uint8_t others[] = {APPS_UI_TAP, APPS_UI_LONG_PRESS, APPS_UI_PRESS, APPS_UI_RELEASE};
+    for (size_t i = 0; i < ARRAY_LEN(others); i++) {
+        probe_t p = PROBE(&e, 1, 0, others[i]);
+        CHECK(p.result == 2, "%#x on its own: %d", others[i], p.result);
+        for (int dir = APPS_UI_RIGHT; dir <= APPS_UI_DOWN; dir++) {  /* left's bits are 0: the event alone */
+            uint8_t code = (uint8_t)(others[i] | (dir << APPS_UI_DIR_SHIFT));
+            p = PROBE(&e, 1, 0, code);
+            CHECK(p.result == 0 && p.top_after == p.top_before, "%#x, with a direction's bits: %d, %d values pushed", code,
+                  p.result, p.top_after - p.top_before);
+        }
+    }
+    RUN(&e, "assert(hits == 4, hits)");
+    for (int dir = APPS_UI_LEFT; dir <= APPS_UI_DOWN; dir++) {
+        for (int slot = 0; slot <= 1; slot++) {  /* the button, and its box: no swipe handler in the chain */
+            probe_t p = PROBE(&e, slot, 0, (uint8_t)APPS_UI_SWIPE_CODE(dir));
+            CHECK(p.result == 0 && p.top_after == p.top_before, "a swipe %d on slot %d: %d, %d values pushed", dir, slot,
+                  p.result, p.top_after - p.top_before);
+        }
+    }
+    RUN(&e, "assert(hits == 4, hits)");
+
+    const uint8_t up = (uint8_t)APPS_UI_SWIPE_CODE(APPS_UI_UP);
+    probe_t p = PROBE(&e, 2, 0, up);
+    CHECK(p.result == 3, "s's swipe: %d", p.result);
+    static const struct {
+        const char *why;
+        int slot;
+        uint8_t event;
+    } refused[] = {
+        {"a swipe still tagged", 2, (uint8_t)(up | APPS_UI_INJECTED)},
+        {"a tap still tagged", 1, APPS_UI_TAP | APPS_UI_INJECTED},
+        {"a swipe and a tap", 2, (uint8_t)(up | APPS_UI_TAP)},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(refused); i++) {
+        p = PROBE(&e, refused[i].slot, 0, refused[i].event);
+        CHECK(p.result == 0 && p.top_after == p.top_before, "%s: %d, %d values pushed", refused[i].why, p.result,
+              p.top_after - p.top_before);
+    }
+    RUN(&e, "assert(hits == 104, hits)");
+    finish(&e);
+}
+
 /* push_handler reserves what it pushes, whatever room its caller left: a C function starts with LUA_MINSTACK free
  * slots, and the probe fills them down to `left`. Its highest point is a handle the app already holds (create keeps
- * it): luaL_testudata's two metatables over the handler, the handle table and the handle, 5 slots. The test builds
- * this harness on a Lua with LUA_USE_APICHECK, which aborts on a push past the slots reserved. */
+ * it): luaL_testudata's two metatables over the handler, the handle table and the handle, 5 slots. A swipe's name and
+ * direction come after that, 4 in all. The test builds this harness on a Lua with LUA_USE_APICHECK, which aborts on a
+ * push past the slots reserved. */
 static void push_handler_reserves_its_slots(void) {
     OPEN(e);
-    RUN(&e, "hits = 0 a = ui.button{text = 'Go'} a:on('tap', function(w) assert(w == a) hits = hits + 1 end)");
+    RUN(&e,
+        "hits = 0 a = ui.button{text = 'Go'} a:on('tap', function(w) assert(w == a) hits = hits + 1 end)\n"
+        "b = ui.box{} b:on('swipe', function(w, ev, dir) assert(w == b and ev == 'swipe' and dir == 'down') hits = hits + 100 end)");
     for (int left = 0; left <= 6; left++) {
         char err[256] = "";
         apps_call_t status;
         probe_t p = probe_filled(&e, 0, 0, APPS_UI_TAP, LUA_MINSTACK - left, &status, err, sizeof err);
-        CHECK(status == APPS_CALL_OK && p.result && p.top_after == p.top_before + 3, "%d slots left: %d, %s", left,
+        CHECK(status == APPS_CALL_OK && p.result == 2 && p.top_after == p.top_before + 3, "%d slots left: %d, %s", left,
               p.result, err);
+        p = probe_filled(&e, 1, 0, (uint8_t)APPS_UI_SWIPE_CODE(APPS_UI_DOWN), LUA_MINSTACK - left, &status, err, sizeof err);
+        CHECK(status == APPS_CALL_OK && p.result == 3 && p.top_after == p.top_before + 4, "a swipe, %d slots left: %d, %s",
+              left, p.result, err);
     }
-    RUN(&e, "assert(hits == 7, hits)");
+    RUN(&e, "assert(hits == 707, hits)");
     finish(&e);
 }
 
@@ -1636,6 +1821,9 @@ int main(int argc, char **argv) {
         {"clear", clear},
         {"bg", bg},
         {"push_handler", push_handler},
+        {"swipe_calls_with_its_direction", swipe_calls_with_its_direction},
+        {"swipe_goes_to_the_nearest_box_with_a_handler", swipe_goes_to_the_nearest_box_with_a_handler},
+        {"swipe_bits_do_not_reach_other_events", swipe_bits_do_not_reach_other_events},
         {"push_handler_reserves_its_slots", push_handler_reserves_its_slots},
         {"handlers_dropped", handlers_dropped},
         {"assets", assets},

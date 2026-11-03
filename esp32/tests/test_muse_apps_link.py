@@ -278,6 +278,11 @@ class GuideAndSkill(unittest.TestCase):
                 props, evs = lines[kind]
                 self.assertEqual(props.rstrip(".").split(", "), c_table(ui, f"apps_ui_props_{kind}"))
                 self.assertEqual(evs.rstrip(".").split(", "), events)
+        # The handler's call is (w, event), with a swipe's direction third, named as apps_ui.c names them (swipes S1).
+        dirs = c_table(ui, "apps_ui_dirs")
+        self.assertEqual(dirs, ["left", "right", "up", "down"])
+        self.assertIn(f'`w:on(event, fn)` calls `fn(w, event)`; a swipe calls `fn(w, "swipe", dir)`, dir is '
+                      f'{", ".join(dirs[:-1])} or {dirs[-1]}', reference)
 
         # Methods and constants are documented, not set-compared (D4).
         for method in c_table(ui, "apps_ui_methods"):
@@ -1409,7 +1414,7 @@ class GuideAndSkill(unittest.TestCase):
         reference = guide_section(GUIDE.read_text(), "API reference")
         self.assertRegex(reference, r"(?m)^- `ui\.spinner\{\.\.\.\}`: a ring that turns by itself")
         self.assertRegex(reference, r"(?m)^- `ui\.spinner` properties: align, x, y, w, h, hidden, opacity, parent, thickness, color, "
-                                    r"track_color; events: tap, long_press, press, release$")
+                                    r"track_color; events: tap, long_press, press, release, swipe$")
         for pattern in (rf"[Ww]ithout `w` and `h` it is {side} px square", r"about once a second", r"no Lua running",
                         r"no value", r"shows no progress", r"nothing shows one for you", r"`muse\.ask` shows none",
                         r"`thickness` \(of an arc or a spinner\)"):

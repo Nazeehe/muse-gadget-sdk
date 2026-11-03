@@ -317,10 +317,13 @@ apps_ui_t *apps_rt_ui(apps_rt_t *rt);
 
 /*
  * A touch on a widget, from the LVGL task through the app's queue: the handler the app gave w:on for that event
- * runs with (w, event) and APPS_BUDGET_CALL, for a RUNNING app. slot and gen are what the event carried when
- * the apply step posted it, and event one APPS_UI_* bit, with APPS_UI_INJECTED for a touch of Muse's own (app.control
- * tap or drag). A widget that has been deleted since (its gen has moved on, or the slot is empty), or has no handler
- * for the event, runs nothing, and says nothing. A handler that fails crashes the app, like any other. A person's
+ * runs with (w, event) and APPS_BUDGET_CALL, for a RUNNING app; a swipe's with (w, "swipe", dir), and when the widget
+ * has no swipe handler the nearest box's around it that has one runs, with that box as w (apps_ui_push_handler). slot
+ * and gen are what the event carried when the apply step posted it, and event one APPS_UI_* bit or a swipe's
+ * APPS_UI_SWIPE_CODE, with APPS_UI_INJECTED for a touch of Muse's own (app.control tap or drag): the tag is taken off
+ * before the handler is found, and a swipe's direction stays. A widget that has been deleted since (its gen has moved
+ * on, or the slot is empty), or has no handler for the event (nor, for a swipe, any box around it), runs nothing, and
+ * says nothing. A handler that fails crashes the app, like any other. A person's
  * touch, whatever it found, opens sys.show's window and muse.ask's (apps_rt_show_allowed, apps_rt_tapped); one with
  * APPS_UI_INJECTED is heard all the same and opens neither.
  */

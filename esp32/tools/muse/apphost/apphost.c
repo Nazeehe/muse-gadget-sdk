@@ -104,6 +104,9 @@
  *                          has moved on from, a widget with no tap handler and an app that isn't running print
  *                          nothing: the touch is dropped, as on the gadget. A slot with no widget is an error.
  *   tap "TEXT"             a tap on the first button or label (in slot order) whose text is TEXT, a JSON string
+ *   swipe #SLOT[@GEN] DIR  a swipe, DIR left, right, up or down, on the widget in that slot, as tap #SLOT is: its swipe
+ *                          handler runs with (w, "swipe", DIR), or, with none, that of the nearest box around it that has
+ *                          one (apps_ui.h), with that box as w. A swipe nobody hears prints nothing.
  *   dump [N]               the widgets as the gadget reports them (apps_ui_dump), in at most N bytes (all of
  *                          them by default)
  *   advance MS             time passes: the monotonic clock moves MS ms (0 to 86400000) in steps of 10 ms, and after each
@@ -711,6 +714,37 @@ static int find_by_text(apps_ui_t *ui, const char *text) {
     return found;
 }
 
+/* #SLOT[@GEN], the whole of arg, for tap and swipe: the slot, and the gen given or, with none, the one the slot has now (a touch on
+ * what is there). False, with an error event, when arg isn't one (bad is what to say) or, given no gen, the slot has no widget. */
+static bool take_slot(apps_ui_t *ui, const char *arg, const char *bad, long *slot, long *gen) {
+    const char *p = arg + 1;
+    *slot = -1;
+    *gen = -1;
+    bool ok = arg[0] == '#' && take_number(&p, APPS_UI_SLOTS, slot);
+    if (ok && *p == '@') {
+        p++;
+        ok = take_number(&p, 65535, gen) && *gen <= 65535;
+    }
+    if (!ok || *p != '\0' || *slot >= APPS_UI_SLOTS) {
+        emit_text("error", bad);
+        return false;
+    }
+    if (*gen < 0) {
+        apps_port_ui_lock();
+        const apps_widget_t *w = apps_ui_slot(ui, (int)*slot);
+        bool alive = w->alive;
+        *gen = w->gen;
+        apps_port_ui_unlock();
+        if (!alive) {
+            char text[64];
+            snprintf(text, sizeof text, "no widget in slot %ld", *slot);
+            emit_text("error", text);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* tap #SLOT[@GEN] or tap "TEXT": see the commands, above. */
 static void cmd_tap(app_t *app, const char *args) {
     if (app->rt == NULL) {
@@ -719,28 +753,9 @@ static void cmd_tap(app_t *app, const char *args) {
     apps_ui_t *ui = apps_rt_ui(app->rt);
     long slot = -1, gen = -1;
     if (args[0] == '#') {
-        const char *p = args + 1;
-        bool ok = take_number(&p, APPS_UI_SLOTS, &slot);
-        if (ok && *p == '@') {
-            p++;
-            ok = take_number(&p, 65535, &gen) && gen <= 65535;
-        }
-        if (!ok || *p != '\0' || slot >= APPS_UI_SLOTS) {
-            emit_text("error", "tap needs a slot of 0 to 127 and, after an @, a gen of 0 to 65535: tap #3 or tap #3@1");
+        if (!take_slot(ui, args, "tap needs a slot of 0 to 127 and, after an @, a gen of 0 to 65535: tap #3 or tap #3@1", &slot,
+                       &gen)) {
             return;
-        }
-        if (gen < 0) {  /* the gen the slot has now: a tap on what is there */
-            apps_port_ui_lock();
-            const apps_widget_t *w = apps_ui_slot(ui, (int)slot);
-            bool alive = w->alive;
-            gen = w->gen;
-            apps_port_ui_unlock();
-            if (!alive) {
-                char text[64];
-                snprintf(text, sizeof text, "no widget in slot %ld", slot);
-                emit_text("error", text);
-                return;
-            }
         }
     } else if (args[0] == '"') {
         apps_jr_t reader;
@@ -768,6 +783,31 @@ static void cmd_tap(app_t *app, const char *args) {
     }
     bool was_crashed = crashed(app);
     apps_rt_touch(app->rt, (uint16_t)slot, (uint16_t)gen, APPS_UI_TAP);
+    flush_warnings(app);
+    report_crash(app, was_crashed);
+}
+
+#define SWIPE_USAGE "swipe needs #<slot>[@<gen>] and left, right, up or down: swipe #3 left or swipe #3@1 up"
+
+/* swipe #SLOT[@GEN] DIR: see the commands, above. target is the line's first word and dir the rest. */
+static void cmd_swipe(app_t *app, const char *target, const char *dir) {
+    if (app->rt == NULL) {
+        return;
+    }
+    int d = APPS_UI_LEFT;
+    while (d <= APPS_UI_DOWN && strcmp(apps_ui_dir_name((uint8_t)APPS_UI_SWIPE_CODE(d)), dir) != 0) {
+        d++;
+    }
+    if (d > APPS_UI_DOWN) {
+        emit_text("error", SWIPE_USAGE);
+        return;
+    }
+    long slot, gen;
+    if (!take_slot(apps_rt_ui(app->rt), target, SWIPE_USAGE, &slot, &gen)) {
+        return;
+    }
+    bool was_crashed = crashed(app);
+    apps_rt_touch(app->rt, (uint16_t)slot, (uint16_t)gen, (uint8_t)APPS_UI_SWIPE_CODE(d));
     flush_warnings(app);
     report_crash(app, was_crashed);
 }
@@ -1234,6 +1274,13 @@ static void run_line(app_t *app, char *line) {
         }
     } else if (strcmp(cmd, "tap") == 0) {
         cmd_tap(app, args);
+    } else if (strcmp(cmd, "swipe") == 0) {
+        char *dir = word_end(args);  /* args is the slot, a space and the direction */
+        if (*dir != '\0') {
+            *dir++ = '\0';
+            dir = skip_space(dir);
+        }
+        cmd_swipe(app, args, dir);
     } else if (strcmp(cmd, "dump") == 0) {
         long cap = DUMP_DEFAULT_BYTES;
         if (*args != '\0' && (!parse_count(args, DUMP_MAX_BYTES, &cap) || cap < 1)) {
@@ -1297,7 +1344,7 @@ static void run_line(app_t *app, char *line) {
         }
     } else {
         snprintf(text, sizeof text,
-                 "unknown command '%.60s' (commands: message, stop, start, show, hide, state, log, tap, dump, advance, dark, "
+                 "unknown command '%.60s' (commands: message, stop, start, show, hide, state, log, tap, swipe, dump, advance, dark, "
                  "sync, timers, restart, install, other_alarm, other_cancel, hold_alarms)",
                  cmd);
         emit_text("error", text);

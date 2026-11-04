@@ -3571,6 +3571,39 @@ lv_obj_t *lv_display_get_layer_bottom(lv_display_t *disp) {
     return display_layer(disp, &layer_bottom_obj, "lv_display_get_layer_bottom");
 }
 
+/* The 1.75C's display: 466 px, the apps' canvas, so apps_lv.c scales nothing (fit_canvas) and the rest only has to link. */
+int32_t lv_display_get_horizontal_resolution(const lv_display_t *disp) {
+    if (disp != NULL && disp != &display_obj) {  /* NULL: the default display, the only one */
+        fake_error("lv_display_get_horizontal_resolution on %p, not the display", (void *)disp);
+    }
+    return 466;
+}
+
+void lv_obj_transform_point(const lv_obj_t *obj, lv_point_t *p, lv_obj_point_transform_flag_t flags) {
+    (void)obj, (void)p, (void)flags;
+    fake_error("lv_obj_transform_point: the 466 px display never scales the canvas");
+}
+
+void lv_obj_set_style_transform_pivot_x(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    (void)obj, (void)value, (void)selector;
+    fake_error("lv_obj_set_style_transform_pivot_x: the 466 px display never scales the canvas");
+}
+
+void lv_obj_set_style_transform_pivot_y(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    (void)obj, (void)value, (void)selector;
+    fake_error("lv_obj_set_style_transform_pivot_y: the 466 px display never scales the canvas");
+}
+
+void lv_obj_set_style_transform_scale_x(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    (void)obj, (void)value, (void)selector;
+    fake_error("lv_obj_set_style_transform_scale_x: the 466 px display never scales the canvas");
+}
+
+void lv_obj_set_style_transform_scale_y(lv_obj_t *obj, int32_t value, lv_style_selector_t selector) {
+    (void)obj, (void)value, (void)selector;
+    fake_error("lv_obj_set_style_transform_scale_y: the 466 px display never scales the canvas");
+}
+
 /* The 1.75C's panel isn't rotated: a point stays where it is (lv_display.c's, for LV_DISPLAY_ROTATION_0). */
 void lv_display_rotate_point(lv_display_t *disp, lv_point_t *point) {
     (void)display_layer(disp, NULL, "lv_display_rotate_point");

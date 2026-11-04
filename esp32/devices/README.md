@@ -708,6 +708,10 @@ tools/muse/board.sh build knob18
 tools/muse/board.sh flash knob18
 ```
 
+With `MUSE_APPS=1`, a long press on the pocket watch opens the apps'
+launcher. Apps are written for a 466 px screen, and the knob draws them
+scaled to its 360 px (`../AGENTS.md`, Muse apps).
+
 To enter the bootloader, hold BOOT while plugging in; there's no reset
 button. A reset over USB after flashing can leave it in the bootloader with a
 dark screen: replug it. Back up the 16 MB firmware first, outside Git:

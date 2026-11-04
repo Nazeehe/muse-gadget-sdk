@@ -795,8 +795,14 @@ the design, the Wi-Fi protocol and the numbers.
 5.4 programs that Muse writes on its VM and installs on the gadget over Link.
 Each draws its own screen and runs in a sandbox with its own memory cap and CPU
 budget, and keeps working without Muse, the VM or Wi-Fi. It's for the Waveshare
-S3 1.75C only (`board.sh` refuses `MUSE_APPS=1` for other boards): the launcher
-hangs off its pocket watch. Add `MUSE_BENCH=1` for the bench console
+S3 1.75C and the Waveshare knob (`knob18`); `board.sh` refuses `MUSE_APPS=1`
+for other boards. The launcher hangs off the pocket watch. Apps draw on a
+466 px canvas (`ui.W`, `app.api`'s screen): the knob's 360 px screen shows
+the layer and the cards as that canvas scaled about its centre (LVGL's
+`transform_scale`, `fit_canvas` in `apps_lv.c`), and touches are brought into
+it (`to_canvas`; `apps_lv_to_screen` for `app.control`'s). A scaled layer
+draws through an offscreen layer, so it costs more CPU a frame than the
+1.75C's. Add `MUSE_BENCH=1` for the bench console
 (screenshots, injected touch, `>mem`). Without the option nothing changes.
 
 - **Pieces:** `components/lua` (Lua 5.4.9, unmodified) and, in

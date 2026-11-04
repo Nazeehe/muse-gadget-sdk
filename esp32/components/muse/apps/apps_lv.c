@@ -157,6 +157,57 @@ static EXT_RAM_BSS_ATTR volatile uint32_t s_spinning;
 /* The cards' parent (made at the first show): the screen the layer is on. The cards themselves are with the launcher, below. */
 static lv_obj_t *s_screen;
 static void forget_cards(void);
+
+/*
+ * The canvas (apps_lv.h): the layer and the cards are SCREEN_PX square, centred on the screen, and on a round screen of another
+ * size scaled about their centre to fit it (s_canvas_scale, 256 for none). Their objects keep the canvas's coordinates offset by
+ * where the square starts (lv_obj_get_coords), and a touch is read on the screen: to_canvas brings it into the canvas, 0 to 465.
+ */
+static int32_t s_canvas_scale = LV_SCALE_NONE;
+
+static void fit_canvas(lv_obj_t *obj) {
+    if (s_canvas_scale == LV_SCALE_NONE) {
+        lv_obj_set_size(obj, lv_pct(100), lv_pct(100));  /* the screen is the canvas */
+        return;
+    }
+    lv_obj_set_size(obj, SCREEN_PX, SCREEN_PX);
+    lv_obj_align(obj, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_transform_pivot_x(obj, SCREEN_R, LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_y(obj, SCREEN_R, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_x(obj, s_canvas_scale, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_y(obj, s_canvas_scale, LV_PART_MAIN);
+}
+
+/* Where a canvas object (the layer or a card) starts on the screen, unscaled: its objects' coordinates are offset by it. */
+static lv_point_t canvas_origin(const lv_obj_t *obj) {
+    if (s_canvas_scale == LV_SCALE_NONE || obj == NULL) {
+        return (lv_point_t){0, 0};
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    return (lv_point_t){a.x1, a.y1};
+}
+
+/* A point as an input device reads it, on obj's canvas. */
+static lv_point_t to_canvas(const lv_obj_t *obj, lv_point_t p) {
+    if (s_canvas_scale == LV_SCALE_NONE || obj == NULL) {
+        return p;
+    }
+    lv_obj_transform_point(obj, &p, LV_OBJ_POINT_TRANSFORM_FLAG_INVERSE);
+    const lv_point_t o = canvas_origin(obj);
+    return (lv_point_t){p.x - o.x, p.y - o.y};
+}
+
+void apps_lv_to_screen(int32_t *x, int32_t *y) {
+    if (s_canvas_scale == LV_SCALE_NONE || s_layer == NULL) {
+        return;
+    }
+    const lv_point_t o = canvas_origin(s_layer);
+    lv_point_t p = {o.x + *x, o.y + *y};
+    lv_obj_transform_point(s_layer, &p, LV_OBJ_POINT_TRANSFORM_FLAG_NONE);
+    *x = p.x;
+    *y = p.y;
+}
 /* The board's frame pairing (apps_lv_set_pairing_cb): the callback, whether it was last told on, and the display its refreshes are
  * followed on. The LVGL task's. */
 static void (*s_pairing_cb)(bool on);
@@ -426,6 +477,7 @@ static void note_app_press(void) {
     lv_indev_t *indev = lv_indev_active();
     if (indev != NULL) {
         lv_indev_get_point(indev, &s_press.at);
+        s_press.at = to_canvas(s_layer, s_press.at);  /* in_left_edge is the canvas's */
         s_press.reset = s_press.resets;
     }
 }
@@ -1344,6 +1396,7 @@ static void write_back(pass_t *p) {
     p->layout_us += t1 - t0;
 #endif
     apply_scrolls(p);
+    const lv_point_t origin = canvas_origin(s_layer);
     for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
         apps_widget_t *w = apps_ui_slot(p->ui, slot);
         const node_t *n = &p->st->node[slot];
@@ -1352,6 +1405,7 @@ static void write_back(pass_t *p) {
         }
         lv_area_t area;
         lv_obj_get_coords(n->obj, &area);
+        area.x1 -= origin.x, area.x2 -= origin.x, area.y1 -= origin.y, area.y2 -= origin.y;  /* the canvas's, as ui has them */
         int32_t x1 = clamp_i32(area.x1, -30000, 30000), y1 = clamp_i32(area.y1, -30000, 30000);
         int32_t rw = clamp_i32(area.x2 - area.x1 + 1, 0, 30000), rh = clamp_i32(area.y2 - area.y1 + 1, 0, 30000);
         w->rx = (int16_t)x1;
@@ -1693,13 +1747,17 @@ void apps_lv_build(lv_obj_t *screen) {
     watch_frames(screen);
 #endif
 
+    /* A round screen smaller or larger than the apps' draws their canvas scaled to its width. */
+    const int32_t side = lv_display_get_horizontal_resolution(NULL);  /* the default display: the gadget has one */
+    s_canvas_scale = side > 0 && side != SCREEN_PX ? (side * LV_SCALE_NONE + SCREEN_PX / 2) / SCREEN_PX : LV_SCALE_NONE;
+
     lv_obj_t *layer = lv_obj_create(screen);
     if (layer == NULL) {
         s_layer = NULL;
         return;
     }
     lv_obj_remove_style_all(layer);
-    lv_obj_set_size(layer, lv_pct(100), lv_pct(100));
+    fit_canvas(layer);
     lv_obj_set_style_bg_color(layer, colour(0), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(layer, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_add_flag(layer, LV_OBJ_FLAG_CLICKABLE);  /* a touch on no widget is the layer's, not the screen's */
@@ -1946,7 +2004,7 @@ static lv_obj_t *new_card(void) {
         return NULL;
     }
     lv_obj_remove_style_all(card);
-    lv_obj_set_size(card, lv_pct(100), lv_pct(100));
+    fit_canvas(card);
     lv_obj_set_style_bg_color(card, colour(0), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
@@ -2465,6 +2523,7 @@ static void note_press(void) {
     lv_indev_t *indev = lv_indev_active();
     if (indev != NULL) {
         lv_indev_get_point(indev, &C.press);
+        C.press = to_canvas(s_launcher, C.press);  /* in_close_edge and in_name_strip are the canvas's */
     }
 }
 
@@ -2478,6 +2537,7 @@ static bool lifted_in_place(void) {
     }
     lv_point_t p;
     lv_indev_get_point(indev, &p);
+    p = to_canvas(s_launcher, p);
     int32_t dx = p.x - C.press.x, dy = p.y - C.press.y;
     return dx > -TAP_SLOP_PX && dx < TAP_SLOP_PX && dy > -TAP_SLOP_PX && dy < TAP_SLOP_PX;
 }
@@ -2491,6 +2551,9 @@ static bool in_name_strip(lv_point_t p) {
     lv_area_t row, name;
     lv_obj_get_coords(C.row, &row);
     lv_obj_get_coords(C.name, &name);
+    const lv_point_t o = canvas_origin(s_launcher);  /* p is the canvas's */
+    row.x1 -= o.x, row.x2 -= o.x, row.y1 -= o.y, row.y2 -= o.y;
+    name.x1 -= o.x, name.x2 -= o.x, name.y1 -= o.y, name.y2 -= o.y;
     return p.x >= name.x1 && p.x <= name.x2 && p.y > row.y2 && p.y <= name.y2;
 }
 

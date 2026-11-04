@@ -196,7 +196,11 @@ void apps_touch_supervise(void) {
         memset(&s_t.a, 0, sizeof s_t.a);
         s_t.a.pressed = APPS_LV_HIT_LAYER;
         s_t.swiped = s_t.ended = false;
-        if (!muse_ui_guarded_drag(s_t.x1, s_t.y1, s_t.x2, s_t.y2, s_t.ms, &GUARD)) {
+        /* The job's points are the apps' canvas's; the touch is played, and admitted and kept (apps_lv_hit), on the screen. */
+        int32_t x1 = s_t.x1, y1 = s_t.y1, x2 = s_t.x2, y2 = s_t.y2;
+        apps_lv_to_screen(&x1, &y1);
+        apps_lv_to_screen(&x2, &y2);
+        if (!muse_ui_guarded_drag((int)x1, (int)y1, (int)x2, (int)y2, s_t.ms, &GUARD)) {
             s_t.a.why = WHY_NO_INPUT;
             s_t.ended = true;
             if (!move(T_QUEUED, T_DONE)) {

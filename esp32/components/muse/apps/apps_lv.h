@@ -249,6 +249,13 @@ bool apps_lv_front(void);
 #define APPS_LV_HIT_OUTSIDE (-2)
 #define APPS_LV_HIT_LAYER (-1)
 int apps_lv_hit(int32_t x, int32_t y);
+/*
+ * The apps' screen is 466 px across (ui.W, app.api's screen): a round screen of another size draws the layer and the cards as a
+ * 466 px canvas scaled about its centre (LVGL's transform_scale), and LVGL finds what a touch presses through that scale.
+ * apps_lv_to_screen: a point on that canvas (an app's, app.control's: 0 to 465) where it shows on the screen, as an input device
+ * reads it, for apps_lv_hit and the touches app.control plays. On a 466 px screen it is the same point. The LVGL task's.
+ */
+void apps_lv_to_screen(int32_t *x, int32_t *y);
 int apps_lv_kind(int slot);
 typedef struct {
     int16_t slot;

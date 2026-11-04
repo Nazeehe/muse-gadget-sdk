@@ -257,6 +257,11 @@ int apps_lv_hit(int32_t x, int32_t y) {
     return APPS_LV_HIT_LAYER;
 }
 
+/* The 1.75C's screen is the apps' canvas: a point shows where it is. */
+void apps_lv_to_screen(int32_t *x, int32_t *y) {
+    (void)x, (void)y;
+}
+
 int apps_lv_kind(int slot) {
     if (slot == BUTTON) {
         return APPS_W_BUTTON;

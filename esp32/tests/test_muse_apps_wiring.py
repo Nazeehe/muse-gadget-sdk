@@ -316,23 +316,27 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertEqual(sorted(listed - on_disk), [], "CMakeLists.txt lists sources that don't exist")
         self.assertIn("apps/apps_lv.c", listed)
 
-    def test_board_sh_refuses_the_apps_for_any_board_but_the_175c(self):  # G
+    def test_board_sh_refuses_the_apps_for_any_board_but_the_175c_and_the_knob(self):  # G
         # The overlay's table and FAT lines apply on any board it is loaded on, apps or not: board.sh refuses the flag for every
         # other board, with one line, before it activates ESP-IDF or touches a build dir. The environment has no ESP-IDF, so a
         # board.sh that went past the guard would stop at "idf.py not found" (or mosaico's utils) and never build.
         board = ROOT / "tools/muse/board.sh"
+        refused = "MUSE_APPS=1 is only for the 1.75C (s3) and the Waveshare knob (knob18)"
         with tempfile.TemporaryDirectory() as home:
             env = {"HOME": home, "PATH": "/usr/bin:/bin", "MUSE_APPS": "1"}
-            for name in ("s3n", "sticks3", "plus2", "mosaico"):
+            for name in ("s3n", "sticks3", "plus2", "mosaico", "185c"):
                 with self.subTest(name):
                     done = subprocess.run(["bash", str(board), "build", name], env=env, capture_output=True, text=True,
                                           timeout=60)
                     self.assertNotEqual(done.returncode, 0)
-                    self.assertEqual((done.stdout + done.stderr).strip(), "MUSE_APPS=1 is only for the 1.75C (s3)")
-            # The 1.75C passes the guard (and stops at the missing ESP-IDF here).
-            done = subprocess.run(["bash", str(board), "build", "s3"], env=env, capture_output=True, text=True, timeout=60)
-            self.assertNotIn("is only for the 1.75C", done.stdout + done.stderr)
-            self.assertIn("idf.py not found", done.stdout + done.stderr)
+                    self.assertEqual((done.stdout + done.stderr).strip(), refused)
+            # The 1.75C and the knob (which scales the apps' canvas) pass the guard (and stop at the missing ESP-IDF here).
+            for name in ("s3", "knob18"):
+                with self.subTest(name):
+                    done = subprocess.run(["bash", str(board), "build", name], env=env, capture_output=True, text=True,
+                                          timeout=60)
+                    self.assertNotIn("is only for", done.stdout + done.stderr)
+                    self.assertIn("idf.py not found", done.stdout + done.stderr)
 
     def test_board_sh_and_ci(self):
         board = (ROOT / "tools/muse/board.sh").read_text()

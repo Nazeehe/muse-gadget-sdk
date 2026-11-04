@@ -480,6 +480,20 @@ bool lv_timer_get_paused(lv_timer_t *timer);
 void lv_timer_ready(lv_timer_t *timer);
 lv_timer_t *lv_display_get_refr_timer(lv_display_t *disp);
 
+/* The display's width, and the scaled canvas a screen of another width uses (apps_lv.c's fit_canvas). The 1.75C's display is the
+ * apps' 466 px canvas, so apps_lv.c never scales here: the transform calls only have to link. */
+#define LV_SCALE_NONE 256
+typedef enum {
+    LV_OBJ_POINT_TRANSFORM_FLAG_NONE = 0x00,
+    LV_OBJ_POINT_TRANSFORM_FLAG_INVERSE = 0x02,
+} lv_obj_point_transform_flag_t;
+int32_t lv_display_get_horizontal_resolution(const lv_display_t *disp);
+void lv_obj_transform_point(const lv_obj_t *obj, lv_point_t *p, lv_obj_point_transform_flag_t flags);
+void lv_obj_set_style_transform_pivot_x(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+void lv_obj_set_style_transform_pivot_y(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+void lv_obj_set_style_transform_scale_x(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+void lv_obj_set_style_transform_scale_y(lv_obj_t *obj, int32_t value, lv_style_selector_t selector);
+
 lv_indev_t *lv_indev_active(void);
 lv_dir_t lv_indev_get_gesture_dir(const lv_indev_t *indev);
 lv_obj_t *lv_indev_search_obj(lv_obj_t *obj, lv_point_t *point);

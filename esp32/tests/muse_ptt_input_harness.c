@@ -53,6 +53,7 @@ bool muse_console_host(void) { return true; }
 bool muse_ui_dark(void) { return false; }
 bool muse_ui_clock_showing(void) { return false; }   /* no pocket watch page here */
 void muse_ui_request_face(void) {}
+void muse_ui_request_page_step(int dir) { (void)dir; }
 void xTaskNotifyGive(TaskHandle_t t) { (void)t; }
 void vTaskDelay(int ms) { clock_us+=ms*1000; }
 TickType_t xTaskGetTickCount(void) { return clock_us/1000; }

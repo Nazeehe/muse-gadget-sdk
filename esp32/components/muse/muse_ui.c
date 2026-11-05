@@ -133,6 +133,7 @@ static int s_pages;
 static lv_obj_t *s_dots[3];
 static volatile bool s_on_clock;    /* read by the input task */
 static volatile bool s_want_face;
+static atomic_int s_page_steps;     /* the knob's detents the next frame takes: + right, - left */
 static lv_obj_t *s_wifi_icon;
 static lv_obj_t *s_ble_icon;
 static lv_obj_t *s_cover;
@@ -2151,6 +2152,45 @@ void muse_ui_request_snapshot(void)
     s_snapshot = true;
 }
 
+/* One page right (dir > 0) or left: muse_ui_request_page_step's, at a frame. */
+static void step_page(int dir)
+{
+    if (!s_tv) {
+        return;
+    }
+#if CONFIG_MUSE_APPS
+    if (muse_apps_front()) {
+        if (dir > 0) {
+            muse_apps_ui_send_back();   /* the app is the page left of the watch */
+        }
+        return;
+    }
+    if (muse_apps_covering()) {
+        return;   /* the launcher or a card takes the screen's touches, and the knob leaves it alone */
+    }
+#endif
+    if (!lv_obj_has_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE)) {
+        return;   /* a Settings sub-page, which turns the swipe off */
+    }
+    lv_obj_t *tile = lv_tileview_get_tile_active(s_tv);
+    lv_obj_t *to = NULL;
+    if (tile == s_settings) {
+        to = dir < 0 ? s_face : NULL;
+    } else if (tile == s_face) {
+        to = dir < 0 ? s_clock : s_settings;
+    } else if (tile == s_clock) {
+        to = dir > 0 ? s_face : NULL;
+#if CONFIG_MUSE_APPS
+        if (dir < 0) {
+            muse_apps_ui_bring_front();   /* nothing when no app runs */
+        }
+#endif
+    }
+    if (to) {
+        lv_tileview_set_tile(s_tv, to, muse_board->epaper ? LV_ANIM_OFF : LV_ANIM_ON);
+    }
+}
+
 static void frame_tick(lv_timer_t *timer)
 {
 #if CONFIG_MUSE_BENCH
@@ -2164,6 +2204,10 @@ static void frame_tick(lv_timer_t *timer)
     if (s_want_face) {
         s_want_face = false;
         muse_ui_show_face();
+    }
+    int steps = atomic_exchange(&s_page_steps, 0);
+    if (steps) {
+        step_page(steps > 0 ? 1 : -1);   /* one page a frame, however fast the knob turns */
     }
     update_control_hints(muse_state_mode(NULL));
     if (s_snapshot) {
@@ -2340,6 +2384,11 @@ void muse_ui_request_face(void)
 {
     s_on_clock = false;   /* a second press before the slide talks */
     s_want_face = true;
+}
+
+void muse_ui_request_page_step(int dir)
+{
+    atomic_fetch_add(&s_page_steps, dir);
 }
 
 void muse_ui_set_swipe_enabled(bool enabled)

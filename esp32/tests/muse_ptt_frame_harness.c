@@ -15,6 +15,7 @@
  */
 #include <assert.h>
 #include <math.h>
+#include <stdatomic.h>
 #include "muse_voice.h"
 #include "muse_pixel.h"
 
@@ -38,6 +39,9 @@ static void send_snapshot(void) {}
 static void image_sync(void) {}
 static void image_hide_locked(void) {}
 static void muse_ui_show_face(void) {}
+/* The knob's page steps: no StopWatch has a knob. */
+static atomic_int s_page_steps;
+static void step_page(int dir) { (void)dir; }
 static bool update_sleep(void) { return false; }
 static void update_chrome(float now) { (void)now; }
 static bool muse_menu_tick(float now) { (void)now; return false; }

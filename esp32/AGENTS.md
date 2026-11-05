@@ -802,7 +802,11 @@ the layer and the cards as that canvas scaled about its centre (LVGL's
 `transform_scale`, `fit_canvas` in `apps_lv.c`), and touches are brought into
 it (`to_canvas`; `apps_lv_to_screen` for `app.control`'s). A scaled layer
 draws through an offscreen layer, so it costs more CPU a frame than the
-1.75C's. Add `MUSE_BENCH=1` for the bench console
+1.75C's. The knob's detents step the home pages, and the app that runs is the
+page left of the pocket watch: a step left of the watch fronts it
+(`muse_apps_ui_bring_front`) and a step right of it puts it behind
+(`muse_apps_ui_send_back`, as the left edge's swipe does), through
+`muse_ui_request_page_step`. Add `MUSE_BENCH=1` for the bench console
 (screenshots, injected touch, `>mem`). Without the option nothing changes.
 
 - **Pieces:** `components/lua` (Lua 5.4.9, unmodified) and, in

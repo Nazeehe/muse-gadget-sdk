@@ -33,7 +33,9 @@
  * on-screen mic (touch_talk), and a tap on the screen confirms pairing. BOOT
  * still works as push-to-talk. The knob is a two-way switch, not a quadrature
  * encoder: each detent pulses one line low, A turning right and B turning
- * left (the demo's bidi_switch_knob.c). It sets the volume.
+ * left (the demo's bidi_switch_knob.c). Each detent steps the home pages
+ * (MUSE_BTN_PAGE_*): right toward Settings, left toward the pocket watch and,
+ * past it, the app that runs. The volume is in Settings > Sound.
  *
  * Audio: a CH445P switch picks which chip drives the DAC, selected by the
  * GPIO0 net. With BOOT up (GPIO0 high) it's the S3, so the DAC only hears
@@ -71,9 +73,6 @@
 #include "muse_ui.h"
 #include "muse_lcd_bands.h"
 #include "muse_mem.h"
-#include "muse_settings.h"
-#include "muse_state.h"
-#include "muse_voice.h"
 
 #include "esp_lcd_st77916.h"
 #include "esp_lcd_touch_cst816s.h"
@@ -113,7 +112,6 @@ static const char *TAG = "board";
 
 #define MIC_GAIN_OFFSET_DB 0
 
-#define KNOB_STEP 5            /* volume points per detent */
 #define KNOB_LOCKOUT 3         /* polls (30 ms) a line's later edges are its bounce */
 
 static i2c_master_bus_handle_t s_i2c;
@@ -432,30 +430,19 @@ static bool knob_detent(pcnt_unit_handle_t unit, int *lockout)
     return n != 0;
 }
 
-/* Right turns raise the volume, left turns lower it, with the menu's chirp at
- * the new level. Volume is a setting, so it's kept across restarts. */
-static void poll_knob(void)
+/* A right turn is a page right, a left turn a page left; muse_input wakes a
+ * dark screen with either and takes the step only when it's lit. */
+static unsigned poll_knob(void)
 {
     static int right_lockout, left_lockout;
-    int step = (knob_detent(s_knob_right, &right_lockout) ? KNOB_STEP : 0)
-             - (knob_detent(s_knob_left, &left_lockout) ? KNOB_STEP : 0);
-    if (!step) {
-        return;
-    }
-    int vol = muse_settings_volume() + step;
-    vol = vol < 0 ? 0 : vol > 100 ? 100 : vol;
-    if (vol != muse_settings_volume()) {
-        muse_settings_set_volume(vol);
-        muse_voice_request_chirp();
-    }
-    muse_state_poke();
+    int step = knob_detent(s_knob_right, &right_lockout) - knob_detent(s_knob_left, &left_lockout);
+    return step > 0 ? MUSE_BTN_PAGE_RIGHT : step < 0 ? MUSE_BTN_PAGE_LEFT : 0;
 }
 
 /* Talk comes from the on-screen mic (touch_talk) or BOOT. */
 static unsigned poll_buttons(void)
 {
-    poll_knob();
-    return muse_gpio_button_poll(&s_boot);
+    return poll_knob() | muse_gpio_button_poll(&s_boot);
 }
 
 /* The battery divider (GPIO1) is on the 5 V rail, so on USB it reads the

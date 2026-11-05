@@ -386,6 +386,18 @@ static void keyboard_buttons(unsigned ev)
     else if (ev & MUSE_BTN_ENTER) muse_menu_key(MUSE_MENU_SELECT);
 }
 
+/* A knob's detent steps the home pages; on a dark screen it only wakes it. */
+static void page_buttons(unsigned ev)
+{
+    if (!(ev & (MUSE_BTN_PAGE_LEFT | MUSE_BTN_PAGE_RIGHT)) || s_talk_down) return;
+    if (muse_state_asleep()) {
+        set_asleep(false, "knob");
+        return;
+    }
+    muse_state_poke();
+    muse_ui_request_page_step(ev & MUSE_BTN_PAGE_RIGHT ? 1 : -1);
+}
+
 /* A pairing prompt wakes the screen and keeps it on; otherwise idle sleeps. */
 static void check_sleep(void)
 {
@@ -622,7 +634,8 @@ static void input_task(void *arg)
         /* Any press leaves the video view (its release then does nothing). */
         const unsigned presses = MUSE_BTN_TALK_PRESS | MUSE_BTN_AUX_PRESS | MUSE_BTN_POWER_PRESS |
                                  MUSE_BTN_SPEAKER_PRESS | MUSE_BTN_UP | MUSE_BTN_DOWN | MUSE_BTN_LEFT |
-                                 MUSE_BTN_RIGHT | MUSE_BTN_ENTER | MUSE_BTN_ESCAPE;
+                                 MUSE_BTN_RIGHT | MUSE_BTN_ENTER | MUSE_BTN_ESCAPE |
+                                 MUSE_BTN_PAGE_LEFT | MUSE_BTN_PAGE_RIGHT;
         if ((ev & presses) && muse_video_is_open()) {
             muse_video_close();
             ev &= ~(presses | MUSE_BTN_POWER_LONG);
@@ -634,6 +647,7 @@ static void input_task(void *arg)
             talk_button(ev);
         }
         keyboard_buttons(ev);
+        page_buttons(ev);
         dedicated_buttons(ev);
         /* A latched key (the 1.75's PMU) can report press and release in the
          * same poll, and a release can land just before the next press; keep

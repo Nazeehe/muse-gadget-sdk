@@ -434,6 +434,15 @@ void muse_apps_ui_turn(bool in_turn);
 /* Any task: the launcher opens at the next frame (after a voice turn). A long press on the watch calls this. */
 void muse_apps_open_launcher(void);
 
+/* The LVGL task: the app that runs comes to the front, as the launcher's pick of it would bring it (a knob's step left of the
+ * watch). False, and nothing changes, when no app runs with its table published, it hung, it is in front already, a card shows
+ * or a voice turn is on. */
+bool muse_apps_ui_bring_front(void);
+
+/* The LVGL task: the app in front goes behind, as the right swipe from the left edge puts it (a knob's step right of the app).
+ * False when it isn't in front or a card covers it. */
+bool muse_apps_ui_send_back(void);
+
 /* Any task: the app layer is in front. */
 bool muse_apps_front(void);
 

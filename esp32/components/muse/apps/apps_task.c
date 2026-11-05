@@ -1818,6 +1818,25 @@ static void front_now(void) {
     post_from_lvgl(APPS_EV_SHOW, L.gen);
 }
 
+bool muse_apps_ui_bring_front(void) {
+    if (!atomic_load(&s_up) || L.in_turn || apps_lv_front() || apps_lv_cards_shown() || !atomic_load(&s_rec->published) ||
+        atomic_load(&s_rec->hung) || atomic_load(&s_rec->app_gen) != L.gen) {  /* read after published: that table is L's app's */
+        return false;
+    }
+    L.want_front = false;
+    front_now();
+    update_covering();
+    return true;
+}
+
+bool muse_apps_ui_send_back(void) {
+    if (!atomic_load(&s_up) || !apps_lv_front() || apps_lv_cards_shown()) {
+        return false;
+    }
+    on_close();
+    return true;
+}
+
 /* The screen was dark and is lit: the timers that came due while it slept are overdue, and the app task's loop, which waits a
  * second for an event while the screen is dark (no timer can run, so no deadline shortens its wait), is told at once, with a
  * no-op event. Without it the loop notices the wake at its next round, up to that second, and an app in front shows its

@@ -39,6 +39,11 @@ bool muse_ui_face_active(void);
 bool muse_ui_clock_showing(void);
 /* From any task: slides to Muse's face at the next frame. */
 void muse_ui_request_face(void);
+/* From any task: one page right (dir > 0) or left at the next frame, as a knob's detent (MUSE_BTN_PAGE_*). The
+ * pages are the app that runs (with Muse apps), the pocket watch, Muse's face and Settings: left of the watch
+ * fronts the app, and right of the app puts it behind. Nothing past either end, nor while the launcher or a card
+ * shows or the swipe is off (a Settings sub-page). */
+void muse_ui_request_page_step(int dir);
 
 /* The functions below run in the LVGL task (or with the display lock held). */
 

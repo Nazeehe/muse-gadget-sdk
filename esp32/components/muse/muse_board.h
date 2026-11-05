@@ -64,6 +64,11 @@ extern "C" {
 #define MUSE_BTN_POWER_LONG   (1u << 12)
 #define MUSE_BTN_SPEAKER_PRESS (1u << 13)
 #define MUSE_BTN_SPEAKER_RELEASE (1u << 14)
+/* A knob's detents on a touch board: one page of the home pages left or right
+ * (muse_ui_request_page_step), the app that runs being the page left of the
+ * pocket watch. */
+#define MUSE_BTN_PAGE_LEFT    (1u << 15)
+#define MUSE_BTN_PAGE_RIGHT   (1u << 16)
 
 /* Where a button's icon goes on screen: beside the button, inside the panel. */
 typedef struct {

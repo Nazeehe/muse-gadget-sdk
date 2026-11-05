@@ -477,6 +477,7 @@ static const muse_board_t s_board = {
     .round = true,
     .touch = true,
     .touch_talk = true,
+    .page_knob = true,
     .diagonal_in = 1.8f,
     .talk_button = "BOOT",
     /* The on-screen mic, low and central where the circle has room for it. */

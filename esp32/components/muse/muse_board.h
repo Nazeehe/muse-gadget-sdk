@@ -86,6 +86,7 @@ typedef struct {
     float diagonal_in;      /* screen size; under 2" typing uses a keypad with bigger keys */
     bool touch_talk;        /* on-screen mic supplies talk edges; no physical talk button */
     bool keyboard;          /* dedicated menu navigation keys */
+    bool page_knob;         /* a knob steps the home pages (MUSE_BTN_PAGE_*): the app that runs gets a page dot */
     const char *talk_button;    /* where the buttons are, for captions: "top" */
     const char *aux_button;     /* "bottom" */
     muse_button_hint_t talk_hint;   /* mic icon; the menu's hints follow both */

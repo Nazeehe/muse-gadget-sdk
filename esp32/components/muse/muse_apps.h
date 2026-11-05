@@ -443,6 +443,10 @@ bool muse_apps_ui_bring_front(void);
  * False when it isn't in front or a card covers it. */
 bool muse_apps_ui_send_back(void);
 
+/* The LVGL task: an app runs with its table published and hasn't hung, so it is the page left of the watch (muse_ui's page dots),
+ * in front or behind. */
+bool muse_apps_ui_has_page(void);
+
 /* Any task: the app layer is in front. */
 bool muse_apps_front(void);
 

@@ -130,7 +130,8 @@ bool muse_ui_face_active(void)
 static lv_obj_t *s_settings;
 static lv_obj_t *s_clock;   /* the pocket watch, left of the face (CONFIG_MUSE_CLOCK) */
 static int s_pages;
-static lv_obj_t *s_dots[3];
+static lv_obj_t *s_dots[4];         /* with Muse apps, the last is the app's, left of the others */
+static bool s_app_dot;              /* it shows: an app runs, so it is the page left of the watch */
 static volatile bool s_on_clock;    /* read by the input task */
 static volatile bool s_want_face;
 static atomic_int s_page_steps;     /* the knob's detents the next frame takes: + right, - left */
@@ -1308,12 +1309,30 @@ static void update_control_hints(muse_mode_t mode)
     }
 }
 
+/* The page dots in a row along the bottom: the app's first when it shows. */
+static void place_dots(bool app)
+{
+    int n = s_pages + app;
+    for (int i = 0; i < s_pages; i++) {
+        lv_obj_align(s_dots[i], LV_ALIGN_BOTTOM_MID, (2 * (i + app) - (n - 1)) * 8, -14);
+    }
+    if (s_dots[s_pages]) {
+        lv_obj_align(s_dots[s_pages], LV_ALIGN_BOTTOM_MID, -(n - 1) * 8, -14);
+        lv_obj_set_flag(s_dots[s_pages], LV_OBJ_FLAG_HIDDEN, !app);
+    }
+    s_app_dot = app;
+}
+
 static void build_overlays(void)
 {
     lv_obj_t *scr = lv_screen_active();
 
-    /* Page dots. */
-    for (int i = 0; i < s_pages; i++) {
+    /* Page dots, and with Muse apps the app's (laid out by place_dots). */
+    int dots = s_pages;
+#if CONFIG_MUSE_APPS
+    dots += s_clock && muse_board->page_knob;   /* the knob reaches the app from the watch */
+#endif
+    for (int i = 0; i < dots; i++) {
         lv_obj_t *d = lv_obj_create(scr);
         lv_obj_remove_style_all(d);
         lv_obj_set_size(d, 8, 8);
@@ -1321,9 +1340,9 @@ static void build_overlays(void)
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(d, lv_color_hex(COLOR_DOT_OFF), 0);
         lv_obj_remove_flag(d, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, (2 * i - (s_pages - 1)) * 8, -14);
         s_dots[i] = d;
     }
+    place_dots(false);
 
 #if CONFIG_MUSE_APPS
     /* Muse apps' full-screen layer: over the pages and their dots, under the downloaded image. */
@@ -1510,14 +1529,25 @@ static void update_chrome(float now)
         if (swipe != lv_obj_has_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE)) {
             lv_obj_set_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE, swipe);
         }
-        int shown = page * 2 + subpage;
+        bool app = false;
+#if CONFIG_MUSE_APPS
+        app = s_dots[s_pages] && muse_apps_ui_has_page();   /* in front, the app's layer covers the dots */
+#endif
+        int shown = (page * 2 + subpage) * 2 + app;
         if (shown != s_shown_page) {
+            if (app != s_app_dot) {
+                place_dots(app);
+            }
             /* On the watch's gold case, dots in its own colours. */
             bool gold = tile == s_clock;
             uint32_t on = gold ? COLOR_DOT_ON_GOLD : COLOR_ACCENT, off = gold ? COLOR_DOT_OFF_GOLD : COLOR_DOT_OFF;
             for (int i = 0; i < s_pages; i++) {
                 lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(i == page ? on : off), 0);
                 lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, settings && subpage);
+            }
+            if (s_dots[s_pages]) {
+                lv_obj_set_style_bg_color(s_dots[s_pages], lv_color_hex(off), 0);
+                lv_obj_set_flag(s_dots[s_pages], LV_OBJ_FLAG_HIDDEN, !app || (settings && subpage));
             }
             s_shown_page = shown;
         }

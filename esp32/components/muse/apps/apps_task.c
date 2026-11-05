@@ -1818,9 +1818,13 @@ static void front_now(void) {
     post_from_lvgl(APPS_EV_SHOW, L.gen);
 }
 
+bool muse_apps_ui_has_page(void) {
+    return atomic_load(&s_up) && atomic_load(&s_rec->published) && !atomic_load(&s_rec->hung) &&
+           atomic_load(&s_rec->app_gen) == L.gen;  /* read after published: that table is L's app's */
+}
+
 bool muse_apps_ui_bring_front(void) {
-    if (!atomic_load(&s_up) || L.in_turn || apps_lv_front() || apps_lv_cards_shown() || !atomic_load(&s_rec->published) ||
-        atomic_load(&s_rec->hung) || atomic_load(&s_rec->app_gen) != L.gen) {  /* read after published: that table is L's app's */
+    if (L.in_turn || apps_lv_front() || apps_lv_cards_shown() || !muse_apps_ui_has_page()) {
         return false;
     }
     L.want_front = false;

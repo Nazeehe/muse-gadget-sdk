@@ -713,7 +713,8 @@ tools/muse/board.sh flash knob18
 With `MUSE_APPS=1`, a long press on the pocket watch opens the apps'
 launcher. The app that runs is the page left of the watch: a left turn there
 brings it to the front, and a right turn puts it behind again (as the swipe
-from the left edge does). Apps are written for a 466 px screen, and the knob
+from the left edge does). While an app runs, a fourth page dot shows left of
+the watch's. Apps are written for a 466 px screen, and the knob
 draws them scaled to its 360 px (`../AGENTS.md`, Muse apps).
 
 To enter the bootloader, hold BOOT while plugging in; there's no reset

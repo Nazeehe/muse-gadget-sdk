@@ -136,8 +136,11 @@ static void round_area(lv_event_t *e)
     a->y2 |= 1;
 }
 
-/* One counter per line, counting its falling edges: a pulse can be shorter
- * than a 10 ms poll, so the hardware catches it and poll_knob() reads it. */
+/* One counter per line, counting its rising edges: the contact closes partway
+ * into a turn and opens as the detent clicks home, so the step lands with the
+ * click (the vendor's bidi_switch_knob.c counts the release too). A pulse can
+ * be shorter than a 10 ms poll, so the hardware catches it and poll_knob()
+ * reads it. */
 static esp_err_t knob_line_init(gpio_num_t gpio, pcnt_unit_handle_t *unit)
 {
     const pcnt_unit_config_t unit_cfg = { .low_limit = -100, .high_limit = 100 };
@@ -147,8 +150,8 @@ static esp_err_t knob_line_init(gpio_num_t gpio, pcnt_unit_handle_t *unit)
     pcnt_channel_handle_t ch;
     const pcnt_chan_config_t ch_cfg = { .edge_gpio_num = gpio, .level_gpio_num = -1 };
     ESP_RETURN_ON_ERROR(pcnt_new_channel(*unit, &ch_cfg, &ch), TAG, "pcnt channel");
-    ESP_RETURN_ON_ERROR(pcnt_channel_set_edge_action(ch, PCNT_CHANNEL_EDGE_ACTION_HOLD,
-                                                     PCNT_CHANNEL_EDGE_ACTION_INCREASE),
+    ESP_RETURN_ON_ERROR(pcnt_channel_set_edge_action(ch, PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                                     PCNT_CHANNEL_EDGE_ACTION_HOLD),
                         TAG, "pcnt edge");
     ESP_RETURN_ON_ERROR(pcnt_unit_enable(*unit), TAG, "pcnt enable");
     ESP_RETURN_ON_ERROR(pcnt_unit_clear_count(*unit), TAG, "pcnt clear");

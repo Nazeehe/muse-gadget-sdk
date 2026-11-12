@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "apps_canvas.h"
 #include "apps_json.h"
 #include "apps_pkg.h"
 #include "apps_port.h"
@@ -62,8 +63,8 @@ _Static_assert(APPS_UI_SCROLL_MAX >= APPS_UI_SLOTS * (SCREEN + APPS_UI_SPACE_MAX
 
 /* ---- The names ---- */
 
-static const char *const apps_ui_kinds[] = {"label", "button", "box", "arc", "bar", "image", "spinner"};
-_Static_assert(ARRAY_LEN(apps_ui_kinds) == APPS_W_SPINNER + 1, "a name for each kind");
+static const char *const apps_ui_kinds[] = {"label", "button", "box", "arc", "bar", "image", "spinner", "canvas"};
+_Static_assert(ARRAY_LEN(apps_ui_kinds) == APPS_W_CANVAS + 1, "a name for each kind");
 
 static const char *const apps_ui_aligns[] = {"center",   "top",       "bottom",      "left",         "right",
                                              "top_left", "top_right", "bottom_left", "bottom_right"};
@@ -118,6 +119,9 @@ static const char *const apps_ui_props_image[] = {
 static const char *const apps_ui_props_spinner[] = {
     "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "thickness", "color", "track_color",
 };
+static const char *const apps_ui_props_canvas[] = {
+    "align", "x", "y", "w", "h", "hidden", "opacity", "parent", "bg",
+};
 
 static const struct {
     const char *const *names;
@@ -130,6 +134,7 @@ static const struct {
     [APPS_W_BAR] = {apps_ui_props_bar, ARRAY_LEN(apps_ui_props_bar)},
     [APPS_W_IMAGE] = {apps_ui_props_image, ARRAY_LEN(apps_ui_props_image)},
     [APPS_W_SPINNER] = {apps_ui_props_spinner, ARRAY_LEN(apps_ui_props_spinner)},
+    [APPS_W_CANVAS] = {apps_ui_props_canvas, ARRAY_LEN(apps_ui_props_canvas)},
 };
 
 /* ---- The properties ---- */
@@ -216,6 +221,7 @@ struct apps_ui {
     apps_asset_t images[APPS_RT_IMAGES_MAX];
     uint32_t image_gen[APPS_RT_IMAGES_MAX];
     uint32_t drawn;
+    void *draw_block; /* c:draw's block while its second pass fills it: a raise there leaves it here, for the next c:draw or the free */
     char handle_key;  /* its address is the registry's key of the table that remembers the app's handles */
     char image_key;   /* and this one's, of the table that remembers the runtime images' handles */
 };
@@ -334,6 +340,9 @@ static void init_widget(apps_widget_t *w, int kind) {
         w->bg = 0x262626;
         w->radius = 16;
     }
+    if (kind == APPS_W_CANVAS) {
+        w->bg = 0x000000;  /* opaque until the app says "none" */
+    }
 }
 
 /* The bits a widget has when it is made: all it needs to be applied from nothing. */
@@ -344,6 +353,9 @@ static uint32_t created_dirty(int kind) {
     }
     if (kind == APPS_W_ARC || kind == APPS_W_BAR) {
         dirty |= APPS_DIRTY_VALUE;
+    }
+    if (kind == APPS_W_CANVAS) {
+        dirty |= APPS_DIRTY_DRAW;  /* its pixels, filled with its bg (and its drawing, once it has one) */
     }
     return dirty;
 }
@@ -938,6 +950,38 @@ static void read_prop(const ctx_t *x, prop_t p, int idx, change_t *c) {
     c->set |= BIT(p);
 }
 
+/* ---- The canvases' pixels ----
+ * A canvas holds its pixels (apps_lv.c makes them, through the floor): 2 bytes a px, or 4 with bg "none" (transparent). Together the
+ * canvases take at most APPS_CANVAS_BYTES_MAX, one opaque canvas the size of the screen. A canvas has no content to size to, so a
+ * create gives w and h. */
+
+static uint32_t canvas_bytes(int64_t w, int64_t h, int64_t bg) {
+    return (uint32_t)(w > 0 ? w : 0) * (uint32_t)(h > 0 ? h : 0) * (bg == APPS_COLOR_NONE ? 4u : 2u);
+}
+
+static void check_canvas(const ctx_t *x, const change_t *c) {
+    if (x->kind != APPS_W_CANVAS) {
+        return;
+    }
+    if (x->creating && ((c->set & BIT(P_W)) == 0 || (c->set & BIT(P_H)) == 0)) {
+        fail_kind(x->L, x->kind, "w and h are required (a canvas is that many px)");
+    }
+    int64_t w = (c->set & BIT(P_W)) != 0 ? c->v[P_W] : x->cur->w;
+    int64_t h = (c->set & BIT(P_H)) != 0 ? c->v[P_H] : x->cur->h;
+    int64_t bg = (c->set & BIT(P_BG)) != 0 ? c->v[P_BG] : (x->cur != NULL ? x->cur->bg : 0);
+    uint32_t total = canvas_bytes(w, h, bg);
+    for (int i = 0; i < APPS_UI_SLOTS; i++) {
+        const apps_widget_t *o = &x->ui->w[i];
+        if (o->alive && o->kind == APPS_W_CANVAS && o != x->cur) {
+            total += canvas_bytes(o->w, o->h, o->bg);
+        }
+    }
+    if (total > APPS_CANVAS_BYTES_MAX) {
+        fail_kind(x->L, x->kind, "canvases may take at most %d bytes together, one opaque canvas of %d x %d (2 bytes a px, 4 with bg "
+                  "\"none\"); these would take %d", APPS_CANVAS_BYTES_MAX, SCREEN, SCREEN, (int)total);
+    }
+}
+
 /*
  * Reads and checks the properties in the table at t (an absolute index), into c, and raises on the first
  * problem. Nothing is changed. An unknown key is found first, whatever else is wrong; then the properties are
@@ -988,6 +1032,7 @@ static void read_props(const ctx_t *x, int t, change_t *c) {
         fail_kind(L, x->kind, "src is required (a .bin image of this app's manifest.json \"files\")");
     }
     check_spin(x, c);
+    check_canvas(x, c);
 }
 
 /* ---- Changing the table ---- */
@@ -1071,8 +1116,9 @@ static void commit_set(apps_ui_t *ui, int slot, const change_t *c, char *text, c
 /* What a delete or a clear takes out of the table, to be let go of after the lock. */
 typedef struct {
     char *text[APPS_UI_SLOTS];
+    struct apps_cv_list *drawing[APPS_UI_SLOTS];
     uint8_t handler_slot[APPS_UI_SLOTS];
-    int n_text, n_handlers;
+    int n_text, n_drawing, n_handlers;
 } leaving_t;
 
 /* The widget at slot is over (under the lock). Its gen moves on, which ends every handle and queued event of
@@ -1083,6 +1129,10 @@ static void leave(apps_ui_t *ui, int slot, leaving_t *gone) {
     if (w->text != NULL) {
         gone->text[gone->n_text++] = w->text;
         w->text = NULL;
+    }
+    if (w->drawing != NULL) {
+        gone->drawing[gone->n_drawing++] = w->drawing;
+        w->drawing = NULL;
     }
     if (w->events != 0) {
         gone->handler_slot[gone->n_handlers++] = (uint8_t)slot;
@@ -1165,6 +1215,9 @@ static void release(lua_State *L, const apps_ui_t *ui, const leaving_t *gone) {
     for (int i = 0; i < gone->n_text; i++) {
         apps_port_free(gone->text[i]);
     }
+    for (int i = 0; i < gone->n_drawing; i++) {
+        apps_port_free(gone->drawing[i]);
+    }
     if (gone->n_handlers == 0) {
         return;
     }
@@ -1240,6 +1293,9 @@ static int ui_image(lua_State *L) {
 static int ui_spinner(lua_State *L) {
     return create(L, APPS_W_SPINNER);
 }
+static int ui_canvas(lua_State *L) {
+    return create(L, APPS_W_CANVAS);
+}
 
 /* ---- The module's helpers ---- */
 
@@ -1264,7 +1320,7 @@ static int ui_clear(lua_State *L) {
     apps_vm_check(L);
     apps_ui_t *ui = ui_of(L);
     leaving_t gone;
-    gone.n_text = gone.n_handlers = 0;
+    gone.n_text = gone.n_drawing = gone.n_handlers = 0;
     commit_clear(ui, &gone);
     release(L, ui, &gone);
     return 0;
@@ -1308,7 +1364,8 @@ static const struct {
 
 static const luaL_Reg apps_ui_funcs[] = {
     {"label", ui_label}, {"button", ui_button}, {"box", ui_box}, {"arc", ui_arc}, {"bar", ui_bar},
-    {"image", ui_image}, {"spinner", ui_spinner}, {"bg", ui_bg}, {"clear", ui_clear}, {"polar", ui_polar},
+    {"image", ui_image}, {"spinner", ui_spinner}, {"canvas", ui_canvas}, {"bg", ui_bg}, {"clear", ui_clear},
+    {"polar", ui_polar},
     {NULL, NULL},
 };
 
@@ -1482,7 +1539,7 @@ static int w_delete(lua_State *L) {
     handle_t *h = self_handle(L, "delete");
     live_widget(L, ui, h);
     leaving_t gone;
-    gone.n_text = gone.n_handlers = 0;
+    gone.n_text = gone.n_drawing = gone.n_handlers = 0;
     commit_delete(ui, h->slot, &gone);
     release(L, ui, &gone);
     return 0;
@@ -1547,8 +1604,457 @@ static int w_scroll_to(lua_State *L) {
     return 1;
 }
 
+/* ---- c:draw (apps_canvas.h) ----
+ * The list is read twice, in the same order and with raw reads only (no metamethod, so no app code, runs in between): the first pass
+ * checks every command and counts its points and text bytes, and raises on the first problem; the second fills one block of
+ * exactly that size, from apps_port_realloc. The second can still raise (the call's instruction budget, or no memory to turn a
+ * number into a text), so the block waits in the table's draw_block until it is committed: a raise leaves it for the next c:draw,
+ * or apps_ui_free, to let go of. */
+
+static const char *const cv_ops[] = {"rect", "circle", "ellipse", "line", "arc", "text", "image", "poly"};
+_Static_assert(ARRAY_LEN(cv_ops) == APPS_CV_POLY + 1, "a name for each command");
+
+typedef enum {
+    K_X, K_Y, K_W, K_H, K_R, K_RX, K_RY, K_POINTS, K_COLOR, K_COLOR2, K_GRAD, K_RADIUS, K_BORDER, K_BORDER_COLOR, K_WIDTH,
+    K_ROUNDED, K_DASH, K_GAP, K_START_ANGLE, K_END_ANGLE, K_TEXT, K_FONT, K_ALIGN, K_SPACING, K_SRC, K_SCALE, K_OPACITY,
+    K_COUNT
+} cv_key_t;
+_Static_assert(K_COUNT <= 32, "a key is a bit of a command's present");
+
+static const char *const cv_key_names[K_COUNT] = {
+    [K_X] = "x", [K_Y] = "y", [K_W] = "w", [K_H] = "h", [K_R] = "r", [K_RX] = "rx", [K_RY] = "ry", [K_POINTS] = "points",
+    [K_COLOR] = "color", [K_COLOR2] = "color2", [K_GRAD] = "grad", [K_RADIUS] = "radius", [K_BORDER] = "border",
+    [K_BORDER_COLOR] = "border_color", [K_WIDTH] = "width", [K_ROUNDED] = "rounded", [K_DASH] = "dash", [K_GAP] = "gap",
+    [K_START_ANGLE] = "start_angle", [K_END_ANGLE] = "end_angle", [K_TEXT] = "text", [K_FONT] = "font", [K_ALIGN] = "align",
+    [K_SPACING] = "spacing", [K_SRC] = "src", [K_SCALE] = "scale", [K_OPACITY] = "opacity",
+};
+
+#define KB(k) (1u << (k))
+/* What each command takes, and what it must have. */
+static const struct {
+    uint32_t keys, required;
+} cv_op_keys[] = {
+    [APPS_CV_RECT] = {KB(K_X) | KB(K_Y) | KB(K_W) | KB(K_H) | KB(K_COLOR) | KB(K_COLOR2) | KB(K_GRAD) | KB(K_RADIUS) | KB(K_BORDER) |
+                          KB(K_BORDER_COLOR) | KB(K_OPACITY),
+                      KB(K_W) | KB(K_H)},
+    [APPS_CV_CIRCLE] = {KB(K_X) | KB(K_Y) | KB(K_R) | KB(K_COLOR) | KB(K_BORDER) | KB(K_BORDER_COLOR) | KB(K_OPACITY), KB(K_R)},
+    [APPS_CV_ELLIPSE] = {KB(K_X) | KB(K_Y) | KB(K_RX) | KB(K_RY) | KB(K_COLOR) | KB(K_OPACITY), KB(K_RX) | KB(K_RY)},
+    [APPS_CV_LINE] = {KB(K_POINTS) | KB(K_WIDTH) | KB(K_COLOR) | KB(K_ROUNDED) | KB(K_DASH) | KB(K_GAP) | KB(K_OPACITY), KB(K_POINTS)},
+    [APPS_CV_ARC] = {KB(K_X) | KB(K_Y) | KB(K_R) | KB(K_START_ANGLE) | KB(K_END_ANGLE) | KB(K_WIDTH) | KB(K_COLOR) | KB(K_ROUNDED) |
+                         KB(K_OPACITY),
+                     KB(K_R)},
+    [APPS_CV_TEXT] = {KB(K_X) | KB(K_Y) | KB(K_W) | KB(K_TEXT) | KB(K_FONT) | KB(K_COLOR) | KB(K_ALIGN) | KB(K_SPACING) | KB(K_OPACITY),
+                      KB(K_TEXT)},
+    [APPS_CV_IMAGE] = {KB(K_X) | KB(K_Y) | KB(K_SRC) | KB(K_SCALE) | KB(K_OPACITY), KB(K_SRC)},
+    [APPS_CV_POLY] = {KB(K_POINTS) | KB(K_COLOR) | KB(K_OPACITY), KB(K_POINTS)},
+};
+static const char *const cv_grads[] = {"none", "v", "h"};
+_Static_assert(ARRAY_LEN(cv_grads) == APPS_CV_GRAD_H + 1, "a name for each gradient");
+
+/* Where a check is: the command's number (from 1) and name, for the message. */
+typedef struct {
+    lua_State *L;
+    apps_ui_t *ui;
+    int i;
+    const char *op;
+} cv_ctx_t;
+
+static NORETURN void cv_fail(const cv_ctx_t *x, const char *fmt, ...) {
+    va_list ap;
+    luaL_where(x->L, 1);
+    if (x->op != NULL) {
+        lua_pushfstring(x->L, "c:draw: command %d (%s): ", x->i, x->op);
+    } else {
+        lua_pushfstring(x->L, "c:draw: command %d: ", x->i);
+    }
+    va_start(ap, fmt);
+    lua_pushvfstring(x->L, fmt, ap);
+    va_end(ap);
+    lua_concat(x->L, 3);
+    lua_error(x->L);
+    __builtin_unreachable();
+}
+
+/* The command's key at idx: its number, or -1 for none of the names. */
+static int cv_key_of(lua_State *L, int idx) {
+    if (lua_type(L, idx) != LUA_TSTRING) {
+        return -1;
+    }
+    size_t len;
+    const char *s = lua_tolstring(L, idx, &len);
+    for (int k = 0; k < K_COUNT; k++) {
+        if (strlen(cv_key_names[k]) == len && memcmp(cv_key_names[k], s, len) == 0) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+static NORETURN void cv_unknown_key(const cv_ctx_t *x, int op, int idx) {
+    const char *names[K_COUNT];
+    int n = 0;
+    for (int k = 0; k < K_COUNT; k++) {
+        if ((cv_op_keys[op].keys & KB(k)) != 0) {
+            names[n++] = cv_key_names[k];
+        }
+    }
+    char list[160];
+    join_names(list, sizeof list, names, n);
+    shown_t shown;
+    int type = lua_type(x->L, idx);
+    if (type == LUA_TSTRING) {
+        size_t len;
+        const char *s = lua_tolstring(x->L, idx, &len);
+        show(&shown, s, len);
+    } else if (type == LUA_TNUMBER) {
+        lua_pushvalue(x->L, idx);  /* a copy, so converting it is harmless */
+        size_t len;
+        const char *s = lua_tolstring(x->L, -1, &len);
+        show(&shown, s, len);
+    } else {
+        snprintf(shown.s, sizeof shown.s, "<%s>", luaL_typename(x->L, idx));
+    }
+    cv_fail(x, "unknown key '%s' (valid: %s)", shown.s, list);
+}
+
+/* The number at idx, rounded (halves away from zero) and clamped to lo..hi; NaN, or not a number, raises. */
+static int32_t cv_int(const cv_ctx_t *x, int k, int idx, int32_t lo, int32_t hi) {
+    if (lua_type(x->L, idx) != LUA_TNUMBER) {
+        cv_fail(x, "'%s' must be a number, got %s", cv_key_names[k], luaL_typename(x->L, idx));
+    }
+    double d = (double)lua_tonumber(x->L, idx);
+    if (isnan(d)) {
+        cv_fail(x, "'%s' must be a number, got NaN", cv_key_names[k]);
+    }
+    d = round(d);
+    return d < lo ? lo : d > hi ? hi : (int32_t)d;
+}
+
+static bool cv_bool(const cv_ctx_t *x, int k, int idx) {
+    if (lua_type(x->L, idx) != LUA_TBOOLEAN) {
+        cv_fail(x, "'%s' must be a boolean, got %s", cv_key_names[k], luaL_typename(x->L, idx));
+    }
+    return lua_toboolean(x->L, idx) != 0;
+}
+
+static uint32_t cv_colour(const cv_ctx_t *x, int k, int idx, bool allow_none) {
+    int type = lua_type(x->L, idx);
+    if (type != LUA_TSTRING && type != LUA_TNUMBER) {
+        cv_fail(x, "%s must be a colour string or number %s, got %s", cv_key_names[k], colour_hint, luaL_typename(x->L, idx));
+    }
+    lua_pushvalue(x->L, idx);  /* colour_at converts a number in place for its message */
+    uint32_t v;
+    shown_t shown;
+    if (!colour_at(x->L, -1, allow_none, &v, &shown)) {
+        cv_fail(x, "%s '%s' is not a colour %s", cv_key_names[k], shown.s, colour_hint);
+    }
+    lua_pop(x->L, 1);
+    return v;
+}
+
+static int cv_enum(const cv_ctx_t *x, int k, int idx, const char *const *names, int n) {
+    shown_t shown;
+    if (lua_type(x->L, idx) == LUA_TSTRING) {
+        size_t len;
+        const char *s = lua_tolstring(x->L, idx, &len);
+        for (int i = 0; i < n; i++) {
+            if (strlen(names[i]) == len && memcmp(names[i], s, len) == 0) {
+                return i;
+            }
+        }
+        show(&shown, s, len);
+    } else {
+        snprintf(shown.s, sizeof shown.s, "<%s>", luaL_typename(x->L, idx));
+    }
+    char list[96];
+    join_names(list, sizeof list, names, n);
+    cv_fail(x, "%s '%s' is not one of %s", cv_key_names[k], shown.s, list);
+}
+
+/* The text at idx, checked as a label's is; its length in *len. */
+static const char *cv_text(const cv_ctx_t *x, int idx, size_t *len) {
+    int type = lua_type(x->L, idx);
+    if (type != LUA_TSTRING && type != LUA_TNUMBER) {
+        cv_fail(x, "'text' must be a string, got %s", luaL_typename(x->L, idx));
+    }
+    const char *s = lua_tolstring(x->L, idx, len);  /* a number: the copy in the table becomes its text, as a label's does */
+    if (*len > APPS_UI_TEXT_MAX) {
+        cv_fail(x, "text is longer than %d bytes", APPS_UI_TEXT_MAX);
+    }
+    if (memchr(s, '\0', *len) != NULL) {
+        cv_fail(x, "text can't contain a NUL byte");
+    }
+    const unsigned char *q = (const unsigned char *)s, *end = q + *len;
+    while (q < end) {
+        if (*q < 0x80) {
+            q++;
+            continue;
+        }
+        int n = apps_json_utf8_len(q, end);
+        if (n <= 0) {
+            cv_fail(x, "text is not valid UTF-8");
+        }
+        q += n;
+    }
+    return s;
+}
+
+/* An image of the package, by its path at idx: its asset index. Runtime images aren't drawn on a canvas. */
+static int16_t cv_src(const cv_ctx_t *x, int idx) {
+    if (lua_type(x->L, idx) != LUA_TSTRING) {
+        cv_fail(x, "'src' must be the path of one of this app's images, got %s", luaL_typename(x->L, idx));
+    }
+    size_t len;
+    const char *s = lua_tolstring(x->L, idx, &len);
+    for (int i = 0; i < x->ui->n_assets; i++) {
+        const char *path = x->ui->assets[i].path;
+        if (path != NULL && strlen(path) == len && memcmp(path, s, len) == 0) {
+            return (int16_t)i;
+        }
+    }
+    shown_t shown;
+    cv_fail(x, "src '%s' is not one of this app's images (manifest.json \"files\")", show(&shown, s, len));
+}
+
+/* The points at idx, {x1, y1, x2, y2, ...}: their count (pairs), at least least. Written in 1/16 px to out when it isn't NULL. */
+static uint32_t cv_points(const cv_ctx_t *x, int idx, uint32_t least, int32_t *out) {
+    lua_State *L = x->L;
+    if (lua_type(L, idx) != LUA_TTABLE) {
+        cv_fail(x, "'points' must be a list of numbers {x1, y1, x2, y2, ...}, got %s", luaL_typename(L, idx));
+    }
+    lua_Unsigned len = lua_rawlen(L, idx);
+    if (len % 2 != 0) {
+        cv_fail(x, "'points' must have an x and a y for each point (it has %d numbers)", (int)len);
+    }
+    if (len / 2 < least) {
+        cv_fail(x, "'points' must have at least %d points (it has %d)", (int)least, (int)(len / 2));
+    }
+    if (len / 2 > APPS_CV_POINTS_MAX) {
+        cv_fail(x, "'points' may have at most %d points (it has %d)", APPS_CV_POINTS_MAX, (int)(len / 2));
+    }
+    apps_vm_charge(L, (int)len + 1);
+    for (lua_Unsigned i = 1; i <= len; i++) {
+        lua_rawgeti(L, idx, (lua_Integer)i);
+        if (lua_type(L, -1) != LUA_TNUMBER) {
+            cv_fail(x, "'points' must be numbers: number %d is %s", (int)i, luaL_typename(L, -1));
+        }
+        double d = (double)lua_tonumber(L, -1);
+        if (isnan(d)) {
+            cv_fail(x, "'points' must be numbers: number %d is NaN", (int)i);
+        }
+        d = round(d * APPS_CV_SUBPX);
+        double lim = (double)APPS_CV_COORD_MAX * APPS_CV_SUBPX;
+        if (out != NULL) {
+            out[i - 1] = (int32_t)(d < -lim ? -lim : d > lim ? lim : d);
+        }
+        lua_pop(L, 1);
+    }
+    return (uint32_t)(len / 2);
+}
+
+/*
+ * The command at idx (an absolute index), the i-th: checked, and when cmd isn't NULL written there, with its points at pts (the
+ * list's points, from *n_points) and its text at texts (from *text_bytes). *n_points and *text_bytes move on by what it has.
+ */
+static void cv_command(cv_ctx_t *x, int idx, apps_cv_cmd_t *cmd, int32_t *pts, char *texts, uint32_t *n_points, uint32_t *text_bytes) {
+    lua_State *L = x->L;
+    x->op = NULL;
+    if (lua_type(L, idx) != LUA_TTABLE) {
+        cv_fail(x, "must be a table like {\"rect\", x = 0, y = 0, w = 10, h = 10}, got %s", luaL_typename(L, idx));
+    }
+    lua_rawgeti(L, idx, 1);
+    int op = -1;
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        size_t len;
+        const char *s = lua_tolstring(L, -1, &len);
+        for (int i = 0; i < ARRAY_LEN(cv_ops); i++) {
+            if (strlen(cv_ops[i]) == len && memcmp(cv_ops[i], s, len) == 0) {
+                op = i;
+            }
+        }
+    }
+    if (op < 0) {
+        char list[96];
+        join_names(list, sizeof list, cv_ops, ARRAY_LEN(cv_ops));
+        cv_fail(x, "its first item must be the command's name, one of %s", list);
+    }
+    lua_pop(L, 1);
+    x->op = cv_ops[op];
+
+    /* Every key first: an unknown one is found whatever else is wrong. */
+    uint32_t present = 0;
+    apps_vm_charge(L, apps_vm_table_slots(L, idx) + 1);
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        lua_pop(L, 1);
+        if (lua_type(L, -1) == LUA_TNUMBER && lua_isinteger(L, -1) && lua_tointeger(L, -1) == 1) {
+            continue;  /* the name */
+        }
+        int k = cv_key_of(L, -1);
+        if (k < 0 || (cv_op_keys[op].keys & KB(k)) == 0) {
+            cv_unknown_key(x, op, -1);
+        }
+        present |= KB(k);
+    }
+    for (int k = 0; k < K_COUNT; k++) {
+        if ((cv_op_keys[op].required & KB(k)) != 0 && (present & KB(k)) == 0) {
+            cv_fail(x, "'%s' is required", cv_key_names[k]);
+        }
+    }
+    if ((present & KB(K_GRAD)) != 0 && (present & KB(K_COLOR2)) == 0) {
+        cv_fail(x, "a grad needs color2, the colour it goes to");
+    }
+
+    apps_cv_cmd_t c = {0};
+    c.op = (uint8_t)op;
+    c.opacity = 100;
+    c.color = 0xFFFFFF;
+    c.border_color = 0xFFFFFF;
+    c.font = APPS_FONT_SANS20;
+    c.scale = 100;
+    c.width = op == APPS_CV_ARC ? 4 : 2;
+    c.rounded = op == APPS_CV_LINE;
+    c.end_angle = 360;
+    c.image = -1;
+    const int32_t coord = APPS_CV_COORD_MAX;
+    for (int k = 0; k < K_COUNT; k++) {
+        if ((present & KB(k)) == 0) {
+            continue;
+        }
+        lua_pushstring(L, cv_key_names[k]);
+        lua_rawget(L, idx);  /* raw: no app code runs in here */
+        int v = lua_gettop(L);
+        switch ((cv_key_t)k) {
+            case K_X: c.x = (int16_t)cv_int(x, k, v, -coord, coord); break;
+            case K_Y: c.y = (int16_t)cv_int(x, k, v, -coord, coord); break;
+            case K_W: c.w = (int16_t)cv_int(x, k, v, 0, coord); break;
+            case K_H: c.h = (int16_t)cv_int(x, k, v, 0, coord); break;
+            case K_R: c.r = (int16_t)cv_int(x, k, v, 0, coord); break;
+            case K_RX: c.w = (int16_t)cv_int(x, k, v, 0, coord); break;
+            case K_RY: c.h = (int16_t)cv_int(x, k, v, 0, coord); break;
+            case K_COLOR: c.color = cv_colour(x, k, v, op == APPS_CV_RECT || op == APPS_CV_CIRCLE); break;
+            case K_COLOR2: c.color2 = cv_colour(x, k, v, false); break;
+            case K_GRAD: c.grad = (uint8_t)cv_enum(x, k, v, cv_grads, ARRAY_LEN(cv_grads)); break;
+            case K_RADIUS:
+                if (lua_type(L, v) == LUA_TSTRING) {
+                    c.radius = (int16_t)(cv_enum(x, k, v, (const char *const[]){"circle"}, 1) - 1);  /* "circle": -1 */
+                } else {
+                    c.radius = (int16_t)cv_int(x, k, v, 0, coord);
+                }
+                break;
+            case K_BORDER: c.border = (uint8_t)cv_int(x, k, v, 0, APPS_CV_WIDTH_MAX); break;
+            case K_BORDER_COLOR: c.border_color = cv_colour(x, k, v, false); break;
+            case K_WIDTH: c.width = (uint8_t)cv_int(x, k, v, 1, APPS_CV_WIDTH_MAX); break;
+            case K_ROUNDED: c.rounded = cv_bool(x, k, v); break;
+            case K_DASH: c.dash = (int16_t)cv_int(x, k, v, 0, coord); break;
+            case K_GAP: c.gap = (int16_t)cv_int(x, k, v, 0, coord); break;
+            case K_START_ANGLE: c.start_angle = (int16_t)cv_int(x, k, v, 0, 360); break;
+            case K_END_ANGLE: c.end_angle = (int16_t)cv_int(x, k, v, 0, 360); break;
+            case K_FONT: c.font = (uint8_t)cv_enum(x, k, v, apps_ui_fonts, ARRAY_LEN(apps_ui_fonts)); break;
+            case K_ALIGN: c.align = (uint8_t)cv_enum(x, k, v, apps_ui_text_aligns, ARRAY_LEN(apps_ui_text_aligns)); break;
+            case K_SPACING: c.spacing = (int16_t)cv_int(x, k, v, -16, 64); break;
+            case K_SRC: c.image = cv_src(x, v); break;
+            case K_SCALE: c.scale = (uint16_t)cv_int(x, k, v, 10, 400); break;
+            case K_OPACITY: c.opacity = (uint8_t)cv_int(x, k, v, 0, 100); break;
+            case K_POINTS: {
+                uint32_t n = cv_points(x, v, op == APPS_CV_POLY ? 3 : 2, cmd != NULL ? pts + 2 * (size_t)*n_points : NULL);
+                if (*n_points + n > APPS_CV_POINTS_MAX) {
+                    cv_fail(x, "a drawing may have at most %d points in all", APPS_CV_POINTS_MAX);
+                }
+                c.pts = *n_points;
+                c.n_pts = (uint16_t)n;
+                *n_points += n;
+                break;
+            }
+            case K_TEXT: {
+                size_t len;
+                const char *s = cv_text(x, v, &len);
+                if (*text_bytes + len + 1 > APPS_CV_TEXT_BYTES_MAX) {
+                    cv_fail(x, "a drawing's texts may take at most %d bytes in all", APPS_CV_TEXT_BYTES_MAX);
+                }
+                if (cmd != NULL) {
+                    memcpy(texts + *text_bytes, s, len);
+                    texts[*text_bytes + len] = '\0';
+                }
+                c.text = *text_bytes;
+                *text_bytes += (uint32_t)len + 1;
+                break;
+            }
+            case K_COUNT: break;
+        }
+        lua_settop(L, v - 1);
+    }
+    if (cmd != NULL) {
+        *cmd = c;
+    }
+}
+
+/* Reads the list at idx (an absolute index) into the counts, or, with list not NULL, into the block. */
+static void cv_read(lua_State *L, apps_ui_t *ui, int idx, apps_cv_list_t *list, uint32_t *n, uint32_t *n_points, uint32_t *text_bytes) {
+    cv_ctx_t x = {.L = L, .ui = ui, .i = 0, .op = NULL};
+    lua_Unsigned len = lua_rawlen(L, idx);
+    if (len > APPS_CV_CMDS_MAX) {
+        fail(L, "c:draw: a drawing may have at most %d commands (this has %d)", APPS_CV_CMDS_MAX, (int)len);
+    }
+    *n = (uint32_t)len;
+    *n_points = *text_bytes = 0;
+    apps_vm_charge(L, (int)len + 1);
+    for (lua_Unsigned i = 1; i <= len; i++) {
+        x.i = (int)i;
+        lua_rawgeti(L, idx, (lua_Integer)i);
+        int top = lua_gettop(L);
+        cv_command(&x, top, list != NULL ? &list->cmds[i - 1] : NULL, list != NULL ? list->points : NULL,
+                   list != NULL ? list->texts : NULL, n_points, text_bytes);
+        lua_settop(L, top - 1);
+    }
+}
+
+static void commit_draw(apps_ui_t *ui, int slot, apps_cv_list_t *list, apps_cv_list_t **old) {
+    apps_port_ui_lock();
+    apps_widget_t *w = &ui->w[slot];
+    *old = w->drawing;
+    w->drawing = list;
+    w->dirty |= APPS_DIRTY_DRAW;
+    apps_port_ui_unlock();
+}
+
+static int w_draw(lua_State *L) {
+    apps_vm_check(L);
+    apps_ui_t *ui = ui_of(L);
+    handle_t *h = self_handle(L, "draw");
+    live_widget(L, ui, h);
+    if (h->kind != APPS_W_CANVAS) {
+        fail(L, "w:draw: only a canvas draws (make one with ui.canvas{w = ..., h = ...})");
+    }
+    if (lua_type(L, 2) != LUA_TTABLE) {
+        fail(L, "c:draw: needs a list of commands, like c:draw{{\"rect\", x = 0, y = 0, w = 10, h = 10}}, got %s",
+             luaL_typename(L, 2));
+    }
+    lua_settop(L, 2);
+    apps_port_free(ui->draw_block);  /* a block an earlier c:draw raised over */
+    ui->draw_block = NULL;
+    uint32_t n, n_points, text_bytes;
+    cv_read(L, ui, 2, NULL, &n, &n_points, &text_bytes);  /* raises on any problem */
+    size_t bytes = apps_canvas_list_bytes(n, n_points, text_bytes);
+    void *mem = bytes > 0 ? apps_port_realloc(NULL, bytes) : NULL;
+    if (mem == NULL) {
+        fail(L, "c:draw: out of memory");
+    }
+    ui->draw_block = mem;
+    apps_cv_list_t *list = apps_canvas_list_init(mem, n, n_points, text_bytes);
+    uint32_t n2, p2, t2;
+    cv_read(L, ui, 2, list, &n2, &p2, &t2);  /* the same reads, so the same counts */
+    ui->draw_block = NULL;
+    apps_cv_list_t *old = NULL;
+    commit_draw(ui, h->slot, list, &old);
+    apps_port_free(old);
+    lua_settop(L, 1);
+    return 1;
+}
+
 static const luaL_Reg apps_ui_methods[] = {
-    {"set", w_set}, {"get", w_get}, {"on", w_on}, {"delete", w_delete}, {"scroll_to", w_scroll_to}, {NULL, NULL},
+    {"set", w_set}, {"get", w_get}, {"on", w_on}, {"delete", w_delete}, {"scroll_to", w_scroll_to}, {"draw", w_draw},
+    {NULL, NULL},
 };
 
 /* ---- The handle's metamethods ---- */
@@ -1710,7 +2216,9 @@ void apps_ui_free(apps_ui_t *ui) {
     }
     for (int i = 0; i < APPS_UI_SLOTS; i++) {
         apps_port_free(ui->w[i].text);
+        apps_port_free(ui->w[i].drawing);
     }
+    apps_port_free(ui->draw_block);
     apps_port_free(ui);
 }
 

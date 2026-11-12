@@ -87,7 +87,7 @@ if(CONFIG_MUSE_ENABLED)
         # (apps_mix.c), the sound module's tones and clips (apps_sound.c) and the big digit fonts (apps/fonts/, made by
         # tools/muse/gen_app_fonts.sh).
         list(APPEND srcs "apps/apps_vm.c" "apps/apps_suggest.c" "apps/apps_json.c" "apps/apps_pkg.c"
-            "apps/apps_rt.c" "apps/apps_svc.c" "apps/apps_ui.c" "apps/apps_lv.c" "apps/apps_task.c"
+            "apps/apps_rt.c" "apps/apps_svc.c" "apps/apps_ui.c" "apps/apps_lv.c" "apps/apps_canvas.c" "apps/apps_task.c"
             "apps/apps_port_idf.c" "apps/apps_alarm.c" "apps/apps_io.c" "apps/apps_values.c" "apps/apps_store.c"
             "apps/apps_install.c" "apps/apps_console.c" "apps/apps_control.c" "apps/apps_snapshot.c" "apps/apps_touch.c"
             "apps/apps_result.c" "apps/apps_icons.c" "apps/apps_jpeg.c" "apps/apps_vmio.c" "apps/apps_net.c" "apps/apps_ask.c"

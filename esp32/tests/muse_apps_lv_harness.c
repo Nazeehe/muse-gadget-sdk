@@ -54,6 +54,7 @@
 #include "apps_port.h"
 #include "apps_rt.h"
 #include "apps_store.h"
+#include "apps_canvas.h"
 #include "apps_ui.h"
 #include "apps_vm.h"
 #include "lauxlib.h"
@@ -728,6 +729,10 @@ struct lv_obj {
         char value[24];
     } styles[32];
     int n_styles;
+    lv_draw_buf_t draw_buf;      /* a canvas's pixels, as lv_canvas_set_buffer gave them (has_buf) */
+    bool has_buf;
+    lv_layer_t *layer;           /* a canvas's layer while it is open */
+    int layers;                  /* times one was opened */
 };
 
 struct lv_indev {
@@ -1024,6 +1029,7 @@ static const char *code_name(lv_event_code_t c) {
         case LV_EVENT_RELEASED: return "released";
         case LV_EVENT_SCROLL: return "scroll";
         case LV_EVENT_GESTURE: return "gesture";
+        case LV_EVENT_DELETE: return "delete";
         case LV_EVENT_REFR_EXT_DRAW_SIZE: return "refr_ext_draw_size";
         case LV_EVENT_REFR_READY: return "refr_ready";
         case LV_EVENT_REFR_START: return "refr_start";
@@ -1110,10 +1116,10 @@ static lv_obj_t *make_object(const char *cls, lv_obj_t *parent, const char *fn) 
     /* The flags LVGL 9.5.0's constructors leave: lv_obj is clickable, scrollable and snappable (every class keeps
      * the last), a label and an image are not clickable, and a button, an arc and a bar are not scrollable. */
     o->flags = LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_SNAPPABLE;
-    if (strcmp(cls, "label") != 0 && strcmp(cls, "image") != 0) {
+    if (strcmp(cls, "label") != 0 && strcmp(cls, "image") != 0 && strcmp(cls, "canvas") != 0) {  /* a canvas is an image */
         o->flags |= LV_OBJ_FLAG_CLICKABLE;
     }
-    if (strcmp(cls, "obj") == 0 || strcmp(cls, "label") == 0 || strcmp(cls, "image") == 0) {
+    if (strcmp(cls, "obj") == 0 || strcmp(cls, "label") == 0 || strcmp(cls, "image") == 0 || strcmp(cls, "canvas") == 0) {
         o->flags |= LV_OBJ_FLAG_SCROLLABLE;
     }
     objs[n_objs++] = o;
@@ -1172,7 +1178,282 @@ lv_obj_t *lv_image_create(lv_obj_t *parent) {
     return o;
 }
 
+/* ---- A canvas (lv_canvas.c) and the draw calls into it ---- */
+
+static void fake_invalidate(lv_obj_t *o, lv_area_t a);
+
+lv_obj_t *lv_canvas_create(lv_obj_t *parent) {
+    return make_object("canvas", parent, "lv_canvas_create");
+}
+
+void lv_canvas_set_buffer(lv_obj_t *obj, void *buf, int32_t w, int32_t h, lv_color_format_t cf) {
+    if (use(obj, "lv_canvas_set_buffer", "canvas") == NULL) {
+        return;
+    }
+    if (buf == NULL || w <= 0 || h <= 0 || (cf != LV_COLOR_FORMAT_RGB565 && cf != LV_COLOR_FORMAT_ARGB8888)) {
+        fake_error("lv_canvas_set_buffer on %d: %p %dx%d cf %u", obj->id, buf, (int)w, (int)h, cf);
+        return;
+    }
+    if (((uintptr_t)buf & 3) != 0) {
+        fake_error("lv_canvas_set_buffer on %d: the buffer isn't aligned to LV_DRAW_BUF_ALIGN (4)", obj->id);
+    }
+    obj->draw_buf.header.cf = cf;
+    obj->draw_buf.header.w = (uint32_t)w;
+    obj->draw_buf.header.h = (uint32_t)h;
+    obj->draw_buf.header.stride = lv_draw_buf_width_to_stride((uint32_t)w, cf);
+    obj->draw_buf.data = buf;
+    obj->draw_buf.data_size = obj->draw_buf.header.stride * (uint32_t)h;
+    obj->has_buf = true;
+    logline("canvas_buffer %d %dx%d %s", obj->id, (int)w, (int)h, cf == LV_COLOR_FORMAT_RGB565 ? "rgb565" : "argb8888");
+}
+
+lv_draw_buf_t *lv_canvas_get_draw_buf(lv_obj_t *obj) {
+    if (use(obj, "lv_canvas_get_draw_buf", "canvas") == NULL) {
+        return NULL;
+    }
+    return obj->has_buf ? &obj->draw_buf : NULL;
+}
+
+uint32_t lv_draw_buf_width_to_stride(uint32_t w, lv_color_format_t cf) {
+    return w * (cf == LV_COLOR_FORMAT_ARGB8888 ? 4u : 2u);  /* CONFIG_LV_DRAW_BUF_STRIDE_ALIGN=1 */
+}
+
+void lv_canvas_fill_bg(lv_obj_t *obj, lv_color_t color, lv_opa_t opa) {
+    if (use(obj, "lv_canvas_fill_bg", "canvas") == NULL) {
+        return;
+    }
+    if (!obj->has_buf || obj->draw_buf.data == NULL) {
+        fake_error("lv_canvas_fill_bg on %d, which has no pixels", obj->id);
+        return;
+    }
+    if (obj->layer != NULL) {
+        fake_error("lv_canvas_fill_bg on %d with its layer open", obj->id);
+    }
+    lv_draw_buf_t *b = &obj->draw_buf;
+    for (uint32_t y = 0; y < b->header.h; y++) {
+        uint8_t *row = b->data + (size_t)y * b->header.stride;
+        for (uint32_t x = 0; x < b->header.w; x++) {
+            if (b->header.cf == LV_COLOR_FORMAT_ARGB8888) {
+                row[4 * x] = color.blue, row[4 * x + 1] = color.green, row[4 * x + 2] = color.red, row[4 * x + 3] = opa;
+            } else {
+                uint16_t c = (uint16_t)((color.red & 0xF8) << 8 | (color.green & 0xFC) << 3 | color.blue >> 3);
+                row[2 * x] = (uint8_t)c, row[2 * x + 1] = (uint8_t)(c >> 8);
+            }
+        }
+    }
+    logline("canvas_fill %d #%06x %u", obj->id, (unsigned)rgb(color), opa);
+}
+
+void lv_canvas_init_layer(lv_obj_t *canvas, lv_layer_t *layer) {
+    if (use(canvas, "lv_canvas_init_layer", "canvas") == NULL || layer == NULL) {
+        return;
+    }
+    if (canvas->layer != NULL) {
+        fake_error("lv_canvas_init_layer on %d, whose layer is open", canvas->id);
+    }
+    if (!canvas->has_buf) {
+        fake_error("lv_canvas_init_layer on %d, which has no pixels", canvas->id);
+    }
+    layer->canvas = canvas;
+    layer->draws = 0;
+    canvas->layer = layer;
+    canvas->layers++;
+    logline("layer %d", canvas->id);
+}
+
+void lv_canvas_finish_layer(lv_obj_t *canvas, lv_layer_t *layer) {
+    if (use(canvas, "lv_canvas_finish_layer", "canvas") == NULL) {
+        return;
+    }
+    if (layer == NULL || canvas->layer != layer || layer->canvas != canvas) {
+        fake_error("lv_canvas_finish_layer on %d, whose layer isn't open", canvas->id);
+        return;
+    }
+    canvas->layer = NULL;
+    logline("layer_done %d %d", canvas->id, layer->draws);
+}
+
+/* The canvas a draw call draws into: its layer must be open. */
+static lv_obj_t *drawn_on(lv_layer_t *layer, const char *fn) {
+    tick();
+    if (apply_active && !lock_held) {
+        fake_error("%s was called inside the apply step without the UI lock", fn);
+    }
+    if (layer == NULL || layer->canvas == NULL || layer->canvas->deleted || layer->canvas->layer != layer) {
+        fake_error("%s on a layer that isn't open", fn);
+        return NULL;
+    }
+    layer->draws++;
+    return layer->canvas;
+}
+
+void lv_draw_rect_dsc_init(lv_draw_rect_dsc_t *dsc) {
+    memset(dsc, 0, sizeof *dsc);
+    dsc->bg_opa = LV_OPA_COVER;
+    dsc->border_opa = LV_OPA_COVER;
+}
+
+void lv_draw_line_dsc_init(lv_draw_line_dsc_t *dsc) {
+    memset(dsc, 0, sizeof *dsc);
+    dsc->width = 1;
+    dsc->opa = LV_OPA_COVER;
+}
+
+void lv_draw_arc_dsc_init(lv_draw_arc_dsc_t *dsc) {
+    memset(dsc, 0, sizeof *dsc);
+    dsc->width = 1;
+    dsc->opa = LV_OPA_COVER;
+}
+
+void lv_draw_label_dsc_init(lv_draw_label_dsc_t *dsc) {
+    memset(dsc, 0, sizeof *dsc);
+    dsc->opa = LV_OPA_COVER;
+}
+
+void lv_draw_image_dsc_init(lv_draw_image_dsc_t *dsc) {
+    memset(dsc, 0, sizeof *dsc);
+    dsc->opa = LV_OPA_COVER;
+    dsc->scale_x = dsc->scale_y = 256;
+}
+
+void lv_grad_init_stops(lv_grad_dsc_t *grad, const lv_color_t colors[], const lv_opa_t opa[], const uint8_t fracs[], int num_stops) {
+    if (num_stops != 2) {
+        fake_error("lv_grad_init_stops with %d stops (the fake keeps 2)", num_stops);
+        return;
+    }
+    for (int i = 0; i < 2; i++) {
+        grad->stops[i].color = colors[i];
+        grad->stops[i].opa = opa != NULL ? opa[i] : LV_OPA_COVER;
+        grad->stops[i].frac = fracs != NULL ? fracs[i] : (uint8_t)(255 * i);
+    }
+    grad->stops_count = 2;
+}
+
+void lv_grad_vertical_init(lv_grad_dsc_t *dsc) {
+    dsc->dir = LV_GRAD_DIR_VER;
+}
+
+void lv_grad_horizontal_init(lv_grad_dsc_t *dsc) {
+    dsc->dir = LV_GRAD_DIR_HOR;
+}
+
+void lv_area_set(lv_area_t *area_p, int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
+    *area_p = (lv_area_t){x1, y1, x2, y2};
+}
+
+/* As the fake lays a label out: 10 px a byte across, 20 a line, plus the spacing between letters; wrapped at max_width. */
+void lv_text_get_size(lv_point_t *size_res, const char *text, const lv_font_t *font, int32_t letter_space, int32_t line_space,
+                      int32_t max_width, lv_text_flag_t flag) {
+    (void)font, (void)line_space, (void)flag;
+    int32_t n = (int32_t)strlen(text), step = 10 + letter_space;
+    int32_t per_line = step > 0 && max_width < LV_COORD_MAX ? (max_width + letter_space) / step : n;
+    per_line = per_line < 1 ? 1 : per_line > n ? n : per_line;
+    int32_t lines = n == 0 ? 1 : (n + per_line - 1) / per_line;
+    size_res->x = n == 0 ? 0 : per_line * step - letter_space;
+    size_res->y = 20 * lines;
+}
+
+lv_result_t lv_obj_invalidate(const lv_obj_t *obj) {
+    lv_obj_t *o = use((lv_obj_t *)obj, "lv_obj_invalidate", NULL);
+    if (o != NULL) {
+        fake_invalidate(o, o->area);
+    }
+    return LV_RESULT_OK;
+}
+
+static const char *grad_name(const lv_grad_dsc_t *g) {
+    return g->dir == LV_GRAD_DIR_VER ? "v" : g->dir == LV_GRAD_DIR_HOR ? "h" : NULL;
+}
+
+void lv_draw_rect(lv_layer_t *layer, const lv_draw_rect_dsc_t *d, const lv_area_t *a) {
+    lv_obj_t *c = drawn_on(layer, "lv_draw_rect");
+    if (c == NULL) {
+        return;
+    }
+    char grad[48] = "", border[48] = "";
+    if (grad_name(&d->bg_grad) != NULL) {
+        snprintf(grad, sizeof grad, " grad=%s #%06x>#%06x", grad_name(&d->bg_grad), (unsigned)rgb(d->bg_grad.stops[0].color),
+                 (unsigned)rgb(d->bg_grad.stops[1].color));
+    }
+    if (d->border_width > 0) {
+        snprintf(border, sizeof border, " border=%d #%06x/%u", (int)d->border_width, (unsigned)rgb(d->border_color), d->border_opa);
+    }
+    logline("draw_rect %d %d,%d,%d,%d r=%d bg=#%06x/%u%s%s", c->id, (int)a->x1, (int)a->y1, (int)a->x2, (int)a->y2,
+            d->radius == LV_RADIUS_CIRCLE ? -1 : (int)d->radius, (unsigned)rgb(d->bg_color), d->bg_opa, grad, border);
+}
+
+void lv_draw_line(lv_layer_t *layer, const lv_draw_line_dsc_t *d) {
+    lv_obj_t *c = drawn_on(layer, "lv_draw_line");
+    if (c == NULL) {
+        return;
+    }
+    char pts[256];
+    size_t len = 0;
+    pts[0] = '\0';
+    if (d->points != NULL) {
+        for (int i = 0; i < d->point_cnt && len < sizeof pts; i++) {
+            len += (size_t)snprintf(pts + len, sizeof pts - len, " %d,%d", (int)d->points[i].x, (int)d->points[i].y);
+        }
+    } else {
+        snprintf(pts, sizeof pts, " %d,%d %d,%d", (int)d->p1.x, (int)d->p1.y, (int)d->p2.x, (int)d->p2.y);
+    }
+    logline("draw_line %d w=%d #%06x/%u round=%d%s", c->id, (int)d->width, (unsigned)rgb(d->color), d->opa,
+            d->round_start && d->round_end, pts);
+}
+
+void lv_draw_arc(lv_layer_t *layer, const lv_draw_arc_dsc_t *d) {
+    lv_obj_t *c = drawn_on(layer, "lv_draw_arc");
+    if (c == NULL) {
+        return;
+    }
+    if (d->start_angle < 0 || d->start_angle > 360 || d->end_angle < 0 || d->end_angle > 360) {
+        fake_error("lv_draw_arc on %d with angles %d %d", c->id, (int)d->start_angle, (int)d->end_angle);
+    }
+    logline("draw_arc %d c=%d,%d r=%u w=%d %d..%d #%06x/%u round=%d", c->id, (int)d->center.x, (int)d->center.y, d->radius,
+            (int)d->width, (int)d->start_angle, (int)d->end_angle, (unsigned)rgb(d->color), d->opa, d->rounded);
+}
+
+void lv_draw_label(lv_layer_t *layer, const lv_draw_label_dsc_t *d, const lv_area_t *a) {
+    lv_obj_t *c = drawn_on(layer, "lv_draw_label");
+    if (c == NULL) {
+        return;
+    }
+    logline("draw_label %d %d,%d,%d,%d \"%s\" %s #%06x/%u space=%d align=%d", c->id, (int)a->x1, (int)a->y1, (int)a->x2, (int)a->y2,
+            d->text, d->font != NULL ? d->font->name : "NULL", (unsigned)rgb(d->color), d->opa, (int)d->letter_space, (int)d->align);
+}
+
+void lv_draw_image(lv_layer_t *layer, const lv_draw_image_dsc_t *d, const lv_area_t *a) {
+    lv_obj_t *c = drawn_on(layer, "lv_draw_image");
+    if (c == NULL) {
+        return;
+    }
+    const lv_image_dsc_t *src = d->src;
+    if (src == NULL || src->data == NULL) {
+        fake_error("lv_draw_image on %d without a picture", c->id);
+        return;
+    }
+    char recolor[32] = "";
+    if (d->recolor_opa > 0) {
+        snprintf(recolor, sizeof recolor, " recolor=#%06x/%u", (unsigned)rgb(d->recolor), d->recolor_opa);
+    }
+    logline("draw_image %d %d,%d,%d,%d src=%ux%u scale=%d,%d pivot=%d,%d opa=%u%s", c->id, (int)a->x1, (int)a->y1, (int)a->x2,
+            (int)a->y2, src->header.w, src->header.h, (int)d->scale_x, (int)d->scale_y, (int)d->pivot.x, (int)d->pivot.y, d->opa,
+            recolor);
+}
+
 static void mark_deleted(lv_obj_t *o) {
+    /* obj_delete_core: LV_EVENT_DELETE to the object, while it is still whole, before its children go. */
+    lv_event_t del = {LV_EVENT_DELETE, NULL, o, false, NULL};
+    for (int i = 0; i < o->n_cbs && !del.stopped; i++) {
+        lv_event_code_t f = (lv_event_code_t)(o->cbs[i].filter & ~LV_EVENT_PREPROCESS);
+        if (f == LV_EVENT_ALL || f == LV_EVENT_DELETE) {
+            del.ud = o->cbs[i].ud;
+            o->cbs[i].cb(&del);
+        }
+    }
+    if (o->layer != NULL) {
+        fake_error("canvas %d deleted with its layer open", o->id);
+    }
     o->deleted = true;
     /* LVGL's obj_delete_core: its animations go with it (lv_obj_destructor's lv_anim_delete(obj, NULL), each deleted callback
      * called), and an input device that presses or scrolls it is reset (obj_indev_reset): a finger that is down waits for its
@@ -11980,6 +12261,197 @@ static void the_touchs_scroll_boxes(void) {
     CHECK(apps_lv_scrolls(s, 4) == 0, "no app: none");
 }
 
+/* ---- Canvases (ui.canvas, c:draw) ---- */
+
+/* A canvas's pixel at x, y: RGB565 as 0xRRGGBB of its 5-6-5 bits, ARGB8888 as 0xAARRGGBB. */
+static uint32_t canvas_px(int id, int x, int y) {
+    lv_obj_t *o = fake_obj(id);
+    CHECK(o != NULL && o->has_buf && o->draw_buf.data != NULL, "canvas %d has pixels", id);
+    if (o == NULL || !o->has_buf || o->draw_buf.data == NULL) {
+        return 0;
+    }
+    const uint8_t *px = o->draw_buf.data + (size_t)y * o->draw_buf.header.stride;
+    if (o->draw_buf.header.cf == LV_COLOR_FORMAT_ARGB8888) {
+        px += 4 * x;
+        return (uint32_t)px[3] << 24 | (uint32_t)px[2] << 16 | (uint32_t)px[1] << 8 | px[0];
+    }
+    px += 2 * x;
+    uint32_t c = (uint32_t)px[0] | (uint32_t)px[1] << 8;
+    return ((c >> 11) & 0x1F) << 16 | ((c >> 5) & 0x3F) << 8 | (c & 0x1F);
+}
+
+static const char CANVAS_SCENE[] =
+    "c = ui.canvas{x = 0, y = 0, w = 40, h = 20, bg = '#102030'}\n"
+    "c:draw{\n"
+    "  {'rect', x = 1, y = 2, w = 10, h = 5, color = '#ff0000', grad = 'v', color2 = '#0000ff', radius = 3, border = 2,\n"
+    "   border_color = '#00ff00'},\n"
+    "  {'line', points = {0, 0, 10, 0, 10, 10}, width = 3, color = '#ffffff', rounded = true},\n"
+    "  {'poly', points = {20, 0, 40, 0, 40, 20, 20, 20}, color = '#ffffff'},\n"
+    "  {'circle', x = 5, y = 5, r = 4, color = '#00ff00', opacity = 50},\n"
+    "  {'arc', x = 20, y = 10, r = 8, start_angle = 0, end_angle = 90, width = 2, color = '#ffff00'},\n"
+    "  {'text', x = 2, y = 2, text = 'Hi', font = 'sans20', spacing = 2, color = '#ffffff'},\n"
+    "  {'image', x = 30, y = 1, src = 'b.bin', scale = 200},\n"
+    "  {'ellipse', x = 5, y = 15, rx = 3, ry = 2, color = '#0000ff'},\n"
+    "}\n";
+
+/* The pass that finds a new canvas asks for its pixels and its scratch; they are made with the lock given back, and a second pass
+ * fills them with the bg and replays the list in order: LVGL's draws in a layer, the poly and the ellipse straight into the pixels
+ * between layers. */
+static void canvas_draws_its_list(void) {
+    env_t e;
+    scene_raw(&e);
+    RUN(&e, CANVAS_SCENE);
+    CHECK(APPLY(&e), "the pass ran");
+    const char *log = log_peek();
+    const char *want =
+        "canvas_buffer 2 40x20 rgb565\n"
+        "canvas_fill 2 #102030 255\n"
+        "layer 2\n"
+        "draw_rect 2 1,2,10,6 r=3 bg=#ff0000/255 grad=v #ff0000>#0000ff border=2 #00ff00/255\n"
+        "draw_line 2 w=3 #ffffff/255 round=1 0,0 10,0 10,10\n"
+        "layer_done 2 2\n"
+        "layer 2\n"
+        "draw_rect 2 1,1,8,8 r=-1 bg=#00ff00/127\n"
+        "draw_arc 2 c=20,10 r=8 w=2 270..0 #ffff00/255 round=0\n"
+        "draw_label 2 2,2,23,21 \"Hi\" montserrat_20 #ffffff/255 space=2 align=1\n"
+        "draw_image 2 30,1,32,2 src=3x2 scale=512,512 pivot=0,0 opa=255 recolor=#ffffff/255\n"
+        "layer_done 2 4\n";
+    CHECK(strstr(log, want) != NULL, "drawn in order, want\n%s\ngot\n%s", want, log);
+    CHECK(log_count("create canvas 2 in 1") == 1 && log_count("add_event_cb 2 delete") == 1 && log_count("canvas_buffer") == 1,
+          "made once, its pixels with it\n%s", log);
+    CHECK(stats_since().applies == 2 && stats_since().refused_creates == 0, "two passes, applies %u refused %u",
+          stats_since().applies, stats_since().refused_creates);
+    CHECK(W(&e, 0)->dirty == 0, "drawn: bits %u", W(&e, 0)->dirty);
+    /* The poly is the right half, white to its edge at x 20; the ellipse is blue about (5, 15); the rest is the bg (#102030 is 2, 8, 6
+     * in 5-6-5). */
+    CHECK(canvas_px(2, 25, 10) == 0x1F3F1F && canvas_px(2, 39, 19) == 0x1F3F1F && canvas_px(2, 20, 0) == 0x1F3F1F,
+          "the poly fills: %06x %06x %06x", canvas_px(2, 25, 10), canvas_px(2, 39, 19), canvas_px(2, 20, 0));
+    CHECK(canvas_px(2, 19, 15) == 0x020806 && canvas_px(2, 0, 19) == 0x020806, "the bg around it: %06x %06x", canvas_px(2, 19, 15),
+          canvas_px(2, 0, 19));
+    CHECK(canvas_px(2, 5, 15) == 0x00001F && canvas_px(2, 5, 18) == 0x020806, "the ellipse: %06x %06x", canvas_px(2, 5, 15),
+          canvas_px(2, 5, 18));
+    log_clear();
+
+    /* A move draws nothing again; a new list does, into the pixels it has. */
+    RUN(&e, "c:set{x = 10}");
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_count("canvas_") == 0 && log_count("layer") == 0, "a move draws nothing\n%s", log_peek());
+    log_clear();
+    RUN(&e, "c:draw{{'rect', w = 4, h = 4, color = 'none', border = 1, border_color = '#ffffff'}}");
+    CHECK(APPLY(&e), "the pass ran");
+    LOG_IS(
+        "canvas_fill 2 #102030 255\n"
+        "layer 2\n"
+        "draw_rect 2 0,0,3,3 r=0 bg=#000000/0 border=1 #ffffff/255\n"
+        "layer_done 2 1\n"
+        "update_layout 1\n");
+    CHECK(canvas_px(2, 25, 10) == 0x020806, "the old poly is gone: %06x", canvas_px(2, 25, 10));
+    CHECK(stats_since().applies == 4, "the scratch it had was enough: one pass, applies %u", stats_since().applies);
+
+    /* A new size, and bg "none": new pixels, ARGB8888, filled clear. */
+    RUN(&e, "c:set{w = 30, bg = 'none'}");
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_has_line("canvas_buffer 2 30x20 argb8888") && log_has_line("canvas_fill 2 #000000 0"), "made again\n%s", log_peek());
+    CHECK(canvas_px(2, 20, 10) == 0, "clear: %08x", canvas_px(2, 20, 10));
+    log_clear();
+
+    /* Deleted: its pixels go with the object, freed once the lock is given back (FINISH counts every byte and every heap use under
+     * the lock). */
+    RUN(&e, "c:delete()");
+    CHECK(APPLY(&e), "the pass ran");
+    LOG_IS(
+        "delete 2\n"
+        "update_layout 1\n");
+    FINISH(&e);
+}
+
+/* Pixels the floor refuses: the canvas waits, its DRAW kept, and is drawn at a pass once they can be had. */
+static void canvas_waits_for_its_pixels(void) {
+    env_t e;
+    scene_raw(&e);
+    CHECK(APPLY(&e), "the first pass, which makes the layer's records");
+    RUN(&e, "c = ui.canvas{w = 100, h = 100}\nc:draw{{'poly', points = {0, 0, 100, 0, 50, 100}, color = '#ffffff'}}");
+    refuse_from = growths + 1;  /* every growth from the next */
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_count("create canvas 2 in 1") == 1 && log_count("canvas_") == 0, "made, not drawn\n%s", log_peek());
+    CHECK((W(&e, 0)->dirty & APPS_DIRTY_DRAW) != 0, "DRAW kept: %u", W(&e, 0)->dirty);
+    CHECK(stats_since().refused_creates >= 1 && stats_since().applies == 2, "refused %u, applies %u", stats_since().refused_creates,
+          stats_since().applies);
+    log_clear();
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_count("canvas_") == 0, "still waiting\n%s", log_peek());
+    refuse_from = -1;
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_has_line("canvas_buffer 2 100x100 rgb565") && log_has_line("canvas_fill 2 #000000 255") && W(&e, 0)->dirty == 0,
+          "drawn once there is room\n%s", log_peek());
+    CHECK(canvas_px(2, 50, 50) == 0x1F3F1F && canvas_px(2, 5, 90) == 0, "the triangle: %06x %06x", canvas_px(2, 50, 50),
+          canvas_px(2, 5, 90));
+    log_clear();
+    /* Inside a box that goes, and then a clear: their pixels go too. */
+    RUN(&e, "b = ui.box{w = 200, h = 200}\nd = ui.canvas{parent = b, w = 50, h = 50}");
+    CHECK(APPLY(&e), "the pass ran");
+    CHECK(log_has_line("canvas_buffer 4 50x50 rgb565"), "the second drawn\n%s", log_peek());
+    RUN(&e, "b:delete()");
+    CHECK(APPLY(&e), "the pass ran");
+    RUN(&e, "ui.clear()");
+    CHECK(APPLY(&e), "the pass ran");
+    FINISH(&e);
+}
+
+/* apps_canvas_fill_poly on its own: coverage at the edges, non-zero winding, cutting, and both pixel formats. */
+static void canvas_poly_coverage(void) {
+    enum { W = 8, H = 4 };
+    uint8_t argb[W * H * 4];
+    uint8_t scratch[1024];
+    CHECK(apps_canvas_poly_scratch(8, W) <= sizeof scratch, "scratch %zu", apps_canvas_poly_scratch(8, W));
+#define S(v) ((int32_t)((v) * APPS_CV_SUBPX))
+    /* A square from 2 to 6 across and 0 to 4 down: whole px inside, nothing outside. */
+    memset(argb, 0, sizeof argb);
+    const int32_t square[] = {S(2), S(0), S(6), S(0), S(6), S(4), S(2), S(4)};
+    apps_canvas_fill_poly(argb, W * 4, W, H, true, square, 4, 0xFF0000, 255, scratch);
+    for (int x = 0; x < W; x++) {
+        uint8_t a = argb[(1 * W + x) * 4 + 3];
+        CHECK(a == (x >= 2 && x < 6 ? 255 : 0), "x %d alpha %u", x, a);
+    }
+    CHECK(argb[(1 * W + 3) * 4 + 2] == 255 && argb[(1 * W + 3) * 4 + 0] == 0, "red: r %u b %u", argb[(1 * W + 3) * 4 + 2],
+          argb[(1 * W + 3) * 4 + 0]);
+    /* Edges half way through a px: half its coverage. */
+    memset(argb, 0, sizeof argb);
+    const int32_t half[] = {S(1.5), S(0), S(4.5), S(0), S(4.5), S(4), S(1.5), S(4)};
+    apps_canvas_fill_poly(argb, W * 4, W, H, true, half, 4, 0xFFFFFF, 255, scratch);
+    uint8_t left = argb[(2 * W + 1) * 4 + 3], mid = argb[(2 * W + 2) * 4 + 3], right = argb[(2 * W + 4) * 4 + 3];
+    CHECK(left >= 125 && left <= 130 && mid == 255 && right >= 125 && right <= 130, "half px: %u %u %u", left, mid, right);
+    /* The square traced twice (winding 2) covers as once: non-zero, and never more than the whole px. */
+    memset(argb, 0, sizeof argb);
+    const int32_t twice[] = {S(2), S(0), S(6), S(0), S(6), S(4), S(2), S(4), S(2), S(0), S(6), S(0), S(6), S(4), S(2), S(4)};
+    apps_canvas_fill_poly(argb, W * 4, W, H, true, twice, 8, 0xFFFFFF, 128, scratch);
+    CHECK(argb[(1 * W + 3) * 4 + 3] == 128, "once at 50%%: alpha %u", argb[(1 * W + 3) * 4 + 3]);
+    /* Over: 50% white on 50% white is 75%. */
+    apps_canvas_fill_poly(argb, W * 4, W, H, true, square, 4, 0xFFFFFF, 128, scratch);
+    uint8_t over = argb[(1 * W + 3) * 4 + 3];
+    CHECK(over >= 190 && over <= 193, "over: alpha %u", over);
+    /* Far past the pixels on every side: cut, and every px covered. */
+    memset(argb, 0, sizeof argb);
+    const int32_t big[] = {S(-900), S(-900), S(900), S(-900), S(900), S(900), S(-900), S(900)};
+    apps_canvas_fill_poly(argb, W * 4, W, H, true, big, 4, 0x00FF00, 255, scratch);
+    for (int i = 0; i < W * H; i++) {
+        CHECK(argb[i * 4 + 3] == 255 && argb[i * 4 + 1] == 255, "px %d: alpha %u green %u", i, argb[i * 4 + 3], argb[i * 4 + 1]);
+    }
+    /* RGB565 with a stride past the row: half of blue over black, and nothing past the row's px. */
+    uint8_t rgb565[H * (W * 2 + 4)];
+    memset(rgb565, 0, sizeof rgb565);
+    apps_canvas_fill_poly(rgb565, W * 2 + 4, W, H, false, big, 4, 0x0000FF, 128, scratch);
+    uint16_t c = (uint16_t)(rgb565[0] | rgb565[1] << 8);
+    CHECK(c == 0x000F || c == 0x0010, "half blue: %04x", c);
+    CHECK(rgb565[W * 2] == 0 && rgb565[W * 2 + 3] == 0, "the stride's padding is left: %u %u", rgb565[W * 2], rgb565[W * 2 + 3]);
+#undef S
+    /* An ellipse's points: about its centre, within its radii, more for a bigger one. */
+    int32_t pts[2 * APPS_CV_ELLIPSE_POINTS_MAX];
+    int small = apps_canvas_ellipse(pts, 10, 10, 3, 2), large = apps_canvas_ellipse(pts, 200, 200, 180, 120);
+    CHECK(small == 24 && large == APPS_CV_ELLIPSE_POINTS_MAX, "points %d %d", small, large);
+    CHECK(pts[0] == 380 * APPS_CV_SUBPX && pts[1] == 200 * APPS_CV_SUBPX, "it starts at 3 o'clock: %d %d", pts[0], pts[1]);
+}
+
 int main(int argc, char **argv) {
     static const struct {
         const char *name;
@@ -11992,6 +12464,9 @@ int main(int argc, char **argv) {
         {"the_pass_reports_what_it_draws", the_pass_reports_what_it_draws},
         {"a_slots_next_image_can_be_at_the_same_address", a_slots_next_image_can_be_at_the_same_address},
         {"create_update_delete_sequence", create_update_delete_sequence},
+        {"canvas_draws_its_list", canvas_draws_its_list},
+        {"canvas_waits_for_its_pixels", canvas_waits_for_its_pixels},
+        {"canvas_poly_coverage", canvas_poly_coverage},
         {"revalidation_drops_bad_slot", revalidation_drops_bad_slot},
         {"parent_chain_of_four_is_drawn", parent_chain_of_four_is_drawn},
         {"every_events_bit_is_drawn", every_events_bit_is_drawn},

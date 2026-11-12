@@ -114,12 +114,23 @@ return app
 - `ui.bar{...}`: a straight progress bar, value between min and max. Give it `w` and `h`: without them it draws nothing.
 - `ui.image{...}`: one of the app's images (`src`, a path of the manifest's files, or a `muse.image`), which can be turned (`rotation`) or spun (`spin`).
 - `ui.spinner{...}`: a ring that turns by itself, about once a second, with no Lua running: show it while the app waits (see Waiting in Patterns). Without `w` and `h` it is 48 px square, and a side you give leaves the other at 48. It takes `thickness`, `color` and `track_color` as an arc does. It has no value and shows no progress, and nothing shows one for you: the gadget draws none of its own, and `muse.ask` shows none.
+- `ui.canvas{w = ..., h = ...}`: a picture the app draws with `w:draw{...}` (below): rects, circles, ellipses, lines, arcs, text, images and filled polygons, with smooth edges. Use it for what widgets can't make, like a landscape, a gauge with a needle or a chart; see Drawing. `w` and `h` are required: the canvas is that many px. `bg` is the colour each draw starts from (black by default), or `"none"` for a clear canvas that shows what is under it. All the canvases together may cover at most one screen: 466 x 466 px with a `bg`, or half that area with `bg = "none"`, which takes 4 bytes a px instead of 2. Gadgets with older firmware have no canvas, and on them `ui.canvas` is an error: an app that may run on one checks `rawget(ui, "canvas")` first, which is nil there, and draws with boxes, arcs and images instead.
 - `ui.bg(color)`: the screen's background colour (black at first).
 - `ui.clear()`: removes every widget.
 - `ui.polar(deg, r)`: the x and y offsets, as integers, of the point r px from the centre at deg clock degrees, for a widget with `align = "center"`: `ui.polar(90, 100)` is `100, 0`, and `ui.polar(0, 100)` is `0, -100`.
 - `ui.W` and `ui.H` are 466, `ui.R` is 233 and `ui.SAFE` is 330.
 - `w:set{...}` changes properties, `w:get(name)` reads one (colours as `"#rrggbb"`), and `w:delete()` removes the widget and everything inside it. `w:on(event, fn)` calls `fn(w, event)`; a swipe calls `fn(w, "swipe", dir)`, dir is left, right, up or down. A nil fn removes the handler. `set` and `on` return w, so calls chain.
 - `w:scroll_to(where, animate)` scrolls a box with `scroll = "y"`: where is `"start"`, `"end"` or a number of px from the top, and animate (false by default) scrolls smoothly instead of at once. Call it in the callback that adds the rows: it scrolls once the screen has laid them out, so `"end"` is their end. A hidden box scrolls when it shows. It returns w.
+- `w:draw{cmd, ...}` draws a canvas: it starts from the canvas's `bg` and draws the commands in order, each over those before. The drawing stays until the next `draw`, which replaces it whole, and is drawn again when the canvas's `w`, `h` or `bg` changes. Each command is a table whose first item is its name:
+  - `{"rect", x =, y =, w =, h =, color =, radius =, border =, border_color =, grad =, color2 =}`: x and y are its top left. `color = "none"` draws only the border. `grad = "v"` or `"h"` fades from `color` to `color2` top to bottom or left to right. `radius` is as a box's.
+  - `{"circle", x =, y =, r =, color =, border =, border_color =}`: x and y are its centre.
+  - `{"ellipse", x =, y =, rx =, ry =, color =}`: filled, about its centre x, y.
+  - `{"line", points = {x1, y1, x2, y2, ...}, width =, color =, rounded =, dash =, gap =}`: through the points in turn. `width` is 2 by default, and `rounded` (round ends, true by default) is a boolean. With `dash` and `gap` (px) it is dashed.
+  - `{"arc", x =, y =, r =, start_angle =, end_angle =, width =, color =, rounded =}`: part of a ring about x, y, clockwise from start_angle to end_angle, in clock degrees (0 to 360, 0 at 12 o'clock); 0 to 360 by default, a whole ring. `width` is 4 by default, and `rounded` false.
+  - `{"text", x =, y =, text =, font =, color =, w =, align =, spacing =}`: x and y are its top left. With a `w` it wraps there and `align` (left by default, center or right) places it within w. `spacing` is extra px between letters, -16 to 64. `font` is as a label's.
+  - `{"poly", points = {x1, y1, x2, y2, x3, y3, ...}, color =}`: a filled polygon of 3 points or more, any shape, closed back to its first point. Where it crosses itself it is filled once.
+  - `{"image", x =, y =, src =, scale =}`: one of the app's images (a path of the manifest's files), its top left at x, y, `scale` a percentage.
+  - Every command takes `opacity`, 0 to 100. `color` is white by default. Coordinates are px in the canvas from its top left, -932 to 932, and what falls outside is cut. Points may have fractions, to a sixteenth of a px, and a polygon's or an ellipse's edges are smooth. One draw has at most 512 commands, 4096 points and 8 KB of text in all. A wrong command is an error that names it by number, and leaves the drawing as it was.
 - `ui.label` properties: align, x, y, w, h, hidden, opacity, parent, text, font, color, text_align, wrap; events: tap, long_press, press, release, swipe
 - `ui.button` properties: align, x, y, w, h, hidden, opacity, parent, text, font, color, bg, radius, border, border_color; events: tap, long_press, press, release, swipe
 - `ui.box` properties: align, x, y, w, h, hidden, opacity, parent, bg, radius, border, border_color, scroll, layout, gap, pad, items; events: tap, long_press, press, release, swipe
@@ -127,6 +138,7 @@ return app
 - `ui.bar` properties: align, x, y, w, h, hidden, opacity, parent, min, max, value, color, track_color, radius; events: tap, long_press, press, release, swipe
 - `ui.image` properties: align, x, y, w, h, hidden, opacity, parent, src, scale, rotation, spin; events: tap, long_press, press, release, swipe
 - `ui.spinner` properties: align, x, y, w, h, hidden, opacity, parent, thickness, color, track_color; events: tap, long_press, press, release, swipe
+- `ui.canvas` properties: align, x, y, w, h, hidden, opacity, parent, bg; events: tap, long_press, press, release, swipe
 
 The values:
 
@@ -307,6 +319,30 @@ Images are LVGL v9 binary images (`.bin`), made with LVGL's own converter:
 - `spin` is for a picture of at most 180 x 180 px on screen (its width and height times `scale`): turning a picture costs about 1 µs for every pixel drawn, each frame, and only up to that size does a spinning picture keep the gadget smooth and its taps quick. Spinning a larger one is an error, when you make it or set `spin`, `scale` or `src`; `spin = 0` always works. Pictures that spin at once share that: together they may cover at most 32,400 px (one 180 x 180), counting each one's width times height on screen, so two of 125 x 125 fit and two of 130 x 130 don't. A hidden one, or one in a hidden box, doesn't count, and showing it again is an error when there's no room; stop one with `spin = 0` (or hide or delete it) to make room. For a larger picture, show it still and spin a smaller copy over it, like a record on a sleeve. A still picture under a spinning one is redrawn at every step: show it at scale 100, written at the size it's shown (a hook can resize it with ffmpeg); a scaled one costs as much as the spin.
 - Make a picture that spins round, like a record: bake a circle into its alpha, with the corners outside it transparent, and convert it with `--cf RGB565A8`. A square picture would swing its corners round the screen. With ffmpeg: `ffmpeg -i art.png -vf "format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='255*lte(hypot(X-(W-1)/2,Y-(H-1)/2),W/2)'" disc.png`, then convert `disc.png` with LVGLImage.py. A JPEG from the VM needs none of this: read it with `circle = true` (see `vm.read`).
 - Spin only what changes as it turns. A record's grooves and the light on it look the same at any angle, so draw the record still and spin only its label, a smaller picture over it: each step the gadget then redraws only the label's square, so the spin stays smooth and costs little. The same goes for the shape of what spins: a picture with a circle in its alpha is redrawn as its own square each step, and one with corners as the square it turns into, up to 1.4 times its side at 45 degrees.
+
+## Drawing
+
+A canvas makes smooth scenes that boxes can't: hills, water, a sky, a needle, a curve. Draw a scene once, in `start()`, and draw it again only when it changes: each `draw` redraws the whole canvas, and a full-screen scene of about 150 commands takes the gadget about 0.13 s, during which the screen doesn't update. Keep what moves every tick (a clock's text, a moving dot) as widgets made after the canvas, so they draw over it, and set those instead.
+
+- One full-screen canvas: `local scene = ui.canvas{w = ui.W, h = ui.H}`, centred like any widget. The screen is round: what is drawn past its edge is cut, so a sky can fill the whole square.
+- Build the list in Lua and draw it in one call: `local cmds = {}`, add commands with `cmds[#cmds + 1] = {...}`, then `scene:draw(cmds)`.
+- Shapes: a hill or a shore is a `poly` along its outline and down to the bottom of the canvas; a curve is many points close together, from `math.sin` or a list; a sky is a `rect` with `grad = "v"`; the sun is a `circle`, with a larger one at low opacity for its glow; water is a gradient with a few thin `line`s for its ripples. Later commands draw over earlier ones: paint from the back to the front.
+- A gauge: an `arc` for its track and one for its value, a `line` for its needle, and `text` for its numbers. A chart: a `line` through the values and a `poly` under it at low opacity.
+- `bg = "none"` makes a canvas you can lay over widgets, or over another canvas.
+
+```lua
+local scene = ui.canvas{w = ui.W, h = ui.H}
+local hill = {0, 300}
+for x = 0, ui.W, 16 do hill[#hill + 1] = x; hill[#hill + 1] = 280 + 20 * math.sin(x / 60) end
+hill[#hill + 1] = ui.W; hill[#hill + 1] = ui.H; hill[#hill + 1] = 0; hill[#hill + 1] = ui.H
+scene:draw{
+  {"rect", w = ui.W, h = 300, color = "#0b1d3a", grad = "v", color2 = "#f2a65a"},
+  {"circle", x = 320, y = 210, r = 40, color = "#ffd27a", opacity = 30},
+  {"circle", x = 320, y = 210, r = 26, color = "#ffd27a"},
+  {"poly", points = hill, color = "#1e3b2f"},
+  {"line", points = {150, 360, 310, 360}, width = 2, color = "#ffffff", opacity = 40},
+}
+```
 
 ## Sounds
 

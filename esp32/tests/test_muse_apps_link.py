@@ -319,7 +319,7 @@ class GuideAndSkill(unittest.TestCase):
         ui = strip_c_comments((APPS / "apps_ui.c").read_text())
         kinds = c_table(ui, "apps_ui_kinds")
         events = c_table(ui, "apps_ui_events")
-        self.assertEqual(kinds, ["label", "button", "box", "arc", "bar", "image", "spinner"])
+        self.assertEqual(kinds, ["label", "button", "box", "arc", "bar", "image", "spinner", "canvas"])
         lines = {kind: (props, evs) for kind, props, evs in
                  re.findall(r"^- `ui\.(\w+)` properties: ([^;\n]+); events: ([^\n]+)$", reference, re.M)}
         self.assertEqual(sorted(lines), sorted(kinds), "one properties line per kind")

@@ -34,6 +34,7 @@
 #include "muse_frame_stats.h"
 #endif
 
+#include "apps_canvas.h"
 #include "apps_icons.h"
 #include "apps_json.h"
 #include "apps_pkg.h"
@@ -63,7 +64,8 @@ static const char *TAG = "muse_apps";
 #endif
 
 /* The bits that name a group of properties (and SCROLL, a w:scroll_to), as opposed to CREATE and DELETE. */
-#define GROUPS (APPS_DIRTY_GEOM | APPS_DIRTY_STYLE | APPS_DIRTY_TEXT | APPS_DIRTY_VALUE | APPS_DIRTY_EVENTS | APPS_DIRTY_SCROLL)
+#define GROUPS (APPS_DIRTY_GEOM | APPS_DIRTY_STYLE | APPS_DIRTY_TEXT | APPS_DIRTY_VALUE | APPS_DIRTY_EVENTS | APPS_DIRTY_SCROLL | \
+                APPS_DIRTY_DRAW)
 
 /* A scroll box's scrollbar (LV_PART_SCROLLBAR), which lv_obj_remove_style_all took off with the theme's: a thin white bar at 40%,
  * rounded at its ends. And the y w:scroll_to("end") asks LVGL for, which lv_obj_scroll_to_y bounds to the bottom of the content. */
@@ -111,15 +113,27 @@ typedef struct {
     int16_t image;    /* an image's: the src and scale its picture was set from, */
     uint16_t scale;
     bool turned;      /* and whether it turned (a rotation or spin not 0) when its reach was worked out */
+    uint16_t cv_w, cv_h;  /* a canvas's: the size its pixels were made for (0: none yet), */
+    bool cv_argb;         /* and whether they are ARGB8888 (bg "none") rather than RGB565 */
+    uint32_t cv_bg;       /* and the bg they were last filled with */
 } node_t;
 
 /* The records of the app on the layer, and the descriptors its images are drawn from: one block, from the apps'
  * heap (PSRAM on the device, so it takes no internal RAM), made by the first pass that has a table, with the lock
  * given back (the heap is not used under it), and freed by apps_lv_reset. */
+#define CV_DROP_MAX (2 * APPS_UI_SLOTS)  /* a canvas lets go of at most one block in a pass (its old pixels, or its last as it goes) */
 typedef struct {
     node_t node[APPS_UI_SLOTS];
     lv_image_dsc_t image[IMAGES_ALL];  /* per asset, then per runtime image's slot; data NULL until first drawn */
     uint32_t drawn;                    /* the runtime images the objects draw from, a bit a slot: the pass's report */
+    /* The canvases' blocks (canvas_blocks), which the heap gives and takes only with the lock given back: */
+    void *cv_ready[APPS_UI_SLOTS];          /* pixels made after a pass asked for them, for the slot's canvas at the next pass */
+    uint32_t cv_ready_bytes[APPS_UI_SLOTS];
+    uint32_t cv_want[APPS_UI_SLOTS];        /* the bytes of pixels the slot's canvas asked for in the last pass (0: none) */
+    void *drop[CV_DROP_MAX];                /* blocks let go of in a pass, under the lock: freed after it */
+    int n_drop;
+    uint8_t *scratch;                       /* the drawing's scratch (draw_canvas), kept for the next draw */
+    size_t scratch_bytes;
 } state_t;
 
 static lv_obj_t *s_layer;
@@ -226,6 +240,8 @@ typedef struct {
     bool changed;            /* LVGL was called for a widget: lay out and write back */
     bool recoloured;         /* the layer's background was set: nothing to lay out, but a frame to draw */
     uint32_t rejects, refused;
+    bool cv_wants;           /* a canvas waits for a block (cv_want, scratch_want): canvas_blocks makes them after the pass */
+    size_t scratch_want;     /* the scratch the biggest drawing that waited for it needs */
     int reject_slot;         /* the first slot dropped, or -1 */
     const char *reject_why;
 #if CONFIG_MUSE_BENCH
@@ -322,8 +338,11 @@ static bool image_size(const pass_t *p, const apps_widget_t *w, uint16_t *iw, ui
  * checked again, field by field, because LVGL asserts abort() and a loop here would hang the UI. The text is
  * read at most APPS_UI_TEXT_MAX + 1 bytes in. */
 static const char *check_widget(const pass_t *p, int slot, const apps_widget_t *w) {
-    if (w->kind > APPS_W_SPINNER) {
+    if (w->kind > APPS_W_CANVAS) {
         return "kind";
+    }
+    if (w->kind == APPS_W_CANVAS && (w->w <= 0 || w->h <= 0)) {
+        return "canvas size";
     }
 
     /* The parent chain: alive boxes, at most APPS_UI_BOX_DEPTH_MAX of them, and a box counts itself (the rule of
@@ -519,6 +538,8 @@ static void on_arc_press(lv_event_t *e) {
 
 /* A bare object of the kind, with LVGL's own style taken off it (every value a widget shows is then set by the
  * pass, none is the theme's) and neither scrollable nor clickable. NULL when LVGL gives none. */
+static void canvas_deleted(lv_event_t *e);
+
 static lv_obj_t *new_object(uint8_t kind, lv_obj_t *parent, lv_obj_t **label) {
     lv_obj_t *obj = NULL;
     switch (kind) {
@@ -529,6 +550,7 @@ static lv_obj_t *new_object(uint8_t kind, lv_obj_t *parent, lv_obj_t **label) {
         case APPS_W_BAR: obj = lv_bar_create(parent); break;
         case APPS_W_IMAGE: obj = lv_image_create(parent); break;
         case APPS_W_SPINNER: obj = lv_spinner_create(parent); break;  /* LVGL's own animation, with its defaults */
+        case APPS_W_CANVAS: obj = lv_canvas_create(parent); break;    /* its pixels come with its first draw (draw_canvas) */
         default: break;
     }
     if (obj == NULL) {
@@ -547,6 +569,9 @@ static lv_obj_t *new_object(uint8_t kind, lv_obj_t *parent, lv_obj_t **label) {
          * scaled size is exactly filled (apply_geom). That is LVGL's default for an image, said here because the
          * box depends on it. */
         lv_image_set_inner_align(obj, LV_IMAGE_ALIGN_CENTER);
+    }
+    if (kind == APPS_W_CANVAS) {
+        lv_obj_add_event_cb(obj, canvas_deleted, LV_EVENT_DELETE, NULL);  /* its pixels go with it, however it goes */
     }
     if (kind == APPS_W_ARC) {
         lv_arc_set_rotation(obj, 270);  /* 0 is 12 o'clock, as for the app */
@@ -576,6 +601,9 @@ static uint32_t groups_of_new(const apps_widget_t *w) {
     }
     if (w->kind == APPS_W_ARC || w->kind == APPS_W_BAR) {
         groups |= APPS_DIRTY_VALUE;
+    }
+    if (w->kind == APPS_W_CANVAS) {
+        groups |= APPS_DIRTY_DRAW;
     }
     if (w->events != 0) {
         groups |= APPS_DIRTY_EVENTS;
@@ -663,6 +691,9 @@ static made_t make_object(pass_t *p, int slot, int depth) {
     n->gap = n->pad = 0;
     n->scroll_sets = 0;     /* a scroll_to made with the box is still to apply */
     n->styled = false;      /* new_object took every style off: the first STYLE sets them all */
+    n->cv_w = n->cv_h = 0;  /* a new canvas has no pixels */
+    n->cv_argb = false;
+    n->cv_bg = 0;
     w->dirty = (w->dirty & ~(uint32_t)APPS_DIRTY_CREATE) | groups_of_new(w);
     p->changed = true;
 #if CONFIG_MUSE_BENCH
@@ -773,6 +804,21 @@ static void style_bar_part(lv_obj_t *obj, uint32_t rgb, int32_t radius, lv_style
     }
 }
 
+/* The descriptor an image of the table draws from, made over its file in place: the header is the file's first bytes, the pixels the
+ * rest. */
+static void fill_image_dsc(lv_image_dsc_t *dsc, const apps_asset_t *asset) {
+    memcpy(&dsc->header, asset->data, sizeof dsc->header);
+    /* Only premultiplied alpha means anything to an image drawn in place; the others say what the memory is
+     * (ALLOCATED: an lv_draw_buf, which this isn't, so LVGL refuses the image and it never shows).
+     * apps_image_check refuses them already: this keeps out of LVGL what the header said when it was
+     * copied, which may not be what the check saw. */
+    dsc->header.flags &= LV_IMAGE_FLAGS_PREMULTIPLIED;
+    dsc->data_size = (uint32_t)(asset->len - IMAGE_HEADER);
+    dsc->data = asset->data + IMAGE_HEADER;
+    dsc->reserved = NULL;
+    dsc->reserved_2 = NULL;
+}
+
 /*
  * How far from its centre a picture draws, in its own px: to the outer corner of its farthest pixel that isn't
  * transparent, by the alpha of an RGB565A8 picture (a plane after the colour, stride / 2 a row) or an A8 one. A
@@ -866,16 +912,7 @@ static bool apply_image(pass_t *p, const apps_widget_t *w, node_t *n) {
      * in place. Made again each time it is set: a slot's next runtime image can be another picture in a block at the same
      * address. Every object that draws from a slot's descriptor draws its current image (the runtime frees an image, and gives
      * its slot to the next, only once no object draws the slot: the report, below). */
-    memcpy(&dsc->header, asset->data, sizeof dsc->header);
-    /* Only premultiplied alpha means anything to an image drawn in place; the others say what the memory is
-     * (ALLOCATED: an lv_draw_buf, which this isn't, so LVGL refuses the image and it never shows).
-     * apps_image_check refuses them already: this keeps out of LVGL what the header said when it was
-     * copied, which may not be what the check saw. */
-    dsc->header.flags &= LV_IMAGE_FLAGS_PREMULTIPLIED;
-    dsc->data_size = (uint32_t)(asset->len - IMAGE_HEADER);
-    dsc->data = asset->data + IMAGE_HEADER;
-    dsc->reserved = NULL;
-    dsc->reserved_2 = NULL;
+    fill_image_dsc(dsc, asset);
     lv_image_set_src(obj, dsc);
     n->runtime = w->image >= APPS_UI_ASSETS_MAX ? (uint8_t)(w->image - APPS_UI_ASSETS_MAX + 1) : 0;
     lv_image_set_scale(obj, (uint32_t)w->scale * 256 / 100);
@@ -964,6 +1001,431 @@ static void apply_turn(const apps_widget_t *w, node_t *n) {
     if (w->spin != 0 && start_spin(obj, lv_image_get_rotation(obj), w->spin)) {
         n->spin = w->spin;
     }
+}
+
+/* ---- Canvases (apps_canvas.h) ----
+ * A canvas's pixels are one block from the apps' heap, through the floor (apps_port_realloc), made for its size and bg when it is first
+ * drawn and made again when either changes: RGB565 for an opaque bg, ARGB8888 for bg "none". The heap is never used with the UI lock
+ * held, and the pass holds it: a pass that finds a canvas without the pixels it needs asks for them (cv_want) and leaves the canvas to
+ * wait (DRAW kept); once the lock is given back canvas_blocks makes them (cv_ready) and the pass runs again, which puts them on the
+ * canvas and draws it. Pixels let go of under the lock (the old ones, or the last ones as the object goes: canvas_deleted, on its
+ * LV_EVENT_DELETE, however it is deleted) are dropped (drop_block) and freed after the pass. The drawing's scratch is kept in the
+ * records the same way. Each draw fills the pixels with the bg and replays the whole list in order: LVGL draws rects, circles,
+ * lines, arcs, texts and images into them through a layer, and apps_canvas_fill_poly fills polys and ellipses straight into the
+ * pixels between layers, so what comes later still draws over what came before. The list was checked when the app gave it
+ * (apps_ui.c); what LVGL is handed is bounded again here. */
+
+/* A block let go of, freed once the lock is given back (canvas_blocks, or the records' end). With no records (an old screen's
+ * objects, deleted after its layer's records went) nothing holds the lock, and it is freed now. */
+static void drop_block(void *block) {
+    if (block == NULL) {
+        return;
+    }
+    if (s_state != NULL && s_state->n_drop < CV_DROP_MAX) {
+        s_state->drop[s_state->n_drop++] = block;
+        return;
+    }
+    apps_port_free(block);
+}
+
+static void canvas_deleted(lv_event_t *e) {
+    lv_draw_buf_t *buf = lv_canvas_get_draw_buf(lv_event_get_target_obj(e));
+    if (buf != NULL && buf->data != NULL) {
+        void *data = buf->data;
+        buf->data = NULL;
+        drop_block(data);
+    }
+}
+
+/* Whether the canvas has pixels for its size and bg. When it hasn't, a block of the right size made after the last pass becomes them
+ * (its old ones dropped); with none, the pass asks for one and the canvas waits. */
+static bool canvas_pixels(pass_t *p, int slot, const apps_widget_t *w, node_t *n) {
+    bool argb = w->bg == APPS_COLOR_NONE;
+    lv_draw_buf_t *have = lv_canvas_get_draw_buf(n->obj);
+    if (have != NULL && have->data != NULL && n->cv_w == w->w && n->cv_h == w->h && n->cv_argb == argb) {
+        return true;
+    }
+    lv_color_format_t cf = argb ? LV_COLOR_FORMAT_ARGB8888 : LV_COLOR_FORMAT_RGB565;
+    uint32_t bytes = lv_draw_buf_width_to_stride((uint32_t)w->w, cf) * (uint32_t)w->h;
+    state_t *st = p->st;
+    if (st->cv_ready[slot] == NULL || st->cv_ready_bytes[slot] != bytes) {
+        st->cv_want[slot] = bytes;
+        p->cv_wants = true;
+        return false;
+    }
+    void *old = have != NULL ? have->data : NULL;
+    lv_canvas_set_buffer(n->obj, st->cv_ready[slot], w->w, w->h, cf);
+    st->cv_ready[slot] = NULL;
+    st->cv_ready_bytes[slot] = 0;
+    drop_block(old);
+    n->cv_w = (uint16_t)w->w;
+    n->cv_h = (uint16_t)w->h;
+    n->cv_argb = argb;
+    return true;
+}
+
+/* After a pass, with the lock given back: the blocks it dropped are freed, a block made for a canvas that no longer asks for it is
+ * freed, and those asked for are made (a refusal of the floor is counted, and the canvas asks again at the next pass). True when one
+ * was made: the pass runs again at once, so what waited is drawn in this frame. */
+static bool canvas_blocks(const pass_t *p) {
+    state_t *st = s_state;
+    if (st == NULL) {
+        return false;
+    }
+    for (int i = 0; i < st->n_drop; i++) {
+        apps_port_free(st->drop[i]);
+    }
+    st->n_drop = 0;
+    bool made = false;
+    for (int slot = 0; slot < APPS_UI_SLOTS; slot++) {
+        if (st->cv_ready[slot] != NULL && st->cv_ready_bytes[slot] != st->cv_want[slot]) {
+            apps_port_free(st->cv_ready[slot]);
+            st->cv_ready[slot] = NULL;
+            st->cv_ready_bytes[slot] = 0;
+        }
+        if (p != NULL && p->cv_wants && st->cv_want[slot] != 0 && st->cv_ready[slot] == NULL) {
+            st->cv_ready[slot] = apps_port_realloc(NULL, st->cv_want[slot]);
+            if (st->cv_ready[slot] != NULL) {
+                st->cv_ready_bytes[slot] = st->cv_want[slot];
+                made = true;
+            } else {
+                s_refused++;
+            }
+        }
+    }
+    if (p != NULL && p->scratch_want > st->scratch_bytes) {
+        apps_port_free(st->scratch);
+        st->scratch = apps_port_realloc(NULL, p->scratch_want);
+        st->scratch_bytes = st->scratch != NULL ? p->scratch_want : 0;
+        made = made || st->scratch != NULL;
+        s_refused += st->scratch != NULL ? 0 : 1;
+    }
+    return made;
+}
+
+/* The records' end (apps_lv_reset, apps_lv_build): their canvases' blocks with them. The objects are gone first, their pixels
+ * dropped. */
+static void free_state(void) {
+    if (s_state == NULL) {
+        return;
+    }
+    memset(s_state->cv_want, 0, sizeof s_state->cv_want);
+    (void)canvas_blocks(NULL);  /* the dropped blocks, and every one made and not yet used */
+    apps_port_free(s_state->scratch);
+    apps_port_free(s_state);
+    s_state = NULL;
+}
+
+static lv_opa_t opa_of(uint8_t opacity) {
+    return (lv_opa_t)((unsigned)(opacity > 100 ? 100 : opacity) * 255 / 100);
+}
+
+/* A command's points, in the list: NULL when they aren't all there (they always are, from apps_ui.c). */
+static const int32_t *cmd_points(const apps_cv_list_t *list, const apps_cv_cmd_t *c, uint32_t least) {
+    if (c->n_pts < least || c->pts > list->n_points || c->n_pts > list->n_points - c->pts) {
+        return NULL;
+    }
+    return list->points + 2 * (size_t)c->pts;
+}
+
+static int32_t px_of(int32_t sub) {  /* 1/16 px to the nearest px */
+    return sub >= 0 ? (sub + APPS_CV_SUBPX / 2) / APPS_CV_SUBPX : -((-sub + APPS_CV_SUBPX / 2) / APPS_CV_SUBPX);
+}
+
+#define DASH_PIECES_MAX 2048  /* the most dashes one dashed line draws */
+
+static void draw_line_cmd(lv_layer_t *layer, const apps_cv_list_t *list, const apps_cv_cmd_t *c, lv_point_precise_t *scratch) {
+    const int32_t *pts = cmd_points(list, c, 2);
+    if (pts == NULL) {
+        return;
+    }
+    lv_draw_line_dsc_t d;
+    lv_draw_line_dsc_init(&d);
+    d.color = colour(c->color);
+    d.opa = opa_of(c->opacity);
+    d.width = c->width < 1 ? 1 : c->width > APPS_CV_WIDTH_MAX ? APPS_CV_WIDTH_MAX : c->width;
+    d.round_start = d.round_end = c->rounded;
+    if (c->dash > 0 && c->gap > 0) {
+        /* Dashes along the whole line, in step across its corners: LVGL dashes only lines that are level or upright. */
+        float on = (float)c->dash, period = (float)(c->dash + c->gap), at = 0;
+        int pieces = 0;
+        for (int i = 0; i + 1 < c->n_pts && pieces < DASH_PIECES_MAX; i++) {
+            float x0 = (float)pts[2 * i] / APPS_CV_SUBPX, y0 = (float)pts[2 * i + 1] / APPS_CV_SUBPX;
+            float x1 = (float)pts[2 * i + 2] / APPS_CV_SUBPX, y1 = (float)pts[2 * i + 3] / APPS_CV_SUBPX;
+            float len = sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+            if (len <= 0) {
+                continue;
+            }
+            float t = 0;
+            while (t < len && pieces < DASH_PIECES_MAX) {
+                float phase = fmodf(at + t, period);
+                float step = phase < on ? on - phase : period - phase;
+                float t1 = t + step > len ? len : t + step;
+                if (phase < on) {
+                    d.p1.x = (int32_t)lroundf(x0 + (x1 - x0) * t / len);
+                    d.p1.y = (int32_t)lroundf(y0 + (y1 - y0) * t / len);
+                    d.p2.x = (int32_t)lroundf(x0 + (x1 - x0) * t1 / len);
+                    d.p2.y = (int32_t)lroundf(y0 + (y1 - y0) * t1 / len);
+                    lv_draw_line(layer, &d);
+                    pieces++;
+                }
+                t = t1;
+            }
+            at += len;
+        }
+        return;
+    }
+    if (c->n_pts == 2 || scratch == NULL) {
+        for (int i = 0; i + 1 < c->n_pts; i++) {  /* without the scratch a polyline goes a segment at a time */
+            d.p1.x = px_of(pts[2 * i]);
+            d.p1.y = px_of(pts[2 * i + 1]);
+            d.p2.x = px_of(pts[2 * i + 2]);
+            d.p2.y = px_of(pts[2 * i + 3]);
+            lv_draw_line(layer, &d);
+        }
+        return;
+    }
+    for (int i = 0; i < c->n_pts; i++) {
+        scratch[i].x = px_of(pts[2 * i]);
+        scratch[i].y = px_of(pts[2 * i + 1]);
+    }
+    d.points = scratch;  /* lv_draw_line copies them */
+    d.point_cnt = c->n_pts;
+    lv_draw_line(layer, &d);
+}
+
+/* LVGL's arc angle (0 at 3 o'clock, clockwise) of a clock angle (0 at 12 o'clock, clockwise). */
+static int32_t lv_angle(int32_t clock) {
+    return (clock + 270) % 360;
+}
+
+static void draw_command(pass_t *p, lv_layer_t *layer, const apps_cv_list_t *list, const apps_cv_cmd_t *c, lv_point_precise_t *scratch) {
+    lv_opa_t opa = opa_of(c->opacity);
+    switch (c->op) {
+        case APPS_CV_RECT:
+        case APPS_CV_CIRCLE: {
+            lv_area_t a;
+            lv_draw_rect_dsc_t d;
+            lv_draw_rect_dsc_init(&d);
+            if (c->op == APPS_CV_RECT) {
+                if (c->w <= 0 || c->h <= 0) {
+                    return;
+                }
+                lv_area_set(&a, c->x, c->y, c->x + c->w - 1, c->y + c->h - 1);
+                d.radius = c->radius < 0 ? LV_RADIUS_CIRCLE : c->radius;
+            } else {
+                if (c->r <= 0) {
+                    return;
+                }
+                lv_area_set(&a, c->x - c->r, c->y - c->r, c->x + c->r - 1, c->y + c->r - 1);
+                d.radius = LV_RADIUS_CIRCLE;
+            }
+            if (c->color == APPS_COLOR_NONE) {
+                d.bg_opa = LV_OPA_TRANSP;
+            } else {
+                d.bg_opa = opa;
+                d.bg_color = colour(c->color);
+                if (c->op == APPS_CV_RECT && (c->grad == APPS_CV_GRAD_V || c->grad == APPS_CV_GRAD_H)) {
+                    lv_color_t stops[2] = {colour(c->color), colour(c->color2)};
+                    lv_grad_init_stops(&d.bg_grad, stops, NULL, NULL, 2);
+                    if (c->grad == APPS_CV_GRAD_V) {
+                        lv_grad_vertical_init(&d.bg_grad);
+                    } else {
+                        lv_grad_horizontal_init(&d.bg_grad);
+                    }
+                }
+            }
+            if (c->border > 0) {
+                d.border_width = c->border > APPS_CV_WIDTH_MAX ? APPS_CV_WIDTH_MAX : c->border;
+                d.border_color = colour(c->border_color);
+                d.border_opa = opa;
+            }
+            lv_draw_rect(layer, &d, &a);
+            return;
+        }
+        case APPS_CV_LINE:
+            draw_line_cmd(layer, list, c, scratch);
+            return;
+        case APPS_CV_ARC: {
+            if (c->r <= 0) {
+                return;
+            }
+            lv_draw_arc_dsc_t d;
+            lv_draw_arc_dsc_init(&d);
+            d.center.x = c->x;
+            d.center.y = c->y;
+            d.radius = (uint16_t)c->r;
+            d.width = c->width < 1 ? 1 : c->width > APPS_CV_WIDTH_MAX ? APPS_CV_WIDTH_MAX : c->width;
+            d.color = colour(c->color);
+            d.opa = opa;
+            d.rounded = c->rounded;
+            int32_t from = clamp_i32(c->start_angle, 0, 360), to = clamp_i32(c->end_angle, 0, 360);
+            if (to - from >= 360 || from - to >= 360) {
+                d.start_angle = 0;  /* the whole ring */
+                d.end_angle = 360;
+            } else if (from == to) {
+                return;
+            } else {
+                d.start_angle = lv_angle(from);
+                d.end_angle = lv_angle(to);
+            }
+            lv_draw_arc(layer, &d);
+            return;
+        }
+        case APPS_CV_TEXT: {
+            if (c->text >= list->text_bytes || memchr(list->texts + c->text, '\0', list->text_bytes - c->text) == NULL) {
+                return;
+            }
+            const char *text = list->texts + c->text;
+            if (text[0] == '\0') {
+                return;
+            }
+            const lv_font_t *font = font_of(c->font);
+            int32_t spacing = clamp_i32(c->spacing, -16, 64);
+            lv_point_t size;
+            lv_text_get_size(&size, text, font, spacing, 0, c->w > 0 ? c->w : LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+            lv_area_t a;
+            lv_area_set(&a, c->x, c->y, c->x + (c->w > 0 ? c->w : size.x) - 1, c->y + size.y - 1);
+            lv_draw_label_dsc_t d;
+            lv_draw_label_dsc_init(&d);
+            d.text = text;  /* the list outlives the layer: it is drawn before this pass lets go of the lock */
+            d.font = font;
+            d.color = colour(c->color);
+            d.opa = opa;
+            d.letter_space = spacing;
+            d.align = text_align_of(c->align);
+            lv_draw_label(layer, &d, &a);
+            return;
+        }
+        case APPS_CV_IMAGE: {
+            const apps_asset_t *asset = apps_ui_asset(p->ui, c->image);
+            uint16_t iw, ih;
+            if (asset == NULL || c->image < 0 || c->image >= APPS_UI_ASSETS_MAX ||
+                !apps_image_check(asset->data, asset->len, &iw, &ih, NULL, 0)) {
+                return;
+            }
+            lv_image_dsc_t *dsc = &p->st->image[c->image];
+            fill_image_dsc(dsc, asset);
+            lv_draw_image_dsc_t d;
+            lv_draw_image_dsc_init(&d);
+            d.src = dsc;
+            d.opa = opa;
+            uint32_t scale = (uint32_t)clamp_i32(c->scale, 10, 400) * 256 / 100;
+            d.scale_x = d.scale_y = (int32_t)scale;
+            d.pivot.x = d.pivot.y = 0;  /* scaled about its top left, which stays at x, y */
+            if (dsc->header.cf == LV_COLOR_FORMAT_A8) {  /* a mask: white, as a ui.image draws it */
+                d.recolor = colour(0xFFFFFF);
+                d.recolor_opa = LV_OPA_COVER;
+            }
+            lv_area_t a;
+            lv_area_set(&a, c->x, c->y, c->x + iw - 1, c->y + ih - 1);
+            lv_draw_image(layer, &d, &a);
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+/* A poly or an ellipse, straight into the pixels (no layer is open). */
+static void fill_shape(const apps_cv_list_t *list, const apps_cv_cmd_t *c, lv_draw_buf_t *buf, bool argb, void *poly_scratch,
+                       int32_t *ellipse) {
+    if (poly_scratch == NULL || c->color == APPS_COLOR_NONE) {
+        return;
+    }
+    const int32_t *pts;
+    int n;
+    if (c->op == APPS_CV_ELLIPSE) {
+        if (c->w <= 0 || c->h <= 0) {
+            return;
+        }
+        n = apps_canvas_ellipse(ellipse, c->x, c->y, c->w, c->h);
+        pts = ellipse;
+    } else {
+        pts = cmd_points(list, c, 3);
+        n = c->n_pts;
+        if (pts == NULL) {
+            return;
+        }
+    }
+    apps_canvas_fill_poly(buf->data, (int)buf->header.stride, (int)buf->header.w, (int)buf->header.h, argb, pts, n, c->color & 0xFFFFFF,
+                          opa_of(c->opacity), poly_scratch);
+}
+
+/* The scratch a draw of the list into a canvas w px wide needs: the longest polyline's points, the biggest poly's crossings with
+ * the rows' coverage, and an ellipse's points. *line_bytes and *ellipse_bytes say where the parts start. */
+static size_t scratch_of(const apps_cv_list_t *list, int32_t w, size_t *line_bytes, size_t *ellipse_bytes) {
+    uint32_t line_pts = 0, poly_pts = APPS_CV_ELLIPSE_POINTS_MAX;
+    uint32_t n_cmds = list->n < APPS_CV_CMDS_MAX ? list->n : APPS_CV_CMDS_MAX;
+    for (uint32_t i = 0; i < n_cmds; i++) {
+        const apps_cv_cmd_t *c = &list->cmds[i];
+        if (c->op == APPS_CV_LINE && c->n_pts > line_pts) {
+            line_pts = c->n_pts;
+        } else if (c->op == APPS_CV_POLY && c->n_pts > poly_pts) {
+            poly_pts = c->n_pts;
+        }
+    }
+    *line_bytes = (size_t)line_pts * sizeof(lv_point_precise_t);
+    *ellipse_bytes = (size_t)APPS_CV_ELLIPSE_POINTS_MAX * 2 * sizeof(int32_t);
+    return *line_bytes + *ellipse_bytes + apps_canvas_poly_scratch((int)poly_pts, (int)w);
+}
+
+/*
+ * The canvas's pixels for what the widget is now: when draw (a c:draw, or a new canvas) or when its size or bg changed since they
+ * were drawn, they are filled with its bg and its list is drawn over it. False when the pixels or the scratch it needs aren't there
+ * yet: the pass has asked for them, the caller keeps DRAW, and the slot comes again.
+ */
+static bool draw_canvas(pass_t *p, int slot, const apps_widget_t *w, node_t *n, bool draw) {
+    bool argb = w->bg == APPS_COLOR_NONE;
+    if (!draw && n->cv_w == w->w && n->cv_h == w->h && n->cv_argb == argb && n->cv_bg == w->bg) {
+        return true;  /* a move, or a style that isn't the pixels' */
+    }
+    const apps_cv_list_t *list = w->drawing;
+    size_t line_bytes = 0, ellipse_bytes = 0;
+    size_t need = list != NULL ? scratch_of(list, w->w, &line_bytes, &ellipse_bytes) : 0;
+    bool ready = true;
+    if (need > p->st->scratch_bytes) {
+        p->scratch_want = need > p->scratch_want ? need : p->scratch_want;
+        p->cv_wants = true;
+        ready = false;
+    }
+    if (!canvas_pixels(p, slot, w, n) || !ready) {
+        return false;
+    }
+    lv_obj_t *obj = n->obj;
+    lv_canvas_fill_bg(obj, colour(argb ? 0 : w->bg), argb ? LV_OPA_TRANSP : LV_OPA_COVER);
+    n->cv_bg = w->bg;
+    lv_draw_buf_t *buf = lv_canvas_get_draw_buf(obj);
+    if (list != NULL && buf != NULL) {
+        uint8_t *scratch = p->st->scratch;
+        lv_point_precise_t *line_scratch = line_bytes > 0 ? (lv_point_precise_t *)scratch : NULL;
+        int32_t *ellipse = (int32_t *)(scratch + line_bytes);
+        void *poly_scratch = scratch + line_bytes + ellipse_bytes;
+        uint32_t n_cmds = list->n < APPS_CV_CMDS_MAX ? list->n : APPS_CV_CMDS_MAX;
+        lv_layer_t layer;
+        bool open = false;
+        for (uint32_t i = 0; i < n_cmds; i++) {
+            const apps_cv_cmd_t *c = &list->cmds[i];
+            if (c->op == APPS_CV_POLY || c->op == APPS_CV_ELLIPSE) {
+                if (open) {
+                    lv_canvas_finish_layer(obj, &layer);  /* what came before is in the pixels first */
+                    open = false;
+                }
+                fill_shape(list, c, buf, argb, poly_scratch, ellipse);
+                continue;
+            }
+            if (!open) {
+                lv_canvas_init_layer(obj, &layer);
+                open = true;
+            }
+            draw_command(p, &layer, list, c, line_scratch);
+        }
+        if (open) {
+            lv_canvas_finish_layer(obj, &layer);
+        }
+    }
+    lv_obj_invalidate(obj);
+    return true;
 }
 
 static lv_flex_align_t items_of(uint8_t items) {
@@ -1264,11 +1726,16 @@ static void visit_live(pass_t *p, int slot, apps_widget_t *w) {
     if ((todo & APPS_DIRTY_EVENTS) != 0) {
         apply_events(slot, w, n);
     }
+    uint32_t keep = 0;
+    if (w->kind == APPS_W_CANVAS && (todo & (APPS_DIRTY_GEOM | APPS_DIRTY_STYLE | APPS_DIRTY_DRAW)) != 0 &&
+        !draw_canvas(p, slot, w, n, (todo & APPS_DIRTY_DRAW) != 0)) {
+        keep = APPS_DIRTY_DRAW;  /* its blocks are made after the pass (canvas_blocks): the slot comes again */
+    }
     /* SCROLL has nothing to apply here: the pass scrolls after its layout (apply_scrolls). */
     if (todo != 0) {
         p->changed = true;
     }
-    w->dirty = 0;
+    w->dirty = keep;
 }
 
 /* ---- Laying out, and what it says to the app ---- */
@@ -1327,8 +1794,8 @@ static uint32_t isqrt(uint64_t n) {
  * round(distance + r - SCREEN_R), halves up.
  */
 static int16_t overflow_of(const pass_t *p, const apps_widget_t *w, int32_t x1, int32_t y1, int32_t rw, int32_t rh) {
-    if (rw <= 0 || rh <= 0 || is_hidden(p, w) || in_scroll_box(p, w)) {
-        return 0;
+    if (rw <= 0 || rh <= 0 || is_hidden(p, w) || in_scroll_box(p, w) || w->kind == APPS_W_CANVAS) {
+        return 0;  /* a canvas is drawn to be cut by the round edge, as a full-screen scene is */
     }
     const int64_t c = 2 * SCREEN_R;  /* the screen's centre, doubled */
     int64_t far2 = 0;                /* the farthest distance, squared, doubled */
@@ -1436,6 +1903,7 @@ static uint32_t drawn_images(const state_t *st) {
 
 /* Everything the pass does, with the UI lock held. */
 static void run_pass(pass_t *p) {
+    memset(p->st->cv_want, 0, sizeof p->st->cv_want);  /* each canvas that waits asks again */
     if (apps_ui_take_clear(p->ui)) {
         lv_obj_clean(s_layer);
         memset(p->st->node, 0, sizeof p->st->node);
@@ -1553,8 +2021,13 @@ static void skip_busy(void) {
 #endif
 }
 
+/* Whether the canvases' blocks were made after the last pass (canvas_blocks): apply_pass runs another, so what waited is drawn in
+ * this frame. The LVGL task's. */
+static bool s_canvas_again;
+
 /* The pass: the lock, the records, run_pass and what it found. */
 static bool locked_pass(void) {
+    s_canvas_again = false;
     /* The table is read with the lock held. The app task clears the pointer under it before it frees the table, so
      * a table seen here stays until the unlock: a pass that holds the lock finishes first, a later one sees NULL. */
     if (!apps_port_ui_trylock(LOCK_MS)) {
@@ -1593,6 +2066,7 @@ static bool locked_pass(void) {
     int64_t end = esp_timer_get_time();
     int64_t took = end - start;
     apps_port_ui_unlock();
+    s_canvas_again = canvas_blocks(&pass);  /* the heap, now that the lock is given back */
 
     s_applies++;
     if ((pass.changed || pass.recoloured) && s_refr_timer != NULL) {
@@ -1643,12 +2117,19 @@ static bool apply_pass(void) {
 #if CONFIG_MUSE_BENCH
     bool painted = s_front && s_state != NULL && muse_stack_paint();
     bool ran = locked_pass();
+    if (ran && s_canvas_again) {
+        (void)locked_pass();  /* once more for a canvas whose blocks were just made: what this one asks for waits for the next */
+    }
     if (painted) {
         muse_stack_note("apply");
     }
     return ran;
 #else
-    return locked_pass();
+    bool ran = locked_pass();
+    if (ran && s_canvas_again) {
+        (void)locked_pass();  /* once more for a canvas whose blocks were just made: what this one asks for waits for the next */
+    }
+    return ran;
 #endif
 }
 
@@ -1734,8 +2215,7 @@ void apps_lv_build(lv_obj_t *screen) {
         return;
     }
     /* Records belong to the layer they were made on, and the cards to the screen; and a press to the layer it went down on. */
-    apps_port_free(s_state);
-    s_state = NULL;
+    free_state();
     s_press.resets++;
     s_reject_logged = false;
     s_front = false;
@@ -1792,8 +2272,7 @@ void apps_lv_reset(void) {
         lv_obj_clean(s_layer);
         lv_obj_set_style_bg_color(s_layer, colour(0), LV_PART_MAIN);
     }
-    apps_port_free(s_state);
-    s_state = NULL;
+    free_state();  /* after the clean, which dropped its canvases' pixels */
     s_press.resets++;  /* a press still down on the layer was the last app's: its swipe is nobody's (on_gesture) */
     s_reject_logged = false;
 }

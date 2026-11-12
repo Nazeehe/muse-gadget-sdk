@@ -51,7 +51,7 @@ HARNESS = TESTS / "muse_apps_lv_harness.c"
 APPS_LV = APPS / "apps_lv.c"
 HARNESS_SOURCES = [HARNESS, APPS_LV, APPS / "apps_icons.c", APPS / "apps_ui.c", APPS / "apps_vm.c", APPS / "apps_json.c",
                    APPS / "apps_pkg.c", APPS / "apps_suggest.c", APPS / "apps_rt.c", APPS / "apps_svc.c", APPS / "apps_sound.c",
-                   APPS / "apps_vmio.c", APPS / "apps_ask.c", MUSE / "muse_frame_stats.c"]
+                   APPS / "apps_vmio.c", APPS / "apps_ask.c", APPS / "apps_canvas.c", MUSE / "muse_frame_stats.c"]
 
 # What apps_lv.c and apps_icons.c include of LVGL and ESP-IDF: each one is a line that includes the fakes.
 FAKE_HEADERS = ["lvgl.h", "esp_attr.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h"]
@@ -166,6 +166,17 @@ class HarnessTest(unittest.TestCase):
 
     def test_create_update_delete_sequence(self):
         self.run_case("create_update_delete_sequence")
+
+    # ---- Canvases (ui.canvas, c:draw) ----
+
+    def test_a_canvas_draws_its_list_in_order(self):
+        self.run_case("canvas_draws_its_list")
+
+    def test_a_canvas_waits_for_its_pixels(self):
+        self.run_case("canvas_waits_for_its_pixels")
+
+    def test_the_poly_fill_covers_edges_and_winds(self):
+        self.run_case("canvas_poly_coverage")
 
     def test_revalidation_drops_bad_slot(self):
         self.run_case("revalidation_drops_bad_slot")

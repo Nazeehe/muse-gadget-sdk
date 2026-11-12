@@ -82,6 +82,7 @@ typedef struct lv_style lv_style_t;
 typedef struct lv_timer lv_timer_t;
 
 typedef uint8_t lv_opa_t;
+typedef enum { LV_RESULT_INVALID = 0, LV_RESULT_OK } lv_result_t;
 typedef int32_t lv_value_precise_t;  /* LV_USE_FLOAT is off in every Muse build */
 typedef uint32_t lv_style_selector_t;
 typedef bool lv_anim_enable_t;
@@ -223,6 +224,7 @@ typedef enum {
     LV_EVENT_SCROLL,
     LV_EVENT_GESTURE,
     LV_EVENT_KEY,
+    LV_EVENT_DELETE = 40,  /* an object's, as it is deleted (a canvas's pixels go with it: apps_lv.c's canvas_deleted) */
     LV_EVENT_REFR_EXT_DRAW_SIZE = 27,  /* an object's: its param is the int32_t room it needs past its box, to raise (or cap) */
     LV_EVENT_INVALIDATE_AREA = 54,  /* a display's: an area marked for redraw (lv_inv_area; the bench's slow frame times the first) */
     LV_EVENT_REFR_START = 58,  /* a display's: the start of each refresh, before its layout (the codes between aren't used) */
@@ -254,8 +256,11 @@ typedef enum {
 } lv_image_align_t;
 
 /* lv_color.h and lv_image_dsc.h: what an image's header says (only what apps_lv.c reads). */
+typedef uint8_t lv_color_format_t;
 enum {
     LV_COLOR_FORMAT_A8 = 0x0E,
+    LV_COLOR_FORMAT_ARGB8888 = 0x10,  /* a canvas with bg "none": blue, green, red, alpha */
+    LV_COLOR_FORMAT_RGB565 = 0x12,    /* an opaque canvas */
     LV_COLOR_FORMAT_RGB565A8 = 0x14,  /* the colour, then a plane of alpha (stride / 2 a row) */
 };
 enum {
@@ -281,6 +286,93 @@ typedef struct {
     const void *reserved;
     const void *reserved_2;
 } lv_image_dsc_t;
+
+/* ---- A canvas and the draw calls apps_lv.c draws a ui.canvas with (lv_canvas.h, lv_draw_buf.h, lv_draw_*.h, lv_grad.h): only the
+ * fields it uses, by the names LVGL 9.5 gives them. ---- */
+typedef struct {
+    lv_image_header_t header;
+    uint32_t data_size;
+    uint8_t *data;
+    void *unaligned_data;
+    const void *handlers;
+} lv_draw_buf_t;
+
+typedef struct {
+    lv_value_precise_t x;
+    lv_value_precise_t y;
+} lv_point_precise_t;
+
+/* The fake's layer: the canvas it draws into while open (lv_canvas_init_layer to lv_canvas_finish_layer). */
+typedef struct lv_layer {
+    lv_obj_t *canvas;
+    int draws;
+} lv_layer_t;
+
+typedef enum { LV_GRAD_DIR_NONE, LV_GRAD_DIR_VER, LV_GRAD_DIR_HOR } lv_grad_dir_t;
+typedef struct {
+    lv_color_t color;
+    lv_opa_t opa;
+    uint8_t frac;
+} lv_grad_stop_t;
+typedef struct {
+    lv_grad_stop_t stops[2];
+    uint8_t stops_count;
+    lv_grad_dir_t dir;
+} lv_grad_dsc_t;
+
+typedef struct {
+    int32_t radius;
+    lv_opa_t bg_opa;
+    lv_color_t bg_color;
+    lv_grad_dsc_t bg_grad;
+    int32_t border_width;
+    lv_color_t border_color;
+    lv_opa_t border_opa;
+} lv_draw_rect_dsc_t;
+
+typedef struct {
+    lv_point_precise_t p1;
+    lv_point_precise_t p2;
+    lv_point_precise_t *points;
+    int32_t point_cnt;
+    lv_color_t color;
+    int32_t width;
+    lv_opa_t opa;
+    uint8_t round_start : 1;
+    uint8_t round_end : 1;
+} lv_draw_line_dsc_t;
+
+typedef struct {
+    lv_color_t color;
+    int32_t width;
+    lv_value_precise_t start_angle;
+    lv_value_precise_t end_angle;
+    lv_point_t center;
+    uint16_t radius;
+    lv_opa_t opa;
+    uint8_t rounded : 1;
+} lv_draw_arc_dsc_t;
+
+typedef struct {
+    const char *text;
+    const lv_font_t *font;
+    lv_color_t color;
+    lv_opa_t opa;
+    int32_t letter_space;
+    lv_text_align_t align;
+} lv_draw_label_dsc_t;
+
+typedef struct {
+    const void *src;
+    lv_opa_t opa;
+    int32_t scale_x;
+    int32_t scale_y;
+    lv_point_t pivot;
+    lv_color_t recolor;
+    lv_opa_t recolor_opa;
+} lv_draw_image_dsc_t;
+
+typedef enum { LV_TEXT_FLAG_NONE = 0 } lv_text_flag_t;
 
 /* lv_types.h and lv_anim.h: an animation (LV_USE_EXT_DATA is off in every Muse build, so it has no ext_data). lv_anim_start copies
  * one into LVGL's list; apps_lv.c's path callback reads its times and values. */
@@ -359,6 +451,32 @@ LV_FONT_DECLARE(lv_font_unscii_16)
 
 /* ---- lvgl.h: functions ---- */
 
+/* A canvas's pixels and the drawing into them (apps_lv.c's draw_canvas). The fake keeps the pixels a canvas is given, fills them for
+ * lv_canvas_fill_bg, and logs each draw call with what it was handed. */
+void lv_canvas_set_buffer(lv_obj_t *obj, void *buf, int32_t w, int32_t h, lv_color_format_t cf);
+lv_draw_buf_t *lv_canvas_get_draw_buf(lv_obj_t *obj);
+void lv_canvas_fill_bg(lv_obj_t *obj, lv_color_t color, lv_opa_t opa);
+void lv_canvas_init_layer(lv_obj_t *canvas, lv_layer_t *layer);
+void lv_canvas_finish_layer(lv_obj_t *canvas, lv_layer_t *layer);
+uint32_t lv_draw_buf_width_to_stride(uint32_t w, lv_color_format_t cf);
+void lv_draw_rect_dsc_init(lv_draw_rect_dsc_t *dsc);
+void lv_draw_line_dsc_init(lv_draw_line_dsc_t *dsc);
+void lv_draw_arc_dsc_init(lv_draw_arc_dsc_t *dsc);
+void lv_draw_label_dsc_init(lv_draw_label_dsc_t *dsc);
+void lv_draw_image_dsc_init(lv_draw_image_dsc_t *dsc);
+void lv_draw_rect(lv_layer_t *layer, const lv_draw_rect_dsc_t *dsc, const lv_area_t *coords);
+void lv_draw_line(lv_layer_t *layer, const lv_draw_line_dsc_t *dsc);
+void lv_draw_arc(lv_layer_t *layer, const lv_draw_arc_dsc_t *dsc);
+void lv_draw_label(lv_layer_t *layer, const lv_draw_label_dsc_t *dsc, const lv_area_t *coords);
+void lv_draw_image(lv_layer_t *layer, const lv_draw_image_dsc_t *dsc, const lv_area_t *coords);
+void lv_grad_init_stops(lv_grad_dsc_t *grad, const lv_color_t colors[], const lv_opa_t opa[], const uint8_t fracs[], int num_stops);
+void lv_grad_vertical_init(lv_grad_dsc_t *dsc);
+void lv_grad_horizontal_init(lv_grad_dsc_t *dsc);
+void lv_text_get_size(lv_point_t *size_res, const char *text, const lv_font_t *font, int32_t letter_space, int32_t line_space,
+                      int32_t max_width, lv_text_flag_t flag);
+void lv_area_set(lv_area_t *area_p, int32_t x1, int32_t y1, int32_t x2, int32_t y2);
+lv_result_t lv_obj_invalidate(const lv_obj_t *obj);
+
 lv_color_t lv_color_hex(uint32_t c);
 int32_t lv_pct(int32_t x);
 
@@ -369,6 +487,7 @@ lv_obj_t *lv_arc_create(lv_obj_t *parent);
 lv_obj_t *lv_spinner_create(lv_obj_t *parent);
 lv_obj_t *lv_bar_create(lv_obj_t *parent);
 lv_obj_t *lv_image_create(lv_obj_t *parent);
+lv_obj_t *lv_canvas_create(lv_obj_t *parent);
 void lv_obj_delete(lv_obj_t *obj);
 void lv_obj_clean(lv_obj_t *obj);
 int32_t lv_obj_get_index(const lv_obj_t *obj);

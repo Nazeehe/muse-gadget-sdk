@@ -813,7 +813,10 @@ page left of the pocket watch: a step left of the watch fronts it
   `components/muse/apps/`: `apps_vm.c` (the sandboxed state, the budgets and
   the kill), `apps_rt.c` (handlers, timers, the duty cycle, the log),
   `apps_pkg.c` (the manifest and package rules), `apps_ui.c` and `apps_lv.c`
-  (widgets: what Lua holds, and the LVGL task's apply step), `apps_svc.c`
+  (widgets: what Lua holds, and the LVGL task's apply step), `apps_canvas.c`
+  (a `ui.canvas`'s draw list and the anti-aliased polygon fill its polys and
+  ellipses use; the apply step makes and frees a canvas's pixels with the UI
+  lock given back, and draws the list into them), `apps_svc.c`
   (`time`, `os`, `timer`, `alarm`, `store`, `sys`), `apps_sound.c` (`sound`)
   and `apps_mix.c` (the mixer of app sound: Sound, below), `apps_json.c`,
   `apps_task.c` (the app task and the supervisor that marks a hung call),

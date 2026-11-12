@@ -24,10 +24,10 @@
  * this module has not checked: LVGL asserts abort().
  *
  * The Lua module (the guide copies this).
- * - ui.label{...} ui.button{...} ui.box{...} ui.arc{...} ui.bar{...} ui.image{...} ui.spinner{...} make a widget and
- *   return its handle. w:set{...} changes properties, w:get(name) reads one, w:on(event, fn) subscribes (fn nil removes it),
- *   w:delete() removes the widget and everything inside it, and w:scroll_to(where, animate) scrolls a box with scroll = "y".
- *   set, on and scroll_to return w, so calls chain. tostring(w) is
+ * - ui.label{...} ui.button{...} ui.box{...} ui.arc{...} ui.bar{...} ui.image{...} ui.spinner{...} ui.canvas{...} make a
+ *   widget and return its handle. w:set{...} changes properties, w:get(name) reads one, w:on(event, fn) subscribes (fn nil removes it),
+ *   w:delete() removes the widget and everything inside it, w:scroll_to(where, animate) scrolls a box with scroll = "y", and
+ *   w:draw{cmd, ...} draws a canvas (apps_canvas.h). set, on and scroll_to return w, so calls chain. tostring(w) is
  *   "label#3": the kind and the slot. A widget is one object for as long as the app holds its handle, so a handle
  *   can be a table key and rawequal holds (a handle of a widget that is gone stays equal to itself, ==). The
  *   handles' metatable is not the app's to see: getmetatable(w) and getmetatable(ui) give a name.
@@ -38,7 +38,7 @@
  * - Properties. All: align x y w h hidden opacity parent. label: text font color text_align wrap. button: text
  *   font color bg radius border border_color. box: bg radius border border_color scroll layout gap pad items. arc: min
  *   max value start_angle end_angle thickness color track_color. bar: min max value color track_color radius. image: src scale rotation
- *   spin. spinner: thickness color track_color.
+ *   spin. spinner: thickness color track_color. canvas: bg.
  *   (apps_ui_props_<kind> in apps_ui.c are the lists; the unknown-property message prints them.)
  * - Values. align is one of center top bottom left right top_left top_right bottom_left bottom_right, and x y are
  *   offsets from that anchor in the parent. Numbers are rounded to the nearest integer (halves away from zero)
@@ -69,7 +69,12 @@
  *   box: bg none, radius 0, scroll none, layout none, gap 0, pad 0, items start. arc: min 0, max 100, value 0, start_angle 0, end_angle 360, thickness 12, color
  *   white, track_color "#262626". bar: min 0, max 100, value 0, color white, track_color "#262626", radius 0.
  *   image: scale 100, rotation 0, spin 0, and src is required. spinner: thickness 12, color white, track_color
- *   "#262626"; w and h stay nil for the app, and a side it leaves out is drawn APPS_SPINNER_SIDE px.
+ *   "#262626"; w and h stay nil for the app, and a side it leaves out is drawn APPS_SPINNER_SIDE px. canvas: bg black, and
+ *   w and h are required.
+ * - A canvas is pixels of its own, w x h, that w:draw fills: its bg, then the commands in order (apps_canvas.h). All canvases
+ *   together take at most APPS_CANVAS_BYTES_MAX (2 bytes a px, 4 with bg "none"): a create or a set past it is an error. The
+ *   drawing is one apps_port_realloc block on the widget (drawing), swapped under the lock; the apply step draws it into the
+ *   canvas's pixels, which it makes and frees itself (apps_lv.c), at a draw (DRAW) and when w, h or bg change.
  * - A spinner is LVGL's own lv_spinner, an arc that turns by itself (about a turn a second, with lv_spinner's default
  *   sweep) on the LVGL task alone: no value, no angles and no progress, no Lua running, and no automatic one from the
  *   platform or from muse.ask. An app shows one while it waits and hides it in its callback.
@@ -110,7 +115,11 @@
  *             image's size is unknown
  *   ui.image: spin: images spinning at once may cover at most 180 x 180 px together (these would cover <n> px)
  *                                                    (ui.box the same, for a box shown with a spinner in it)
- *   ui.<kind>: unknown method '<name>' (valid: set, get, on, delete, scroll_to)
+ *   ui.<kind>: unknown method '<name>' (valid: set, get, on, delete, scroll_to, draw)
+ *   ui.canvas: w and h are required (a canvas is that many px)
+ *   ui.canvas: canvases may take at most <n> bytes together, one opaque canvas of 466 x 466 (...); these would take <n>
+ *   w:draw: only a canvas draws (make one with ui.canvas{w = ..., h = ...}) | c:draw: out of memory
+ *   c:draw: command <i> (<name>): '<key>' is required | ...       each command's own checks, by its number and name
  *   w:scroll_to: only a box scrolls | w:scroll_to: box#<n> doesn't scroll (set scroll = "y")
  *   w:scroll_to: where must be "start", "end" or a number of px, got <type>      also "got NaN"
  *   w:scroll_to: where '<s>' is not "start", "end" or a number of px
@@ -121,7 +130,7 @@
  *                                                    slots, it ends " (a deleted widget keeps its slot until
  *                                                    the screen next updates)")
  *   widget was deleted                                        any use of a handle of a deleted widget
- *   ui.<name> doesn't exist (ui has: label, button, box, arc, bar, image, spinner, bg, clear, polar, W, H, R, SAFE)
+ *   ui.<name> doesn't exist (ui has: label, button, box, arc, bar, image, spinner, canvas, bg, clear, polar, W, H, R, SAFE)
  *   ui.bg: '<s>' is not a colour (...)
  * Text an app supplied is shown cut at 40 bytes and with its control bytes as '?'.
  *
@@ -216,7 +225,9 @@ typedef struct lua_State lua_State;
 #define APPS_UI_SCROLL_END (-1)    /* w:scroll_to("end") as scroll_target: the apply step scrolls to the bottom bound */
 #define APPS_COLOR_NONE 0xFF000000u
 
-typedef enum { APPS_W_LABEL, APPS_W_BUTTON, APPS_W_BOX, APPS_W_ARC, APPS_W_BAR, APPS_W_IMAGE, APPS_W_SPINNER } apps_wkind_t;
+typedef enum {
+    APPS_W_LABEL, APPS_W_BUTTON, APPS_W_BOX, APPS_W_ARC, APPS_W_BAR, APPS_W_IMAGE, APPS_W_SPINNER, APPS_W_CANVAS
+} apps_wkind_t;
 typedef enum {
     APPS_FONT_SANS14, APPS_FONT_SANS16, APPS_FONT_SANS20, APPS_FONT_SANS28,
     APPS_FONT_MONO8, APPS_FONT_MONO16, APPS_FONT_DIGITS48, APPS_FONT_DIGITS96
@@ -244,8 +255,10 @@ typedef enum { APPS_UI_LEFT = 0, APPS_UI_RIGHT = 1, APPS_UI_UP = 2, APPS_UI_DOWN
 
 enum {
     APPS_DIRTY_CREATE = 1, APPS_DIRTY_GEOM = 2, APPS_DIRTY_STYLE = 4, APPS_DIRTY_TEXT = 8,
-    APPS_DIRTY_VALUE = 16, APPS_DIRTY_EVENTS = 32, APPS_DIRTY_DELETE = 64, APPS_DIRTY_SCROLL = 128
+    APPS_DIRTY_VALUE = 16, APPS_DIRTY_EVENTS = 32, APPS_DIRTY_DELETE = 64, APPS_DIRTY_SCROLL = 128, APPS_DIRTY_DRAW = 256
 };
+
+struct apps_cv_list;  /* apps_canvas.h */
 
 typedef struct {
     uint16_t gen;
@@ -271,6 +284,7 @@ typedef struct {
     int32_t scroll_target;                     /* and its where: px, or APPS_UI_SCROLL_END */
     uint32_t scroll_sets;                      /* w:scroll_to calls (above) */
     char *text;                                /* PSRAM, NULL = "" */
+    struct apps_cv_list *drawing;              /* a canvas's last c:draw (apps_canvas.h), PSRAM; NULL: none yet, it shows its bg */
     uint8_t events;                            /* APPS_UI_* subscribed */
     uint32_t dirty;                            /* APPS_DIRTY_*; the apply step clears it */
     int16_t rx, ry, rw, rh, overflow;          /* written back by the apply step; rw 0 = not yet laid out */

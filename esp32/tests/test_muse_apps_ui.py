@@ -49,14 +49,15 @@ PROPS = {
     "bar": COMMON + ["min", "max", "value", "color", "track_color", "radius"],
     "image": COMMON + ["src", "scale", "rotation", "spin"],
     "spinner": COMMON + ["thickness", "color", "track_color"],
+    "canvas": COMMON + ["bg"],
 }
 KINDS = list(PROPS)
 
 FONTS = "sans14, sans16, sans20, sans28, mono8, mono16, digits48, digits96"
 ALIGNS = "center, top, bottom, left, right, top_left, top_right, bottom_left, bottom_right"
 EVENTS = "tap, long_press, press, release, swipe"
-METHODS = "set, get, on, delete, scroll_to"
-UI_HAS = "label, button, box, arc, bar, image, spinner, bg, clear, polar, W, H, R, SAFE"
+METHODS = "set, get, on, delete, scroll_to, draw"
+UI_HAS = "label, button, box, arc, bar, image, spinner, canvas, bg, clear, polar, W, H, R, SAFE"
 COLOUR_HINT = '(use "#rgb", "#rrggbb" or 0xRRGGBB)'
 QUOTA = "ui: no more than 128 widgets per app"
 QUOTA_PENDING = QUOTA + " (a deleted widget keeps its slot until the screen next updates)"
@@ -374,6 +375,18 @@ class UiTest(UiTestCase):
                                      f"{path.name}:{n + 1}: the metatable made here is not given __metatable")
         self.assertGreater(made, 0, "no luaL_newmetatable to check: has this test lost its target?")
 
+    def test_an_app_can_ask_for_the_canvas_without_an_error(self):
+        # The guide tells an app that may run on older firmware to check rawget(ui, "canvas") before it makes one: ui's
+        # functions are its own fields, so rawget finds the canvas here and gives nil for a name ui doesn't have (as
+        # "canvas" is on firmware without it), where reading the name raises.
+        lines = self.lua_lines("""
+            print(type(rawget(ui, "canvas")), rawget(ui, "nothing"))
+            print(pcall(function() return ui.nothing end))
+        """)
+        self.assertEqual(lines, ["function\tnil", f"false\tmain.lua:5: ui.nothing doesn't exist (ui has: {UI_HAS})"])
+        guide = (APPS / "apps_guide.md").read_text()
+        self.assertIn('checks `rawget(ui, "canvas")` first', guide)
+
     def test_a_handle_does_not_alias_a_widget_of_another_kind_after_the_gen_wraps(self):  # F4
         # A slot's gen has 16 bits: after 65536 deletes it is the same again, and a handle kept from before matches
         # the slot and the gen of whatever lives there. It has to match the kind too, or it writes a box's state
@@ -634,7 +647,7 @@ class UiTest(UiTestCase):
             self.assertIsNotNone(body, array)
             return re.findall(r'\{"(\w+)",', body.group(1))
 
-        self.assertEqual(reg("apps_ui_funcs"), ["label", "button", "box", "arc", "bar", "image", "spinner", "bg", "clear", "polar"])
+        self.assertEqual(reg("apps_ui_funcs"), ["label", "button", "box", "arc", "bar", "image", "spinner", "canvas", "bg", "clear", "polar"])
         self.assertEqual(reg("apps_ui_methods"), METHODS.split(", "))
         self.assertEqual(strings("apps_ui_scrolls"), ["none", "y"])
         self.assertEqual(strings("apps_ui_layouts"), ["none", "column"])
@@ -1040,10 +1053,11 @@ class UiTest(UiTestCase):
             "start_angle": 0, "end_angle": 360, "thickness": 12, "track_color": "#262626", "src": "logo.bin",
             "scale": 100, "rotation": 0, "spin": 0, "scroll": "none", "layout": "none", "gap": 0, "pad": 0, "items": "start",
         }
-        per_kind = {"button": {"bg": "#262626", "radius": 16}}  # the rest follow the table above
+        # the rest follow the table above; a canvas is made with the w and h it requires, and is opaque black at first
+        per_kind = {"button": {"bg": "#262626", "radius": 16}, "canvas": {"w": 100, "h": 50, "bg": "#000000"}}
         for kind in KINDS:
             with self.subTest(kind):
-                args = "{src = 'logo.bin'}" if kind == "image" else "{}"
+                args = {"image": "{src = 'logo.bin'}", "canvas": "{w = 100, h = 50}"}.get(kind, "{}")
                 names = PROPS[kind]
                 source = f"local w = ui.{kind}{args}\n" + "".join(
                     f"print({name!r}, w:get({name!r}))\n" for name in names)

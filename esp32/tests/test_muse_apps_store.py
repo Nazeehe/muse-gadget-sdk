@@ -253,7 +253,7 @@ class Partitions(unittest.TestCase):
         self.assertNotIn("Hatch", text)
 
     def test_the_overlay_picks_the_table(self):  # its other lines are test_muse_apps_wiring.py's (the ruling's place for them)
-        overlay = (ROOT / "devices/sdkconfig.muse-apps").read_text().splitlines()
+        overlay = (ROOT / "devices/sdkconfig.muse-lua-apps").read_text().splitlines()
         self.assertIn('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_apps.csv"', overlay)
 
     def test_apps_store_is_in_the_device_build(self):  # X6

@@ -24,9 +24,9 @@
 # the other's.
 # MUSE_VIDEO=1 adds devices/sdkconfig.muse-video (the phone camera over
 # Wi-Fi, on boards whose panel driver has draw_frame) in build-muse-<profile>-video/.
-# MUSE_APPS=1 adds devices/sdkconfig.muse-apps (Lua apps, on the 1.75C: s3,
+# MUSE_LUA_APPS=1 adds devices/sdkconfig.muse-lua-apps (Lua apps, on the 1.75C: s3,
 # and the Waveshare knob: knob18, which draws their 466 px canvas scaled) in
-# build-muse-<profile>-apps/; any other board is refused (its table and FAT
+# build-muse-<profile>-lua-apps/; any other board is refused (its table and FAT
 # lines would apply there, with no apps to use them).
 # mosaico (Espressif ESP-Mosaico, ESP32-S31) builds with ESP-IDF master
 # (IDF_EXPORT_S31) and Espressif's esp-mosaico-utils (MOSAICO_UTILS), and
@@ -68,8 +68,8 @@ case $board in
     ai-passport) profile=ai-passport;      target=esp32c3 ;;
     *) echo "unknown board $board"; exit 2 ;;
 esac
-if [ -n "${MUSE_APPS:-}" ] && [ "$board" != s3 ] && [ "$board" != knob18 ]; then
-    echo "MUSE_APPS=1 is only for the 1.75C (s3) and the Waveshare knob (knob18)" >&2; exit 2
+if [ -n "${MUSE_LUA_APPS:-}" ] && [ "$board" != s3 ] && [ "$board" != knob18 ]; then
+    echo "MUSE_LUA_APPS=1 is only for the 1.75C (s3) and the Waveshare knob (knob18)" >&2; exit 2
 fi
 baud=${baud:-460800}
 if [ "$target" = esp32s31 ]; then
@@ -96,8 +96,8 @@ defaults="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-$prof
 if [ -n "${MUSE_VIDEO:-}" ]; then
     B=$B-video; defaults="$defaults;devices/sdkconfig.muse-video"
 fi
-if [ -n "${MUSE_APPS:-}" ]; then
-    B=$B-apps; defaults="$defaults;devices/sdkconfig.muse-apps"
+if [ -n "${MUSE_LUA_APPS:-}" ]; then
+    B=$B-lua-apps; defaults="$defaults;devices/sdkconfig.muse-lua-apps"
 fi
 if [ -n "${MUSE_BENCH:-}" ]; then
     B=$B-bench; defaults="$defaults;devices/sdkconfig.muse-bench"

@@ -278,12 +278,12 @@ VP8, the board decodes and draws it, 30 fps on the round 466 px boards. [`../pro
 [`AGENTS.md`](AGENTS.md#video-from-a-phone) which boards can.
 
 To let Muse put small apps of its own on a Waveshare 1.75C's screen (a timer, a
-stopwatch, a dashboard), build it with `MUSE_APPS=1 tools/muse/board.sh build|flash s3`
+stopwatch, a dashboard), build it with `MUSE_LUA_APPS=1 tools/muse/board.sh build|flash s3`
 and flash it over USB once. Muse writes each app in Lua on its VM and installs it
 over Home Link; the gadget keeps it in flash and runs it in a sandbox, with or
 without Muse. A long press on the watch opens the apps.
 [`AGENTS.md`](AGENTS.md#muse-apps) has the pieces, the limits and the tests, and
-`tools/muse/app.py` runs and installs an app from your computer.
+`tools/muse/lua_app.py` runs and installs an app from your computer.
 
 To work on the UI without a board, use the
 [`simulator/`](simulator/README.md) desktop preview. It runs the production UI

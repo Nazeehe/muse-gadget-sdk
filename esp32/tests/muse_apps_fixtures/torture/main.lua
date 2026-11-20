@@ -2,7 +2,7 @@
 -- SPDX-License-Identifier: Apache-2.0
 
 -- The torture fixture: what the deepest C recursion, JSON, floats and a full screen of widgets cost the gadget.
--- tools/muse/app.py pushes it, and the board's own numbers are read after each step (>app.status's stack_free,
+-- tools/muse/lua_app.py pushes it, and the board's own numbers are read after each step (>app.status's stack_free,
 -- the bench's >mem). Nothing here is an example of how to write an app.
 --
 -- Every chain below nests C-boundary calls (the ones LUAI_MAXCCALLS counts) until Lua says "C stack overflow".

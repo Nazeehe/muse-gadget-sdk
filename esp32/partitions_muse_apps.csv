@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Name,    Type, SubType, Offset,   Size,    Flags
-# Muse apps builds (devices/sdkconfig.muse-apps) on boards with the full UI (16 MB+
+# Muse apps builds (devices/sdkconfig.muse-lua-apps) on boards with the full UI (16 MB+
 # flash): partitions_muse.csv as it is, entry for entry, so nothing moves (the
 # pairing's nvs stays at 0x11000 and the app slots where they were), and two
 # entries after them for the apps (components/muse/apps/apps_store.h):

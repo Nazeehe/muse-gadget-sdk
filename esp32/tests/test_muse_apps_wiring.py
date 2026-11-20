@@ -229,7 +229,7 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertLess(kconfig.index("config MUSE_CLOCK_TZ"), kconfig.index("config MUSE_APPS\n"))
         self.assertLess(kconfig.index("config MUSE_APPS_JPEG"), kconfig.index("config MUSE_BENCH"))
 
-        overlay = ROOT / "devices/sdkconfig.muse-apps"
+        overlay = ROOT / "devices/sdkconfig.muse-lua-apps"
         self.assertIn("CONFIG_MUSE_APPS=y", overlay.read_text())
         # The FAT's long names (ids like stopwatch, paths like timer_face.lua), their buffers on the heap and in PSRAM (the
         # 2026-10-27 ruling's place for these two).
@@ -248,7 +248,7 @@ class MuseAppsWiringTest(unittest.TestCase):
         # The apps' overlay turns LVGL's snapshot on (the bench overlay had it alone), and the JPEG encoder comes from the
         # registry only into a build with the apps, keyed on MUSE_APPS_JPEG: a string that every build defines (its Kconfig block,
         # with no depends on, is test_option_is_opt_in's, D22).
-        lines = (ROOT / "devices/sdkconfig.muse-apps").read_text().splitlines()
+        lines = (ROOT / "devices/sdkconfig.muse-lua-apps").read_text().splitlines()
         self.assertIn("CONFIG_LV_USE_SNAPSHOT=y", lines)
         manifest = (MUSE / "idf_component.yml").read_text()
         entry = re.search(r"^  espressif/esp_new_jpeg:\n((?:    .*\n)+)", manifest, re.M)
@@ -321,9 +321,9 @@ class MuseAppsWiringTest(unittest.TestCase):
         # other board, with one line, before it activates ESP-IDF or touches a build dir. The environment has no ESP-IDF, so a
         # board.sh that went past the guard would stop at "idf.py not found" (or mosaico's utils) and never build.
         board = ROOT / "tools/muse/board.sh"
-        refused = "MUSE_APPS=1 is only for the 1.75C (s3) and the Waveshare knob (knob18)"
+        refused = "MUSE_LUA_APPS=1 is only for the 1.75C (s3) and the Waveshare knob (knob18)"
         with tempfile.TemporaryDirectory() as home:
-            env = {"HOME": home, "PATH": "/usr/bin:/bin", "MUSE_APPS": "1"}
+            env = {"HOME": home, "PATH": "/usr/bin:/bin", "MUSE_LUA_APPS": "1"}
             for name in ("s3n", "sticks3", "plus2", "mosaico", "185c"):
                 with self.subTest(name):
                     done = subprocess.run(["bash", str(board), "build", name], env=env, capture_output=True, text=True,
@@ -340,17 +340,17 @@ class MuseAppsWiringTest(unittest.TestCase):
 
     def test_board_sh_and_ci(self):
         board = (ROOT / "tools/muse/board.sh").read_text()
-        flag = 'B=$B-apps; defaults="$defaults;devices/sdkconfig.muse-apps"'
+        flag = 'B=$B-lua-apps; defaults="$defaults;devices/sdkconfig.muse-lua-apps"'
         self.assertIn(flag, board)
         # After MUSE_VIDEO, so MUSE_BENCH stays the last suffix.
         self.assertLess(board.index('if [ -n "${MUSE_VIDEO:-}" ]'), board.index(flag))
         self.assertLess(board.index(flag), board.index('if [ -n "${MUSE_BENCH:-}" ]'))
 
         ci = (REPO / ".github/workflows/esp32.yml").read_text()
-        row = re.search(r'- board: muse-waveshare-s3-175c-apps\n\s+target: esp32s3\n\s+overlays: ("[^"\n]*")', ci)
-        self.assertIsNotNone(row, "no muse-waveshare-s3-175c-apps row in esp32.yml")
+        row = re.search(r'- board: muse-waveshare-s3-175c-lua-apps\n\s+target: esp32s3\n\s+overlays: ("[^"\n]*")', ci)
+        self.assertIsNotNone(row, "no muse-waveshare-s3-175c-lua-apps row in esp32.yml")
         self.assertEqual(row.group(1), '";devices/sdkconfig.muse;devices/sdkconfig.muse-waveshare-s3-175c'
-                                       ';devices/sdkconfig.muse-apps"')
+                                       ';devices/sdkconfig.muse-lua-apps"')
 
     def test_license_rows(self):
         self.assertIn("esp32/components/lua", (REPO / "README.md").read_text())
@@ -541,7 +541,7 @@ class MuseAppsWiringTest(unittest.TestCase):
                         f"set(CONFIG_MUSE_APPS {apps})\nset(CONFIG_PARTITION_TABLE_CUSTOM ON)\n"
                         f'set(CONFIG_PARTITION_TABLE_FILENAME "{table}")\n'
                         "function(idf_build_get_property var name)\n"
-                        '    set(${var} "/work/build-muse-waveshare-s3-175c-apps/sdkconfig" PARENT_SCOPE)\n'
+                        '    set(${var} "/work/build-muse-waveshare-s3-175c-lua-apps/sdkconfig" PARENT_SCOPE)\n'
                         "endfunction()\n" + block)
                     done = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, cwd=ROOT)
                     self.assertEqual(done.returncode, 0, done.stderr)
@@ -551,7 +551,7 @@ class MuseAppsWiringTest(unittest.TestCase):
                         continue
                     self.assertIn("CMake Warning", said)
                     self.assertIn(f"CONFIG_MUSE_APPS with the partition table {table}, which has no apps partition", said)
-                    self.assertIn("/work/build-muse-waveshare-s3-175c-apps/sdkconfig", said)
+                    self.assertIn("/work/build-muse-waveshare-s3-175c-lua-apps/sdkconfig", said)
                     self.assertIn('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_apps.csv" and '
                                   'CONFIG_PARTITION_TABLE_FILENAME="partitions_muse_apps.csv"', said)
 
@@ -959,7 +959,7 @@ class MuseAppsWiringTest(unittest.TestCase):
             with self.subTest(option):
                 self.assertRegex(overlay, rf"(?m)^{option}=y$")
                 # Nothing else the apps build loads (board.sh: defaults, muse, the board's, muse-apps, muse-bench) turns it off.
-                for other in ("sdkconfig.defaults", "devices/sdkconfig.muse", "devices/sdkconfig.muse-apps", "devices/sdkconfig.muse-bench"):
+                for other in ("sdkconfig.defaults", "devices/sdkconfig.muse", "devices/sdkconfig.muse-lua-apps", "devices/sdkconfig.muse-bench"):
                     self.assertNotRegex((ROOT / other).read_text(), rf"(?m)^(# {option} is not set|{option}=n)$", other)
 
     def test_the_lvgl_task_takes_2_kb_of_the_drawing_tasks_stacks(self):  # perf plan Task 6 (W1), rulings P11 and P21: fix B
@@ -979,7 +979,7 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertLess(given, board.index("esp_lv_adapter_init(&adapter_cfg)"))
         self.assertEqual(board.count("task_stack_size"), 1)
         self.assertNotIn("stack_in_psram", board)
-        apps = (ROOT / "devices/sdkconfig.muse-apps").read_text()
+        apps = (ROOT / "devices/sdkconfig.muse-lua-apps").read_text()
         draw = int(re.search(r"(?m)^CONFIG_LV_DRAW_THREAD_STACK_SIZE=(\d+)$", apps).group(1))
         units = int(re.search(r"(?m)^CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=(\d+)$",
                               (ROOT / "devices/sdkconfig.muse-waveshare-s3-175c").read_text()).group(1))
@@ -992,7 +992,7 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertIsNotNone(guard, "no guard on the drawing tasks' stacks")
         self.assertEqual(int(guard.group(1)), draw)
         self.assertEqual(open_conditions(board, guard.start()), ["if CONFIG_MUSE_APPS"])
-        self.assertIn(f"CONFIG_LV_DRAW_THREAD_STACK_SIZE={draw} (devices/sdkconfig.muse-apps)", guard.group(2))
+        self.assertIn(f"CONFIG_LV_DRAW_THREAD_STACK_SIZE={draw} (devices/sdkconfig.muse-lua-apps)", guard.group(2))
         # Only the apps' overlay sets it: the plain image's drawing tasks keep LVGL's default, and its LVGL task the adapter's.
         for other in ("sdkconfig.defaults", "devices/sdkconfig.muse", "devices/sdkconfig.muse-waveshare-s3-175c",
                       "devices/sdkconfig.muse-bench"):

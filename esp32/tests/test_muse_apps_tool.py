@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""tools/muse/app.py, the laptop side of the Muse apps dev loop (check, push, watch, logs), the host build of
+"""tools/muse/lua_app.py, the laptop side of the Muse apps dev loop (check, push, watch, logs), the host build of
 apphost it checks with (tools/muse/apphost_build.py), and the two apps that ship with it: the hello example and the
 torture fixture.
 
@@ -49,7 +49,7 @@ TOOLS = ROOT / "tools" / "muse"
 APPS = ROOT / "components" / "muse" / "apps"
 HELLO = APPS / "examples" / "hello"
 TORTURE = ROOT / "tests" / "muse_apps_fixtures" / "torture"
-APP_PY = TOOLS / "app.py"
+APP_PY = TOOLS / "lua_app.py"
 COPYRIGHT = (ROOT / "components/muse/muse_clock.h").read_text().splitlines()[1].lstrip("* ").strip()
 LUA_HEADER = [f"-- {COPYRIGHT}", "-- SPDX-License-Identifier: Apache-2.0"]   # X7
 
@@ -89,14 +89,14 @@ def no_longer_than(seconds):
 
 
 def load_app():
-    """tools/muse/app.py with fresh copies of its siblings and pyserial blocked: everything but opening a port
+    """tools/muse/lua_app.py with fresh copies of its siblings and pyserial blocked: everything but opening a port
     (check above all, which needs no gadget) has to work without it."""
     sys.path.insert(0, str(TOOLS))
     try:
         with mock.patch.dict(sys.modules, {"serial": None}):
-            for name in ("app", "chat", "ports", "snap", "apphost_build"):
+            for name in ("lua_app", "chat", "ports", "snap", "apphost_build"):
                 sys.modules.pop(name, None)
-            return importlib.import_module("app")
+            return importlib.import_module("lua_app")
     finally:
         sys.path.remove(str(TOOLS))
 
@@ -129,7 +129,7 @@ class FakeClock:
 
 
 class FakeBoard:
-    """What app.py asks of chat.Board (write, write_line, read_line, close, port, ser), over a board that answers a
+    """What lua_app.py asks of chat.Board (write, write_line, read_line, close, port, ser), over a board that answers a
     command with `respond(command)`, a list of (delay in seconds, line). Lines come out of read_line in the order they
     are due, and a wait with nothing due costs the clock all of it. `backlog` is what the port held before anyone wrote,
     `later` lines [(seconds from now, line)] that turn up by themselves. `commands` is every command sent with the
@@ -175,7 +175,7 @@ class FakeBoard:
 
 
 class Gadget:
-    """The console of a board running Muse apps as far as app.py talks to it (apps_console.c): put with its seq rules
+    """The console of a board running Muse apps as far as lua_app.py talks to it (apps_console.c): put with its seq rules
     and refusals, commit with its result, the usage errors. Call it with a command for the lines it prints."""
 
     ID = re.compile(r"^[a-z][a-z0-9_]{1,23}$")
@@ -734,7 +734,7 @@ class ReplyTest(ToolTestCase):
             self.app.Console(self.board(backlog=[stale])).ack("util.lua", 0, 1)
 
     def test_the_fakes_wire_contracts_are_the_boards_c(self):
-        # K: the Gadget fake says what the C says, and app.py reads what the C prints. A later task that rewords the
+        # K: the Gadget fake says what the C says, and lua_app.py reads what the C prints. A later task that rewords the
         # refusal of an id, the ack or the fields of a refusal fails here, and not on a gadget.
         self.assertIn("'%s'", BAD_ID_MESSAGE, "is_sync_reply looks for the nonce in the id's refusal, in single quotes")
         self.assertEqual(BAD_ID_MESSAGE % "0abc", "app id '0abc' must match ^[a-z][a-z0-9_]{1,23}$")
@@ -761,7 +761,7 @@ class ReplyTest(ToolTestCase):
 
 
 class TerminalTest(ToolTestCase):
-    """What app.py prints is for a terminal that obeys what it is sent, and the board's and an app's text is not the
+    """What lua_app.py prints is for a terminal that obeys what it is sent, and the board's and an app's text is not the
     tool's (B): human text shows each control character but newline and tab, DEL and each C1 character (U+009B is CSI) as
     \\xNN, and a JSON line printed whole keeps its meaning, with U+007F to U+009F as \\u00XX."""
 
@@ -873,7 +873,7 @@ class TerminalTest(ToolTestCase):
 
 
 class SyncTest(ToolTestCase):
-    """app.py synchronizes when it opens the port (H1): it sends a query and takes that reply at column 0, or glued to
+    """lua_app.py synchronizes when it opens the port (H1): it sends a query and takes that reply at column 0, or glued to
     the end of the first line (a stale USB packet may sit in front of it), and never from inside an @app.log line."""
 
     def sync(self, gadget=None, **kw):
@@ -947,7 +947,7 @@ class SyncTest(ToolTestCase):
             self.app.Console(board).sync()
         message = str(raised.exception)
         self.assertIn("/dev/cu.fake", message)
-        self.assertIn("MUSE_APPS", message)
+        self.assertIn("MUSE_LUA_APPS", message)
         self.assertEqual(len(board.sent()), self.app.SYNC_TRIES)
         self.assertLessEqual(self.clock.now - 1000.0, self.app.SYNC_TRIES * self.app.SYNC_S + 0.5)
 
@@ -1179,7 +1179,7 @@ class OpenTest(ToolTestCase):
         self.assertEqual(opened, ["/dev/cu.usbmodem101"])
         source = re.sub(r"#[^\n]*", "", APP_PY.read_text())
         for word in (".dtr", ".rts", "setDTR", "setRTS", "serial.Serial"):
-            self.assertNotIn(word, source, "chat.Board opens the port; app.py never touches the control lines")
+            self.assertNotIn(word, source, "chat.Board opens the port; lua_app.py never touches the control lines")
 
     def test_a_port_that_cannot_be_opened_is_an_app_error(self):
         def refuse(port):
@@ -1912,7 +1912,7 @@ class BuildTest(unittest.TestCase):
 
     def test_a_dot_file_or_a_dangling_link_beside_the_headers_is_no_key_input(self):
         # H: pathlib's `*` takes dot-files: Emacs's lock file `.#apps_vm.h` is a dangling link, and reading it failed the
-        # key (and so `app.py check`) for as long as the buffer was unsaved. The compiler never includes a dot-file.
+        # key (and so `lua_app.py check`) for as long as the buffer was unsaved. The compiler never includes a dot-file.
         build = self.build
         with tempfile.TemporaryDirectory() as tmp:
             tree = self.copy_tree(tmp)
@@ -1931,7 +1931,7 @@ class BuildTest(unittest.TestCase):
             self.assertNotEqual(build.cache_key(["cc"], tree), key, "an ordinary new header is")
 
     def test_the_strict_build_passes_with_the_host_compiler(self):
-        # O: `app.py check`'s own flags, as the manual zig run and CI build them (-Werror), with the compiler of this
+        # O: `lua_app.py check`'s own flags, as the manual zig run and CI build them (-Werror), with the compiler of this
         # machine: a call that wants a feature macro under -std=c11, or a warning the test build's flags hide, fails here
         # and not on someone's Linux.
         with tempfile.TemporaryDirectory() as tmp:
@@ -1962,7 +1962,7 @@ class BuildTest(unittest.TestCase):
 
 
 class RuleTest(unittest.TestCase):
-    """app.py checks an id and a path before it sends anything (PATH_RULE, ID_RULE), so that the board's refusal is the
+    """lua_app.py checks an id and a path before it sends anything (PATH_RULE, ID_RULE), so that the board's refusal is the
     tool's. They are two more copies of the C's rule (apps_id_valid and apps_path_valid), and are held to it here: the
     same texts go to the pkg harness's own `check id` and `check path`, which run the real functions (L)."""
 
@@ -2031,7 +2031,7 @@ class CheckTest(unittest.TestCase):
     def say_sanitizers():
         """X13: the other apphost builds of this suite say which sanitizers they have (apps_host); this one is the dev
         loop's own, which the tests below run their scratch apps on, and has none."""
-        print("apps_host: apphost (app.py check's build): sanitizers off, the dev loop's own build", file=sys.stderr,
+        print("apps_host: apphost (lua_app.py check's build): sanitizers off, the dev loop's own build", file=sys.stderr,
               flush=True)
 
     @classmethod
@@ -2192,7 +2192,7 @@ class CheckTest(unittest.TestCase):
                 with self.assertRaises(self.app.AppError) as raised:
                     self.app.read_package(folder)
                 err = self.refused_before_apphost(folder)
-                self.assertEqual(err, f"app.py: {raised.exception}\n")
+                self.assertEqual(err, f"lua_app.py: {raised.exception}\n")
 
     def test_what_apphost_says_is_printed_without_a_control_character_a_terminal_would_act_on(self):
         # B: an app's data round-trips (a reply), so U+009B (CSI) in it reaches the line apphost prints, and DEL.
@@ -2230,7 +2230,7 @@ class CheckTest(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             CheckTest.say_sanitizers()
-        self.assertEqual(err.getvalue(), "apps_host: apphost (app.py check's build): sanitizers off, the dev loop's own build\n")
+        self.assertEqual(err.getvalue(), "apps_host: apphost (lua_app.py check's build): sanitizers off, the dev loop's own build\n")
 
     def test_a_package_that_cannot_load_is_an_error_event_and_exits_one(self):
         # What the tool's own look at the folder can't see: a .json file that isn't JSON, an image that isn't one, a

@@ -15,14 +15,14 @@
 
 """Develop a Muse app from a laptop: check it with no gadget, push it, run it, snapshot it, watch it, follow its log.
 
-    app.py check DIR [--script FILE]                run the app here, on the gadget's runtime, and say what it did
-    app.py push PORT DIR [--run] [--snap OUT.png]   install the app on the gadget; --run starts it, --snap saves a PNG
-    app.py watch PORT DIR                           push with --run now, and again on every change to DIR
-    app.py logs PORT                                print what the app prints (the console's @app.log lines)
+    lua_app.py check DIR [--script FILE]                run the app here, on the gadget's runtime, and say what it did
+    lua_app.py push PORT DIR [--run] [--snap OUT.png]   install the app on the gadget; --run starts it, --snap saves a PNG
+    lua_app.py watch PORT DIR                           push with --run now, and again on every change to DIR
+    lua_app.py logs PORT                                print what the app prints (the console's @app.log lines)
 
 DIR is the app's folder: manifest.json, main.lua (or the manifest's "main") and the files the manifest lists. PORT is
 the gadget's USB serial port (/dev/cu.usbmodem101): `tools/muse/ports.py s3` finds it. The firmware has to be built
-with MUSE_APPS=1 (tools/muse/board.sh), and MUSE_BENCH=1 as well for --snap. It opens the port the way
+with MUSE_LUA_APPS=1 (tools/muse/board.sh), and MUSE_BENCH=1 as well for --snap. It opens the port the way
 tools/muse/chat.py does, with the control lines left alone, so the board doesn't reset. check holds the folder to
 the gadget's rule that its name is the app's id.
 
@@ -351,7 +351,7 @@ class Console:
                 if is_sync_reply(line, nonce, first):
                     return
         raise AppError(f"the board on {self.board.port} didn't answer app.put. Is it running firmware built with "
-                       "MUSE_APPS=1 (tools/muse/board.sh), and is nothing else using the port?")
+                       "MUSE_LUA_APPS=1 (tools/muse/board.sh), and is nothing else using the port?")
 
     def wait(self, timeout, accept, what):
         """The first reply `accept` takes, within `timeout` seconds; every other line is skipped (the app's echo, the
@@ -508,7 +508,7 @@ def deploy(console, folder):
     try:
         report(push(console, read_package(folder), run=True))
     except AppError as e:
-        say(f"app.py: {e}", err=True)
+        say(f"lua_app.py: {e}", err=True)
 
 
 def cmd_watch(args):
@@ -575,7 +575,7 @@ def cmd_check(args):
 # ---- The command line ----
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="app.py", description=__doc__,
+    parser = argparse.ArgumentParser(prog="lua_app.py", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True, metavar="{check,push,watch,logs}")
     check = commands.add_parser("check", help="run the app on this machine, no gadget needed")
@@ -603,14 +603,14 @@ def main(argv=None):
     try:
         return args.func(args)
     except AppError as e:
-        say(f"app.py: {e}", err=True)
+        say(f"lua_app.py: {e}", err=True)
         return 1
     except BrokenPipeError:
         return 0   # whoever reads our output has gone
     except OSError as e:
         # The port's, for a command that has one; check never opened a board, and a full disk or a file it can't read is
         # the host's.
-        say(f"app.py: {'check failed on this machine' if args.command == 'check' else 'lost the board'}: {e}", err=True)
+        say(f"lua_app.py: {'check failed on this machine' if args.command == 'check' else 'lost the board'}: {e}", err=True)
         return 1
     except KeyboardInterrupt:
         return 130

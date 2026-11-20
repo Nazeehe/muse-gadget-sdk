@@ -790,12 +790,12 @@ the design, the Wi-Fi protocol and the numbers.
 
 ## Muse apps
 
-`MUSE_APPS=1 tools/muse/board.sh build|flash s3` (overlay
-`devices/sdkconfig.muse-apps`, `CONFIG_MUSE_APPS`) adds Muse apps: small Lua
+`MUSE_LUA_APPS=1 tools/muse/board.sh build|flash s3` (overlay
+`devices/sdkconfig.muse-lua-apps`, `CONFIG_MUSE_APPS`) adds Muse apps: small Lua
 5.4 programs that Muse writes on its VM and installs on the gadget over Link.
 Each draws its own screen and runs in a sandbox with its own memory cap and CPU
 budget, and keeps working without Muse, the VM or Wi-Fi. It's for the Waveshare
-S3 1.75C and the Waveshare knob (`knob18`); `board.sh` refuses `MUSE_APPS=1`
+S3 1.75C and the Waveshare knob (`knob18`); `board.sh` refuses `MUSE_LUA_APPS=1`
 for other boards. The launcher hangs off the pocket watch. Apps draw on a
 466 px canvas (`ui.W`, `app.api`'s screen): the knob's 360 px screen shows
 the layer and the cards as that canvas scaled about its centre (LVGL's
@@ -829,7 +829,7 @@ page left of the pocket watch: a step left of the watch fronts it
   worker, which runs the `vm` module's requests over the VM ops),
   `apps_ask.c` (`muse.ask`), `apps_jpeg.c` (runtime JPEGs), the examples
   (`examples/`) and the digit fonts (`fonts/`); `main/apps_link.c` (the Link
-  commands and the VM ops); `tools/muse/app.py` and `tools/muse/apphost/`
+  commands and the VM ops); `tools/muse/lua_app.py` and `tools/muse/apphost/`
   (the host runner).
   `components/muse/apps/apps_guide.md` is the guide Muse reads, and
   `skills/gadget-muse-apps/SKILL.md` holds it for an agent.
@@ -849,7 +849,7 @@ page left of the pocket watch: a step left of the watch fronts it
   `app.install` (the gadget reads `workspace/apps/<id>/`
   from the VM, checks, compiles, stores and runs it), `app.control` (list,
   status, logs, launch, stop, remove, snapshot, tap, drag) and `app.send` (an
-  event to the app's `message()`). From a laptop, `tools/muse/app.py check DIR` runs an app
+  event to the app's `message()`). From a laptop, `tools/muse/lua_app.py check DIR` runs an app
   on the host, `push PORT DIR [--run] [--snap OUT.png]` installs it over USB,
   `watch PORT DIR` pushes it on every change and `logs PORT` follows its log.
   The console's own lines are `>app.put`, `>app.commit ID [run]`,
@@ -1136,7 +1136,7 @@ page left of the pocket watch: a step left of the watch fronts it
   write NVS on that task (a PSRAM stack would rely on code and constant data
   running from PSRAM to keep the cache on through those writes), and LVGL's
   two drawing tasks 6,144 bytes each (`CONFIG_LV_DRAW_THREAD_STACK_SIZE` in
-  `devices/sdkconfig.muse-apps`), 2,048 less than LVGL's 8,192: 2,048 bytes
+  `devices/sdkconfig.muse-lua-apps`), 2,048 less than LVGL's 8,192: 2,048 bytes
   more internal RAM free in all. Measured on the 1.75C on 2026-11-02 (perf
   plan Task 6, apps+bench build, each from a fresh boot: Flappy with 2 min of
   taps, `whatsapp`'s first chat and its 20 drags, the launcher opened, browsed
@@ -1280,12 +1280,12 @@ page left of the pocket watch: a step left of the watch fronts it
   lowest.
 - **Test** with `tests/test_muse_apps_*.py` (the VM and the sandbox, JSON,
   packages, widgets and the apply step, the services, the runtime and its duty
-  cycle, the app task, the store, the install, the console and `app.py`, the
+  cycle, the app task, the store, the install, the console and `lua_app.py`, the
   Link commands and the guide, snapshots; the guide's quoted numbers are pinned
   to the headers), `tests/test_vm_file.py` and `tests/test_muse_bench.py`.
   They compile the apps' sources with ASan and UBSan where the compiler can,
   and need `CJSON_SOURCE_DIR` or a `managed_components/` from a build. On a
-  board, `app.py push PORT tests/muse_apps_fixtures/<fixture> --run --snap
+  board, `lua_app.py push PORT tests/muse_apps_fixtures/<fixture> --run --snap
   OUT.png`, then `>app.status`, `>mem` and `tools/muse/snap.py`; a typed turn
   through `tools/muse/chat.py` checks the Link commands with Muse.
 - **Untrusted input:** the package, the app's code and what `app.send` brings

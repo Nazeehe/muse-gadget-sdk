@@ -59,7 +59,7 @@ def cc() -> list[str]:
 
 def _load_apphost_build():
     """tools/muse/apphost_build.py by its path (tools/muse isn't on sys.path): the parsers of
-    components/lua/CMakeLists.txt and apphost's sources.txt, which tools/muse/app.py check builds apphost
+    components/lua/CMakeLists.txt and apphost's sources.txt, which tools/muse/lua_app.py check builds apphost
     with too. One parser and one Lua for the host tests, the dev loop and the firmware."""
     path = ROOT / "tools" / "muse" / "apphost_build.py"
     spec = importlib.util.spec_from_file_location("apphost_build", path)

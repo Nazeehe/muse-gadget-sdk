@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Muse apps (small Lua programs), loaded after the board's own overlay:
-#   MUSE_APPS=1 tools/muse/board.sh build|flash s3
-# Only for the Waveshare S3 1.75C, and board.sh refuses MUSE_APPS=1 for any
+#   MUSE_LUA_APPS=1 tools/muse/board.sh build|flash s3
+# Only for the Waveshare S3 1.75C, and board.sh refuses MUSE_LUA_APPS=1 for any
 # other board: the launcher hangs off the pocket watch (CONFIG_MUSE_CLOCK),
 # which only its overlay turns on, and while Kconfig drops this option without
 # it, the partition table and the FAT lines below would still apply.

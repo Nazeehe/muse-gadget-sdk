@@ -838,7 +838,7 @@ class GuideAndSkill(unittest.TestCase):
             self.assertEqual(from_source, adapter_default, "esp_lvgl_adapter 0.6.4's ESP_LV_ADAPTER_DEFAULT_STACK_SIZE")
         board = strip_c_comments((MUSE / "boards/board_waveshare_s3_175c.c").read_text())
         stack = int(re.search(r"(?m)^#define LVGL_STACK_APPS (\d+)$", board).group(1))
-        draw = int(re.search(r"(?m)^CONFIG_LV_DRAW_THREAD_STACK_SIZE=(\d+)$", (ROOT / "devices/sdkconfig.muse-apps").read_text()).group(1))
+        draw = int(re.search(r"(?m)^CONFIG_LV_DRAW_THREAD_STACK_SIZE=(\d+)$", (ROOT / "devices/sdkconfig.muse-lua-apps").read_text()).group(1))
         net = 2 * (draw_default - draw) - (stack - adapter_default)
         agents = (ROOT / "AGENTS.md").read_text()
         section = " ".join(agents[agents.index("\n## Muse apps\n"):agents.index("\n## Configuration gotchas\n")].split())
@@ -854,7 +854,7 @@ class GuideAndSkill(unittest.TestCase):
                 f"{stack - adapter_default:,} more than the adapter's {adapter_default:,}, in internal RAM, since Settings' handlers "
                 "write NVS on that task (a PSRAM stack would rely on code and constant data running from PSRAM to keep "
                 f"the cache on through those writes), and LVGL's two drawing tasks {draw:,} bytes each (`CONFIG_LV_DRAW_THREAD_STACK_SIZE` in "
-                f"`devices/sdkconfig.muse-apps`), {draw_default - draw:,} less than LVGL's {draw_default:,}: {net:,} bytes more "
+                f"`devices/sdkconfig.muse-lua-apps`), {draw_default - draw:,} less than LVGL's {draw_default:,}: {net:,} bytes more "
                 "internal RAM free in all.",):
             with self.subTest(phrase[:60]):
                 self.assertIn(phrase, section)

@@ -576,7 +576,7 @@ class ConsoleBaudTest(unittest.TestCase):
                                      r"SECONDARY_NONE|UART_TX_GPIO|UART_RX_GPIO)=")
         self.assertEqual(len(re.findall(r"(?m)^CONFIG_ESP_CONSOLE_\w+=", overlay)), 2)
         # Nothing else the 1.75C's builds load (board.sh: defaults, muse, the board's, muse-apps, muse-bench) sets the console.
-        for other in ("sdkconfig.defaults", "devices/sdkconfig.muse", "devices/sdkconfig.muse-apps", "devices/sdkconfig.muse-bench"):
+        for other in ("sdkconfig.defaults", "devices/sdkconfig.muse", "devices/sdkconfig.muse-lua-apps", "devices/sdkconfig.muse-bench"):
             with self.subTest(other):
                 self.assertNotIn("CONFIG_ESP_CONSOLE", (ROOT / other).read_text())
         board = (TOOLS / "board.sh").read_text()
@@ -586,7 +586,7 @@ class ConsoleBaudTest(unittest.TestCase):
     def test_the_baud_is_in_kconfigs_range(self):
         # What ESP-IDF's Kconfig says of the baud in a 1.75C build (its kconfig_menus.json, when a build left one): a prompt with the
         # custom UART, and a range that ends at 1,000,000 with PM_ENABLE.
-        menus = [ROOT / f"build-muse-waveshare-s3-175c{suffix}/config/kconfig_menus.json" for suffix in ("-apps-bench", "")]
+        menus = [ROOT / f"build-muse-waveshare-s3-175c{suffix}/config/kconfig_menus.json" for suffix in ("-lua-apps-bench", "")]
         menus = [path for path in menus if path.is_file()]
         if not menus:
             self.skipTest("no 1.75C build here")
@@ -2937,7 +2937,7 @@ int main(void)
         self.assertEqual((board.writes, clock.slept), ([b"p"], []))
 
     def test_snap_capture_wakes_first_and_waits_for_a_touch_script(self):
-        # S5: capture() applies prepare() itself, so every caller (Task 15's app.py too) gets C13's 'w' and wait for a
+        # S5: capture() applies prepare() itself, so every caller (Task 15's lua_app.py too) gets C13's 'w' and wait for a
         # touch command; a settle given on purpose replaces the wait, even 0.35.
         snap = load_snap()
         raw = pixels(30, 8, seed=18)

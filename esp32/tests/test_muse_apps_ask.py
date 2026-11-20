@@ -222,7 +222,7 @@ class AskStatic(unittest.TestCase):
 
 
 class AskOnAppHost(AppHostTestCase):
-    """apphost, app.py check's runner, has no Muse: its port ends every ask at once, "not set up", and the callback runs on
+    """apphost, lua_app.py check's runner, has no Muse: its port ends every ask at once, "not set up", and the callback runs on
     `advance`, after the timers and the vm module's, as the app task's round runs it (apphost.c: run_ask)."""
 
     def test_an_ask_is_not_set_up(self):

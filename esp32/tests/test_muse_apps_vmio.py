@@ -243,7 +243,7 @@ class VmioStatic(unittest.TestCase):
 
 
 class VmOnAppHost(AppHostTestCase):
-    """apphost, app.py check's runner, has no VM: its port refuses every vm request in the gadget's words for a VM it can't reach,
+    """apphost, lua_app.py check's runner, has no VM: its port refuses every vm request in the gadget's words for a VM it can't reach,
     and the callbacks run on `advance`, after the timers, as the app task's round runs them (apphost.c: run_vm)."""
 
     def test_every_request_is_not_connected(self):

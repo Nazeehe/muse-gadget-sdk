@@ -1066,7 +1066,7 @@ class TimeTest(SvcTestCase):
 
     def test_a_run_is_in_utc_whatever_the_zone_of_the_machine_is(self):
         # These tests run apphost in the board's zone (SvcTestCase.host_env), as a machine in any zone could: the run is UTC0
-        # (apphost.c sets it), so that a script gives the same events everywhere, and `app.py check` with it.
+        # (apphost.c sets it), so that a script gives the same events everywhere, and `lua_app.py check` with it.
         run = self.handler_app("""
             function app.message()
                 local t = os.date("*t", 3600 * 20)

@@ -18,7 +18,7 @@
 # the libraries one at a time), nor the lua and luac programs.
 #
 # tools/muse/apphost_build.py reads this file for the host builds (tests/apps_host.py
-# and tools/muse/app.py check build with what it finds) and doesn't evaluate
+# and tools/muse/lua_app.py check build with what it finds) and doesn't evaluate
 # if(): keep every source a quoted "src/<name>.c", all the definitions in the one
 # target_compile_definitions call and all the options in the one
 # target_compile_options call, both PRIVATE.
@@ -40,7 +40,7 @@ if(CONFIG_MUSE_APPS)
     # overflow" (200 by default). The app task runs on a 56 KB stack in PSRAM
     # (57,344 bytes), and error handling may go on to 1.1 times this limit, 44
     # levels. Measured on the S3 with tests/muse_apps_fixtures/torture, which
-    # tools/muse/app.py pushes: five C-call chains (pcall, coroutine.resume,
+    # tools/muse/lua_app.py pushes: five C-call chains (pcall, coroutine.resume,
     # __index through table.concat, __tostring through string.format, and a
     # message handler under xpcall that nests pcall as deep as error handling
     # allows) run to the limit with a 16-deep json.encode and json.decode, each

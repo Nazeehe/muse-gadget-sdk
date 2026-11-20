@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Builds apphost, the host runner of Muse apps (tools/muse/apphost), for tools/muse/app.py check.
+"""Builds apphost, the host runner of Muse apps (tools/muse/apphost), for tools/muse/lua_app.py check.
 
 apphost is the runtime the gadget runs (apps_rt and what it stands on) compiled for the laptop, so an app does there
 what it does on the board. This module knows what it is built from:

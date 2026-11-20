@@ -2,7 +2,7 @@
 -- SPDX-License-Identifier: Apache-2.0
 
 -- The example to start from: a ring, big digits, a greeting and a button.
--- Edit it, and `tools/muse/app.py watch PORT components/muse/apps/examples/hello` puts it on the gadget again.
+-- Edit it, and `tools/muse/lua_app.py watch PORT components/muse/apps/examples/hello` puts it on the gadget again.
 local app = {}
 
 function app.start()

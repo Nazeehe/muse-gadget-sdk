@@ -43,7 +43,7 @@
 #endif
 
 #if defined(ESP_PLATFORM) && !LV_USE_SNAPSHOT
-#error "apps_snapshot.c draws the screen with lv_snapshot: set CONFIG_LV_USE_SNAPSHOT (devices/sdkconfig.muse-apps does)"
+#error "apps_snapshot.c draws the screen with lv_snapshot: set CONFIG_LV_USE_SNAPSHOT (devices/sdkconfig.muse-lua-apps does)"
 #endif
 
 /*

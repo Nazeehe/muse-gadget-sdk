@@ -1213,7 +1213,7 @@ class RuntimeTest(AppHostTestCase):
     def test_apphost_asks_for_the_posix_it_uses(self):
         # getline, realpath and PATH_MAX are hidden on glibc under -std=c11 unless the defaults are asked for
         # (_DEFAULT_SOURCE: realpath is not under _POSIX_C_SOURCE 200809L alone), and build() passes
-        # -D_GNU_SOURCE to every file, which hides that from this test. A build that doesn't (app.py check
+        # -D_GNU_SOURCE to every file, which hides that from this test. A build that doesn't (lua_app.py check
         # builds apphost with its own command) needs the file to ask. The macro comes before any include, or the
         # headers have already decided.
         source = (apps_host.APPHOST / "apphost.c").read_text()
@@ -1297,7 +1297,7 @@ class RuntimeTest(AppHostTestCase):
 class CompileStepTest(AppHostTestCase):
     """apphost compiles a package as the install does before it makes the runtime (apps_task.c's compile): every .lua
     file, main first and the others in the package's order, in a scratch VM with the manifest's memory limit. A package
-    it refuses is one crash event, in the install's words, and nothing else: that is what `app.py check` is for."""
+    it refuses is one crash event, in the install's words, and nothing else: that is what `lua_app.py check` is for."""
 
     BAD = "local a = 1\nlocal b = = 2\nreturn {}\n"
 

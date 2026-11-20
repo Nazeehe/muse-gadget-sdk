@@ -710,7 +710,7 @@ tools/muse/board.sh build knob18
 tools/muse/board.sh flash knob18
 ```
 
-With `MUSE_APPS=1`, a long press on the pocket watch opens the apps'
+With `MUSE_LUA_APPS=1`, a long press on the pocket watch opens the apps'
 launcher. The app that runs is the page left of the watch: a left turn there
 brings it to the front, and a right turn puts it behind again (as the swipe
 from the left edge does). While an app runs, a fourth page dot shows left of

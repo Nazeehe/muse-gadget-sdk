@@ -54,7 +54,7 @@ header to it. Set build options in `CMakeLists.txt` instead.
   - While Lua handles that error it lets the count go on to 1.1 times the
     limit, 44 C levels.
   - Measured on the ESP32-S3 with `tests/muse_apps_fixtures/torture`, which
-    `tools/muse/app.py` pushes: five chains (`pcall`, `coroutine.resume`,
+    `tools/muse/lua_app.py` pushes: five chains (`pcall`, `coroutine.resume`,
     `__index` through `table.concat`, `__tostring` through `string.format`, and
     a message handler under `xpcall` that nests `pcall` as deep as error
     handling allows, until one is refused with "error in error handling") run
@@ -79,10 +79,10 @@ header to it. Set build options in `CMakeLists.txt` instead.
 
 `tools/muse/apphost_build.py` reads the source list, the definition and the
 options from `CMakeLists.txt`, so the host tests (through `tests/apps_host.py`)
-and `tools/muse/app.py check` build Lua the way the firmware does. The tests add
+and `tools/muse/lua_app.py check` build Lua the way the firmware does. The tests add
 `-D_GNU_SOURCE`, `-pthread` and `luai_makeseed`, a fixed string hash seed, so a
 table's keys come in the same order on every run, and link `-lm`. The device
-keeps Lua's own seed, and so does `app.py check`. Sanitized builds
+keeps Lua's own seed, and so does `lua_app.py check`. Sanitized builds
 (`sanitize=True`, the default) also compile Lua's own files with ASan and UBSan,
 which inflate stack frames: take stack measurements from
 `build(..., sanitize=False)`.

@@ -106,11 +106,11 @@ static void round_area(lv_event_t *e)
  * internal RAM: Settings' handlers write NVS on this task, which a PSRAM stack
  * survives only while code and rodata run from PSRAM (the cache stays on).
  * LVGL's two drawing tasks pay for it with 2 KB less each
- * (devices/sdkconfig.muse-apps), so internal RAM gains 2 KB in all.
+ * (devices/sdkconfig.muse-lua-apps), so internal RAM gains 2 KB in all.
  */
 #define LVGL_STACK_APPS 10240
 #if CONFIG_LV_DRAW_THREAD_STACK_SIZE > 6144
-#error "board_waveshare_s3_175c.c: the LVGL task's 2 KB more stack comes out of LVGL's drawing tasks: set CONFIG_LV_DRAW_THREAD_STACK_SIZE=6144 (devices/sdkconfig.muse-apps), or the apps build has less internal RAM"
+#error "board_waveshare_s3_175c.c: the LVGL task's 2 KB more stack comes out of LVGL's drawing tasks: set CONFIG_LV_DRAW_THREAD_STACK_SIZE=6144 (devices/sdkconfig.muse-lua-apps), or the apps build has less internal RAM"
 #endif
 #endif
 

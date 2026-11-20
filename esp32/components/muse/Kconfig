@@ -279,8 +279,8 @@ menu "Muse"
             own memory cap and CPU budget, drawing its own screen. It needs
             PSRAM and the pocket watch (MUSE_CLOCK), which the launcher hangs
             off.
-            devices/sdkconfig.muse-apps turns it on:
-            MUSE_APPS=1 tools/muse/board.sh build|flash s3
+            devices/sdkconfig.muse-lua-apps turns it on:
+            MUSE_LUA_APPS=1 tools/muse/board.sh build|flash s3
             Costs, measured on the 1.75C against the same build without the
             option:
             - Flash: 441,064 bytes more image (about 431 KB): Lua 101 KB, the

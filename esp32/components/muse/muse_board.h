@@ -64,11 +64,19 @@ extern "C" {
 #define MUSE_BTN_POWER_LONG   (1u << 12)
 #define MUSE_BTN_SPEAKER_PRESS (1u << 13)
 #define MUSE_BTN_SPEAKER_RELEASE (1u << 14)
+/* Rotary reply navigation; these are steps, not held buttons. */
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+#define MUSE_BTN_REVIEW_PREV  (1u << 15)
+#define MUSE_BTN_REVIEW_NEXT  (1u << 16)
+#endif
+/* With TALK_PRESS: reported once a hold passes its threshold (a finger held on
+ * the face to talk), not at the press's own edge, so it never confirms pairing. */
+#define MUSE_BTN_TALK_HELD    (1u << 17)
 /* A knob's detents on a touch board: one page of the home pages left or right
  * (muse_ui_request_page_step), the app that runs being the page left of the
  * pocket watch. */
-#define MUSE_BTN_PAGE_LEFT    (1u << 15)
-#define MUSE_BTN_PAGE_RIGHT   (1u << 16)
+#define MUSE_BTN_PAGE_LEFT    (1u << 18)
+#define MUSE_BTN_PAGE_RIGHT   (1u << 19)
 
 /* Where a button's icon goes on screen: beside the button, inside the panel. */
 typedef struct {
@@ -84,11 +92,12 @@ typedef struct {
     bool no_ring;           /* square panel: progress as a bar along the bottom edge, no ring around Muse */
     bool touch;             /* no touch: no settings screen, set up over BLE */
     float diagonal_in;      /* screen size; under 2" typing uses a keypad with bigger keys */
-    bool touch_talk;        /* on-screen mic supplies talk edges; no physical talk button */
+    bool touch_talk;        /* on-screen mic supplies talk edges, alone or beside a talk button */
     bool keyboard;          /* dedicated menu navigation keys */
     bool page_knob;         /* a knob steps the home pages (MUSE_BTN_PAGE_*): the app that runs gets a page dot */
     const char *talk_button;    /* where the buttons are, for captions: "top" */
     const char *aux_button;     /* "bottom" */
+    const char *wake_button;    /* wakes it from power off, if not aux_button: "K0" */
     muse_button_hint_t talk_hint;   /* mic icon; the menu's hints follow both */
     muse_button_hint_t aux_hint;    /* power or menu icon; left out, there's none */
     /* Optional dedicated POWER and speaker controls, independent of AUX. */
@@ -157,12 +166,17 @@ typedef struct {
     void (*frame_copy)(bool on);
 #endif
 
-    /* Codec handles for one duplex, 2-slot I2S bus, not yet opened. */
+    /* Speaker codec and mic codec, not yet opened. A mic without a codec (a
+     * PDM mic) leaves *mic NULL and is read through mic_read below. */
     esp_err_t (*audio_init)(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic);
     /* A microphone without a codec or speaker (a PDM mic), in place of
      * audio_init: set up once, powered on and off with the audio
      * (muse_audio_power), read as mono at MUSE_AUDIO_RATE.
-     * A board with mic_init has no speaker: replies are read, not heard. */
+     * A board with mic_init has no speaker: replies are read, not heard.
+     * mic_read also serves a board whose audio_init returns a speaker but
+     * no mic codec, which sets the mic up there (mic_init and mic_power
+     * stay NULL). muse_audio applies the mic gain to what mic_read returns,
+     * in both cases. */
     esp_err_t (*mic_init)(void);
     esp_err_t (*mic_power)(bool on);
     esp_err_t (*mic_read)(int16_t *mono, size_t frames);

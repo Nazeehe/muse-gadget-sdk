@@ -25,6 +25,8 @@
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 #if CONFIG_PM_ENABLE
@@ -37,17 +39,35 @@
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_chat.h"
+#include "muse_options.h"
 #include "muse_console.h"
 #include "muse_link.h"
 #include "muse_mem.h"
 #include "muse_menu.h"
+#if CONFIG_MUSE_MIRROR
+#include "muse_mirror.h"
+#endif
 #include "muse_settings.h"
+#if !CONFIG_MUSE_UI_FREEINK
+#include "muse_settings_ui.h"   /* LVGL only; e-paper builds use FreeInk */
+#endif
 #include "muse_state.h"
 #include "muse_ui.h"
+#if CONFIG_MUSE_LATEST_REPLY
+#include "muse_latest_reply.h"
+#endif
 #include "muse_voice.h"
+#include "muse_wakeword_glue.h"
 #include "muse_wifi.h"
 #if CONFIG_MUSE_VIDEO
 #include "muse_video.h"
+#endif
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+#include "muse_review.h"
+#include "muse_wheel.h"
+#endif
+#if CONFIG_MUSE_APP_VIEW
+#include "muse_app_view.h"
 #endif
 #if CONFIG_MUSE_WATCHER_CAMERA
 #include "boards/watcher_camera.h"
@@ -81,11 +101,30 @@ static const char *TAG = "muse_input";
 #define CHAT_MAX (192 * 1024)  /* a typed message, assembled from "chat+=" lines */
 
 static QueueHandle_t s_queue;
-#define CONSOLE_HOOKS_MAX 4    /* the SDK token's (main/), Muse apps' (muse_apps.h) and room for two more */
+#define CONSOLE_HOOKS_MAX 4    /* the SDK token's (main/), Muse apps' (muse_lua_apps.h) and room for two more */
 static bool (*s_console_hooks[CONSOLE_HOOKS_MAX])(const char *line);
 static int s_console_hook_count;
 static TaskHandle_t s_input;
+#if CONFIG_MUSE_MIRROR
+void muse_input_inject(unsigned events)
+{
+    atomic_fetch_or(&s_touch_talk_events, events);
+    if (s_input) xTaskNotifyGive(s_input);
+}
+#endif
 static bool s_talk_down;
+static int64_t s_talk_released_us;   /* when the talk control was last let go */
+#if CONFIG_MUSE_VOICE_NOTE_TOGGLE
+static atomic_bool s_note_toggled;   /* a toggled voice note is recording, talk released */
+
+void muse_input_note_toggled(bool on)
+{
+    atomic_store(&s_note_toggled, on);
+}
+#define NOTE_TOGGLED() atomic_load(&s_note_toggled)
+#else
+#define NOTE_TOGGLED() false
+#endif
 /* A push-to-talk press the voice task hasn't taken up yet: the speaker
  * button already ends the call it will start. Each such DOWN sets a mark of
  * its own and carries it; the voice task clears a mark only by that id, so
@@ -102,6 +141,7 @@ void muse_input_clear_call_pending(uint32_t mark)
 }
 static bool s_cpu_low;      /* display stopped and the CPU allowed to sleep */
 static volatile bool s_power_off_requested;
+static volatile bool s_restart_requested;
 static bool s_cpu_pd;       /* muse_input_power_init() holds the CPU's retention memory */
 #if CONFIG_PM_ENABLE
 static esp_pm_lock_handle_t s_awake;   /* with s_cpu_pd: held whenever !s_cpu_low */
@@ -111,7 +151,8 @@ static volatile bool s_nap_now;   /* ">nap": asleep, as if on battery, nap witho
 
 static void post(muse_ptt_t type, bool wake)
 {
-    muse_input_event_t ev = { .type = type, .wake = wake, .epoch = muse_input_call_epoch() };
+    muse_input_event_t ev = { .type = type, .wake = wake, .epoch = muse_input_call_epoch(),
+                             .at_us = esp_timer_get_time() };
     bool pending = type == MUSE_PTT_DOWN && muse_voice_ptt_enabled() && !muse_voice_in_call();
     if (pending) {
         uint32_t mark;
@@ -162,11 +203,32 @@ static void power_off(void)
     muse_state_set_caption("COULDN'T POWER OFF");
 }
 
+static void restart(void)
+{
+    ESP_LOGI(TAG, "restarting");
+    muse_voice_shutdown(3000);   /* bounded best effort, as before a power-off */
+    muse_state_set_asleep(false);
+    update_power();
+    muse_state_set_progress(0);
+    muse_state_set_level(0);
+    muse_state_set_caption("RESTARTING...");
+    vTaskDelay(pdMS_TO_TICKS(GOODBYE_MS));
+    esp_restart();
+}
+
 static void set_asleep(bool asleep, const char *why)
 {
+    if (asleep && NOTE_TOGGLED()) {
+        return;   /* never hide a recording note */
+    }
     if (asleep != muse_state_asleep()) {
         ESP_LOGI(TAG, "%s (%s)", asleep ? "sleeping" : "waking", why);
         muse_state_set_asleep(asleep);
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+        if (asleep) {
+            muse_review_close();   /* auto-sleep too: waking shows the live caption */
+        }
+#endif
         if (s_input) {
             xTaskNotifyGive(s_input);   /* out of wait_buttons() */
         }
@@ -208,9 +270,13 @@ static void toggle_phone_setup(void)
     muse_ble_status_t b;
     muse_ble_status(&b);
     if (on && b.name[0]) {
+        /* The setup name stays up: it is the instruction for pairing. */
         muse_state_set_caption("PHONE SETUP: %s", b.name);
+    } else if (on) {
+        muse_state_set_caption("PHONE SETUP ON");
     } else {
-        muse_state_set_caption("PHONE SETUP %s", on ? "ON" : "OFF");
+        /* OFF is a confirmation, not a state worth keeping on screen. */
+        muse_state_set_hint("PHONE SETUP OFF");
     }
 }
 
@@ -226,6 +292,7 @@ static void aux_button(bool pressed, bool edge)
     static bool hinted;
     static int sleep_in;    /* ticks until a pending single press sleeps */
     static char saved_caption[64];
+    static bool saved_hint;
 
     if (sleep_in && --sleep_in == 0) {
         set_asleep(true, muse_board->aux_button);
@@ -251,6 +318,7 @@ static void aux_button(bool pressed, bool edge)
         if (held == HINT_TICKS) {
             uint32_t v = UINT32_MAX;
             muse_state_caption(saved_caption, sizeof(saved_caption), &v);
+            saved_hint = muse_state_hint_pending();
             muse_state_set_caption("HOLD TO POWER OFF");
             hinted = true;
         } else if (held == LONG_TICKS) {
@@ -261,7 +329,12 @@ static void aux_button(bool pressed, bool edge)
     }
     if (edge && !pressed && !swallow) {
         if (hinted) {
-            muse_state_set_caption("%s", saved_caption);   /* let go early: cancel */
+            /* Let go early: cancel, and put back what was there, a hint as a hint. */
+            if (saved_hint) {
+                muse_state_set_hint(saved_caption);
+            } else {
+                muse_state_set_caption("%s", saved_caption);
+            }
         } else {
             sleep_in = DOUBLE_TICKS;
         }
@@ -276,7 +349,7 @@ static void menu_button(bool pressed, bool edge)
     }
     if (muse_state_asleep()) {
         set_asleep(false, muse_board->aux_button);
-    } else if (!s_talk_down) {
+    } else if (!s_talk_down && !NOTE_TOGGLED()) {
         muse_state_poke();
         muse_menu_key(MUSE_MENU_DOWN);
     }
@@ -294,30 +367,20 @@ static void aux_key(bool pressed, bool edge)
 /* Talk button: push-to-talk, or Select while the menu is open. Asleep, the
  * press wakes and is posted as a waking one: muse_voice records only if it's
  * still held once awake. On the pocket watch, which the screen also sleeps
- * on, it only brings Muse's face up. */
-static void talk_button(unsigned ev)
+ * on, it only brings Muse's face up. A display-only board (no audio_init or
+ * mic_init) runs no voice task to take presses off the queue, so there the
+ * press only wakes, selects or confirms pairing. Pairing takes a press that
+ * began after its prompt: only a press's own edge can confirm (`can_confirm`;
+ * not a press reported after its hold, MUSE_BTN_TALK_HELD or the Watcher's
+ * wheel), with the time the control was last let go. */
+static void talk_input(unsigned ev, bool can_confirm)
 {
     bool talk_down = s_talk_down;
+    bool voice = muse_board->audio_init || muse_board->mic_init;
     static bool swallow;
-#if CONFIG_MUSE_WATCHER_CAMERA
-    static TickType_t last_release;
-    if ((ev & MUSE_BTN_TALK_PRESS) && !muse_state_asleep()
-        && !muse_menu_is_open() && last_release
-        && xTaskGetTickCount() - last_release <= pdMS_TO_TICKS(350)) {
-        ESP_LOGI(TAG, "wheel double-click: camera preview/shutter");
-        last_release = 0;
-        watcher_camera_preview_toggle();
-        swallow = true;
-        return;
-    }
-#endif
-
     /* A quick tap can latch press and release in the same poll, and a release
      * can land just before the next press; keep them ordered. */
     bool released = ev & MUSE_BTN_TALK_RELEASE;
-#if CONFIG_MUSE_WATCHER_CAMERA
-    bool saw_release = released;
-#endif
     if ((talk_down || swallow) && released) {
         if (talk_down) {
             post(MUSE_PTT_UP, false);
@@ -326,7 +389,7 @@ static void talk_button(unsigned ev)
         released = false;
     }
     if (!talk_down && !swallow && (ev & MUSE_BTN_TALK_PRESS)) {
-        if (muse_link_talk_press()) {
+        if (can_confirm && muse_link_confirm_press(s_talk_released_us)) {
             /* Confirmed a Muse app pairing (Link's setup button). */
             muse_state_poke();
             swallow = true;
@@ -337,15 +400,22 @@ static void talk_button(unsigned ev)
             swallow = true;
         } else if (muse_state_asleep()) {
             set_asleep(false, muse_board->talk_button);
-            post(MUSE_PTT_DOWN, true);
-            talk_down = true;
+            if (voice) {
+                post(MUSE_PTT_DOWN, true);
+                talk_down = true;
+            } else {
+                swallow = true;
+            }
         } else if (muse_menu_is_open()) {
             muse_state_poke();
             if (!muse_board->keyboard) muse_menu_key(MUSE_MENU_SELECT);
             swallow = true;
-        } else {
+        } else if (voice) {
             post(MUSE_PTT_DOWN, false);
             talk_down = true;
+        } else {
+            muse_state_poke();
+            swallow = true;
         }
     }
     if ((talk_down || swallow) && released) {
@@ -354,12 +424,15 @@ static void talk_button(unsigned ev)
         }
         talk_down = swallow = false;
     }
-#if CONFIG_MUSE_WATCHER_CAMERA
-    if (saw_release && !swallow) {
-        last_release = xTaskGetTickCount();
-    }
-#endif
     s_talk_down = talk_down;
+    if (ev & MUSE_BTN_TALK_RELEASE) {
+        s_talk_released_us = esp_timer_get_time();   /* after this event's press */
+    }
+}
+
+static void talk_button(unsigned ev)
+{
+    talk_input(ev, !(ev & MUSE_BTN_TALK_HELD));
 }
 
 /* Keyboard menus don't repurpose Space/GO as Select. Navigation wakes the
@@ -368,7 +441,7 @@ static void keyboard_buttons(unsigned ev)
 {
     const unsigned mask = MUSE_BTN_UP | MUSE_BTN_DOWN | MUSE_BTN_LEFT |
                           MUSE_BTN_RIGHT | MUSE_BTN_ENTER | MUSE_BTN_ESCAPE;
-    if (!(ev & mask) || s_talk_down) return;
+    if (!(ev & mask) || s_talk_down || NOTE_TOGGLED()) return;
     if ((ev & MUSE_BTN_ENTER) && muse_link_talk_press()) {
         muse_state_poke();
         return;
@@ -397,6 +470,73 @@ static void page_buttons(unsigned ev)
     muse_state_poke();
     muse_ui_request_page_step(ev & MUSE_BTN_PAGE_RIGHT ? 1 : -1);
 }
+
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+static void watcher_buttons(unsigned ev)
+{
+    static muse_wheel_t wheel;
+    bool down = wheel.down;
+    if (ev & MUSE_BTN_TALK_PRESS) down = true;
+    else if (ev & MUSE_BTN_TALK_RELEASE) down = false;   /* let go before the hold timer runs */
+    bool confirmed = down && !wheel.down && muse_link_confirm_press(s_talk_released_us);
+    bool asleep = muse_state_asleep();
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+#if CONFIG_MUSE_WATCHER_CAMERA
+    static bool sleep_pending;
+    static uint32_t sleep_deadline;
+    if (confirmed) sleep_pending = false;
+    if (sleep_pending && (int32_t)(now - sleep_deadline) >= 0) {
+        sleep_pending = false;
+        set_asleep(true, "wheel click");
+        asleep = true;
+    }
+    if (down && !wheel.down && sleep_pending) {
+        sleep_pending = false;
+        confirmed = true;   /* consume the second click without starting a note */
+        muse_review_close();
+        ESP_LOGI(TAG, "wheel double-click: camera preview/shutter");
+        watcher_camera_preview_toggle();
+    }
+#endif
+    muse_wheel_action_t action = muse_wheel_update(&wheel, down, now, asleep, confirmed);
+    if (confirmed) muse_state_poke();
+    if (action == MUSE_WHEEL_WAKE) {
+        set_asleep(false, "wheel click");
+    } else if (action == MUSE_WHEEL_TALK_DOWN) {
+        muse_review_close();
+        talk_input(MUSE_BTN_TALK_PRESS, false);   /* the press's edge had its chance to confirm */
+    }
+    if ((ev & MUSE_BTN_TALK_RELEASE) && wheel.down) {   /* pressed and let go in one poll */
+        action = muse_wheel_update(&wheel, false, now, muse_state_asleep(), false);
+    }
+    if (action == MUSE_WHEEL_TALK_UP) {
+        talk_button(MUSE_BTN_TALK_RELEASE);
+    } else if (action == MUSE_WHEEL_SLEEP) {
+        muse_review_close();
+#if CONFIG_MUSE_WATCHER_CAMERA
+        sleep_pending = true;
+        sleep_deadline = now + 350;
+#else
+        set_asleep(true, "wheel click");
+#endif
+    }
+    if ((ev & (MUSE_BTN_REVIEW_PREV | MUSE_BTN_REVIEW_NEXT)) && !wheel.down) {
+#if CONFIG_MUSE_WATCHER_CAMERA
+        sleep_pending = false;
+#endif
+        set_asleep(false, "wheel review");
+        muse_state_poke();
+        if (muse_review_step(ev & MUSE_BTN_REVIEW_NEXT ? 1 : -1)) {
+            ESP_LOGI(TAG, "wheel: reviewing reply");
+        } else if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
+            muse_state_set_caption("NO REPLY YET");   /* not over an error or a turn's caption */
+        }
+    }
+    if (ev & MUSE_BTN_TALK_RELEASE) {
+        s_talk_released_us = esp_timer_get_time();   /* after this event's press */
+    }
+}
+#endif
 
 /* A pairing prompt wakes the screen and keeps it on; otherwise idle sleeps. */
 static void check_sleep(void)
@@ -502,6 +642,10 @@ static bool update_power(void)
     static bool paused;
     bool pause = muse_board->display_pause && muse_state_on_battery() && muse_state_asleep()
                  && muse_ui_dark() && muse_voice_resting();
+#if CONFIG_MUSE_MIRROR
+    /* The viewer needs LVGL timers even while the physical screen is dark. */
+    pause = pause && !muse_mirror_connected();
+#endif
     bool want_low = pause && !muse_console_host();
     if (pause == paused && want_low == s_cpu_low) {
         return paused;
@@ -559,6 +703,13 @@ static void power_release(void)
 {
     if (!s_power_down) return;
     s_power_down = false;
+#if CONFIG_MUSE_APP_VIEW
+    /* With an app open, the power key closes it instead of sleeping the screen. */
+    if (!s_power_swallow && muse_app_view_power()) {
+        s_power_swallow = false;
+        return;
+    }
+#endif
     if (!s_power_swallow) set_asleep(true, muse_board->power_button);
     s_power_swallow = false;
 }
@@ -583,7 +734,7 @@ static void dedicated_buttons(unsigned ev)
         power_off();
     }
     if (release) power_release();
-#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH_FAMILY && CONFIG_MUSE_REALTIME_VOICE
     /* In a push-to-talk call, or with its press still on the way, the speaker
      * button (blue) hangs up, on the press, and wakes the screen. A quick
      * second press just after doesn't toggle the speaker. If the hang-up
@@ -611,7 +762,7 @@ static void dedicated_buttons(unsigned ev)
             bool on = !muse_settings_speaker_on();
             muse_settings_set_speaker_on(on);
             if (muse_state_mode(NULL) == MUSE_MODE_IDLE) {
-                muse_state_set_caption(on ? "SPEAKER ON" : "SPEAKER OFF");
+                muse_state_set_hint(on ? "SPEAKER ON" : "SPEAKER OFF");
             }
         }
     }
@@ -641,11 +792,22 @@ static void input_task(void *arg)
             ev &= ~(presses | MUSE_BTN_POWER_LONG);
         }
 #endif
+#if CONFIG_MUSE_APP_VIEW
+        /* An open app takes the talk, speaker and aux buttons; the power key still closes it.
+         * A toggled voice note that's recording keeps the talk key: its next press stops it. */
+        unsigned keep = NOTE_TOGGLED() ? ev & (MUSE_BTN_TALK_PRESS | MUSE_BTN_TALK_RELEASE) : 0;
+        ev = muse_app_view_buttons(ev & ~keep) | keep;
+#endif
         if (ev & (MUSE_BTN_TALK_PRESS | MUSE_BTN_TALK_RELEASE)) {
             ESP_LOGI(TAG, "talk key:%s%s", ev & MUSE_BTN_TALK_PRESS ? " press" : "",
                      ev & MUSE_BTN_TALK_RELEASE ? " release" : "");
+#if !CONFIG_MUSE_BOARD_SENSECAP_WATCHER
             talk_button(ev);
+#endif
         }
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+        watcher_buttons(ev);
+#endif
         keyboard_buttons(ev);
         page_buttons(ev);
         dedicated_buttons(ev);
@@ -676,6 +838,10 @@ static void input_task(void *arg)
         if (s_power_off_requested) {
             s_power_off_requested = false;
             power_off();
+        }
+        if (s_restart_requested) {
+            s_restart_requested = false;
+            restart();
         }
 
         TickType_t now = xTaskGetTickCount();
@@ -828,9 +994,40 @@ static bool run_console_hooks(const char *line)
  */
 static bool console_command(char *line, bool whole)
 {
+#if CONFIG_MUSE_HATCH
+    if (whole && muse_options_console(line)) {
+        muse_state_poke();
+        muse_state_set_asleep(false);
+        muse_state_nudge();
+        return true;
+    }
+#endif
     if (whole && run_console_hooks(line)) {
         return true;
     }
+#if CONFIG_MUSE_MIRROR
+    if (whole && (!strcmp(line, "mirror") || !strncmp(line, "mirror=", 7))) {
+        muse_mirror_serial_session(line[6] ? atoi(line + 7) : 0);
+        return true;
+    }
+#endif
+#if CONFIG_MUSE_BOARD_SENSECAP_WATCHER
+    if (!strcmp(line, "review.next") || !strcmp(line, "review.prev")) {
+        set_asleep(false, "reply review");
+        muse_state_poke();
+        muse_review_step(!strcmp(line, "review.next") ? 1 : -1);
+        char page[MUSE_CAPTION_MAX];
+        int at = 0, pages = 0;
+        muse_review_page(page, sizeof(page), &at, &pages);
+        printf("@review {\"page\":%d,\"pages\":%d}\n", at, pages);
+        fflush(stdout);
+        return true;
+    }
+    if (!strcmp(line, "review.close")) {
+        muse_review_close();
+        return true;
+    }
+#endif
 #if CONFIG_MUSE_VIDEO
     /* The Phone camera item, for a bench without fingers: "video" opens the
      * view (asking the phone for a stream), "video=0" closes it. */
@@ -942,6 +1139,12 @@ static bool console_command(char *line, bool whole)
         }
         return true;
     }
+#if CONFIG_MUSE_LATEST_REPLY
+    if (muse_latest_reply_bench(line)) {
+        set_asleep(false, "reply review");
+        return true;
+    }
+#endif
     /* The touch page ("ui=settings", "ui=face", "ui=clock") and a display-only demo name, for screenshots. */
     if (!strcmp(line, "ui.demo=1") || !strcmp(line, "ui.demo=0")) {
         muse_ui_bench_demo(!strcmp(line, "ui.demo=1"));
@@ -997,6 +1200,31 @@ static bool console_command(char *line, bool whole)
         }
         return true;
     }
+    if (!strncmp(line, "ui.settings=", 12)) {
+        if (muse_settings_ui_bench_open(line + 12)) {
+            muse_ui_bench_page(true);
+        } else {
+            printf("@ui.error unknown settings page \"%s\": home wifi muse ble sound sleep battery power\n", line + 12);
+            fflush(stdout);
+        }
+        return true;
+    }
+#endif
+#if CONFIG_MUSE_WAKEWORD_ENABLE
+    if (!strcmp(line, "wake") || !strcmp(line, "wake.on") || !strcmp(line, "wake.off")) {
+        if (line[4] == '.') {
+            muse_wakeword_set_enabled(!strcmp(line, "wake.on"));
+        }
+        muse_wakeword_status_t st;
+        muse_wakeword_status(&st);
+        printf("@wake {\"enabled\":%s,\"listening\":%s,\"runner\":\"%s\",\"wakes\":%u,\"cancels\":%u,"
+               "\"submits\":%u,\"drops\":%u}\n",
+               st.enabled ? "true" : "false", st.listening ? "true" : "false", st.runner,
+               (unsigned)st.wakes, (unsigned)st.cancels, (unsigned)st.submits,
+               (unsigned)st.dropped_frames);
+        fflush(stdout);
+        return true;
+    }
 #endif
     if (!strncmp(line, "face=", 5)) {
         set_face(line + 5);
@@ -1033,11 +1261,12 @@ static bool console_command(char *line, bool whole)
  * the device's state, "power" the battery meter (muse_battery.h) and
  * "power.reset" starts it over, "nap" sleeps and leaves Wi-Fi at once (as
  * two minutes asleep on battery would; 'w' rejoins), "face=" shows a face
- * (see set_face), and "chat=" sends a typed message to Hatch (see chat_line
+ * (see set_face), "wake" prints the wake word state, "wake.on" and "wake.off"
+ * toggle listening, and "chat=" sends a typed message to Hatch (see chat_line
  * and tools/muse/chat.py). A bench build (CONFIG_MUSE_BENCH) adds "mem", "ui=",
- * the touch commands "tap", "longpress", "swipe" and "drag", which
- * tools/muse/snap.py sends before it takes a screenshot, and "frame copy on|off"
- * and "memtest".
+ * "ui.reply=" (with Latest reply), the touch commands "tap", "longpress",
+ * "swipe" and "drag", which tools/muse/snap.py sends before it takes a
+ * screenshot, and "frame copy on|off" and "memtest".
  */
 static void serial_task(void *arg)
 {
@@ -1065,6 +1294,7 @@ static void serial_task(void *arg)
             if (line && !console_command(line, whole)) {
                 muse_ble_command(line);
             }
+            if (line) { volatile char *p = line; for (int i = 0; i < SERIAL_LINE; i++) p[i] = 0; }
             free(line);
         } else if (c == 'd' || c == 'u') {
             muse_state_poke();
@@ -1099,4 +1329,9 @@ esp_err_t muse_input_start(QueueHandle_t queue)
 void muse_input_request_power_off(void)
 {
     s_power_off_requested = true;
+}
+
+void muse_input_request_restart(void)
+{
+    s_restart_requested = true;
 }

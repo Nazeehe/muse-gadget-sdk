@@ -170,7 +170,7 @@ class Pins(unittest.TestCase):
     """D12: the numbers the touch's contract quotes are its headers'."""
 
     def setUp(self):
-        self.header = (MUSE / "muse_apps.h").read_text()
+        self.header = (MUSE / "muse_lua_apps.h").read_text()
         self.ui = (MUSE / "muse_ui.h").read_text()
 
     def define(self, name, text=None):

@@ -67,7 +67,7 @@
 #include "apps_touch.h"
 #include "apps_ui.h"
 #include "apps_values.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "muse_apps_task_fakes.h"
 #include "muse_input.h"
 #include "muse_state.h"

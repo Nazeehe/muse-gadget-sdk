@@ -30,7 +30,7 @@
 
 #include "apps_jpeg.h"
 #include "apps_port.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 
 /*
  * The network worker (apps_net.h has the contract). The app task alone submits, so the first submit makes the lock, the queue and the

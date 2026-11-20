@@ -17,7 +17,7 @@
 #pragma once
 
 /*
- * Link's app.control tap and drag: Muse's touches on the app it tests (muse_apps.h has the contract, muse_apps_touch). How its
+ * Link's app.control tap and drag: Muse's touches on the app it tests (muse_lua_apps.h has the contract, muse_apps_touch). How its
  * three tasks meet, after snapshot's way (apps_snapshot.h):
  *
  * 1. The caller (the Noise session's task, or the console's) checks the parameters and claims the one touch there may be, then

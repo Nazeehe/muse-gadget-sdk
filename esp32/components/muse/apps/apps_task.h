@@ -18,7 +18,7 @@
 
 /*
  * The app task of Muse apps: the one task that runs an app's Lua (apps_rt), and the services the rest of the
- * firmware asks of it. muse_apps_start() (muse_apps.h) makes it: "muse_apps", core 1, priority 2, a 56 KB stack in
+ * firmware asks of it. muse_apps_start() (muse_lua_apps.h) makes it: "muse_apps", core 1, priority 2, a 56 KB stack in
  * PSRAM and a queue of 16 apps_event_t in PSRAM. One app at a time.
  *
  * Callers. apps_task_run, apps_task_compile, apps_task_stop and apps_task_message post a request and wait for its
@@ -116,7 +116,7 @@
 #define APPS_TASK_SEND_LAUNCH_MS 3000  /* app.send's launch of a stored app: store load is the worker's, this is the load and start() (about 750 ms of instructions); with the 5 s reply it stays 2 s under the VM's 10 s */
 #define APPS_TASK_WAIT_MS 2000       /* compile and stop */
 #define APPS_TASK_HUNG_MS 3000       /* a call that has run longer is hung (strictly longer) */
-#define APPS_BOOT_DEADLINE_MS 20000  /* I2: the boot's mount goes by then (apps_port_mono_ms) with no word from the Link (muse_apps.h) */
+#define APPS_BOOT_DEADLINE_MS 20000  /* I2: the boot's mount goes by then (apps_port_mono_ms) with no word from the Link (muse_lua_apps.h) */
 #define APPS_TASK_RESET_MS 500       /* the app task's wait for the LVGL task's reset */
 #define APPS_TASK_LAYOUT_MS 500      /* a run's wait for a pass of the apply step that has laid its widgets out */
 #define APPS_QUEUE_LEN 16            /* the queue's events: a touch or an alarm's post leaves the last 2 to requests */
@@ -216,7 +216,7 @@ bool apps_task_run_by_id(apps_pkg_t *pkg, bool front, int settle_ms, apps_status
 /*
  * Posts a launch of the app id and returns: it never waits, for the answer or for a frame, so the LVGL task (the
  * launcher's pick) can call it. The app task fronts the app that runs when it is that app (front) and leaves it where
- * it is otherwise. Any other id goes to muse_apps_launch (muse_apps.h): the I/O worker loads the store's copy and runs
+ * it is otherwise. Any other id goes to muse_apps_launch (muse_lua_apps.h): the I/O worker loads the store's copy and runs
  * it through apps_task_run_by_id, in front or behind; a refusal, or an id the store doesn't have, is one log line. A full
  * queue drops the launch, with a log line. The launcher lists the store's apps whether they run or not
  * (apps_task_set_list); Task 17's alarms and Task 20's flash store build on this.

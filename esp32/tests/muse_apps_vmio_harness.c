@@ -51,7 +51,7 @@
 #include "apps_port.h"
 #include "apps_rt.h"
 #include "apps_vmio.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "muse_apps_task_fakes.h"
 
 static atomic_int failures;

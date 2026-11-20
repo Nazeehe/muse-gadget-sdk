@@ -27,7 +27,7 @@
 #endif
 
 #include "apps_port.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 
 /*
  * The mixer (apps_mix.h has the contract). A slot holds a voice that plays, with its id, and a tail: a voice fading out after a
@@ -435,7 +435,7 @@ bool apps_mix_active(void) {
     return atomic_load(&s_active);
 }
 
-/* ---- The voice task's hooks (muse_apps.h) ---- */
+/* ---- The voice task's hooks (muse_lua_apps.h) ---- */
 
 bool muse_apps_sound_render(int16_t *out, size_t frames) {
     return apps_mix_render(out, frames);

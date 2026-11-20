@@ -36,7 +36,7 @@ HARNESS = TESTS / "muse_apps_mix_harness.c"
 
 WAVES = ("sine", "square", "triangle", "saw", "noise")
 
-# What apps_mix.c and muse_apps.h include of ESP-IDF and LVGL, as the least that compiles on the host.
+# What apps_mix.c and muse_lua_apps.h include of ESP-IDF and LVGL, as the least that compiles on the host.
 FAKES = {
     "esp_attr.h": "#pragma once\n#define EXT_RAM_BSS_ATTR\n",
     "esp_err.h": "#pragma once\ntypedef int esp_err_t;\n",
@@ -374,7 +374,7 @@ class MixTest(unittest.TestCase):
         self.assertEqual(mix.number(7), 0)
 
     def test_hooks_are_the_mixer(self):
-        # muse_apps.h's hooks for the voice task. A cut (a talk press, the dark) fades every voice out, those already fading too, and
+        # muse_lua_apps.h's hooks for the voice task. A cut (a talk press, the dark) fades every voice out, those already fading too, and
         # the next chunk the voice task renders holds the whole fade: after it nothing is live.
         mix = self.run_script("make c 9000 4000", "hook_active", "clip 1 c 100 1", "tone 2 440 440 2000 saw 100", "hook_active",
                               "hook_render 320", "stop #1", "hook_cut", "hook_active", "active", "playing #0",
@@ -405,6 +405,7 @@ class MixTest(unittest.TestCase):
         # build's lines (games Task 3, G4) are logged by the render once it has released the lock, and by nothing else.
         code = strip_c_comments((APPS / "apps_mix.c").read_text())
         plain = re.sub(r"#if CONFIG_MUSE_BENCH\n.*?#endif\n", "", code, flags=re.S)
+        plain = re.sub(r'(?m)^#include ".*"$', "", plain)   # muse_lua_apps.h is a name, not a Lua call
         for word in ("malloc", "calloc", "realloc", "free(", "heap_caps", "apps_port_realloc", "ESP_LOG", "printf", "puts",
                      "vTaskDelay", "xSemaphore", "xQueue", "lua_", "luaL_", "apps_port_ui_lock"):
             with self.subTest(word):

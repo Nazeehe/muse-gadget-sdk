@@ -20,7 +20,7 @@
 // gadget. Muse writes an app's folder, workspace/apps/<id>/, on its VM and
 // calls app.install; the gadget reads the files itself (vm_file, GET /fs/raw),
 // then checks, compiles, stores and runs the app, and answers with one result
-// (components/muse/muse_apps.h has the install, apps_install.h the result).
+// (components/muse/muse_lua_apps.h has the install, apps_install.h the result).
 // Every caller of these sits inside #if CONFIG_MUSE_APPS.
 
 #include <stdbool.h>

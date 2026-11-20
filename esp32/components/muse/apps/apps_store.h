@@ -35,7 +35,7 @@
  *
  * The mount. muse_apps_start() makes it the worker's first step (apps_io_set_first), and the app task's first apps_store_tick
  * submits the boot job that brings the worker, once the boot lets it (I2: after the Link's registration, at once without the Link,
- * or APPS_BOOT_DEADLINE_MS after boot: muse_apps.h); apps_store_tick asks again every APPS_STORE_RETRY_MS while the worker refuses.
+ * or APPS_BOOT_DEADLINE_MS after boot: muse_lua_apps.h); apps_store_tick asks again every APPS_STORE_RETRY_MS while the worker refuses.
  * In order:
  *   1. the partition: none, and the store is in RAM mode ("store: no apps partition: ... reflash over USB once to keep apps");
  *   2. FAT at APPS_STORE_BASE on "apps": format_if_mount_failed, 4 files open at most, units of 4 KB (a partition with no file

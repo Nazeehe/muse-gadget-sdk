@@ -40,7 +40,7 @@
 #include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "noise_control.h"
 #include "vm_file.h"
 
@@ -124,7 +124,7 @@ int64_t esp_timer_get_time(void) {
     return now_us;
 }
 
-/* ---- The apps (muse_apps.h) ---- */
+/* ---- The apps (muse_lua_apps.h) ---- */
 
 static const muse_apps_vm_ops_t *vm_ops;
 
@@ -263,7 +263,7 @@ bool muse_apps_send(const char *id, const char *event, const char *data_json, bo
     return async_call("send", id, done, ctx, code, err);
 }
 
-/* The wrapper over apps_json_validate (muse_apps.h): one JSON value, and an object. The real one is apps_control.c's. */
+/* The wrapper over apps_json_validate (muse_lua_apps.h): one JSON value, and an object. The real one is apps_control.c's. */
 static int object_checks;
 
 bool muse_apps_json_object_valid(const char *s, size_t len, char *err, size_t err_len) {

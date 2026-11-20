@@ -620,7 +620,7 @@ class MuseAppsWiringTest(unittest.TestCase):
         dark = task.index("if (asleep) {\n                muse_apps_sound_cut();")
         self.assertLess(asleep, dark)
         self.assertLess(dark, task.index("set_resting(rest);"))
-        self.assertRegex(task, r"bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback;\n"
+        self.assertRegex(task, r"bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback[^;\n]*;\n"
                                r"#if CONFIG_MUSE_APPS\n\s*rest = rest && !muse_apps_sound_active\(\);")
         # One chunk a pass, rendered into the PSRAM buffer and written before the 20 ms read that paces the loop; the pre-roll starts
         # again while it plays and on the first pass that plays none.
@@ -635,11 +635,11 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertLess(task.index("if (s_loopback) {"), render)
         # A talk press the loop accepts cuts it before anything else, and writes the fade (R1a: one chunk holds it) inside the
         # option's block: the recording (or a call) starts after.
-        accepted = task.index("if (ev.type != MUSE_PTT_DOWN || ev.epoch != muse_input_call_epoch()) {")
+        accepted = re.search(r"if \(ev\.type != MUSE_PTT_DOWN \|\|\s*\(?[^{]*ev\.epoch != muse_input_call_epoch\(\)\)+ \{", task).end()
         press = task.index("muse_apps_sound_cut();", accepted)
         stored = task.index("s_press_input_epoch = ev.epoch;")
         self.assertLess(press, stored)
-        self.assertLess(press, task.index("bool ok = record(pending_down, &held, why, sizeof(why));"))
+        self.assertLess(press, task.index("note_held(", accepted))   # the recording (note_held, record) comes after
         self.assertEqual(task.count("muse_apps_sound_cut();"), 2)
         fade = task[press:stored]
         self.assertIn("if (muse_apps_sound_render(s_app_sound, MUSE_AUDIO_CHUNK)) {", fade)
@@ -702,7 +702,7 @@ class MuseAppsWiringTest(unittest.TestCase):
         self.assertLess(app.index("muse_ui_start()"), start)
         self.assertLess(start, app.index("muse_input_start(q)"))
         self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, start))
-        self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, app.index('#include "muse_apps.h"')))
+        self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, app.index('#include "muse_lua_apps.h"')))
 
     def test_the_boot_mount_waits_for_the_links_registration(self):  # I2
         # The apps' storage (FAT, apps_nvs, the I/O worker) is mounted once the Link's first link.register has its reply, accepted
@@ -1058,13 +1058,13 @@ class MuseAppsWiringTest(unittest.TestCase):
                          r"apps_values_init\(\);[\s\S]*xTaskCreatePinnedToCoreWithCaps\(apps_task,")
         # device.health's "apps" and the heartbeat's " apps=<resident>/<state> lua=<KB>K": only in a build with the apps.
         health = (ROOT / "main/noise_control.cpp").read_text()
-        for needle in ('#include "muse_apps.h"', "muse_apps_health()", 'cJSON_AddItemToObject(health, "apps", apps);'):
+        for needle in ('#include "muse_lua_apps.h"', "muse_apps_health()", 'cJSON_AddItemToObject(health, "apps", apps);'):
             with self.subTest(needle):
                 self.assertEqual(health.count(needle), 1)
                 self.assertIn("if CONFIG_MUSE_APPS", open_conditions(health, health.index(needle)))
-        self.assertLess(health.index('"version"'), health.index('"apps"'), "after the version, in send_device_health")
+        self.assertLess(health.index('"version"'), health.index('"apps"'), "after the version, in noise_ctrl_device_health_json")
         app = (ROOT / "main/app.c").read_text()
-        for needle in ('#include "muse_apps.h"', "muse_apps_brief(", '" apps=%s/%s lua=%uK"'):
+        for needle in ('#include "muse_lua_apps.h"', "muse_apps_brief(", '" apps=%s/%s lua=%uK"'):
             with self.subTest(needle):
                 self.assertEqual(app.count(needle), 1)
                 self.assertIn("if CONFIG_MUSE_APPS", open_conditions(app, app.index(needle)))

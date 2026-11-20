@@ -17,11 +17,25 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef void (*button_cb)(void);
 
 bool button_init(button_cb on_short_press, button_cb on_double_press,
                  button_cb on_long_press);
+
+// From the short-press callback: a time (esp_timer's clock) the button was
+// last seen up before that press began.
+int64_t button_pressed_after_us(void);
+
+// For a setup button that isn't a GPIO (one read over I2C, say): set before
+// button_init(), which then reads it with `read` instead of
+// CONFIG_HOMEHUB_BUTTON_GPIO. `read` stores whether the button is down and
+// returns true, or returns false, leaving it alone, if it couldn't read it: a
+// failed read is neither a press nor a release.
+typedef bool (*button_read_cb)(bool *pressed);
+
+void button_set_reader(button_read_cb read);
 
 // Called from the button task on each press and release. Returning true from
 // a press claims it: it then counts as neither a tap nor a hold, and its

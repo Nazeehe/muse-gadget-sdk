@@ -52,7 +52,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "muse_apps_exact_stack.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))

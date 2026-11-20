@@ -48,12 +48,12 @@
 #include "apps_values.h"
 #include "apps_vm.h"
 #include "apps_vmio.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "muse_input.h"
 #include "muse_state.h"
 
 /*
- * The app task, and the glue muse_ui calls on the LVGL task (muse_apps.h). apps_task.h has the contract; this is how
+ * The app task, and the glue muse_ui calls on the LVGL task (muse_lua_apps.h). apps_task.h has the contract; this is how
  * the three kinds of task meet.
  *
  * Who touches what. The app task alone runs Lua and owns the runtime, the package and its own state (T below). The
@@ -278,7 +278,7 @@ static EXT_RAM_BSS_ATTR struct {
     bool boot_open;           /* I2: the boot's mount may go (boot_open) */
 } T;
 
-/* I2: the Link's word on the boot's mount (muse_apps.h): the first one stays. Any task; internal, as an atomic. */
+/* I2: the Link's word on the boot's mount (muse_lua_apps.h): the first one stays. Any task; internal, as an atomic. */
 enum { BOOT_WAITING, BOOT_REGISTERED, BOOT_OFFLINE };
 static atomic_int s_boot_word;
 

@@ -17,7 +17,7 @@
 #pragma once
 
 /*
- * Link's app.control snapshot (Task 25): a JPEG of the gadget's screen, written to Muse's VM. muse_apps.h has the command's
+ * Link's app.control snapshot (Task 25): a JPEG of the gadget's screen, written to Muse's VM. muse_lua_apps.h has the command's
  * contract (muse_apps_snapshot); this is how its three tasks meet.
  *
  * 1. The caller (the Noise session's task) checks the parameters and one snapshot at a time, and admits it before anything is drawn

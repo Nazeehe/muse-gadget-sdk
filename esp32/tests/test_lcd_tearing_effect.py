@@ -1109,7 +1109,7 @@ int main(void)
         self.assertEqual(len(re.findall(r"lv_display_flush_ready\(s_disp\);\s*xSemaphoreGive\(s_flush_ready\);", code)), readies)
         sent = function(code, "on_chunk_sent")
         notify = sent.index("esp_lv_adapter_display_notify_color_trans_done_from_isr(s_disp);")
-        self.assertRegex(sent[notify:], r"^[^}]*?if \(last\) \{\s*xSemaphoreGiveFromISR\(s_flush_ready, &woken\);\s*\}")
+        self.assertRegex(sent[notify:], r"^[^}]*?xSemaphoreGiveFromISR\(s_flush_ready, &woken\);\s*\}")   # in the last piece's block
         self.assertRegex(sent[notify:], r"if \(yield \|\| woken == pdTRUE\) \{\s*portYIELD_FROM_ISR\(\);")
         # The adapter's own flush_ready calls come from inside LVGL's flush callback, before LVGL waits: flush_wait isn't called
         # then (LVGL 9.5.0's wait_for_flushing calls it only while disp->flushing).
@@ -1408,18 +1408,19 @@ FRAME_MODE_NAMES = ["whole_t", "s_whole", "s_framing", "s_framed", "s_te_whole",
                     "refresh_whole", "frame_band", "whole_est", "whole_band", "whole_write", "muse_lcd_bands_set_frame_mode",
                     "EXT_RAM_BSS_ATTR", "MALLOC_CAP_SPIRAM", "heap_caps_get_free_size",
                     # Task 5 of the perf plan: the frame made as frame mode registers, and the blocking flush wait.
-                    "muse_lcd_bands_make_frame", "FLUSH_WAIT_MS", "s_flush_ready", "flush_wait", "lv_display_set_flush_wait_cb",
-                    "band_back"]
+                    "muse_lcd_bands_make_frame", "FLUSH_WAIT_MS", "s_flush_ready", "flush_wait", "band_back"]
 
 # sha256 of esp32/components/muse/boards/muse_lcd_bands.c at 7e59ee0, the connected apps' base: what a build without the apps
 # compiles. On a mismatch, diff variant(SOURCE, apps=False) with `git show 7e59ee0:esp32/components/muse/boards/muse_lcd_bands.c`.
-PLAIN_SHA256 = "058c9a2e4f76a56f2d15096a29cbc04dda748abf2bd17d161c03c4636768a530"
+# main's muse_lcd_bands.c (c24d956) without the apps: 7e59ee0's, and main's blocking wait for a band (wait_band).
+PLAIN_SHA256 = "76948890c05b783dda17d398b2a472cab78560f6b5347fa495820c2ae8161537"
 
 
 class PlainBuildTest(unittest.TestCase):
     """The final review's I8 (the user's decision, "Only with apps"): Task 7's display changes are built only with the apps. Without
-    CONFIG_MUSE_APPS, muse_lcd_bands.c is 7e59ee0's, byte for byte: the per-band hold that sleeps in ticks, no esp_timer, no pairing
-    and no display callbacks of its own, and a 2560 B send stack. With it the code is Task 7's, its hold's timer no longer needed."""
+    CONFIG_MUSE_APPS, muse_lcd_bands.c is main's (c24d956), byte for byte: 7e59ee0's per-band hold that sleeps in ticks, no esp_timer,
+    no pairing and no display callbacks of its own, and a 2560 B send stack, with main's wait for a band (wait_band). With it the code is
+    Task 7's, its hold's timer no longer needed."""
 
     @classmethod
     def setUpClass(cls):
@@ -1454,9 +1455,9 @@ class PlainBuildTest(unittest.TestCase):
                              text=True).stdout
         return [tuple(int(v) for v in line.split()) for line in out.splitlines()]
 
-    def test_the_plain_build_is_7e59ee0s(self):
+    def test_the_plain_build_is_mains(self):
         self.assertEqual(hashlib.sha256(self.plain.encode()).hexdigest(), PLAIN_SHA256,
-                         "muse_lcd_bands.c without the apps isn't 7e59ee0's")
+                         "muse_lcd_bands.c without the apps isn't main's")
         # What that means, said plainly: 7e59ee0's queue item, its hold, its stack, and nothing of Task 7's.
         code = strip_c(self.plain)
         self.assertRegex(code, r"typedef struct \{\s*const uint8_t \*data;\s*int x1, y1, x2, y2;\s*\} band_t;")

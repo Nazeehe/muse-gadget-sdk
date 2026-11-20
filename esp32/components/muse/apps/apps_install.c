@@ -27,7 +27,7 @@
 #include "apps_port.h"
 #include "apps_result.h"
 #include "esp_log.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "sdkconfig.h"
 
 /*

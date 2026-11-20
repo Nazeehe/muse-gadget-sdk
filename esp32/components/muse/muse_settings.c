@@ -25,6 +25,9 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
+#if CONFIG_MUSE_APP_VIEW
+#include "esp_system.h"
+#endif
 
 #include "muse_link.h"
 
@@ -32,6 +35,8 @@ static const char *TAG = "muse_settings";
 
 #define NS "muse"
 #define DEFAULT_HOST "hatch.metaaivm.com"
+#define TEXT_SIZE_KEY "text_sz5"     /* MUSE_TEXT_*; "text_size" had three */
+#define TEXT_SIZE_UNSET 0xff
 
 static struct {
     uint8_t volume;
@@ -39,6 +44,7 @@ static struct {
     uint8_t mic_gain;
     uint8_t brightness;
     uint16_t sleep_s;
+    uint8_t text_size;
     bool wifi_on;
     bool ble_on;
     char ssid[MUSE_SSID_MAX + 1];
@@ -52,6 +58,7 @@ static struct {
     .mic_gain = 30,
     .brightness = 100,
     .sleep_s = 120,
+    .text_size = TEXT_SIZE_UNSET,
     .wifi_on = true,
     .host = DEFAULT_HOST,
 };
@@ -59,8 +66,12 @@ static struct {
 static SemaphoreHandle_t s_lock;
 /* StopWatch samples this at the next press, never during an active call. */
 static atomic_bool s_voice_notes;
+#if CONFIG_MUSE_APP_VIEW
+static bool s_apps_on;
+#endif
 static nvs_handle_t s_nvs;
 static muse_setting_cb_t s_listener;
+static int s_text_default = MUSE_TEXT_SMALL;
 
 #define LOCKED(body) do { xSemaphoreTake(s_lock, portMAX_DELAY); body; xSemaphoreGive(s_lock); } while (0)
 
@@ -100,6 +111,21 @@ static void notify(muse_setting_t what)
     }
 }
 
+/* The text size someone chose. Before there were five sizes, "text_size"
+ * kept one of three for small screens' full-screen replies: their Small
+ * (unscii-8), Medium (Montserrat 14) and Large (Montserrat 20) are now Extra
+ * small, Small and Large. */
+static void load_text_size(void)
+{
+    static const uint8_t FROM_THREE[] = { MUSE_TEXT_XSMALL, MUSE_TEXT_SMALL, MUSE_TEXT_LARGE };
+    uint8_t v;
+    if (nvs_get_u8(s_nvs, TEXT_SIZE_KEY, &v) == ESP_OK) {
+        s.text_size = v < MUSE_TEXT_SIZES ? v : TEXT_SIZE_UNSET;
+    } else if (nvs_get_u8(s_nvs, "text_size", &v) == ESP_OK && v < sizeof(FROM_THREE)) {
+        s.text_size = FROM_THREE[v];
+    }
+}
+
 esp_err_t muse_settings_init(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -123,19 +149,25 @@ esp_err_t muse_settings_init(void)
         s.speaker_on = b;
     }
     load_u8("mic_gain", &s.mic_gain);
-#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH_FAMILY && CONFIG_MUSE_REALTIME_VOICE
     if (nvs_get_u8(s_nvs, "voice_notes", &b) == ESP_OK) {
         atomic_store(&s_voice_notes, b != 0);
     }
 #endif
     load_u8("bright", &s.brightness);
     nvs_get_u16(s_nvs, "sleep_s", &s.sleep_s);
+    load_text_size();
     if (nvs_get_u8(s_nvs, "wifi_on", &b) == ESP_OK) {
         s.wifi_on = b;
     }
     if (nvs_get_u8(s_nvs, "ble_on", &b) == ESP_OK) {
         s.ble_on = b;
     }
+#if CONFIG_MUSE_APP_VIEW
+    if (nvs_get_u8(s_nvs, "apps_on", &b) == ESP_OK) {
+        s_apps_on = b;
+    }
+#endif
     load_str("ssid", s.ssid, sizeof(s.ssid));
     load_str("pass", s.pass, sizeof(s.pass));
     load_str("host", s.host, sizeof(s.host));
@@ -161,6 +193,7 @@ bool muse_settings_speaker_on(void) { return s.speaker_on; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_brightness(void) { return s.brightness; }
 int muse_settings_sleep_s(void) { return s.sleep_s; }
+int muse_settings_text_size(void) { return s.text_size == TEXT_SIZE_UNSET ? s_text_default : s.text_size; }
 bool muse_settings_wifi_on(void) { return s.wifi_on; }
 bool muse_settings_ble_on(void) { return s.ble_on; }
 bool muse_settings_voice_notes(void) { return atomic_load(&s_voice_notes); }
@@ -171,6 +204,17 @@ void muse_settings_set_voice_notes(bool on)
     save_u8("voice_notes", on);
     notify(MUSE_SETTING_VOICE_NOTES);
 }
+
+#if CONFIG_MUSE_APP_VIEW
+bool muse_settings_apps_on(void) { return s_apps_on; }
+
+void muse_settings_set_apps_on(bool on)
+{
+    s_apps_on = on;
+    save_u8("apps_on", on);
+    esp_restart();   /* Muse learns of the app commands, or that there are none, as it reconnects */
+}
+#endif
 
 /* Home Link owns the saved networks (this is the first); the local copy is only a fallback. */
 void muse_settings_wifi(char ssid[MUSE_SSID_MAX + 1], char pass[MUSE_PASS_MAX + 1])
@@ -244,6 +288,17 @@ void muse_settings_set_sleep_s(int secs)
     notify(MUSE_SETTING_SLEEP);
 }
 
+void muse_settings_set_text_size(int size)
+{
+    s.text_size = clampi(size, MUSE_TEXT_XSMALL, MUSE_TEXT_XLARGE);
+    save_u8(TEXT_SIZE_KEY, s.text_size);   /* the UI polls it */
+}
+
+void muse_settings_set_text_size_default(int size)
+{
+    s_text_default = clampi(size, MUSE_TEXT_XSMALL, MUSE_TEXT_XLARGE);
+}
+
 void muse_settings_set_wifi_on(bool on)
 {
     s.wifi_on = on;
@@ -312,3 +367,53 @@ esp_err_t muse_settings_set_hatch_token(const char *token, bool append)
     }
     return err;
 }
+
+#if CONFIG_MUSE_WAKEWORD_ENABLE
+/* The wake word opt-in, kept apart (and last) so builds without the feature
+ * compile this file exactly as before. Read from NVS on first use, which is
+ * muse_wakeword_init() after muse_settings_init(). Default off: listening is
+ * an explicit opt-in. */
+static bool s_wakeword_on, s_wakeword_loaded;
+
+bool muse_settings_wakeword_on(void)
+{
+    if (!s_wakeword_loaded) {
+        uint8_t b = 0;
+        s_wakeword_on = nvs_get_u8(s_nvs, "ww_on", &b) == ESP_OK && b;
+        s_wakeword_loaded = true;
+    }
+    return s_wakeword_on;
+}
+
+void muse_settings_set_wakeword_on(bool on)
+{
+    s_wakeword_on = on;
+    s_wakeword_loaded = true;
+    save_u8("ww_on", on);
+    notify(MUSE_SETTING_WAKEWORD);
+}
+#endif
+
+#if CONFIG_MUSE_PHOTO_NOTES
+/* Photo with voice notes, kept apart like the wake word so builds without it
+ * compile this file as before. Read from NVS on first use. Default off: the
+ * camera takes photos only once the person turns it on. */
+static atomic_bool s_photo_notes, s_photo_notes_loaded;
+
+bool muse_settings_photo_notes(void)
+{
+    if (!atomic_load(&s_photo_notes_loaded)) {
+        uint8_t b = 0;
+        atomic_store(&s_photo_notes, nvs_get_u8(s_nvs, "photo_notes", &b) == ESP_OK && b);
+        atomic_store(&s_photo_notes_loaded, true);
+    }
+    return atomic_load(&s_photo_notes);
+}
+
+void muse_settings_set_photo_notes(bool on)
+{
+    atomic_store(&s_photo_notes, on);
+    atomic_store(&s_photo_notes_loaded, true);
+    save_u8("photo_notes", on);
+}
+#endif

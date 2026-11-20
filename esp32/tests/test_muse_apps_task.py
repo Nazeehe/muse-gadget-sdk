@@ -46,7 +46,7 @@ SOURCES = [HARNESS, TESTS / "muse_apps_fake_esp_timer.c", APPS / "apps_task.c", 
            TESTS / "fake_tjpgd.c"]
 CONSOLE_SOURCES = [APPS / "apps_console.c", APPS / "apps_install.c", APPS / "apps_result.c"]
 
-# What apps_task.c and muse_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one is a line that includes the fakes.
+# What apps_task.c and muse_lua_apps.h include of FreeRTOS, ESP-IDF and LVGL: each one is a line that includes the fakes.
 FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/idf_additions.h", "freertos/queue.h", "freertos/semphr.h",
                 "freertos/task.h", "esp_attr.h", "esp_err.h", "esp_heap_caps.h", "esp_log.h", "esp_timer.h", "lvgl.h"]
 SDKCONFIG = "#define CONFIG_MUSE_APPS 1\n#define CONFIG_SPIRAM 1\n#define CONFIG_MUSE_APPS_HEAP_MAX_KB 1024\n"
@@ -660,7 +660,7 @@ class AppTaskBenchTest(HarnessCase):
         self.assertIn("static EXT_RAM_BSS_ATTR atomic_bool s_poll_held;", source)
         self.assertIn("atomic_load(&s_poll_held)", c_function(source, "static void poll_step(void) {"))
         self.assertIn("poll = poll && !atomic_load(&s_poll_held);", c_function(source, "bool muse_apps_ui_tick(void) {"))
-        header = strip_c_comments((MUSE / "muse_apps.h").read_text())
+        header = strip_c_comments((MUSE / "muse_lua_apps.h").read_text())
         self.assertEqual(open_conditions(header, header.index("void muse_apps_bench_poll(bool on);")),
                          ["if CONFIG_MUSE_APPS", "if CONFIG_MUSE_BENCH"])
 

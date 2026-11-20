@@ -35,6 +35,7 @@ import base64
 import enum
 import json
 import logging
+import re
 import struct
 import time
 import uuid
@@ -44,6 +45,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable, Sequence
 from urllib.parse import quote
 
+from musegadget import device_guide, tls
 from musegadget.muse_api import user_agent
 from musegadget.noise import Header, NoiseTransport, NoiseXXInitiator
 from musegadget.streaming import MAX_BUFFER_BYTES, MAX_BUFFER_CHUNKS, StreamingRequest
@@ -60,15 +62,40 @@ HANDSHAKE_TIMEOUT_S = 20
 PING_INTERVAL_S = 20
 MAX_CONCURRENT_INVOKES = 4
 MAX_INBOUND_MESSAGE = 4 * 1024 * 1024
+RECEIVE_FRAMES_PER_TURN = 32
+RECEIVE_BYTES_PER_TURN = 64 * 1024
+# Documented VM limit: 256 KiB per device control message. Include the u32
+# length prefix in our budget, conservatively, not just the JSON payload.
+MAX_CONTROL_MESSAGE_BYTES = 256 * 1024
+REGISTER_ID_BYTES = 36  # str(uuid.uuid4())
 MAX_CHAT_EVENT_BYTES = 256 * 1024
 MAX_STREAM_BUFFER_BYTES = 1024 * 1024
 MAX_TTS_BUFFER_BYTES = 8 * 1024 * 1024
 STREAM_CHUNK_BYTES = 16 * 1024
 MAX_VOICE_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+IMAGE_MIME_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
 REQUEST_CHUNK_BYTES = 16 * 1024
 MAX_INLINE_REQUEST_BYTES = 64 * 1024
 # Matches JavaScript's encodeURIComponent, as the firmware does.
 _URI_COMPONENT_SAFE = "-_.!~*'()"
+DEFAULT_MODEL_ID = "muse-gadget-linux"
+DEFAULT_MODEL_NAME = "Linux gadget"
+MAX_MODEL_NAME_BYTES = 128
+_MODEL_ID = re.compile(r"[a-z0-9-]{1,64}")
+# Printable ASCII without " or \, so link.register never escapes it.
+_MODEL_NAME = re.compile(r"[ !#-\[\]-~]{1,%d}" % MAX_MODEL_NAME_BYTES)
+
+
+def check_model(model_id: str, model_name: str, guide: str | None) -> None:
+    """Raise ValueError for a model id, name or guide outside protocols/DEVICE.md's rules."""
+    if not isinstance(model_id, str) or not _MODEL_ID.fullmatch(model_id):
+        raise ValueError("model_id must be 1 to 64 lowercase letters, digits and hyphens")
+    if not isinstance(model_name, str) or not _MODEL_NAME.fullmatch(model_name):
+        raise ValueError(f"model_name must be 1 to {MAX_MODEL_NAME_BYTES} printable ASCII characters, "
+                         'without " or \\')
+    if guide is not None:
+        device_guide.check(guide)
 
 
 class Outcome(enum.Enum):
@@ -85,18 +112,32 @@ class DeviceDescription:
     display_name: str
     version: str
     commands: dict
+    model_id: str = DEFAULT_MODEL_ID
+    model_name: str = DEFAULT_MODEL_NAME
+    guide: str | None = None
+
+    def __post_init__(self) -> None:
+        check_model(self.model_id, self.model_name, self.guide)
 
     def register_params(self) -> dict:
+        commands = self.commands
+        if self.guide is not None:
+            commands = {**commands, device_guide.COMMAND: device_guide.SPEC}
         return {
             "node_id": self.node_id,
             "display_name": self.display_name,
             "platform": "linux",
             "version": self.version,
-            "device_family": "homehub",
-            "model_id": "linux",
+            "device_family": "gadget",
+            "model_id": self.model_id,
+            "metadata": {"model_name": self.model_name},
             "is_wakeup_supported": False,
-            "commands_v2": self.commands,
+            "commands_v2": commands,
         }
+
+    def register_message(self, request_id: str) -> dict:
+        return {"type": "req", "id": request_id, "method": "link.register",
+                "params": self.register_params()}
 
 
 def encode_message(obj: dict) -> bytes:
@@ -128,7 +169,7 @@ class MessageDecoder:
                 continue  # keepalive
             try:
                 message = json.loads(raw)
-            except ValueError:  # bad JSON, or bytes that aren't UTF-8
+            except (ValueError, RecursionError):  # malformed, overdeep, or non-UTF-8 JSON
                 log.warning("dropping malformed control message (%d bytes)", length)
                 continue
             if isinstance(message, dict):
@@ -153,6 +194,22 @@ def noise_url(noise_host: str, vm_id: str, app_id: str | None = None) -> str:
     return url
 
 
+@dataclass(frozen=True)
+class SideChat:
+    session_id: str
+    exists: bool    # False: Muse has no chat with this ID yet; the first send_chat to it creates it
+
+
+def check_image(image_bytes: bytes, mime_type: str) -> None:
+    """Raise ``ValueError`` unless ``LinkSession.send_image`` takes this picture."""
+    if mime_type not in IMAGE_MIME_TYPES:
+        raise ValueError("images must be JPEG, PNG, GIF or WebP")
+    if not image_bytes:
+        raise ValueError("the image is empty")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError(f"the image is {len(image_bytes):,} bytes; images must be 2 MiB or less")
+
+
 class LinkSession:
     def __init__(
         self,
@@ -163,6 +220,7 @@ class LinkSession:
         device: DeviceDescription,
         run_command: Callable[[str, dict, int | None], dict],
         connect=None,
+        invoke_slots: asyncio.Semaphore | None = None,
         app_id: str | None = None,
         register_device: bool = True,
     ) -> None:
@@ -174,7 +232,7 @@ class LinkSession:
         self._run_command = run_command
         self._connect = connect
         self._send_lock = asyncio.Lock()
-        self._invokes = asyncio.Semaphore(MAX_CONCURRENT_INVOKES)
+        self._invokes = invoke_slots if invoke_slots is not None else asyncio.Semaphore(MAX_CONCURRENT_INVOKES)
         self._tasks: set[asyncio.Task] = set()
         self._stream_id = 0
         self._register_id = ""
@@ -275,10 +333,12 @@ class LinkSession:
                 self._url,
                 additional_headers=headers,
                 user_agent_header=user_agent(),
+                compression=None,
                 open_timeout=HANDSHAKE_TIMEOUT_S,
                 ping_interval=PING_INTERVAL_S,
                 ping_timeout=PING_INTERVAL_S,
                 max_size=128 * 1024,
+                ssl=tls.client_context(),
             )
         except InvalidStatus as exc:
             status = exc.response.status_code
@@ -307,18 +367,17 @@ class LinkSession:
         )
         self._stream_id = encrypted.stream_id
         self._register_id = str(uuid.uuid4())
-        await self.send({
-            "type": "req",
-            "id": self._register_id,
-            "method": "link.register",
-            "params": self._device.register_params(),
-        })
+        message = self._device.register_message(self._register_id)
+        if len(encode_message(message)) > MAX_CONTROL_MESSAGE_BYTES:
+            raise ValueError("link.register exceeds the VM's control message budget")
+        await self.send(message)
         log.info("sent link.register as %s", self._device.node_id)
 
     # -- Device-originated requests -------------------------------------------
 
     async def send_chat(
         self, message: str, session_id: str | None = None, *, output_modality: str = "text",
+        device: str | None = None,
     ) -> dict:
         """Post a user message to the Muse as coming from this device.
 
@@ -327,7 +386,9 @@ class LinkSession:
         commands back here. ``session_id`` targets a side chat; an id the Muse
         has not seen before starts a new one. Without it the message goes to
         the main chat. Pass ``output_modality="voice"`` to get a reply that
-        ``stream_tts`` can speak.
+        ``stream_tts`` can speak. For dictation, ``device="mcu-wearable"`` asks
+        Muse for short plain sentences without changing the output modality
+        or this session's device identity.
         """
         request_body = {
             "message": message,
@@ -336,31 +397,68 @@ class LinkSession:
         }
         if session_id:
             request_body["session_id"] = session_id
+        if device is not None:
+            request_body["device"] = device
         return await self._post_chat(request_body)
 
     async def send_voice(
         self, wav_bytes: bytes, session_id: str | None = None, *, message: str = "",
-        output_modality: str | None = None,
+        output_modality: str | None = None, device: str | None = None,
     ) -> dict:
         """Post a WAV voice note, optionally including instructions in ``message``.
 
-        Muse chooses its usual reply format unless ``output_modality`` is set.
-        Its TTS endpoint requires a voice-modality assistant reply.
+        Muse reads only the items of a request that has any, so the text goes
+        first as its own item. Muse chooses its usual reply format unless
+        ``output_modality`` is set. Its TTS endpoint requires a voice-modality
+        assistant reply. Pass ``device="mcu-wearable"`` to ask for short plain
+        sentences, independently of the output modality and device identity.
         """
         if not wav_bytes or len(wav_bytes) > MAX_VOICE_BYTES:
             raise ValueError("voice note must contain at most 2 MiB of WAV audio")
+        voice = {
+            "type": "file", "mime_type": "audio/wav", "filename": "voice_note.wav",
+            "data_base64": base64.b64encode(wav_bytes).decode("ascii"),
+        }
+        text = [{"type": "text", "text": message}] if message.strip() else []
         request_body = {
             "message": message,
             "device_id": self._device.node_id,
-            "items": [{
-                "type": "file", "mime_type": "audio/wav", "filename": "voice_note.wav",
-                "data_base64": base64.b64encode(wav_bytes).decode("ascii"),
-            }],
+            "items": text + [voice],
         }
         if session_id:
             request_body["session_id"] = session_id
         if output_modality is not None:
             request_body["output_modality"] = output_modality
+        if device is not None:
+            request_body["device"] = device
+        return await self._post_chat(request_body)
+
+    async def send_image(
+        self, image_bytes: bytes, mime_type: str, session_id: str | None = None, *,
+        message: str = "", filename: str | None = None, output_modality: str = "text",
+    ) -> dict:
+        """Post a picture for Muse to look at, with ``message`` as its text.
+
+        ``mime_type`` must be one of ``IMAGE_MIME_TYPES`` and the picture at
+        most 2 MiB. Muse reads only the items of a request that has any, so
+        the text goes first as its own item.
+        """
+        check_image(image_bytes, mime_type)
+        image = {
+            "type": "image", "mime_type": mime_type,
+            "data_base64": base64.b64encode(image_bytes).decode("ascii"),
+        }
+        if filename:
+            image["filename"] = filename
+        text = [{"type": "text", "text": message}] if message.strip() else []
+        request_body = {
+            "message": message,
+            "output_modality": output_modality,
+            "device_id": self._device.node_id,
+            "items": text + [image],
+        }
+        if session_id:
+            request_body["session_id"] = session_id
         return await self._post_chat(request_body)
 
     @staticmethod
@@ -429,7 +527,7 @@ class LinkSession:
                     log.warning("could not reset abandoned request")
         try:
             decoded = json.loads(response) if response else None
-        except (ValueError, UnicodeError):
+        except (ValueError, UnicodeError, RecursionError):
             decoded = response.decode("utf-8", errors="replace")[:2000]
         return {"ok": 200 <= status < 300, "status": status, "response": decoded}
 
@@ -471,8 +569,33 @@ class LinkSession:
                     await self._reset_stream(stream_id)
             stream.close()
 
-    async def subscribe_chat(self, session_id: str | None = None) -> AsyncIterator[dict]:
-        """Yield Muse chat events from its NDJSON subscription."""
+    async def open_side_chat(self, session_id: str) -> SideChat:
+        """Look up the side chat ``session_id`` without reading its events.
+
+        Raises :class:`HttpStreamError` when Muse answers with anything but
+        success or 404.
+        """
+        path = "/chat/subscribe"
+        body = json.dumps({"session_id": session_id}).encode()
+        async with self.stream_http("POST", path, body, headers=[
+            Header("Content-Type", "application/json"), Header("Accept", "application/x-ndjson"),
+        ]) as stream:
+            if 200 <= stream.status < 300:
+                exists = True
+            elif stream.status == 404:
+                exists = False
+            else:
+                raise HttpStreamError(stream.status, path)
+        return SideChat(session_id, exists)
+
+    async def subscribe_chat(
+        self, session_id: str | None = None, *, opened: asyncio.Event | None = None,
+    ) -> AsyncIterator[dict]:
+        """Yield Muse chat events from its NDJSON subscription.
+
+        ``opened`` is set once Muse accepts this subscription, so events from
+        then on reach it.
+        """
         body = json.dumps({"session_id": session_id} if session_id else {}).encode()
         path = "/chat/subscribe"
         async with self.stream_http("POST", path, body, headers=[
@@ -481,6 +604,8 @@ class LinkSession:
             if not 200 <= stream.status < 300:
                 raise HttpStreamError(stream.status, path)
             self.chat_subscribed.set()
+            if opened is not None:
+                opened.set()
             try:
                 buffered = bytearray()
                 async for chunk in stream:
@@ -507,7 +632,7 @@ class LinkSession:
             return None
         try:
             event = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (ValueError, RecursionError):  # malformed, overdeep, or non-UTF-8 JSON
             log.warning("dropping malformed chat event (%d bytes)", len(raw))
             return None
         return event if isinstance(event, dict) and event.get("type") == "event" else None
@@ -627,12 +752,20 @@ class LinkSession:
 
     async def _read_loop(self) -> Outcome:
         decoder = MessageDecoder()
+        received_frames = received_bytes = 0
         while True:
+            if (received_frames >= RECEIVE_FRAMES_PER_TURN
+                    or received_bytes >= RECEIVE_BYTES_PER_TURN):
+                # A buffered recv() may not yield to response consumers or writers.
+                await asyncio.sleep(0)
+                received_frames = received_bytes = 0
             try:
                 raw = await self._ws.recv()
             except Exception as exc:
                 log.info("control connection closed: %s", exc)
                 return Outcome.CLOSED
+            received_frames += 1
+            received_bytes += len(raw)
             if isinstance(raw, str):
                 log.warning("ignoring text frame on Noise connection")
                 continue
@@ -698,15 +831,52 @@ class LinkSession:
         timeout_ms = message.get("timeout_ms") or None
         if not invoke_id:
             return
+        if not isinstance(command, str):
+            await self.send({"method": "link.result", "id": invoke_id,
+                             "ok": False, "error": "command must be a string"})
+            return
         shown = printable(command)
         log.info("invoke %s", shown)
-        async with self._invokes:
-            started = time.monotonic()
-            result = await asyncio.get_running_loop().run_in_executor(
+        if command == device_guide.COMMAND and self._device.guide is not None:
+            result = {"ok": True, "payload": device_guide.payload(self._device.guide)}
+            log.info("%s %s in 0 ms", shown, describe_result(result))
+            await self.send({"method": "link.result", "id": invoke_id, **result})
+            return
+        await self._invokes.acquire()
+        started = time.monotonic()
+        try:
+            worker = asyncio.get_running_loop().run_in_executor(
                 None, self._run_command, command, params, timeout_ms,
             )
-            log.info("%s %s in %d ms", shown, describe_result(result),
-                     (time.monotonic() - started) * 1000)
+        except BaseException:
+            self._invokes.release()
+            raise
+
+        def finished(future: asyncio.Future) -> None:
+            self._invokes.release()
+            # Observe failures even when the disconnected session no longer waits.
+            if not future.cancelled():
+                future.exception()
+
+        worker.add_done_callback(finished)
+        try:
+            # Cancelling this session cannot stop a running command thread. Keep its
+            # slot until it really finishes, including across service reconnects.
+            result = await asyncio.shield(worker)
+            summary = describe_result(result)
+            # Validate JSON before leaving the callback boundary. Sending
+            # remains outside so a broken transport is never retried as a
+            # command error.
+            encode_message({"method": "link.result", "id": invoke_id, **result})
+        except Exception as exc:
+            # Callback failures belong to this invocation. Log only the
+            # exception type: its text can contain parameters or credentials.
+            # Cancellation and other BaseExceptions still propagate, and
+            # transport failures remain outside this boundary.
+            result = {"ok": False, "error": "command failed"}
+            summary = f"failed ({printable(type(exc).__name__)})"
+        log.info("%s %s in %d ms", shown, summary,
+                 (time.monotonic() - started) * 1000)
         await self.send({"method": "link.result", "id": invoke_id, **result})
 
 
@@ -734,6 +904,28 @@ class HttpStreamError(ConnectionError):
         super().__init__(f"Muse request {path} failed: HTTP {status}")
         self.status = status
         self.path = path
+
+
+class RequestRejected(ConnectionError):
+    """Muse refused a ``send_chat``, ``send_voice`` or ``send_image`` request."""
+
+    def __init__(self, status: int | None) -> None:
+        super().__init__(f"Muse rejected conversation request: HTTP {status}")
+        self.status = status
+
+
+def acknowledgement(result: dict) -> dict:
+    """Muse's acknowledgement in a ``send_chat``, ``send_voice`` or ``send_image`` result.
+
+    Raises :class:`RequestRejected` when Muse refused the request, and
+    ``ValueError`` when it accepted it without an acknowledgement.
+    """
+    if not result.get("ok"):
+        raise RequestRejected(result.get("status"))
+    response = result.get("response")
+    if not isinstance(response, dict):
+        raise ValueError("Muse did not acknowledge the request")
+    return response
 
 
 class HttpStream:

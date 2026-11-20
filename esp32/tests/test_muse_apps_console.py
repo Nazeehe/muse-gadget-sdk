@@ -55,7 +55,7 @@ EMBEDDED = {"apps_guide_md": APPS / "apps_guide.md", "manifest_json": APPS / "ex
             "tally_manifest_json": APPS / "examples/tally/manifest.json", "tally_main_lua": APPS / "examples/tally/main.lua",
             "tally_hook_sh": APPS / "examples/tally/hook.sh"}
 
-# What apps_console.c and muse_apps.h include of ESP-IDF and LVGL, staged as the little they use.
+# What apps_console.c and muse_lua_apps.h include of ESP-IDF and LVGL, staged as the little they use.
 STAGED = {
     "esp_err.h": "#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_FAIL -1\n#define ESP_ERR_NO_MEM 0x101\n",
     "lvgl.h": "#pragma once\ntypedef struct lv_obj lv_obj_t;\n",

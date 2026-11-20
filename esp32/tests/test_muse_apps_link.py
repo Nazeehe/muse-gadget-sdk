@@ -224,7 +224,7 @@ def c_table(source, name):
 def swipe_numbers():
     """What a swipe is, each number from where it is pinned (D12): LVGL 9.5.0's gesture distance and speed as the lv harness's fake
     has them (test_muse_apps_lv.py pins those to LVGL's), the board's read of the touch (devices/sdkconfig.muse's refresh period),
-    LVGL's long press as muse_apps.h quotes it, and the left edge's band (apps_lv.h)."""
+    LVGL's long press as muse_lua_apps.h quotes it, and the left edge's band (apps_lv.h)."""
     lv = (TESTS / "muse_apps_lv_harness.c").read_text()
 
     def fake(name):
@@ -233,7 +233,7 @@ def swipe_numbers():
     sdkconfig = (ROOT / "devices/sdkconfig.muse").read_text()
     return {"gesture": fake("FAKE_GESTURE_LIMIT"), "velocity": fake("FAKE_GESTURE_MIN_VELOCITY"),
             "refresh": int(re.search(r"(?m)^CONFIG_LV_DEF_REFR_PERIOD=(\d+)$", sdkconfig).group(1)),
-            "long": int(re.search(r"LVGL makes a press\s+\* a long press (\d+) ms into it", (MUSE / "muse_apps.h").read_text()).group(1)),
+            "long": int(re.search(r"LVGL makes a press\s+\* a long press (\d+) ms into it", (MUSE / "muse_lua_apps.h").read_text()).group(1)),
             "edge": header_number("apps_lv.h", "APPS_LV_CLOSE_EDGE_PX")}
 
 
@@ -591,7 +591,7 @@ class GuideAndSkill(unittest.TestCase):
         # prefixes the code puts in front (": "), is inside one string literal of the apps' sources (comments don't count),
         # so a paraphrase fails.
         # The chat's words too (muse_chat.h, muse_chat_session.cpp): muse.ask's callback gets them (connected apps Task 4).
-        literals = [text for p in [*sorted(APPS.glob("*.[ch]")), MUSE / "muse_apps.h", MAIN / "apps_link.c", MAIN / "vm_file.c",
+        literals = [text for p in [*sorted(APPS.glob("*.[ch]")), MUSE / "muse_lua_apps.h", MAIN / "apps_link.c", MAIN / "vm_file.c",
                                    MAIN / "vm_file.h", MUSE / "muse_chat.h", MUSE / "muse_chat_session.cpp"]
                     for text in c_literals(p.read_text())]
         self.assertIn("busy: another install is running", literals)  # a #define's
@@ -609,14 +609,14 @@ class GuideAndSkill(unittest.TestCase):
 
     def test_guide_says_what_to_do_when_a_snapshot_has_no_room(self):
         # N1: a snapshot is refused before anything is drawn when the gadget has no room for it. The guide's Common errors quote each
-        # of the three refusals as muse_apps.h has them, with what to do, and its snapshot entry says that it happens.
-        header = (MUSE / "muse_apps.h").read_text()
+        # of the three refusals as muse_lua_apps.h has them, with what to do, and its snapshot entry says that it happens.
+        header = (MUSE / "muse_lua_apps.h").read_text()
         section = " ".join(guide_section(GUIDE.read_text(), "Common errors").split())
         for name, fix in (("MUSE_APPS_SNAPSHOT_TRY_SCALE_2", "`scale: 2`"), ("MUSE_APPS_SNAPSHOT_STOP_APP", "stop it with `app.control`"),
                           ("MUSE_APPS_SNAPSHOT_NO_MEMORY", "try again in a few seconds")):
             with self.subTest(name):
                 match = re.search(rf'^#define {name} (?:\\\n\s*)?"([^"]+)"', header, re.M)
-                self.assertIsNotNone(match, f"no #define {name} in muse_apps.h")
+                self.assertIsNotNone(match, f"no #define {name} in muse_lua_apps.h")
                 self.assertRegex(section, rf"- `{re.escape(match.group(1))}`: [^`]*{re.escape(fix)}")
         guide = " ".join(GUIDE.read_text().split())
         self.assertIn("it is refused before anything is drawn (`out_of_memory`), and a full-size one says when `scale: 2` would fit",
@@ -651,8 +651,8 @@ class GuideAndSkill(unittest.TestCase):
         self.assertIn(f"once the gadget has set its clock and its apps have started (up to {deadline_s} s after the restart, so an "
                       "alarm due before then fires that late)", guide)
         self.assertIn('"Loading apps..."', (APPS / "apps_lv.c").read_text())
-        match = re.search(r'^#define MUSE_APPS_STARTING "([^"]+)"', (MUSE / "muse_apps.h").read_text(), re.M)
-        self.assertIsNotNone(match, "no #define MUSE_APPS_STARTING in muse_apps.h")
+        match = re.search(r'^#define MUSE_APPS_STARTING "([^"]+)"', (MUSE / "muse_lua_apps.h").read_text(), re.M)
+        self.assertIsNotNone(match, "no #define MUSE_APPS_STARTING in muse_lua_apps.h")
         section = " ".join(guide_section(GUIDE.read_text(), "Common errors").split())
         self.assertIn(f"- `{match.group(1)}`: the gadget has just restarted: try again in a few seconds.", section)
         agents = " ".join((ROOT / "AGENTS.md").read_text().split())
@@ -752,8 +752,8 @@ class GuideAndSkill(unittest.TestCase):
         net_stack = header_number("apps_net.h", "APPS_NET_STACK")  # connected apps Task 6 (M22): the network worker's
         # Connected apps Task 6: the measured paragraph's code constants (app.api's write deadline, the VM reader's reserve
         # beside the Link's TX margin, and the spin cap its record spun at).
-        guide_write = re.search(r"^#define\s+MUSE_APPS_GUIDE_WRITE_MS\s+(\d+)", (MUSE / "muse_apps.h").read_text(), re.M)
-        self.assertIsNotNone(guide_write, "no #define MUSE_APPS_GUIDE_WRITE_MS in muse_apps.h")
+        guide_write = re.search(r"^#define\s+MUSE_APPS_GUIDE_WRITE_MS\s+(\d+)", (MUSE / "muse_lua_apps.h").read_text(), re.M)
+        self.assertIsNotNone(guide_write, "no #define MUSE_APPS_GUIDE_WRITE_MS in muse_lua_apps.h")
         guide_write_s = int(guide_write.group(1)) / 1000
         vm_reserve_kb = define_kb(MAIN / "vm_file.c", "VM_RESERVE_BYTES")
         spin_side = header_number("apps_ui.h", "APPS_SPIN_SIDE_MAX")
@@ -964,7 +964,7 @@ class GuideAndSkill(unittest.TestCase):
         least, slow = int(m.group(1)), int(m.group(2))
         self.assertEqual(m.group(3), "twice")
         self.assertGreater(least, n["gesture"])
-        high = int(re.search(r"(?m)^#define MUSE_APPS_TOUCH_MS_MAX (\d+)", (MUSE / "muse_apps.h").read_text()).group(1))
+        high = int(re.search(r"(?m)^#define MUSE_APPS_TOUCH_MS_MAX (\d+)", (MUSE / "muse_lua_apps.h").read_text()).group(1))
         checked = 0
         for run in range(least, 465, 17):
             for ms in sorted({slow, slow + 1, run, run + 7, 2 * run - 1, 2 * run}):
@@ -1068,10 +1068,10 @@ class GuideAndSkill(unittest.TestCase):
                 self.assertIn(phrase, section)
 
     def test_guide_documents_tap_and_drag(self):
-        # app.control tap and drag (D12): The loop's entries quote muse_apps.h's numbers and the reply's fields, say what the guards
+        # app.control tap and drag (D12): The loop's entries quote muse_lua_apps.h's numbers and the reply's fields, say what the guards
         # do and that Muse's touches open no tap gate; Touches and Games' Testing it send Muse to them; the refusals are in Common
         # errors in the firmware's words (test_common_errors_are_the_firmwares_words checks the words).
-        header = (MUSE / "muse_apps.h").read_text()
+        header = (MUSE / "muse_lua_apps.h").read_text()
 
         def define(name):
             return int(re.search(rf"(?m)^#define {name} (\d+)", header).group(1))
@@ -1132,7 +1132,7 @@ class GuideAndSkill(unittest.TestCase):
     def test_agents_md_has_the_touch_paragraph(self):
         # app.control tap and drag: the guard, the cut, the tag and the numbers as the headers have them (D12), the console's
         # lines as apps_console.c takes them, and app.control's actions as apps_link.c has them.
-        header = (MUSE / "muse_apps.h").read_text()
+        header = (MUSE / "muse_lua_apps.h").read_text()
 
         def define(name):
             return int(re.search(rf"(?m)^#define {name} (\d+)", header).group(1))

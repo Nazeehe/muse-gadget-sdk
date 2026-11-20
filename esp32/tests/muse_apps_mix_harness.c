@@ -51,7 +51,7 @@
 
 #include "apps_mix.h"
 #include "apps_port.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "sdkconfig.h"
 
 /* ---- The mixer's lock ---- */

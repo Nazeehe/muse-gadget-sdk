@@ -21,6 +21,10 @@ static const muse_ptest_state_t generic_matrix[] = {
     STATE("other_board_rest", "generic board resting", MUSE_PTEST_IDLE, 0, -1, false),
 };
 /* generic_board 3: a non-Watcher sleep matrix size (3 non-deep + 1 deep). */
+static const muse_ptest_state_t epaper_matrix[] = {
+    STATE("epaper", "test panel refresh", MUSE_PTEST_EPAPER, 80, -1, false),
+    STATE("rest", "resting", MUSE_PTEST_IDLE, 0, -1, false),
+};
 static const muse_ptest_state_t generic_sleep_matrix[] = {
     SLEEP_STATE("other_sleep_ref", "generic sleep reference", 0, MUSE_PTEST_CODEC_KEEP, "ref", "warm", 1000, MUSE_PTEST_IDLE),
     SLEEP_STATE("other_sleep_variant", "generic sleep variant", MUSE_PTEST_CPU_PD, MUSE_PTEST_CODEC_KEEP, "variant", "warm", 1000, MUSE_PTEST_IDLE),
@@ -35,6 +39,10 @@ const muse_ptest_state_t *muse_ptest_board_matrix(const char *name, size_t *coun
 {
     if (!generic_board) { return reference_board_matrix(name, count); }
     if (count) { *count = 0; }
+    if (generic_board == 4 && name && !strcmp(name, "peripheral")) {
+        if (count) { *count = sizeof(epaper_matrix)/sizeof(epaper_matrix[0]); }
+        return epaper_matrix;
+    }
     if (name && !strcmp(name, "peripheral")) {
         if (count) { *count = sizeof(generic_matrix) / sizeof(generic_matrix[0]); }
         return generic_matrix;
@@ -204,6 +212,7 @@ static esp_err_t fw_service(muse_ptest_load_t load)
     if (current_index() == service_index) { return service_error; }
     if (current_index() == empty_index) { return ESP_OK; }
     if (load == MUSE_PTEST_MIC || load == MUSE_PTEST_SINE) { frames += 16000; }
+    if (load == MUSE_PTEST_EPAPER) { frames++; }
     if (load == MUSE_PTEST_ADC_SAMPLE) { adc_samples += 8; }
     if (load == MUSE_PTEST_WIFI_SCAN) { scans++; }
     return ESP_OK;
@@ -318,7 +327,7 @@ int main(void)
             case 13: s_saved.run.deep[0].rtc_slept_us = -1; break;
             case 14: s_saved.run.codec_count = MUSE_PTEST_CODEC_SLOTS + 1; break;
             case 15: s_saved.run.records[0].codec_slot = MUSE_PTEST_CODEC_SLOTS; break;
-            case 16: s_saved.run.codec_regs[0].adc_variant = 3; break;
+            case 16: s_saved.run.codec_regs[0].adc_variant = 4; break;
             case 17: s_saved.run.codec_regs[0].dac_mask = 0x80; break;
             case 18: s_saved.run.codec_regs[0].adc_mask = 0xff; break;
             case 19: ((uint8_t *)&s_saved.run.codec_regs[0].expected)[0] = 2; break;

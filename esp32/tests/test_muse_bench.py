@@ -914,7 +914,15 @@ int main(void)
         source = (MUSE / "muse_input.c").read_text()
         command = c_function(source, "static bool console_command(char *line, bool whole)")
         start = command.index("#if CONFIG_MUSE_BENCH") + len("#if CONFIG_MUSE_BENCH\n")
-        block = command[start:command.index("\n#endif", start)]
+        # To the block's own #endif: it holds conditionals of its own (Latest reply's ui.reply=).
+        depth, end = 1, start
+        for line in command[start:].splitlines(keepends=True):
+            word = line.strip()
+            depth += word.startswith("#if") - word.startswith("#endif")
+            if depth == 0:
+                break
+            end += len(line)
+        block = command[start:end]
         program = r"""
 #include <stdbool.h>
 #include <stdio.h>
@@ -943,6 +951,7 @@ void muse_ui_bench_page(muse_ui_page_t page) { printf("page %d\n", (int)page); }
 void muse_ui_bench_demo(bool enabled) { printf("demo %d\n", enabled); }
 void muse_ui_bench_touch(muse_ui_touch_t kind, int x, int y) { printf("touch %d %d %d\n", (int)kind, x, y); }
 void muse_ui_bench_drag(int x1, int y1, int x2, int y2, int ms) { printf("drag %d %d %d %d %d\n", x1, y1, x2, y2, ms); }
+static bool muse_settings_ui_bench_open(const char *page) { printf("settings %s\n", page); return true; }
 
 static bool bench_commands(char *line)
 {
@@ -2773,13 +2782,18 @@ int main(void)
         self.assertEqual(result, (30, 8, raw))
         self.assertEqual(board.writes, [b"p"])
         self.assertEqual(errors, "")
-        # Short of bytes without a CRC to say so: kept and warned about, as before, the missing rows zero.
+        # Short of bytes without a CRC to say so: retaken like a CRC mismatch, never padded (upstream's rule: an
+        # incomplete transfer writes no picture), and three short ones are no picture at all.
         lines = stream(30, 8, raw, crc=False).split("\n")
-        result, board, _, errors = self.capture(snap, ["\n".join(lines[:5] + lines[6:])])
-        self.assertEqual(result[:2], (30, 8))
-        self.assertEqual(len(result[2]), 30 * 8 * 2)
-        self.assertEqual(board.writes, [b"p"])
-        self.assertIn("bytes lost", errors)
+        short = "\n".join(lines[:5] + lines[6:])
+        result, board, _, errors = self.capture(snap, [short, stream(30, 8, raw, crc=False)])
+        self.assertEqual(result, (30, 8, raw))
+        self.assertEqual(board.writes, [b"p", b"p"])
+        self.assertEqual(errors, "missing pixel bytes: expected 480, got 420, retaking\n")
+        result, board, _, errors = self.capture(snap, [short] * 3)
+        self.assertIsInstance(result, snap.SnapError)
+        self.assertIn("missing pixel bytes", str(result))
+        self.assertEqual(board.writes, [b"p"] * 3)
 
     def test_snap_capture_says_why_it_has_no_picture(self):
         snap = load_snap()

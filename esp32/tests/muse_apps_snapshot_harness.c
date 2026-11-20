@@ -55,7 +55,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "muse_input.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))

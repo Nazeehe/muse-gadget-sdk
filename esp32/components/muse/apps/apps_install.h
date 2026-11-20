@@ -145,7 +145,7 @@ cJSON *apps_install_run(const char *id, bool run, const apps_source_t *src, cons
 
 /*
  * An install from Muse's VM (Task 22's app.install), for the I/O worker's job: apps_install_run(id, run, <the VM>, ops),
- * whose source reads each file of the app through vm->read (muse_apps.h) from "workspace/apps/<id>/<rel>", a path made
+ * whose source reads each file of the app through vm->read (muse_lua_apps.h) from "workspace/apps/<id>/<rel>", a path made
  * here from the id and a path the manifest's parse passed, into a block of apps_port_realloc that grows as the file comes,
  * never past the file's limit. What a read that fails gives the result:
  *   install timed out after 90 s (reading <rel>)    read_failed: the reader said its deadline came, or the install's

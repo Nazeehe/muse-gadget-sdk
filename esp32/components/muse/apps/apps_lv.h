@@ -310,7 +310,7 @@ void apps_lv_bench_forced(void);
  * what muse_ui puts above the layer (the downloaded image, the top layer). They are not on the layer, so
  * apps_lv_reset leaves them. Each takes every touch on it (clickable, not scrollable, and a swipe goes no further),
  * so the pages under them see none. The crash card sits over the launcher. Like apps_lv_reset, these need the LVGL
- * task, or a holder of the display lock: other tasks ask the app task's glue (muse_apps.h), which calls them at the
+ * task, or a holder of the display lock: other tasks ask the app task's glue (muse_lua_apps.h), which calls them at the
  * next frame. Without a layer they do nothing.
  */
 

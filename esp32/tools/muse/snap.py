@@ -19,7 +19,12 @@ tools/muse/snap.py [--settle S] <port> <keys> <out.png> [reset_wait_s]
 Keys are the serial bench hooks in muse_input.c ('a' menu Down, 's' menu Select, ...),
 sent 350 ms apart. A '>' starts a console command that runs to the end of the keys,
 sent as one line: '>face=thinking' puts the avatar in a mode, '>face=happy' pets it.
-Bench touch boards use '>ui=settings' / '>ui=face' / '>ui=clock' to select the tile;
+Bench touch boards use '>ui=settings' / '>ui=face' / '>ui=clock' to select the tile.
+The 1.75C also accepts '>ui=reply', '>ui.reply=down', and '>ui.reply=new'
+for latest-reply review; `>ui.reply=test-long` stores an oversized synthetic
+answer and `>ui.reply=end` scrolls to its end. Use
+'>ui.settings=PAGE' to open a settings page (home, wifi, muse, ble, sound,
+sleep, battery, power);
 'a/s' are non-touch menu keys, not touch-settings navigation.
 A bench build also injects touch through LVGL's input, as a finger would arrive:
 '>tap X Y' presses that point for 80 ms, '>longpress X Y' for 900 ms (LVGL's long press
@@ -37,11 +42,13 @@ prints meanwhile comes after the END line, and the CRC catches what still gets i
 console (the Watcher's) holds nothing, and the retake is what copes with the log there. A
 stream whose END comes without a BEGIN to read it by arrived damaged, and is retaken too.
 With reset_wait_s the board is reset first and given that long to boot.
-The PNG is scaled 3x so small screens are readable.
+The PNG is scaled 3x so small screens are readable. Incomplete transfers fail
+without writing the output; missing pixels are never padded.
 
 As a module: parse(log) reads a captured stream, capture(ser, keys, settle) does the whole
 exchange on an open port (the wake and the touch waits above included, so a caller gets
-them too), and write_png(path, w, h, raw) saves what they return.
+them too), and write_png(path, w, h, raw) saves what they return. decode_snapshot(log) is the strict
+one-shot decoder: exactly one complete frame, or ValueError.
 """
 import argparse
 import base64
@@ -175,6 +182,50 @@ def parse(log, fresh=False):
     return w, h, raw, crc_ok
 
 
+def decode_snapshot(log):
+    """Decode exactly one complete RGB565 frame, allowing UART log prefixes."""
+    header = re.search(r'(?m)^SNAP BEGIN (\d+) (\d+)(?: (\d+))?\r?\n', log)
+    if not header:
+        raise ValueError('missing snapshot header')
+    w, h = int(header[1]), int(header[2])
+    per_line = int(header[3]) if header[3] else 144
+    if not w or not h or not per_line:
+        raise ValueError('invalid snapshot dimensions or chunk size')
+    body = log[header.end():]
+    # The end marker can follow a log fragment, like a pixel line.
+    end = re.search(r'SNAP END\r?(?:\n|$)', body)
+    if not end:
+        raise ValueError('missing snapshot end marker')
+    lines = iter(body[:end.start()].rpartition('\n')[0].splitlines())
+    raw = bytearray()
+    # UART logs may prefix a base64 line; preserve the existing tail handling.
+    for n in [min(per_line, w * 2 - x) for _ in range(h)
+              for x in range(0, w * 2, per_line)]:
+        k = 4 * -(-n // 3)
+        for line in lines:
+            tail = re.search(r'[A-Za-z0-9+/]*={0,2}$', line).group()
+            if len(tail) >= k:
+                try:
+                    part = base64.b64decode(tail[-k:], validate=True)
+                except ValueError as error:
+                    raise ValueError('invalid pixel chunk') from error
+                if len(part) != n:
+                    raise ValueError('pixel chunk size mismatch')
+                raw.extend(part)
+                break
+        else:
+            raise ValueError(f'missing pixel bytes: expected {w * h * 2}, got {len(raw)}')
+    for line in lines:
+        # Logs can leave bare tails here; only a pixel-sized chunk is extra data.
+        try:
+            extra = base64.b64decode(line, validate=True)
+        except ValueError:
+            continue
+        if len(extra) in (per_line, n):
+            raise ValueError('unexpected extra pixel data')
+    return w, h, bytes(raw)
+
+
 def first_whole_line(log):
     """Where the first line `log` has whole begins, just after its first newline; None while it has no newline.
     What a read starts with is the end of a line the last read stopped in, never a column 0 of its own."""
@@ -186,6 +237,16 @@ def whole_lines(log):
     """`log` from its first whole line on."""
     start = first_whole_line(log)
     return log[start:] if start is not None else b''
+
+
+def reply_body(log):
+    """What a reply to 'p' is read from: its whole lines (see first_whole_line()). A read that opens with SNAP BEGIN
+    and has no SNAP BEGIN at a column 0 after it is the reply of firmware that sends no newline in front of its
+    stream, and is read from its start."""
+    body = whole_lines(log)
+    if BEGIN_LINE.match(log) and not BEGIN_LINE.search(body):
+        return bytes(log)
+    return body
 
 
 def read_until(ser, timeout, found, log=b''):
@@ -225,17 +286,19 @@ def fetch(ser):
     SnapError when the board has screenshots off or never answers.
 
     Nothing before the first newline of what comes back is looked at: it is the end of a line the drain before the
-    'p' stopped in (an @app.log echo that says SNAP END there is not the firmware). The reply starts with a newline."""
+    'p' stopped in (an @app.log echo that says SNAP END there is not the firmware). The reply starts with a newline,
+    except from firmware that sends none (see reply_body()). A stream short of pixels, from firmware without a CRC
+    to say so, is not ok either: it is never padded."""
     ser.write(b'p')
     log = read_until(ser, 10, re.compile(END_LINE.pattern + b'|' + OFF_LINE.pattern, re.M))
-    body = whole_lines(log)
+    body = reply_body(log)
     begin = BEGIN_LINE.search(body)
     if begin and not END_LINE.search(body):
         # Wait as long as the image takes on a UART console at 115200 (base64, a newline a
         # line, 10 bits a byte): ~8 s for 135x240, ~40 s for the Watcher's 412x412.
         size = int(begin.group(1)) * int(begin.group(2)) * 2 * 4 / 3 * 1.01
         log = read_until(ser, 10 + size * 10 / 115200, END_LINE, log)
-        body = whole_lines(log)
+        body = reply_body(log)
     text = body.decode('latin1')
     try:
         w, h, raw, ok = parse(text)
@@ -251,13 +314,16 @@ def fetch(ser):
         if END.search(text, head.end()):
             return 0, 0, b'', False, DAMAGED   # a BEGIN that is no screen's, and the END after it
         return 0, 0, b'', False, CUT_SHORT
+    if ok and len(raw) != w * h * 2:
+        return w, h, raw, False, f'missing pixel bytes: expected {w * h * 2}, got {len(raw)}'
     return w, h, raw, ok, CRC_MISMATCH
 
 
 def capture(ser, keys='', settle=DEFAULT_SETTLE):
     """Sends `keys` to the open port `ser`, waits `settle` seconds after the last key or command, and takes a
-    screenshot. -> (w, h, raw): RGB565 bytes, w*h*2 of them. A capture whose CRC doesn't match is taken again
-    (only the 'p', not the keys), up to TRIES times in all; SnapError when none is good, or when there is none.
+    screenshot. -> (w, h, raw): RGB565 bytes, w*h*2 of them. A capture whose CRC doesn't match, or that is short of
+    pixels, is taken again (only the 'p', not the keys), up to TRIES times in all; SnapError when none is good, or
+    when there is none.
 
     keys is what the command line takes: keys sent 350 ms apart, then perhaps a '>' with a console command that
     runs to the end of the keys. A touch command gets a 'w' in front and waits for its script (see prepare());
@@ -283,10 +349,6 @@ def capture(ser, keys='', settle=DEFAULT_SETTLE):
                 settle_down(ser)   # the rest of that stream may still be coming; a CRC mismatch's had ended
     else:
         raise SnapError(f'{why} on all {TRIES} tries: the screenshot would be corrupt, so there is none')
-    if len(raw) != w * h * 2:
-        print(f'{w * h * 2 - len(raw)} bytes lost (a log line broke into the image): the rest is shifted',
-              file=sys.stderr)
-        raw = raw.ljust(w * h * 2, b'\0')
     return w, h, raw
 
 
@@ -341,6 +403,9 @@ def open_port(port):
         pass
     return ser
 
+    def chunk(tag, data):
+        c = struct.pack('>I', len(data)) + tag + data
+        return c + struct.pack('>I', zlib.crc32(tag + data))
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)

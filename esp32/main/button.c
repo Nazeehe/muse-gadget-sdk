@@ -31,9 +31,11 @@ static const char *TAG = "link.button";
 #define DOUBLE_CLICK_MS    400
 #define POLL_MS            50
 
+static button_read_cb s_read = NULL;
 static button_cb s_short_press_cb = NULL;
 static button_cb s_double_press_cb = NULL;
 static button_cb s_long_press_cb = NULL;
+static int64_t s_pressed_after_us;   // the reported short press began after this
 #if CONFIG_HOMEHUB_VOICE
 static volatile button_press_cb s_press_cb = NULL;
 
@@ -42,10 +44,26 @@ void button_set_press_cb(button_press_cb cb) {
 }
 #endif
 
+int64_t button_pressed_after_us(void) {
+    return s_pressed_after_us;
+}
+
+void button_set_reader(button_read_cb read) {
+    s_read = read;
+}
+
+static bool read_button(bool *pressed) {
+    if (s_read) return s_read(pressed);
+    *pressed = gpio_get_level(BTN_GPIO) == 0;
+    return true;
+}
+
 static void button_task(void *arg) {
     stack_monitor_t stack = STACK_MONITOR_INIT;
     bool was_pressed = false;
     int64_t press_start = 0;
+    int64_t up_at = 0;          // the last poll that saw the button up
+    int64_t press_after = 0;    // ... before the current press
     bool fired = false;
     int click_count = 0;
     int64_t last_release = 0;
@@ -54,10 +72,19 @@ static void button_task(void *arg) {
 #endif
 
     while (1) {
-        bool pressed = (gpio_get_level(BTN_GPIO) == 0);
+        int64_t now = esp_timer_get_time();
+        bool pressed = was_pressed;
+        if (!read_button(&pressed)) {
+            // No edge: drop any click or hold in progress.
+            fired = true;
+            click_count = 0;
+            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+            continue;
+        }
 
         if (pressed && !was_pressed) {
             press_start = esp_timer_get_time();
+            press_after = up_at;
             fired = false;
 #if CONFIG_HOMEHUB_VOICE
             button_press_cb press_cb = s_press_cb;
@@ -83,7 +110,7 @@ static void button_task(void *arg) {
         } else if (!pressed && was_pressed && !fired) {
             int64_t held_ms = (esp_timer_get_time() - press_start) / 1000;
             if (held_ms >= 50 && held_ms <= SHORT_PRESS_MAX_MS) {
-                click_count++;
+                if (click_count++ == 0) s_pressed_after_us = press_after;
                 last_release = esp_timer_get_time();
             }
         }
@@ -102,6 +129,7 @@ static void button_task(void *arg) {
             }
         }
 
+        if (!pressed) up_at = now;
         was_pressed = pressed;
         stack_monitor_poll(&stack);
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
@@ -113,6 +141,13 @@ bool button_init(button_cb on_short_press, button_cb on_double_press,
     s_short_press_cb = on_short_press;
     s_double_press_cb = on_double_press;
     s_long_press_cb = on_long_press;
+
+    if (s_read) {
+        xTaskCreate(button_task, "btn", 4096, NULL, 2, NULL);
+        ESP_LOGI(TAG, "button ready (tap=retry wifi, 2x=rescan, hold %ds=reset setup)",
+                 LONG_PRESS_MS / 1000);
+        return true;
+    }
 
     gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << BTN_GPIO),

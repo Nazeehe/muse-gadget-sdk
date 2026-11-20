@@ -30,11 +30,11 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "sdkconfig.h"
 
 /*
- * The USB console's ">app.*" lines (muse_apps.h has the commands). muse_input's serial task calls the hook with each
+ * The USB console's ">app.*" lines (muse_lua_apps.h has the commands). muse_input's serial task calls the hook with each
  * whole line it reads, at most 1,023 bytes after the '>' (a longer one never comes here), on a stack of 3,584 bytes:
  * so nothing here keeps an array of more than 128 bytes in a frame, and everything else is on the heap (PSRAM on the
  * gadget). Senders send a file in pieces of at most 768 base64 characters, each after the last one's "@app.ack".
@@ -1051,7 +1051,7 @@ cJSON *muse_apps_health(void) {
 }
 
 #if CONFIG_MUSE_BENCH
-/* The bench's '>apply poll on|off' (muse_apps.h): true for a line that starts "apply", which it answers. */
+/* The bench's '>apply poll on|off' (muse_lua_apps.h): true for a line that starts "apply", which it answers. */
 static bool bench_command(const char *line) {
     if (strncmp(line, "apply", 5) != 0 || (line[5] != '\0' && line[5] != ' ')) {
         return false;

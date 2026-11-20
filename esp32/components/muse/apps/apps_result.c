@@ -22,7 +22,7 @@
 #include "apps_install.h"
 #include "apps_pkg.h"
 #include "apps_store.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 
 cJSON *apps_result_failure(const char *code, const char *message) {
     cJSON *r = cJSON_CreateObject();

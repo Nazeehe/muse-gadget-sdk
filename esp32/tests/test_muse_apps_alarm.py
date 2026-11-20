@@ -40,7 +40,7 @@ SOURCES = [HARNESS, TESTS / "muse_apps_fake_esp_timer.c", APPS / "apps_alarm.c"]
 
 # What apps_alarm.c, muse_input.h and muse_voice.h include of FreeRTOS and ESP-IDF: each one is a line that includes the fakes.
 FAKE_HEADERS = ["freertos/FreeRTOS.h", "freertos/queue.h", "freertos/semphr.h", "freertos/task.h", "esp_attr.h", "esp_err.h",
-                "esp_log.h", "esp_timer.h"]
+                "esp_log.h", "esp_timer.h", "sdkconfig.h"]
 
 
 def stage_fakes(directory):

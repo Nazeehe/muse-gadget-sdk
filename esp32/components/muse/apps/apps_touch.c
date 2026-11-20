@@ -33,12 +33,12 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "muse_input.h"
 #include "muse_ui.h"
 
 /*
- * app.control tap and drag (apps_touch.h has how its tasks meet, muse_apps.h the contract). The caller's side and the job are the
+ * app.control tap and drag (apps_touch.h has how its tasks meet, muse_lua_apps.h the contract). The caller's side and the job are the
  * I/O worker's way (apps_snapshot.c's): a job of its own in PSRAM, one done. The LVGL task's side is the guard the touch player
  * calls inside the input read, the tag on_widget_event asks for, and the frame's hand-off and settle; it touches nothing but the
  * handshake, the touch's own state and what LVGL and the app layer say.
@@ -385,7 +385,7 @@ static bool add_scrolls(const touch_job_t *job, const answer_t *a, cJSON *scroll
     return true;
 }
 
-/* The success's payload (muse_apps.h): NULL without memory. */
+/* The success's payload (muse_lua_apps.h): NULL without memory. */
 static cJSON *payload(const touch_job_t *job, const answer_t *a) {
     char item[APPS_ID_MAX + 240];
     cJSON *heard = NULL, *scroll = NULL, *warnings = NULL;

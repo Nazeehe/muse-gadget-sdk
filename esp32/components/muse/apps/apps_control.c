@@ -34,11 +34,11 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "sdkconfig.h"
 
 /*
- * Link's app.control and app.api (muse_apps.h has the contract; main/apps_link.c the commands). The Noise session's task
+ * Link's app.control and app.api (muse_lua_apps.h has the contract; main/apps_link.c the commands). The Noise session's task
  * calls these, and must never wait long: it delivers every frame of the session, the VM's answers to the guide's writes
  * among them.
  *

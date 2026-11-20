@@ -24,6 +24,8 @@
 # BL 3, no reset; touch I2C 4/5/0/1) and matching community pinouts for the
 # ESP32-2424S012 family.
 CONFIG_IDF_TARGET="esp32c3"
+CONFIG_MUSE_DEVICE_MODEL_ID="muse-gadget-esp32-2424s012c"
+CONFIG_MUSE_DEVICE_MODEL_NAME="ESP32-2424S012C 1.28-inch round display"
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
 
 # GC9A01 status screen: status bars, animation, agent name, display.* commands.

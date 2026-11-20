@@ -18,7 +18,7 @@
 
 /*
  * The mixer of app sound: APPS_MIX_VOICES voices of tones and clips, summed into the 16 kHz mono stream that the voice task, the
- * speaker's only writer, renders a chunk at a time on its idle passes (muse_voice.c, through muse_apps.h's muse_apps_sound_render).
+ * speaker's only writer, renders a chunk at a time on its idle passes (muse_voice.c, through muse_lua_apps.h's muse_apps_sound_render).
  * The rest of the apps start and stop voices here and return: nothing here waits for the voice task.
  *
  * Any task may call any function. Each holds the mixer's lock (apps_port_mix_lock) only for bounded work: no allocation, no log

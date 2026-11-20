@@ -15,19 +15,29 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import dataclasses
 import json
 import os
+import re
 import stat
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from musegadget import muse_api
+from musegadget import commands, config, device_guide, muse_api, service as service_module
 from musegadget.executor import Account, Executor
 from musegadget.identity import Identity
-from musegadget.service import Backoff, Service
+from musegadget.link_client import (
+    MAX_CONTROL_MESSAGE_BYTES, MAX_IMAGE_BYTES, REGISTER_ID_BYTES, DeviceDescription, Outcome, encode_message,
+)
+from musegadget.noise import ApplicationResponse, ServiceFrame
+from musegadget.service import MAX_LOCAL_REQUEST, Backoff, Service
+
+from test_link_client import FakeVm, Pipe, bounded_scenario
 
 
 class FakeSession:
@@ -38,6 +48,11 @@ class FakeSession:
 
     async def send_chat(self, message: str, session_id: str | None = None) -> dict:
         self.sent.append((message, session_id))
+        return {"ok": True, "status": 200, "response": None}
+
+    async def send_image(self, image_bytes: bytes, mime_type: str, session_id: str | None = None,
+                         *, message: str = "", filename: str | None = None) -> dict:
+        self.sent.append((message, session_id, image_bytes, mime_type, filename))
         return {"ok": True, "status": 200, "response": None}
 
 
@@ -90,6 +105,50 @@ def test_local_message_can_target_a_side_chat():
     run_with_socket(check)
 
 
+def test_local_message_can_carry_a_picture():
+    async def check(service, path):
+        session = FakeSession()
+        service._current = session
+        largest = bytes(MAX_IMAGE_BYTES)
+        image = {"filename": "porch.jpg", "mime_type": "image/jpeg",
+                 "data_base64": base64.b64encode(largest).decode()}
+        request = {"message": "who is it?", "image": image}
+        assert (await ask(path, json.dumps(request).encode() + b"\n"))["ok"]
+        assert session.sent == [("who is it?", None, largest, "image/jpeg", "porch.jpg")]
+        too_big = {**image, "data_base64": base64.b64encode(bytes(MAX_IMAGE_BYTES + 1)).decode()}
+        for bad, error in (
+            ([image], "image must be"),
+            ({"filename": "porch.jpg"}, "image must be"),
+            ({**image, "data_base64": 1}, "image must be"),
+            ({**image, "data_base64": "not base64!"}, "not valid base64"),
+            ({**image, "mime_type": "application/pdf"}, "JPEG, PNG, GIF or WebP"),
+            ({**image, "data_base64": ""}, "empty"),
+            (too_big, "images must be 2 MiB or less"),
+        ):
+            reply = await ask(path, json.dumps({"message": "hi", "image": bad}).encode() + b"\n")
+            assert not reply["ok"] and error in reply["error"], reply
+        assert len(session.sent) == 1
+
+    run_with_socket(check)
+
+
+def test_local_request_over_the_line_limit_gets_a_json_error():
+    async def check(service, path):
+        service._current = session = FakeSession()
+        reader, writer = await asyncio.open_unix_connection(str(path))
+        # Send the whole oversized line before reading, as the CLI does.
+        writer.write(b'{"message": "' + b"x" * MAX_LOCAL_REQUEST + b'"}\n')
+        await writer.drain()
+        reply = json.loads(await reader.readline())
+        writer.close()
+        assert reply == {"ok": False, "error": "the request is over 4 MiB"}
+        assert session.sent == []
+        # The socket keeps serving.
+        assert (await ask(path, b'{"message": "hi"}\n'))["ok"]
+
+    run_with_socket(check)
+
+
 def test_local_message_fails_cleanly_when_not_connected():
     async def check(service, path):
         reply = await ask(path, b'{"message": "hi"}\n')
@@ -109,6 +168,192 @@ def test_local_message_must_be_non_empty_text():
     run_with_socket(check)
 
 
+@pytest.fixture
+def paired_device(tmp_path, monkeypatch):
+    monkeypatch.setenv(config.STATE_DIR_ENV, str(tmp_path))
+    config.save_json(config.PAIRING_FILE, fresh_pairing())
+    vm = {"is_default": True, "vm_id": "vm-1", "vm_name": "muse", "vm_auth_token": "vm-token"}
+    monkeypatch.setattr(muse_api, "fetch_vms_with_status", lambda token, api: ([vm], 200))
+
+
+@pytest.mark.parametrize("failure", [None, "connection", "hook"])
+def test_a_subclass_runs_its_own_device_and_work_on_the_service_session(paired_device, monkeypatch, failure):
+    monkeypatch.setattr("musegadget.service.BACKOFF_BASE_S", 0)
+    served = []
+    commands = {"lamp.on": {"description": "Turn on the lamp", "required": {}, "optional": {}}}
+
+    class Lamp(Service):
+        def describe(self):
+            return DeviceDescription(self.identity.node_id, "Lamp", "2.0", commands)
+
+        def run_command(self, name, params, timeout_ms=None):
+            return {"ok": True, "payload": {"command": name, "params": params, "timeout_ms": timeout_ms}}
+
+        async def serve(self, session, vm, stop):
+            served.append(vm["vm_id"])
+            if failure == "hook" and len(served) == 1:
+                raise ConnectionError("temporary gadget failure")
+            return await super().serve(session, vm, stop)
+
+    async def scenario():
+        to_device, to_vm = asyncio.Queue(), asyncio.Queue()
+        device_ws = Pipe(to_device, to_vm)
+        vm = FakeVm(Pipe(to_vm, to_device))
+        connects = []
+
+        async def connect(url, **kwargs):
+            connects.append((url, kwargs["additional_headers"]))
+            if failure == "connection" and len(connects) == 1:
+                raise ConnectionError("temporary network failure")
+            return device_ws
+
+        monkeypatch.setattr("websockets.asyncio.client.connect", connect)
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            lamp = Lamp(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current()))
+            path = Path(tmp) / "mg.sock"
+            server = await lamp.serve_local(path)
+
+            async def use_gadget():
+                await vm.handshake()
+                await vm.accept_control_stream()
+                register = await vm.next_message()
+                assert register["method"] == "link.register"
+                assert register["params"] == {
+                    "node_id": "homelink-000001", "display_name": "Lamp", "version": "2.0",
+                    "platform": "linux", "device_family": "gadget", "model_id": "muse-gadget-linux",
+                    "metadata": {"model_name": "Linux gadget"}, "is_wakeup_supported": False,
+                    "commands_v2": {"lamp.on": {"description": "Turn on the lamp", "required": {}, "optional": {}}},
+                }
+                await vm.send_message({"type": "res", "id": register["id"], "ok": True})
+                await vm.send_message({
+                    "method": "link.invoke", "id": "inv-1", "command": "lamp.on",
+                    "params": {"brightness": 50}, "timeout_ms": 1000,
+                })
+                assert await vm.next_message() == {
+                    "method": "link.result", "id": "inv-1", "ok": True,
+                    "payload": {"command": "lamp.on", "params": {"brightness": 50}, "timeout_ms": 1000},
+                }
+                message = asyncio.ensure_future(ask(path, b'{"message": "hi"}\n'))
+                request = await vm.next_frame()
+                assert (request.value.verb, request.value.path) == ("POST", "/chat/stream")
+                assert json.loads(request.value.body) == {
+                    "message": "hi", "output_modality": "text", "device_id": "homelink-000001",
+                }
+                await vm.send_frame(ServiceFrame.response(request.stream_id, ApplicationResponse(
+                    status=200, body=b'{"message_id":"user-1"}', end_body=True,
+                )))
+                assert await message == {"ok": True, "status": 200, "response": {"message_id": "user-1"}}
+                lamp.stop()
+
+            tasks = [asyncio.ensure_future(lamp.run()), asyncio.ensure_future(use_gadget())]
+            try:
+                await asyncio.gather(*tasks)
+                assert await ask(path, b'{"message": "late"}\n') == {
+                    "ok": False, "error": "not connected to the Muse",
+                }
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                server.close()
+                await server.wait_closed()
+        assert connects == [
+            ("wss://hatch.metaaivm.com/v1/noise?vm_id=vm-1", {"Authorization": "Bearer vm-token"}),
+        ] * (2 if failure == "connection" else 1)
+
+    asyncio.run(bounded_scenario(scenario()))
+    assert served == (["vm-1", "vm-1"] if failure else ["vm-1"])
+
+
+
+def test_the_service_describes_the_linux_client_with_its_guide():
+    async def describe():
+        return Service(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current())).describe()
+
+    params = asyncio.run(describe()).register_params()
+    assert params["commands_v2"]["device.guide"] == device_guide.SPEC
+    guide = device_guide.default_guide()
+    assert guide.startswith("# Linux gadget\n")
+    assert "Hatch" not in guide and len(guide.encode()) <= 2048
+    # The rules for this repository's guides (protocols/DEVICE.md, Guides in this repository).
+    assert not re.search(r"https?://|www\.|<[A-Za-z!/]|^\s*(```|~~~)|[\x00-\x09\x0b-\x1f\x7f-\x9f]", guide, re.M)
+    assert len(re.findall(r"^# ", guide, re.M)) == 1
+
+
+def test_the_service_sizes_drop_ins_with_its_own_model_and_guide():
+    # Drop-ins that overfill the registration budget: big ones, then smaller
+    # and smaller ones that pack what is left down to less than the model can add.
+    sizes = [4000] * 70 + [2 ** n for n in range(11, -1, -1) for _ in range(2)]
+    drop_ins = [commands.DropInCommand(f"pump.p{i:03d}", "x" * size, ("/bin/true",), {}, {}, 1000)
+                for i, size in enumerate(sizes)]
+    model = {"model_id": "z" * 64, "model_name": "~" * 128,
+             "guide": "# Acme Robot\n\n" + "x" * (device_guide.MAX_BYTES - 14)}
+
+    def register_bytes(device):
+        return len(encode_message(device.register_message("0" * REGISTER_ID_BYTES)))
+
+    async def describe(**model):
+        return Service(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current(), drop_ins),
+                       display_name="Robot", **model).describe()
+
+    default, robot = asyncio.run(describe()), asyncio.run(describe(**model))
+    assert MAX_CONTROL_MESSAGE_BYTES - register_bytes(default) < 150
+    # Changing what describe() returned would overflow; the service's own settings are sized.
+    assert register_bytes(dataclasses.replace(default, **model)) > MAX_CONTROL_MESSAGE_BYTES
+    assert register_bytes(robot) <= MAX_CONTROL_MESSAGE_BYTES
+    assert (robot.model_id, robot.model_name, robot.guide) == tuple(model.values())
+    assert robot.register_params()["commands_v2"]["device.guide"] == device_guide.SPEC
+    assert len(robot.commands) < len(default.commands)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("model_id", "Acme Robot"), ("model_name", 'Acme "Robot"'), ("guide", ""),
+])
+def test_the_service_refuses_a_model_muse_would_not_take(field, value):
+    async def make():
+        Service(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current()), **{field: value})
+
+    with pytest.raises(ValueError):
+        asyncio.run(make())
+
+
+def test_an_invalid_description_fails_before_any_request(paired_device, monkeypatch):
+    def fetch(*args):
+        raise AssertionError("fetched VMs")
+
+    monkeypatch.setattr(muse_api, "fetch_vms_with_status", fetch)
+
+    class Robot(Service):
+        def describe(self):
+            return dataclasses.replace(super().describe(), model_id="Acme Robot")
+
+    async def scenario():
+        await Robot(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current())).run()
+
+    with pytest.raises(ValueError, match="model_id"):
+        asyncio.run(scenario())
+
+
+def test_cancelling_a_service_does_not_reconnect(paired_device):
+    async def scenario():
+        started = asyncio.Event()
+
+        class Lamp(Service):
+            async def serve(self, session, vm, stop):
+                started.set()
+                await stop.wait()
+                return Outcome.STOPPED
+
+        lamp = Lamp(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current()))
+        task = asyncio.ensure_future(lamp.run())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(bounded_scenario(scenario()))
+
+
 def test_backoff_doubles_to_a_ceiling_and_honours_the_floor():
     backoff = Backoff()
     assert [backoff.next_delay() for _ in range(7)] == [2, 4, 8, 16, 32, 60, 60]
@@ -122,6 +367,77 @@ def test_backoff_stays_at_the_ceiling_through_a_long_outage():
     for _ in range(1100):  # 2 ** 1024 no longer fits a float
         delay = backoff.next_delay()
     assert delay == 60
+
+
+@pytest.mark.parametrize("sessions, delays", [
+    ([(Outcome.CLOSED, 30, True), (Outcome.CLOSED, 0, False), (Outcome.CLOSED, 0, False)],
+     [1, 2, 4]),
+    ([(Outcome.CLOSED, 29, True)] * 3, [2, 4, 8]),
+    ([(Outcome.CLOSED, 60, False)] * 3, [2, 4, 8]),
+    ([(Outcome.AUTH_REJECTED, 30, True), (Outcome.CLOSED, 0, False)], [15, 15]),
+    ([(Outcome.FORBIDDEN, 30, True), (Outcome.CLOSED, 0, False)], [15, 15]),
+    ([(Outcome.CLOSED, 0, False)] * 6 + [(Outcome.CLOSED, 30, True), (Outcome.CLOSED, 0, False)],
+     [2, 4, 8, 16, 32, 60, 1, 2]),
+])
+def test_reconnect_delay_depends_on_registered_uptime(paired_device, monkeypatch, sessions, delays):
+    clock = [100.0]
+    monkeypatch.setattr(service_module, "time", SimpleNamespace(
+        time=time.time, monotonic=lambda: clock[0],
+    ))
+    pending = iter(sessions)
+    waited = []
+
+    class Lamp(Service):
+        async def serve(self, session, vm, stop):
+            try:
+                outcome, duration, registered = next(pending)
+            except StopIteration:
+                return Outcome.STOPPED
+            if registered:
+                session.registered_at = clock[0]
+            clock[0] += duration
+            return outcome
+
+        async def _sleep(self, seconds):
+            waited.append(seconds)
+            await asyncio.sleep(0)
+
+    async def scenario():
+        lamp = Lamp(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current()))
+        await asyncio.wait_for(lamp.run(), 3)
+
+    asyncio.run(scenario())
+    assert waited == delays
+
+
+def test_stop_interrupts_the_healthy_reconnect_delay(paired_device):
+    async def scenario():
+        entered = asyncio.Event()
+        served = []
+
+        class Lamp(Service):
+            async def serve(self, session, vm, stop):
+                served.append(vm["vm_id"])
+                session.registered_at = time.monotonic() - 30
+                return Outcome.CLOSED
+
+            async def _sleep(self, seconds):
+                assert seconds == 1
+                entered.set()
+                await super()._sleep(seconds)
+
+        lamp = Lamp(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current()))
+        task = asyncio.ensure_future(lamp.run())
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            lamp.stop()
+            await asyncio.wait_for(task, 0.5)
+            assert served == ["vm-1"]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 def refresh_with(service_kwargs, pairing, calls=1):
@@ -138,6 +454,48 @@ def refresh_with(service_kwargs, pairing, calls=1):
 
 def fresh_pairing() -> dict:
     return {"access_token": "a", "refresh_token": "r", "access_token_saved_at": int(time.time())}
+
+
+@pytest.mark.parametrize("invalid_fields", [
+    {"refresh_token": None},
+    {"access_token_saved_at": None},
+])
+def test_service_waits_for_repaired_pairing(tmp_path, monkeypatch, caplog, invalid_fields):
+    monkeypatch.setenv(config.STATE_DIR_ENV, str(tmp_path))
+    valid = fresh_pairing()
+    invalid = {**valid, **invalid_fields}
+    if invalid["refresh_token"] is None:
+        del invalid["refresh_token"]
+    config.save_json(config.PAIRING_FILE, invalid)
+    path = tmp_path / config.PAIRING_FILE
+    original = path.read_bytes()
+    fetched = []
+
+    async def scenario():
+        service = Service(identity=Identity("02:00:00:00:00:01"),
+                          executor=Executor(Account.current()))
+
+        def fetch(token, api):
+            fetched.append(token)
+            return [], 200
+
+        async def sleep(delay):
+            if not fetched:
+                assert delay == service_module.UNPAIRED_POLL_S
+                assert path.read_bytes() == original
+                config.save_json(config.PAIRING_FILE, valid)
+            else:
+                service.stop()
+
+        monkeypatch.setattr(service, "_sleep", sleep)
+        monkeypatch.setattr(muse_api, "fetch_vms_with_status", fetch)
+        monkeypatch.setattr(muse_api, "refresh_device_token",
+                            lambda *args: pytest.fail("unexpected refresh"))
+        await asyncio.wait_for(service.run(), 2)
+
+    asyncio.run(scenario())
+    assert fetched == [valid["access_token"]]
+    assert "musegadget pair --force" in caplog.text
 
 
 def test_a_start_with_an_sdk_token_keeps_a_fresh_token(monkeypatch):
@@ -183,3 +541,238 @@ def test_the_token_pairing_used_or_an_older_pairing_says_nothing(caplog):
 def test_api_root_uses_api_url_v2_or_the_muse_api():
     assert muse_api.api_root("https://api.example/") == "https://api.example"
     assert muse_api.api_root() == "https://api.muse.ai"
+
+
+def test_reconnected_sessions_share_command_slots(monkeypatch):
+    from musegadget.link_client import MAX_CONCURRENT_INVOKES, Outcome
+
+    sessions = []
+
+    class Session:
+        registered_at = None
+
+        def __init__(self, **options):
+            sessions.append(options)
+
+        async def run(self, stop):
+            return Outcome.CLOSED
+
+    monkeypatch.setattr("musegadget.service.LinkSession", Session)
+
+    async def scenario():
+        service = Service(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current()))
+        vm = {"vm_id": "test", "vm_name": "test", "vm_auth_token": "unused"}
+        await service._session(vm, {})
+        await service._session(vm, {})
+        slots = sessions[0]["invoke_slots"]
+        assert slots is sessions[1]["invoke_slots"]
+        other = Service(identity=service.identity, executor=service.executor)
+        assert other._invoke_slots is not slots
+        for _ in range(MAX_CONCURRENT_INVOKES):
+            await asyncio.wait_for(slots.acquire(), 1)
+        assert slots.locked()
+        for _ in range(MAX_CONCURRENT_INVOKES):
+            slots.release()
+
+    asyncio.run(scenario())
+
+
+# Drive the production run loop with synthetic API responses and a recorded
+# stop-aware delay. asyncio's watchdog keeps using its real monotonic clock.
+def run_auth_cycles(tmp_path, monkeypatch, statuses, outcomes=(), refresh_status=200):
+    monkeypatch.setenv(config.STATE_DIR_ENV, str(tmp_path))
+    config.save_json(config.PAIRING_FILE, fresh_pairing())
+    trace = []
+
+    async def scenario():
+        service = Service(identity=Identity("02:00:00:00:00:01"),
+                          executor=Executor(Account.current()))
+        loop = asyncio.get_running_loop()
+        pending_statuses = iter(statuses)
+        pending_outcomes = iter(outcomes)
+
+        def fetch(token, api):
+            status = next(pending_statuses)
+            trace.append(("fetch", token, status))
+            if len([x for x in trace if x[0] == "fetch"]) == len(statuses) and status == 401:
+                loop.call_soon_threadsafe(service.stop)
+            return ([{"is_default": True}] if status == 200 else []), status
+
+        def refresh(*args):
+            trace.append(("refresh", refresh_status))
+            return ({"access_token": "new-a", "refresh_token": "new-r"}
+                    if refresh_status == 200 else None), refresh_status
+
+        async def sleep(seconds):
+            trace.append(("sleep", seconds))
+            await asyncio.sleep(0)
+
+        async def session(vm, pairing):
+            result = next(pending_outcomes)
+            trace.append(("session", result[0]))
+            return result
+
+        monkeypatch.setattr(muse_api, "fetch_vms_with_status", fetch)
+        monkeypatch.setattr(muse_api, "refresh_device_token", refresh)
+        monkeypatch.setattr(service, "_sleep", sleep)
+        monkeypatch.setattr(service, "_session", session)
+        await asyncio.wait_for(service.run(), 3)
+
+    asyncio.run(scenario())
+    return trace
+
+
+def test_repeated_rejections_after_successful_refresh_are_paced(tmp_path, monkeypatch, caplog):
+    trace = run_auth_cycles(tmp_path, monkeypatch, [401] * 4)
+    assert [x[2] for x in trace if x[0] == "fetch"] == [401] * 4
+    # The first refresh gets one immediate retry. Later rejected refreshed
+    # tokens must encounter a positive delay before another fetch/refresh cycle.
+    fetch_indices = [i for i, event in enumerate(trace) if event[0] == "fetch"]
+    for left, right in zip(fetch_indices[1:], fetch_indices[2:]):
+        assert any(event[0] == "sleep" and event[1] >= service_module.AUTH_BACKOFF_MIN_S
+                   for event in trace[left + 1:right]), trace
+    assert "new-a" not in caplog.text and "new-r" not in caplog.text
+
+
+def test_temporary_token_rejection_retries_immediately_with_the_saved_token(tmp_path, monkeypatch):
+    trace = run_auth_cycles(tmp_path, monkeypatch, [401, 200], [(Outcome.STOPPED, 0)])
+    assert [x[1] for x in trace if x[0] == "fetch"] == ["a", "new-a"]
+    assert [x for x in trace if x[0] == "refresh"] == [("refresh", 200)]
+    assert not [x for x in trace if x[0] == "sleep"]
+
+
+def test_healthy_session_resets_rejection_backoff(tmp_path, monkeypatch):
+    trace = run_auth_cycles(tmp_path, monkeypatch, [401] * 6 + [200, 401, 401, 200],
+                            [(Outcome.CLOSED, service_module.HEALTHY_SESSION_S), (Outcome.STOPPED, 0)])
+    assert [x[1] for x in trace if x[0] == "sleep"] == [15, 15, 15, 16, 32, 1, 15]
+
+
+@pytest.mark.parametrize("refresh_status, retained", [(401, False), (503, True)])
+def test_forced_refresh_failure_keeps_revocation_distinct_from_transient_failure(
+    tmp_path, monkeypatch, refresh_status, retained,
+):
+    trace = run_auth_cycles(tmp_path, monkeypatch, [401], refresh_status=refresh_status)
+    assert [x[1] for x in trace if x[0] == "sleep"] == [service_module.TOKEN_RETRY_S]
+    assert (tmp_path / config.PAIRING_FILE).exists() is retained
+    if retained:
+        assert config.load_json(config.PAIRING_FILE)["access_token"] == "a"
+
+
+def test_stop_wakes_the_real_rejection_delay_without_more_api_calls(tmp_path, monkeypatch):
+    monkeypatch.setenv(config.STATE_DIR_ENV, str(tmp_path))
+    config.save_json(config.PAIRING_FILE, fresh_pairing())
+    fetches = []
+
+    async def scenario():
+        service = Service(identity=Identity("02:00:00:00:00:01"),
+                          executor=Executor(Account.current()))
+        entered = asyncio.Event()
+        original_sleep = service._sleep
+
+        async def sleep(seconds):
+            assert seconds >= service_module.AUTH_BACKOFF_MIN_S
+            entered.set()
+            await original_sleep(seconds)
+
+        def fetch(*args):
+            fetches.append(1)
+            assert len(fetches) < 10, "unpaced rejection loop"
+            return [], 401
+
+        monkeypatch.setattr(muse_api, "fetch_vms_with_status", fetch)
+        monkeypatch.setattr(muse_api, "refresh_device_token",
+                            lambda *args: ({"access_token": "new-a", "refresh_token": "new-r"}, 200))
+        monkeypatch.setattr(service, "_sleep", sleep)
+        task = asyncio.ensure_future(service.run())
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            assert len(fetches) == 2
+            service.stop()
+            await asyncio.wait_for(task, 1)
+            assert len(fetches) == 2
+        finally:
+            service.stop()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_age_based_refresh_keeps_pairing_and_observes_retry_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setenv(config.STATE_DIR_ENV, str(tmp_path))
+    calls = []
+    fresh = fresh_pairing()
+    fresh["access_token_saved_at"] -= service_module.TOKEN_REFRESH_AGE_S + 1
+
+    def refresh(*args):
+        calls.append(1)
+        return None, 503
+
+    monkeypatch.setattr(muse_api, "refresh_device_token", refresh)
+    assert refresh_with({}, fresh, calls=2) is fresh
+    assert calls == [1]
+
+
+def test_repeated_rejection_backoff_is_bounded_in_the_run_loop(tmp_path, monkeypatch):
+    trace = run_auth_cycles(tmp_path, monkeypatch, [401] * 10)
+    delays = [x[1] for x in trace if x[0] == "sleep"]
+    assert len(delays) == 9
+    assert all(service_module.AUTH_BACKOFF_MIN_S <= delay <= service_module.BACKOFF_MAX_S
+               for delay in delays)
+    assert delays[-1] == service_module.BACKOFF_MAX_S
+
+
+@pytest.mark.parametrize("stored, used", [
+    ({"node_id": "gadget-000001"}, "gadget-000001"),
+    ({"node_id": "homelink-000001"}, "homelink-000001"),   # a stored id is never renamed
+    ({}, "homelink-000001"),                                # paired before ids were stored
+])
+def test_a_token_refresh_names_and_keeps_the_paired_node_id(monkeypatch, stored, used):
+    calls = []
+
+    def refresh(refresh_token, node_id, api, sdk_token):
+        calls.append(node_id)
+        return {"access_token": "a2", "refresh_token": "r2"}, 200
+
+    monkeypatch.setattr("musegadget.service.muse_api.refresh_device_token", refresh)
+    monkeypatch.setattr("musegadget.service.config.save_json", lambda *args: None)
+    stale = {"access_token": "a", "refresh_token": "r", "access_token_saved_at": 0, **stored}
+
+    async def scenario():
+        service = Service(identity=Identity("02:00:00:00:00:01").for_pairing(stale),
+                          executor=Executor(Account.current()))
+        return await service._maybe_refresh(stale)
+
+    rotated = asyncio.run(scenario())
+    assert calls == [used]
+    assert rotated["access_token"] == "a2"
+    assert Identity("02:00:00:00:00:01").for_pairing(rotated).node_id == used
+
+
+@pytest.mark.parametrize("stored, used", [
+    ({"node_id": "gadget-000001"}, "gadget-000001"),
+    ({"node_id": "homelink-000001"}, "homelink-000001"),
+    ({}, "homelink-000001"),
+])
+def test_the_service_registers_with_the_pairings_node_id(monkeypatch, stored, used):
+    # The service follows the pairing it connects with, even one made after
+    # it started (a `pair --force` meanwhile).
+    pairing = {"access_token": "a", "refresh_token": "r", "access_token_saved_at": int(time.time()), **stored}
+    monkeypatch.setattr(service_module.tls, "client_context", lambda: None)
+    monkeypatch.setattr(service_module.config, "load_json", lambda name, *args: dict(pairing))
+    monkeypatch.setattr(service_module.muse_api, "fetch_vms_with_status",
+                        lambda *args: ([{"vm_id": "vm", "vm_name": "vm", "vm_auth_token": "t",
+                                         "is_default": True}], 200))
+    seen = []
+
+    class Probe(Service):
+        async def _session(self, vm, pairing):
+            seen.append((self.identity.node_id, self.describe().node_id))
+            return Outcome.STOPPED, 0.0
+
+    async def scenario():
+        probe = Probe(identity=Identity("02:00:00:00:00:01"), executor=Executor(Account.current()))
+        await probe.run()
+
+    asyncio.run(scenario())
+    assert seen == [(used, used)]

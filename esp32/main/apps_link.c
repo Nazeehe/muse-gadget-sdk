@@ -23,7 +23,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "vm_file.h"
 
 // Link's app.* commands (apps_link.h).
@@ -249,7 +249,7 @@ static cJSON *async_reply(void) {
     return async;
 }
 
-// A queued command's done (muse_apps.h), on the I/O worker: the result once (no_room when there was no memory for one), then
+// A queued command's done (muse_lua_apps.h), on the I/O worker: the result once (no_room when there was no memory for one), then
 // the request goes.
 static void finish_request(void *ctx, cJSON *result, const char *no_room) {
     request_t *req = ctx;
@@ -489,7 +489,7 @@ bool apps_link_handles(const char *command) {
 cJSON *apps_link_handle(const char *command, cJSON *params, const char *request_id,
                         noise_ctrl_session_generation_t session_generation) {
     if (apps_link_handles(command) && muse_apps_starting()) {
-        return error_result("unavailable", MUSE_APPS_STARTING);  /* I2: the store isn't mounted yet (muse_apps.h) */
+        return error_result("unavailable", MUSE_APPS_STARTING);  /* I2: the store isn't mounted yet (muse_lua_apps.h) */
     }
     if (command && strcmp(command, "app.install") == 0) {
         return install_command(params, request_id, session_generation);

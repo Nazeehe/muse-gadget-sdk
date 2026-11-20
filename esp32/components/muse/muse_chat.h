@@ -88,11 +88,29 @@ void muse_hatch_turn_end(void);
 /* Abandons the turn (tap, or barge-in during the reply). */
 void muse_hatch_turn_cancel(void);
 
+/*
+ * Photo with voice notes (CONFIG_MUSE_PHOTO_NOTES): sends a photo with a
+ * voice note being recorded. Once the note's audio has gone, the photo
+ * follows as an image item in the same request, so Muse gets them as one
+ * message. `note` is muse_chat_note_id() from when the note started.
+ * `jpeg_base64` is a malloc'd base64 JPEG of up to MUSE_CHAT_PHOTO_MAX bytes;
+ * this takes ownership and frees it in every case, as soon as it has gone up
+ * or been dropped. Call it before muse_hatch_turn_end(): a photo for a note
+ * whose end has gone, or that was cancelled or followed by another press, is
+ * dropped. False if it can't be queued (not a base64 JPEG, too large, or no
+ * voice session).
+ */
+#define MUSE_CHAT_PHOTO_MAX (256u * 1024u)
+bool muse_chat_attach_jpeg(char *jpeg_base64, size_t len, uint32_t note);
+/* The note muse_hatch_turn_begin() just started (voice task). */
+uint32_t muse_chat_note_id(void);
+
 typedef enum {
     MUSE_HATCH_EV_NONE,
     MUSE_HATCH_EV_HEARD,    /* transcript so far (partial while talking, then final) */
     MUSE_HATCH_EV_REPLY,    /* reply text so far */
-    MUSE_HATCH_EV_DONE,     /* reply complete; the audio stream is drained after this */
+    MUSE_HATCH_EV_DONE,     /* turn ended; empty text = complete, nonempty text = incomplete reason;
+                            * drain remaining audio after either outcome */
     MUSE_HATCH_EV_ERROR,    /* turn failed; text says why */
     MUSE_HATCH_EV_SENT,     /* the VM has acknowledged the note */
 } muse_hatch_ev_t;
@@ -100,12 +118,56 @@ typedef enum {
 /* Non-blocking; copies the event's text. Events of cancelled turns are dropped. */
 muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap);
 
+/* What a voice note's failed turn means for the note (CONFIG_MUSE_RESEND_NOTES). */
+typedef enum {
+    MUSE_CHAT_FAIL_NONE,      /* no failure reported */
+    MUSE_CHAT_FAIL_RETRY,     /* Muse never had all of it: worth sending again */
+    MUSE_CHAT_FAIL_REFUSED,   /* Muse answered that it won't take it */
+    MUSE_CHAT_FAIL_UNKNOWN,   /* all of it went up, unacknowledged: Muse may have it */
+} muse_chat_fail_t;
+
+/*
+ * The failure that the last MUSE_HATCH_EV_ERROR muse_hatch_turn_event()
+ * returned since muse_hatch_turn_begin() reported, or MUSE_CHAT_FAIL_NONE
+ * (CONFIG_MUSE_RESEND_NOTES only). Voice task only.
+ */
+muse_chat_fail_t muse_chat_turn_failure(void);
+
+/*
+ * For the voice task, while idle. True once a reply has come for a request
+ * whose turn ended before it (Muse said it was still working, and the turn
+ * said so and let go); it then starts that reply's turn, to be played like any
+ * reply (muse_hatch_turn_event and the rest), though nobody pressed anything.
+ */
+bool muse_hatch_incoming(void);
+
 /*
  * The page of reply text holding what's being said after `played` frames of
  * reply speech (sized by muse_state_page), or before the speech its opening
  * page. False until there's reply text to page.
  */
 bool muse_hatch_turn_caption(size_t played, char *out, size_t cap);
+
+/* Approximate progress at the same playback cursor as captions, 0..1.
+ * message receives the current message index, or -1 before playback. Values
+ * may be revised as duration becomes known; the voice task stabilizes them.
+ * 1 means this message has drained; the ring caps at 99% until the whole
+ * turn succeeds. Voice task only.
+ * Link-only builds return 0 and -1 (their paging is unchanged). */
+float muse_turn_progress(size_t played, int *message);
+
+/*
+ * For a caption font whose letters differ in width: pages also wrap each line
+ * to width_px, measuring it with glyph_px (a glyph's advance in pixels,
+ * kerned towards the next one, 0 at the line's end) as the label will, so no
+ * line wraps again on screen and a page holds exactly its lines. Every reply
+ * is measured: one with CJK or accented letters also keeps to their font's
+ * page (muse_state_page), but its pages without any show in this font. A
+ * NULL glyph_px turns it off. Set before any reply is paged; the full UI sets
+ * it again when the speaker switches its reply layout, and pages after that
+ * use the new width.
+ */
+void muse_chat_set_caption_px(int width_px, int (*glyph_px)(uint32_t letter, uint32_t next));
 
 /* Reply speech as 16 kHz mono. Waits up to wait_ms for some; returns frames read. */
 size_t muse_hatch_turn_read(int16_t *pcm, size_t frames, int wait_ms);

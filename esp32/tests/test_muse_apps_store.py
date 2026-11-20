@@ -221,7 +221,8 @@ class Store(unittest.TestCase):
 
 
 class Partitions(unittest.TestCase):
-    """The table and the overlay: partitions_muse.csv as it is, then the two entries of the brief, and the pairing's nvs where it was."""
+    """The table and the overlay: partitions_muse.csv as it is but for the WebAssembly apps' LittleFS partitions, then the two entries
+    of the brief, and the pairing's nvs where it was."""
 
     @staticmethod
     def rows(path):
@@ -229,8 +230,12 @@ class Partitions(unittest.TestCase):
         return [[cell.strip() for cell in row][:5] for row in csv.reader(lines)]
 
     def test_the_apps_table_is_the_muse_table_and_two_entries(self):
-        base = self.rows(ROOT / "partitions_muse.csv")
+        # partitions_muse.csv's apps and files are the WebAssembly apps' (components/muse_apps), which a Lua build has none of.
+        muse = self.rows(ROOT / "partitions_muse.csv")
+        base = [row for row in muse if row[2] != "littlefs"]
+        self.assertEqual([row[0] for row in muse if row[2] == "littlefs"], ["apps", "files"])
         apps = self.rows(ROOT / "partitions_muse_apps.csv")
+        self.assertNotIn("littlefs", [row[2] for row in apps])
         self.assertEqual(apps[:len(base)], base, "no existing entry moves or changes")
         self.assertEqual(apps[len(base):], [["apps", "data", "fat", "0x830000", "0x600000"],
                                             ["apps_nvs", "data", "nvs", "0xE30000", "0x10000"]])

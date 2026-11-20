@@ -35,7 +35,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "muse_apps.h"
+#include "muse_lua_apps.h"
 #include "muse_input.h"
 #include "sdkconfig.h"
 #if CONFIG_MUSE_BENCH
@@ -47,7 +47,7 @@
 #endif
 
 /*
- * app.control snapshot (apps_snapshot.h has how it runs and what it takes of memory, muse_apps.h the contract). The caller's side and
+ * app.control snapshot (apps_snapshot.h has how it runs and what it takes of memory, muse_lua_apps.h the contract). The caller's side and
  * the job are the I/O worker's way of doing things (apps_control.c's): a job of its own in PSRAM, one done, the store read on the
  * worker. The LVGL task's side touches nothing but the handshake, LVGL and the one block of PSRAM it allocates for the sequence.
  *
@@ -540,7 +540,7 @@ static bool fill_ui(const cJSON *p, cJSON *ui, cJSON *all, int *left) {
     return true;
 }
 
-/* The success's payload (muse_apps.h): NULL without memory. runs says id is the app that runs, front that it is on screen. */
+/* The success's payload (muse_lua_apps.h): NULL without memory. runs says id is the app that runs, front that it is on screen. */
 static cJSON *payload(const snap_job_t *job, const encoded_t *e, bool runs, bool front) {
     char path[PATH_MAX_LEN];
     snapshot_path(job->id, path, sizeof path);
